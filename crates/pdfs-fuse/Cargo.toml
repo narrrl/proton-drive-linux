@@ -1,0 +1,16 @@
+[package]
+name = "pdfs-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "FUSE on-demand filesystem for Proton Drive"
+
+[dependencies]
+pdfs-core.workspace = true
+proton-drive-rs.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+fuser.workspace = true
+libc.workspace = true

@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Nils Pukropp <contact@narl.io>"]
+rust-version = "1.96"
+
+[workspace.dependencies]
+# Local Proton SDK crates (path deps until published; switch to versioned later).
+proton-sdk = { path = "../proton-sdk-rs/crates/proton-sdk" }
+proton-drive-rs = { path = "../proton-sdk-rs/crates/proton-drive-rs" }
+
+# Internal crates.
+pdfs-core = { path = "crates/pdfs-core" }
+pdfs-fuse = { path = "crates/pdfs-fuse" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+fuser = "0.17"
+libc = "0.2"
