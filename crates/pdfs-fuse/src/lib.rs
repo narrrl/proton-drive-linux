@@ -9,6 +9,14 @@
 //! cursor ([`ProtonDriveClient::enumerate_events`]) and pushes invalidations
 //! into the kernel via a fuser [`Notifier`], so the cache TTL can be long while
 //! remote changes still show up promptly.
+//!
+//! Phase 3 makes the mount writable. Each file opened for writing gets a
+//! [`WriteHandle`] whose buffer accumulates the full plaintext; on flush/release
+//! the buffer is sealed as a new revision via
+//! [`ProtonDriveClient::upload_new_revision`] (the SDK uploads whole revisions,
+//! not byte ranges). New files are created empty up front so they get a real
+//! uid; namespace ops map to `create_folder`, `trash_nodes`, `rename_node` and
+//! `move_node`.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -17,9 +25,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, Request, Session,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    Session, TimeOrNow, WriteFlags,
 };
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid};
 use proton_drive_rs::{DriveEvent, DriveEventScopeId, Node, NodeKind, ProtonDriveClient};
@@ -43,6 +52,21 @@ struct Entry {
     node: Node,
 }
 
+/// Buffered state for a file opened for writing. The full plaintext is
+/// assembled here and uploaded as one new revision on flush/release, because
+/// the SDK seals whole revisions rather than byte ranges.
+struct WriteHandle {
+    ino: u64,
+    uid: NodeUid,
+    /// The plaintext being assembled; valid only once `seeded`.
+    buf: Vec<u8>,
+    /// Whether `buf` holds the file's current content (or was emptied by a
+    /// truncate). Until then a partial write must hydrate the base first.
+    seeded: bool,
+    /// Whether `buf` diverged from the remote and needs an upload.
+    dirty: bool,
+}
+
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
 /// `Filesystem` trait through `&self`.
 struct State {
@@ -54,6 +78,10 @@ struct State {
     /// key means the directory has been enumerated.
     children: HashMap<u64, Vec<u64>>,
     next_ino: u64,
+    /// Open write handles keyed by file handle id. Read-only opens use fh 0 and
+    /// have no entry here.
+    handles: HashMap<u64, WriteHandle>,
+    next_fh: u64,
 }
 
 impl State {
@@ -85,6 +113,23 @@ impl State {
             kids.retain(|&k| k != ino);
         }
         Some((entry.parent, entry.node.name))
+    }
+
+    /// Update a file entry's recorded plaintext size so `getattr` reflects an
+    /// in-progress write before the new revision is sealed.
+    fn set_size(&mut self, ino: u64, size: u64) {
+        if let Some(e) = self.entries.get_mut(&ino)
+            && let NodeKind::File { claimed_size, .. } = &mut e.node.kind
+        {
+            *claimed_size = Some(size as i64);
+        }
+    }
+
+    /// Update a file entry's modification time (epoch seconds).
+    fn touch_mtime(&mut self, ino: u64, secs: i64) {
+        if let Some(e) = self.entries.get_mut(&ino) {
+            e.node.modification_time = secs;
+        }
     }
 }
 
@@ -119,6 +164,8 @@ impl ProtonFs {
                 by_uid,
                 children: HashMap::new(),
                 next_ino: 2,
+                handles: HashMap::new(),
+                next_fh: 1,
             })),
             uid,
             gid,
@@ -178,8 +225,8 @@ impl ProtonFs {
 
     fn attr(&self, ino: u64, node: &Node) -> FileAttr {
         let (kind, perm) = match node.kind {
-            NodeKind::Folder => (FileType::Directory, 0o555),
-            NodeKind::File { .. } => (FileType::RegularFile, 0o444),
+            NodeKind::Folder => (FileType::Directory, 0o755),
+            NodeKind::File { .. } => (FileType::RegularFile, 0o644),
         };
         let size = node_size(node);
         let mtime = unix_secs(node.modification_time);
@@ -201,6 +248,102 @@ impl ProtonFs {
             blksize: 512,
             flags: 0,
         }
+    }
+
+    /// Resolve a child `name` within `parent` to its `(inode, uid)`, ensuring
+    /// the parent's listing is cached first.
+    fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
+        self.ensure_children(parent)?;
+        let st = self.state.lock().unwrap();
+        st.children
+            .get(&parent)
+            .and_then(|kids| {
+                kids.iter().copied().find_map(|ino| {
+                    st.entries
+                        .get(&ino)
+                        .filter(|e| e.node.name == name)
+                        .map(|e| (ino, e.uid.clone()))
+                })
+            })
+            .ok_or(Errno::ENOENT)
+    }
+
+    /// Fetch a single node's current metadata from the remote.
+    fn fetch_node(&self, uid: &NodeUid) -> Result<Node, Errno> {
+        let nodes = self
+            .rt
+            .block_on(self.client.enumerate_nodes(std::slice::from_ref(uid)))
+            .map_err(|e| {
+                error!(%uid, error = %e, "enumerate node failed");
+                Errno::EIO
+            })?;
+        nodes.into_iter().next().ok_or(Errno::ENOENT)
+    }
+
+    /// Upload a write handle's buffer as a new revision if it is dirty, clearing
+    /// the dirty flag and refreshing the entry's size/mtime on success. No-op for
+    /// a clean (or unknown) handle. Network I/O happens without the lock held.
+    fn commit(&self, fh: u64) -> Result<(), Errno> {
+        let (uid, buf, ino) = {
+            let st = self.state.lock().unwrap();
+            match st.handles.get(&fh) {
+                Some(h) if h.dirty => (h.uid.clone(), h.buf.clone(), h.ino),
+                _ => return Ok(()),
+            }
+        };
+        self.rt
+            .block_on(self.client.upload_new_revision(&uid, &buf))
+            .map_err(|e| {
+                error!(%uid, error = %e, "upload new revision failed");
+                Errno::EIO
+            })?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut st = self.state.lock().unwrap();
+        if let Some(h) = st.handles.get_mut(&fh) {
+            h.dirty = false;
+        }
+        st.set_size(ino, buf.len() as u64);
+        st.touch_mtime(ino, now);
+        Ok(())
+    }
+
+    /// Trash the child `name` under `parent` on the remote, then drop it from the
+    /// local cache. Backs both `unlink` and `rmdir` (Proton trashes whole
+    /// subtrees, so an `rmdir` of a non-empty dir behaves the same).
+    fn trash_child(&self, parent: u64, name: &str, reply: ReplyEmpty) {
+        let (_ino, uid) = match self.lookup_child(parent, name) {
+            Ok(x) => x,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        if let Err(e) = self.rt.block_on(self.client.trash_nodes(std::slice::from_ref(&uid))) {
+            error!(%uid, error = %e, "trash failed");
+            reply.error(Errno::EIO);
+            return;
+        }
+        self.state.lock().unwrap().forget(&uid);
+        reply.ok();
+    }
+}
+
+/// A coarse MIME type guessed from a file name's extension; Proton stores this
+/// on the node but an exact value is not required for correctness.
+fn media_type_for(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("txt" | "md" | "log") => "text/plain",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("pdf") => "application/pdf",
+        Some("json") => "application/json",
+        Some("html" | "htm") => "text/html",
+        _ => "application/octet-stream",
     }
 }
 
@@ -304,13 +447,35 @@ impl Filesystem for ProtonFs {
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let st = self.state.lock().unwrap();
-        match st.entries.get(&ino.0) {
-            Some(e) if e.node.is_file() => reply.opened(FileHandle(0), FopenFlags::empty()),
-            Some(_) => reply.error(Errno::EISDIR),
-            None => reply.error(Errno::ENOENT),
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let uid = {
+            let st = self.state.lock().unwrap();
+            match st.entries.get(&ino.0) {
+                Some(e) if e.node.is_file() => e.uid.clone(),
+                Some(_) => {
+                    reply.error(Errno::EISDIR);
+                    return;
+                }
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        // Read-only opens stay stateless (fh 0). A write open allocates a buffer
+        // handle, hydrated lazily on the first write that needs the base content.
+        if flags.acc_mode() == OpenAccMode::O_RDONLY {
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
         }
+        let mut st = self.state.lock().unwrap();
+        let fh = st.next_fh;
+        st.next_fh += 1;
+        st.handles.insert(
+            fh,
+            WriteHandle { ino: ino.0, uid, buf: Vec::new(), seeded: false, dirty: false },
+        );
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
@@ -326,6 +491,14 @@ impl Filesystem for ProtonFs {
     ) {
         let uid = {
             let st = self.state.lock().unwrap();
+            // If the file is open for writing and its buffer is populated, serve
+            // from there so reads see the in-flight (possibly unsaved) content.
+            if let Some(h) = st.handles.values().find(|h| h.ino == ino.0 && h.seeded) {
+                let off = (offset as usize).min(h.buf.len());
+                let end = (off + size as usize).min(h.buf.len());
+                reply.data(&h.buf[off..end]);
+                return;
+            }
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => e.uid.clone(),
                 Some(_) => {
@@ -348,6 +521,383 @@ impl Filesystem for ProtonFs {
                 reply.error(Errno::EIO);
             }
         }
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let parent = parent.0;
+        if let Err(e) = self.ensure_children(parent) {
+            reply.error(e);
+            return;
+        }
+        let name = name.to_string_lossy().into_owned();
+        let parent_uid = {
+            let st = self.state.lock().unwrap();
+            match st.entries.get(&parent) {
+                Some(e) => e.uid.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        // Create an empty file on the remote so it has a real uid immediately;
+        // written bytes are buffered and sealed as a new revision on close.
+        let new_uid = match self.rt.block_on(self.client.upload_file(
+            &parent_uid,
+            &name,
+            media_type_for(&name),
+            b"",
+        )) {
+            Ok(u) => u,
+            Err(e) => {
+                error!(%parent_uid, name, error = %e, "create file failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        let node = match self.fetch_node(&new_uid) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let mut st = self.state.lock().unwrap();
+        let ino = st.intern(parent, node);
+        if let Some(kids) = st.children.get_mut(&parent)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        let fh = st.next_fh;
+        st.next_fh += 1;
+        st.handles.insert(
+            fh,
+            WriteHandle { ino, uid: new_uid, buf: Vec::new(), seeded: true, dirty: false },
+        );
+        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
+        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let fh = fh.0;
+        // Partial writes need the file's current content; hydrate it once.
+        let need_seed = {
+            let st = self.state.lock().unwrap();
+            match st.handles.get(&fh) {
+                Some(h) => !h.seeded,
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            }
+        };
+        if need_seed {
+            let uid = self
+                .state
+                .lock()
+                .unwrap()
+                .handles
+                .get(&fh)
+                .map(|h| h.uid.clone());
+            let Some(uid) = uid else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            let base = match self.rt.block_on(self.client.download_file(&uid)) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(%uid, error = %e, "seed write buffer failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+            let mut st = self.state.lock().unwrap();
+            if let Some(h) = st.handles.get_mut(&fh)
+                && !h.seeded
+            {
+                h.buf = base;
+                h.seeded = true;
+            }
+        }
+        let off = offset as usize;
+        let new_len = {
+            let mut st = self.state.lock().unwrap();
+            let Some(h) = st.handles.get_mut(&fh) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            let end = off + data.len();
+            if h.buf.len() < end {
+                h.buf.resize(end, 0);
+            }
+            h.buf[off..end].copy_from_slice(data);
+            h.dirty = true;
+            let len = h.buf.len() as u64;
+            st.set_size(ino.0, len);
+            len
+        };
+        debug!(ino = ino.0, fh, offset, len = data.len(), new_len, "buffered write");
+        reply.written(data.len() as u32);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        // Only resizes change remote state; everything else (mode/owner/times) is
+        // accepted and ignored so tools that chmod/utimes after writing succeed.
+        if let Some(size) = size {
+            let fh = fh.map(|f| f.0).filter(|&f| f != 0);
+            let handled = match fh {
+                Some(fh) => {
+                    let mut st = self.state.lock().unwrap();
+                    match st.handles.get_mut(&fh) {
+                        Some(h) => {
+                            h.buf.resize(size as usize, 0);
+                            h.seeded = true;
+                            h.dirty = true;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            };
+            if !handled {
+                // Path-based truncate with no open write handle: resize the
+                // remote content and seal it now.
+                let uid = {
+                    let st = self.state.lock().unwrap();
+                    match st.entries.get(&ino.0) {
+                        Some(e) if e.node.is_file() => e.uid.clone(),
+                        Some(_) => {
+                            reply.error(Errno::EISDIR);
+                            return;
+                        }
+                        None => {
+                            reply.error(Errno::ENOENT);
+                            return;
+                        }
+                    }
+                };
+                let mut content = if size == 0 {
+                    Vec::new()
+                } else {
+                    match self.rt.block_on(self.client.download_file(&uid)) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(%uid, error = %e, "truncate base download failed");
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                };
+                content.resize(size as usize, 0);
+                if let Err(e) = self.rt.block_on(self.client.upload_new_revision(&uid, &content)) {
+                    error!(%uid, error = %e, "truncate upload failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+            self.state.lock().unwrap().set_size(ino.0, size);
+        }
+        let st = self.state.lock().unwrap();
+        match st.entries.get(&ino.0) {
+            Some(e) => {
+                let attr = self.attr(ino.0, &e.node);
+                reply.attr(&TTL, &attr);
+            }
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        match self.commit(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        match self.commit(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let res = self.commit(fh.0);
+        self.state.lock().unwrap().handles.remove(&fh.0);
+        match res {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.trash_child(parent.0, &name.to_string_lossy(), reply);
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.trash_child(parent.0, &name.to_string_lossy(), reply);
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let parent = parent.0;
+        if let Err(e) = self.ensure_children(parent) {
+            reply.error(e);
+            return;
+        }
+        let name = name.to_string_lossy().into_owned();
+        let parent_uid = {
+            let st = self.state.lock().unwrap();
+            match st.entries.get(&parent) {
+                Some(e) => e.uid.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .ok();
+        let new_uid = match self.rt.block_on(self.client.create_folder(&parent_uid, &name, now)) {
+            Ok(u) => u,
+            Err(e) => {
+                error!(%parent_uid, name, error = %e, "create folder failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        let node = match self.fetch_node(&new_uid) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let mut st = self.state.lock().unwrap();
+        let ino = st.intern(parent, node);
+        if let Some(kids) = st.children.get_mut(&parent)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
+        reply.entry(&TTL, &attr, Generation(0));
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let parent = parent.0;
+        let newparent = newparent.0;
+        let name = name.to_string_lossy().into_owned();
+        let newname = newname.to_string_lossy().into_owned();
+        let (_ino, uid) = match self.lookup_child(parent, &name) {
+            Ok(x) => x,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        // Move first if the parent changed, then rename if the name changed.
+        if newparent != parent {
+            if let Err(e) = self.ensure_children(newparent) {
+                reply.error(e);
+                return;
+            }
+            let new_parent_uid = {
+                let st = self.state.lock().unwrap();
+                match st.entries.get(&newparent) {
+                    Some(e) => e.uid.clone(),
+                    None => {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = self.rt.block_on(self.client.move_node(&uid, &new_parent_uid)) {
+                error!(%uid, error = %e, "move failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        if newname != name
+            && let Err(e) = self.rt.block_on(self.client.rename_node(&uid, &newname, None))
+        {
+            error!(%uid, error = %e, "rename failed");
+            reply.error(Errno::EIO);
+            return;
+        }
+        // Forget the node so it re-interns under its new parent, and drop the
+        // destination listing so it re-enumerates on next access.
+        let mut st = self.state.lock().unwrap();
+        st.forget(&uid);
+        st.children.remove(&newparent);
+        reply.ok();
     }
 }
 
@@ -482,8 +1032,6 @@ pub fn mount(
     config.mount_options = vec![
         MountOption::FSName("protondrive".to_string()),
         MountOption::Subtype("protondrive".to_string()),
-        MountOption::RO,
-        MountOption::NoExec,
         MountOption::DefaultPermissions,
     ];
     info!(mountpoint = %mountpoint.display(), "mounting Proton Drive");
