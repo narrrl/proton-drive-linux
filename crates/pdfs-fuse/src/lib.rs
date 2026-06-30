@@ -1784,24 +1784,22 @@ pub fn mount(
     // channel of 1 is enough — we only need to know that *a* stop arrived.
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<()>(1);
     rt.spawn(async move {
-        let mut sigterm = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "install SIGTERM handler failed");
-                return;
-            }
-        };
-        let mut sigint = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "install SIGINT handler failed");
-                return;
-            }
-        };
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "install SIGTERM handler failed");
+                    return;
+                }
+            };
+        let mut sigint =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "install SIGINT handler failed");
+                    return;
+                }
+            };
         tokio::select! {
             _ = sigterm.recv() => info!("received SIGTERM"),
             _ = sigint.recv() => info!("received SIGINT"),

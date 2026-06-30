@@ -16,7 +16,8 @@
 //! daemon running; live mount status comes from the daemon over the control
 //! socket the CLI and tray already speak.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -42,6 +43,9 @@ const APP_ID: &str = "io.narl.proton-drive-linux";
 const PROTON_PURPLE: &str = "#6d4aff";
 /// How often the window re-reads mount status, cache usage and the pin list.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff between auto-retries of a Files/Photos load while the mount service
+/// is still coming up (see [`load_browser`] / [`load_gallery`]).
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// All widgets the periodic refresh and the action handlers mutate, plus the
 /// resolved paths they act on. Wrapped in an [`Rc`] so handlers and the timeout
@@ -49,6 +53,13 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 struct Ui {
     dirs: AppDirs,
     stack: adw::ViewStack,
+    /// Header spinner shown while any open/load round-trip is in flight; ref-
+    /// counted via [`Self::busy`] so concurrent operations don't stop it early.
+    spinner: gtk4::Spinner,
+    busy: Cell<u32>,
+    /// Keys (relative path / photo uid) of open requests currently in flight, so
+    /// a double-click on the same entry is a no-op instead of a second download.
+    opening: RefCell<HashSet<String>>,
     // Login page.
     email: adw::EntryRow,
     password: adw::PasswordEntryRow,
@@ -78,12 +89,35 @@ struct Ui {
     browser_back: gtk4::Button,
     browser_crumb: gtk4::Label,
     browser_status: gtk4::Label,
+    /// Shown beside [`Self::browser_status`] when a load failed because the mount
+    /// service is down (not merely starting); restarts the service and reloads.
+    browser_retry: gtk4::Button,
     /// Mountpoint-relative path the browser is showing (empty = root).
     browser_path: RefCell<String>,
     // Photos (gallery) page.
     gallery_model: gio::ListStore,
     gallery_status: gtk4::Label,
+    gallery_retry: gtk4::Button,
     gallery_more: gtk4::Button,
+}
+
+impl Ui {
+    /// Begin a unit of background work: show + spin the header spinner.
+    fn busy_begin(&self) {
+        self.busy.set(self.busy.get() + 1);
+        self.spinner.set_visible(true);
+        self.spinner.start();
+    }
+
+    /// End a unit of background work: stop the spinner once the last one is done.
+    fn busy_end(&self) {
+        let remaining = self.busy.get().saturating_sub(1);
+        self.busy.set(remaining);
+        if remaining == 0 {
+            self.spinner.stop();
+            self.spinner.set_visible(false);
+        }
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -169,9 +203,16 @@ fn build_window(app: &adw::Application) {
 
     let switcher = adw::ViewSwitcherBar::builder().stack(&stack).build();
 
+    // Header spinner, hidden until a background open/load is in flight.
+    let spinner = gtk4::Spinner::new();
+    spinner.set_visible(false);
+
     let ui = Rc::new(Ui {
         dirs,
         stack: stack.clone(),
+        spinner: spinner.clone(),
+        busy: Cell::new(0),
+        opening: RefCell::new(HashSet::new()),
         email: login_widgets.0,
         password: login_widgets.1,
         totp: login_widgets.2,
@@ -189,9 +230,11 @@ fn build_window(app: &adw::Application) {
         browser_back: browser_widgets.1,
         browser_crumb: browser_widgets.2,
         browser_status: browser_widgets.3,
+        browser_retry: browser_widgets.6,
         browser_path: RefCell::new(String::new()),
         gallery_model: gallery_widgets.0,
         gallery_status: gallery_widgets.1,
+        gallery_retry: gallery_widgets.4,
         gallery_more: gallery_widgets.2,
     });
 
@@ -199,6 +242,7 @@ fn build_window(app: &adw::Application) {
     wire_logout(&ui, &main_widgets.5);
     wire_browser(&ui, &browser_widgets.4, &browser_widgets.5);
     wire_gallery(&ui, &gallery_widgets.3);
+    wire_retry(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
     // network round-trip only happens on demand rather than on every refresh.
@@ -218,6 +262,7 @@ fn build_window(app: &adw::Application) {
     brand.append(&icon);
     brand.append(&gtk4::Label::new(Some("Proton Drive")));
     header.set_title_widget(Some(&brand));
+    header.pack_end(&spinner);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -502,6 +547,22 @@ fn wire_logout(ui: &Rc<Ui>, button: &gtk4::Button) {
     });
 }
 
+/// Connect the Files/Photos "Retry" buttons (shown by [`browser_unreachable`] /
+/// [`gallery_unreachable`] when the mount is down): restart the systemd unit and
+/// reload the page.
+fn wire_retry(ui: &Rc<Ui>) {
+    let ui_browser = ui.clone();
+    ui.browser_retry.clone().connect_clicked(move |_| {
+        service::restart();
+        load_browser(&ui_browser);
+    });
+    let ui_gallery = ui.clone();
+    ui.gallery_retry.clone().connect_clicked(move |_| {
+        service::restart();
+        load_gallery(&ui_gallery, false);
+    });
+}
+
 /// Re-read mount status, login identity, cache usage and the pin list, and
 /// repaint the window. Cheap, synchronous local reads — safe on the main loop.
 fn refresh(ui: &Rc<Ui>) {
@@ -646,6 +707,7 @@ fn spawn_request(
 /// The factories that render entries — and the columns — need the [`Ui`] handle
 /// for activation and the right-click menu, so they're installed later in
 /// [`wire_browser`]; this builder only assembles the empty widgets.
+#[allow(clippy::type_complexity)]
 fn build_browser_page() -> (
     gtk4::Widget,
     (
@@ -655,6 +717,7 @@ fn build_browser_page() -> (
         gtk4::Label,
         gtk4::GridView,
         gtk4::ColumnView,
+        gtk4::Button,
     ),
 ) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
@@ -698,6 +761,18 @@ fn build_browser_page() -> (
     let status = gtk4::Label::builder().wrap(true).build();
     status.add_css_class("dim-label");
     status.set_visible(false);
+
+    // Shown only when a load failed because the mount is down; restarts it.
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Start)
+        .build();
+    retry.add_css_class("pill");
+    retry.set_visible(false);
+
+    let status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    status_box.append(&status);
+    status_box.append(&retry);
 
     // Icon grid.
     let grid = gtk4::GridView::builder()
@@ -745,12 +820,12 @@ fn build_browser_page() -> (
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header);
-    inner.append(&status);
+    inner.append(&status_box);
     inner.append(&view_stack);
 
     (
         inner.upcast(),
-        (model, back, crumb, status, grid, column_view),
+        (model, back, crumb, status, grid, column_view, retry),
     )
 }
 
@@ -980,9 +1055,22 @@ fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
         *ui.browser_path.borrow_mut() = rel;
         load_browser(ui);
     } else {
-        let rx = spawn_request(ui.dirs.control_socket(), Request::OpenFile { path: rel });
+        // Ignore a repeat activation of a file already downloading, so an
+        // impatient double-click doesn't kick off a second round-trip.
+        if !ui.opening.borrow_mut().insert(rel.clone()) {
+            return;
+        }
+        ui.busy_begin();
+        let rx = spawn_request(
+            ui.dirs.control_socket(),
+            Request::OpenFile { path: rel.clone() },
+        );
+        let ui = ui.clone();
         glib::spawn_future_local(async move {
-            match rx.recv().await {
+            let result = rx.recv().await;
+            ui.busy_end();
+            ui.opening.borrow_mut().remove(&rel);
+            match result {
                 Ok(Ok(Response::FilePath { path })) => open_path(&path),
                 Ok(Ok(Response::Error { message })) => {
                     tracing::error!("open file failed: {message}")
@@ -1080,25 +1168,59 @@ fn load_browser(ui: &Rc<Ui>) {
         &path
     });
     ui.browser_back.set_sensitive(!path.is_empty());
-    ui.browser_status.set_visible(false);
 
+    // Drop the previous folder's rows up front: a slow reply must not leave stale
+    // entries visible, where clicking one would open with a wrong relative path.
+    ui.browser_model.remove_all();
+    ui.browser_retry.set_visible(false);
+    ui.browser_status.set_label("Loading…");
+    ui.browser_status.set_visible(true);
+
+    ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListDir { path });
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        match rx.recv().await {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
             Ok(Ok(Response::Entries { entries })) => repaint_browser(&ui, &entries),
             Ok(Ok(Response::Error { message })) => browser_message(&ui, &message),
             Ok(Ok(_)) => browser_message(&ui, "Unexpected reply from daemon."),
-            Ok(Err(_)) | Err(_) => browser_message(&ui, "Mount Proton Drive to browse your files."),
+            Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
         }
     });
 }
 
-/// Clear the model and show a single status line instead.
+/// Clear the model and show a single status line instead. Hides the Retry button
+/// (used for "in-band" outcomes: empty folder, or an error the daemon returned).
 fn browser_message(ui: &Rc<Ui>, message: &str) {
     ui.browser_model.remove_all();
+    ui.browser_retry.set_visible(false);
     ui.browser_status.set_label(message);
     ui.browser_status.set_visible(true);
+}
+
+/// The daemon didn't answer. Distinguish *still starting* (auto-retry, no
+/// button) from *down* (actionable error + Retry), so a cold start self-heals
+/// once the systemd mount comes up but a real failure stays visible.
+fn browser_unreachable(ui: &Rc<Ui>) {
+    if service::is_failed() || !service::is_active() {
+        ui.browser_status
+            .set_label("Couldn't reach Proton Drive. The mount service isn't running.");
+        ui.browser_status.set_visible(true);
+        ui.browser_retry.set_visible(true);
+        return;
+    }
+    ui.browser_status.set_label("Connecting to Proton Drive…");
+    ui.browser_status.set_visible(true);
+    ui.browser_retry.set_visible(false);
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        // Only keep polling while the Files page is the one on screen.
+        if ui.stack.visible_child_name().as_deref() == Some("browser") {
+            load_browser(&ui);
+        }
+    });
 }
 
 /// Repopulate the shared model — folders first, then case-insensitive by name —
@@ -1127,7 +1249,13 @@ fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
 /// "Load more" button and a status label.
 fn build_gallery_page() -> (
     gtk4::Widget,
-    (gio::ListStore, gtk4::Label, gtk4::Button, gtk4::GridView),
+    (
+        gio::ListStore,
+        gtk4::Label,
+        gtk4::Button,
+        gtk4::GridView,
+        gtk4::Button,
+    ),
 ) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
 
@@ -1168,6 +1296,14 @@ fn build_gallery_page() -> (
     status.add_css_class("dim-label");
     status.set_visible(false);
 
+    // Shown only when a load failed because the mount is down; restarts it.
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Center)
+        .build();
+    retry.add_css_class("pill");
+    retry.set_visible(false);
+
     let more = gtk4::Button::builder()
         .label("Load more")
         .halign(gtk4::Align::Center)
@@ -1186,10 +1322,11 @@ fn build_gallery_page() -> (
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&status);
+    inner.append(&retry);
     inner.append(&scroll);
     inner.append(&more);
 
-    (inner.upcast(), (model, status, more, grid))
+    (inner.upcast(), (model, status, more, grid, retry))
 }
 
 /// Wire the gallery: activating a tile downloads the photo and opens it; the
@@ -1204,9 +1341,21 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
             .downcast_ref::<BoxedAnyObject>()
             .map(|o| o.borrow::<PhotoItem>().uid.clone());
         let Some(uid) = uid else { return };
-        let rx = spawn_request(ui_open.dirs.control_socket(), Request::OpenPhoto { uid });
+        // Ignore a repeat activation of a photo already downloading.
+        if !ui_open.opening.borrow_mut().insert(uid.clone()) {
+            return;
+        }
+        ui_open.busy_begin();
+        let rx = spawn_request(
+            ui_open.dirs.control_socket(),
+            Request::OpenPhoto { uid: uid.clone() },
+        );
+        let ui = ui_open.clone();
         glib::spawn_future_local(async move {
-            match rx.recv().await {
+            let result = rx.recv().await;
+            ui.busy_end();
+            ui.opening.borrow_mut().remove(&uid);
+            match result {
                 Ok(Ok(Response::FilePath { path })) => open_path(&path),
                 Ok(Ok(Response::Error { message })) => {
                     tracing::error!("open photo failed: {message}")
@@ -1225,13 +1374,19 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
 /// Fetch a timeline page from the daemon. When `append` is false the model is
 /// cleared first (fresh load); otherwise the next page is tacked on.
 fn load_gallery(ui: &Rc<Ui>, append: bool) {
-    if !append {
+    if append {
+        ui.gallery_status.set_visible(false);
+    } else {
+        // Fresh load: clear the grid and show Loading until the first page lands.
         ui.gallery_model.remove_all();
+        ui.gallery_retry.set_visible(false);
+        ui.gallery_status.set_label("Loading…");
+        ui.gallery_status.set_visible(true);
     }
     let offset = ui.gallery_model.n_items() as usize;
-    ui.gallery_status.set_visible(false);
     ui.gallery_more.set_sensitive(false);
 
+    ui.busy_begin();
     let rx = spawn_request(
         ui.dirs.control_socket(),
         Request::PhotosTimeline {
@@ -1241,8 +1396,10 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
     );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
         ui.gallery_more.set_sensitive(true);
-        match rx.recv().await {
+        match result {
             Ok(Ok(Response::Photos { available, items })) => {
                 if !available {
                     gallery_message(&ui, "This account has no photos.");
@@ -1261,16 +1418,39 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
             }
             Ok(Ok(Response::Error { message })) => gallery_message(&ui, &message),
             Ok(Ok(_)) => gallery_message(&ui, "Unexpected reply from daemon."),
-            Ok(Err(_)) | Err(_) => gallery_message(&ui, "Mount Proton Drive to see your photos."),
+            Ok(Err(_)) | Err(_) => gallery_unreachable(&ui),
         }
     });
 }
 
-/// Show a gallery status line and hide the pager.
+/// Show a gallery status line and hide the pager + Retry button.
 fn gallery_message(ui: &Rc<Ui>, message: &str) {
+    ui.gallery_retry.set_visible(false);
     ui.gallery_status.set_label(message);
     ui.gallery_status.set_visible(true);
     ui.gallery_more.set_visible(false);
+}
+
+/// Photos counterpart of [`browser_unreachable`]: auto-retry while the mount is
+/// still starting, surface an actionable error + Retry once it's actually down.
+fn gallery_unreachable(ui: &Rc<Ui>) {
+    ui.gallery_more.set_visible(false);
+    if service::is_failed() || !service::is_active() {
+        ui.gallery_status
+            .set_label("Couldn't reach Proton Drive. The mount service isn't running.");
+        ui.gallery_status.set_visible(true);
+        ui.gallery_retry.set_visible(true);
+        return;
+    }
+    ui.gallery_status.set_label("Connecting to Proton Drive…");
+    ui.gallery_status.set_visible(true);
+    ui.gallery_retry.set_visible(false);
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        if ui.stack.visible_child_name().as_deref() == Some("gallery") {
+            load_gallery(&ui, false);
+        }
+    });
 }
 
 /// Open a local path with the user's default handler.
