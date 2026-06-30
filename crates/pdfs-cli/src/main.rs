@@ -380,7 +380,10 @@ fn cmd_transfers() -> Result<()> {
                     TransferDirection::Upload => "↑",
                 };
                 let pct = if t.bytes_total > 0 {
-                    format!("{:.0}%", 100.0 * t.bytes_completed as f64 / t.bytes_total as f64)
+                    format!(
+                        "{:.0}%",
+                        100.0 * t.bytes_completed as f64 / t.bytes_total as f64
+                    )
                 } else {
                     "—".to_string()
                 };

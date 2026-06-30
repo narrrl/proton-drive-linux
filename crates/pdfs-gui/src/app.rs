@@ -32,7 +32,9 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{DirEntry, PhotoItem, Request, Response, SearchHit, send};
+use pdfs_core::control::{
+    DirEntry, PhotoItem, Request, Response, SearchHit, TransferDirection, TransferItem, send,
+};
 use pdfs_core::service;
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
@@ -61,6 +63,15 @@ struct PinRow {
     unpin: Option<gtk4::Button>,
 }
 
+/// One rendered transfer row in the Activity group: a name + speed line over a
+/// progress bar. Retained so [`repaint_transfers`] can update the bar and label
+/// in place each tick when the active set is unchanged, instead of rebuilding.
+struct TransferRow {
+    row: adw::PreferencesRow,
+    label: gtk4::Label,
+    bar: gtk4::ProgressBar,
+}
+
 /// All widgets the periodic refresh and the action handlers mutate, plus the
 /// resolved paths they act on. Wrapped in an [`Rc`] so handlers and the timeout
 /// closure share one instance.
@@ -81,6 +92,12 @@ struct Ui {
     /// Whether a [`Request::Status`] round-trip is already in flight, so the 2s
     /// refresh tick doesn't pile worker threads up on a slow/wedged daemon.
     status_inflight: Cell<bool>,
+    /// Guards the [`Request::GetQueueStatus`] poll the same way: at most one
+    /// in-flight at a time so a wedged daemon can't stack worker threads.
+    transfers_inflight: Cell<bool>,
+    /// Activity group + its current rows, hidden when no transfer is in flight.
+    transfers_group: adw::PreferencesGroup,
+    transfer_rows: RefCell<Vec<TransferRow>>,
     // Login page.
     email: adw::EntryRow,
     password: adw::PasswordEntryRow,
@@ -278,6 +295,9 @@ fn build_window(app: &adw::Application) {
         login_status: login_widgets.3,
         account_row: main_widgets.account_row.clone(),
         mount_row: main_widgets.mount_row.clone(),
+        transfers_group: main_widgets.transfers_group.clone(),
+        transfer_rows: RefCell::new(Vec::new()),
+        transfers_inflight: Cell::new(false),
         cache_bar: main_widgets.cache_bar.clone(),
         cache_label: main_widgets.cache_label.clone(),
         autostart_row: main_widgets.autostart_row.clone(),
@@ -441,6 +461,8 @@ fn build_login_page() -> (
 struct MainWidgets {
     account_row: adw::ActionRow,
     mount_row: adw::ActionRow,
+    /// Live upload/download progress, populated by the refresh loop.
+    transfers_group: adw::PreferencesGroup,
     cache_bar: gtk4::ProgressBar,
     cache_label: gtk4::Label,
     pins_group: adw::PreferencesGroup,
@@ -482,6 +504,14 @@ fn build_main_page() -> (gtk4::Widget, MainWidgets) {
         .subtitle("Not mounted")
         .build();
     mount_group.add(&mount_row);
+
+    // Activity group: live upload/download progress. Hidden until the refresh
+    // loop sees an in-flight transfer from `Request::GetQueueStatus`.
+    let transfers_group = adw::PreferencesGroup::builder()
+        .title("Activity")
+        .description("Files moving to and from Proton Drive.")
+        .visible(false)
+        .build();
 
     // Storage group: a progress bar + "X of Y used" label, plus the cache-budget
     // editor and a purge button. `budget_row`/`purge_button` are wired in
@@ -575,6 +605,7 @@ fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     inner.set_margin_end(12);
     inner.append(&account_group);
     inner.append(&mount_group);
+    inner.append(&transfers_group);
     inner.append(&storage_group);
     inner.append(&system_group);
     inner.append(&pins_group);
@@ -591,6 +622,7 @@ fn build_main_page() -> (gtk4::Widget, MainWidgets) {
         MainWidgets {
             account_row,
             mount_row,
+            transfers_group,
             cache_bar,
             cache_label,
             pins_group,
@@ -937,6 +969,100 @@ fn refresh(ui: &Rc<Ui>) {
     }
 
     refresh_status(ui);
+    refresh_transfers(ui);
+}
+
+/// Poll the daemon's in-flight transfers on a worker thread and repaint the
+/// Activity group. Independently inflight-guarded from [`refresh_status`] so the
+/// two cheap polls on the 2s tick don't gate each other. The group hides itself
+/// when nothing is moving, so an idle account shows no Activity section.
+fn refresh_transfers(ui: &Rc<Ui>) {
+    if ui.transfers_inflight.get() {
+        return;
+    }
+    ui.transfers_inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::GetQueueStatus);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.transfers_inflight.set(false);
+        match result {
+            Ok(Ok(Response::Transfers { items })) => repaint_transfers(&ui, &items),
+            // Daemon unreachable or odd reply: clear the section rather than
+            // leave stale progress bars frozen on screen.
+            _ => repaint_transfers(&ui, &[]),
+        }
+    });
+}
+
+/// Render the Activity group from `items`. Rebuilds the rows only when the set of
+/// transfers changes (count differs); on the common steady tick it updates each
+/// bar's fraction and the name/speed label in place, so progress animates without
+/// flicker. Hides the whole group when nothing is in flight.
+fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
+    if items.is_empty() {
+        if !ui.transfer_rows.borrow().is_empty() {
+            for tr in ui.transfer_rows.borrow_mut().drain(..) {
+                ui.transfers_group.remove(&tr.row);
+            }
+        }
+        ui.transfers_group.set_visible(false);
+        return;
+    }
+
+    ui.transfers_group.set_visible(true);
+
+    // Rebuild rows only when the count changes; otherwise reuse them in place.
+    if ui.transfer_rows.borrow().len() != items.len() {
+        for tr in ui.transfer_rows.borrow_mut().drain(..) {
+            ui.transfers_group.remove(&tr.row);
+        }
+        for _ in items {
+            let row_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            row_box.set_margin_top(8);
+            row_box.set_margin_bottom(8);
+            let label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+            label.add_css_class("dim-label");
+            let bar = gtk4::ProgressBar::new();
+            row_box.append(&label);
+            row_box.append(&bar);
+            let row = adw::PreferencesRow::builder()
+                .activatable(false)
+                .child(&row_box)
+                .build();
+            ui.transfers_group.add(&row);
+            ui.transfer_rows
+                .borrow_mut()
+                .push(TransferRow { row, label, bar });
+        }
+    }
+
+    for (item, tr) in items.iter().zip(ui.transfer_rows.borrow().iter()) {
+        let arrow = match item.direction {
+            TransferDirection::Download => "↓",
+            TransferDirection::Upload => "↑",
+        };
+        if item.bytes_total == 0 {
+            // Unknown size: pulse instead of a fraction, and omit the percentage.
+            tr.bar.pulse();
+            tr.label.set_text(&format!(
+                "{arrow} {} — {} ({}/s)",
+                item.name,
+                human_bytes(item.bytes_completed),
+                human_bytes(item.speed_bytes_sec),
+            ));
+        } else {
+            let fraction = (item.bytes_completed as f64 / item.bytes_total as f64).min(1.0);
+            tr.bar.set_fraction(fraction);
+            tr.label.set_text(&format!(
+                "{arrow} {} — {} of {} ({}/s)",
+                item.name,
+                human_bytes(item.bytes_completed),
+                human_bytes(item.bytes_total),
+                human_bytes(item.speed_bytes_sec),
+            ));
+        }
+    }
 }
 
 /// Fetch mount status + cache stats from the daemon on a worker thread and repaint

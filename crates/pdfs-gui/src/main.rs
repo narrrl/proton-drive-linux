@@ -18,7 +18,7 @@ use ksni::menu::StandardItem;
 use ksni::{MenuItem, Tray, TrayService};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{Request, Response, send};
+use pdfs_core::control::{Request, Response, TransferDirection, TransferItem, send};
 use pdfs_core::service;
 
 /// How often the tray re-polls the daemon to refresh its menu.
@@ -33,6 +33,42 @@ struct DriveState {
     mounted: bool,
     /// Mountpoint to act on (from the daemon when mounted, else the default).
     mountpoint: PathBuf,
+    /// One-line sync summary of in-flight transfers, empty when idle. Shown as a
+    /// disabled menu line under the status line.
+    sync: String,
+}
+
+/// Summarise a transfer snapshot into one menu line, or empty when idle. A single
+/// transfer names the file and its percentage; several collapse to counts so the
+/// menu stays one line regardless of queue depth.
+fn sync_line(items: &[TransferItem]) -> String {
+    match items {
+        [] => String::new(),
+        [t] => {
+            let arrow = match t.direction {
+                TransferDirection::Download => "↓",
+                TransferDirection::Upload => "↑",
+            };
+            if t.bytes_total == 0 {
+                format!("{arrow} {}…", t.name)
+            } else {
+                let pct = (t.bytes_completed * 100 / t.bytes_total.max(1)).min(100);
+                format!("{arrow} {} ({pct}%)", t.name)
+            }
+        }
+        _ => {
+            let down = items
+                .iter()
+                .filter(|t| t.direction == TransferDirection::Download)
+                .count();
+            let up = items.len() - down;
+            match (down, up) {
+                (d, 0) => format!("↓ {d} downloading"),
+                (0, u) => format!("↑ {u} uploading"),
+                (d, u) => format!("↓ {d} · ↑ {u}"),
+            }
+        }
+    }
 }
 
 struct DriveTray {
@@ -49,12 +85,18 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             line: format!("Mounted at {mountpoint} ({pinned} pinned)"),
             mounted: true,
             mountpoint: PathBuf::from(mountpoint),
+            // Same daemon is up, so a cheap follow-up poll gives the sync line.
+            sync: match send(socket, &Request::GetQueueStatus) {
+                Ok(Response::Transfers { items }) => sync_line(&items),
+                _ => String::new(),
+            },
         },
         // Socket answered but with something unexpected — treat as up but odd.
         Ok(_) => DriveState {
             line: "Mount: unexpected daemon response".into(),
             mounted: true,
             mountpoint: default_mountpoint.to_path_buf(),
+            sync: String::new(),
         },
         // No daemon: describe login state instead so the menu is still useful.
         Err(_) => {
@@ -67,6 +109,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 line,
                 mounted: false,
                 mountpoint: default_mountpoint.to_path_buf(),
+                sync: String::new(),
             }
         }
     }
@@ -116,6 +159,21 @@ impl Tray for DriveTray {
                 ..Default::default()
             }
             .into(),
+        ];
+
+        // Live sync status, shown only while something is transferring.
+        if !self.state.sync.is_empty() {
+            items.push(
+                StandardItem {
+                    label: self.state.sync.clone(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.extend([
             MenuItem::Separator,
             StandardItem {
                 label: "Open Manager".into(),
@@ -123,7 +181,7 @@ impl Tray for DriveTray {
                 ..Default::default()
             }
             .into(),
-        ];
+        ]);
 
         if self.state.mounted {
             items.push(

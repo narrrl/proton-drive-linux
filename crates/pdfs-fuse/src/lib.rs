@@ -63,8 +63,8 @@ use proton_drive_rs::{
 };
 
 mod transfers;
-use transfers::{CountingReader, CountingWriter, TransferRegistry};
 use tracing::{debug, error, info, warn};
+use transfers::{CountingReader, CountingWriter, TransferRegistry};
 
 /// Attribute/entry cache lifetime handed back to the kernel. Long because the
 /// Phase 2 event poller actively invalidates changed inodes; without a remote
@@ -776,8 +776,7 @@ impl Core {
             .transfers
             .begin(name, uid.to_string(), TransferDirection::Download, total);
         let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
-        self.rt
-            .block_on(photos.download_photo_to(uid, &mut out))?;
+        self.rt.block_on(photos.download_photo_to(uid, &mut out))?;
         Ok(out.into_inner())
     }
 
@@ -1134,7 +1133,11 @@ impl Core {
             if !e.node.is_file() {
                 return Err("not a regular file".into());
             }
-            (e.node.name.clone(), e.node.modification_time, node_size(&e.node))
+            (
+                e.node.name.clone(),
+                e.node.modification_time,
+                node_size(&e.node),
+            )
         };
         if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
             return Ok(p);
@@ -2393,9 +2396,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 capture_time,
                 ..Default::default()
             };
-            let guard =
-                core.transfers
-                    .begin(name.clone(), "", TransferDirection::Upload, bytes.len() as u64);
+            let guard = core.transfers.begin(
+                name.clone(),
+                "",
+                TransferDirection::Upload,
+                bytes.len() as u64,
+            );
             let reader = CountingReader::new(std::io::Cursor::new(&bytes), &guard);
             match core.rt.block_on(photos.upload_photo_from(
                 &name,
