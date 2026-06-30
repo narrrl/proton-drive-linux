@@ -89,6 +89,34 @@ pub enum Request {
     /// persist it to config so the next mount keeps it. Replies with
     /// [`Response::Ok`].
     SetCacheBudget { bytes: u64 },
+    /// Snapshot the daemon's in-flight transfers (active uploads/downloads).
+    /// Replies with [`Response::Transfers`]. Cheap to poll: the daemon keeps the
+    /// registry in memory, so a front-end can render a live progress widget.
+    GetQueueStatus,
+}
+
+/// Which way an active transfer is moving, in a [`TransferItem`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Download,
+    Upload,
+}
+
+/// One in-flight transfer in a [`Response::Transfers`] snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TransferItem {
+    /// Node uid in `volume~link` form (empty for an upload whose uid isn't known
+    /// until the draft is sealed).
+    pub uid: String,
+    /// File name being transferred.
+    pub name: String,
+    pub direction: TransferDirection,
+    /// Bytes moved so far.
+    pub bytes_completed: u64,
+    /// Total bytes expected, or `0` when unknown (indeterminate progress).
+    pub bytes_total: u64,
+    /// Average throughput since the transfer began, bytes per second.
+    pub speed_bytes_sec: u64,
 }
 
 /// One entry in a [`Request::ListDir`] listing.
@@ -178,6 +206,8 @@ pub enum Response {
     FilePath { path: String },
     /// Full-text search results (reply to [`Request::Search`]).
     SearchResults { hits: Vec<SearchHit> },
+    /// A snapshot of in-flight transfers (reply to [`Request::GetQueueStatus`]).
+    Transfers { items: Vec<TransferItem> },
     /// The request failed.
     Error { message: String },
 }

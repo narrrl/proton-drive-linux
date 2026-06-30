@@ -52,13 +52,18 @@ use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse, SearchHit,
+    TransferDirection,
 };
 use pdfs_core::db::{Db, StoredNode};
+use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
     DriveEvent, DriveEventScopeId, Node, NodeKind, PhotosTimelineItem, ProtonDriveClient,
     ProtonPhotosClient, ThumbnailType,
 };
+
+mod transfers;
+use transfers::{CountingReader, CountingWriter, TransferRegistry};
 use tracing::{debug, error, info, warn};
 
 /// Attribute/entry cache lifetime handed back to the kernel. Long because the
@@ -293,6 +298,9 @@ struct Core {
     /// requests slice memory instead of re-fetching the whole timeline per page.
     /// `None` until first fetched; refreshed once older than [`TIMELINE_TTL`].
     timeline: Arc<Mutex<Option<TimelineCache>>>,
+    /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
+    /// across the FUSE session and the control-socket task.
+    transfers: Arc<TransferRegistry>,
 }
 
 /// The whole photos timeline plus when it was fetched, for TTL freshness.
@@ -681,6 +689,17 @@ impl Core {
             error!(%uid, error = %e, "reopen scratch file failed");
             Errno::EIO
         })?;
+        let name = {
+            let st = self.state.lock().unwrap();
+            st.entries
+                .get(&ino)
+                .map(|e| e.node.name.clone())
+                .unwrap_or_default()
+        };
+        let guard = self
+            .transfers
+            .begin(name, uid.to_string(), TransferDirection::Upload, len);
+        let reader = CountingReader::new(reader, &guard);
         self.rt
             .block_on(self.client.upload_new_revision_from(
                 &uid,
@@ -693,6 +712,7 @@ impl Core {
                 error!(%uid, error = %e, "upload new revision failed");
                 Errno::EIO
             })?;
+        drop(guard);
         let now = now_secs();
         {
             let mut st = self.state.lock().unwrap();
@@ -717,6 +737,48 @@ impl Core {
             self.cache.evict(&uid);
         }
         Ok(())
+    }
+
+    /// Download a whole file's plaintext, registering the transfer so
+    /// `GetQueueStatus` can report its progress. `total` is the expected size
+    /// (`0` if unknown). Streams through [`download_file_to`] so each block ticks
+    /// the progress counter.
+    ///
+    /// [`download_file_to`]: ProtonDriveClient::download_file_to
+    fn download_file_tracked(
+        &self,
+        uid: &NodeUid,
+        name: &str,
+        total: u64,
+    ) -> std::result::Result<Vec<u8>, ProtonError> {
+        let guard = self
+            .transfers
+            .begin(name, uid.to_string(), TransferDirection::Download, total);
+        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
+        self.rt
+            .block_on(self.client.download_file_to(uid, &mut out))?;
+        Ok(out.into_inner())
+    }
+
+    /// Like [`download_file_tracked`] for a photo, streaming through the photos
+    /// client's [`download_photo_to`].
+    ///
+    /// [`download_file_tracked`]: Core::download_file_tracked
+    /// [`download_photo_to`]: ProtonPhotosClient::download_photo_to
+    fn download_photo_tracked(
+        &self,
+        photos: &ProtonPhotosClient,
+        uid: &NodeUid,
+        name: &str,
+        total: u64,
+    ) -> std::result::Result<Vec<u8>, ProtonError> {
+        let guard = self
+            .transfers
+            .begin(name, uid.to_string(), TransferDirection::Download, total);
+        let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
+        self.rt
+            .block_on(photos.download_photo_to(uid, &mut out))?;
+        Ok(out.into_inner())
     }
 
     /// Pin the node at mountpoint-relative `rel`. A file downloads its full
@@ -746,8 +808,7 @@ impl Core {
             return Ok(format!("{name} ({n} files)"));
         }
         let bytes = self
-            .rt
-            .block_on(self.client.download_file(&uid))
+            .download_file_tracked(&uid, &name, size)
             .map_err(|e| format!("download: {e}"))?;
         self.cache
             .store(&uid, mtime, size, &bytes)
@@ -763,7 +824,7 @@ impl Core {
     /// Walks the tree depth-first, enumerating each folder so a cold subtree is
     /// fully discovered; the lock is dropped before each network download.
     fn pin_subtree(&self, ino: u64) -> Result<usize, String> {
-        let mut files: Vec<(NodeUid, i64, u64)> = Vec::new();
+        let mut files: Vec<(NodeUid, String, i64, u64)> = Vec::new();
         let mut stack = vec![ino];
         while let Some(dir) = stack.pop() {
             self.ensure_children(dir)
@@ -777,6 +838,7 @@ impl Core {
                         } else {
                             files.push((
                                 e.uid.clone(),
+                                e.node.name.clone(),
                                 e.node.modification_time,
                                 node_size(&e.node),
                             ));
@@ -786,12 +848,12 @@ impl Core {
             }
         }
         let mut count = 0;
-        for (uid, mtime, size) in files {
+        for (uid, name, mtime, size) in files {
             if self.cache.is_cached(&uid, mtime, size) {
                 count += 1;
                 continue;
             }
-            match self.rt.block_on(self.client.download_file(&uid)) {
+            match self.download_file_tracked(&uid, &name, size) {
                 Ok(bytes) => {
                     if self.cache.store(&uid, mtime, size, &bytes).is_ok() {
                         count += 1;
@@ -1050,8 +1112,7 @@ impl Core {
             return Ok(p);
         }
         let bytes = self
-            .rt
-            .block_on(photos.download_photo(uid))
+            .download_photo_tracked(&photos, uid, &node.name, size)
             .map_err(|e| format!("download photo: {e}"))?;
         self.cache
             .store(uid, mtime, size, &bytes)
@@ -1067,20 +1128,19 @@ impl Core {
         let (ino, uid) = self
             .resolve_path(rel)
             .map_err(|e| format!("resolve path: {e:?}"))?;
-        let (mtime, size) = {
+        let (name, mtime, size) = {
             let st = self.state.lock().unwrap();
             let e = st.entries.get(&ino).ok_or("node vanished")?;
             if !e.node.is_file() {
                 return Err("not a regular file".into());
             }
-            (e.node.modification_time, node_size(&e.node))
+            (e.node.name.clone(), e.node.modification_time, node_size(&e.node))
         };
         if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
             return Ok(p);
         }
         let bytes = self
-            .rt
-            .block_on(self.client.download_file(&uid))
+            .download_file_tracked(&uid, &name, size)
             .map_err(|e| format!("download: {e}"))?;
         self.cache
             .store(&uid, mtime, size, &bytes)
@@ -1206,13 +1266,24 @@ impl Core {
             .map_err(|e| format!("resolve path: {e:?}"))?;
         self.ensure_children(pino)
             .map_err(|e| format!("enumerate: {e:?}"))?;
+        let guard = self
+            .transfers
+            .begin(name, "", TransferDirection::Upload, bytes.len() as u64);
+        let reader = CountingReader::new(std::io::Cursor::new(bytes), &guard);
         let new_uid = self
             .rt
-            .block_on(
-                self.client
-                    .upload_file(&parent_uid, name, media_type_for(name), bytes),
-            )
+            .block_on(self.client.upload_file_from(
+                &parent_uid,
+                name,
+                media_type_for(name),
+                reader,
+                bytes.len() as i64,
+                Vec::new(),
+                None,
+                false,
+            ))
             .map_err(|e| format!("upload: {e}"))?;
+        drop(guard);
         let node = self
             .fetch_node(&new_uid)
             .map_err(|e| format!("fetch node: {e:?}"))?;
@@ -2322,10 +2393,19 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 capture_time,
                 ..Default::default()
             };
-            match core
-                .rt
-                .block_on(photos.upload_photo(&name, &media_type, &bytes, metadata))
-            {
+            let guard =
+                core.transfers
+                    .begin(name.clone(), "", TransferDirection::Upload, bytes.len() as u64);
+            let reader = CountingReader::new(std::io::Cursor::new(&bytes), &guard);
+            match core.rt.block_on(photos.upload_photo_from(
+                &name,
+                &media_type,
+                reader,
+                bytes.len() as i64,
+                Vec::new(),
+                metadata,
+                false,
+            )) {
                 Ok(uid) => {
                     *core.timeline.lock().unwrap() = None;
                     CtlResponse::Ok {
@@ -2413,6 +2493,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 ),
             }
         }
+        Ok(CtlRequest::GetQueueStatus) => CtlResponse::Transfers {
+            items: core.transfers.snapshot(),
+        },
         Ok(CtlRequest::SetCacheBudget { bytes }) => {
             core.cache.set_budget(bytes);
             // Persist so the next mount keeps the new cap. Best-effort: a config
@@ -2539,6 +2622,7 @@ pub fn mount(
         cache: Arc::new(cache),
         db,
         timeline: Arc::new(Mutex::new(None)),
+        transfers: TransferRegistry::new(),
     };
 
     let mut config = Config::default();

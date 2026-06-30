@@ -119,6 +119,8 @@ enum Command {
         /// Destination folder path, inside the mountpoint or relative to it.
         parent: PathBuf,
     },
+    /// Show the daemon's in-flight transfers (active uploads/downloads).
+    Transfers,
 }
 
 fn main() -> Result<()> {
@@ -151,6 +153,7 @@ fn main() -> Result<()> {
         Command::Rm { path } => cmd_rm(path),
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
         Command::Upload { file, parent } => cmd_upload(file, parent),
+        Command::Transfers => cmd_transfers(),
     }
 }
 
@@ -360,6 +363,34 @@ fn cmd_unpin(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_transfers() -> Result<()> {
+    use pdfs_core::control::TransferDirection;
+    match control_request(CtlRequest::GetQueueStatus)? {
+        CtlResponse::Transfers { items } if items.is_empty() => println!("No active transfers."),
+        CtlResponse::Transfers { items } => {
+            for t in items {
+                let arrow = match t.direction {
+                    TransferDirection::Download => "↓",
+                    TransferDirection::Upload => "↑",
+                };
+                let pct = if t.bytes_total > 0 {
+                    format!("{:.0}%", 100.0 * t.bytes_completed as f64 / t.bytes_total as f64)
+                } else {
+                    "—".to_string()
+                };
+                let speed = t.speed_bytes_sec as f64 / 1_048_576.0;
+                println!(
+                    "{arrow} {:>4}  {:>8} / {:>8}  {speed:>6.2} MiB/s  {}",
+                    pct, t.bytes_completed, t.bytes_total, t.name
+                );
+            }
+        }
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
     }
