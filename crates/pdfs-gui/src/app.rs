@@ -93,9 +93,20 @@ fn main() -> glib::ExitCode {
         .init();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_proton_theme());
+    app.connect_startup(|_| {
+        load_proton_theme();
+        spawn_tray();
+    });
     app.connect_activate(build_window);
     app.run()
+}
+
+/// Spawn the tray icon process in the background.
+fn spawn_tray() {
+    match Command::new("pdfs-tray").spawn() {
+        Ok(_) => tracing::info!("spawned `pdfs-tray`"),
+        Err(e) => tracing::error!("failed to spawn `pdfs-tray`: {e}"),
+    }
 }
 
 /// Install a CSS provider that overrides libadwaita's accent colour with Proton

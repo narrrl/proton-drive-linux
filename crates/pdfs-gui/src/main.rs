@@ -180,6 +180,17 @@ fn main() -> Result<()> {
         .init();
 
     let dirs = AppDirs::new().context("resolve app dirs")?;
+
+    // Ensure only one instance of the tray runs.
+    let tray_sock = dirs.tray_socket();
+    if std::os::unix::net::UnixStream::connect(&tray_sock).is_ok() {
+        tracing::info!("Another instance of pdfs-tray is already running; exiting.");
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&tray_sock);
+    let _lock_socket = std::os::unix::net::UnixListener::bind(&tray_sock)
+        .context("failed to bind tray single-instance socket")?;
+
     let socket = dirs.control_socket();
     let default_mountpoint = dirs.default_mountpoint();
 

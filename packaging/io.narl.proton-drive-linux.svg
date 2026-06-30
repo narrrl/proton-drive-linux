@@ -10,5 +10,5 @@
   <!-- cloud -->
   <path fill="#ffffff" d="M44 84c-11 0-20-9-20-20 0-10 7-18 17-20 3-11 13-19 25-19 13 0 24 10 26 23 9 1 16 9 16 18 0 10-8 18-18 18z"/>
   <!-- down arrow (on-demand pull) -->
-  <path fill="#6d4aff" d="M64 50v22m0 0l-9-9m9 9l9-9" stroke="#6d4aff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M64 50v22m0 0l-9-9m9 9l9-9" stroke="#6d4aff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 </svg>

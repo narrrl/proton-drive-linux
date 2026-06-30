@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Drive (Tray)
+GenericName=Cloud Drive Tray
+Comment=Proton Drive system tray icon
+Exec=pdfs-tray
+Icon=io.narl.proton-drive-linux
+Terminal=false
+Categories=Network;FileTransfer;GTK;
+Keywords=proton;drive;cloud;sync;storage;
+NoDisplay=true

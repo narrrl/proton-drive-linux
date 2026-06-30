@@ -12,7 +12,7 @@ use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{APP_VERSION, KEYRING_SERVICE, USER_AGENT};
+use crate::config::{AppDirs, APP_VERSION, KEYRING_SERVICE, USER_AGENT};
 use crate::error::{Error, Result};
 
 /// Fixed keyring account name for the single stored session blob.
@@ -53,7 +53,14 @@ impl StoredSession {
 }
 
 fn client_config() -> ProtonClientConfiguration {
-    ProtonClientConfiguration::new(APP_VERSION).with_user_agent(USER_AGENT)
+    let (app_version, user_agent) = match AppDirs::new() {
+        Ok(dirs) => {
+            let config = dirs.load_config();
+            (config.app_version, config.user_agent)
+        }
+        Err(_) => (APP_VERSION.to_string(), USER_AGENT.to_string()),
+    };
+    ProtonClientConfiguration::new(app_version).with_user_agent(user_agent)
 }
 
 fn keyring_entry() -> Result<Entry> {

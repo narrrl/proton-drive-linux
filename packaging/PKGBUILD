@@ -20,7 +20,7 @@ provides=('pdfs')
 # Files-on-demand mount + keyring need these at runtime.
 optdepends=('gnome-keyring: credential storage via Secret Service'
             'xdg-utils: "Open folder" action from the tray')
-options=('!lto')
+options=('!lto' '!debug')
 
 # Built in place from the checkout; nothing to fetch or checksum.
 source=()
@@ -56,6 +56,8 @@ package() {
 
   install -Dm644 "packaging/io.narl.proton-drive-linux.desktop" \
     "$pkgdir/usr/share/applications/io.narl.proton-drive-linux.desktop"
+  install -Dm644 "packaging/io.narl.proton-drive-linux-tray.desktop" \
+    "$pkgdir/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop"
   install -Dm644 "packaging/io.narl.proton-drive-linux.svg" \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg"
 
