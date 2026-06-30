@@ -12,7 +12,7 @@ use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppDirs, APP_VERSION, KEYRING_SERVICE, USER_AGENT};
+use crate::config::{APP_VERSION, AppDirs, KEYRING_SERVICE, USER_AGENT};
 use crate::error::{Error, Result};
 
 /// Fixed keyring account name for the single stored session blob.

@@ -42,7 +42,9 @@ struct DriveTray {
 /// menu can still say "Logged in …" / "Not logged in" when no mount is running.
 fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
     match send(socket, &Request::Status) {
-        Ok(Response::Status { mountpoint, pinned, .. }) => DriveState {
+        Ok(Response::Status {
+            mountpoint, pinned, ..
+        }) => DriveState {
             line: format!("Mounted at {mountpoint} ({pinned} pinned)"),
             mounted: true,
             mountpoint: PathBuf::from(mountpoint),
@@ -174,8 +176,7 @@ impl Tray for DriveTray {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

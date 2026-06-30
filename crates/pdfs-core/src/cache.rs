@@ -81,7 +81,12 @@ impl ContentCache {
         if let Some(parent) = pins_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self { content_dir, thumb_dir, pins_path, max_bytes })
+        Ok(Self {
+            content_dir,
+            thumb_dir,
+            pins_path,
+            max_bytes,
+        })
     }
 
     /// Filesystem-safe, fixed-length cache key for a uid display string: the
@@ -192,7 +197,8 @@ impl ContentCache {
     }
 
     fn thumb_meta(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
-        self.thumb_dir.join(format!("{}.t{ttype}.meta", Self::key(uid)))
+        self.thumb_dir
+            .join(format!("{}.t{ttype}.meta", Self::key(uid)))
     }
 
     /// Serve a cached thumbnail of `ttype` for `uid`, or `None` on miss/stale.
@@ -267,8 +273,12 @@ impl ContentCache {
             return;
         }
         // Pinned blobs (by cache key) are exempt from eviction.
-        let pinned: HashSet<String> =
-            self.load_pins().pins.keys().map(|uid| Self::key_str(uid)).collect();
+        let pinned: HashSet<String> = self
+            .load_pins()
+            .pins
+            .keys()
+            .map(|uid| Self::key_str(uid))
+            .collect();
 
         // Scan blobs (the `<key>` files; skip `.meta`/`.tmp` siblings), record
         // size + last-access (mtime) for each.
@@ -336,7 +346,10 @@ impl ContentCache {
         let key = uid.to_string();
         file.pins.insert(
             key.clone(),
-            Pin { uid: key, path: path.display().to_string() },
+            Pin {
+                uid: key,
+                path: path.display().to_string(),
+            },
         );
         self.save_pins(&file)
     }

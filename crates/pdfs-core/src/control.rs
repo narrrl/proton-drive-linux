@@ -99,7 +99,10 @@ pub enum Response {
     Entries { entries: Vec<DirEntry> },
     /// A page of the photos timeline. `available` is false when the account
     /// has no photos volume.
-    Photos { available: bool, items: Vec<PhotoItem> },
+    Photos {
+        available: bool,
+        items: Vec<PhotoItem>,
+    },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
     FilePath { path: String },
     /// The request failed.

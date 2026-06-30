@@ -11,7 +11,11 @@ use pdfs_core::config::AppDirs;
 use pdfs_core::control::{Request as CtlRequest, Response as CtlResponse};
 
 #[derive(Parser)]
-#[command(name = "pdfs", version, about = "Proton Drive for Linux (Files On-Demand)")]
+#[command(
+    name = "pdfs",
+    version,
+    about = "Proton Drive for Linux (Files On-Demand)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -111,8 +115,7 @@ fn cmd_login(username: Option<String>) -> Result<()> {
 
     // The 2FA prompt fires lazily — only if the account actually requires it.
     let get_totp = || -> pdfs_core::Result<String> {
-        prompt_line("2FA code")
-            .map_err(|e| pdfs_core::Error::Other(format!("read 2FA code: {e}")))
+        prompt_line("2FA code").map_err(|e| pdfs_core::Error::Other(format!("read 2FA code: {e}")))
     };
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -143,7 +146,9 @@ fn cmd_status() -> Result<()> {
     }
     // If a mount daemon is running, report live status from its control socket.
     match control_request(CtlRequest::Status) {
-        Ok(CtlResponse::Status { mountpoint, pinned, .. }) => {
+        Ok(CtlResponse::Status {
+            mountpoint, pinned, ..
+        }) => {
             println!("Mounted at {mountpoint} ({pinned} pinned)");
         }
         Ok(other) => println!("Mount: unexpected response {other:?}"),
@@ -209,8 +214,14 @@ fn cmd_mount(mountpoint: Option<PathBuf>) -> Result<()> {
     });
 
     let handle = rt.handle().clone();
-    let result =
-        pdfs_fuse::mount(client, handle, &mountpoint, cache, &control_socket, username);
+    let result = pdfs_fuse::mount(
+        client,
+        handle,
+        &mountpoint,
+        cache,
+        &control_socket,
+        username,
+    );
 
     // Clean unmount: flush whatever tokens the store holds now so the keyring
     // always ends a session with the live refresh token, not a stale one. Runs
@@ -224,7 +235,9 @@ fn cmd_mount(mountpoint: Option<PathBuf>) -> Result<()> {
 }
 
 fn cmd_pin(path: PathBuf) -> Result<()> {
-    match control_request(CtlRequest::Pin { path: path_arg(&path)? })? {
+    match control_request(CtlRequest::Pin {
+        path: path_arg(&path)?,
+    })? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
@@ -233,7 +246,9 @@ fn cmd_pin(path: PathBuf) -> Result<()> {
 }
 
 fn cmd_unpin(path: PathBuf) -> Result<()> {
-    match control_request(CtlRequest::Unpin { path: path_arg(&path)? })? {
+    match control_request(CtlRequest::Unpin {
+        path: path_arg(&path)?,
+    })? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
@@ -277,7 +292,9 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
 
 fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
     match control_request(CtlRequest::PhotosTimeline { offset, limit })? {
-        CtlResponse::Photos { available: false, .. } => {
+        CtlResponse::Photos {
+            available: false, ..
+        } => {
             println!("This account has no photos volume.")
         }
         CtlResponse::Photos { items, .. } if items.is_empty() => println!("No photos."),
@@ -307,8 +324,7 @@ fn cmd_open_photo(uid: String) -> Result<()> {
 /// relative paths are passed through and resolved against the mount root.
 fn path_arg(path: &Path) -> Result<String> {
     let p = if path.is_absolute() {
-        std::fs::canonicalize(path)
-            .with_context(|| format!("resolve {}", path.display()))?
+        std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?
     } else {
         path.to_path_buf()
     };

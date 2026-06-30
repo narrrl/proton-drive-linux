@@ -87,8 +87,7 @@ struct Ui {
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -152,7 +151,12 @@ fn build_window(app: &adw::Application) {
     // Login has no title, so it never appears in the switcher; the three signed-in
     // pages are titled + iconed so the bottom switcher lists them.
     stack.add_named(&login_page, Some("login"));
-    stack.add_titled_with_icon(&main_page, Some("main"), "Account", "avatar-default-symbolic");
+    stack.add_titled_with_icon(
+        &main_page,
+        Some("main"),
+        "Account",
+        "avatar-default-symbolic",
+    );
     stack.add_titled_with_icon(&browser_page, Some("browser"), "Files", "folder-symbolic");
     stack.add_titled_with_icon(
         &gallery_page,
@@ -364,9 +368,7 @@ fn build_main_page() -> (
     storage_box.set_margin_top(6);
     storage_box.set_margin_bottom(6);
     let cache_bar = gtk4::ProgressBar::new();
-    let cache_label = gtk4::Label::builder()
-        .halign(gtk4::Align::Start)
-        .build();
+    let cache_label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
     cache_label.add_css_class("dim-label");
     storage_box.append(&cache_bar);
     storage_box.append(&cache_label);
@@ -388,7 +390,10 @@ fn build_main_page() -> (
     inner.append(&storage_group);
     inner.append(&pins_group);
 
-    let clamp = adw::Clamp::builder().maximum_size(560).child(&inner).build();
+    let clamp = adw::Clamp::builder()
+        .maximum_size(560)
+        .child(&inner)
+        .build();
     let scroll = gtk4::ScrolledWindow::builder().child(&clamp).build();
 
     (
@@ -424,7 +429,10 @@ fn wire_login(ui: &Rc<Ui>) {
 
         let ui = ui.clone();
         glib::spawn_future_local(async move {
-            let result = rx.recv().await.unwrap_or_else(|_| Err("login cancelled".into()));
+            let result = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("login cancelled".into()));
             ui.login_button.set_sensitive(true);
             match result {
                 Ok(()) => {
@@ -635,7 +643,10 @@ fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin]) {
 /// channel that yields the [`Response`] once. Browser/gallery requests reach the
 /// network through the daemon, so they must not block the GTK main loop the way
 /// the cheap [`Request::Status`] poll in [`refresh`] can.
-fn spawn_request(socket: PathBuf, req: Request) -> async_channel::Receiver<Result<Response, String>> {
+fn spawn_request(
+    socket: PathBuf,
+    req: Request,
+) -> async_channel::Receiver<Result<Response, String>> {
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let result = send(&socket, &req).map_err(|e| e.to_string());
@@ -714,7 +725,10 @@ fn build_browser_page() -> (
         .max_columns(10)
         .build();
     grid.add_css_class("file-grid");
-    let grid_scroll = gtk4::ScrolledWindow::builder().vexpand(true).child(&grid).build();
+    let grid_scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&grid)
+        .build();
 
     // Column list.
     let column_view = gtk4::ColumnView::builder()
@@ -753,7 +767,10 @@ fn build_browser_page() -> (
     inner.append(&status);
     inner.append(&view_stack);
 
-    (inner.upcast(), (model, back, crumb, status, grid, column_view))
+    (
+        inner.upcast(),
+        (model, back, crumb, status, grid, column_view),
+    )
 }
 
 /// Install the entry factories, columns, activation handlers and the back
@@ -986,7 +1003,9 @@ fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
         glib::spawn_future_local(async move {
             match rx.recv().await {
                 Ok(Ok(Response::FilePath { path })) => open_path(&path),
-                Ok(Ok(Response::Error { message })) => tracing::error!("open file failed: {message}"),
+                Ok(Ok(Response::Error { message })) => {
+                    tracing::error!("open file failed: {message}")
+                }
                 _ => tracing::error!("open file request failed"),
             }
         });
@@ -1063,7 +1082,10 @@ fn icon_base_for(entry: &DirEntry) -> &'static str {
 /// Format an epoch-seconds modification time as a short local date.
 fn format_modified(secs: i64) -> String {
     match glib::DateTime::from_unix_local(secs) {
-        Ok(dt) => dt.format("%-d %b %Y").map(|s| s.to_string()).unwrap_or_default(),
+        Ok(dt) => dt
+            .format("%-d %b %Y")
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
         Err(_) => String::new(),
     }
 }
@@ -1086,9 +1108,7 @@ fn load_browser(ui: &Rc<Ui>) {
             Ok(Ok(Response::Entries { entries })) => repaint_browser(&ui, &entries),
             Ok(Ok(Response::Error { message })) => browser_message(&ui, &message),
             Ok(Ok(_)) => browser_message(&ui, "Unexpected reply from daemon."),
-            Ok(Err(_)) | Err(_) => {
-                browser_message(&ui, "Mount Proton Drive to browse your files.")
-            }
+            Ok(Err(_)) | Err(_) => browser_message(&ui, "Mount Proton Drive to browse your files."),
         }
     });
 }
@@ -1207,7 +1227,9 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
         glib::spawn_future_local(async move {
             match rx.recv().await {
                 Ok(Ok(Response::FilePath { path })) => open_path(&path),
-                Ok(Ok(Response::Error { message })) => tracing::error!("open photo failed: {message}"),
+                Ok(Ok(Response::Error { message })) => {
+                    tracing::error!("open photo failed: {message}")
+                }
                 _ => tracing::error!("open photo request failed"),
             }
         });
@@ -1258,9 +1280,7 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
             }
             Ok(Ok(Response::Error { message })) => gallery_message(&ui, &message),
             Ok(Ok(_)) => gallery_message(&ui, "Unexpected reply from daemon."),
-            Ok(Err(_)) | Err(_) => {
-                gallery_message(&ui, "Mount Proton Drive to see your photos.")
-            }
+            Ok(Err(_)) | Err(_) => gallery_message(&ui, "Mount Proton Drive to see your photos."),
         }
     });
 }

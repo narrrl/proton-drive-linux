@@ -32,13 +32,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fuser::{
-    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
-    Session, TimeOrNow, WriteFlags,
-};
 use fuser::ReplyXattr;
+use fuser::{
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
+};
 use pdfs_core::cache::ContentCache;
 use pdfs_core::control::{DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse};
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
@@ -120,8 +120,14 @@ impl State {
         let ino = self.next_ino;
         self.next_ino += 1;
         self.by_uid.insert(node.uid.clone(), ino);
-        self.entries
-            .insert(ino, Entry { uid: node.uid.clone(), parent, node });
+        self.entries.insert(
+            ino,
+            Entry {
+                uid: node.uid.clone(),
+                parent,
+                node,
+            },
+        );
         ino
     }
 
@@ -252,14 +258,16 @@ impl Core {
         let mut ino = ROOT_INO;
         let mut uid = {
             let st = self.state.lock().unwrap();
-            st.entries.get(&ROOT_INO).map(|e| e.uid.clone()).ok_or(Errno::ENOENT)?
+            st.entries
+                .get(&ROOT_INO)
+                .map(|e| e.uid.clone())
+                .ok_or(Errno::ENOENT)?
         };
         for comp in rel.components() {
             match comp {
                 Component::RootDir | Component::CurDir => continue,
                 Component::Normal(name) => {
-                    let (child_ino, child_uid) =
-                        self.lookup_child(ino, &name.to_string_lossy())?;
+                    let (child_ino, child_uid) = self.lookup_child(ino, &name.to_string_lossy())?;
                     ino = child_ino;
                     uid = child_uid;
                 }
@@ -320,14 +328,20 @@ impl Core {
     /// into the content cache and record it in the pin registry. Returns the
     /// resolved node name on success.
     fn pin(&self, rel: &Path) -> Result<String, String> {
-        let (ino, uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        let (ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
         let (name, mtime, size) = {
             let st = self.state.lock().unwrap();
             let e = st.entries.get(&ino).ok_or("node vanished")?;
             if !e.node.is_file() {
                 return Err("not a regular file".into());
             }
-            (e.node.name.clone(), e.node.modification_time, node_size(&e.node))
+            (
+                e.node.name.clone(),
+                e.node.modification_time,
+                node_size(&e.node),
+            )
         };
         let bytes = self
             .rt
@@ -336,7 +350,9 @@ impl Core {
         self.cache
             .store(&uid, mtime, size, &bytes)
             .map_err(|e| format!("cache store: {e}"))?;
-        self.cache.add_pin(&uid, rel).map_err(|e| format!("pin: {e}"))?;
+        self.cache
+            .add_pin(&uid, rel)
+            .map_err(|e| format!("pin: {e}"))?;
         Ok(name)
     }
 
@@ -363,19 +379,28 @@ impl Core {
                 Errno::EIO
             })?;
         if let Some(bytes) = &bytes {
-            let _ = self.cache.store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
+            let _ = self
+                .cache
+                .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
         }
         Ok(bytes)
     }
 
     /// Unpin the file at `rel`, evicting its cached content.
     fn unpin(&self, rel: &Path) -> Result<String, String> {
-        let (ino, uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        let (ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
         let name = {
             let st = self.state.lock().unwrap();
-            st.entries.get(&ino).map(|e| e.node.name.clone()).unwrap_or_default()
+            st.entries
+                .get(&ino)
+                .map(|e| e.node.name.clone())
+                .unwrap_or_default()
         };
-        self.cache.remove_pin(&uid).map_err(|e| format!("unpin: {e}"))?;
+        self.cache
+            .remove_pin(&uid)
+            .map_err(|e| format!("unpin: {e}"))?;
         Ok(name)
     }
 
@@ -391,8 +416,11 @@ impl Core {
     /// the same lazy remote enumeration `readdir` uses, projected into
     /// serializable [`DirEntry`]s (with per-file pin state).
     fn list_dir(&self, rel: &Path) -> Result<Vec<DirEntry>, String> {
-        let (ino, _uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
-        self.ensure_children(ino).map_err(|e| format!("enumerate: {e:?}"))?;
+        let (ino, _uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        self.ensure_children(ino)
+            .map_err(|e| format!("enumerate: {e:?}"))?;
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
         let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
@@ -480,16 +508,22 @@ impl Core {
         // Batch-fetch only the thumbnails not already cached fresh.
         let want: Vec<NodeUid> = page
             .iter()
-            .filter(|it| self.cache.cached_thumbnail_path(&it.uid, ttype, it.capture_time).is_none())
+            .filter(|it| {
+                self.cache
+                    .cached_thumbnail_path(&it.uid, ttype, it.capture_time)
+                    .is_none()
+            })
             .map(|it| it.uid.clone())
             .collect();
         if !want.is_empty() {
-            let cap: HashMap<NodeUid, i64> =
-                page.iter().map(|it| (it.uid.clone(), it.capture_time)).collect();
-            match self
-                .rt
-                .block_on(self.photos().enumerate_thumbnails(&want, ThumbnailType::Thumbnail))
-            {
+            let cap: HashMap<NodeUid, i64> = page
+                .iter()
+                .map(|it| (it.uid.clone(), it.capture_time))
+                .collect();
+            match self.rt.block_on(
+                self.photos()
+                    .enumerate_thumbnails(&want, ThumbnailType::Thumbnail),
+            ) {
                 Ok(thumbs) => {
                     for ft in thumbs {
                         if let (Ok(bytes), Some(&tag)) = (ft.result, cap.get(&ft.file_uid)) {
@@ -546,7 +580,9 @@ impl Core {
     /// when a fresh blob already exists). Lets a front-end open the file with
     /// the user's default application without pinning it.
     fn open_file(&self, rel: &Path) -> Result<PathBuf, String> {
-        let (ino, uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        let (ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
         let (mtime, size) = {
             let st = self.state.lock().unwrap();
             let e = st.entries.get(&ino).ok_or("node vanished")?;
@@ -593,7 +629,11 @@ impl ProtonFs {
             st.by_uid.insert(root.uid.clone(), ROOT_INO);
             st.entries.insert(
                 ROOT_INO,
-                Entry { uid: root.uid.clone(), parent: ROOT_INO, node: root },
+                Entry {
+                    uid: root.uid.clone(),
+                    parent: ROOT_INO,
+                    node: root,
+                },
             );
         }
         // SAFETY: geteuid/getegid are infallible and have no preconditions.
@@ -682,9 +722,11 @@ fn media_type_for(name: &str) -> &'static str {
 fn node_size(node: &Node) -> u64 {
     match &node.kind {
         NodeKind::Folder => 0,
-        NodeKind::File { claimed_size, total_size_on_storage, .. } => {
-            claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64
-        }
+        NodeKind::File {
+            claimed_size,
+            total_size_on_storage,
+            ..
+        } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
     }
 }
 
@@ -804,7 +846,13 @@ impl Filesystem for ProtonFs {
         st.next_fh += 1;
         st.handles.insert(
             fh,
-            WriteHandle { ino: ino.0, uid, buf: Vec::new(), seeded: false, dirty: false },
+            WriteHandle {
+                ino: ino.0,
+                uid,
+                buf: Vec::new(),
+                seeded: false,
+                dirty: false,
+            },
         );
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -925,10 +973,22 @@ impl Filesystem for ProtonFs {
         st.next_fh += 1;
         st.handles.insert(
             fh,
-            WriteHandle { ino, uid: new_uid, buf: Vec::new(), seeded: true, dirty: false },
+            WriteHandle {
+                ino,
+                uid: new_uid,
+                buf: Vec::new(),
+                seeded: true,
+                dirty: false,
+            },
         );
         let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
-        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+        reply.created(
+            &TTL,
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::empty(),
+        );
     }
 
     fn write(
@@ -1001,7 +1061,14 @@ impl Filesystem for ProtonFs {
             st.set_size(ino.0, len);
             len
         };
-        debug!(ino = ino.0, fh, offset, len = data.len(), new_len, "buffered write");
+        debug!(
+            ino = ino.0,
+            fh,
+            offset,
+            len = data.len(),
+            new_len,
+            "buffered write"
+        );
         reply.written(data.len() as u32);
     }
 
@@ -1101,14 +1168,28 @@ impl Filesystem for ProtonFs {
         }
     }
 
-    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         match self.core.commit(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         match self.core.commit(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1170,18 +1251,19 @@ impl Filesystem for ProtonFs {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .ok();
-        let new_uid = match self
-            .core
-            .rt
-            .block_on(self.core.client.create_folder(&parent_uid, &name, now))
-        {
-            Ok(u) => u,
-            Err(e) => {
-                error!(%parent_uid, name, error = %e, "create folder failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
+        let new_uid =
+            match self
+                .core
+                .rt
+                .block_on(self.core.client.create_folder(&parent_uid, &name, now))
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    error!(%parent_uid, name, error = %e, "create folder failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
         let node = match self.core.fetch_node(&new_uid) {
             Ok(n) => n,
             Err(e) => {
@@ -1340,9 +1422,19 @@ impl Filesystem for ProtonFs {
 /// The cache is authoritative-by-absence: dropping a directory's `children`
 /// entry forces the next `lookup`/`readdir` to re-enumerate from the remote, so
 /// most events only need to invalidate listings rather than re-fetch eagerly.
-fn apply_event(state: &Mutex<State>, content: &ContentCache, notifier: &Notifier, event: &DriveEvent) {
+fn apply_event(
+    state: &Mutex<State>,
+    content: &ContentCache,
+    notifier: &Notifier,
+    event: &DriveEvent,
+) {
     match event {
-        DriveEvent::NodeUpdated { node_uid, parent_node_uid, is_trashed, .. } => {
+        DriveEvent::NodeUpdated {
+            node_uid,
+            parent_node_uid,
+            is_trashed,
+            ..
+        } => {
             let mut st = state.lock().unwrap();
             if *is_trashed {
                 // Trashing makes a node vanish from its parent listing.
@@ -1486,19 +1578,25 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.pin(&rel) {
-                Ok(name) => CtlResponse::Ok { message: format!("pinned {name}") },
+                Ok(name) => CtlResponse::Ok {
+                    message: format!("pinned {name}"),
+                },
                 Err(e) => CtlResponse::Error { message: e },
             },
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::Unpin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.unpin(&rel) {
-                Ok(name) => CtlResponse::Ok { message: format!("unpinned {name}") },
+                Ok(name) => CtlResponse::Ok {
+                    message: format!("unpinned {name}"),
+                },
                 Err(e) => CtlResponse::Error { message: e },
             },
             Err(e) => CtlResponse::Error { message: e },
         },
-        Ok(CtlRequest::ListPins) => CtlResponse::Pins { pins: core.cache.list_pins() },
+        Ok(CtlRequest::ListPins) => CtlResponse::Pins {
+            pins: core.cache.list_pins(),
+        },
         Ok(CtlRequest::ListDir { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.list_dir(&rel) {
                 Ok(entries) => CtlResponse::Entries { entries },
@@ -1508,26 +1606,40 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::PhotosTimeline { offset, limit }) => {
             match core.photos_timeline(offset, limit) {
-                Ok(Some(items)) => CtlResponse::Photos { available: true, items },
-                Ok(None) => CtlResponse::Photos { available: false, items: Vec::new() },
+                Ok(Some(items)) => CtlResponse::Photos {
+                    available: true,
+                    items,
+                },
+                Ok(None) => CtlResponse::Photos {
+                    available: false,
+                    items: Vec::new(),
+                },
                 Err(e) => CtlResponse::Error { message: e },
             }
         }
         Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
             Some(u) => match core.open_photo(&u) {
-                Ok(p) => CtlResponse::FilePath { path: p.display().to_string() },
+                Ok(p) => CtlResponse::FilePath {
+                    path: p.display().to_string(),
+                },
                 Err(e) => CtlResponse::Error { message: e },
             },
-            None => CtlResponse::Error { message: format!("bad uid: {uid}") },
+            None => CtlResponse::Error {
+                message: format!("bad uid: {uid}"),
+            },
         },
         Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.open_file(&rel) {
-                Ok(p) => CtlResponse::FilePath { path: p.display().to_string() },
+                Ok(p) => CtlResponse::FilePath {
+                    path: p.display().to_string(),
+                },
                 Err(e) => CtlResponse::Error { message: e },
             },
             Err(e) => CtlResponse::Error { message: e },
         },
-        Err(e) => CtlResponse::Error { message: format!("bad request: {e}") },
+        Err(e) => CtlResponse::Error {
+            message: format!("bad request: {e}"),
+        },
     };
     let mut out = match serde_json::to_vec(&response) {
         Ok(v) => v,
@@ -1618,7 +1730,9 @@ pub fn mount(
     // `mount`'s blocking contract.
     let session = Session::new(fs, mountpoint, &config)?.spawn()?;
     let notifier = session.notifier();
-    rt.spawn(run_event_sync(client, scope, core.state, core.cache, notifier));
+    rt.spawn(run_event_sync(
+        client, scope, core.state, core.cache, notifier,
+    ));
 
     let result = session.join();
     let _ = std::fs::remove_file(control_socket);
