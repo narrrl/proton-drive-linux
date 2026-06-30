@@ -5,8 +5,9 @@
 //! [`pdfs-tray`](crate) SNI icon. It presents four things in a Proton-purple,
 //! Google-Drive-style layout:
 //!
-//! * a **login form** (email / password / optional 2FA) driving
-//!   [`pdfs_core::auth::login`]; logging in enables the systemd mount service;
+//! * a **login form** (email / password, with a lazy 2FA dialog shown only when
+//!   the account requires it) driving [`pdfs_core::auth::login`]; logging in
+//!   enables the systemd mount service;
 //! * a **read-only mount status** line (the mount is managed automatically);
 //! * a **cache usage** read-out; and
 //! * the **pin list** with per-file unpin.
@@ -78,7 +79,6 @@ struct Ui {
     // Login page.
     email: adw::EntryRow,
     password: adw::PasswordEntryRow,
-    totp: adw::EntryRow,
     login_button: gtk4::Button,
     login_status: gtk4::Label,
     // Main page.
@@ -235,9 +235,8 @@ fn build_window(app: &adw::Application) {
         status_inflight: Cell::new(false),
         email: login_widgets.0,
         password: login_widgets.1,
-        totp: login_widgets.2,
-        login_button: login_widgets.3,
-        login_status: login_widgets.4,
+        login_button: login_widgets.2,
+        login_status: login_widgets.3,
         account_row: main_widgets.0,
         mount_row: main_widgets.1,
         cache_bar: main_widgets.2,
@@ -317,15 +316,15 @@ fn build_window(app: &adw::Application) {
     window.present();
 }
 
-/// The login page: an email row, password row, optional 2FA row, a primary
-/// "Sign in" button and a status label, centred in a clamp.
+/// The login page: an email row, password row, a primary "Sign in" button and a
+/// status label, centred in a clamp. The 2FA code is prompted lazily in a
+/// dialog (see [`prompt_2fa`]) only when the account actually requires it.
 #[allow(clippy::type_complexity)]
 fn build_login_page() -> (
     gtk4::Widget,
     (
         adw::EntryRow,
         adw::PasswordEntryRow,
-        adw::EntryRow,
         gtk4::Button,
         gtk4::Label,
     ),
@@ -337,12 +336,8 @@ fn build_login_page() -> (
 
     let email = adw::EntryRow::builder().title("Email or username").build();
     let password = adw::PasswordEntryRow::builder().title("Password").build();
-    let totp = adw::EntryRow::builder()
-        .title("Two-factor code (if enabled)")
-        .build();
     group.add(&email);
     group.add(&password);
-    group.add(&totp);
 
     let login_button = gtk4::Button::builder()
         .label("Sign in")
@@ -385,7 +380,7 @@ fn build_login_page() -> (
 
     (
         scroll.upcast(),
-        (email, password, totp, login_button, login_status),
+        (email, password, login_button, login_status),
     )
 }
 
@@ -484,7 +479,6 @@ fn wire_login(ui: &Rc<Ui>) {
     button.connect_clicked(move |_| {
         let username = ui.email.text().to_string();
         let password = ui.password.text().to_string();
-        let totp = ui.totp.text().to_string();
         if username.is_empty() || password.is_empty() {
             ui.login_status.set_text("Enter your email and password.");
             return;
@@ -492,7 +486,17 @@ fn wire_login(ui: &Rc<Ui>) {
 
         ui.login_button.set_sensitive(false);
         ui.login_status.set_text("Signing in…");
-        let rx = spawn_login(username, password, totp);
+        let (rx, totp_req_rx) = spawn_login(username, password);
+
+        // Surface the 2FA dialog only if the SDK actually asks for a code (i.e.
+        // the account has 2FA enabled). The worker blocks until the dialog feeds
+        // back a code (or is cancelled, dropping the sender).
+        let ui_2fa = ui.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(code_tx) = totp_req_rx.recv().await {
+                prompt_2fa(&ui_2fa, code_tx);
+            }
+        });
 
         let ui = ui.clone();
         glib::spawn_future_local(async move {
@@ -505,7 +509,6 @@ fn wire_login(ui: &Rc<Ui>) {
                 Ok(()) => {
                     ui.login_status.set_text("");
                     ui.password.set_text("");
-                    ui.totp.set_text("");
                     // Cache the new identity so `refresh` never hits the keyring.
                     *ui.session.borrow_mut() = auth::load().ok();
                     // Enable+start the mount service now that we have a session.
@@ -519,15 +522,21 @@ fn wire_login(ui: &Rc<Ui>) {
 }
 
 /// Run the async SRP + optional 2FA login on a dedicated current-thread Tokio
-/// runtime, returning a channel that yields the result once. The TOTP closure
-/// supplies whatever was typed in the 2FA field, erroring if the account needs a
-/// code but none was entered.
+/// runtime. Returns two channels: the first yields the final login result once;
+/// the second fires *only if* the account needs a 2FA code, carrying a
+/// [`std::sync::mpsc::Sender`] the UI uses to feed the code back. The login
+/// closure blocks the worker on that sender until the dialog answers, so the
+/// code is requested lazily and can't expire before the password proof.
+#[allow(clippy::type_complexity)]
 fn spawn_login(
     username: String,
     password: String,
-    totp: String,
-) -> async_channel::Receiver<Result<(), String>> {
+) -> (
+    async_channel::Receiver<Result<(), String>>,
+    async_channel::Receiver<std::sync::mpsc::Sender<String>>,
+) {
     let (tx, rx) = async_channel::bounded(1);
+    let (totp_req_tx, totp_req_rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -541,19 +550,60 @@ fn spawn_login(
         };
         let result = rt.block_on(async move {
             auth::login(&username, &password, || {
-                let code = totp.trim();
-                if code.is_empty() {
-                    Err(pdfs_core::Error::Other("two-factor code required".into()))
-                } else {
-                    Ok(code.to_string())
-                }
+                // 2FA required: hand a one-shot sender to the UI and block until
+                // the dialog supplies the code. A dropped sender (cancelled
+                // dialog) surfaces as a cancelled login.
+                let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+                totp_req_tx
+                    .send_blocking(code_tx)
+                    .map_err(|_| pdfs_core::Error::Other("two-factor prompt closed".into()))?;
+                code_rx
+                    .recv()
+                    .map_err(|_| pdfs_core::Error::Other("two-factor entry cancelled".into()))
             })
             .await
             .map_err(|e| e.to_string())
         });
         let _ = tx.send_blocking(result);
     });
-    rx
+    (rx, totp_req_rx)
+}
+
+/// Show the lazy two-factor dialog and feed the entered code back to the waiting
+/// login worker via `code_tx`. Cancelling (or closing) drops the sender, which
+/// the worker reads as a cancelled login.
+fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Two-factor authentication")
+        .body("Enter the code from your authenticator app.")
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+    let entry = adw::EntryRow::builder()
+        .title("Authentication code")
+        .build();
+    group.add(&entry);
+    dialog.set_extra_child(Some(&group));
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", "Confirm");
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("confirm"));
+    dialog.set_close_response("cancel");
+
+    let code_tx = RefCell::new(Some(code_tx));
+    dialog.connect_response(None, move |_, resp| {
+        // On cancel/close we take + drop `tx` without sending, so the worker's
+        // recv errors out and the login is reported as cancelled.
+        if let Some(tx) = code_tx.borrow_mut().take()
+            && resp == "confirm"
+        {
+            let _ = tx.send(entry.text().trim().to_string());
+        }
+    });
+
+    let parent = ui.login_button.root().and_downcast::<gtk4::Window>();
+    dialog.present(parent.as_ref());
 }
 
 /// Connect the sign-out button: disable+stop the mount service (so the daemon
@@ -642,7 +692,8 @@ fn refresh_status(ui: &Rc<Ui>) {
                 ..
             })) => {
                 *ui.mounted.borrow_mut() = true;
-                ui.mount_row.set_subtitle(&format!("Mounted at {mountpoint}"));
+                ui.mount_row
+                    .set_subtitle(&format!("Mounted at {mountpoint}"));
                 let fraction = if budget == 0 {
                     0.0
                 } else {
