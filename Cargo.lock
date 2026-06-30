@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -2787,7 +2787,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "directories",
  "keyring",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-fuse"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "fuser",
  "libc",
@@ -2816,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-gui"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
