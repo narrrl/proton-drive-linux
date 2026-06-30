@@ -38,6 +38,13 @@ enum Command {
         /// Mountpoint; defaults to ~/ProtonDrive.
         mountpoint: Option<PathBuf>,
     },
+    /// Run the auto-mount daemon: wait for login, mount, and keep it mounted
+    /// until stopped. This is what the systemd user service runs; you normally
+    /// don't invoke it by hand.
+    Daemon {
+        /// Mountpoint; defaults to ~/ProtonDrive.
+        mountpoint: Option<PathBuf>,
+    },
     /// Keep a file on this device (download + cache it). Needs a running mount.
     Pin {
         /// File path, inside the mountpoint or relative to it.
@@ -88,6 +95,7 @@ fn main() -> Result<()> {
         Command::Logout => cmd_logout(),
         Command::Status => cmd_status(),
         Command::Mount { mountpoint } => cmd_mount(mountpoint),
+        Command::Daemon { mountpoint } => cmd_daemon(mountpoint),
         Command::Pin { path } => cmd_pin(path),
         Command::Unpin { path } => cmd_unpin(path),
         Command::Pins => cmd_pins(),
@@ -158,6 +166,50 @@ fn cmd_status() -> Result<()> {
 }
 
 fn cmd_mount(mountpoint: Option<PathBuf>) -> Result<()> {
+    mount_once(mountpoint)?;
+    Ok(())
+}
+
+/// Run the auto-mount daemon loop. Waits for a stored login, mounts, and keeps
+/// the mount alive: a clean stop (SIGTERM via `systemctl --user stop`) exits 0;
+/// an external unmount triggers a remount; errors back off and retry. This is
+/// the entry point for the systemd user service.
+fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
+    loop {
+        // Wait until a session is stored. The GUI enables this service on login,
+        // but the service may also start at boot before the user has logged in.
+        loop {
+            match auth::load() {
+                Ok(_) => break,
+                Err(pdfs_core::Error::NotLoggedIn) => {
+                    tracing::info!("not logged in; waiting…");
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        match mount_once(mountpoint.clone()) {
+            Ok(pdfs_fuse::MountOutcome::Shutdown) => {
+                tracing::info!("daemon stopping");
+                return Ok(());
+            }
+            Ok(pdfs_fuse::MountOutcome::Unmounted) => {
+                tracing::warn!("mount ended externally; remounting in 2s");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "mount failed; retrying in 5s");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+/// One mount run: resume the session, mount, and block until the mount ends
+/// (clean shutdown or external unmount). Returns the [`MountOutcome`] so the
+/// daemon loop can decide whether to exit or remount.
+fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
     let dirs = AppDirs::new()?;
     dirs.ensure()?;
     let mountpoint = mountpoint.unwrap_or_else(|| dirs.default_mountpoint());
@@ -230,8 +282,8 @@ fn cmd_mount(mountpoint: Option<PathBuf>) -> Result<()> {
         tracing::warn!(error = %e, "failed to persist tokens on shutdown");
     }
 
-    result.context("mount failed")?;
-    Ok(())
+    let outcome = result.context("mount failed")?;
+    Ok(outcome)
 }
 
 fn cmd_pin(path: PathBuf) -> Result<()> {

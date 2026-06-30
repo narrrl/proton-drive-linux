@@ -19,6 +19,7 @@ use ksni::{MenuItem, Tray, TrayService};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{Request, Response, send};
+use pdfs_core::service;
 
 /// How often the tray re-polls the daemon to refresh its menu.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -71,26 +72,6 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
     }
 }
 
-/// Launch `pdfs mount` detached so the tray keeps running independently.
-fn spawn_mount() {
-    match Command::new("pdfs").arg("mount").spawn() {
-        Ok(_) => tracing::info!("spawned `pdfs mount`"),
-        Err(e) => tracing::error!("failed to spawn `pdfs mount`: {e}"),
-    }
-}
-
-/// Unmount the FUSE filesystem. `fusermount3 -u` is the FUSE-native teardown;
-/// fall back to `fusermount` on older systems.
-fn unmount(mountpoint: &Path) {
-    let try_unmount = |bin: &str| Command::new(bin).arg("-u").arg(mountpoint).status();
-    let result = try_unmount("fusermount3").or_else(|_| try_unmount("fusermount"));
-    match result {
-        Ok(s) if s.success() => tracing::info!("unmounted {}", mountpoint.display()),
-        Ok(s) => tracing::error!("unmount exited with {s}"),
-        Err(e) => tracing::error!("failed to run fusermount: {e}"),
-    }
-}
-
 fn open_folder(mountpoint: &Path) {
     if let Err(e) = Command::new("xdg-open").arg(mountpoint).spawn() {
         tracing::error!("failed to xdg-open {}: {e}", mountpoint.display());
@@ -111,9 +92,8 @@ impl Tray for DriveTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        // Values captured into the action closures (which only get `&mut Self`).
-        let mountpoint = self.state.mountpoint.clone();
-        let open_mp = mountpoint.clone();
+        // Value captured into the action closure (which only gets `&mut Self`).
+        let open_mp = self.state.mountpoint.clone();
 
         let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
@@ -134,25 +114,28 @@ impl Tray for DriveTray {
                 }
                 .into(),
             );
+            // Stop the systemd service (clean SIGTERM → lazy unmount). The next
+            // login or reboot brings it back; this is a deliberate disconnect.
             items.push(
                 StandardItem {
-                    label: "Unmount".into(),
+                    label: "Disconnect".into(),
                     activate: Box::new(move |this: &mut Self| {
-                        unmount(&mountpoint);
+                        service::stop();
                         this.state.mounted = false;
-                        this.state.line = "Unmounting…".into();
+                        this.state.line = "Disconnecting…".into();
                     }),
                     ..Default::default()
                 }
                 .into(),
             );
         } else {
+            // Enable+start the service so it mounts now and on future logins.
             items.push(
                 StandardItem {
-                    label: "Mount".into(),
+                    label: "Connect".into(),
                     activate: Box::new(|this: &mut Self| {
-                        spawn_mount();
-                        this.state.line = "Mounting…".into();
+                        service::enable_start();
+                        this.state.line = "Connecting…".into();
                     }),
                     ..Default::default()
                 }

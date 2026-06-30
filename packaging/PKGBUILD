@@ -61,5 +61,10 @@ package() {
   install -Dm644 "packaging/io.narl.proton-drive-linux.svg" \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg"
 
+  # systemd user service that runs the auto-mount daemon. Enabled per-user by
+  # the GUI on login (`systemctl --user enable --now proton-drive.service`).
+  install -Dm644 "packaging/proton-drive.service" \
+    "$pkgdir/usr/lib/systemd/user/proton-drive.service"
+
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

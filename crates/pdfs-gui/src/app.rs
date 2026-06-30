@@ -6,8 +6,8 @@
 //! Google-Drive-style layout:
 //!
 //! * a **login form** (email / password / optional 2FA) driving
-//!   [`pdfs_core::auth::login`];
-//! * a **mount toggle** that spawns `pdfs mount` / `fusermount3 -u`;
+//!   [`pdfs_core::auth::login`]; logging in enables the systemd mount service;
+//! * a **read-only mount status** line (the mount is managed automatically);
 //! * a **cache usage** read-out from the on-disk [`ContentCache`]; and
 //! * the **pin list** with per-file unpin.
 //!
@@ -25,12 +25,13 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk4::gio;
 use gtk4::glib;
-use gtk4::glib::{BoxedAnyObject, SignalHandlerId};
+use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::{AppDirs, DEFAULT_CACHE_BUDGET_BYTES};
 use pdfs_core::control::{DirEntry, PhotoItem, Request, Response, send};
+use pdfs_core::service;
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
 const PHOTOS_PAGE: usize = 60;
@@ -56,8 +57,9 @@ struct Ui {
     login_status: gtk4::Label,
     // Main page.
     account_row: adw::ActionRow,
-    mount_row: adw::SwitchRow,
-    mount_handler: RefCell<Option<SignalHandlerId>>,
+    /// Read-only mount status line. The mount is driven by the systemd user
+    /// service (enabled on login), not by the user — so this only reports.
+    mount_row: adw::ActionRow,
     cache_bar: gtk4::ProgressBar,
     cache_label: gtk4::Label,
     pins_group: adw::PreferencesGroup,
@@ -177,7 +179,6 @@ fn build_window(app: &adw::Application) {
         login_status: login_widgets.4,
         account_row: main_widgets.0,
         mount_row: main_widgets.1,
-        mount_handler: RefCell::new(None),
         cache_bar: main_widgets.2,
         cache_label: main_widgets.3,
         pins_group: main_widgets.4,
@@ -196,7 +197,6 @@ fn build_window(app: &adw::Application) {
 
     wire_login(&ui);
     wire_logout(&ui, &main_widgets.5);
-    wire_mount_switch(&ui);
     wire_browser(&ui, &browser_widgets.4, &browser_widgets.5);
     wire_gallery(&ui, &gallery_widgets.3);
 
@@ -331,7 +331,7 @@ fn build_main_page() -> (
     gtk4::Widget,
     (
         adw::ActionRow,
-        adw::SwitchRow,
+        adw::ActionRow,
         gtk4::ProgressBar,
         gtk4::Label,
         adw::PreferencesGroup,
@@ -351,10 +351,11 @@ fn build_main_page() -> (
     account_row.add_suffix(&logout_button);
     account_group.add(&account_row);
 
-    // Mount group: a switch row driving the FUSE mount.
+    // Mount group: a read-only status line. The mount is managed automatically
+    // by the systemd user service; there is no toggle to fiddle with.
     let mount_group = adw::PreferencesGroup::builder().title("Drive").build();
-    let mount_row = adw::SwitchRow::builder()
-        .title("Mount Proton Drive")
+    let mount_row = adw::ActionRow::builder()
+        .title("Proton Drive")
         .subtitle("Not mounted")
         .build();
     mount_group.add(&mount_row);
@@ -439,6 +440,8 @@ fn wire_login(ui: &Rc<Ui>) {
                     ui.login_status.set_text("");
                     ui.password.set_text("");
                     ui.totp.set_text("");
+                    // Enable+start the mount service now that we have a session.
+                    service::enable_start();
                     refresh(&ui);
                 }
                 Err(e) => ui.login_status.set_text(&format!("Sign-in failed: {e}")),
@@ -485,35 +488,18 @@ fn spawn_login(
     rx
 }
 
-/// Connect the sign-out button: forget the stored session and drop back to the
-/// login page. Unmounts first so the daemon isn't left without credentials.
+/// Connect the sign-out button: disable+stop the mount service (so the daemon
+/// isn't left running without credentials), forget the stored session, and drop
+/// back to the login page.
 fn wire_logout(ui: &Rc<Ui>, button: &gtk4::Button) {
     let ui = ui.clone();
     button.connect_clicked(move |_| {
-        if *ui.mounted.borrow() {
-            unmount(&ui.dirs.default_mountpoint());
-        }
+        service::disable_stop();
         if let Err(e) = auth::logout() {
             tracing::error!("logout failed: {e}");
         }
         refresh(&ui);
     });
-}
-
-/// Connect the mount switch. The handler id is stored so the refresh loop can
-/// block it while syncing the switch to the real mount state (otherwise setting
-/// `active` would re-trigger a mount/unmount).
-fn wire_mount_switch(ui: &Rc<Ui>) {
-    let ui_for_handler = ui.clone();
-    let handler = ui.mount_row.connect_active_notify(move |row| {
-        let mountpoint = ui_for_handler.dirs.default_mountpoint();
-        if row.is_active() {
-            spawn_mount();
-        } else {
-            unmount(&mountpoint);
-        }
-    });
-    *ui.mount_handler.borrow_mut() = Some(handler);
 }
 
 /// Re-read mount status, login identity, cache usage and the pin list, and
@@ -547,12 +533,7 @@ fn refresh(ui: &Rc<Ui>) {
     };
     *ui.mounted.borrow_mut() = mount.is_some();
 
-    // Sync the switch without re-triggering its handler.
-    if let Some(id) = ui.mount_handler.borrow().as_ref() {
-        ui.mount_row.block_signal(id);
-        ui.mount_row.set_active(mount.is_some());
-        ui.mount_row.unblock_signal(id);
-    }
+    // Read-only status: the service mounts automatically, we only report.
     ui.mount_row.set_subtitle(&match &mount {
         Some(mp) => format!("Mounted at {mp}"),
         None => "Not mounted".into(),
@@ -1296,25 +1277,6 @@ fn gallery_message(ui: &Rc<Ui>, message: &str) {
 fn open_path(path: &str) {
     if let Err(e) = Command::new("xdg-open").arg(path).spawn() {
         tracing::error!("xdg-open {path} failed: {e}");
-    }
-}
-
-/// Launch `pdfs mount` detached so the window keeps running independently.
-fn spawn_mount() {
-    match Command::new("pdfs").arg("mount").spawn() {
-        Ok(_) => tracing::info!("spawned `pdfs mount`"),
-        Err(e) => tracing::error!("failed to spawn `pdfs mount`: {e}"),
-    }
-}
-
-/// Tear down the FUSE mount. `fusermount3 -u` is the native path; fall back to
-/// `fusermount` on older systems.
-fn unmount(mountpoint: &Path) {
-    let try_unmount = |bin: &str| Command::new(bin).arg("-u").arg(mountpoint).status();
-    match try_unmount("fusermount3").or_else(|_| try_unmount("fusermount")) {
-        Ok(s) if s.success() => tracing::info!("unmounted {}", mountpoint.display()),
-        Ok(s) => tracing::error!("unmount exited with {s}"),
-        Err(e) => tracing::error!("failed to run fusermount: {e}"),
     }
 }
 

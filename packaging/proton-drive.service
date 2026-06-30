@@ -1,0 +1,19 @@
+[Unit]
+Description=Proton Drive Files-On-Demand mount
+Documentation=https://github.com/narl/proton-drive-linux
+# Tie the mount to the desktop session: start after it is up and stop with it.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# The daemon waits for a stored login, mounts ~/ProtonDrive, and keeps it
+# mounted. SIGTERM (from `systemctl --user stop`) triggers a clean lazy unmount.
+ExecStart=/usr/bin/pdfs daemon
+Restart=on-failure
+RestartSec=3
+# Give the lazy unmount time to finish before SIGKILL.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

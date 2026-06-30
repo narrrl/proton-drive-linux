@@ -1667,12 +1667,53 @@ fn run_control_socket(core: Core, username: String, mountpoint: PathBuf, listene
     }
 }
 
-/// Mount the filesystem at `mountpoint` and block until it is unmounted.
+/// Why a [`mount`] call returned. Lets the daemon decide whether to exit (clean
+/// shutdown) or remount (the mount went away under it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountOutcome {
+    /// The daemon was asked to stop (SIGTERM/SIGINT) and we lazily unmounted
+    /// ourselves. The caller should exit cleanly.
+    Shutdown,
+    /// The kernel mount ended on its own (e.g. an external `fusermount -u`).
+    /// The caller may want to remount.
+    Unmounted,
+}
+
+/// Best-effort teardown of a stale mount left behind by a crashed daemon. A
+/// previous run that died without unmounting leaves the kernel mount in place,
+/// so the fresh `Session::new` below would fail with EBUSY ("Device or resource
+/// busy"). `fusermount3 -u -z` is the lazy (detach) unmount, which succeeds even
+/// when the old mount is still busy. Swallow all output/errors: if there is no
+/// stale mount this is simply a no-op.
+fn clear_stale_mount(mountpoint: &Path) {
+    for bin in ["fusermount3", "fusermount"] {
+        let ok = std::process::Command::new(bin)
+            .arg("-u")
+            .arg("-z")
+            .arg(mountpoint)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            info!(mountpoint = %mountpoint.display(), "cleared stale mount before remount");
+            return;
+        }
+    }
+}
+
+/// Mount the filesystem at `mountpoint` and block until it is unmounted or the
+/// daemon is asked to stop.
 ///
 /// Fetches the My Files root up front (so an auth/network failure surfaces
 /// before the kernel mount), then spawns the Phase 2 event-sync task, the
-/// Phase 4 control socket, and takes over the calling thread in the FUSE session
-/// loop. `rt` must be a handle to a *running* multi-threaded runtime.
+/// Phase 4 control socket, and runs the FUSE session on its own thread while
+/// this thread waits for either a stop signal (SIGTERM/SIGINT) or the kernel
+/// mount ending on its own. On a stop signal we lazily unmount ourselves
+/// (`umount_and_join`, the MNT_DETACH path that succeeds even while downloads
+/// are in flight), so `systemctl --user stop` is always a clean teardown.
+/// `rt` must be a handle to a *running* multi-threaded runtime.
 pub fn mount(
     client: ProtonDriveClient,
     rt: tokio::runtime::Handle,
@@ -1680,7 +1721,7 @@ pub fn mount(
     cache: ContentCache,
     control_socket: &Path,
     username: String,
-) -> std::io::Result<()> {
+) -> std::io::Result<MountOutcome> {
     let root = rt
         .block_on(client.get_my_files_folder())
         .map_err(|e| std::io::Error::other(format!("fetch My Files root: {e}")))?;
@@ -1707,6 +1748,10 @@ pub fn mount(
         MountOption::Subtype("protondrive".to_string()),
         MountOption::DefaultPermissions,
     ];
+
+    // A crashed previous run can leave the kernel mount in place, which makes
+    // the fresh mount below fail with EBUSY. Lazily detach any leftover first.
+    clear_stale_mount(mountpoint);
     info!(mountpoint = %mountpoint.display(), "mounting Proton Drive");
 
     // Bind the control socket before the FUSE session takes over the thread. A
@@ -1725,16 +1770,75 @@ pub fn mount(
     let fs = ProtonFs::new(core.clone(), root);
 
     // Build the session explicitly (not `mount2`) so we can grab a `Notifier`
-    // for the event task. `spawn` runs the session loop on its own thread;
-    // `join` then blocks here until the filesystem is unmounted, preserving
-    // `mount`'s blocking contract.
-    let session = Session::new(fs, mountpoint, &config)?.spawn()?;
-    let notifier = session.notifier();
+    // for the event task. `spawn` runs the session loop on its own background
+    // thread; we then wait here for either a stop signal or the mount ending.
+    let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
+    let notifier = bg.notifier();
     rt.spawn(run_event_sync(
         client, scope, core.state, core.cache, notifier,
     ));
 
-    let result = session.join();
+    // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
+    // are delivered onto the async runtime; bridge them onto a sync channel so
+    // the loop below can react without blocking a worker thread. A bounded
+    // channel of 1 is enough — we only need to know that *a* stop arrived.
+    let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    rt.spawn(async move {
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "install SIGTERM handler failed");
+                return;
+            }
+        };
+        let mut sigint = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "install SIGINT handler failed");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM"),
+            _ = sigint.recv() => info!("received SIGINT"),
+        }
+        let _ = sig_tx.try_send(());
+    });
+
+    // Wait for whichever happens first: a stop signal (→ we unmount ourselves
+    // via the lazy MNT_DETACH path, clean even mid-download), or the kernel
+    // mount ending on its own (→ the session thread finishes). Poll instead of
+    // blocking on `join` so we can also notice the signal.
+    let outcome = loop {
+        match sig_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => {
+                info!("stop requested; unmounting");
+                if let Err(e) = bg.umount_and_join() {
+                    warn!(error = %e, "umount_and_join failed");
+                }
+                break MountOutcome::Shutdown;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if bg.guard.is_finished() {
+                    info!("mount ended externally");
+                    if let Err(e) = bg.join() {
+                        warn!(error = %e, "session join failed");
+                    }
+                    break MountOutcome::Unmounted;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Signal task gone (failed to install); fall back to join.
+                let _ = bg.join();
+                break MountOutcome::Unmounted;
+            }
+        }
+    };
+
     let _ = std::fs::remove_file(control_socket);
-    result
+    Ok(outcome)
 }
