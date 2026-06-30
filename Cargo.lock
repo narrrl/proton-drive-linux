@@ -3031,7 +3031,9 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9380c88a032e2ff079b2d5a6221ccc40ebeee3ebbb4ea60d4d65ef770e4ca8d"
 dependencies = [
  "async-trait",
  "base64",
@@ -3054,7 +3056,9 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1da22604d2568af2d15be6a45f23f8c5b95fa775bdac1540e833c2eafb587888"
 dependencies = [
  "aes-gcm",
  "async-trait",
