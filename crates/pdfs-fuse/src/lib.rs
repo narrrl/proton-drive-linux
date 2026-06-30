@@ -450,7 +450,13 @@ impl Core {
             } else {
                 let bend = e.min(base_size);
                 if s < bend {
-                    out.extend_from_slice(&self.read_range(uid, base_mtime, base_size, s, bend - s)?);
+                    out.extend_from_slice(&self.read_range(
+                        uid,
+                        base_mtime,
+                        base_size,
+                        s,
+                        bend - s,
+                    )?);
                 }
                 // Anything past the base is a hole: zero-fill.
                 let zeros = e.saturating_sub(s.max(base_size));
@@ -510,10 +516,13 @@ impl Core {
             Errno::EIO
         })?;
         self.rt
-            .block_on(
-                self.client
-                    .upload_new_revision_from(&uid, reader, len as i64, Vec::new(), None),
-            )
+            .block_on(self.client.upload_new_revision_from(
+                &uid,
+                reader,
+                len as i64,
+                Vec::new(),
+                None,
+            ))
             .map_err(|e| {
                 error!(%uid, error = %e, "upload new revision failed");
                 Errno::EIO
@@ -1123,7 +1132,14 @@ impl Filesystem for ProtonFs {
         };
         if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
             match self.core.serve_open_read(
-                &file, len, &uid, base_mtime, base_size, &written, offset, size as u64,
+                &file,
+                len,
+                &uid,
+                base_mtime,
+                base_size,
+                &written,
+                offset,
+                size as u64,
             ) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(e),
@@ -1146,7 +1162,10 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
-        match self.core.read_range(&uid, mtime, fsize, offset, size as u64) {
+        match self
+            .core
+            .read_range(&uid, mtime, fsize, offset, size as u64)
+        {
             Ok(bytes) => reply.data(&bytes),
             Err(e) => reply.error(e),
         }

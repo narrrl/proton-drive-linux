@@ -206,7 +206,8 @@ impl ContentCache {
     }
 
     fn block_meta(&self, uid: &NodeUid, idx: u64) -> PathBuf {
-        self.block_dir.join(format!("{}.b{idx}.meta", Self::key(uid)))
+        self.block_dir
+            .join(format!("{}.b{idx}.meta", Self::key(uid)))
     }
 
     /// Serve cached block `idx` (a [`BLOCK_SIZE`]-aligned chunk) of `uid`, or
@@ -244,7 +245,10 @@ impl ContentCache {
             .join(format!("{}.b{idx}.tmp", Self::key(uid)));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &blob)?;
-        std::fs::write(self.block_meta(uid, idx), serde_json::to_vec(&Meta { mtime, size })?)?;
+        std::fs::write(
+            self.block_meta(uid, idx),
+            serde_json::to_vec(&Meta { mtime, size })?,
+        )?;
         self.enforce_block_budget();
         Ok(())
     }
@@ -744,7 +748,10 @@ mod tests {
         assert!(c.cached_block(&u, 1, 12, 0).is_some());
         std::thread::sleep(std::time::Duration::from_millis(10));
         c.store_block(&u, 1, 12, 2, b"cccc").unwrap();
-        assert!(c.cached_block(&u, 1, 12, 0).is_some(), "recently-read survives");
+        assert!(
+            c.cached_block(&u, 1, 12, 0).is_some(),
+            "recently-read survives"
+        );
         assert!(c.cached_block(&u, 1, 12, 1).is_none(), "LRU block evicted");
         assert!(c.cached_block(&u, 1, 12, 2).is_some(), "newest survives");
     }
