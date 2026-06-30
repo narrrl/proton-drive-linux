@@ -1633,8 +1633,8 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
         let ui = ui_upload.clone();
         let parent_win = ui.stack.root().and_downcast::<gtk4::Window>();
         dialog.open(parent_win.as_ref(), gio::Cancellable::NONE, move |res| {
-            if let Ok(file) = res {
-                if let Some(path) = file.path() {
+            if let Ok(file) = res
+                && let Some(path) = file.path() {
                     let name = path
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -1698,7 +1698,6 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
                         }
                     });
                 }
-            }
         });
     });
 }
@@ -1715,13 +1714,11 @@ fn show_error_dialog(ui: &Rc<Ui>, message: &str) {
 
 fn find_photo_index(model: &gio::ListStore, uid: &str) -> Option<u32> {
     for i in 0..model.n_items() {
-        if let Some(obj) = model.item(i) {
-            if let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() {
-                if boxed.borrow::<PhotoItem>().uid == uid {
+        if let Some(obj) = model.item(i)
+            && let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>()
+                && boxed.borrow::<PhotoItem>().uid == uid {
                     return Some(i);
                 }
-            }
-        }
     }
     None
 }
@@ -1792,15 +1789,14 @@ fn save_photo_to_disk(window: &gtk4::Window, source_path: &str, original_name: &
         .build();
     let source_path_str = source_path.to_string();
     dialog.save(Some(window), gio::Cancellable::NONE, move |res| {
-        if let Ok(file) = res {
-            if let Some(dest_path) = file.path() {
+        if let Ok(file) = res
+            && let Some(dest_path) = file.path() {
                 if let Err(e) = std::fs::copy(&source_path_str, &dest_path) {
                     tracing::error!("Failed to copy file to {:?}: {}", dest_path, e);
                 } else {
                     tracing::info!("Saved photo to {:?}", dest_path);
                 }
             }
-        }
     });
 }
 
@@ -1961,11 +1957,10 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     next_btn.set_sensitive(initial_idx < n - 1);
 
     let mut initial_capture_time = 0;
-    if let Some(obj) = ui.gallery_model.item(initial_idx) {
-        if let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() {
+    if let Some(obj) = ui.gallery_model.item(initial_idx)
+        && let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() {
             initial_capture_time = boxed.borrow::<PhotoItem>().capture_time;
         }
-    }
     let date_str = format_capture_time(initial_capture_time);
     title_label.set_label(&format!(
         "Photo {} of {} • {}",

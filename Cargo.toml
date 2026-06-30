@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
 sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
