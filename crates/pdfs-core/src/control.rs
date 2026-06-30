@@ -63,6 +63,32 @@ pub enum Request {
     /// Full-text search node names against the daemon's local metadata index.
     /// `limit` caps the number of hits returned. Replies with [`Response::SearchResults`].
     Search { query: String, limit: usize },
+    /// Rename a file or folder. `path` is mountpoint-relative; `new_name` is a
+    /// single path component (no separators). Replies with [`Response::Ok`].
+    Rename { path: String, new_name: String },
+    /// Move a file or folder into a new parent folder. Both `path` and
+    /// `new_parent` are mountpoint-relative. Replies with [`Response::Ok`].
+    Move { path: String, new_parent: String },
+    /// Trash a file or folder. `path` is mountpoint-relative. Replies with
+    /// [`Response::Ok`].
+    Delete { path: String },
+    /// Create a new folder named `name` under the mountpoint-relative `parent`.
+    /// Replies with [`Response::Ok`].
+    CreateFolder { parent: String, name: String },
+    /// Upload a file named `name` with content `bytes` into the
+    /// mountpoint-relative `parent` folder. Replies with [`Response::Ok`].
+    UploadFile {
+        parent: String,
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// Delete all unpinned cached blobs and on-demand blocks, keeping pinned
+    /// files intact. Replies with [`Response::Ok`] reporting the bytes freed.
+    PurgeCache,
+    /// Retune the on-disk cache's soft byte cap at runtime (`0` = unlimited) and
+    /// persist it to config so the next mount keeps it. Replies with
+    /// [`Response::Ok`].
+    SetCacheBudget { bytes: u64 },
 }
 
 /// One entry in a [`Request::ListDir`] listing.
@@ -77,6 +103,11 @@ pub struct DirEntry {
     pub modified: i64,
     /// Whether the file is pinned to this device.
     pub pinned: bool,
+    /// Whether the file's full content is present in the local cache (a current,
+    /// non-stale blob). Always false for folders. Defaulted for wire-compat with
+    /// clients/daemons predating the field.
+    #[serde(default)]
+    pub cached: bool,
     /// Node uid in `volume~link` form, for follow-up requests.
     pub uid: String,
     /// Full mountpoint-relative path. Empty for a [`Request::ListDir`] listing
@@ -167,4 +198,44 @@ pub fn send(socket: &Path, req: &Request) -> Result<Response> {
     let mut resp = String::new();
     reader.read_line(&mut resp)?;
     Ok(serde_json::from_str(resp.trim())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mutation requests must survive a line-delimited JSON round-trip, since
+    /// that is exactly how they cross the control socket.
+    #[test]
+    fn mutation_requests_roundtrip() {
+        let reqs = [
+            Request::Rename {
+                path: "a/b.txt".into(),
+                new_name: "c.txt".into(),
+            },
+            Request::Move {
+                path: "a/b.txt".into(),
+                new_parent: "d".into(),
+            },
+            Request::Delete {
+                path: "a/b.txt".into(),
+            },
+            Request::CreateFolder {
+                parent: "a".into(),
+                name: "new".into(),
+            },
+            Request::UploadFile {
+                parent: "a".into(),
+                name: "f.bin".into(),
+                bytes: vec![0, 1, 2, 255],
+            },
+        ];
+        for req in reqs {
+            let line = serde_json::to_string(&req).unwrap();
+            assert!(!line.contains('\n'), "wire form must be a single line");
+            let back: Request = serde_json::from_str(&line).unwrap();
+            // Round-trip is lossless: re-serializing yields the same bytes.
+            assert_eq!(line, serde_json::to_string(&back).unwrap());
+        }
+    }
 }

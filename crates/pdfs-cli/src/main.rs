@@ -86,6 +86,39 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Rename a file or folder via the running daemon.
+    Rename {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// New name (a single path component).
+        new_name: String,
+    },
+    /// Move a file or folder into another folder via the running daemon.
+    Move {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Destination folder path, inside the mountpoint or relative to it.
+        new_parent: PathBuf,
+    },
+    /// Trash a file or folder via the running daemon.
+    Rm {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+    },
+    /// Create a folder via the running daemon.
+    Mkdir {
+        /// Parent folder path, inside the mountpoint or relative to it.
+        parent: PathBuf,
+        /// New folder name (a single path component).
+        name: String,
+    },
+    /// Upload a local file into a Drive folder via the running daemon.
+    Upload {
+        /// Local file to upload.
+        file: PathBuf,
+        /// Destination folder path, inside the mountpoint or relative to it.
+        parent: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -113,6 +146,11 @@ fn main() -> Result<()> {
         Command::Photos { limit, offset } => cmd_photos(limit, offset),
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
         Command::Search { query, limit } => cmd_search(query, limit),
+        Command::Rename { path, new_name } => cmd_rename(path, new_name),
+        Command::Move { path, new_parent } => cmd_move(path, new_parent),
+        Command::Rm { path } => cmd_rm(path),
+        Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
+        Command::Upload { file, parent } => cmd_upload(file, parent),
     }
 }
 
@@ -223,7 +261,10 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
 fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
     let dirs = AppDirs::new()?;
     dirs.ensure()?;
-    let mountpoint = mountpoint.unwrap_or_else(|| dirs.default_mountpoint());
+    let config = dirs.load_config();
+    // An explicit `--mountpoint` wins; otherwise honor the Settings-page choice
+    // (config), falling back to the default location.
+    let mountpoint = mountpoint.unwrap_or_else(|| dirs.resolved_mountpoint(&config));
     std::fs::create_dir_all(&mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
@@ -235,7 +276,7 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
     let cache = ContentCache::open(
         dirs.content_cache_dir(),
         dirs.pins_path(),
-        pdfs_core::config::DEFAULT_CACHE_BUDGET_BYTES,
+        config.resolved_cache_budget(),
         db.clone(),
     )
     .context("open content cache")?;
@@ -398,6 +439,72 @@ fn cmd_search(query: String, limit: usize) -> Result<()> {
                 println!("{kind}{pin} {:>12}  {}", h.size, h.path);
             }
         }
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_rename(path: PathBuf, new_name: String) -> Result<()> {
+    match control_request(CtlRequest::Rename {
+        path: path_arg(&path)?,
+        new_name,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_move(path: PathBuf, new_parent: PathBuf) -> Result<()> {
+    match control_request(CtlRequest::Move {
+        path: path_arg(&path)?,
+        new_parent: path_arg(&new_parent)?,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_rm(path: PathBuf) -> Result<()> {
+    match control_request(CtlRequest::Delete {
+        path: path_arg(&path)?,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_mkdir(parent: PathBuf, name: String) -> Result<()> {
+    match control_request(CtlRequest::CreateFolder {
+        parent: path_arg(&parent)?,
+        name,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_upload(file: PathBuf, parent: PathBuf) -> Result<()> {
+    let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("source file has no valid name"))?
+        .to_owned();
+    match control_request(CtlRequest::UploadFile {
+        parent: path_arg(&parent)?,
+        name,
+        bytes,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
     }

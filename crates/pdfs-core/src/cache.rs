@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -100,8 +101,10 @@ pub struct ContentCache {
     /// Soft cap on total blob bytes. Exceeded only transiently: a `store`
     /// evicts least-recently-used *unpinned* blobs back under the cap. `0`
     /// disables the cap. Pinned blobs are never evicted, so pins alone may push
-    /// the cache over budget.
-    max_bytes: u64,
+    /// the cache over budget. Atomic so the daemon can retune it at runtime
+    /// (a Settings-page change) via [`set_budget`](Self::set_budget) without
+    /// taking a lock on every cache read.
+    max_bytes: AtomicU64,
     /// Unified metadata DB. Its `cache_entries` table is the LRU index: every
     /// store/read/evict updates it, and the budget enforcers query it instead of
     /// scanning the cache directories (plan.md P4).
@@ -139,7 +142,7 @@ impl ContentCache {
             block_dir,
             scratch_dir,
             pins_path,
-            max_bytes,
+            max_bytes: AtomicU64::new(max_bytes),
             db,
         };
         cache.reconcile()?;
@@ -366,7 +369,8 @@ impl ContentCache {
     /// `max_bytes`. No-op when the cap is disabled (`0`). All blocks are
     /// evictable — pinned files are served from whole-file blobs, never blocks.
     fn enforce_block_budget(&self) {
-        if self.max_bytes == 0 {
+        let cap = self.cap();
+        if cap == 0 {
             return;
         }
         // LRU-ordered (oldest first) block entries straight from the index — no
@@ -376,11 +380,11 @@ impl ContentCache {
             return;
         };
         let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
-        if total <= self.max_bytes {
+        if total <= cap {
             return;
         }
         for (key, size) in entries {
-            if total <= self.max_bytes {
+            if total <= cap {
                 break;
             }
             // `key` is the block file's name (and its `.meta` sibling's stem).
@@ -517,7 +521,8 @@ impl ContentCache {
     /// cache already fits. Pinned blobs are skipped, so a cache held entirely by
     /// pins can legitimately stay over budget.
     fn enforce_budget(&self) {
-        if self.max_bytes == 0 {
+        let cap = self.cap();
+        if cap == 0 {
             return;
         }
         // Pinned blobs (by cache key) are exempt from eviction. Resolves direct
@@ -538,11 +543,11 @@ impl ContentCache {
             return;
         };
         let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
-        if total <= self.max_bytes {
+        if total <= cap {
             return;
         }
         for (key, size) in entries {
-            if total <= self.max_bytes {
+            if total <= cap {
                 break;
             }
             if pinned.contains(&key) {
@@ -624,7 +629,61 @@ impl ContentCache {
     /// Configured soft byte cap (`0` = unlimited), for display alongside
     /// [`usage`](Self::usage).
     pub fn budget(&self) -> u64 {
-        self.max_bytes
+        self.cap()
+    }
+
+    /// The current soft byte cap. A plain atomic load; the value can change
+    /// under [`set_budget`](Self::set_budget) while the daemon runs.
+    fn cap(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Retune the soft byte cap (`0` = unlimited) at runtime and immediately
+    /// enforce it: blobs and blocks are LRU-evicted back under the new cap (a
+    /// lower cap frees space now; a higher one is a no-op until the next store).
+    /// Called by the daemon when the Settings page changes the cache budget.
+    pub fn set_budget(&self, bytes: u64) {
+        self.max_bytes.store(bytes, Ordering::Relaxed);
+        self.enforce_budget();
+        self.enforce_block_budget();
+    }
+
+    /// Delete every *unpinned* cached blob plus all on-demand block chunks,
+    /// keeping pinned files intact. Pinned files keep their whole-file blobs
+    /// (and are never served from blocks), so dropping all blocks is safe.
+    /// Returns the number of bytes freed, for a user-facing confirmation.
+    pub fn clear_unpinned(&self) -> u64 {
+        // Pinned blobs are exempt; resolve them to cache keys to match filenames.
+        let pinned: HashSet<String> = self
+            .db
+            .pinned_uids()
+            .unwrap_or_default()
+            .iter()
+            .map(|uid| Self::key_str(uid))
+            .collect();
+        let mut freed = 0u64;
+        // Unpinned whole-file blobs.
+        if let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOB) {
+            for (key, size) in entries {
+                if pinned.contains(&key) {
+                    continue;
+                }
+                let _ = std::fs::remove_file(self.content_dir.join(&key));
+                let _ = std::fs::remove_file(self.content_dir.join(format!("{key}.meta")));
+                let _ = self.db.cache_remove(&key);
+                freed = freed.saturating_add(size);
+            }
+        }
+        // Every on-demand block (transient partial reads, re-fetched on demand).
+        if let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOCK) {
+            for (key, size) in entries {
+                let _ = std::fs::remove_file(self.block_dir.join(&key));
+                let _ = std::fs::remove_file(self.block_dir.join(format!("{key}.meta")));
+                let _ = self.db.cache_remove(&key);
+                freed = freed.saturating_add(size);
+            }
+        }
+        freed
     }
 }
 
@@ -820,6 +879,43 @@ mod tests {
         assert!(c.is_cached(&a, 1, 4), "pinned blob never evicted");
         assert!(!c.is_cached(&b, 1, 4), "unpinned LRU blob evicted");
         assert!(c.is_cached(&d, 1, 4));
+    }
+
+    #[test]
+    fn clear_unpinned_keeps_pinned() {
+        let (c, _d) = cache();
+        let (a, b) = (uid("a"), uid("b"));
+        c.store(&a, 1, 4, b"aaaa").unwrap();
+        c.add_pin(&a, Path::new("a"), false).unwrap();
+        c.store(&b, 1, 4, b"bbbb").unwrap();
+        // A stray on-demand block of the unpinned file is purged too.
+        c.store_block(&b, 1, 8, 0, b"bbbb").unwrap();
+
+        let freed = c.clear_unpinned();
+        assert_eq!(freed, 8, "one 4-byte blob + one 4-byte block freed");
+        assert!(c.is_cached(&a, 1, 4), "pinned blob survives purge");
+        assert!(!c.is_cached(&b, 1, 4), "unpinned blob purged");
+        assert!(c.cached_block(&b, 1, 8, 0).is_none(), "block purged");
+    }
+
+    #[test]
+    fn set_budget_evicts_immediately() {
+        // Start unlimited so three blobs all fit, then tighten the cap.
+        let (c, _d) = cache();
+        let (a, b, d) = (uid("a"), uid("b"), uid("d"));
+        c.store(&a, 1, 4, b"aaaa").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        c.store(&b, 1, 4, b"bbbb").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        c.store(&d, 1, 4, b"dddd").unwrap();
+
+        // Tightening to 8 bytes evicts the LRU unpinned blob(s) now, not on the
+        // next store.
+        c.set_budget(8);
+        assert!(!c.is_cached(&a, 1, 4), "oldest blob evicted on tighten");
+        assert!(c.is_cached(&b, 1, 4));
+        assert!(c.is_cached(&d, 1, 4));
+        assert_eq!(c.budget(), 8);
     }
 
     #[test]

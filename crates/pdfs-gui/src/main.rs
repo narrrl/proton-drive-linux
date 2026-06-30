@@ -78,6 +78,20 @@ fn open_folder(mountpoint: &Path) {
     }
 }
 
+/// Launch (or, since it's `SingleMainWindow`, raise) the settings/management
+/// window. The app binary lives next to the tray binary; fall back to the bare
+/// name so a PATH install still works.
+fn open_manager() {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("pdfs-app")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("pdfs-app"));
+    if let Err(e) = Command::new(&exe).spawn() {
+        tracing::error!("failed to launch {}: {e}", exe.display());
+    }
+}
+
 impl Tray for DriveTray {
     fn id(&self) -> String {
         "io.narl.proton-drive-linux".into()
@@ -103,6 +117,12 @@ impl Tray for DriveTray {
             }
             .into(),
             MenuItem::Separator,
+            StandardItem {
+                label: "Open Manager".into(),
+                activate: Box::new(|_: &mut Self| open_manager()),
+                ..Default::default()
+            }
+            .into(),
         ];
 
         if self.state.mounted {

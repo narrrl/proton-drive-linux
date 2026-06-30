@@ -79,6 +79,26 @@ pub fn is_failed() -> bool {
     systemctl_query(&["is-failed"])
 }
 
+/// Whether the unit is enabled to start on login/boot. `systemctl is-enabled`
+/// exits 0 only for an enabled unit, so the Settings page can render the
+/// "Start on login" switch in its true state.
+pub fn is_enabled() -> bool {
+    systemctl_query(&["is-enabled"])
+}
+
+/// Enable the service so it auto-starts on future logins, without necessarily
+/// starting it now beyond what `enable` does. Used by the Settings "Start on
+/// login" switch; pairs with [`disable`](disable).
+pub fn enable() -> bool {
+    systemctl(&["enable"])
+}
+
+/// Disable auto-start without stopping the running mount. Used by the Settings
+/// "Start on login" switch turning off; the current session stays mounted.
+pub fn disable() -> bool {
+    systemctl(&["disable"])
+}
+
 /// Disable the service so it no longer auto-starts, and stop it now. Called on
 /// logout.
 pub fn disable_stop() -> bool {

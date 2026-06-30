@@ -49,6 +49,7 @@ use fuser::{
     ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
 use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
+use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse, SearchHit,
 };
@@ -519,23 +520,62 @@ impl Core {
         let mut out = Vec::with_capacity((end - offset) as usize);
         let first = offset / BLOCK_SIZE;
         let last = (end - 1) / BLOCK_SIZE;
+
+        // Collect the blocks overlapping the request, serving any already cached
+        // and fetching the rest concurrently. A multi-block read (e.g. a media
+        // player buffering, or a large sequential read split into one FUSE call)
+        // would otherwise stall on each block round-trip in turn; downloading the
+        // misses in parallel saturates the connection and bounds latency at the
+        // slowest single block instead of their sum.
+        let mut blocks: Vec<Option<Vec<u8>>> = Vec::with_capacity((last - first + 1) as usize);
+        let mut misses: Vec<u64> = Vec::new();
         for bidx in first..=last {
-            let bstart = bidx * BLOCK_SIZE;
-            let block = match self.cache.cached_block(uid, mtime, fsize, bidx) {
-                Some(b) => b,
+            match self.cache.cached_block(uid, mtime, fsize, bidx) {
+                Some(b) => blocks.push(Some(b)),
                 None => {
-                    let blen = BLOCK_SIZE.min(fsize - bstart);
-                    let bytes = self
-                        .rt
-                        .block_on(self.client.download_range(uid, bstart, blen))
-                        .map_err(|e| {
-                            warn!(%uid, bstart, blen, error = %e, "download_range failed");
-                            Errno::EIO
-                        })?;
-                    let _ = self.cache.store_block(uid, mtime, fsize, bidx, &bytes);
-                    bytes
+                    blocks.push(None);
+                    misses.push(bidx);
                 }
-            };
+            }
+        }
+
+        if !misses.is_empty() {
+            let fetched = self.rt.block_on(async {
+                let mut set = tokio::task::JoinSet::new();
+                for &bidx in &misses {
+                    let client = self.client.clone();
+                    let uid = uid.clone();
+                    let bstart = bidx * BLOCK_SIZE;
+                    let blen = BLOCK_SIZE.min(fsize - bstart);
+                    set.spawn(async move {
+                        client
+                            .download_range(&uid, bstart, blen)
+                            .await
+                            .map(|bytes| (bidx, bytes))
+                            .map_err(|e| {
+                                warn!(%uid, bstart, blen, error = %e, "download_range failed");
+                                Errno::EIO
+                            })
+                    });
+                }
+                let mut out = Vec::with_capacity(misses.len());
+                while let Some(joined) = set.join_next().await {
+                    // A join error means the task panicked; surface it as EIO.
+                    out.push(joined.map_err(|_| Errno::EIO)??);
+                }
+                Ok::<_, Errno>(out)
+            })?;
+            for (bidx, bytes) in fetched {
+                let _ = self.cache.store_block(uid, mtime, fsize, bidx, &bytes);
+                blocks[(bidx - first) as usize] = Some(bytes);
+            }
+        }
+
+        for (i, block) in blocks.into_iter().enumerate() {
+            let bidx = first + i as u64;
+            let bstart = bidx * BLOCK_SIZE;
+            // Every slot is populated: cache hits up front, misses by the fetch above.
+            let block = block.expect("block fetched or cached");
             let s = (offset.max(bstart) - bstart) as usize;
             let e = (end.min(bstart + block.len() as u64) - bstart) as usize;
             if s < e {
@@ -869,6 +909,7 @@ impl Core {
                 size,
                 modified,
                 pinned: self.cache.is_pinned(&uid),
+                cached: !is_dir && self.cache.is_cached(&uid, modified, size),
                 uid: uid.to_string(),
                 // Listing entries live in the requested dir; the caller derives
                 // the path from its name. Left empty.
@@ -1045,6 +1086,144 @@ impl Core {
             .store(&uid, mtime, size, &bytes)
             .map_err(|e| format!("cache store: {e}"))?;
         Ok(self.cache.content_path(&uid))
+    }
+
+    /// Drop the cached child listing of `rel`'s parent directory so the next
+    /// `ListDir` re-enumerates it from the server. No-op when the parent can't be
+    /// resolved (e.g. `rel` is the root). Resolves the parent without holding the
+    /// state lock, then invalidates under it.
+    fn invalidate_parent_listing(&self, rel: &Path) {
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        if let Ok((pino, _)) = self.resolve_path(parent) {
+            self.state.lock().unwrap().invalidate_listing(pino);
+        }
+    }
+
+    /// Rename a file or folder to `new_name`. `rel` is mountpoint-relative.
+    /// Mirrors the FUSE `rename` write path: rename on the remote, forget the
+    /// node so it re-interns under its new name, and drop the parent listing so
+    /// the next `ListDir` re-enumerates.
+    fn rename(&self, rel: &Path, new_name: &str) -> Result<String, String> {
+        if new_name.is_empty() || new_name.contains('/') {
+            return Err(format!("invalid name: {new_name:?}"));
+        }
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        self.rt
+            .block_on(self.client.rename_node(&uid, new_name, None))
+            .map_err(|e| format!("rename: {e}"))?;
+        self.state.lock().unwrap().forget(&uid);
+        self.invalidate_parent_listing(rel);
+        Ok(new_name.to_string())
+    }
+
+    /// Move a file or folder into the folder at `new_parent_rel`. Both paths are
+    /// mountpoint-relative. Forgets the node and invalidates both the source and
+    /// destination listings so each re-enumerates on next access.
+    fn move_to(&self, rel: &Path, new_parent_rel: &Path) -> Result<String, String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let (pino, new_parent_uid) = self
+            .resolve_path(new_parent_rel)
+            .map_err(|e| format!("resolve new parent: {e:?}"))?;
+        self.rt
+            .block_on(self.client.move_node(&uid, &new_parent_uid))
+            .map_err(|e| format!("move: {e}"))?;
+        let name = self
+            .state
+            .lock()
+            .unwrap()
+            .forget(&uid)
+            .map(|(_, n)| n)
+            .unwrap_or_default();
+        self.invalidate_parent_listing(rel);
+        self.state.lock().unwrap().invalidate_listing(pino);
+        Ok(name)
+    }
+
+    /// Trash a file or folder. `rel` is mountpoint-relative. Forgets the node,
+    /// evicts any cached content, and invalidates the parent listing.
+    fn delete(&self, rel: &Path) -> Result<String, String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        self.rt
+            .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
+            .map_err(|e| format!("trash: {e}"))?;
+        let name = self
+            .state
+            .lock()
+            .unwrap()
+            .forget(&uid)
+            .map(|(_, n)| n)
+            .unwrap_or_default();
+        self.cache.evict(&uid);
+        self.invalidate_parent_listing(rel);
+        Ok(name)
+    }
+
+    /// Create a folder named `name` under the mountpoint-relative `parent_rel`.
+    /// Interns the new node directly so it shows up without a re-enumeration.
+    fn create_folder(&self, parent_rel: &Path, name: &str) -> Result<String, String> {
+        if name.is_empty() || name.contains('/') {
+            return Err(format!("invalid name: {name:?}"));
+        }
+        let (pino, parent_uid) = self
+            .resolve_path(parent_rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        self.ensure_children(pino)
+            .map_err(|e| format!("enumerate: {e:?}"))?;
+        let new_uid = self
+            .rt
+            .block_on(
+                self.client
+                    .create_folder(&parent_uid, name, Some(now_secs())),
+            )
+            .map_err(|e| format!("create folder: {e}"))?;
+        let node = self
+            .fetch_node(&new_uid)
+            .map_err(|e| format!("fetch node: {e:?}"))?;
+        let mut st = self.state.lock().unwrap();
+        let ino = st.intern(pino, node);
+        if let Some(kids) = st.children.get_mut(&pino)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        Ok(name.to_string())
+    }
+
+    /// Upload a file named `name` with content `bytes` into the
+    /// mountpoint-relative `parent_rel` folder. Interns the new node directly.
+    fn upload(&self, parent_rel: &Path, name: &str, bytes: &[u8]) -> Result<String, String> {
+        if name.is_empty() || name.contains('/') {
+            return Err(format!("invalid name: {name:?}"));
+        }
+        let (pino, parent_uid) = self
+            .resolve_path(parent_rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        self.ensure_children(pino)
+            .map_err(|e| format!("enumerate: {e:?}"))?;
+        let new_uid = self
+            .rt
+            .block_on(
+                self.client
+                    .upload_file(&parent_uid, name, media_type_for(name), bytes),
+            )
+            .map_err(|e| format!("upload: {e}"))?;
+        let node = self
+            .fetch_node(&new_uid)
+            .map_err(|e| format!("fetch node: {e:?}"))?;
+        let mut st = self.state.lock().unwrap();
+        let ino = st.intern(pino, node);
+        if let Some(kids) = st.children.get_mut(&pino)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        Ok(name.to_string())
     }
 }
 
@@ -2171,6 +2350,89 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(hits) => CtlResponse::SearchResults { hits },
             Err(e) => CtlResponse::Error { message: e },
         },
+        Ok(CtlRequest::Rename { path, new_name }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.rename(&rel, &new_name) {
+                Ok(name) => CtlResponse::Ok {
+                    message: format!("renamed to {name}"),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::Move { path, new_parent }) => {
+            match (
+                rel_to_mount(mountpoint, &path),
+                rel_to_mount(mountpoint, &new_parent),
+            ) {
+                (Ok(rel), Ok(parent_rel)) => match core.move_to(&rel, &parent_rel) {
+                    Ok(name) => CtlResponse::Ok {
+                        message: format!("moved {name}"),
+                    },
+                    Err(e) => CtlResponse::Error { message: e },
+                },
+                (Err(e), _) | (_, Err(e)) => CtlResponse::Error { message: e },
+            }
+        }
+        Ok(CtlRequest::Delete { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.delete(&rel) {
+                Ok(name) => CtlResponse::Ok {
+                    message: format!("trashed {name}"),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::CreateFolder { parent, name }) => match rel_to_mount(mountpoint, &parent) {
+            Ok(parent_rel) => match core.create_folder(&parent_rel, &name) {
+                Ok(name) => CtlResponse::Ok {
+                    message: format!("created folder {name}"),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::UploadFile {
+            parent,
+            name,
+            bytes,
+        }) => match rel_to_mount(mountpoint, &parent) {
+            Ok(parent_rel) => match core.upload(&parent_rel, &name, &bytes) {
+                Ok(name) => CtlResponse::Ok {
+                    message: format!("uploaded {name}"),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::PurgeCache) => {
+            let freed = core.cache.clear_unpinned();
+            CtlResponse::Ok {
+                message: format!(
+                    "purged {:.1} MiB of unpinned cache",
+                    freed as f64 / 1_048_576.0
+                ),
+            }
+        }
+        Ok(CtlRequest::SetCacheBudget { bytes }) => {
+            core.cache.set_budget(bytes);
+            // Persist so the next mount keeps the new cap. Best-effort: a config
+            // write failure is reported but the live cap is already applied.
+            match AppDirs::new().map(|dirs| {
+                let mut cfg = dirs.load_config();
+                cfg.cache_budget = Some(bytes);
+                dirs.save_config(&cfg)
+            }) {
+                Ok(Ok(())) => CtlResponse::Ok {
+                    message: format!("cache budget set to {bytes} bytes"),
+                },
+                Ok(Err(e)) => CtlResponse::Error {
+                    message: format!("budget applied but config write failed: {e}"),
+                },
+                Err(e) => CtlResponse::Error {
+                    message: format!("budget applied but config unavailable: {e}"),
+                },
+            }
+        }
         Err(e) => CtlResponse::Error {
             message: format!("bad request: {e}"),
         },

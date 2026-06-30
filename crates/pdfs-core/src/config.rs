@@ -24,6 +24,16 @@ pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub struct AppConfig {
     pub app_version: String,
     pub user_agent: String,
+    /// Soft cap on the on-disk content cache, in bytes (`0` = unlimited).
+    /// `None` means "use [`DEFAULT_CACHE_BUDGET_BYTES`]"; the Settings page
+    /// writes an explicit value here. Defaulted for configs predating the field.
+    #[serde(default)]
+    pub cache_budget: Option<u64>,
+    /// Mountpoint the daemon mounts at. `None` means
+    /// [`AppDirs::default_mountpoint`]; the Settings page writes an explicit
+    /// path here. Defaulted for configs predating the field.
+    #[serde(default)]
+    pub mountpoint: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -31,7 +41,17 @@ impl Default for AppConfig {
         Self {
             app_version: APP_VERSION.to_string(),
             user_agent: USER_AGENT.to_string(),
+            cache_budget: None,
+            mountpoint: None,
         }
+    }
+}
+
+impl AppConfig {
+    /// The effective cache budget in bytes: the user's explicit choice, or
+    /// [`DEFAULT_CACHE_BUDGET_BYTES`] when unset.
+    pub fn resolved_cache_budget(&self) -> u64 {
+        self.cache_budget.unwrap_or(DEFAULT_CACHE_BUDGET_BYTES)
     }
 }
 
@@ -68,6 +88,18 @@ impl AppDirs {
             let _ = std::fs::write(&path, content);
         }
         default_config
+    }
+
+    /// Persist `config` to [`config_path`](Self::config_path), creating the
+    /// config dir if missing. The Settings page calls this after editing the
+    /// cache budget or mountpoint; the daemon re-reads the file on its next mount.
+    pub fn save_config(&self, config: &AppConfig) -> Result<()> {
+        let path = self.config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(config)?)?;
+        Ok(())
     }
 
     /// Persistent state: inode map / cache index DB lives here.
@@ -117,6 +149,16 @@ impl AppDirs {
             .unwrap_or_else(|| PathBuf::from("/tmp/ProtonDrive"))
     }
 
+    /// The effective mountpoint: the config's explicit path, or
+    /// [`default_mountpoint`](Self::default_mountpoint) when unset.
+    pub fn resolved_mountpoint(&self, config: &AppConfig) -> PathBuf {
+        config
+            .mountpoint
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.default_mountpoint())
+    }
+
     /// Create state + cache dirs if missing.
     pub fn ensure(&self) -> Result<()> {
         std::fs::create_dir_all(self.state_dir())?;
@@ -135,6 +177,8 @@ mod tests {
         let config = AppConfig {
             app_version: "external-drive-test-client@1.0.0".to_string(),
             user_agent: "test-agent/1.0".to_string(),
+            cache_budget: Some(1234),
+            mountpoint: Some("/tmp/x".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();

@@ -93,6 +93,18 @@ struct Ui {
     mount_row: adw::ActionRow,
     cache_bar: gtk4::ProgressBar,
     cache_label: gtk4::Label,
+    /// "Start on login" toggle. [`Self::settings_suppress`] guards programmatic
+    /// sets so reflecting the systemd state doesn't fire the toggle handler.
+    autostart_row: adw::SwitchRow,
+    /// Cache-budget editor (GiB). Populated once from config; user edits drive a
+    /// `SetCacheBudget` round-trip. Guarded by [`Self::settings_suppress`].
+    budget_row: adw::SpinRow,
+    /// Shows the active mountpoint in its subtitle; updated when the user picks a
+    /// new folder.
+    mountpoint_row: adw::ActionRow,
+    /// Set while a settings widget is being populated programmatically, so its
+    /// change handler skips the IPC/systemd side effect.
+    settings_suppress: Cell<bool>,
     pins_group: adw::PreferencesGroup,
     /// Rows currently shown under [`Self::pins_group`], retained so a refresh can
     /// diff against them and only rebuild when the pin set actually changes.
@@ -110,7 +122,9 @@ struct Ui {
     /// Shared model behind the grid and column views; repopulated per directory.
     browser_model: gio::ListStore,
     browser_back: gtk4::Button,
-    browser_crumb: gtk4::Label,
+    /// Clickable breadcrumb trail (a button per path segment); rebuilt per load
+    /// by [`repaint_crumb`] so each ancestor folder navigates on click.
+    browser_crumb: gtk4::Box,
     browser_status: gtk4::Label,
     /// Shown beside [`Self::browser_status`] when a load failed because the mount
     /// service is down (not merely starting); restarts the service and reloads.
@@ -185,6 +199,10 @@ fn load_proton_theme() {
          .file-grid {{ padding: 6px; }}\n\
          .file-tile {{ padding: 8px; border-radius: 10px; }}\n\
          .file-tile:hover {{ background: alpha({PROTON_PURPLE}, 0.10); }}\n\
+         .file-badge {{ -gtk-icon-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }}\n\
+         .badge-pinned {{ color: #f5c211; }}\n\
+         .badge-cached {{ color: #2ec27e; }}\n\
+         .badge-cloud {{ color: #9aa0a6; }}\n\
          .photo-viewer-window {{ background-color: #000000; }}\n\
          .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0)); padding: 12px 24px; color: white; }}\n\
          .viewer-title {{ font-weight: bold; font-size: 1.1rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
@@ -258,11 +276,15 @@ fn build_window(app: &adw::Application) {
         password: login_widgets.1,
         login_button: login_widgets.2,
         login_status: login_widgets.3,
-        account_row: main_widgets.0,
-        mount_row: main_widgets.1,
-        cache_bar: main_widgets.2,
-        cache_label: main_widgets.3,
-        pins_group: main_widgets.4,
+        account_row: main_widgets.account_row.clone(),
+        mount_row: main_widgets.mount_row.clone(),
+        cache_bar: main_widgets.cache_bar.clone(),
+        cache_label: main_widgets.cache_label.clone(),
+        autostart_row: main_widgets.autostart_row.clone(),
+        budget_row: main_widgets.budget_row.clone(),
+        mountpoint_row: main_widgets.mountpoint_row.clone(),
+        settings_suppress: Cell::new(false),
+        pins_group: main_widgets.pins_group.clone(),
         pin_rows: RefCell::new(Vec::new()),
         pins_state: RefCell::new(None),
         mounted: RefCell::new(false),
@@ -283,8 +305,14 @@ fn build_window(app: &adw::Application) {
     });
 
     wire_login(&ui);
-    wire_logout(&ui, &main_widgets.5);
+    wire_logout(&ui, &main_widgets.logout_button);
+    wire_settings(
+        &ui,
+        &main_widgets.purge_button,
+        &main_widgets.mountpoint_button,
+    );
     wire_browser(&ui, &browser_widgets.4, &browser_widgets.5);
+    wire_browser_actions(&ui, &browser_widgets.8, &browser_widgets.9);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.3);
     wire_retry(&ui);
@@ -409,21 +437,30 @@ fn build_login_page() -> (
     )
 }
 
-/// The main (logged-in) page: account header, mount toggle, storage usage and
-/// the pin list. Returns the widgets the refresh loop updates plus the logout
-/// button to wire.
-#[allow(clippy::type_complexity)]
-fn build_main_page() -> (
-    gtk4::Widget,
-    (
-        adw::ActionRow,
-        adw::ActionRow,
-        gtk4::ProgressBar,
-        gtk4::Label,
-        adw::PreferencesGroup,
-        gtk4::Button,
-    ),
-) {
+/// Widgets the settings page hands back for the refresh loop and action wiring.
+struct MainWidgets {
+    account_row: adw::ActionRow,
+    mount_row: adw::ActionRow,
+    cache_bar: gtk4::ProgressBar,
+    cache_label: gtk4::Label,
+    pins_group: adw::PreferencesGroup,
+    logout_button: gtk4::Button,
+    /// "Start on login" toggle, reflecting the systemd unit's enabled state.
+    autostart_row: adw::SwitchRow,
+    /// Cache soft-cap editor, in GiB; `0` = unlimited.
+    budget_row: adw::SpinRow,
+    /// Purges all unpinned cached content.
+    purge_button: gtk4::Button,
+    /// Shows the active mountpoint; its suffix button opens a folder chooser.
+    mountpoint_row: adw::ActionRow,
+    mountpoint_button: gtk4::Button,
+}
+
+/// The main (logged-in) page: a libadwaita settings surface — account header,
+/// mount status, storage controls (cache budget + purge), system integration
+/// (start-on-login, mountpoint), the pin list, and developer overrides. Returns
+/// the widgets the refresh loop updates plus the controls to wire.
+fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     // Account group: identity + sign-out.
     let account_group = adw::PreferencesGroup::new();
     let account_row = adw::ActionRow::builder().title("Not signed in").build();
@@ -446,7 +483,9 @@ fn build_main_page() -> (
         .build();
     mount_group.add(&mount_row);
 
-    // Storage group: a progress bar + "X of Y used" label.
+    // Storage group: a progress bar + "X of Y used" label, plus the cache-budget
+    // editor and a purge button. `budget_row`/`purge_button` are wired in
+    // `wire_settings`; the bar + label are repainted by the refresh loop.
     let storage_group = adw::PreferencesGroup::builder()
         .title("Storage")
         .description("Local cache for pinned and recently opened files.")
@@ -459,13 +498,75 @@ fn build_main_page() -> (
     cache_label.add_css_class("dim-label");
     storage_box.append(&cache_bar);
     storage_box.append(&cache_label);
-    storage_group.add(&storage_box);
+    let usage_row = adw::PreferencesRow::builder()
+        .activatable(false)
+        .child(&storage_box)
+        .build();
+    storage_group.add(&usage_row);
+
+    // Cache budget, expressed in GiB. 0 = unlimited; the daemon applies a 0 cap
+    // as "no eviction". Step in 0.5 GiB; the upper bound is generous.
+    let budget_adj = gtk4::Adjustment::new(0.0, 0.0, 1024.0, 0.5, 1.0, 0.0);
+    let budget_row = adw::SpinRow::builder()
+        .title("Cache budget (GiB)")
+        .subtitle("Soft cap for cached content; 0 = unlimited.")
+        .adjustment(&budget_adj)
+        .digits(1)
+        .build();
+    storage_group.add(&budget_row);
+    let purge_row = adw::ActionRow::builder()
+        .title("Purge cache")
+        .subtitle("Delete cached content. Pinned files are kept.")
+        .build();
+    let purge_button = gtk4::Button::builder()
+        .label("Purge")
+        .valign(gtk4::Align::Center)
+        .build();
+    purge_button.add_css_class("destructive-action");
+    purge_row.add_suffix(&purge_button);
+    storage_group.add(&purge_row);
+
+    // System integration: start-on-login + mountpoint chooser.
+    let system_group = adw::PreferencesGroup::builder()
+        .title("System integration")
+        .build();
+    let autostart_row = adw::SwitchRow::builder()
+        .title("Start on login")
+        .subtitle("Mount Proton Drive automatically when you log in.")
+        .build();
+    system_group.add(&autostart_row);
+    let mountpoint_row = adw::ActionRow::builder()
+        .title("Mountpoint")
+        .subtitle("—")
+        .build();
+    let mountpoint_button = gtk4::Button::builder()
+        .label("Change")
+        .valign(gtk4::Align::Center)
+        .build();
+    mountpoint_button.add_css_class("flat");
+    mountpoint_row.add_suffix(&mountpoint_button);
+    system_group.add(&mountpoint_row);
 
     // Pins group: filled in by refresh.
     let pins_group = adw::PreferencesGroup::builder()
         .title("Pinned files")
         .description("Kept available offline on this device.")
         .build();
+
+    // Developer overrides: read-only client identity, for support/debugging.
+    let dev_group = adw::PreferencesGroup::builder().title("Developer").build();
+    let version_row = adw::ActionRow::builder()
+        .title("App version")
+        .subtitle(pdfs_core::config::APP_VERSION)
+        .build();
+    version_row.add_css_class("property");
+    let agent_row = adw::ActionRow::builder()
+        .title("User agent")
+        .subtitle(pdfs_core::config::USER_AGENT)
+        .build();
+    agent_row.add_css_class("property");
+    dev_group.add(&version_row);
+    dev_group.add(&agent_row);
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
     inner.set_margin_top(18);
@@ -475,7 +576,9 @@ fn build_main_page() -> (
     inner.append(&account_group);
     inner.append(&mount_group);
     inner.append(&storage_group);
+    inner.append(&system_group);
     inner.append(&pins_group);
+    inner.append(&dev_group);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(560)
@@ -485,14 +588,19 @@ fn build_main_page() -> (
 
     (
         scroll.upcast(),
-        (
+        MainWidgets {
             account_row,
             mount_row,
             cache_bar,
             cache_label,
             pins_group,
             logout_button,
-        ),
+            autostart_row,
+            budget_row,
+            purge_button,
+            mountpoint_row,
+            mountpoint_button,
+        },
     )
 }
 
@@ -643,6 +751,144 @@ fn wire_logout(ui: &Rc<Ui>, button: &gtk4::Button) {
         }
         *ui.session.borrow_mut() = None;
         refresh(&ui);
+    });
+}
+
+/// Bytes per GiB, for the cache-budget editor's unit conversion.
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Wire the Settings-page controls: the cache-budget editor, the purge button,
+/// the start-on-login switch and the mountpoint chooser. Initial widget state is
+/// read once from config / systemd here (the refresh loop owns only the live
+/// mount + cache-usage read-out), with [`Ui::settings_suppress`] set around the
+/// programmatic populate so the change handlers don't fire on it.
+fn wire_settings(ui: &Rc<Ui>, purge_button: &gtk4::Button, mountpoint_button: &gtk4::Button) {
+    let config = ui.dirs.load_config();
+
+    // Populate from persisted config + the systemd unit state, suppressed.
+    ui.settings_suppress.set(true);
+    ui.budget_row
+        .set_value(config.resolved_cache_budget() as f64 / GIB);
+    ui.mountpoint_row
+        .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
+    ui.autostart_row.set_active(service::is_enabled());
+    ui.settings_suppress.set(false);
+
+    // Cache budget: a user edit applies the new soft cap on the daemon (which
+    // also persists it to config). 0 GiB = unlimited.
+    let ui_budget = ui.clone();
+    ui.budget_row.connect_value_notify(move |row| {
+        if ui_budget.settings_suppress.get() {
+            return;
+        }
+        let bytes = (row.value() * GIB).round() as u64;
+        settings_request(
+            &ui_budget,
+            Request::SetCacheBudget { bytes },
+            "Couldn't set cache budget",
+        );
+    });
+
+    // Purge: confirm, then drop all unpinned cached content via the daemon.
+    let ui_purge = ui.clone();
+    purge_button.connect_clicked(move |_| {
+        let ui = ui_purge.clone();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Purge cache")
+            .body("Delete all cached content that isn't pinned? Pinned files stay offline.")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("purge", "Purge");
+        dialog.set_response_appearance("purge", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, move |_, resp| {
+            if resp == "purge" {
+                settings_request(&ui, Request::PurgeCache, "Couldn't purge cache");
+            }
+        });
+        dialog.present(ui_window(&ui_purge).as_ref());
+    });
+
+    // Start on login: enable/disable the systemd unit without stopping a live
+    // mount (the user can disconnect separately).
+    let ui_auto = ui.clone();
+    ui.autostart_row.connect_active_notify(move |row| {
+        if ui_auto.settings_suppress.get() {
+            return;
+        }
+        if row.is_active() {
+            service::enable();
+        } else {
+            service::disable();
+        }
+    });
+
+    // Mountpoint: pick a folder, persist it, and offer to restart the mount so
+    // the change takes effect (the daemon reads the path on mount).
+    let ui_mp = ui.clone();
+    mountpoint_button.connect_clicked(move |_| prompt_mountpoint(&ui_mp));
+}
+
+/// Run a settings control-socket round-trip (budget / purge) on a worker thread,
+/// surfacing the daemon's error under `err_heading` on failure. Unlike
+/// [`run_mutation`] there's no browser reload; the next refresh tick repaints the
+/// cache read-out.
+fn settings_request(ui: &Rc<Ui>, req: Request, err_heading: &'static str) {
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), req);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::Ok { .. })) => {}
+            Ok(Ok(Response::Error { message })) => alert(&ui, err_heading, &message),
+            _ => alert(&ui, err_heading, "The mount service didn't respond."),
+        }
+    });
+}
+
+/// Prompt for a new mountpoint folder, persist it to config, and offer to restart
+/// the mount service so the daemon picks it up.
+fn prompt_mountpoint(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let dialog = gtk4::FileDialog::builder()
+        .title("Choose mountpoint folder")
+        .build();
+    let ui = ui.clone();
+    dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Ok(folder) = res else { return };
+        let Some(path) = folder.path() else { return };
+        let path_str = path.display().to_string();
+
+        // Persist the choice to config so the next mount uses it.
+        let mut config = ui.dirs.load_config();
+        config.mountpoint = Some(path_str.clone());
+        if let Err(e) = ui.dirs.save_config(&config) {
+            alert(&ui, "Couldn't save mountpoint", &e.to_string());
+            return;
+        }
+        ui.mountpoint_row.set_subtitle(&path_str);
+
+        // The daemon only reads the mountpoint at mount time, so offer a restart.
+        let confirm = adw::AlertDialog::builder()
+            .heading("Restart to apply")
+            .body(format!(
+                "The mountpoint is now “{path_str}”. Restart the Drive mount to use it?"
+            ))
+            .build();
+        confirm.add_response("later", "Later");
+        confirm.add_response("restart", "Restart now");
+        confirm.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
+        confirm.set_default_response(Some("restart"));
+        confirm.set_close_response("later");
+        confirm.connect_response(None, |_, resp| {
+            if resp == "restart" {
+                service::restart();
+            }
+        });
+        confirm.present(ui_window(&ui).as_ref());
     });
 }
 
@@ -851,12 +1097,14 @@ fn build_browser_page() -> (
     (
         gio::ListStore,
         gtk4::Button,
-        gtk4::Label,
+        gtk4::Box,
         gtk4::Label,
         gtk4::GridView,
         gtk4::ColumnView,
         gtk4::Button,
         gtk4::SearchEntry,
+        gtk4::Button,
+        gtk4::Button,
     ),
 ) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
@@ -868,13 +1116,32 @@ fn build_browser_page() -> (
         .sensitive(false)
         .build();
     back.add_css_class("flat");
-    let crumb = gtk4::Label::builder()
-        .label("Proton Drive")
-        .halign(gtk4::Align::Start)
+    // Clickable breadcrumb trail; `repaint_crumb` fills it per load. Wrapped in a
+    // horizontally-scrolling viewport so a deep path can't shove the search box
+    // and view toggles off the right edge.
+    let crumb = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    crumb.set_valign(gtk4::Align::Center);
+    let crumb_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::External)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
         .hexpand(true)
-        .ellipsize(gtk4::pango::EllipsizeMode::Start)
+        .child(&crumb)
         .build();
-    crumb.add_css_class("heading");
+
+    // Folder-level actions: create a subfolder / upload a file into the current
+    // directory. Wired in `wire_browser_actions`.
+    let new_folder = gtk4::Button::builder()
+        .icon_name("folder-new-symbolic")
+        .tooltip_text("New folder")
+        .valign(gtk4::Align::Center)
+        .build();
+    new_folder.add_css_class("flat");
+    let upload = gtk4::Button::builder()
+        .icon_name("document-send-symbolic")
+        .tooltip_text("Upload file")
+        .valign(gtk4::Align::Center)
+        .build();
+    upload.add_css_class("flat");
 
     // Linked grid/list toggle, top-right, Nautilus-style.
     let grid_toggle = gtk4::ToggleButton::builder()
@@ -900,7 +1167,9 @@ fn build_browser_page() -> (
 
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&back);
-    header.append(&crumb);
+    header.append(&crumb_scroll);
+    header.append(&new_folder);
+    header.append(&upload);
     header.append(&search);
     header.append(&toggles);
 
@@ -971,7 +1240,18 @@ fn build_browser_page() -> (
 
     (
         inner.upcast(),
-        (model, back, crumb, status, grid, column_view, retry, search),
+        (
+            model,
+            back,
+            crumb,
+            status,
+            grid,
+            column_view,
+            retry,
+            search,
+            new_folder,
+            upload,
+        ),
     )
 }
 
@@ -999,6 +1279,16 @@ fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk4::ColumnVi
         move |_, item| {
             let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
             let icon = gtk4::Image::builder().pixel_size(64).build();
+            // Corner sync-state badge, overlaid on the big icon.
+            let badge = gtk4::Image::builder()
+                .pixel_size(18)
+                .halign(gtk4::Align::End)
+                .valign(gtk4::Align::End)
+                .build();
+            badge.add_css_class("file-badge");
+            let overlay = gtk4::Overlay::new();
+            overlay.set_child(Some(&icon));
+            overlay.add_overlay(&badge);
             let label = gtk4::Label::builder()
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
                 .justify(gtk4::Justification::Center)
@@ -1009,21 +1299,26 @@ fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk4::ColumnVi
                 .build();
             let tile = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
             tile.add_css_class("file-tile");
-            tile.append(&icon);
+            tile.append(&overlay);
             tile.append(&label);
             attach_context_menu(&ui, item, &tile);
+            attach_drag(&ui, item, &tile);
+            attach_drop(&ui, item, &tile);
             item.set_child(Some(&tile));
         }
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
         let tile = item.child().and_downcast::<gtk4::Box>().unwrap();
-        let icon = tile.first_child().and_downcast::<gtk4::Image>().unwrap();
+        let overlay = tile.first_child().and_downcast::<gtk4::Overlay>().unwrap();
+        let icon = overlay.first_child().and_downcast::<gtk4::Image>().unwrap();
+        let badge = overlay.last_child().and_downcast::<gtk4::Image>().unwrap();
         let label = tile.last_child().and_downcast::<gtk4::Label>().unwrap();
         let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
         let entry = obj.borrow::<DirEntry>();
         icon.set_icon_name(Some(icon_base_for(&entry)));
-        label.set_label(&display_name(&entry));
+        label.set_label(&entry.name);
+        apply_badge(&badge, &entry);
     });
     grid.set_factory(Some(&factory));
 
@@ -1063,10 +1358,15 @@ fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
             let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
             let icon = gtk4::Image::builder().pixel_size(16).build();
             let label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+            let badge = gtk4::Image::builder().pixel_size(14).build();
+            badge.add_css_class("file-badge");
             let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             cell.append(&icon);
             cell.append(&label);
+            cell.append(&badge);
             attach_context_menu(&ui, item, &cell);
+            attach_drag(&ui, item, &cell);
+            attach_drop(&ui, item, &cell);
             item.set_child(Some(&cell));
         }
     });
@@ -1074,11 +1374,13 @@ fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
         let cell = item.child().and_downcast::<gtk4::Box>().unwrap();
         let icon = cell.first_child().and_downcast::<gtk4::Image>().unwrap();
-        let label = cell.last_child().and_downcast::<gtk4::Label>().unwrap();
+        let badge = cell.last_child().and_downcast::<gtk4::Image>().unwrap();
+        let label = icon.next_sibling().and_downcast::<gtk4::Label>().unwrap();
         let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
         let entry = obj.borrow::<DirEntry>();
         icon.set_icon_name(Some(&format!("{}-symbolic", icon_base_for(&entry))));
-        label.set_label(&display_name(&entry));
+        label.set_label(&entry.name);
+        apply_badge(&badge, &entry);
     });
     let column = gtk4::ColumnViewColumn::new(Some("Name"), Some(factory));
     column.set_expand(true);
@@ -1167,6 +1469,38 @@ fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Box, x: f64, 
         });
         menu.append(&pin);
     }
+
+    menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let rename = menu_item("Rename…", "document-edit-symbolic");
+    let ui_rn = ui.clone();
+    let entry_rn = entry.clone();
+    let pop = popover.clone();
+    rename.connect_clicked(move |_| {
+        pop.popdown();
+        prompt_rename(&ui_rn, &entry_rn);
+    });
+    menu.append(&rename);
+
+    let move_it = menu_item("Move…", "folder-move-symbolic");
+    let ui_mv = ui.clone();
+    let entry_mv = entry.clone();
+    let pop = popover.clone();
+    move_it.connect_clicked(move |_| {
+        pop.popdown();
+        prompt_move(&ui_mv, &entry_mv);
+    });
+    menu.append(&move_it);
+
+    let trash = menu_item("Move to Trash", "user-trash-symbolic");
+    let ui_tr = ui.clone();
+    let entry_tr = entry.clone();
+    let pop = popover.clone();
+    trash.connect_clicked(move |_| {
+        pop.popdown();
+        prompt_delete(&ui_tr, &entry_tr);
+    });
+    menu.append(&trash);
 
     popover.popup();
 }
@@ -1268,14 +1602,360 @@ fn entry_rel(ui: &Rc<Ui>, entry: &DirEntry) -> String {
     }
 }
 
-/// The name shown under a tile / in the Name column, marked with a star when the
-/// file is kept offline.
-fn display_name(entry: &DirEntry) -> String {
-    if entry.pinned {
-        format!("★ {}", entry.name)
-    } else {
-        entry.name.clone()
+/// Rebuild the clickable breadcrumb trail for the mountpoint-relative `path`. The
+/// root is always present ("Proton Drive"); each segment becomes a flat button
+/// that navigates to that ancestor, except the last (the current folder), shown
+/// as a plain heading label.
+fn repaint_crumb(ui: &Rc<Ui>, path: &str) {
+    while let Some(child) = ui.browser_crumb.first_child() {
+        ui.browser_crumb.remove(&child);
     }
+    let segments: Vec<&str> = if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    };
+    ui.browser_crumb
+        .append(&crumb_node(ui, "Proton Drive", "", segments.is_empty()));
+    let mut acc = String::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let sep = gtk4::Label::new(Some("›"));
+        sep.add_css_class("dim-label");
+        ui.browser_crumb.append(&sep);
+        acc = if acc.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{acc}/{seg}")
+        };
+        let current = i == segments.len() - 1;
+        ui.browser_crumb.append(&crumb_node(ui, seg, &acc, current));
+    }
+}
+
+/// One breadcrumb segment: a plain heading label for the current folder, or a
+/// flat button that navigates to `target` (clearing any active search first).
+fn crumb_node(ui: &Rc<Ui>, label: &str, target: &str, current: bool) -> gtk4::Widget {
+    if current {
+        let l = gtk4::Label::builder()
+            .label(label)
+            .ellipsize(gtk4::pango::EllipsizeMode::Start)
+            .build();
+        l.add_css_class("heading");
+        return l.upcast();
+    }
+    let button = gtk4::Button::builder().label(label).build();
+    button.add_css_class("flat");
+    let ui = ui.clone();
+    let target = target.to_string();
+    button.connect_clicked(move |_| {
+        ui.browser_search.set_text("");
+        *ui.browser_path.borrow_mut() = target.clone();
+        load_browser(&ui);
+    });
+    button.upcast()
+}
+
+/// Wire the browser header's New-folder and Upload-file buttons.
+fn wire_browser_actions(ui: &Rc<Ui>, new_folder: &gtk4::Button, upload: &gtk4::Button) {
+    let ui_nf = ui.clone();
+    new_folder.connect_clicked(move |_| prompt_new_folder(&ui_nf));
+    let ui_up = ui.clone();
+    upload.connect_clicked(move |_| prompt_upload(&ui_up));
+}
+
+/// Send a mutating browser request (rename / move / delete / mkdir / upload) on a
+/// worker thread, then reload the current listing on success or surface the
+/// daemon's error in a dialog. Mirrors the gallery upload flow.
+fn run_mutation(ui: &Rc<Ui>, req: Request) {
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), req);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::Ok { .. })) => load_browser(&ui),
+            Ok(Ok(Response::Error { message })) => alert(&ui, "Couldn't complete", &message),
+            _ => alert(
+                &ui,
+                "Couldn't complete",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
+/// Prompt for a new name and rename the entry through the daemon.
+fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
+    let parent = ui_window(ui);
+    let rel = entry_rel(ui, entry);
+    let original = entry.name.clone();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Rename")
+        .body(format!("Rename “{original}”."))
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let row = adw::EntryRow::builder().title("New name").build();
+    row.set_text(&original);
+    group.add(&row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", "Rename");
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("confirm"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "confirm" {
+            return;
+        }
+        let new_name = row.text().trim().to_string();
+        if new_name.is_empty() || new_name == original {
+            return;
+        }
+        run_mutation(
+            &ui,
+            Request::Rename {
+                path: rel.clone(),
+                new_name,
+            },
+        );
+    });
+    dialog.present(parent.as_ref());
+}
+
+/// Prompt for a destination folder (mountpoint-relative, empty = Drive root) and
+/// move the entry there through the daemon.
+fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
+    let parent = ui_window(ui);
+    let rel = entry_rel(ui, entry);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Move")
+        .body(format!(
+            "Move “{}” into another folder. Enter its path from the Drive root \
+             (leave blank for the root).",
+            entry.name
+        ))
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let row = adw::EntryRow::builder().title("Destination folder").build();
+    group.add(&row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", "Move");
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("confirm"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "confirm" {
+            return;
+        }
+        let new_parent = row.text().trim().trim_matches('/').to_string();
+        run_mutation(
+            &ui,
+            Request::Move {
+                path: rel.clone(),
+                new_parent,
+            },
+        );
+    });
+    dialog.present(parent.as_ref());
+}
+
+/// Confirm and move the entry to Trash through the daemon.
+fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
+    let win = ui_window(ui);
+    let rel = entry_rel(ui, entry);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Move to Trash")
+        .body(format!("Move “{}” to Trash?", entry.name))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("trash", "Move to Trash");
+    dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "trash" {
+            run_mutation(&ui, Request::Delete { path: rel.clone() });
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Prompt for a folder name and create it under the current browser directory.
+fn prompt_new_folder(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let parent = ui.browser_path.borrow().clone();
+    let dialog = adw::AlertDialog::builder()
+        .heading("New folder")
+        .body("Create a folder in the current directory.")
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let row = adw::EntryRow::builder().title("Folder name").build();
+    group.add(&row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", "Create");
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("confirm"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "confirm" {
+            return;
+        }
+        let name = row.text().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        run_mutation(
+            &ui,
+            Request::CreateFolder {
+                parent: parent.clone(),
+                name,
+            },
+        );
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Pick a local file and upload it into the current browser directory.
+fn prompt_upload(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let parent = ui.browser_path.borrow().clone();
+    let dialog = gtk4::FileDialog::builder().title("Upload File").build();
+    let ui = ui.clone();
+    dialog.open(win.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Ok(file) = res else { return };
+        let Some(path) = file.path() else { return };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                alert(&ui, "Upload failed", &format!("Couldn't read file: {e}"));
+                return;
+            }
+        };
+        run_mutation(
+            &ui,
+            Request::UploadFile {
+                parent: parent.clone(),
+                name,
+                bytes,
+            },
+        );
+    });
+}
+
+/// The top-level window, for parenting dialogs.
+fn ui_window(ui: &Rc<Ui>) -> Option<gtk4::Window> {
+    ui.stack.root().and_downcast::<gtk4::Window>()
+}
+
+/// Show a simple modal alert with a single OK button.
+fn alert(ui: &Rc<Ui>, heading: &str, body: &str) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .build();
+    dialog.add_response("ok", "OK");
+    dialog.present(ui_window(ui).as_ref());
+}
+
+/// The sync-state badge for an entry: `(icon, css-class)`, or `None` for folders
+/// (which carry no per-file cache state). Pinned (kept offline) ranks above merely
+/// cached (downloaded, evictable); everything else is online-only.
+fn badge_for(entry: &DirEntry) -> Option<(&'static str, &'static str)> {
+    if entry.is_dir {
+        return None;
+    }
+    Some(if entry.pinned {
+        ("starred-symbolic", "badge-pinned")
+    } else if entry.cached {
+        ("emblem-ok-symbolic", "badge-cached")
+    } else {
+        ("weather-overcast-symbolic", "badge-cloud")
+    })
+}
+
+/// Paint `badge` to reflect the entry's sync state (see [`badge_for`]). Clears any
+/// prior colour class first, since list factories recycle cells.
+fn apply_badge(badge: &gtk4::Image, entry: &DirEntry) {
+    for class in ["badge-pinned", "badge-cached", "badge-cloud"] {
+        badge.remove_css_class(class);
+    }
+    match badge_for(entry) {
+        Some((icon, class)) => {
+            badge.set_icon_name(Some(icon));
+            badge.add_css_class(class);
+            badge.set_visible(true);
+        }
+        None => badge.set_visible(false),
+    }
+}
+
+/// Make a browser cell draggable, carrying the bound entry's mountpoint-relative
+/// path as the drag payload. Reads the entry live at drag time (via the captured
+/// [`gtk4::ListItem`]) so a recycled cell drags whatever it currently shows.
+fn attach_drag(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
+    let source = gtk4::DragSource::new();
+    source.set_actions(gtk4::gdk::DragAction::MOVE);
+    let ui = ui.clone();
+    let item = item.clone();
+    source.connect_prepare(move |_, _, _| {
+        let obj = item.item().and_downcast::<BoxedAnyObject>()?;
+        let rel = entry_rel(&ui, &obj.borrow::<DirEntry>());
+        Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(
+            rel.as_str(),
+        )))
+    });
+    anchor.add_controller(source);
+}
+
+/// Make a browser cell a drop target: dropping a dragged path onto a *folder* cell
+/// moves the source into it through the daemon. Drops onto files, onto the item
+/// itself, or that would move a folder into its own subtree are rejected.
+fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
+    let target = gtk4::DropTarget::new(glib::types::Type::STRING, gtk4::gdk::DragAction::MOVE);
+    let ui = ui.clone();
+    let item = item.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() else {
+            return false;
+        };
+        let dest = obj.borrow::<DirEntry>();
+        if !dest.is_dir {
+            return false;
+        }
+        let Ok(src) = value.get::<String>() else {
+            return false;
+        };
+        let dest_path = entry_rel(&ui, &dest);
+        // No-op onto self, and never move a folder into itself or a descendant.
+        if src == dest_path || dest_path.starts_with(&format!("{src}/")) {
+            return false;
+        }
+        run_mutation(
+            &ui,
+            Request::Move {
+                path: src,
+                new_parent: dest_path,
+            },
+        );
+        true
+    });
+    anchor.add_controller(target);
 }
 
 /// Pick a freedesktop icon base name for an entry from its kind / extension.
@@ -1318,11 +1998,7 @@ fn format_modified(secs: i64) -> String {
 /// Request the current browser directory from the daemon and repaint both views.
 fn load_browser(ui: &Rc<Ui>) {
     let path = ui.browser_path.borrow().clone();
-    ui.browser_crumb.set_label(if path.is_empty() {
-        "Proton Drive"
-    } else {
-        &path
-    });
+    repaint_crumb(ui, &path);
     ui.browser_back.set_sensitive(!path.is_empty());
 
     // Drop the previous folder's rows up front: a slow reply must not leave stale
@@ -1477,6 +2153,8 @@ fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             size: h.size,
             modified: h.modified,
             pinned: h.pinned,
+            // Search hits don't carry cache state; the badge shows in listings.
+            cached: false,
             uid: h.uid.clone(),
             path: h.path.clone(),
         })
@@ -1634,91 +2312,87 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
         let parent_win = ui.stack.root().and_downcast::<gtk4::Window>();
         dialog.open(parent_win.as_ref(), gio::Cancellable::NONE, move |res| {
             if let Ok(file) = res
-                && let Some(path) = file.path() {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("photo.jpg")
-                        .to_string();
-                    let bytes = match std::fs::read(&path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!("Failed to read photo: {e}");
-                            return;
-                        }
-                    };
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg")
-                        .to_lowercase();
-                    let media_type = match ext.as_str() {
-                        "png" => "image/png",
-                        "gif" => "image/gif",
-                        "webp" => "image/webp",
-                        "tiff" | "tif" => "image/tiff",
-                        _ => "image/jpeg",
-                    };
-                    let capture_time = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64);
+                && let Some(path) = file.path()
+            {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("photo.jpg")
+                    .to_string();
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!("Failed to read photo: {e}");
+                        return;
+                    }
+                };
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg")
+                    .to_lowercase();
+                let media_type = match ext.as_str() {
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "tiff" | "tif" => "image/tiff",
+                    _ => "image/jpeg",
+                };
+                let capture_time = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
 
-                    ui.busy_begin();
-                    let rx = spawn_request(
-                        ui.dirs.control_socket(),
-                        Request::UploadPhoto {
-                            name,
-                            media_type: media_type.to_string(),
-                            bytes,
-                            capture_time,
-                        },
-                    );
-                    let ui_clone = ui.clone();
-                    glib::spawn_future_local(async move {
-                        let res = rx.recv().await;
-                        ui_clone.busy_end();
-                        match res {
-                            Ok(Ok(Response::Ok { message })) => {
-                                tracing::info!("Photo uploaded: {message}");
-                                load_gallery(&ui_clone, false);
-                            }
-                            Ok(Ok(Response::Error { message })) => {
-                                tracing::error!("Upload failed: {message}");
-                                show_error_dialog(&ui_clone, &format!("Upload failed: {message}"));
-                            }
-                            _ => {
-                                tracing::error!("Upload request failed");
-                                show_error_dialog(
-                                    &ui_clone,
-                                    "Upload request failed (daemon unreachable).",
-                                );
-                            }
+                ui.busy_begin();
+                let rx = spawn_request(
+                    ui.dirs.control_socket(),
+                    Request::UploadPhoto {
+                        name,
+                        media_type: media_type.to_string(),
+                        bytes,
+                        capture_time,
+                    },
+                );
+                let ui_clone = ui.clone();
+                glib::spawn_future_local(async move {
+                    let res = rx.recv().await;
+                    ui_clone.busy_end();
+                    match res {
+                        Ok(Ok(Response::Ok { message })) => {
+                            tracing::info!("Photo uploaded: {message}");
+                            load_gallery(&ui_clone, false);
                         }
-                    });
-                }
+                        Ok(Ok(Response::Error { message })) => {
+                            tracing::error!("Upload failed: {message}");
+                            show_error_dialog(&ui_clone, &format!("Upload failed: {message}"));
+                        }
+                        _ => {
+                            tracing::error!("Upload request failed");
+                            show_error_dialog(
+                                &ui_clone,
+                                "Upload request failed (daemon unreachable).",
+                            );
+                        }
+                    }
+                });
+            }
         });
     });
 }
 
 fn show_error_dialog(ui: &Rc<Ui>, message: &str) {
-    let parent = ui.stack.root().and_downcast::<gtk4::Window>();
-    let dialog = adw::AlertDialog::builder()
-        .heading("Photo Operation")
-        .body(message)
-        .build();
-    dialog.add_response("ok", "OK");
-    dialog.present(parent.as_ref());
+    alert(ui, "Photo Operation", message);
 }
 
 fn find_photo_index(model: &gio::ListStore, uid: &str) -> Option<u32> {
     for i in 0..model.n_items() {
         if let Some(obj) = model.item(i)
             && let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>()
-                && boxed.borrow::<PhotoItem>().uid == uid {
-                    return Some(i);
-                }
+            && boxed.borrow::<PhotoItem>().uid == uid
+        {
+            return Some(i);
+        }
     }
     None
 }
@@ -1790,13 +2464,14 @@ fn save_photo_to_disk(window: &gtk4::Window, source_path: &str, original_name: &
     let source_path_str = source_path.to_string();
     dialog.save(Some(window), gio::Cancellable::NONE, move |res| {
         if let Ok(file) = res
-            && let Some(dest_path) = file.path() {
-                if let Err(e) = std::fs::copy(&source_path_str, &dest_path) {
-                    tracing::error!("Failed to copy file to {:?}: {}", dest_path, e);
-                } else {
-                    tracing::info!("Saved photo to {:?}", dest_path);
-                }
+            && let Some(dest_path) = file.path()
+        {
+            if let Err(e) = std::fs::copy(&source_path_str, &dest_path) {
+                tracing::error!("Failed to copy file to {:?}: {}", dest_path, e);
+            } else {
+                tracing::info!("Saved photo to {:?}", dest_path);
             }
+        }
     });
 }
 
@@ -1958,9 +2633,10 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let mut initial_capture_time = 0;
     if let Some(obj) = ui.gallery_model.item(initial_idx)
-        && let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() {
-            initial_capture_time = boxed.borrow::<PhotoItem>().capture_time;
-        }
+        && let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>()
+    {
+        initial_capture_time = boxed.borrow::<PhotoItem>().capture_time;
+    }
     let date_str = format_capture_time(initial_capture_time);
     title_label.set_label(&format!(
         "Photo {} of {} • {}",
