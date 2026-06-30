@@ -1571,11 +1571,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         return;
     }
     let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
-        Ok(CtlRequest::Status) => CtlResponse::Status {
-            username: username.to_string(),
-            mountpoint: mountpoint.display().to_string(),
-            pinned: core.cache.list_pins().len(),
-        },
+        Ok(CtlRequest::Status) => {
+            let pins = core.cache.list_pins();
+            CtlResponse::Status {
+                username: username.to_string(),
+                mountpoint: mountpoint.display().to_string(),
+                pinned: pins.len(),
+                used: core.cache.usage(),
+                budget: core.cache.budget(),
+                pins,
+            }
+        }
         Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.pin(&rel) {
                 Ok(name) => CtlResponse::Ok {

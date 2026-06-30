@@ -8,13 +8,14 @@
 //! * a **login form** (email / password / optional 2FA) driving
 //!   [`pdfs_core::auth::login`]; logging in enables the systemd mount service;
 //! * a **read-only mount status** line (the mount is managed automatically);
-//! * a **cache usage** read-out from the on-disk [`ContentCache`]; and
+//! * a **cache usage** read-out; and
 //! * the **pin list** with per-file unpin.
 //!
-//! State the GUI only displays (cache size, pins, login identity) is read
-//! straight off disk via `pdfs-core`, so the window is useful even with no mount
-//! daemon running; live mount status comes from the daemon over the control
-//! socket the CLI and tray already speak.
+//! Mount status, cache usage and the pin list all ride along on one
+//! [`Request::Status`] round-trip to the daemon (which owns the cache), fetched on
+//! a worker thread so the periodic refresh never blocks the GTK main loop. Login
+//! identity is cached in [`Ui`] and refreshed only on login/logout, so the 2s tick
+//! never touches the keyring.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -29,8 +30,7 @@ use gtk4::glib;
 use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
-use pdfs_core::cache::ContentCache;
-use pdfs_core::config::{AppDirs, DEFAULT_CACHE_BUDGET_BYTES};
+use pdfs_core::config::AppDirs;
 use pdfs_core::control::{DirEntry, PhotoItem, Request, Response, send};
 use pdfs_core::service;
 
@@ -47,6 +47,14 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// is still coming up (see [`load_browser`] / [`load_gallery`]).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
+/// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
+struct PinRow {
+    row: adw::ActionRow,
+    /// The unpin button, absent on the placeholder row.
+    unpin: Option<gtk4::Button>,
+}
+
 /// All widgets the periodic refresh and the action handlers mutate, plus the
 /// resolved paths they act on. Wrapped in an [`Rc`] so handlers and the timeout
 /// closure share one instance.
@@ -60,6 +68,13 @@ struct Ui {
     /// Keys (relative path / photo uid) of open requests currently in flight, so
     /// a double-click on the same entry is a no-op instead of a second download.
     opening: RefCell<HashSet<String>>,
+    /// Resolved login identity, cached so the periodic [`refresh`] never hits the
+    /// keyring (a DBus round-trip). Populated at startup and updated only on
+    /// login / logout. `None` = signed out.
+    session: RefCell<Option<auth::StoredSession>>,
+    /// Whether a [`Request::Status`] round-trip is already in flight, so the 2s
+    /// refresh tick doesn't pile worker threads up on a slow/wedged daemon.
+    status_inflight: Cell<bool>,
     // Login page.
     email: adw::EntryRow,
     password: adw::PasswordEntryRow,
@@ -74,9 +89,12 @@ struct Ui {
     cache_bar: gtk4::ProgressBar,
     cache_label: gtk4::Label,
     pins_group: adw::PreferencesGroup,
-    /// Rows currently shown under [`Self::pins_group`], so a refresh can clear
-    /// the previous batch before re-adding.
-    pin_rows: RefCell<Vec<adw::ActionRow>>,
+    /// Rows currently shown under [`Self::pins_group`], retained so a refresh can
+    /// diff against them and only rebuild when the pin set actually changes.
+    pin_rows: RefCell<Vec<PinRow>>,
+    /// The pin paths last rendered, the diff baseline for [`repaint_pins`].
+    /// `None` = nothing built yet; `Some(empty)` = the placeholder is shown.
+    pins_state: RefCell<Option<Vec<String>>>,
     /// Whether the last refresh saw a live mount daemon. Gates the unpin
     /// buttons, which need the daemon to evict + re-hydrate.
     mounted: RefCell<bool>,
@@ -213,6 +231,8 @@ fn build_window(app: &adw::Application) {
         spinner: spinner.clone(),
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
+        session: RefCell::new(auth::load().ok()),
+        status_inflight: Cell::new(false),
         email: login_widgets.0,
         password: login_widgets.1,
         totp: login_widgets.2,
@@ -224,6 +244,7 @@ fn build_window(app: &adw::Application) {
         cache_label: main_widgets.3,
         pins_group: main_widgets.4,
         pin_rows: RefCell::new(Vec::new()),
+        pins_state: RefCell::new(None),
         mounted: RefCell::new(false),
         switcher: switcher.clone(),
         browser_model: browser_widgets.0,
@@ -485,6 +506,8 @@ fn wire_login(ui: &Rc<Ui>) {
                     ui.login_status.set_text("");
                     ui.password.set_text("");
                     ui.totp.set_text("");
+                    // Cache the new identity so `refresh` never hits the keyring.
+                    *ui.session.borrow_mut() = auth::load().ok();
                     // Enable+start the mount service now that we have a session.
                     service::enable_start();
                     refresh(&ui);
@@ -543,6 +566,7 @@ fn wire_logout(ui: &Rc<Ui>, button: &gtk4::Button) {
         if let Err(e) = auth::logout() {
             tracing::error!("logout failed: {e}");
         }
+        *ui.session.borrow_mut() = None;
         refresh(&ui);
     });
 }
@@ -563,87 +587,122 @@ fn wire_retry(ui: &Rc<Ui>) {
     });
 }
 
-/// Re-read mount status, login identity, cache usage and the pin list, and
-/// repaint the window. Cheap, synchronous local reads — safe on the main loop.
+/// Repaint the window from the cached login identity, then kick an async mount-
+/// status fetch. Runs on the 2s tick: the identity check is instant (no keyring),
+/// and the status round-trip is offloaded to a worker so the main loop never
+/// blocks on a slow or wedged daemon.
 fn refresh(ui: &Rc<Ui>) {
-    // Login identity decides which page is shown.
-    let session = auth::load().ok();
-    match &session {
-        Some(s) => {
-            // Only pull the user onto "main" when they're sitting on the login
-            // page; otherwise leave whichever signed-in page they navigated to.
-            if ui.stack.visible_child_name().as_deref() == Some("login") {
-                ui.stack.set_visible_child_name("main");
+    // Login identity decides which page is shown. Read the cached session — set
+    // at startup and on login/logout — never the keyring.
+    {
+        let session = ui.session.borrow();
+        match session.as_ref() {
+            Some(s) => {
+                // Only pull the user onto "main" when they're sitting on the login
+                // page; otherwise leave whichever signed-in page they navigated to.
+                if ui.stack.visible_child_name().as_deref() == Some("login") {
+                    ui.stack.set_visible_child_name("main");
+                }
+                ui.switcher.set_reveal(true);
+                ui.account_row.set_title(&s.username);
+                ui.account_row.set_subtitle("Proton account");
             }
-            ui.switcher.set_reveal(true);
-            ui.account_row.set_title(&s.username);
-            ui.account_row.set_subtitle("Proton account");
-        }
-        None => {
-            ui.stack.set_visible_child_name("login");
-            ui.switcher.set_reveal(false);
-            return;
+            None => {
+                ui.stack.set_visible_child_name("login");
+                ui.switcher.set_reveal(false);
+                return;
+            }
         }
     }
 
-    // Live mount status from the daemon, falling back to "not mounted".
-    let socket = ui.dirs.control_socket();
-    let mount = match send(&socket, &Request::Status) {
-        Ok(Response::Status { mountpoint, .. }) => Some(mountpoint),
-        _ => None,
-    };
-    *ui.mounted.borrow_mut() = mount.is_some();
-
-    // Read-only status: the service mounts automatically, we only report.
-    ui.mount_row.set_subtitle(&match &mount {
-        Some(mp) => format!("Mounted at {mp}"),
-        None => "Not mounted".into(),
-    });
-
-    // Cache usage + pins, read straight off disk so they work offline too.
-    let cache = ContentCache::open(
-        ui.dirs.content_cache_dir(),
-        ui.dirs.pins_path(),
-        DEFAULT_CACHE_BUDGET_BYTES,
-    );
-    match cache {
-        Ok(cache) => {
-            let used = cache.usage();
-            let budget = cache.budget();
-            let fraction = if budget == 0 {
-                0.0
-            } else {
-                (used as f64 / budget as f64).min(1.0)
-            };
-            ui.cache_bar.set_fraction(fraction);
-            ui.cache_label.set_text(&format!(
-                "{} of {} used",
-                human_bytes(used),
-                human_bytes(budget)
-            ));
-            repaint_pins(ui, &cache.list_pins());
-        }
-        Err(e) => ui.cache_label.set_text(&format!("Cache unavailable: {e}")),
-    }
+    refresh_status(ui);
 }
 
-/// Replace the rows under the pins group with one [`adw::ActionRow`] per pin,
-/// each with an unpin button enabled only while a mount daemon is running.
-fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin]) {
-    for row in ui.pin_rows.borrow_mut().drain(..) {
-        ui.pins_group.remove(&row);
+/// Fetch mount status + cache stats from the daemon on a worker thread and repaint
+/// the mount line, cache bar and pin list on the reply. The daemon owns the cache
+/// stats now (`used`/`budget`/`pins` ride along on [`Response::Status`]), so the
+/// GUI never opens the on-disk cache itself. Skipped while a fetch is in flight so
+/// the tick can't stack threads on a stalled daemon.
+fn refresh_status(ui: &Rc<Ui>) {
+    if ui.status_inflight.get() {
+        return;
     }
+    ui.status_inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::Status);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.status_inflight.set(false);
+        match result {
+            Ok(Ok(Response::Status {
+                mountpoint,
+                used,
+                budget,
+                pins,
+                ..
+            })) => {
+                *ui.mounted.borrow_mut() = true;
+                ui.mount_row.set_subtitle(&format!("Mounted at {mountpoint}"));
+                let fraction = if budget == 0 {
+                    0.0
+                } else {
+                    (used as f64 / budget as f64).min(1.0)
+                };
+                ui.cache_bar.set_fraction(fraction);
+                ui.cache_label.set_text(&format!(
+                    "{} of {} used",
+                    human_bytes(used),
+                    human_bytes(budget)
+                ));
+                repaint_pins(&ui, &pins, true);
+            }
+            // Daemon unreachable (still starting, or down): report not-mounted and
+            // grey out the unpin buttons in place, but leave the last-known pin
+            // rows and cache read-out so the page doesn't flicker on a blip.
+            _ => {
+                *ui.mounted.borrow_mut() = false;
+                ui.mount_row.set_subtitle("Not mounted");
+                for r in ui.pin_rows.borrow().iter() {
+                    if let Some(b) = &r.unpin {
+                        b.set_sensitive(false);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Render the pins group from `pins`, with the unpin buttons enabled only while a
+/// mount daemon is running (`mounted`). Diffs against the last batch by path: when
+/// the set is unchanged (the common case on the 2s tick) it only flips the unpin
+/// buttons' `sensitive` flag, avoiding the rebuild that used to flicker the list
+/// and drop scroll/selection every tick.
+fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted: bool) {
+    let desired: Vec<String> = pins.iter().map(|p| p.path.clone()).collect();
+    if ui.pins_state.borrow().as_ref() == Some(&desired) {
+        for r in ui.pin_rows.borrow().iter() {
+            if let Some(b) = &r.unpin {
+                b.set_sensitive(mounted);
+            }
+        }
+        return;
+    }
+
+    for pr in ui.pin_rows.borrow_mut().drain(..) {
+        ui.pins_group.remove(&pr.row);
+    }
+    *ui.pins_state.borrow_mut() = Some(desired);
+
     if pins.is_empty() {
         let row = adw::ActionRow::builder()
             .title("No pinned files")
             .subtitle("Right-click a file in the mount to keep it offline.")
             .build();
         ui.pins_group.add(&row);
-        ui.pin_rows.borrow_mut().push(row);
+        ui.pin_rows.borrow_mut().push(PinRow { row, unpin: None });
         return;
     }
 
-    let mounted = *ui.mounted.borrow();
     for pin in pins {
         let name = Path::new(&pin.path)
             .file_name()
@@ -677,7 +736,10 @@ fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin]) {
         row.add_suffix(&unpin);
 
         ui.pins_group.add(&row);
-        ui.pin_rows.borrow_mut().push(row);
+        ui.pin_rows.borrow_mut().push(PinRow {
+            row,
+            unpin: Some(unpin),
+        });
     }
 }
 

@@ -85,11 +85,19 @@ pub struct PhotoItem {
 /// The daemon's reply to a [`Request`].
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
-    /// Current mount status.
+    /// Current mount status. Carries the cache stats the daemon already holds
+    /// (`used`/`budget` bytes and the pin list) so a front-end never has to open
+    /// the on-disk cache itself on its UI thread.
     Status {
         username: String,
         mountpoint: String,
         pinned: usize,
+        /// Bytes of cached content blobs (see [`crate::cache::ContentCache::usage`]).
+        used: u64,
+        /// Configured soft byte cap (`0` = unlimited).
+        budget: u64,
+        /// The pin registry.
+        pins: Vec<Pin>,
     },
     /// A human-readable success message.
     Ok { message: String },
