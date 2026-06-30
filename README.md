@@ -8,6 +8,7 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 - **Command-Line Interface (CLI)**: Manage your drive, authenticate, and monitor sync status directly from the terminal.
 - **Non-Blocking GTK4 Desktop App**: Browse files, manage pins, and configure options through a modern, native GUI with a fully non-blocking asynchronous main loop.
 - **System Tray Integration**: Background indicator for status monitoring, quick actions, and fast sync controls.
+- **Fuzzy Search Launcher Prompt (HUD)**: A Google Drive-style search launcher (`pdfs-prompt`) for finding and opening files or folders instantly, ideal for binding to a system-wide hotkey.
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
 
@@ -23,15 +24,15 @@ The client includes several optimizations designed for high efficiency, a low me
 
 ## Screenshots
 
-### GUI Application
+### GUI Application & Launcher
 
-| Login Screen | Account Overview |
+| Login Screen | Files Browser |
 | :---: | :---: |
-| ![Login Screen](images/login.png) | ![Account Overview](images/account.png) |
+| ![Login Screen](images/login.png) | ![Files Browser](images/files.png) |
 
-| Files (Grid View) | Files (List View) |
+| Photos Timeline | Search Launcher Prompt |
 | :---: | :---: |
-| ![Files Grid](images/files_grid.png) | ![Files List](images/files_list.png) |
+| ![Photos Timeline](images/photos.png) | ![Search Launcher Prompt](images/prompt.png) |
 
 ---
 
@@ -76,6 +77,7 @@ The compiled binaries will be available under `target/release/`:
 - `pdfs`: The CLI utility.
 - `pdfs-app`: The GTK4 application.
 - `pdfs-tray`: The tray status notifier.
+- `pdfs-prompt`: The launcher prompt for quick HUD search.
 
 ---
 
@@ -108,7 +110,7 @@ This project has a GitHub Actions CI workflow configured under `.github/workflow
    - Sets up the Rust compiler and caches build targets to speed up runs.
    - Compiles the workspace members in release mode.
 3. **Artifact Packaging**:
-   - Generates a `.tar.gz` containing the raw binaries (`pdfs`, `pdfs-app`, `pdfs-tray`).
+   - Generates a `.tar.gz` containing the raw binaries (`pdfs`, `pdfs-app`, `pdfs-tray`, `pdfs-prompt`).
    - Packs them into a Debian package (`.deb`).
 4. **Publishing**:
    - Creates a GitHub Release matching the pushed tag and uploads the `.deb` and `.tar.gz` packages as release assets.

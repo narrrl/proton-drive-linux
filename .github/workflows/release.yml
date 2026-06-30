@@ -62,6 +62,7 @@ jobs:
           cp target/release/pdfs dist/binaries/
           cp target/release/pdfs-tray dist/binaries/
           cp target/release/pdfs-app dist/binaries/
+          cp target/release/pdfs-prompt dist/binaries/
           
           # Create tarball
           tar -czf proton-drive-linux-${{ env.VERSION }}-x86_64.tar.gz -C dist/binaries .
@@ -78,6 +79,7 @@ jobs:
           cp target/release/pdfs deb/usr/bin/
           cp target/release/pdfs-tray deb/usr/bin/
           cp target/release/pdfs-app deb/usr/bin/
+          cp target/release/pdfs-prompt deb/usr/bin/
 
           # Copy desktop integration files
           cp packaging/io.narl.proton-drive-linux.desktop deb/usr/share/applications/
@@ -101,7 +103,7 @@ jobs:
            Proton Drive client for Linux featuring:
            - FUSE files-on-demand mount
            - Command-line interface (CLI)
-           - GTK4 system tray and desktop application
+           - GTK4 system tray, desktop application, and search launcher
           EOF
 
           # Build Debian package
