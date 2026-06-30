@@ -9,6 +9,19 @@ A fast, unofficial Proton Drive client for Linux. This client provides a FUSE fi
 - **GTK4 Desktop App**: Log in, browse files, and configure sync options through a modern, native Linux GUI.
 - **System Tray Integration**: Background indicator for status monitoring, quick actions, and fast sync controls.
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) for safe token storage.
+- **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
+
+## Screenshots
+
+### GUI Application
+
+| Login Screen | Account Overview |
+| :---: | :---: |
+| ![Login Screen](images/login.png) | ![Account Overview](images/account.png) |
+
+| Files (Grid View) | Files (List View) |
+| :---: | :---: |
+| ![Files Grid](images/files_grid.png) | ![Files List](images/files_list.png) |
 
 ---
 
