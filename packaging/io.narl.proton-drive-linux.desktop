@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Drive
+GenericName=Cloud Drive
+Comment=Proton Drive files-on-demand for Linux
+Exec=pdfs-app
+Icon=io.narl.proton-drive-linux
+Terminal=false
+Categories=Network;FileTransfer;GTK;
+Keywords=proton;drive;cloud;sync;storage;
+StartupNotify=true
+SingleMainWindow=true

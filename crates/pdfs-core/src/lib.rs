@@ -3,7 +3,9 @@
 //! front-end (CLI today, daemon + GUI later) shares.
 
 pub mod auth;
+pub mod cache;
 pub mod config;
+pub mod control;
 pub mod error;
 
 pub use error::{Error, Result};

@@ -1,0 +1,63 @@
+# Maintainer: Nils Pukropp <contact@narl.io>
+#
+# Local-build PKGBUILD. Builds the proton-drive-linux workspace from the
+# checkout this file lives in. Path deps point at a sibling ../proton-sdk-rs
+# checkout (the Proton SDK is unpublished), so this is NOT a source-fetch
+# package: it compiles the working tree in place.
+#
+# Build + install:   cd packaging && makepkg -fi
+
+pkgname=proton-drive-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Proton Drive client for Linux: FUSE files-on-demand mount, CLI, GTK4 app + tray"
+arch=('x86_64')
+url="https://github.com/narl/proton-drive-linux"
+license=('MIT')
+depends=('fuse3' 'gtk4' 'libadwaita')
+makedepends=('cargo')
+provides=('pdfs')
+# Files-on-demand mount + keyring need these at runtime.
+optdepends=('gnome-keyring: credential storage via Secret Service'
+            'xdg-utils: "Open folder" action from the tray')
+options=('!lto')
+
+# Built in place from the checkout; nothing to fetch or checksum.
+source=()
+sha256sums=()
+
+# Absolute path to the workspace root (packaging/ lives directly under it).
+_workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+pkgver() {
+  cd "$_workspace"
+  local v
+  v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+  printf '%s' "${v:-0.1.0}"
+}
+
+build() {
+  cd "$_workspace"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$_workspace/target"
+  cargo build --release --frozen \
+    --bin pdfs \
+    --bin pdfs-tray \
+    --bin pdfs-app
+}
+
+package() {
+  cd "$_workspace"
+  local rel="target/release"
+
+  install -Dm755 "$rel/pdfs"      "$pkgdir/usr/bin/pdfs"
+  install -Dm755 "$rel/pdfs-tray" "$pkgdir/usr/bin/pdfs-tray"
+  install -Dm755 "$rel/pdfs-app"  "$pkgdir/usr/bin/pdfs-app"
+
+  install -Dm644 "packaging/io.narl.proton-drive-linux.desktop" \
+    "$pkgdir/usr/share/applications/io.narl.proton-drive-linux.desktop"
+  install -Dm644 "packaging/io.narl.proton-drive-linux.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg"
+
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

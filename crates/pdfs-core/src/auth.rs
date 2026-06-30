@@ -35,7 +35,7 @@ pub struct StoredSession {
 }
 
 impl StoredSession {
-    fn into_params(&self) -> ResumeParameters {
+    fn to_params(&self) -> ResumeParameters {
         ResumeParameters {
             session_id: self.session_id.clone().into(),
             username: self.username.clone(),
@@ -122,11 +122,25 @@ pub fn logout() -> Result<()> {
 
 /// Resume a persisted session and build an authenticated Drive client.
 ///
-/// Re-persists tokens afterward in case the refresh path rotated them. Returns
-/// `Error::NotLoggedIn` when no session has been saved.
+/// Returns `Error::NotLoggedIn` when no session has been saved. The caller is
+/// responsible for persisting rotated tokens over the session's lifetime via
+/// [`persist`] — Proton refresh tokens are single-use, so a refresh that is not
+/// written back leaves the keyring holding a stale (now-invalid) refresh token,
+/// and the next resume fails with `InvalidRefreshToken`.
 pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
     let stored = load()?;
-    let session = ProtonApiSession::resume(client_config(), stored.into_params())?;
+    let session = ProtonApiSession::resume(client_config(), stored.to_params())?;
     let client = ProtonDriveClient::new(&session, stored.mailbox_password.clone().into_bytes());
     Ok((client, session))
+}
+
+/// Write the session's current tokens back to the keyring.
+///
+/// The session does not carry the mailbox password (it is only needed to rebuild
+/// the key chain on resume), so it is re-read from the existing stored blob and
+/// preserved. Call whenever the session may have rotated its tokens through the
+/// 401-refresh path so a later [`resume_client`] presents a live refresh token.
+pub async fn persist(session: &ProtonApiSession) -> Result<()> {
+    let mailbox_password = load()?.mailbox_password;
+    save(session, &mailbox_password).await
 }

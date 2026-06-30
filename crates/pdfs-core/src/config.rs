@@ -14,6 +14,10 @@ pub const USER_AGENT: &str = "proton-drive-linux/0.1.0";
 /// Keyring service name; one entry per credential kind keyed by username.
 pub const KEYRING_SERVICE: &str = "proton-drive-linux";
 
+/// Default soft cap on the on-disk content cache (5 GiB). LRU-evicts unpinned
+/// blobs back under this; pinned files are exempt. See [`crate::cache`].
+pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// Resolved XDG locations for state, cache, and the default mountpoint.
 pub struct AppDirs {
     dirs: ProjectDirs,
@@ -38,6 +42,21 @@ impl AppDirs {
     /// Hydrated file-content cache.
     pub fn cache_dir(&self) -> PathBuf {
         self.dirs.cache_dir().to_path_buf()
+    }
+
+    /// Directory holding cached file-content blobs (pinned files).
+    pub fn content_cache_dir(&self) -> PathBuf {
+        self.cache_dir().join("content")
+    }
+
+    /// JSON pin registry, in persistent state (not the evictable cache).
+    pub fn pins_path(&self) -> PathBuf {
+        self.state_dir().join("pins.json")
+    }
+
+    /// Unix domain socket the mount daemon listens on for CLI control commands.
+    pub fn control_socket(&self) -> PathBuf {
+        self.state_dir().join("control.sock")
     }
 
     /// Default mountpoint when the user does not pass one explicitly.

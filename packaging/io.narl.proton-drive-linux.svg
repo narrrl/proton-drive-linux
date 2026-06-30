@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8b6dff"/>
+      <stop offset="1" stop-color="#6d4aff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#g)"/>
+  <!-- cloud -->
+  <path fill="#ffffff" d="M44 84c-11 0-20-9-20-20 0-10 7-18 17-20 3-11 13-19 25-19 13 0 24 10 26 23 9 1 16 9 16 18 0 10-8 18-18 18z"/>
+  <!-- down arrow (on-demand pull) -->
+  <path fill="#6d4aff" d="M64 50v22m0 0l-9-9m9 9l9-9" stroke="#6d4aff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

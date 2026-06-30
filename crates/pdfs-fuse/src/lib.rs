@@ -17,12 +17,20 @@
 //! not byte ranges). New files are created empty up front so they get a real
 //! uid; namespace ops map to `create_folder`, `trash_nodes`, `rename_node` and
 //! `move_node`.
+//!
+//! Phase 4 adds Files-On-Demand pinning. A control socket (see [`control`])
+//! lets the CLI pin/unpin files; a pinned file's plaintext is downloaded once
+//! into the on-disk [`ContentCache`] and every later `read` is served from disk
+//! instead of the network. Writes and remote events evict the cache so it never
+//! goes stale.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write as _};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -30,8 +38,14 @@ use fuser::{
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
     Session, TimeOrNow, WriteFlags,
 };
-use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid};
-use proton_drive_rs::{DriveEvent, DriveEventScopeId, Node, NodeKind, ProtonDriveClient};
+use fuser::ReplyXattr;
+use pdfs_core::cache::ContentCache;
+use pdfs_core::control::{DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse};
+use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
+use proton_drive_rs::{
+    DriveEvent, DriveEventScopeId, Node, NodeKind, PhotosTimelineItem, ProtonDriveClient,
+    ProtonPhotosClient, ThumbnailType,
+};
 use tracing::{debug, error, info, warn};
 
 /// Attribute/entry cache lifetime handed back to the kernel. Long because the
@@ -41,9 +55,18 @@ const TTL: Duration = Duration::from_secs(30);
 
 /// How often the background task polls the remote event cursor.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a fetched photos timeline stays good before the next page request
+/// re-fetches it. The SDK hands back the whole timeline at once, so we cache it
+/// in [`Core`] and serve every page from memory until it goes stale.
+const TIMELINE_TTL: Duration = Duration::from_secs(60);
 
 /// The FUSE root inode is always 1.
 const ROOT_INO: u64 = 1;
+
+/// Extended attribute exposing the small server-side thumbnail of a file.
+const XATTR_THUMBNAIL: &str = "user.proton.thumbnail";
+/// Extended attribute exposing the larger server-side preview image of a file.
+const XATTR_PREVIEW: &str = "user.proton.preview";
 
 /// A node known to the filesystem, addressed by its kernel inode.
 struct Entry {
@@ -133,50 +156,31 @@ impl State {
     }
 }
 
-/// The Proton Drive VFS. FUSE callbacks are synchronous, so the Tokio handle
-/// bridges each one to the async SDK via [`Handle::block_on`]; the fuser
-/// session thread is not a runtime worker, so blocking on it is sound.
-pub struct ProtonFs {
+/// Shared engine behind both the FUSE callbacks and the control socket: the
+/// Drive client, a Tokio handle to bridge the synchronous FUSE/socket threads
+/// to the async SDK, the inode bookkeeping, and the on-disk content cache.
+///
+/// Cheaply cloneable (every field is a handle/`Arc`), so the control-socket task
+/// gets its own copy while the FUSE session keeps another.
+#[derive(Clone)]
+struct Core {
     client: ProtonDriveClient,
     rt: tokio::runtime::Handle,
     state: Arc<Mutex<State>>,
-    uid: u32,
-    gid: u32,
+    cache: Arc<ContentCache>,
+    /// Cached full photos timeline (newest first), so paged `PhotosTimeline`
+    /// requests slice memory instead of re-fetching the whole timeline per page.
+    /// `None` until first fetched; refreshed once older than [`TIMELINE_TTL`].
+    timeline: Arc<Mutex<Option<TimelineCache>>>,
 }
 
-impl ProtonFs {
-    /// Build the filesystem rooted at `root` (the user's My Files folder).
-    pub fn new(client: ProtonDriveClient, rt: tokio::runtime::Handle, root: Node) -> Self {
-        let mut entries = HashMap::new();
-        let mut by_uid = HashMap::new();
-        by_uid.insert(root.uid.clone(), ROOT_INO);
-        entries.insert(
-            ROOT_INO,
-            Entry { uid: root.uid.clone(), parent: ROOT_INO, node: root },
-        );
-        // SAFETY: geteuid/getegid are infallible and have no preconditions.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        Self {
-            client,
-            rt,
-            state: Arc::new(Mutex::new(State {
-                entries,
-                by_uid,
-                children: HashMap::new(),
-                next_ino: 2,
-                handles: HashMap::new(),
-                next_fh: 1,
-            })),
-            uid,
-            gid,
-        }
-    }
+/// The whole photos timeline plus when it was fetched, for TTL freshness.
+struct TimelineCache {
+    items: Vec<PhotosTimelineItem>,
+    fetched: Instant,
+}
 
-    /// A handle to the shared inode state, for the event poller.
-    fn shared_state(&self) -> Arc<Mutex<State>> {
-        Arc::clone(&self.state)
-    }
-
+impl Core {
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
@@ -223,33 +227,6 @@ impl ProtonFs {
         Ok(())
     }
 
-    fn attr(&self, ino: u64, node: &Node) -> FileAttr {
-        let (kind, perm) = match node.kind {
-            NodeKind::Folder => (FileType::Directory, 0o755),
-            NodeKind::File { .. } => (FileType::RegularFile, 0o644),
-        };
-        let size = node_size(node);
-        let mtime = unix_secs(node.modification_time);
-        let crtime = unix_secs(node.creation_time);
-        FileAttr {
-            ino: INodeNo(ino),
-            size,
-            blocks: size.div_ceil(512),
-            atime: mtime,
-            mtime,
-            ctime: mtime,
-            crtime,
-            kind,
-            perm,
-            nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid: self.uid,
-            gid: self.gid,
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-
     /// Resolve a child `name` within `parent` to its `(inode, uid)`, ensuring
     /// the parent's listing is cached first.
     fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
@@ -266,6 +243,30 @@ impl ProtonFs {
                 })
             })
             .ok_or(Errno::ENOENT)
+    }
+
+    /// Walk a mountpoint-relative path to its `(inode, uid)`, enumerating each
+    /// directory on the way as needed. Leading `/` and `.` components are
+    /// ignored; `..` is rejected.
+    fn resolve_path(&self, rel: &Path) -> Result<(u64, NodeUid), Errno> {
+        let mut ino = ROOT_INO;
+        let mut uid = {
+            let st = self.state.lock().unwrap();
+            st.entries.get(&ROOT_INO).map(|e| e.uid.clone()).ok_or(Errno::ENOENT)?
+        };
+        for comp in rel.components() {
+            match comp {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => {
+                    let (child_ino, child_uid) =
+                        self.lookup_child(ino, &name.to_string_lossy())?;
+                    ino = child_ino;
+                    uid = child_uid;
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        Ok((ino, uid))
     }
 
     /// Fetch a single node's current metadata from the remote.
@@ -297,38 +298,368 @@ impl ProtonFs {
                 error!(%uid, error = %e, "upload new revision failed");
                 Errno::EIO
             })?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = now_secs();
         let mut st = self.state.lock().unwrap();
         if let Some(h) = st.handles.get_mut(&fh) {
             h.dirty = false;
         }
         st.set_size(ino, buf.len() as u64);
         st.touch_mtime(ino, now);
+        drop(st);
+        // The sealed content differs from any cached blob; if the file is
+        // pinned, refresh the cache so reads stay served from disk.
+        if self.cache.is_pinned(&uid) {
+            let _ = self.cache.store(&uid, now, buf.len() as u64, &buf);
+        } else {
+            self.cache.evict(&uid);
+        }
         Ok(())
+    }
+
+    /// Pin the file at mountpoint-relative `rel`: download its full plaintext
+    /// into the content cache and record it in the pin registry. Returns the
+    /// resolved node name on success.
+    fn pin(&self, rel: &Path) -> Result<String, String> {
+        let (ino, uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        let (name, mtime, size) = {
+            let st = self.state.lock().unwrap();
+            let e = st.entries.get(&ino).ok_or("node vanished")?;
+            if !e.node.is_file() {
+                return Err("not a regular file".into());
+            }
+            (e.node.name.clone(), e.node.modification_time, node_size(&e.node))
+        };
+        let bytes = self
+            .rt
+            .block_on(self.client.download_file(&uid))
+            .map_err(|e| format!("download: {e}"))?;
+        self.cache
+            .store(&uid, mtime, size, &bytes)
+            .map_err(|e| format!("cache store: {e}"))?;
+        self.cache.add_pin(&uid, rel).map_err(|e| format!("pin: {e}"))?;
+        Ok(name)
+    }
+
+    /// Fetch a thumbnail of `ttype` for the file at `ino`, served from the cache
+    /// when fresh and otherwise downloaded from the remote and cached. Returns
+    /// `Ok(None)` when the node is not a file or has no thumbnail of that type.
+    fn thumbnail(&self, ino: u64, ttype: ThumbnailType) -> Result<Option<Vec<u8>>, Errno> {
+        let (uid, mtime) = {
+            let st = self.state.lock().unwrap();
+            match st.entries.get(&ino) {
+                Some(e) if e.node.is_file() => (e.uid.clone(), e.node.modification_time),
+                Some(_) => return Ok(None),
+                None => return Err(Errno::ENOENT),
+            }
+        };
+        if let Some(bytes) = self.cache.read_thumbnail(&uid, ttype.as_i32(), mtime) {
+            return Ok(Some(bytes));
+        }
+        let bytes = self
+            .rt
+            .block_on(self.client.download_thumbnail(&uid, ttype))
+            .map_err(|e| {
+                warn!(%uid, error = %e, "download thumbnail failed");
+                Errno::EIO
+            })?;
+        if let Some(bytes) = &bytes {
+            let _ = self.cache.store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
+        }
+        Ok(bytes)
+    }
+
+    /// Unpin the file at `rel`, evicting its cached content.
+    fn unpin(&self, rel: &Path) -> Result<String, String> {
+        let (ino, uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        let name = {
+            let st = self.state.lock().unwrap();
+            st.entries.get(&ino).map(|e| e.node.name.clone()).unwrap_or_default()
+        };
+        self.cache.remove_pin(&uid).map_err(|e| format!("unpin: {e}"))?;
+        Ok(name)
+    }
+
+    /// A Photos API handle sharing this Core's Drive client and session, so it
+    /// reuses the daemon's single authenticated session rather than logging in
+    /// again (Proton refresh tokens are single-use). Cheap — the Drive client
+    /// is `Clone` over `Arc`-backed state.
+    fn photos(&self) -> ProtonPhotosClient {
+        ProtonPhotosClient::from_drive_client(self.client.clone())
+    }
+
+    /// List the directory at mountpoint-relative `rel` for the in-app browser:
+    /// the same lazy remote enumeration `readdir` uses, projected into
+    /// serializable [`DirEntry`]s (with per-file pin state).
+    fn list_dir(&self, rel: &Path) -> Result<Vec<DirEntry>, String> {
+        let (ino, _uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        self.ensure_children(ino).map_err(|e| format!("enumerate: {e:?}"))?;
+        // Snapshot the listing, then drop the lock before touching the on-disk
+        // pin registry so a slow disk read doesn't block FUSE metadata ops.
+        let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
+            let st = self.state.lock().unwrap();
+            st.children
+                .get(&ino)
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|k| st.entries.get(k))
+                        .map(|e| {
+                            (
+                                e.node.name.clone(),
+                                e.node.is_folder(),
+                                node_size(&e.node),
+                                e.node.modification_time,
+                                e.uid.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(name, is_dir, size, modified, uid)| DirEntry {
+                name,
+                is_dir,
+                size,
+                modified,
+                pinned: self.cache.is_pinned(&uid),
+                uid: uid.to_string(),
+            })
+            .collect())
+    }
+
+    /// A page of the photos timeline (newest first), with the page's thumbnails
+    /// fetched into the cache and their paths attached. `Ok(None)` when the
+    /// account has no photos volume.
+    ///
+    /// The SDK's `enumerate_timeline` returns the *whole* timeline, so the first
+    /// request (or the first after [`TIMELINE_TTL`] elapses) fetches and caches
+    /// it in [`Core::timeline`]; every page then slices that cached vec, so
+    /// "load more" scrolling doesn't re-hit the network per page.
+    fn photos_timeline(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<PhotoItem>>, String> {
+        let page: Vec<PhotosTimelineItem> = {
+            // Refresh the cached timeline if absent or stale. The lock is only
+            // held for the freshness check and the store, never across the fetch.
+            let stale = {
+                let guard = self.timeline.lock().unwrap();
+                guard
+                    .as_ref()
+                    .is_none_or(|c| c.fetched.elapsed() >= TIMELINE_TTL)
+            };
+            if stale {
+                let photos = self.photos();
+                if self
+                    .rt
+                    .block_on(photos.get_photos_root())
+                    .map_err(|e| format!("photos root: {e}"))?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let items = self
+                    .rt
+                    .block_on(photos.enumerate_timeline())
+                    .map_err(|e| format!("timeline: {e}"))?;
+                *self.timeline.lock().unwrap() = Some(TimelineCache {
+                    items,
+                    fetched: Instant::now(),
+                });
+            }
+            let guard = self.timeline.lock().unwrap();
+            match guard.as_ref() {
+                Some(c) => c.items.iter().skip(offset).take(limit).cloned().collect(),
+                None => return Ok(None),
+            }
+        };
+        let ttype = ThumbnailType::Thumbnail.as_i32();
+
+        // Batch-fetch only the thumbnails not already cached fresh.
+        let want: Vec<NodeUid> = page
+            .iter()
+            .filter(|it| self.cache.cached_thumbnail_path(&it.uid, ttype, it.capture_time).is_none())
+            .map(|it| it.uid.clone())
+            .collect();
+        if !want.is_empty() {
+            let cap: HashMap<NodeUid, i64> =
+                page.iter().map(|it| (it.uid.clone(), it.capture_time)).collect();
+            match self
+                .rt
+                .block_on(self.photos().enumerate_thumbnails(&want, ThumbnailType::Thumbnail))
+            {
+                Ok(thumbs) => {
+                    for ft in thumbs {
+                        if let (Ok(bytes), Some(&tag)) = (ft.result, cap.get(&ft.file_uid)) {
+                            let _ = self.cache.store_thumbnail(&ft.file_uid, ttype, tag, &bytes);
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, "batch photo thumbnails failed"),
+            }
+        }
+
+        Ok(Some(
+            page.into_iter()
+                .map(|it| {
+                    let thumb_path = self
+                        .cache
+                        .cached_thumbnail_path(&it.uid, ttype, it.capture_time)
+                        .map(|p| p.display().to_string());
+                    PhotoItem {
+                        uid: it.uid.to_string(),
+                        capture_time: it.capture_time,
+                        thumb_path,
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    /// Download a photo's full content into the content cache, returning its
+    /// on-disk path (served from cache when a fresh blob already exists).
+    fn open_photo(&self, uid: &NodeUid) -> Result<PathBuf, String> {
+        let photos = self.photos();
+        let node = self
+            .rt
+            .block_on(photos.get_node(uid))
+            .map_err(|e| format!("photo node: {e}"))?
+            .ok_or("photo not found")?;
+        let (mtime, size) = (node.modification_time, node_size(&node));
+        if let Some(p) = self.cache.cached_content_path(uid, mtime, size) {
+            return Ok(p);
+        }
+        let bytes = self
+            .rt
+            .block_on(photos.download_photo(uid))
+            .map_err(|e| format!("download photo: {e}"))?;
+        self.cache
+            .store(uid, mtime, size, &bytes)
+            .map_err(|e| format!("cache store: {e}"))?;
+        Ok(self.cache.content_path(uid))
+    }
+
+    /// Download the full content of the Drive file at mountpoint-relative `rel`
+    /// into the content cache, returning its on-disk path (served from cache
+    /// when a fresh blob already exists). Lets a front-end open the file with
+    /// the user's default application without pinning it.
+    fn open_file(&self, rel: &Path) -> Result<PathBuf, String> {
+        let (ino, uid) = self.resolve_path(rel).map_err(|e| format!("resolve path: {e:?}"))?;
+        let (mtime, size) = {
+            let st = self.state.lock().unwrap();
+            let e = st.entries.get(&ino).ok_or("node vanished")?;
+            if !e.node.is_file() {
+                return Err("not a regular file".into());
+            }
+            (e.node.modification_time, node_size(&e.node))
+        };
+        if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
+            return Ok(p);
+        }
+        let bytes = self
+            .rt
+            .block_on(self.client.download_file(&uid))
+            .map_err(|e| format!("download: {e}"))?;
+        self.cache
+            .store(&uid, mtime, size, &bytes)
+            .map_err(|e| format!("cache store: {e}"))?;
+        Ok(self.cache.content_path(&uid))
+    }
+}
+
+/// Parse a `volume~link` uid display string back into a [`NodeUid`]. Front-ends
+/// receive uids as strings over the control socket and pass them back verbatim.
+fn parse_uid(s: &str) -> Option<NodeUid> {
+    let (vol, link) = s.split_once('~')?;
+    Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
+}
+
+/// The Proton Drive VFS. FUSE callbacks are synchronous, so the Tokio handle
+/// bridges each one to the async SDK via [`Handle::block_on`]; the fuser
+/// session thread is not a runtime worker, so blocking on it is sound.
+pub struct ProtonFs {
+    core: Core,
+    uid: u32,
+    gid: u32,
+}
+
+impl ProtonFs {
+    /// Build the filesystem rooted at `root` (the user's My Files folder).
+    fn new(core: Core, root: Node) -> Self {
+        {
+            let mut st = core.state.lock().unwrap();
+            st.by_uid.insert(root.uid.clone(), ROOT_INO);
+            st.entries.insert(
+                ROOT_INO,
+                Entry { uid: root.uid.clone(), parent: ROOT_INO, node: root },
+            );
+        }
+        // SAFETY: geteuid/getegid are infallible and have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Self { core, uid, gid }
+    }
+
+    fn attr(&self, ino: u64, node: &Node) -> FileAttr {
+        let (kind, perm) = match node.kind {
+            NodeKind::Folder => (FileType::Directory, 0o755),
+            NodeKind::File { .. } => (FileType::RegularFile, 0o644),
+        };
+        let size = node_size(node);
+        let mtime = unix_secs(node.modification_time);
+        let crtime = unix_secs(node.creation_time);
+        FileAttr {
+            ino: INodeNo(ino),
+            size,
+            blocks: size.div_ceil(512),
+            atime: mtime,
+            mtime,
+            ctime: mtime,
+            crtime,
+            kind,
+            perm,
+            nlink: if kind == FileType::Directory { 2 } else { 1 },
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        }
     }
 
     /// Trash the child `name` under `parent` on the remote, then drop it from the
     /// local cache. Backs both `unlink` and `rmdir` (Proton trashes whole
     /// subtrees, so an `rmdir` of a non-empty dir behaves the same).
     fn trash_child(&self, parent: u64, name: &str, reply: ReplyEmpty) {
-        let (_ino, uid) = match self.lookup_child(parent, name) {
+        let (_ino, uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,
             Err(e) => {
                 reply.error(e);
                 return;
             }
         };
-        if let Err(e) = self.rt.block_on(self.client.trash_nodes(std::slice::from_ref(&uid))) {
+        if let Err(e) = self
+            .core
+            .rt
+            .block_on(self.core.client.trash_nodes(std::slice::from_ref(&uid)))
+        {
             error!(%uid, error = %e, "trash failed");
             reply.error(Errno::EIO);
             return;
         }
-        self.state.lock().unwrap().forget(&uid);
+        self.core.state.lock().unwrap().forget(&uid);
+        self.core.cache.evict(&uid);
         reply.ok();
     }
+}
+
+/// Current wall-clock time as epoch seconds (0 if the clock is before the epoch).
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// A coarse MIME type guessed from a file name's extension; Proton stores this
@@ -369,12 +700,12 @@ fn unix_secs(secs: i64) -> SystemTime {
 impl Filesystem for ProtonFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
-        if let Err(e) = self.ensure_children(parent) {
+        if let Err(e) = self.core.ensure_children(parent) {
             reply.error(e);
             return;
         }
         let name = name.to_string_lossy();
-        let st = self.state.lock().unwrap();
+        let st = self.core.state.lock().unwrap();
         let hit = st.children.get(&parent).and_then(|kids| {
             kids.iter().copied().find_map(|ino| {
                 st.entries
@@ -393,7 +724,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let st = self.state.lock().unwrap();
+        let st = self.core.state.lock().unwrap();
         match st.entries.get(&ino.0) {
             Some(e) => {
                 let attr = self.attr(ino.0, &e.node);
@@ -412,11 +743,11 @@ impl Filesystem for ProtonFs {
         mut reply: ReplyDirectory,
     ) {
         let ino = ino.0;
-        if let Err(e) = self.ensure_children(ino) {
+        if let Err(e) = self.core.ensure_children(ino) {
             reply.error(e);
             return;
         }
-        let st = self.state.lock().unwrap();
+        let st = self.core.state.lock().unwrap();
         let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
 
         // "." and ".." occupy offsets 0 and 1; real children follow.
@@ -449,7 +780,7 @@ impl Filesystem for ProtonFs {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let uid = {
-            let st = self.state.lock().unwrap();
+            let st = self.core.state.lock().unwrap();
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => e.uid.clone(),
                 Some(_) => {
@@ -468,7 +799,7 @@ impl Filesystem for ProtonFs {
             reply.opened(FileHandle(0), FopenFlags::empty());
             return;
         }
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.core.state.lock().unwrap();
         let fh = st.next_fh;
         st.next_fh += 1;
         st.handles.insert(
@@ -489,8 +820,8 @@ impl Filesystem for ProtonFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let uid = {
-            let st = self.state.lock().unwrap();
+        let (uid, mtime, fsize) = {
+            let st = self.core.state.lock().unwrap();
             // If the file is open for writing and its buffer is populated, serve
             // from there so reads see the in-flight (possibly unsaved) content.
             if let Some(h) = st.handles.values().find(|h| h.ino == ino.0 && h.seeded) {
@@ -500,7 +831,9 @@ impl Filesystem for ProtonFs {
                 return;
             }
             match st.entries.get(&ino.0) {
-                Some(e) if e.node.is_file() => e.uid.clone(),
+                Some(e) if e.node.is_file() => {
+                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
+                }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
                     return;
@@ -511,9 +844,19 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
+        // Pinned (or otherwise cached) files are served straight from disk.
+        if let Some(bytes) = self
+            .core
+            .cache
+            .read_range(&uid, mtime, fsize, offset, size as u64)
+        {
+            reply.data(&bytes);
+            return;
+        }
         match self
+            .core
             .rt
-            .block_on(self.client.download_range(&uid, offset, size as u64))
+            .block_on(self.core.client.download_range(&uid, offset, size as u64))
         {
             Ok(bytes) => reply.data(&bytes),
             Err(e) => {
@@ -534,13 +877,13 @@ impl Filesystem for ProtonFs {
         reply: ReplyCreate,
     ) {
         let parent = parent.0;
-        if let Err(e) = self.ensure_children(parent) {
+        if let Err(e) = self.core.ensure_children(parent) {
             reply.error(e);
             return;
         }
         let name = name.to_string_lossy().into_owned();
         let parent_uid = {
-            let st = self.state.lock().unwrap();
+            let st = self.core.state.lock().unwrap();
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -551,7 +894,7 @@ impl Filesystem for ProtonFs {
         };
         // Create an empty file on the remote so it has a real uid immediately;
         // written bytes are buffered and sealed as a new revision on close.
-        let new_uid = match self.rt.block_on(self.client.upload_file(
+        let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
             &parent_uid,
             &name,
             media_type_for(&name),
@@ -564,14 +907,14 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let node = match self.fetch_node(&new_uid) {
+        let node = match self.core.fetch_node(&new_uid) {
             Ok(n) => n,
             Err(e) => {
                 reply.error(e);
                 return;
             }
         };
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.core.state.lock().unwrap();
         let ino = st.intern(parent, node);
         if let Some(kids) = st.children.get_mut(&parent)
             && !kids.contains(&ino)
@@ -603,7 +946,7 @@ impl Filesystem for ProtonFs {
         let fh = fh.0;
         // Partial writes need the file's current content; hydrate it once.
         let need_seed = {
-            let st = self.state.lock().unwrap();
+            let st = self.core.state.lock().unwrap();
             match st.handles.get(&fh) {
                 Some(h) => !h.seeded,
                 None => {
@@ -614,6 +957,7 @@ impl Filesystem for ProtonFs {
         };
         if need_seed {
             let uid = self
+                .core
                 .state
                 .lock()
                 .unwrap()
@@ -624,7 +968,7 @@ impl Filesystem for ProtonFs {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let base = match self.rt.block_on(self.client.download_file(&uid)) {
+            let base = match self.core.rt.block_on(self.core.client.download_file(&uid)) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(%uid, error = %e, "seed write buffer failed");
@@ -632,7 +976,7 @@ impl Filesystem for ProtonFs {
                     return;
                 }
             };
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.core.state.lock().unwrap();
             if let Some(h) = st.handles.get_mut(&fh)
                 && !h.seeded
             {
@@ -642,7 +986,7 @@ impl Filesystem for ProtonFs {
         }
         let off = offset as usize;
         let new_len = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.core.state.lock().unwrap();
             let Some(h) = st.handles.get_mut(&fh) else {
                 reply.error(Errno::EBADF);
                 return;
@@ -686,7 +1030,7 @@ impl Filesystem for ProtonFs {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
             let handled = match fh {
                 Some(fh) => {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.core.state.lock().unwrap();
                     match st.handles.get_mut(&fh) {
                         Some(h) => {
                             h.buf.resize(size as usize, 0);
@@ -703,7 +1047,7 @@ impl Filesystem for ProtonFs {
                 // Path-based truncate with no open write handle: resize the
                 // remote content and seal it now.
                 let uid = {
-                    let st = self.state.lock().unwrap();
+                    let st = self.core.state.lock().unwrap();
                     match st.entries.get(&ino.0) {
                         Some(e) if e.node.is_file() => e.uid.clone(),
                         Some(_) => {
@@ -719,7 +1063,7 @@ impl Filesystem for ProtonFs {
                 let mut content = if size == 0 {
                     Vec::new()
                 } else {
-                    match self.rt.block_on(self.client.download_file(&uid)) {
+                    match self.core.rt.block_on(self.core.client.download_file(&uid)) {
                         Ok(b) => b,
                         Err(e) => {
                             warn!(%uid, error = %e, "truncate base download failed");
@@ -729,15 +1073,25 @@ impl Filesystem for ProtonFs {
                     }
                 };
                 content.resize(size as usize, 0);
-                if let Err(e) = self.rt.block_on(self.client.upload_new_revision(&uid, &content)) {
+                if let Err(e) = self
+                    .core
+                    .rt
+                    .block_on(self.core.client.upload_new_revision(&uid, &content))
+                {
                     error!(%uid, error = %e, "truncate upload failed");
                     reply.error(Errno::EIO);
                     return;
                 }
+                // Keep any pinned cache consistent with the new content.
+                if self.core.cache.is_pinned(&uid) {
+                    let _ = self.core.cache.store(&uid, now_secs(), size, &content);
+                } else {
+                    self.core.cache.evict(&uid);
+                }
             }
-            self.state.lock().unwrap().set_size(ino.0, size);
+            self.core.state.lock().unwrap().set_size(ino.0, size);
         }
-        let st = self.state.lock().unwrap();
+        let st = self.core.state.lock().unwrap();
         match st.entries.get(&ino.0) {
             Some(e) => {
                 let attr = self.attr(ino.0, &e.node);
@@ -748,14 +1102,14 @@ impl Filesystem for ProtonFs {
     }
 
     fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
-        match self.commit(fh.0) {
+        match self.core.commit(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        match self.commit(fh.0) {
+        match self.core.commit(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -771,8 +1125,8 @@ impl Filesystem for ProtonFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let res = self.commit(fh.0);
-        self.state.lock().unwrap().handles.remove(&fh.0);
+        let res = self.core.commit(fh.0);
+        self.core.state.lock().unwrap().handles.remove(&fh.0);
         match res {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -797,13 +1151,13 @@ impl Filesystem for ProtonFs {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
-        if let Err(e) = self.ensure_children(parent) {
+        if let Err(e) = self.core.ensure_children(parent) {
             reply.error(e);
             return;
         }
         let name = name.to_string_lossy().into_owned();
         let parent_uid = {
-            let st = self.state.lock().unwrap();
+            let st = self.core.state.lock().unwrap();
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -816,7 +1170,11 @@ impl Filesystem for ProtonFs {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .ok();
-        let new_uid = match self.rt.block_on(self.client.create_folder(&parent_uid, &name, now)) {
+        let new_uid = match self
+            .core
+            .rt
+            .block_on(self.core.client.create_folder(&parent_uid, &name, now))
+        {
             Ok(u) => u,
             Err(e) => {
                 error!(%parent_uid, name, error = %e, "create folder failed");
@@ -824,14 +1182,14 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let node = match self.fetch_node(&new_uid) {
+        let node = match self.core.fetch_node(&new_uid) {
             Ok(n) => n,
             Err(e) => {
                 reply.error(e);
                 return;
             }
         };
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.core.state.lock().unwrap();
         let ino = st.intern(parent, node);
         if let Some(kids) = st.children.get_mut(&parent)
             && !kids.contains(&ino)
@@ -856,7 +1214,7 @@ impl Filesystem for ProtonFs {
         let newparent = newparent.0;
         let name = name.to_string_lossy().into_owned();
         let newname = newname.to_string_lossy().into_owned();
-        let (_ino, uid) = match self.lookup_child(parent, &name) {
+        let (_ino, uid) = match self.core.lookup_child(parent, &name) {
             Ok(x) => x,
             Err(e) => {
                 reply.error(e);
@@ -865,12 +1223,12 @@ impl Filesystem for ProtonFs {
         };
         // Move first if the parent changed, then rename if the name changed.
         if newparent != parent {
-            if let Err(e) = self.ensure_children(newparent) {
+            if let Err(e) = self.core.ensure_children(newparent) {
                 reply.error(e);
                 return;
             }
             let new_parent_uid = {
-                let st = self.state.lock().unwrap();
+                let st = self.core.state.lock().unwrap();
                 match st.entries.get(&newparent) {
                     Some(e) => e.uid.clone(),
                     None => {
@@ -879,14 +1237,21 @@ impl Filesystem for ProtonFs {
                     }
                 }
             };
-            if let Err(e) = self.rt.block_on(self.client.move_node(&uid, &new_parent_uid)) {
+            if let Err(e) = self
+                .core
+                .rt
+                .block_on(self.core.client.move_node(&uid, &new_parent_uid))
+            {
                 error!(%uid, error = %e, "move failed");
                 reply.error(Errno::EIO);
                 return;
             }
         }
         if newname != name
-            && let Err(e) = self.rt.block_on(self.client.rename_node(&uid, &newname, None))
+            && let Err(e) = self
+                .core
+                .rt
+                .block_on(self.core.client.rename_node(&uid, &newname, None))
         {
             error!(%uid, error = %e, "rename failed");
             reply.error(Errno::EIO);
@@ -894,10 +1259,78 @@ impl Filesystem for ProtonFs {
         }
         // Forget the node so it re-interns under its new parent, and drop the
         // destination listing so it re-enumerates on next access.
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.core.state.lock().unwrap();
         st.forget(&uid);
         st.children.remove(&newparent);
         reply.ok();
+    }
+
+    /// Expose a file's server-side thumbnail/preview as an extended attribute, so
+    /// a previewing client can fetch it without downloading the whole file. The
+    /// bytes are fetched on demand and cached; absence yields `ENODATA`.
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let ttype = match name.to_str() {
+            Some(XATTR_THUMBNAIL) => ThumbnailType::Thumbnail,
+            Some(XATTR_PREVIEW) => ThumbnailType::Preview,
+            // Any other attribute simply does not exist on this filesystem.
+            _ => {
+                reply.error(Errno::ENODATA);
+                return;
+            }
+        };
+        let bytes = match self.core.thumbnail(ino.0, ttype) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                reply.error(Errno::ENODATA);
+                return;
+            }
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let len = bytes.len() as u32;
+        // The xattr protocol: a zero `size` is a probe for the length; otherwise
+        // the caller's buffer must be large enough or it gets `ERANGE`.
+        if size == 0 {
+            reply.size(len);
+        } else if size < len {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&bytes);
+        }
+    }
+
+    /// Advertise the thumbnail/preview attribute names for regular files. The
+    /// names are listed unconditionally for files; a `getxattr` for one a given
+    /// file lacks returns `ENODATA`.
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let is_file = {
+            let st = self.core.state.lock().unwrap();
+            match st.entries.get(&ino.0) {
+                Some(e) => e.node.is_file(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        // xattr names are returned as a NUL-terminated, concatenated list.
+        let mut buf = Vec::new();
+        if is_file {
+            for name in [XATTR_THUMBNAIL, XATTR_PREVIEW] {
+                buf.extend_from_slice(name.as_bytes());
+                buf.push(0);
+            }
+        }
+        let len = buf.len() as u32;
+        if size == 0 {
+            reply.size(len);
+        } else if size < len {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&buf);
+        }
     }
 }
 
@@ -907,7 +1340,7 @@ impl Filesystem for ProtonFs {
 /// The cache is authoritative-by-absence: dropping a directory's `children`
 /// entry forces the next `lookup`/`readdir` to re-enumerate from the remote, so
 /// most events only need to invalidate listings rather than re-fetch eagerly.
-fn apply_event(state: &Mutex<State>, notifier: &Notifier, event: &DriveEvent) {
+fn apply_event(state: &Mutex<State>, content: &ContentCache, notifier: &Notifier, event: &DriveEvent) {
     match event {
         DriveEvent::NodeUpdated { node_uid, parent_node_uid, is_trashed, .. } => {
             let mut st = state.lock().unwrap();
@@ -915,6 +1348,7 @@ fn apply_event(state: &Mutex<State>, notifier: &Notifier, event: &DriveEvent) {
                 // Trashing makes a node vanish from its parent listing.
                 let child = st.by_uid.get(node_uid).copied();
                 if let Some((parent, name)) = st.forget(node_uid) {
+                    content.evict(node_uid);
                     match child {
                         Some(child) => {
                             let _ =
@@ -927,8 +1361,10 @@ fn apply_event(state: &Mutex<State>, notifier: &Notifier, event: &DriveEvent) {
                 }
             } else if let Some(&ino) = st.by_uid.get(node_uid) {
                 // Known node changed: drop its cached attrs/data (and listing if
-                // it is a directory) so the next access re-fetches.
+                // it is a directory) so the next access re-fetches. Its content
+                // blob may now be stale, so evict it too.
                 st.children.remove(&ino);
+                content.evict(node_uid);
                 let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
             }
             // A create (or move-in) shows up as a change to the parent listing;
@@ -944,6 +1380,7 @@ fn apply_event(state: &Mutex<State>, notifier: &Notifier, event: &DriveEvent) {
             let mut st = state.lock().unwrap();
             // Capture the inode before `forget` clears the uid mapping.
             let child = st.by_uid.get(node_uid).copied();
+            content.evict(node_uid);
             if let Some((parent, name)) = st.forget(node_uid) {
                 match child {
                     Some(child) => {
@@ -980,6 +1417,7 @@ async fn run_event_sync(
     client: ProtonDriveClient,
     scope: DriveEventScopeId,
     state: Arc<Mutex<State>>,
+    content: Arc<ContentCache>,
     notifier: Notifier,
 ) {
     // Seed: a `None` cursor yields a single `CursorAdvanced` at the server head.
@@ -1006,27 +1444,150 @@ async fn run_event_sync(
         }
         debug!(count = events.len(), "applying remote events");
         for event in &events {
-            apply_event(&state, &notifier, event);
+            apply_event(&state, &content, &notifier, event);
         }
         cursor = events.last().map(|e| e.id().clone());
+    }
+}
+
+/// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
+/// must live under `mountpoint`; a relative path is taken as already relative to
+/// the mount root.
+fn rel_to_mount(mountpoint: &Path, path: &str) -> Result<PathBuf, String> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.strip_prefix(mountpoint)
+            .map(Path::to_path_buf)
+            .map_err(|_| format!("{path} is not under the mountpoint"))
+    } else {
+        Ok(p.to_path_buf())
+    }
+}
+
+/// Handle one control-socket connection: read a single JSON request line,
+/// dispatch it against `core`, and write back a JSON response line.
+fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: UnixStream) {
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "control: clone stream failed");
+            return;
+        }
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        return;
+    }
+    let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
+        Ok(CtlRequest::Status) => CtlResponse::Status {
+            username: username.to_string(),
+            mountpoint: mountpoint.display().to_string(),
+            pinned: core.cache.list_pins().len(),
+        },
+        Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.pin(&rel) {
+                Ok(name) => CtlResponse::Ok { message: format!("pinned {name}") },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::Unpin { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.unpin(&rel) {
+                Ok(name) => CtlResponse::Ok { message: format!("unpinned {name}") },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListPins) => CtlResponse::Pins { pins: core.cache.list_pins() },
+        Ok(CtlRequest::ListDir { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.list_dir(&rel) {
+                Ok(entries) => CtlResponse::Entries { entries },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::PhotosTimeline { offset, limit }) => {
+            match core.photos_timeline(offset, limit) {
+                Ok(Some(items)) => CtlResponse::Photos { available: true, items },
+                Ok(None) => CtlResponse::Photos { available: false, items: Vec::new() },
+                Err(e) => CtlResponse::Error { message: e },
+            }
+        }
+        Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
+            Some(u) => match core.open_photo(&u) {
+                Ok(p) => CtlResponse::FilePath { path: p.display().to_string() },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            None => CtlResponse::Error { message: format!("bad uid: {uid}") },
+        },
+        Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.open_file(&rel) {
+                Ok(p) => CtlResponse::FilePath { path: p.display().to_string() },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Err(e) => CtlResponse::Error { message: format!("bad request: {e}") },
+    };
+    let mut out = match serde_json::to_vec(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "control: serialize response failed");
+            return;
+        }
+    };
+    out.push(b'\n');
+    let mut stream = stream;
+    let _ = stream.write_all(&out);
+}
+
+/// Listen on the control socket, serving one CLI command per connection. Runs on
+/// its own thread; returns only if the listener itself fails.
+fn run_control_socket(core: Core, username: String, mountpoint: PathBuf, listener: UnixListener) {
+    info!("control socket listening");
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => handle_control_conn(&core, &username, &mountpoint, stream),
+            Err(e) => {
+                warn!(error = %e, "control: accept failed");
+            }
+        }
     }
 }
 
 /// Mount the filesystem at `mountpoint` and block until it is unmounted.
 ///
 /// Fetches the My Files root up front (so an auth/network failure surfaces
-/// before the kernel mount), then spawns the Phase 2 event-sync task and takes
-/// over the calling thread in the FUSE session loop. `rt` must be a handle to a
-/// *running* multi-threaded runtime.
+/// before the kernel mount), then spawns the Phase 2 event-sync task, the
+/// Phase 4 control socket, and takes over the calling thread in the FUSE session
+/// loop. `rt` must be a handle to a *running* multi-threaded runtime.
 pub fn mount(
     client: ProtonDriveClient,
     rt: tokio::runtime::Handle,
     mountpoint: &Path,
+    cache: ContentCache,
+    control_socket: &Path,
+    username: String,
 ) -> std::io::Result<()> {
     let root = rt
         .block_on(client.get_my_files_folder())
         .map_err(|e| std::io::Error::other(format!("fetch My Files root: {e}")))?;
     let scope = root.tree_event_scope_id();
+
+    let core = Core {
+        client: client.clone(),
+        rt: rt.clone(),
+        state: Arc::new(Mutex::new(State {
+            entries: HashMap::new(),
+            by_uid: HashMap::new(),
+            children: HashMap::new(),
+            next_ino: 2,
+            handles: HashMap::new(),
+            next_fh: 1,
+        })),
+        cache: Arc::new(cache),
+        timeline: Arc::new(Mutex::new(None)),
+    };
 
     let mut config = Config::default();
     config.mount_options = vec![
@@ -1036,8 +1597,20 @@ pub fn mount(
     ];
     info!(mountpoint = %mountpoint.display(), "mounting Proton Drive");
 
-    let fs = ProtonFs::new(client.clone(), rt.clone(), root);
-    let shared = fs.shared_state();
+    // Bind the control socket before the FUSE session takes over the thread. A
+    // stale socket file from a previous run would block the bind, so clear it.
+    let _ = std::fs::remove_file(control_socket);
+    let listener = UnixListener::bind(control_socket)?;
+    {
+        let core = core.clone();
+        let username = username.clone();
+        let mountpoint = mountpoint.to_path_buf();
+        std::thread::Builder::new()
+            .name("pdfs-control".into())
+            .spawn(move || run_control_socket(core, username, mountpoint, listener))?;
+    }
+
+    let fs = ProtonFs::new(core.clone(), root);
 
     // Build the session explicitly (not `mount2`) so we can grab a `Notifier`
     // for the event task. `spawn` runs the session loop on its own thread;
@@ -1045,7 +1618,9 @@ pub fn mount(
     // `mount`'s blocking contract.
     let session = Session::new(fs, mountpoint, &config)?.spawn()?;
     let notifier = session.notifier();
-    rt.spawn(run_event_sync(client, scope, shared, notifier));
+    rt.spawn(run_event_sync(client, scope, core.state, core.cache, notifier));
 
-    session.join()
+    let result = session.join();
+    let _ = std::fs::remove_file(control_socket);
+    result
 }
