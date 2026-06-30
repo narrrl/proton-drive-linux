@@ -1,15 +1,25 @@
 # Proton Drive client for Linux (unofficial)
 
-A fast, unofficial Proton Drive client for Linux. This client provides a FUSE files-on-demand virtual mount, a command-line interface (CLI), and a GTK4 desktop application with system tray integration.
+A fast, unofficial Proton Drive client for Linux. This client features an advanced files-on-demand FUSE virtual mount with block-level caching, a command-line interface (CLI), and a fully non-blocking GTK4 desktop application with system tray integration.
 
 ## Features
 
-- **Files-on-demand (FUSE)**: Mount your Proton Drive as a virtual filesystem where files are downloaded only when opened.
+- **Files-on-Demand (FUSE)**: Mount your Proton Drive as a virtual filesystem where files are downloaded only when opened, utilizing smart block-level caching and disk-backed writes.
 - **Command-Line Interface (CLI)**: Manage your drive, authenticate, and monitor sync status directly from the terminal.
-- **GTK4 Desktop App**: Log in, browse files, and configure sync options through a modern, native Linux GUI.
+- **Non-Blocking GTK4 Desktop App**: Browse files, manage pins, and configure options through a modern, native GUI with a fully non-blocking asynchronous main loop.
 - **System Tray Integration**: Background indicator for status monitoring, quick actions, and fast sync controls.
-- **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) for safe token storage.
+- **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
+
+## Performance & Caching
+
+The client includes several optimizations designed for high efficiency, a low memory footprint, and a responsive user experience:
+
+- **On-Demand Block Cache**: Files are read in fixed 4 MiB blocks. For unpinned files, the client fetches and caches only the blocks containing the requested byte ranges. This enables fast sequential and sparse reads (e.g. media streaming or metadata scanning) without downloading entire files.
+- **Disk-Backed Writes**: Large file writes are staged on disk in temporary scratch files (rather than fully buffered in RAM) and track modified byte intervals. Only the unedited remote segments are fetched at commit time, keeping memory usage minimal.
+- **Non-Blocking GTK4 Loop**: To prevent UI freezes, all synchronous D-Bus credential checks, control socket requests, and cache usage calculations are offloaded to background worker threads or fetched asynchronously.
+- **Flicker-Free UI Rendering**: The GTK4 application performs differential rendering of the pins list, only modifying list rows when the list content changes, preserving the user's scroll position and widget focus.
+
 
 ## Screenshots
 
