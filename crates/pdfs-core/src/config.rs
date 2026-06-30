@@ -94,6 +94,12 @@ impl AppDirs {
         self.state_dir().join("pins.json")
     }
 
+    /// Unified SQLite metadata cache (inodes, FTS, cache LRU, pins). Lives in
+    /// persistent state next to `control.sock`; only the daemon writes it.
+    pub fn db_path(&self) -> PathBuf {
+        self.state_dir().join("cache.db")
+    }
+
     /// Unix domain socket the mount daemon listens on for CLI control commands.
     pub fn control_socket(&self) -> PathBuf {
         self.state_dir().join("control.sock")

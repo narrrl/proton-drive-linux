@@ -49,7 +49,10 @@ use fuser::{
     ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
 use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
-use pdfs_core::control::{DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse};
+use pdfs_core::control::{
+    DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse, SearchHit,
+};
+use pdfs_core::db::{Db, StoredNode};
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
     DriveEvent, DriveEventScopeId, Node, NodeKind, PhotosTimelineItem, ProtonDriveClient,
@@ -186,11 +189,19 @@ struct State {
     /// have no entry here.
     handles: HashMap<u64, WriteHandle>,
     next_fh: u64,
+    /// Unified SQLite metadata cache. Every map mutation below writes through to
+    /// it inside the `State` lock so the DB stays the authoritative copy across
+    /// restarts (see plan.md P1).
+    db: Arc<Db>,
 }
 
 impl State {
-    /// Allocate (or reuse) a stable inode for a node and store its metadata.
+    /// Allocate (or reuse) a stable inode for a node and store its metadata,
+    /// writing the node through to the DB.
     fn intern(&mut self, parent: u64, node: Node) -> u64 {
+        if let Err(e) = self.db.upsert_node(&node) {
+            warn!(uid = %node.uid, error = %e, "db upsert_node failed");
+        }
         if let Some(&ino) = self.by_uid.get(&node.uid) {
             if let Some(e) = self.entries.get_mut(&ino) {
                 e.node = node;
@@ -213,16 +224,34 @@ impl State {
     }
 
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
-    /// listing, and its slot in its parent's listing. Returns `(parent_ino,
-    /// name)` when the node was known, so the caller can notify the kernel.
+    /// listing, its slot in its parent's listing, and its DB row. Returns
+    /// `(parent_ino, name)` when the node was known, so the caller can notify
+    /// the kernel.
     fn forget(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
         let ino = self.by_uid.remove(uid)?;
+        if let Err(e) = self.db.delete_node(uid) {
+            warn!(%uid, error = %e, "db delete_node failed");
+        }
         let entry = self.entries.remove(&ino)?;
         self.children.remove(&ino);
         if let Some(kids) = self.children.get_mut(&entry.parent) {
             kids.retain(|&k| k != ino);
         }
         Some((entry.parent, entry.node.name))
+    }
+
+    /// Drop a directory's cached child listing and mark it unlisted in the DB,
+    /// so the next access re-enumerates instead of trusting a stale listing.
+    fn invalidate_listing(&mut self, ino: u64) {
+        if self.children.remove(&ino).is_none() {
+            return;
+        }
+        if let Some(e) = self.entries.get(&ino) {
+            let uid = e.uid.clone();
+            if let Err(err) = self.db.set_listed(&uid, false) {
+                warn!(%uid, error = %err, "db set_listed(false) failed");
+            }
+        }
     }
 
     /// Update a file entry's recorded plaintext size so `getattr` reflects an
@@ -255,6 +284,10 @@ struct Core {
     rt: tokio::runtime::Handle,
     state: Arc<Mutex<State>>,
     cache: Arc<ContentCache>,
+    /// Unified SQLite metadata cache: the persistence layer behind the in-memory
+    /// `State` maps. Every mutation writes through here, and the maps rehydrate
+    /// from it on mount (plan.md P1).
+    db: Arc<Db>,
     /// Cached full photos timeline (newest first), so paged `PhotosTimeline`
     /// requests slice memory instead of re-fetching the whole timeline per page.
     /// `None` until first fetched; refreshed once older than [`TIMELINE_TTL`].
@@ -268,6 +301,71 @@ struct TimelineCache {
 }
 
 impl Core {
+    /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
+    /// start serves previously-seen metadata (stable inodes, instant listings)
+    /// without re-hitting the API. The root inode is already installed by
+    /// [`ProtonFs::new`]; this fills in every other persisted node and rebuilds
+    /// the child listings of folders the DB records as fully enumerated.
+    fn hydrate(&self) {
+        let stored = match self.db.load_all() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "db load_all failed; mounting cold");
+                return;
+            }
+        };
+        if stored.is_empty() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+
+        // Pass 1: assign a stable inode to every uid (root is already mapped).
+        for sn in &stored {
+            if st.by_uid.contains_key(&sn.node.uid) {
+                continue;
+            }
+            let ino = st.next_ino;
+            st.next_ino += 1;
+            st.by_uid.insert(sn.node.uid.clone(), ino);
+        }
+
+        // Pass 2: materialize entries, resolving each parent's inode by uid.
+        // Track folders flagged complete so their listings rebuild in pass 3.
+        let mut listed_dirs: Vec<u64> = Vec::new();
+        for sn in stored {
+            let StoredNode { node, listed } = sn;
+            let Some(&ino) = st.by_uid.get(&node.uid) else {
+                continue;
+            };
+            if listed && node.is_folder() {
+                listed_dirs.push(ino);
+            }
+            // The root entry is owned by `ProtonFs::new`; don't overwrite it.
+            if ino == ROOT_INO {
+                continue;
+            }
+            let parent = node
+                .parent_uid
+                .as_ref()
+                .and_then(|p| st.by_uid.get(p).copied())
+                .unwrap_or(ROOT_INO);
+            let uid = node.uid.clone();
+            st.entries.insert(ino, Entry { uid, parent, node });
+        }
+
+        // Pass 3: rebuild child listings for fully-enumerated folders.
+        for dir_ino in listed_dirs {
+            let kids: Vec<u64> = st
+                .entries
+                .iter()
+                .filter(|(_, e)| e.parent == dir_ino && !e.node.trashed)
+                .map(|(&ino, _)| ino)
+                .collect();
+            st.children.insert(dir_ino, kids);
+        }
+        info!(nodes = st.entries.len(), "hydrated metadata cache from db");
+    }
+
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
@@ -282,6 +380,29 @@ impl Core {
                 None => return Err(Errno::ENOENT),
             }
         };
+
+        // Offline fast path: a folder the DB still records as fully enumerated
+        // can be rebuilt from disk without hitting the API, even if its listing
+        // was trimmed from the hot cache mid-run.
+        match self.db.children_if_listed(&folder_uid) {
+            Ok(Some(nodes)) => {
+                let mut st = self.state.lock().unwrap();
+                if st.children.contains_key(&ino) {
+                    return Ok(());
+                }
+                let mut child_inos = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    if node.trashed {
+                        continue;
+                    }
+                    child_inos.push(st.intern(ino, node));
+                }
+                st.children.insert(ino, child_inos);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => warn!(%folder_uid, error = %e, "db children_if_listed failed"),
+        }
 
         let uids = self
             .rt
@@ -311,6 +432,11 @@ impl Core {
             child_inos.push(st.intern(ino, node));
         }
         st.children.insert(ino, child_inos);
+        // Record the listing as complete so a later restart (or a trimmed hot
+        // cache) can rebuild it from the DB without the API.
+        if let Err(e) = self.db.set_listed(&folder_uid, true) {
+            warn!(%folder_uid, error = %e, "db set_listed(true) failed");
+        }
         Ok(())
     }
 
@@ -553,25 +679,32 @@ impl Core {
         Ok(())
     }
 
-    /// Pin the file at mountpoint-relative `rel`: download its full plaintext
-    /// into the content cache and record it in the pin registry. Returns the
-    /// resolved node name on success.
+    /// Pin the node at mountpoint-relative `rel`. A file downloads its full
+    /// plaintext into the content cache; a folder records a recursive pin and
+    /// downloads every descendant file (selective sync). Returns a human message.
     fn pin(&self, rel: &Path) -> Result<String, String> {
         let (ino, uid) = self
             .resolve_path(rel)
             .map_err(|e| format!("resolve path: {e:?}"))?;
-        let (name, mtime, size) = {
+        let (name, is_folder, mtime, size) = {
             let st = self.state.lock().unwrap();
             let e = st.entries.get(&ino).ok_or("node vanished")?;
-            if !e.node.is_file() {
-                return Err("not a regular file".into());
-            }
             (
                 e.node.name.clone(),
+                e.node.is_folder(),
                 e.node.modification_time,
                 node_size(&e.node),
             )
         };
+        if is_folder {
+            // Record the recursive pin first so every descendant is eviction-
+            // exempt before we start filling the cache with the subtree.
+            self.cache
+                .add_pin(&uid, rel, true)
+                .map_err(|e| format!("pin: {e}"))?;
+            let n = self.pin_subtree(ino)?;
+            return Ok(format!("{name} ({n} files)"));
+        }
         let bytes = self
             .rt
             .block_on(self.client.download_file(&uid))
@@ -580,9 +713,54 @@ impl Core {
             .store(&uid, mtime, size, &bytes)
             .map_err(|e| format!("cache store: {e}"))?;
         self.cache
-            .add_pin(&uid, rel)
+            .add_pin(&uid, rel, false)
             .map_err(|e| format!("pin: {e}"))?;
         Ok(name)
+    }
+
+    /// Download and cache every file in the subtree rooted at folder `ino`,
+    /// returning the count cached (already-fresh blobs counted, not re-fetched).
+    /// Walks the tree depth-first, enumerating each folder so a cold subtree is
+    /// fully discovered; the lock is dropped before each network download.
+    fn pin_subtree(&self, ino: u64) -> Result<usize, String> {
+        let mut files: Vec<(NodeUid, i64, u64)> = Vec::new();
+        let mut stack = vec![ino];
+        while let Some(dir) = stack.pop() {
+            self.ensure_children(dir)
+                .map_err(|e| format!("enumerate: {e:?}"))?;
+            let st = self.state.lock().unwrap();
+            if let Some(kids) = st.children.get(&dir) {
+                for &k in kids {
+                    if let Some(e) = st.entries.get(&k) {
+                        if e.node.is_folder() {
+                            stack.push(k);
+                        } else {
+                            files.push((
+                                e.uid.clone(),
+                                e.node.modification_time,
+                                node_size(&e.node),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let mut count = 0;
+        for (uid, mtime, size) in files {
+            if self.cache.is_cached(&uid, mtime, size) {
+                count += 1;
+                continue;
+            }
+            match self.rt.block_on(self.client.download_file(&uid)) {
+                Ok(bytes) => {
+                    if self.cache.store(&uid, mtime, size, &bytes).is_ok() {
+                        count += 1;
+                    }
+                }
+                Err(e) => warn!(%uid, error = %e, "pin subtree: download failed"),
+            }
+        }
+        Ok(count)
     }
 
     /// Fetch a thumbnail of `ttype` for the file at `ino`, served from the cache
@@ -615,21 +793,32 @@ impl Core {
         Ok(bytes)
     }
 
-    /// Unpin the file at `rel`, evicting its cached content.
+    /// Unpin the node at `rel`, evicting its cached content. For a folder, also
+    /// evicts every descendant's cached blob (the subtree is no longer kept).
     fn unpin(&self, rel: &Path) -> Result<String, String> {
         let (ino, uid) = self
             .resolve_path(rel)
             .map_err(|e| format!("resolve path: {e:?}"))?;
-        let name = {
+        let (name, is_folder) = {
             let st = self.state.lock().unwrap();
             st.entries
                 .get(&ino)
-                .map(|e| e.node.name.clone())
+                .map(|e| (e.node.name.clone(), e.node.is_folder()))
                 .unwrap_or_default()
         };
         self.cache
             .remove_pin(&uid)
             .map_err(|e| format!("unpin: {e}"))?;
+        // A recursively-pinned folder's descendants were eviction-exempt; now
+        // that the pin is gone, reclaim their blobs eagerly instead of waiting
+        // for budget pressure. Descendants come from the DB node tree.
+        if is_folder && let Ok(uids) = self.db.descendants(&uid.to_string()) {
+            for s in uids {
+                if let Some(u) = parse_uid(&s) {
+                    self.cache.evict(&u);
+                }
+            }
+        }
         Ok(name)
     }
 
@@ -681,6 +870,31 @@ impl Core {
                 modified,
                 pinned: self.cache.is_pinned(&uid),
                 uid: uid.to_string(),
+                // Listing entries live in the requested dir; the caller derives
+                // the path from its name. Left empty.
+                path: String::new(),
+            })
+            .collect())
+    }
+
+    /// Full-text search node names against the local SQLite index, mapping each
+    /// DB hit to the wire [`SearchHit`] (resolving live pin state from the cache,
+    /// which the DB doesn't track). Pure local lookup — never hits the network.
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+        let hits = self
+            .db
+            .search(query, limit)
+            .map_err(|e| format!("search: {e}"))?;
+        Ok(hits
+            .into_iter()
+            .map(|h| SearchHit {
+                name: h.node.name.clone(),
+                path: h.path,
+                is_dir: h.node.is_folder(),
+                size: node_size(&h.node),
+                modified: h.node.modification_time,
+                pinned: self.cache.is_pinned(&h.node.uid),
+                uid: h.node.uid.to_string(),
             })
             .collect())
     }
@@ -855,6 +1069,9 @@ impl ProtonFs {
     fn new(core: Core, root: Node) -> Self {
         {
             let mut st = core.state.lock().unwrap();
+            if let Err(e) = st.db.upsert_node(&root) {
+                warn!(uid = %root.uid, error = %e, "db upsert root failed");
+            }
             st.by_uid.insert(root.uid.clone(), ROOT_INO);
             st.entries.insert(
                 ROOT_INO,
@@ -1710,7 +1927,7 @@ fn apply_event(
                 // Known node changed: drop its cached attrs/data (and listing if
                 // it is a directory) so the next access re-fetches. Its content
                 // blob may now be stale, so evict it too.
-                st.children.remove(&ino);
+                st.invalidate_listing(ino);
                 content.evict(node_uid);
                 let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
             }
@@ -1718,8 +1935,8 @@ fn apply_event(
             // drop it so the new child is picked up on the next readdir.
             if let Some(parent_uid) = parent_node_uid
                 && let Some(&parent) = st.by_uid.get(parent_uid)
-                && st.children.remove(&parent).is_some()
             {
+                st.invalidate_listing(parent);
                 let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
             }
         }
@@ -1746,8 +1963,8 @@ fn apply_event(
             warn!("event continuity lost; dropping all cached listings, resyncing lazily");
             let mut st = state.lock().unwrap();
             let dirs: Vec<u64> = st.children.keys().copied().collect();
-            st.children.clear();
-            for ino in dirs {
+            for &ino in &dirs {
+                st.invalidate_listing(ino);
                 let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
             }
         }
@@ -1758,20 +1975,41 @@ fn apply_event(
 }
 
 /// Poll the remote event cursor forever, applying each batch to the shared
-/// state. Seeds the cursor from the current server head so we only react to
-/// changes made after mount. Runs as a Tokio task; returns only on fatal error.
+/// state. Resumes from the cursor persisted in the DB so changes made while
+/// unmounted are applied; only a first-ever mount seeds from the server head.
+/// The cursor is persisted after every batch. Runs as a Tokio task; returns
+/// only on fatal error.
 async fn run_event_sync(
     client: ProtonDriveClient,
     scope: DriveEventScopeId,
     state: Arc<Mutex<State>>,
     content: Arc<ContentCache>,
+    db: Arc<Db>,
     notifier: Notifier,
 ) {
-    // Seed: a `None` cursor yields a single `CursorAdvanced` at the server head.
-    let mut cursor: Option<DriveEventId> = match client.enumerate_events(&scope, None).await {
-        Ok(events) => events.last().map(|e| e.id().clone()),
+    let mut cursor: Option<DriveEventId> = match db.get_event_cursor() {
+        // Resume: pick up exactly where the last run left off.
+        Ok(Some(saved)) => Some(DriveEventId::from(saved)),
+        // First mount: a `None` cursor yields a single `CursorAdvanced` at the
+        // server head; persist it so the next restart resumes instead of
+        // reseeding (which would skip everything that changed offline).
+        Ok(None) => match client.enumerate_events(&scope, None).await {
+            Ok(events) => {
+                let head = events.last().map(|e| e.id().clone());
+                if let Some(c) = &head
+                    && let Err(e) = db.set_event_cursor(c.as_str())
+                {
+                    warn!(error = %e, "persist seed cursor failed");
+                }
+                head
+            }
+            Err(e) => {
+                error!(error = %e, "failed to seed event cursor; live sync disabled");
+                return;
+            }
+        },
         Err(e) => {
-            error!(error = %e, "failed to seed event cursor; live sync disabled");
+            error!(error = %e, "read persisted cursor failed; live sync disabled");
             return;
         }
     };
@@ -1794,6 +2032,11 @@ async fn run_event_sync(
             apply_event(&state, &content, &notifier, event);
         }
         cursor = events.last().map(|e| e.id().clone());
+        if let Some(c) = &cursor
+            && let Err(e) = db.set_event_cursor(c.as_str())
+        {
+            warn!(error = %e, "persist event cursor failed");
+        }
     }
 }
 
@@ -1889,6 +2132,32 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 message: format!("bad uid: {uid}"),
             },
         },
+        Ok(CtlRequest::UploadPhoto {
+            name,
+            media_type,
+            bytes,
+            capture_time,
+        }) => {
+            let photos = core.photos();
+            let metadata = proton_drive_rs::PhotoUploadMetadata {
+                capture_time,
+                ..Default::default()
+            };
+            match core
+                .rt
+                .block_on(photos.upload_photo(&name, &media_type, &bytes, metadata))
+            {
+                Ok(uid) => {
+                    *core.timeline.lock().unwrap() = None;
+                    CtlResponse::Ok {
+                        message: format!("uploaded photo with uid {uid}"),
+                    }
+                }
+                Err(e) => CtlResponse::Error {
+                    message: format!("upload photo failed: {e}"),
+                },
+            }
+        }
         Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.open_file(&rel) {
                 Ok(p) => CtlResponse::FilePath {
@@ -1896,6 +2165,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 },
                 Err(e) => CtlResponse::Error { message: e },
             },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::Search { query, limit }) => match core.search(&query, limit) {
+            Ok(hits) => CtlResponse::SearchResults { hits },
             Err(e) => CtlResponse::Error { message: e },
         },
         Err(e) => CtlResponse::Error {
@@ -1981,6 +2254,7 @@ pub fn mount(
     mountpoint: &Path,
     cache: ContentCache,
     control_socket: &Path,
+    db: Arc<Db>,
     username: String,
 ) -> std::io::Result<MountOutcome> {
     let root = rt
@@ -1998,8 +2272,10 @@ pub fn mount(
             next_ino: 2,
             handles: HashMap::new(),
             next_fh: 1,
+            db: db.clone(),
         })),
         cache: Arc::new(cache),
+        db,
         timeline: Arc::new(Mutex::new(None)),
     };
 
@@ -2029,6 +2305,9 @@ pub fn mount(
     }
 
     let fs = ProtonFs::new(core.clone(), root);
+    // Warm the in-memory maps from the DB so a cold start serves previously
+    // seen metadata without re-hitting the API (plan.md P1).
+    core.hydrate();
 
     // Build the session explicitly (not `mount2`) so we can grab a `Notifier`
     // for the event task. `spawn` runs the session loop on its own background
@@ -2036,7 +2315,7 @@ pub fn mount(
     let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
     let notifier = bg.notifier();
     rt.spawn(run_event_sync(
-        client, scope, core.state, core.cache, notifier,
+        client, scope, core.state, core.cache, core.db, notifier,
     ));
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)

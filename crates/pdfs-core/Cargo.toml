@@ -17,4 +17,5 @@ thiserror.workspace = true
 tracing.workspace = true
 directories.workspace = true
 sha2.workspace = true
+rusqlite.workspace = true
 keyring.workspace = true

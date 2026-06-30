@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -9,6 +10,7 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{Request as CtlRequest, Response as CtlResponse};
+use pdfs_core::db::Db;
 
 #[derive(Parser)]
 #[command(
@@ -76,6 +78,14 @@ enum Command {
         /// Photo node uid in `volume~link` form (from `pdfs photos`).
         uid: String,
     },
+    /// Search file/folder names via the running daemon's local index.
+    Search {
+        /// Query string (substring match).
+        query: String,
+        /// Max hits to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -102,6 +112,7 @@ fn main() -> Result<()> {
         Command::Ls { path } => cmd_ls(path),
         Command::Photos { limit, offset } => cmd_photos(limit, offset),
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
+        Command::Search { query, limit } => cmd_search(query, limit),
     }
 }
 
@@ -217,10 +228,15 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
     let username = auth::load().map(|s| s.username).unwrap_or_default();
+    // The daemon owns the unified DB (single writer). Open it here so the content
+    // cache and the mount share one handle: the cache uses its `cache_entries`
+    // table as the LRU index, the mount uses it for nodes/search/event cursor.
+    let db = Arc::new(Db::open(&dirs.db_path()).context("open cache db")?);
     let cache = ContentCache::open(
         dirs.content_cache_dir(),
         dirs.pins_path(),
         pdfs_core::config::DEFAULT_CACHE_BUDGET_BYTES,
+        db.clone(),
     )
     .context("open content cache")?;
     let control_socket = dirs.control_socket();
@@ -272,6 +288,7 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         &mountpoint,
         cache,
         &control_socket,
+        db,
         username,
     );
 
@@ -365,6 +382,22 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
 fn cmd_open_photo(uid: String) -> Result<()> {
     match control_request(CtlRequest::OpenPhoto { uid })? {
         CtlResponse::FilePath { path } => println!("{path}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_search(query: String, limit: usize) -> Result<()> {
+    match control_request(CtlRequest::Search { query, limit })? {
+        CtlResponse::SearchResults { hits } if hits.is_empty() => println!("(no matches)"),
+        CtlResponse::SearchResults { hits } => {
+            for h in hits {
+                let kind = if h.is_dir { "d" } else { "-" };
+                let pin = if h.pinned { "*" } else { " " };
+                println!("{kind}{pin} {:>12}  {}", h.size, h.path);
+            }
+        }
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
     }

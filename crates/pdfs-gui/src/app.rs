@@ -32,7 +32,7 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{DirEntry, PhotoItem, Request, Response, send};
+use pdfs_core::control::{DirEntry, PhotoItem, Request, Response, SearchHit, send};
 use pdfs_core::service;
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
@@ -47,6 +47,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff between auto-retries of a Files/Photos load while the mount service
 /// is still coming up (see [`load_browser`] / [`load_gallery`]).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Idle pause after the last keystroke before a search query is sent, so typing
+/// doesn't fire a request per character.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Cap on search hits requested from the daemon.
+const SEARCH_LIMIT: usize = 200;
 
 /// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
 /// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
@@ -112,11 +117,17 @@ struct Ui {
     browser_retry: gtk4::Button,
     /// Mountpoint-relative path the browser is showing (empty = root).
     browser_path: RefCell<String>,
+    /// Debounced full-text search box in the browser header.
+    browser_search: gtk4::SearchEntry,
+    /// Pending debounce timer for the search box; replaced on every keystroke so
+    /// only the last pause actually fires a [`Request::Search`].
+    search_source: RefCell<Option<glib::SourceId>>,
     // Photos (gallery) page.
     gallery_model: gio::ListStore,
     gallery_status: gtk4::Label,
     gallery_retry: gtk4::Button,
     gallery_more: gtk4::Button,
+    gallery_upload: gtk4::Button,
 }
 
 impl Ui {
@@ -173,7 +184,17 @@ fn load_proton_theme() {
          .brand-icon {{ color: {PROTON_PURPLE}; }}\n\
          .file-grid {{ padding: 6px; }}\n\
          .file-tile {{ padding: 8px; border-radius: 10px; }}\n\
-         .file-tile:hover {{ background: alpha({PROTON_PURPLE}, 0.10); }}\n"
+         .file-tile:hover {{ background: alpha({PROTON_PURPLE}, 0.10); }}\n\
+         .photo-viewer-window {{ background-color: #000000; }}\n\
+         .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0)); padding: 12px 24px; color: white; }}\n\
+         .viewer-title {{ font-weight: bold; font-size: 1.1rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
+         .viewer-action-btn {{ color: white; background-color: rgba(255, 255, 255, 0.15); border-radius: 50%; padding: 8px; margin-left: 4px; }}\n\
+         .viewer-action-btn:hover {{ background-color: rgba(255, 255, 255, 0.3); color: white; }}\n\
+         .viewer-nav-btn {{ background-color: rgba(0, 0, 0, 0.5); color: white; margin: 24px; padding: 16px; border-radius: 50%; }}\n\
+         .viewer-nav-btn:hover {{ background-color: rgba(0, 0, 0, 0.8); color: white; }}\n\
+         .viewer-status {{ color: #ff5555; font-size: 1.1rem; background-color: rgba(0, 0, 0, 0.8); padding: 12px 24px; border-radius: 8px; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }}\n\
+         .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
+         .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n"
     );
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(&css);
@@ -252,15 +273,19 @@ fn build_window(app: &adw::Application) {
         browser_status: browser_widgets.3,
         browser_retry: browser_widgets.6,
         browser_path: RefCell::new(String::new()),
+        browser_search: browser_widgets.7,
+        search_source: RefCell::new(None),
         gallery_model: gallery_widgets.0,
         gallery_status: gallery_widgets.1,
         gallery_retry: gallery_widgets.4,
         gallery_more: gallery_widgets.2,
+        gallery_upload: gallery_widgets.5,
     });
 
     wire_login(&ui);
     wire_logout(&ui, &main_widgets.5);
     wire_browser(&ui, &browser_widgets.4, &browser_widgets.5);
+    wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.3);
     wire_retry(&ui);
 
@@ -831,6 +856,7 @@ fn build_browser_page() -> (
         gtk4::GridView,
         gtk4::ColumnView,
         gtk4::Button,
+        gtk4::SearchEntry,
     ),
 ) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
@@ -866,9 +892,16 @@ fn build_browser_page() -> (
     toggles.append(&grid_toggle);
     toggles.append(&list_toggle);
 
+    let search = gtk4::SearchEntry::builder()
+        .placeholder_text("Search Drive")
+        .valign(gtk4::Align::Center)
+        .build();
+    search.set_width_chars(18);
+
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&back);
     header.append(&crumb);
+    header.append(&search);
     header.append(&toggles);
 
     let status = gtk4::Label::builder().wrap(true).build();
@@ -938,7 +971,7 @@ fn build_browser_page() -> (
 
     (
         inner.upcast(),
-        (model, back, crumb, status, grid, column_view, retry),
+        (model, back, crumb, status, grid, column_view, retry, search),
     )
 }
 
@@ -1165,6 +1198,11 @@ fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Option<DirEnt
 fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
     if entry.is_dir {
+        // Descending into a search hit: clear the query so the folder listing
+        // isn't immediately re-masked by a stale search.
+        if !entry.path.is_empty() {
+            ui.browser_search.set_text("");
+        }
         *ui.browser_path.borrow_mut() = rel;
         load_browser(ui);
     } else {
@@ -1217,6 +1255,11 @@ fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
 /// Join the entry name onto the current browser directory to get its
 /// mountpoint-relative path.
 fn entry_rel(ui: &Rc<Ui>, entry: &DirEntry) -> String {
+    // Search hits carry an absolute (mountpoint-relative) path since they can
+    // live anywhere; plain listing entries derive it from the current folder.
+    if !entry.path.is_empty() {
+        return entry.path.clone();
+    }
     let base = ui.browser_path.borrow();
     if base.is_empty() {
         entry.name.clone()
@@ -1357,6 +1400,97 @@ fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     }
 }
 
+/// Wire the browser header's search box: debounce keystrokes, then either run a
+/// search or — when cleared — restore the current directory listing.
+fn wire_search(ui: &Rc<Ui>) {
+    let ui_s = ui.clone();
+    ui.browser_search.connect_search_changed(move |_| {
+        // Replace any pending debounce so only the last keystroke's pause fires.
+        if let Some(src) = ui_s.search_source.borrow_mut().take() {
+            src.remove();
+        }
+        let ui_t = ui_s.clone();
+        let src = glib::timeout_add_local_once(SEARCH_DEBOUNCE, move || {
+            ui_t.search_source.borrow_mut().take();
+            let query = ui_t.browser_search.text().trim().to_string();
+            if query.is_empty() {
+                load_browser(&ui_t);
+            } else {
+                run_search(&ui_t, &query);
+            }
+        });
+        *ui_s.search_source.borrow_mut() = Some(src);
+    });
+}
+
+/// Send a [`Request::Search`] to the daemon and render the hits in the browser
+/// views, reusing the same row model so click-to-open and pin work unchanged
+/// (each hit carries its full path; see [`entry_rel`]).
+fn run_search(ui: &Rc<Ui>, query: &str) {
+    ui.browser_model.remove_all();
+    ui.browser_retry.set_visible(false);
+    ui.browser_status.set_label("Searching…");
+    ui.browser_status.set_visible(true);
+
+    ui.busy_begin();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::Search {
+            query: query.to_string(),
+            limit: SEARCH_LIMIT,
+        },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        // The box may have been cleared (or changed) while the reply was in
+        // flight; if so a fresh load/search already owns the model — drop this.
+        if ui.browser_search.text().trim().is_empty() {
+            return;
+        }
+        match result {
+            Ok(Ok(Response::SearchResults { hits })) => repaint_search(&ui, &hits),
+            Ok(Ok(Response::Error { message })) => browser_message(&ui, &message),
+            Ok(Ok(_)) => browser_message(&ui, "Unexpected reply from daemon."),
+            Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
+        }
+    });
+}
+
+/// Repopulate the model with search hits — folders first, then by name — mapping
+/// each [`SearchHit`] to a path-carrying [`DirEntry`] the existing renderers and
+/// handlers already understand.
+fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
+    ui.browser_model.remove_all();
+    if hits.is_empty() {
+        browser_message(ui, "No matches.");
+        return;
+    }
+    ui.browser_status.set_visible(false);
+
+    let mut entries: Vec<DirEntry> = hits
+        .iter()
+        .map(|h| DirEntry {
+            name: h.name.clone(),
+            is_dir: h.is_dir,
+            size: h.size,
+            modified: h.modified,
+            pinned: h.pinned,
+            uid: h.uid.clone(),
+            path: h.path.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    for entry in entries {
+        ui.browser_model.append(&BoxedAnyObject::new(entry));
+    }
+}
+
 /// The Photos page: a [`gtk4::GridView`] of thumbnails backed by a
 /// [`gio::ListStore`] of [`BoxedAnyObject`]-wrapped [`PhotoItem`]s, plus a
 /// "Load more" button and a status label.
@@ -1368,6 +1502,7 @@ fn build_gallery_page() -> (
         gtk4::Button,
         gtk4::GridView,
         gtk4::Button,
+        gtk4::Button, // Upload Photo
     ),
 ) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
@@ -1429,21 +1564,41 @@ fn build_gallery_page() -> (
         .child(&grid)
         .build();
 
+    // Modern header: "Photos" title + "Upload Photo" action button
+    let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let title_label = gtk4::Label::builder()
+        .label("Photos")
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .build();
+    title_label.add_css_class("heading");
+
+    let upload = gtk4::Button::builder()
+        .label("Upload Photo")
+        .icon_name("list-add-symbolic")
+        .valign(gtk4::Align::Center)
+        .build();
+    upload.add_css_class("pill");
+    upload.add_css_class("suggested-action");
+    header_box.append(&title_label);
+    header_box.append(&upload);
+
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
     inner.set_margin_bottom(12);
     inner.set_margin_start(12);
     inner.set_margin_end(12);
+    inner.append(&header_box);
     inner.append(&status);
     inner.append(&retry);
     inner.append(&scroll);
     inner.append(&more);
 
-    (inner.upcast(), (model, status, more, grid, retry))
+    (inner.upcast(), (model, status, more, grid, retry, upload))
 }
 
-/// Wire the gallery: activating a tile downloads the photo and opens it; the
-/// "Load more" button appends the next page.
+/// Wire the gallery: activating a tile downloads the photo and opens it in our
+/// in-app lightbox viewer; the "Load more" button appends the next page.
 fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
     let ui_open = ui.clone();
     grid.connect_activate(move |grid, pos| {
@@ -1454,34 +1609,513 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
             .downcast_ref::<BoxedAnyObject>()
             .map(|o| o.borrow::<PhotoItem>().uid.clone());
         let Some(uid) = uid else { return };
-        // Ignore a repeat activation of a photo already downloading.
-        if !ui_open.opening.borrow_mut().insert(uid.clone()) {
-            return;
-        }
-        ui_open.busy_begin();
-        let rx = spawn_request(
-            ui_open.dirs.control_socket(),
-            Request::OpenPhoto { uid: uid.clone() },
-        );
-        let ui = ui_open.clone();
-        glib::spawn_future_local(async move {
-            let result = rx.recv().await;
-            ui.busy_end();
-            ui.opening.borrow_mut().remove(&uid);
-            match result {
-                Ok(Ok(Response::FilePath { path })) => open_path(&path),
-                Ok(Ok(Response::Error { message })) => {
-                    tracing::error!("open photo failed: {message}")
-                }
-                _ => tracing::error!("open photo request failed"),
-            }
-        });
+        open_photo_viewer(&ui_open, uid);
     });
 
     let ui_more = ui.clone();
     ui.gallery_more.clone().connect_clicked(move |_| {
         load_gallery(&ui_more, true);
     });
+
+    let ui_upload = ui.clone();
+    ui.gallery_upload.connect_clicked(move |_| {
+        let dialog = gtk4::FileDialog::builder()
+            .title("Select Photo to Upload")
+            .build();
+
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("Images"));
+        filter.add_mime_type("image/*");
+        let filters = gio::ListStore::new::<gtk4::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+
+        let ui = ui_upload.clone();
+        let parent_win = ui.stack.root().and_downcast::<gtk4::Window>();
+        dialog.open(parent_win.as_ref(), gio::Cancellable::NONE, move |res| {
+            if let Ok(file) = res {
+                if let Some(path) = file.path() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("photo.jpg")
+                        .to_string();
+                    let bytes = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("Failed to read photo: {e}");
+                            return;
+                        }
+                    };
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jpg")
+                        .to_lowercase();
+                    let media_type = match ext.as_str() {
+                        "png" => "image/png",
+                        "gif" => "image/gif",
+                        "webp" => "image/webp",
+                        "tiff" | "tif" => "image/tiff",
+                        _ => "image/jpeg",
+                    };
+                    let capture_time = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+
+                    ui.busy_begin();
+                    let rx = spawn_request(
+                        ui.dirs.control_socket(),
+                        Request::UploadPhoto {
+                            name,
+                            media_type: media_type.to_string(),
+                            bytes,
+                            capture_time,
+                        },
+                    );
+                    let ui_clone = ui.clone();
+                    glib::spawn_future_local(async move {
+                        let res = rx.recv().await;
+                        ui_clone.busy_end();
+                        match res {
+                            Ok(Ok(Response::Ok { message })) => {
+                                tracing::info!("Photo uploaded: {message}");
+                                load_gallery(&ui_clone, false);
+                            }
+                            Ok(Ok(Response::Error { message })) => {
+                                tracing::error!("Upload failed: {message}");
+                                show_error_dialog(&ui_clone, &format!("Upload failed: {message}"));
+                            }
+                            _ => {
+                                tracing::error!("Upload request failed");
+                                show_error_dialog(
+                                    &ui_clone,
+                                    "Upload request failed (daemon unreachable).",
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    });
+}
+
+fn show_error_dialog(ui: &Rc<Ui>, message: &str) {
+    let parent = ui.stack.root().and_downcast::<gtk4::Window>();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Photo Operation")
+        .body(message)
+        .build();
+    dialog.add_response("ok", "OK");
+    dialog.present(parent.as_ref());
+}
+
+fn find_photo_index(model: &gio::ListStore, uid: &str) -> Option<u32> {
+    for i in 0..model.n_items() {
+        if let Some(obj) = model.item(i) {
+            if let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() {
+                if boxed.borrow::<PhotoItem>().uid == uid {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn format_capture_time(secs: i64) -> String {
+    let date = glib::DateTime::from_unix_local(secs);
+    match date {
+        Ok(d) => match d.format("%Y-%m-%d %H:%M:%S") {
+            Ok(s) => s.to_string(),
+            Err(_) => "Unknown Date".to_string(),
+        },
+        Err(_) => "Unknown Date".to_string(),
+    }
+}
+
+fn load_photo(
+    ui: &Rc<Ui>,
+    uid: String,
+    picture: &gtk4::Picture,
+    spinner: &gtk4::Spinner,
+    status_label: &gtk4::Label,
+    current_path: Rc<RefCell<Option<String>>>,
+) {
+    spinner.set_visible(true);
+    spinner.start();
+    picture.set_paintable(gtk4::gdk::Paintable::NONE);
+    status_label.set_visible(false);
+    *current_path.borrow_mut() = None;
+
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::OpenPhoto { uid: uid.clone() },
+    );
+    let picture_clone = picture.clone();
+    let spinner_clone = spinner.clone();
+    let status_clone = status_label.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        spinner_clone.stop();
+        spinner_clone.set_visible(false);
+        match result {
+            Ok(Ok(Response::FilePath { path })) => match gtk4::gdk::Texture::from_filename(&path) {
+                Ok(texture) => {
+                    picture_clone.set_paintable(Some(&texture));
+                    *current_path.borrow_mut() = Some(path);
+                }
+                Err(e) => {
+                    status_clone.set_label(&format!("Failed to load image: {e}"));
+                    status_clone.set_visible(true);
+                }
+            },
+            Ok(Ok(Response::Error { message })) => {
+                status_clone.set_label(&format!("Error downloading photo: {message}"));
+                status_clone.set_visible(true);
+            }
+            _ => {
+                status_clone.set_label("Failed to connect to daemon");
+                status_clone.set_visible(true);
+            }
+        }
+    });
+}
+
+fn save_photo_to_disk(window: &gtk4::Window, source_path: &str, original_name: &str) {
+    let dialog = gtk4::FileDialog::builder()
+        .title("Save Photo")
+        .initial_name(original_name)
+        .build();
+    let source_path_str = source_path.to_string();
+    dialog.save(Some(window), gio::Cancellable::NONE, move |res| {
+        if let Ok(file) = res {
+            if let Some(dest_path) = file.path() {
+                if let Err(e) = std::fs::copy(&source_path_str, &dest_path) {
+                    tracing::error!("Failed to copy file to {:?}: {}", dest_path, e);
+                } else {
+                    tracing::info!("Saved photo to {:?}", dest_path);
+                }
+            }
+        }
+    });
+}
+
+fn navigate_photo(
+    ui: &Rc<Ui>,
+    current_uid: &Rc<RefCell<String>>,
+    delta: i32,
+    picture: &gtk4::Picture,
+    spinner: &gtk4::Spinner,
+    status_label: &gtk4::Label,
+    title_label: &gtk4::Label,
+    prev_btn: &gtk4::Button,
+    next_btn: &gtk4::Button,
+    current_path: Rc<RefCell<Option<String>>>,
+) {
+    let model = &ui.gallery_model;
+    let n = model.n_items();
+    if n == 0 {
+        return;
+    }
+    let uid_val = current_uid.borrow().clone();
+    let current_idx = find_photo_index(model, &uid_val).unwrap_or(0);
+    let next_idx = (current_idx as i32 + delta).clamp(0, n as i32 - 1) as u32;
+
+    let Some(obj) = model.item(next_idx) else {
+        return;
+    };
+    let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() else {
+        return;
+    };
+    let photo = boxed.borrow::<PhotoItem>().clone();
+
+    *current_uid.borrow_mut() = photo.uid.clone();
+
+    prev_btn.set_sensitive(next_idx > 0);
+    next_btn.set_sensitive(next_idx < n - 1);
+
+    let date_str = format_capture_time(photo.capture_time);
+    title_label.set_label(&format!("Photo {} of {} • {}", next_idx + 1, n, date_str));
+
+    load_photo(
+        ui,
+        photo.uid.clone(),
+        picture,
+        spinner,
+        status_label,
+        current_path,
+    );
+}
+
+fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
+    let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
+
+    let window = gtk4::Window::builder()
+        .title("Photo Viewer")
+        .modal(true)
+        .transient_for(&parent)
+        .default_width(800)
+        .default_height(600)
+        .build();
+    window.add_css_class("photo-viewer-window");
+
+    let overlay = gtk4::Overlay::new();
+
+    let picture = gtk4::Picture::builder()
+        .content_fit(gtk4::ContentFit::Contain)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    overlay.set_child(Some(&picture));
+
+    let prev_btn = gtk4::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Previous Photo")
+        .halign(gtk4::Align::Start)
+        .valign(gtk4::Align::Center)
+        .build();
+    prev_btn.add_css_class("circular");
+    prev_btn.add_css_class("flat");
+    prev_btn.add_css_class("viewer-nav-btn");
+    overlay.add_overlay(&prev_btn);
+
+    let next_btn = gtk4::Button::builder()
+        .icon_name("go-next-symbolic")
+        .tooltip_text("Next Photo")
+        .halign(gtk4::Align::End)
+        .valign(gtk4::Align::Center)
+        .build();
+    next_btn.add_css_class("circular");
+    next_btn.add_css_class("flat");
+    next_btn.add_css_class("viewer-nav-btn");
+    overlay.add_overlay(&next_btn);
+
+    let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    top_bar.add_css_class("viewer-top-bar");
+    top_bar.set_valign(gtk4::Align::Start);
+    top_bar.set_hexpand(true);
+
+    let title_label = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
+    title_label.add_css_class("viewer-title");
+    top_bar.append(&title_label);
+
+    let download_btn = gtk4::Button::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Download to Disk")
+        .build();
+    download_btn.add_css_class("flat");
+    download_btn.add_css_class("viewer-action-btn");
+    top_bar.append(&download_btn);
+
+    let open_ext_btn = gtk4::Button::builder()
+        .icon_name("document-open-symbolic")
+        .tooltip_text("Open in External App")
+        .build();
+    open_ext_btn.add_css_class("flat");
+    open_ext_btn.add_css_class("viewer-action-btn");
+    top_bar.append(&open_ext_btn);
+
+    let close_btn = gtk4::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Close")
+        .build();
+    close_btn.add_css_class("flat");
+    close_btn.add_css_class("viewer-action-btn");
+    top_bar.append(&close_btn);
+
+    overlay.add_overlay(&top_bar);
+
+    let spinner = gtk4::Spinner::builder()
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .width_request(48)
+        .height_request(48)
+        .build();
+    overlay.add_overlay(&spinner);
+
+    let status_label = gtk4::Label::builder()
+        .wrap(true)
+        .justify(gtk4::Justification::Center)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .build();
+    status_label.add_css_class("viewer-status");
+    overlay.add_overlay(&status_label);
+
+    window.set_child(Some(&overlay));
+
+    let current_uid = Rc::new(RefCell::new(initial_uid.clone()));
+    let current_path = Rc::new(RefCell::new(None::<String>));
+
+    let n = ui.gallery_model.n_items();
+    let initial_idx = find_photo_index(&ui.gallery_model, &initial_uid).unwrap_or(0);
+    prev_btn.set_sensitive(initial_idx > 0);
+    next_btn.set_sensitive(initial_idx < n - 1);
+
+    let mut initial_capture_time = 0;
+    if let Some(obj) = ui.gallery_model.item(initial_idx) {
+        if let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() {
+            initial_capture_time = boxed.borrow::<PhotoItem>().capture_time;
+        }
+    }
+    let date_str = format_capture_time(initial_capture_time);
+    title_label.set_label(&format!(
+        "Photo {} of {} • {}",
+        initial_idx + 1,
+        n,
+        date_str
+    ));
+
+    load_photo(
+        ui,
+        initial_uid,
+        &picture,
+        &spinner,
+        &status_label,
+        current_path.clone(),
+    );
+
+    let w_close = window.clone();
+    close_btn.connect_clicked(move |_| {
+        w_close.close();
+    });
+
+    let w_download = window.clone();
+    let path_download = current_path.clone();
+    let uid_download = current_uid.clone();
+    download_btn.connect_clicked(move |_| {
+        if let Some(path) = path_download.borrow().as_deref() {
+            let uid_val = uid_download.borrow();
+            let name = format!("{}.jpg", uid_val);
+            save_photo_to_disk(&w_download, path, &name);
+        }
+    });
+
+    let path_ext = current_path.clone();
+    open_ext_btn.connect_clicked(move |_| {
+        if let Some(path) = path_ext.borrow().as_deref() {
+            open_path(path);
+        }
+    });
+
+    let ui_prev = ui.clone();
+    let uid_prev = current_uid.clone();
+    let pic_prev = picture.clone();
+    let spin_prev = spinner.clone();
+    let status_prev = status_label.clone();
+    let title_prev = title_label.clone();
+    let p_btn = prev_btn.clone();
+    let n_btn = next_btn.clone();
+    let path_prev = current_path.clone();
+    prev_btn.connect_clicked(move |_| {
+        navigate_photo(
+            &ui_prev,
+            &uid_prev,
+            -1,
+            &pic_prev,
+            &spin_prev,
+            &status_prev,
+            &title_prev,
+            &p_btn,
+            &n_btn,
+            path_prev.clone(),
+        );
+    });
+
+    let ui_next = ui.clone();
+    let uid_next = current_uid.clone();
+    let pic_next = picture.clone();
+    let spin_next = spinner.clone();
+    let status_next = status_label.clone();
+    let title_next = title_label.clone();
+    let p_btn = prev_btn.clone();
+    let n_btn = next_btn.clone();
+    let path_next = current_path.clone();
+    next_btn.connect_clicked(move |_| {
+        navigate_photo(
+            &ui_next,
+            &uid_next,
+            1,
+            &pic_next,
+            &spin_next,
+            &status_next,
+            &title_next,
+            &p_btn,
+            &n_btn,
+            path_next.clone(),
+        );
+    });
+
+    let key_controller = gtk4::EventControllerKey::new();
+    let ui_key = ui.clone();
+    let uid_key = current_uid.clone();
+    let pic_key = picture.clone();
+    let spin_key = spinner.clone();
+    let status_key = status_label.clone();
+    let title_key = title_label.clone();
+    let p_btn = prev_btn.clone();
+    let n_btn = next_btn.clone();
+    let path_key = current_path.clone();
+    let w_key = window.clone();
+    key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
+        match key.name().as_deref() {
+            Some("Left") => {
+                let current_idx =
+                    find_photo_index(&ui_key.gallery_model, &uid_key.borrow()).unwrap_or(0);
+                if current_idx > 0 {
+                    navigate_photo(
+                        &ui_key,
+                        &uid_key,
+                        -1,
+                        &pic_key,
+                        &spin_key,
+                        &status_key,
+                        &title_key,
+                        &p_btn,
+                        &n_btn,
+                        path_key.clone(),
+                    );
+                }
+                glib::Propagation::Stop
+            }
+            Some("Right") => {
+                let n = ui_key.gallery_model.n_items();
+                let current_idx =
+                    find_photo_index(&ui_key.gallery_model, &uid_key.borrow()).unwrap_or(0);
+                if current_idx < n - 1 {
+                    navigate_photo(
+                        &ui_key,
+                        &uid_key,
+                        1,
+                        &pic_key,
+                        &spin_key,
+                        &status_key,
+                        &title_key,
+                        &p_btn,
+                        &n_btn,
+                        path_key.clone(),
+                    );
+                }
+                glib::Propagation::Stop
+            }
+            Some("Escape") => {
+                w_key.close();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    window.add_controller(key_controller);
+
+    window.present();
 }
 
 /// Fetch a timeline page from the daemon. When `append` is false the model is

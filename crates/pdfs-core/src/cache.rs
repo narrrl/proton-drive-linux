@@ -19,13 +19,31 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::db::Db;
 use crate::error::Result;
+
+/// `cache_entries.kind` tag for whole-file content blobs.
+const KIND_BLOB: &str = "blob";
+/// `cache_entries.kind` tag for on-demand block-cache chunks.
+const KIND_BLOCK: &str = "block";
+
+/// Current wall-clock time in unix *milliseconds*, for the LRU `last_accessed`
+/// column. Milliseconds (not seconds) so two cache events in the same second
+/// still order correctly — a coarse second-granularity clock would make LRU
+/// eviction order indeterminate under bursty access.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Block size for the on-demand block cache. Matches the SDK content block size
 /// (`DEFAULT_BLOCK_SIZE`, 4 MiB) so each cached block maps to exactly one
@@ -42,18 +60,22 @@ struct Meta {
     size: u64,
 }
 
-/// One pinned file, as persisted to the pin registry.
+/// One pin, as carried over the control socket and listed in `status`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Pin {
     /// Node uid in `volume~link` display form.
     pub uid: String,
-    /// Last path the file was pinned under, for display in `status`. Advisory
+    /// Last path the node was pinned under, for display in `status`. Advisory
     /// only — the uid is the identity.
     pub path: String,
+    /// A folder pin whose whole subtree is kept on disk. `false` for a single
+    /// file. Defaulted so a legacy `pins.json` (file pins only) still parses.
+    #[serde(default)]
+    pub recursive: bool,
 }
 
-/// The pin registry, persisted as JSON. Keyed by uid display string so a pin
-/// survives renames/moves of the node.
+/// The legacy JSON pin registry, kept only to import a pre-P5 `pins.json` into
+/// the DB once on open. Live pins are owned by the `pins` table.
 #[derive(Serialize, Deserialize, Default)]
 struct PinFile {
     pins: BTreeMap<String, Pin>,
@@ -80,13 +102,24 @@ pub struct ContentCache {
     /// disables the cap. Pinned blobs are never evicted, so pins alone may push
     /// the cache over budget.
     max_bytes: u64,
+    /// Unified metadata DB. Its `cache_entries` table is the LRU index: every
+    /// store/read/evict updates it, and the budget enforcers query it instead of
+    /// scanning the cache directories (plan.md P4).
+    db: Arc<Db>,
 }
 
 impl ContentCache {
     /// Open (and create) a cache under `content_dir`, with the pin registry at
     /// `pins_path` and a `max_bytes` size cap (`0` = unlimited). Both parent
-    /// directories are created if missing.
-    pub fn open(content_dir: PathBuf, pins_path: PathBuf, max_bytes: u64) -> Result<Self> {
+    /// directories are created if missing. `db` is the shared metadata database
+    /// whose `cache_entries` table backs LRU eviction; the on-disk cache is
+    /// reconciled into it on open.
+    pub fn open(
+        content_dir: PathBuf,
+        pins_path: PathBuf,
+        max_bytes: u64,
+        db: Arc<Db>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&content_dir)?;
         let thumb_dir = content_dir.join("thumbs");
         std::fs::create_dir_all(&thumb_dir)?;
@@ -100,14 +133,71 @@ impl ContentCache {
         if let Some(parent) = pins_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self {
+        let cache = Self {
             content_dir,
             thumb_dir,
             block_dir,
             scratch_dir,
             pins_path,
             max_bytes,
-        })
+            db,
+        };
+        cache.reconcile()?;
+        cache.import_legacy_pins()?;
+        Ok(cache)
+    }
+
+    /// One-time migration of a pre-P5 `pins.json` into the DB `pins` table, then
+    /// delete the file so it never re-imports. Legacy pins were all whole-file
+    /// (non-recursive). Absent file → nothing to do.
+    fn import_legacy_pins(&self) -> Result<()> {
+        let Ok(bytes) = std::fs::read(&self.pins_path) else {
+            return Ok(());
+        };
+        if let Ok(file) = serde_json::from_slice::<PinFile>(&bytes) {
+            for (uid, pin) in file.pins {
+                self.db.pin_add(&uid, &pin.path, false)?;
+            }
+        }
+        let _ = std::fs::remove_file(&self.pins_path);
+        Ok(())
+    }
+
+    /// Rebuild the `cache_entries` LRU index from the on-disk cache. Called once
+    /// on open: the index is cleared, then every blob (`content_dir`) and block
+    /// (`block_dir`) file is re-registered with its on-disk size and last-modified
+    /// time as the initial LRU key. This makes the DB authoritative even after a
+    /// crash or an external file deletion, and picks up caches written by builds
+    /// predating the index. In-run accesses then refine the ordering.
+    fn reconcile(&self) -> Result<()> {
+        self.db.cache_clear()?;
+        for (dir, kind) in [
+            (&self.content_dir, KIND_BLOB),
+            (&self.block_dir, KIND_BLOCK),
+        ] {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.ends_with(".meta") || name.ends_with(".tmp") {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let at = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.db.cache_touch(name, kind, meta.len(), at)?;
+            }
+        }
+        Ok(())
     }
 
     /// Filesystem-safe, fixed-length cache key for a uid display string: the
@@ -171,10 +261,10 @@ impl ContentCache {
         len: u64,
     ) -> Option<Vec<u8>> {
         let blob = self.valid_blob(uid, mtime, size)?;
-        // Record the access for LRU: bump the blob's mtime to now. Best effort —
-        // a failed touch only makes eviction order slightly less accurate.
+        // Record the access for LRU in the cache index. Best effort — a failed
+        // update only makes eviction order slightly less accurate.
+        let _ = self.db.cache_accessed(&Self::key(uid), now_millis());
         let mut f = std::fs::File::open(&blob).ok()?;
-        let _ = f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
         if offset >= size {
             return Some(Vec::new());
         }
@@ -197,12 +287,22 @@ impl ContentCache {
         std::fs::rename(&tmp, &blob)?;
         let meta = serde_json::to_vec(&Meta { mtime, size })?;
         std::fs::write(self.meta_path(uid), meta)?;
+        // Register the blob in the LRU index before enforcing the budget so the
+        // newest entry is weighed (and ordered most-recent) like any other.
+        self.db
+            .cache_touch(&Self::key(uid), KIND_BLOB, bytes.len() as u64, now_millis())?;
         self.enforce_budget();
         Ok(())
     }
 
+    /// Cache-index key for block `idx` of `uid` — the block file's name, which
+    /// is also its `cache_entries.cache_key`.
+    fn block_key(&self, uid: &NodeUid, idx: u64) -> String {
+        format!("{}.b{idx}", Self::key(uid))
+    }
+
     fn block_blob(&self, uid: &NodeUid, idx: u64) -> PathBuf {
-        self.block_dir.join(format!("{}.b{idx}", Self::key(uid)))
+        self.block_dir.join(self.block_key(uid, idx))
     }
 
     fn block_meta(&self, uid: &NodeUid, idx: u64) -> PathBuf {
@@ -222,7 +322,10 @@ impl ContentCache {
             return None;
         }
         let mut f = std::fs::File::open(self.block_blob(uid, idx)).ok()?;
-        let _ = f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
+        // LRU touch in the cache index (best effort).
+        let _ = self
+            .db
+            .cache_accessed(&self.block_key(uid, idx), now_millis());
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).ok()?;
         Some(buf)
@@ -249,6 +352,12 @@ impl ContentCache {
             self.block_meta(uid, idx),
             serde_json::to_vec(&Meta { mtime, size })?,
         )?;
+        self.db.cache_touch(
+            &self.block_key(uid, idx),
+            KIND_BLOCK,
+            bytes.len() as u64,
+            now_millis(),
+        )?;
         self.enforce_block_budget();
         Ok(())
     }
@@ -260,42 +369,25 @@ impl ContentCache {
         if self.max_bytes == 0 {
             return;
         }
-        let mut total: u64 = 0;
-        let mut blobs: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&self.block_dir) else {
+        // LRU-ordered (oldest first) block entries straight from the index — no
+        // directory scan. All blocks are evictable; pinned files are served from
+        // whole-file blobs, never blocks.
+        let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOCK) else {
             return;
         };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.ends_with(".meta") || name.ends_with(".tmp") {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            total += meta.len();
-            let atime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            blobs.push((path, meta.len(), atime));
-        }
+        let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
         if total <= self.max_bytes {
             return;
         }
-        blobs.sort_by_key(|(_, _, atime)| *atime);
-        for (path, len, _) in blobs {
+        for (key, size) in entries {
             if total <= self.max_bytes {
                 break;
             }
-            let meta = path.with_file_name(format!(
-                "{}.meta",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(meta);
-            total = total.saturating_sub(len);
+            // `key` is the block file's name (and its `.meta` sibling's stem).
+            let _ = std::fs::remove_file(self.block_dir.join(&key));
+            let _ = std::fs::remove_file(self.block_dir.join(format!("{key}.meta")));
+            let _ = self.db.cache_remove(&key);
+            total = total.saturating_sub(size);
         }
     }
 
@@ -328,7 +420,10 @@ impl ContentCache {
             let _ = std::fs::remove_file(self.thumb_blob(uid, ttype));
             let _ = std::fs::remove_file(self.thumb_meta(uid, ttype));
         }
-        // Drop every cached block (and its meta/tmp) for this uid.
+        // Drop every cached block (and its meta/tmp) for this uid. The block
+        // dir is still scanned here because eviction targets one uid's files by
+        // name prefix, not by LRU order; the index rows are removed in one shot
+        // by `cache_remove_all` below.
         let prefix = format!("{}.b", Self::key(uid));
         if let Ok(rd) = std::fs::read_dir(&self.block_dir) {
             for entry in rd.flatten() {
@@ -341,6 +436,8 @@ impl ContentCache {
                 }
             }
         }
+        // Forget the blob and all of this uid's block rows in the LRU index.
+        let _ = self.db.cache_remove_all(&Self::key(uid));
     }
 
     fn thumb_blob(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
@@ -423,101 +520,80 @@ impl ContentCache {
         if self.max_bytes == 0 {
             return;
         }
-        // Pinned blobs (by cache key) are exempt from eviction.
+        // Pinned blobs (by cache key) are exempt from eviction. Resolves direct
+        // pins plus every descendant of a recursively-pinned folder, hashed into
+        // cache keys to match on-disk filenames.
         let pinned: HashSet<String> = self
-            .load_pins()
-            .pins
-            .keys()
+            .db
+            .pinned_uids()
+            .unwrap_or_default()
+            .iter()
             .map(|uid| Self::key_str(uid))
             .collect();
 
-        // Scan blobs (the `<key>` files; skip `.meta`/`.tmp` siblings), record
-        // size + last-access (mtime) for each.
-        let mut total: u64 = 0;
-        let mut blobs: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&self.content_dir) else {
+        // LRU-ordered (oldest first) blob entries from the index — no directory
+        // scan. Pinned blobs still count toward the total (so pins alone can hold
+        // the cache over budget) but are never chosen as victims.
+        let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOB) else {
             return;
         };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.ends_with(".meta") || name.ends_with(".tmp") {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            total += meta.len();
-            if pinned.contains(name) {
-                continue; // counts toward total but is never a victim
-            }
-            let atime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            blobs.push((path, meta.len(), atime));
-        }
+        let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
         if total <= self.max_bytes {
             return;
         }
-        // Oldest access first.
-        blobs.sort_by_key(|(_, _, atime)| *atime);
-        for (path, len, _) in blobs {
+        for (key, size) in entries {
             if total <= self.max_bytes {
                 break;
             }
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(path.with_extension("meta"));
-            total = total.saturating_sub(len);
+            if pinned.contains(&key) {
+                continue; // counts toward total but is never a victim
+            }
+            // `key` is the blob file's name (and its `.meta` sibling's stem).
+            let _ = std::fs::remove_file(self.content_dir.join(&key));
+            let _ = std::fs::remove_file(self.content_dir.join(format!("{key}.meta")));
+            let _ = self.db.cache_remove(&key);
+            total = total.saturating_sub(size);
         }
     }
 
-    fn load_pins(&self) -> PinFile {
-        std::fs::read(&self.pins_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
-    }
-
-    fn save_pins(&self, pins: &PinFile) -> Result<()> {
-        std::fs::write(&self.pins_path, serde_json::to_vec_pretty(pins)?)?;
-        Ok(())
-    }
-
-    /// Whether `uid` is pinned (independent of whether its blob is currently
-    /// cached).
+    /// Whether `uid` is pinned — directly, or because an ancestor folder is
+    /// pinned recursively (resolved in the DB against the node tree). Independent
+    /// of whether its blob is currently cached. Best effort: a DB error reads as
+    /// "not pinned" rather than failing the calling FUSE op.
     pub fn is_pinned(&self, uid: &NodeUid) -> bool {
-        self.load_pins().pins.contains_key(&uid.to_string())
+        self.db.is_pinned(&uid.to_string()).unwrap_or(false)
     }
 
-    /// Record `uid` as pinned under `path`. The caller is responsible for having
-    /// already cached the content via [`store`](Self::store).
-    pub fn add_pin(&self, uid: &NodeUid, path: &Path) -> Result<()> {
-        let mut file = self.load_pins();
-        let key = uid.to_string();
-        file.pins.insert(
-            key.clone(),
-            Pin {
-                uid: key,
-                path: path.display().to_string(),
-            },
-        );
-        self.save_pins(&file)
+    /// Record `uid` as pinned under `path`. `recursive` marks a folder pin whose
+    /// whole subtree is kept. The caller is responsible for having cached the
+    /// content (a file via [`store`](Self::store); a folder's descendants by the
+    /// daemon walking the subtree).
+    pub fn add_pin(&self, uid: &NodeUid, path: &Path, recursive: bool) -> Result<()> {
+        self.db
+            .pin_add(&uid.to_string(), &path.display().to_string(), recursive)
     }
 
     /// Drop `uid` from the pin registry and evict its blob. No-op if not pinned.
+    /// A recursively-pinned folder's descendants are evicted by the daemon
+    /// (`Core::unpin`), which knows the node tree.
     pub fn remove_pin(&self, uid: &NodeUid) -> Result<()> {
-        let mut file = self.load_pins();
-        if file.pins.remove(&uid.to_string()).is_some() {
-            self.save_pins(&file)?;
-        }
+        self.db.pin_remove(&uid.to_string())?;
         self.evict(uid);
         Ok(())
     }
 
-    /// All pinned files, ordered by uid.
+    /// All pins (files and recursive folders), ordered by uid.
     pub fn list_pins(&self) -> Vec<Pin> {
-        self.load_pins().pins.into_values().collect()
+        self.db
+            .pin_list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(uid, path, recursive)| Pin {
+                uid,
+                path,
+                recursive,
+            })
+            .collect()
     }
 
     /// Total bytes of cached content blobs (pinned + unpinned), matching what
@@ -591,10 +667,12 @@ mod tests {
 
     fn cache_capped(max_bytes: u64) -> (ContentCache, TempDir) {
         let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
         let c = ContentCache::open(
             dir.path().join("content"),
             dir.path().join("pins.json"),
             max_bytes,
+            db,
         )
         .unwrap();
         (c, dir)
@@ -619,6 +697,40 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_rebuilds_index_from_disk() {
+        let dir = TempDir::new();
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+
+        // First session: unlimited cap, store three blobs onto disk.
+        let db1 = Arc::new(Db::open_in_memory().unwrap());
+        {
+            let c = ContentCache::open(content.clone(), pins.clone(), 0, db1).unwrap();
+            c.store(&uid("a"), 1, 4, b"aaaa").unwrap();
+            c.store(&uid("b"), 1, 4, b"bbbb").unwrap();
+            c.store(&uid("c"), 1, 4, b"cccc").unwrap();
+        }
+
+        // Second session with a *fresh* index (as if predating P4, or after a
+        // crash) but the same on-disk cache: reconcile repopulates from disk.
+        let db2 = Arc::new(Db::open_in_memory().unwrap());
+        assert!(db2.cache_entries_by_kind("blob").unwrap().is_empty());
+        let c = ContentCache::open(content, pins, 8, db2.clone()).unwrap();
+        assert_eq!(db2.cache_entries_by_kind("blob").unwrap().len(), 3);
+
+        // With the index rebuilt, a further store enforces the budget against the
+        // reconciled entries instead of leaking them.
+        c.store(&uid("d"), 1, 4, b"dddd").unwrap();
+        let total: u64 = db2
+            .cache_entries_by_kind("blob")
+            .unwrap()
+            .iter()
+            .map(|(_, s)| s)
+            .sum();
+        assert!(total <= 8, "budget enforced after reconcile, total={total}");
+    }
+
+    #[test]
     fn stale_metadata_is_a_miss() {
         let (c, _d) = cache();
         let u = uid("a");
@@ -631,11 +743,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pins_json_imported_then_removed() {
+        let dir = TempDir::new();
+        let pins = dir.path().join("pins.json");
+        // Hand-write a pre-P5 pins.json (file pins only, no `recursive` field).
+        std::fs::write(
+            &pins,
+            r#"{"pins":{"vol~a":{"uid":"vol~a","path":"docs/a.txt"}}}"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let c = ContentCache::open(dir.path().join("content"), pins.clone(), 0, db).unwrap();
+
+        // Imported into the DB as a non-recursive pin...
+        assert!(c.is_pinned(&uid("a")));
+        let listed = c.list_pins();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "docs/a.txt");
+        assert!(!listed[0].recursive);
+        // ...and the legacy file is gone so it never re-imports.
+        assert!(!pins.exists());
+    }
+
+    #[test]
     fn pin_lifecycle_evicts_on_unpin() {
         let (c, _d) = cache();
         let u = uid("a");
         c.store(&u, 100, 3, b"abc").unwrap();
-        c.add_pin(&u, Path::new("docs/a.txt")).unwrap();
+        c.add_pin(&u, Path::new("docs/a.txt"), false).unwrap();
         assert!(c.is_pinned(&u));
         assert_eq!(c.list_pins().len(), 1);
         assert_eq!(c.list_pins()[0].path, "docs/a.txt");
@@ -675,7 +811,7 @@ mod tests {
         let (a, b, d) = (uid("a"), uid("b"), uid("d"));
 
         c.store(&a, 1, 4, b"aaaa").unwrap();
-        c.add_pin(&a, Path::new("a")).unwrap();
+        c.add_pin(&a, Path::new("a"), false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         c.store(&b, 1, 4, b"bbbb").unwrap();
         // Over budget: `a` is pinned (oldest) so `b` must be the victim.

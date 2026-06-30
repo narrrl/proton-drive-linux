@@ -16,6 +16,9 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("database: {0}")]
+    Db(#[from] rusqlite::Error),
+
     /// No persisted session found — caller must run an interactive login.
     #[error("not logged in (no saved session)")]
     NotLoggedIn,

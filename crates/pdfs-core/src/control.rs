@@ -49,10 +49,20 @@ pub enum Request {
     PhotosTimeline { offset: usize, limit: usize },
     /// Download a photo's full content into the cache; replies with its path.
     OpenPhoto { uid: String },
+    /// Upload a photo with the given name, media type, and content bytes.
+    UploadPhoto {
+        name: String,
+        media_type: String,
+        bytes: Vec<u8>,
+        capture_time: Option<i64>,
+    },
     /// Download a Drive file's full content into the cache; replies with the
     /// on-disk path so the front-end can open it with the default app. `path`
     /// is mountpoint-relative.
     OpenFile { path: String },
+    /// Full-text search node names against the daemon's local metadata index.
+    /// `limit` caps the number of hits returned. Replies with [`Response::SearchResults`].
+    Search { query: String, limit: usize },
 }
 
 /// One entry in a [`Request::ListDir`] listing.
@@ -68,6 +78,28 @@ pub struct DirEntry {
     /// Whether the file is pinned to this device.
     pub pinned: bool,
     /// Node uid in `volume~link` form, for follow-up requests.
+    pub uid: String,
+    /// Full mountpoint-relative path. Empty for a [`Request::ListDir`] listing
+    /// (the entry lives in the requested directory, so the caller derives the
+    /// path by joining its name); populated when an entry can live anywhere in
+    /// the tree, as for search hits rendered through the browser.
+    #[serde(default)]
+    pub path: String,
+}
+
+/// One hit in a [`Request::Search`] result. Like [`DirEntry`] but carries the
+/// full mountpoint-relative `path` (a hit can live anywhere in the tree), so the
+/// front-end can navigate to or open it directly.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SearchHit {
+    pub name: String,
+    /// Mountpoint-relative path (`/`-joined, no leading slash).
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: i64,
+    pub pinned: bool,
+    /// Node uid in `volume~link` form.
     pub uid: String,
 }
 
@@ -113,6 +145,8 @@ pub enum Response {
     },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
     FilePath { path: String },
+    /// Full-text search results (reply to [`Request::Search`]).
+    SearchResults { hits: Vec<SearchHit> },
     /// The request failed.
     Error { message: String },
 }
