@@ -107,71 +107,12 @@ jobs:
           # Build Debian package
           dpkg-deb --build deb proton-drive-linux_${{ env.VERSION }}_amd64.deb
 
-      - name: Package AppImage (.AppImage)
-        run: |
-          # 1. Set up AppDir structure
-          mkdir -p AppDir/usr/bin
-          mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
-
-          # Copy binaries
-          cp target/release/pdfs AppDir/usr/bin/
-          cp target/release/pdfs-tray AppDir/usr/bin/
-          cp target/release/pdfs-app AppDir/usr/bin/
-
-          # Copy desktop integration files
-          cp packaging/io.narl.proton-drive-linux.desktop AppDir/usr/share/applications/
-          cp packaging/io.narl.proton-drive-linux.svg AppDir/usr/share/icons/hicolor/scalable/apps/
-
-          # Create required AppImage root symlinks
-          ln -s usr/share/applications/io.narl.proton-drive-linux.desktop AppDir/
-          ln -s usr/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg AppDir/
-
-          # 2. Write custom AppRun to support multi-call execution
-          cat <<'EOF' > AppDir/AppRun
-          #!/bin/sh
-          HERE="$(dirname "$(readlink -f "${0}")")"
-          ARG0="$(basename "${0}")"
-          case "${ARG0}" in
-            pdfs)
-              exec "${HERE}/usr/bin/pdfs" "$@"
-              ;;
-            pdfs-tray)
-              exec "${HERE}/usr/bin/pdfs-tray" "$@"
-              ;;
-            pdfs-app)
-              exec "${HERE}/usr/bin/pdfs-app" "$@"
-              ;;
-            *)
-              # Support running a specific binary by passing its name as first arg
-              if [ "$1" = "pdfs" ] || [ "$1" = "pdfs-tray" ] || [ "$1" = "pdfs-app" ]; then
-                CMD="$1"
-                shift
-                exec "${HERE}/usr/bin/${CMD}" "$@"
-              else
-                # Default behavior: run GUI app
-                exec "${HERE}/usr/bin/pdfs-app" "$@"
-              fi
-              ;;
-          esac
-          EOF
-          chmod +x AppDir/AppRun
-
-          # 3. Download and extract appimagetool (avoids FUSE mount failures in CI)
-          curl -Lo appimagetool https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
-          chmod +x appimagetool
-          ./appimagetool --appimage-extract
-
-          # 4. Generate AppImage
-          ARCH=x86_64 ./squashfs-root/AppRun AppDir proton-drive-linux-${{ env.VERSION }}-x86_64.AppImage
-
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: proton-drive-linux-builds
           path: |
             *.deb
-            *.AppImage
             *.tar.gz
           if-no-files-found: error
 
@@ -181,7 +122,6 @@ jobs:
         with:
           files: |
             *.deb
-            *.AppImage
             *.tar.gz
           draft: false
           prerelease: false

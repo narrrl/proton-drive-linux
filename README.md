@@ -64,24 +64,7 @@ Install the debian package via `dpkg` or `apt`:
 sudo apt install ./proton-drive-linux_*.deb
 ```
 
-### 2. AppImage (.AppImage)
-The AppImage is a portable build that packages all binaries. Make it executable and run it:
-```bash
-chmod +x proton-drive-linux-*.AppImage
-./proton-drive-linux-*.AppImage
-```
-
-> [!TIP]
-> The AppImage is a multi-call binary. By default, running it launches the GUI. You can run the CLI or the Tray app by passing their name as the first argument, or by renaming/symlinking the AppImage file:
-> ```bash
-> # Run CLI
-> ./proton-drive-linux-*.AppImage pdfs --help
-> 
-> # Run Tray
-> ./proton-drive-linux-*.AppImage pdfs-tray
-> ```
-
-### 3. Arch Linux
+### 2. Arch Linux
 A local `PKGBUILD` is available under the `packaging/` directory. You can build and install it using:
 ```bash
 cd packaging && makepkg -fi
@@ -104,9 +87,8 @@ This project has a GitHub Actions CI workflow configured under `.github/workflow
 3. **Artifact Packaging**:
    - Generates a `.tar.gz` containing the raw binaries (`pdfs`, `pdfs-app`, `pdfs-tray`).
    - Packs them into a Debian package (`.deb`).
-   - Builds a portable AppImage using `appimagetool` without requiring FUSE inside CI.
 4. **Publishing**:
-   - Creates a GitHub Release matching the pushed tag and uploads the `.deb`, `.AppImage`, and `.tar.gz` packages as release assets.
+   - Creates a GitHub Release matching the pushed tag and uploads the `.deb` and `.tar.gz` packages as release assets.
    - For manual runs, compiles and exposes the packages as workflow run artifacts for testing.
 
 ---
