@@ -55,13 +55,11 @@ impl AppDirs {
     /// Load config from disk, creating default if missing.
     pub fn load_config(&self) -> AppConfig {
         let path = self.config_path();
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str::<AppConfig>(&content) {
+        if path.exists()
+            && let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(config) = serde_json::from_str::<AppConfig>(&content) {
                     return config;
                 }
-            }
-        }
 
         let default_config = AppConfig::default();
         if let Ok(content) = serde_json::to_string_pretty(&default_config) {
