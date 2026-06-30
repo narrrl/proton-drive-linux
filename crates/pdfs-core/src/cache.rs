@@ -27,6 +27,11 @@ use sha2::{Digest, Sha256};
 
 use crate::error::Result;
 
+/// Block size for the on-demand block cache. Matches the SDK content block size
+/// (`DEFAULT_BLOCK_SIZE`, 4 MiB) so each cached block maps to exactly one
+/// `download_range` fetch with no straddling.
+pub const BLOCK_SIZE: u64 = 1 << 22;
+
 /// Validity tag stored alongside a cached blob. A blob is fresh only if both
 /// fields still match the node's current metadata.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +66,13 @@ pub struct ContentCache {
     /// Subdirectory holding cached thumbnails (`<key>.t<n>` + `.meta`). Kept out
     /// of `content_dir` so the budget scan never sees thumbnail files.
     thumb_dir: PathBuf,
+    /// Subdirectory holding on-demand block-cache files (`<key>.b<idx>` +
+    /// `.meta`). Kept out of `content_dir` so the whole-file budget scan never
+    /// sees them; blocks carry their own LRU budget.
+    block_dir: PathBuf,
+    /// Subdirectory for write-handle scratch files (disk-backed write buffers).
+    /// Emptied on open so a crashed run leaves no orphans.
+    scratch_dir: PathBuf,
     /// JSON pin registry path.
     pins_path: PathBuf,
     /// Soft cap on total blob bytes. Exceeded only transiently: a `store`
@@ -78,12 +90,21 @@ impl ContentCache {
         std::fs::create_dir_all(&content_dir)?;
         let thumb_dir = content_dir.join("thumbs");
         std::fs::create_dir_all(&thumb_dir)?;
+        let block_dir = content_dir.join("blocks");
+        std::fs::create_dir_all(&block_dir)?;
+        // Scratch holds disk-backed write buffers; a previous run's leftovers are
+        // worthless, so start clean.
+        let scratch_dir = content_dir.join("scratch");
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+        std::fs::create_dir_all(&scratch_dir)?;
         if let Some(parent) = pins_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         Ok(Self {
             content_dir,
             thumb_dir,
+            block_dir,
+            scratch_dir,
             pins_path,
             max_bytes,
         })
@@ -180,6 +201,119 @@ impl ContentCache {
         Ok(())
     }
 
+    fn block_blob(&self, uid: &NodeUid, idx: u64) -> PathBuf {
+        self.block_dir.join(format!("{}.b{idx}", Self::key(uid)))
+    }
+
+    fn block_meta(&self, uid: &NodeUid, idx: u64) -> PathBuf {
+        self.block_dir.join(format!("{}.b{idx}.meta", Self::key(uid)))
+    }
+
+    /// Serve cached block `idx` (a [`BLOCK_SIZE`]-aligned chunk) of `uid`, or
+    /// `None` on miss/stale. Validated against `(mtime, size)` like a whole-file
+    /// blob, so a new revision (which bumps the mtime) is detected. Bumps the
+    /// block's mtime for LRU, best effort.
+    pub fn cached_block(&self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> Option<Vec<u8>> {
+        let want = Meta { mtime, size };
+        let meta: Meta =
+            serde_json::from_slice(&std::fs::read(self.block_meta(uid, idx)).ok()?).ok()?;
+        if meta != want {
+            return None;
+        }
+        let mut f = std::fs::File::open(self.block_blob(uid, idx)).ok()?;
+        let _ = f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// Store `bytes` as cached block `idx` of `uid`, tagged `(mtime, size)`.
+    /// Temp-file-then-rename like [`store`](Self::store); meta written last so a
+    /// crash mid-store fails validation. Enforces the block-cache LRU budget.
+    pub fn store_block(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        size: u64,
+        idx: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let blob = self.block_blob(uid, idx);
+        let tmp = self
+            .block_dir
+            .join(format!("{}.b{idx}.tmp", Self::key(uid)));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &blob)?;
+        std::fs::write(self.block_meta(uid, idx), serde_json::to_vec(&Meta { mtime, size })?)?;
+        self.enforce_block_budget();
+        Ok(())
+    }
+
+    /// Evict least-recently-used block-cache files until the block dir fits
+    /// `max_bytes`. No-op when the cap is disabled (`0`). All blocks are
+    /// evictable — pinned files are served from whole-file blobs, never blocks.
+    fn enforce_block_budget(&self) {
+        if self.max_bytes == 0 {
+            return;
+        }
+        let mut total: u64 = 0;
+        let mut blobs: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        let Ok(rd) = std::fs::read_dir(&self.block_dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".meta") || name.ends_with(".tmp") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            total += meta.len();
+            let atime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            blobs.push((path, meta.len(), atime));
+        }
+        if total <= self.max_bytes {
+            return;
+        }
+        blobs.sort_by_key(|(_, _, atime)| *atime);
+        for (path, len, _) in blobs {
+            if total <= self.max_bytes {
+                break;
+            }
+            let meta = path.with_file_name(format!(
+                "{}.meta",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(meta);
+            total = total.saturating_sub(len);
+        }
+    }
+
+    /// Create a fresh, empty read-write scratch file for a disk-backed write
+    /// handle. Returns the open file and its path (for cleanup on release).
+    pub fn create_scratch(&self) -> Result<(std::fs::File, PathBuf)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = self.scratch_dir.join(format!(
+            "w-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok((file, path))
+    }
+
     /// Remove any cached blob + meta for `uid`, including its thumbnails (best
     /// effort; absence is fine). Thumbnails are tied to the revision, so a
     /// content eviction must drop them too.
@@ -189,6 +323,19 @@ impl ContentCache {
         for ttype in [1, 2] {
             let _ = std::fs::remove_file(self.thumb_blob(uid, ttype));
             let _ = std::fs::remove_file(self.thumb_meta(uid, ttype));
+        }
+        // Drop every cached block (and its meta/tmp) for this uid.
+        let prefix = format!("{}.b", Self::key(uid));
+        if let Ok(rd) = std::fs::read_dir(&self.block_dir) {
+            for entry in rd.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&prefix))
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
         }
     }
 
@@ -558,5 +705,61 @@ mod tests {
         c.store(&u, 1, 3, b"abc").unwrap();
         c.evict(&u);
         assert!(!c.is_cached(&u, 1, 3));
+    }
+
+    #[test]
+    fn block_store_then_read() {
+        let (c, _d) = cache();
+        let u = uid("a");
+        c.store_block(&u, 100, 4096, 0, b"block-zero").unwrap();
+        assert_eq!(c.cached_block(&u, 100, 4096, 0).unwrap(), b"block-zero");
+        // A different index is a separate cache entry, absent here.
+        assert!(c.cached_block(&u, 100, 4096, 1).is_none());
+        // A new revision (mtime/size bump) invalidates the block.
+        assert!(c.cached_block(&u, 101, 4096, 0).is_none());
+        assert!(c.cached_block(&u, 100, 5000, 0).is_none());
+    }
+
+    #[test]
+    fn evict_drops_blocks() {
+        let (c, _d) = cache();
+        let u = uid("a");
+        c.store_block(&u, 1, 8, 0, b"aaaa").unwrap();
+        c.store_block(&u, 1, 8, 1, b"bbbb").unwrap();
+        c.evict(&u);
+        assert!(c.cached_block(&u, 1, 8, 0).is_none());
+        assert!(c.cached_block(&u, 1, 8, 1).is_none());
+    }
+
+    #[test]
+    fn block_budget_evicts_lru() {
+        // Cap fits two 4-byte blocks but not three.
+        let (c, _d) = cache_capped(8);
+        let u = uid("a");
+        c.store_block(&u, 1, 12, 0, b"aaaa").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        c.store_block(&u, 1, 12, 1, b"bbbb").unwrap();
+        // Touch block 0 so block 1 is the least-recently-used.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(c.cached_block(&u, 1, 12, 0).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        c.store_block(&u, 1, 12, 2, b"cccc").unwrap();
+        assert!(c.cached_block(&u, 1, 12, 0).is_some(), "recently-read survives");
+        assert!(c.cached_block(&u, 1, 12, 1).is_none(), "LRU block evicted");
+        assert!(c.cached_block(&u, 1, 12, 2).is_some(), "newest survives");
+    }
+
+    #[test]
+    fn scratch_file_is_writable_and_isolated() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let (c, _d) = cache();
+        let (mut f1, p1) = c.create_scratch().unwrap();
+        let (_f2, p2) = c.create_scratch().unwrap();
+        assert_ne!(p1, p2, "each scratch file is unique");
+        f1.write_all(b"scratch").unwrap();
+        f1.seek(SeekFrom::Start(0)).unwrap();
+        let mut s = String::new();
+        f1.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "scratch");
     }
 }

@@ -23,10 +23,19 @@
 //! into the on-disk [`ContentCache`] and every later `read` is served from disk
 //! instead of the network. Writes and remote events evict the cache so it never
 //! goes stale.
+//!
+//! Reads of unpinned files no longer hit the network per call: [`Core::read_range`]
+//! fetches and caches [`BLOCK_SIZE`]-aligned blocks, so sequential/sparse reads
+//! reuse the on-disk block cache. Writes are disk-backed: each [`WriteHandle`]
+//! stages authored bytes in a scratch file and tracks them with an [`Intervals`]
+//! set, so a multi-GiB write never buffers in RAM and only the untouched
+//! remainder of the file is pulled from the remote — lazily, at commit.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write as _};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -39,7 +48,7 @@ use fuser::{
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
-use pdfs_core::cache::ContentCache;
+use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
 use pdfs_core::control::{DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse};
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
@@ -75,18 +84,90 @@ struct Entry {
     node: Node,
 }
 
-/// Buffered state for a file opened for writing. The full plaintext is
-/// assembled here and uploaded as one new revision on flush/release, because
-/// the SDK seals whole revisions rather than byte ranges.
+/// A set of non-overlapping `[start, end)` byte ranges, kept sorted and merged.
+/// Tracks which bytes of a [`WriteHandle`]'s scratch file were authored locally
+/// (vs. still living only in the remote base), so reads and the commit gap-fill
+/// know which regions to pull from the network.
+#[derive(Clone, Default)]
+struct Intervals(Vec<(u64, u64)>);
+
+impl Intervals {
+    /// Mark `[start, end)` as authored, coalescing with any touching ranges.
+    fn add(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.0.push((start, end));
+        self.0.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.0.len());
+        for &(s, e) in &self.0 {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        self.0 = merged;
+    }
+
+    /// Drop everything at or beyond `len` (a shrink/truncate).
+    fn clip(&mut self, len: u64) {
+        self.0.retain(|&(s, _)| s < len);
+        for iv in &mut self.0 {
+            iv.1 = iv.1.min(len);
+        }
+    }
+
+    /// Split `[start, end)` into contiguous `(s, e, authored)` segments, in
+    /// order. `authored == true` means the bytes live in the scratch file;
+    /// `false` means they must come from the remote base (or are a hole).
+    fn segments(&self, start: u64, end: u64) -> Vec<(u64, u64, bool)> {
+        let mut out = Vec::new();
+        let mut pos = start;
+        for &(s, e) in &self.0 {
+            if e <= start {
+                continue;
+            }
+            if s >= end {
+                break;
+            }
+            let ws = s.max(start);
+            let we = e.min(end);
+            if pos < ws {
+                out.push((pos, ws, false));
+            }
+            out.push((ws, we, true));
+            pos = we;
+        }
+        if pos < end {
+            out.push((pos, end, false));
+        }
+        out
+    }
+}
+
+/// State for a file opened for writing. Authored bytes are staged in an on-disk
+/// scratch file (positional reads/writes) rather than RAM, so a multi-GiB write
+/// never balloons the daemon. On flush/release the scratch file — gap-filled
+/// from the remote base where untouched — is streamed up as one new revision,
+/// since the SDK seals whole revisions rather than byte ranges.
 struct WriteHandle {
     ino: u64,
     uid: NodeUid,
-    /// The plaintext being assembled; valid only once `seeded`.
-    buf: Vec<u8>,
-    /// Whether `buf` holds the file's current content (or was emptied by a
-    /// truncate). Until then a partial write must hydrate the base first.
-    seeded: bool,
-    /// Whether `buf` diverged from the remote and needs an upload.
+    /// Disk-backed staging buffer. Shared (`Arc`) so reads can use it without
+    /// holding the state lock across I/O. Accessed positionally (`read_at`/
+    /// `write_at`), so a clone never disturbs another's file offset.
+    file: Arc<File>,
+    /// Scratch file path, removed on release.
+    path: PathBuf,
+    /// Byte ranges authored into `file`. Everything else in `[0, len)` is base.
+    written: Intervals,
+    /// Logical file size (may exceed authored bytes after a truncate-extend).
+    len: u64,
+    /// Size of the remote base at open, for serving untouched ranges.
+    base_size: u64,
+    /// Modification time of the remote base at open, validating its block cache.
+    base_mtime: i64,
+    /// Whether anything diverged from the remote and needs an upload.
     dirty: bool,
 }
 
@@ -289,35 +370,174 @@ impl Core {
         nodes.into_iter().next().ok_or(Errno::ENOENT)
     }
 
-    /// Upload a write handle's buffer as a new revision if it is dirty, clearing
-    /// the dirty flag and refreshing the entry's size/mtime on success. No-op for
-    /// a clean (or unknown) handle. Network I/O happens without the lock held.
+    /// Serve bytes `[offset, offset + len)` of `uid`'s active revision, hitting
+    /// the on-disk caches before the network: a whole-file blob (pinned files)
+    /// first, then the block cache — fetching only the [`BLOCK_SIZE`]-aligned
+    /// blocks that overlap the request and caching each. `mtime`/`fsize` validate
+    /// both caches. Network I/O runs without any lock held.
+    fn read_range(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, Errno> {
+        if let Some(bytes) = self.cache.read_range(uid, mtime, fsize, offset, len) {
+            return Ok(bytes);
+        }
+        if offset >= fsize || len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(len).min(fsize);
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        let first = offset / BLOCK_SIZE;
+        let last = (end - 1) / BLOCK_SIZE;
+        for bidx in first..=last {
+            let bstart = bidx * BLOCK_SIZE;
+            let block = match self.cache.cached_block(uid, mtime, fsize, bidx) {
+                Some(b) => b,
+                None => {
+                    let blen = BLOCK_SIZE.min(fsize - bstart);
+                    let bytes = self
+                        .rt
+                        .block_on(self.client.download_range(uid, bstart, blen))
+                        .map_err(|e| {
+                            warn!(%uid, bstart, blen, error = %e, "download_range failed");
+                            Errno::EIO
+                        })?;
+                    let _ = self.cache.store_block(uid, mtime, fsize, bidx, &bytes);
+                    bytes
+                }
+            };
+            let s = (offset.max(bstart) - bstart) as usize;
+            let e = (end.min(bstart + block.len() as u64) - bstart) as usize;
+            if s < e {
+                out.extend_from_slice(&block[s..e]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Serve a read against an open write handle: stitch authored ranges (from
+    /// the scratch file) and untouched ranges (from the remote base via the
+    /// block cache) in order, zero-filling any region past the base.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_open_read(
+        &self,
+        file: &Arc<File>,
+        len: u64,
+        uid: &NodeUid,
+        base_mtime: i64,
+        base_size: u64,
+        written: &Intervals,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, Errno> {
+        if offset >= len || size == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(size).min(len);
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        for (s, e, authored) in written.segments(offset, end) {
+            if authored {
+                let mut buf = vec![0u8; (e - s) as usize];
+                file.read_exact_at(&mut buf, s).map_err(|err| {
+                    warn!(%uid, error = %err, "scratch read failed");
+                    Errno::EIO
+                })?;
+                out.extend_from_slice(&buf);
+            } else {
+                let bend = e.min(base_size);
+                if s < bend {
+                    out.extend_from_slice(&self.read_range(uid, base_mtime, base_size, s, bend - s)?);
+                }
+                // Anything past the base is a hole: zero-fill.
+                let zeros = e.saturating_sub(s.max(base_size));
+                out.resize(out.len() + zeros as usize, 0);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Upload a write handle's scratch file as a new revision if it is dirty.
+    /// Untouched bytes within the base are filled from the remote first (reusing
+    /// the block cache), so a partial overwrite never had to pre-download the
+    /// whole file. On success the handle's base is advanced to the just-sealed
+    /// revision and `written` cleared, so later reads of untouched regions see
+    /// the new content. No-op for a clean (or unknown) handle. Network I/O runs
+    /// without the lock held.
     fn commit(&self, fh: u64) -> Result<(), Errno> {
-        let (uid, buf, ino) = {
+        let (uid, file, path, len, base_mtime, base_size, written, ino) = {
             let st = self.state.lock().unwrap();
             match st.handles.get(&fh) {
-                Some(h) if h.dirty => (h.uid.clone(), h.buf.clone(), h.ino),
+                Some(h) if h.dirty => (
+                    h.uid.clone(),
+                    h.file.clone(),
+                    h.path.clone(),
+                    h.len,
+                    h.base_mtime,
+                    h.base_size,
+                    h.written.clone(),
+                    h.ino,
+                ),
                 _ => return Ok(()),
             }
         };
+        // Materialize the full new content in the scratch file: ensure its length,
+        // then fill every untouched range that overlaps the base with base bytes.
+        file.set_len(len).map_err(|e| {
+            error!(%uid, error = %e, "resize scratch file failed");
+            Errno::EIO
+        })?;
+        for (s, e, authored) in written.segments(0, len) {
+            if authored {
+                continue;
+            }
+            let bend = e.min(base_size);
+            if s >= bend {
+                continue; // wholly past the base: already zero-filled on disk
+            }
+            let bytes = self.read_range(&uid, base_mtime, base_size, s, bend - s)?;
+            file.write_all_at(&bytes, s).map_err(|err| {
+                error!(%uid, error = %err, "scratch gap-fill write failed");
+                Errno::EIO
+            })?;
+        }
+        // Stream the scratch file up as one revision (fresh handle reads from 0).
+        let reader = File::open(&path).map_err(|e| {
+            error!(%uid, error = %e, "reopen scratch file failed");
+            Errno::EIO
+        })?;
         self.rt
-            .block_on(self.client.upload_new_revision(&uid, &buf))
+            .block_on(
+                self.client
+                    .upload_new_revision_from(&uid, reader, len as i64, Vec::new(), None),
+            )
             .map_err(|e| {
                 error!(%uid, error = %e, "upload new revision failed");
                 Errno::EIO
             })?;
         let now = now_secs();
-        let mut st = self.state.lock().unwrap();
-        if let Some(h) = st.handles.get_mut(&fh) {
-            h.dirty = false;
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(h) = st.handles.get_mut(&fh) {
+                h.dirty = false;
+                // The scratch file now equals the sealed revision; treat it all as
+                // base so further reads of untouched bytes hit the new content.
+                h.written = Intervals::default();
+                h.base_mtime = now;
+                h.base_size = len;
+            }
+            st.set_size(ino, len);
+            st.touch_mtime(ino, now);
         }
-        st.set_size(ino, buf.len() as u64);
-        st.touch_mtime(ino, now);
-        drop(st);
-        // The sealed content differs from any cached blob; if the file is
-        // pinned, refresh the cache so reads stay served from disk.
+        // The sealed content differs from any cached blob/blocks; refresh a pinned
+        // file's whole-file blob, otherwise evict so reads re-fetch fresh.
         if self.cache.is_pinned(&uid) {
-            let _ = self.cache.store(&uid, now, buf.len() as u64, &buf);
+            if let Ok(bytes) = std::fs::read(&path) {
+                let _ = self.cache.store(&uid, now, len, &bytes);
+            }
         } else {
             self.cache.evict(&uid);
         }
@@ -821,10 +1041,12 @@ impl Filesystem for ProtonFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let uid = {
+        let (uid, base_mtime, base_size) = {
             let st = self.core.state.lock().unwrap();
             match st.entries.get(&ino.0) {
-                Some(e) if e.node.is_file() => e.uid.clone(),
+                Some(e) if e.node.is_file() => {
+                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
+                }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
                     return;
@@ -835,12 +1057,21 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
-        // Read-only opens stay stateless (fh 0). A write open allocates a buffer
-        // handle, hydrated lazily on the first write that needs the base content.
+        // Read-only opens stay stateless (fh 0). A write open allocates a
+        // disk-backed handle; bytes are authored into a scratch file and the
+        // untouched remainder is pulled from the base lazily (on read / commit).
         if flags.acc_mode() == OpenAccMode::O_RDONLY {
             reply.opened(FileHandle(0), FopenFlags::empty());
             return;
         }
+        let (file, path) = match self.core.cache.create_scratch() {
+            Ok(x) => x,
+            Err(e) => {
+                error!(%uid, error = %e, "create scratch file failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         let mut st = self.core.state.lock().unwrap();
         let fh = st.next_fh;
         st.next_fh += 1;
@@ -849,8 +1080,14 @@ impl Filesystem for ProtonFs {
             WriteHandle {
                 ino: ino.0,
                 uid,
-                buf: Vec::new(),
-                seeded: false,
+                file: Arc::new(file),
+                path,
+                written: Intervals::default(),
+                // Starts at the current size; reads in [0, base_size) come from
+                // the base until overwritten.
+                len: base_size,
+                base_size,
+                base_mtime,
                 dirty: false,
             },
         );
@@ -868,16 +1105,33 @@ impl Filesystem for ProtonFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        // A file open for writing is served from its handle so reads see the
+        // in-flight (possibly unsaved) content: authored bytes come from the
+        // scratch file, untouched bytes from the base.
+        let handle = {
+            let st = self.core.state.lock().unwrap();
+            st.handles.values().find(|h| h.ino == ino.0).map(|h| {
+                (
+                    h.file.clone(),
+                    h.len,
+                    h.uid.clone(),
+                    h.base_mtime,
+                    h.base_size,
+                    h.written.clone(),
+                )
+            })
+        };
+        if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
+            match self.core.serve_open_read(
+                &file, len, &uid, base_mtime, base_size, &written, offset, size as u64,
+            ) {
+                Ok(bytes) => reply.data(&bytes),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let (uid, mtime, fsize) = {
             let st = self.core.state.lock().unwrap();
-            // If the file is open for writing and its buffer is populated, serve
-            // from there so reads see the in-flight (possibly unsaved) content.
-            if let Some(h) = st.handles.values().find(|h| h.ino == ino.0 && h.seeded) {
-                let off = (offset as usize).min(h.buf.len());
-                let end = (off + size as usize).min(h.buf.len());
-                reply.data(&h.buf[off..end]);
-                return;
-            }
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     (e.uid.clone(), e.node.modification_time, node_size(&e.node))
@@ -892,25 +1146,9 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
-        // Pinned (or otherwise cached) files are served straight from disk.
-        if let Some(bytes) = self
-            .core
-            .cache
-            .read_range(&uid, mtime, fsize, offset, size as u64)
-        {
-            reply.data(&bytes);
-            return;
-        }
-        match self
-            .core
-            .rt
-            .block_on(self.core.client.download_range(&uid, offset, size as u64))
-        {
+        match self.core.read_range(&uid, mtime, fsize, offset, size as u64) {
             Ok(bytes) => reply.data(&bytes),
-            Err(e) => {
-                warn!(%uid, offset, size, error = %e, "download_range failed");
-                reply.error(Errno::EIO);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
@@ -962,6 +1200,14 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
+        let (file, path) = match self.core.cache.create_scratch() {
+            Ok(x) => x,
+            Err(e) => {
+                error!(%new_uid, error = %e, "create scratch file failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         let mut st = self.core.state.lock().unwrap();
         let ino = st.intern(parent, node);
         if let Some(kids) = st.children.get_mut(&parent)
@@ -973,11 +1219,16 @@ impl Filesystem for ProtonFs {
         st.next_fh += 1;
         st.handles.insert(
             fh,
+            // A brand-new file: empty base, everything written is authored.
             WriteHandle {
                 ino,
                 uid: new_uid,
-                buf: Vec::new(),
-                seeded: true,
+                file: Arc::new(file),
+                path,
+                written: Intervals::default(),
+                len: 0,
+                base_size: 0,
+                base_mtime: now_secs(),
                 dirty: false,
             },
         );
@@ -1004,60 +1255,34 @@ impl Filesystem for ProtonFs {
         reply: ReplyWrite,
     ) {
         let fh = fh.0;
-        // Partial writes need the file's current content; hydrate it once.
-        let need_seed = {
+        // Stage the bytes straight into the scratch file (no base download): only
+        // the untouched remainder is pulled from the remote, and only at commit.
+        let file = {
             let st = self.core.state.lock().unwrap();
             match st.handles.get(&fh) {
-                Some(h) => !h.seeded,
+                Some(h) => h.file.clone(),
                 None => {
                     reply.error(Errno::EBADF);
                     return;
                 }
             }
         };
-        if need_seed {
-            let uid = self
-                .core
-                .state
-                .lock()
-                .unwrap()
-                .handles
-                .get(&fh)
-                .map(|h| h.uid.clone());
-            let Some(uid) = uid else {
-                reply.error(Errno::EBADF);
-                return;
-            };
-            let base = match self.core.rt.block_on(self.core.client.download_file(&uid)) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(%uid, error = %e, "seed write buffer failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-            let mut st = self.core.state.lock().unwrap();
-            if let Some(h) = st.handles.get_mut(&fh)
-                && !h.seeded
-            {
-                h.buf = base;
-                h.seeded = true;
-            }
+        if let Err(e) = file.write_all_at(data, offset) {
+            error!(ino = ino.0, fh, error = %e, "scratch write failed");
+            reply.error(Errno::EIO);
+            return;
         }
-        let off = offset as usize;
         let new_len = {
             let mut st = self.core.state.lock().unwrap();
             let Some(h) = st.handles.get_mut(&fh) else {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let end = off + data.len();
-            if h.buf.len() < end {
-                h.buf.resize(end, 0);
-            }
-            h.buf[off..end].copy_from_slice(data);
+            let end = offset + data.len() as u64;
+            h.written.add(offset, end);
+            h.len = h.len.max(end);
             h.dirty = true;
-            let len = h.buf.len() as u64;
+            let len = h.len;
             st.set_size(ino.0, len);
             len
         };
@@ -1067,7 +1292,7 @@ impl Filesystem for ProtonFs {
             offset,
             len = data.len(),
             new_len,
-            "buffered write"
+            "staged write"
         );
         reply.written(data.len() as u32);
     }
@@ -1100,8 +1325,16 @@ impl Filesystem for ProtonFs {
                     let mut st = self.core.state.lock().unwrap();
                     match st.handles.get_mut(&fh) {
                         Some(h) => {
-                            h.buf.resize(size as usize, 0);
-                            h.seeded = true;
+                            if size < h.len {
+                                // Shrink: drop authored ranges past the new end.
+                                h.written.clip(size);
+                            } else if size > h.len {
+                                // Grow: the new tail is defined as zeros, so claim
+                                // it as authored rather than base content.
+                                h.written.add(h.len, size);
+                            }
+                            let _ = h.file.set_len(size);
+                            h.len = size;
                             h.dirty = true;
                             true
                         }
@@ -1207,7 +1440,10 @@ impl Filesystem for ProtonFs {
         reply: ReplyEmpty,
     ) {
         let res = self.core.commit(fh.0);
-        self.core.state.lock().unwrap().handles.remove(&fh.0);
+        let handle = self.core.state.lock().unwrap().handles.remove(&fh.0);
+        if let Some(h) = handle {
+            let _ = std::fs::remove_file(&h.path);
+        }
         match res {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1845,4 +2081,84 @@ pub fn mount(
 
     let _ = std::fs::remove_file(control_socket);
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Intervals;
+
+    /// Flatten `segments` into a readable form for assertions.
+    fn segs(iv: &Intervals, start: u64, end: u64) -> Vec<(u64, u64, bool)> {
+        iv.segments(start, end)
+    }
+
+    #[test]
+    fn append_merges_into_one_run() {
+        // Sequential writes (an append) coalesce into a single authored range.
+        let mut iv = Intervals::default();
+        iv.add(0, 10);
+        iv.add(10, 20);
+        iv.add(20, 25);
+        assert_eq!(segs(&iv, 0, 25), vec![(0, 25, true)]);
+    }
+
+    #[test]
+    fn partial_overwrite_leaves_base_gap() {
+        // Author [0,4) and [8,12); [4,8) stays base. A read of [0,12) must stitch
+        // authored / base / authored in order.
+        let mut iv = Intervals::default();
+        iv.add(0, 4);
+        iv.add(8, 12);
+        assert_eq!(
+            segs(&iv, 0, 12),
+            vec![(0, 4, true), (4, 8, false), (8, 12, true)]
+        );
+    }
+
+    #[test]
+    fn overlapping_writes_coalesce() {
+        let mut iv = Intervals::default();
+        iv.add(0, 10);
+        iv.add(5, 15);
+        iv.add(14, 20);
+        assert_eq!(segs(&iv, 0, 20), vec![(0, 20, true)]);
+    }
+
+    #[test]
+    fn segments_clamp_to_request_window() {
+        let mut iv = Intervals::default();
+        iv.add(0, 100);
+        // A sub-window of one big authored range is a single authored segment.
+        assert_eq!(segs(&iv, 20, 50), vec![(20, 50, true)]);
+        // A window entirely outside any authored range is all base.
+        let empty = Intervals::default();
+        assert_eq!(segs(&empty, 0, 8), vec![(0, 8, false)]);
+    }
+
+    #[test]
+    fn truncate_shrink_drops_tail() {
+        // Grow-then-shrink: clip removes/truncates authored ranges past the end.
+        let mut iv = Intervals::default();
+        iv.add(0, 100);
+        iv.clip(40);
+        assert_eq!(segs(&iv, 0, 40), vec![(0, 40, true)]);
+        // Authored ranges wholly past the new end disappear.
+        let mut iv2 = Intervals::default();
+        iv2.add(0, 10);
+        iv2.add(50, 60);
+        iv2.clip(40);
+        assert_eq!(segs(&iv2, 0, 40), vec![(0, 10, true), (10, 40, false)]);
+    }
+
+    #[test]
+    fn truncate_extend_authors_zero_tail() {
+        // setattr grow claims the new tail as authored (defined zeros), so commit
+        // never pulls it from the base.
+        let mut iv = Intervals::default();
+        iv.add(0, 10); // base content authored over
+        let old_len = 10u64;
+        let new_len = 30u64;
+        iv.add(old_len, new_len);
+        assert_eq!(segs(&iv, 0, 30), vec![(0, 30, true)]);
+    }
 }
