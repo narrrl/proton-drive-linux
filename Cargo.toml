@@ -3,16 +3,15 @@ resolver = "2"
 members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
 
 [workspace.dependencies]
-# Local Proton SDK crates (path deps until published; switch to versioned later).
-proton-sdk = "0.1.3"
-proton-drive-rs = "0.1.3"
+proton-sdk = "0.1.4"
+proton-drive-rs = "0.1.4"
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }

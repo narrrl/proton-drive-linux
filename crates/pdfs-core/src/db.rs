@@ -213,9 +213,13 @@ impl Db {
             )?;
             collect_pairs(stmt.query_map(params![pat, limit as i64], pair)?)?
         } else {
-            // Quote the user input as a single FTS phrase so its characters are
-            // matched literally, never parsed as FTS query syntax.
-            let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+            // Escape double quotes and quote each term, then combine with AND so
+            // all terms must match but can appear in any order or position.
+            let phrase = query
+                .split_whitespace()
+                .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             let mut stmt = conn.prepare(
                 "SELECT n.node_json, n.uid
                  FROM nodes_fts f JOIN nodes n ON n.uid = f.uid
@@ -805,6 +809,7 @@ mod tests {
         db.upsert_node(&file("f1", "docs", "report.pdf", 1))
             .unwrap();
         db.upsert_node(&file("f2", "root", "notes.txt", 2)).unwrap();
+        db.upsert_node(&file("f3", "root", "Rampage Open Air 2026 - order 166765244.pdf", 3)).unwrap();
 
         // Substring match (trigram), not just prefix.
         let hits = db.search("port", 10).unwrap();
@@ -816,6 +821,11 @@ mod tests {
         // Top-level file → bare name.
         let hits = db.search("notes", 10).unwrap();
         assert_eq!(hits[0].path, "notes.txt");
+
+        // Multi-term FTS5 query matching (out of order, separated terms)
+        let hits = db.search("rampage 2026", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node.name, "Rampage Open Air 2026 - order 166765244.pdf");
     }
 
     #[test]
