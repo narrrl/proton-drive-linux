@@ -35,5 +35,8 @@ fuser = "0.17"
 libc = "0.2"
 
 [patch.crates-io]
-proton-sdk = { path = "../proton-sdk-rs/crates/proton-sdk" }
-proton-drive-rs = { path = "../proton-sdk-rs/crates/proton-drive-rs" }
+# Track the SDK's `main` on GitHub rather than a sibling checkout, so a clean
+# clone (and CI, and the PKGBUILD) builds without the working tree next door.
+# `cargo update -p proton-sdk -p proton-drive-rs` pulls newer pushes.
+proton-sdk = { git = "https://github.com/narrrl/proton-sdk-rs", branch = "main" }
+proton-drive-rs = { git = "https://github.com/narrrl/proton-sdk-rs", branch = "main" }

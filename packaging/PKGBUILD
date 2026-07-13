@@ -1,9 +1,10 @@
 # Maintainer: Nils Pukropp <contact@narl.io>
 #
 # Local-build PKGBUILD. Builds the proton-drive-linux workspace from the
-# checkout this file lives in. Path deps point at a sibling ../proton-sdk-rs
-# checkout (the Proton SDK is unpublished), so this is NOT a source-fetch
-# package: it compiles the working tree in place.
+# checkout this file lives in: this is NOT a source-fetch package, it compiles
+# the working tree in place. The Proton SDK is unpublished and comes from its
+# GitHub repo (pinned by Cargo.lock), so the build needs network access — no
+# sibling checkout required any more.
 #
 # Build + install:   cd packaging && makepkg -fi
 
@@ -15,7 +16,7 @@ arch=('x86_64')
 url="https://github.com/narl/proton-drive-linux"
 license=('MIT')
 depends=('fuse3' 'gtk4' 'libadwaita')
-makedepends=('cargo')
+makedepends=('cargo' 'git')
 provides=('pdfs')
 # Files-on-demand mount + keyring need these at runtime.
 optdepends=('gnome-keyring: credential storage via Secret Service'
@@ -40,7 +41,9 @@ build() {
   cd "$_workspace"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$_workspace/target"
-  cargo build --release --frozen \
+  # `--locked` not `--frozen`: the lock is authoritative, but cargo must still be
+  # allowed to fetch the git-sourced SDK.
+  cargo build --release --locked \
     --bin pdfs \
     --bin pdfs-tray \
     --bin pdfs-app \

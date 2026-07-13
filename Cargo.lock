@@ -3161,6 +3161,7 @@ dependencies = [
 [[package]]
 name = "proton-drive-rs"
 version = "0.1.4"
+source = "git+https://github.com/narrrl/proton-sdk-rs?branch=main#2e3c23803eecbdcb9f442c1e49229347f272596b"
 dependencies = [
  "async-trait",
  "base64",
@@ -3184,6 +3185,7 @@ dependencies = [
 [[package]]
 name = "proton-sdk"
 version = "0.1.4"
+source = "git+https://github.com/narrrl/proton-sdk-rs?branch=main#2e3c23803eecbdcb9f442c1e49229347f272596b"
 dependencies = [
  "aes-gcm",
  "async-trait",
