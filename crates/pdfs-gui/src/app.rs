@@ -55,6 +55,13 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Cap on search hits requested from the daemon.
 const SEARCH_LIMIT: usize = 200;
 
+/// Gallery thumbnail height in px: the zoom range, its default, and the step one
+/// Ctrl+scroll notch (or Ctrl+±) moves it by.
+const TILE_MIN: i32 = 90;
+const TILE_MAX: i32 = 300;
+const TILE_DEFAULT: i32 = 150;
+const TILE_STEP: i32 = 30;
+
 /// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
 /// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
 struct PinRow {
@@ -154,7 +161,15 @@ struct Ui {
     /// only the last pause actually fires a [`Request::Search`].
     search_source: RefCell<Option<glib::SourceId>>,
     // Photos (gallery) page.
+    /// Every photo loaded so far, newest first — the order the lightbox's
+    /// prev/next walks. The visible day sections are derived from this.
     gallery_model: gio::ListStore,
+    /// The day sections rendered by the Photos ListView, rebuilt from
+    /// [`Self::gallery_model`] by [`repaint_gallery`].
+    gallery_groups: gio::ListStore,
+    /// Thumbnail height in px, retuned by Ctrl+scroll / Ctrl+± (see
+    /// [`zoom_gallery`]). Widths follow each photo's own aspect ratio.
+    gallery_tile: Cell<i32>,
     gallery_status: gtk4::Label,
     gallery_retry: gtk4::Button,
     gallery_more: gtk4::Button,
@@ -228,6 +243,8 @@ fn load_proton_theme() {
          .viewer-nav-btn {{ background-color: rgba(0, 0, 0, 0.5); color: white; margin: 24px; padding: 16px; border-radius: 50%; }}\n\
          .viewer-nav-btn:hover {{ background-color: rgba(0, 0, 0, 0.8); color: white; }}\n\
          .viewer-status {{ color: #ff5555; font-size: 1.1rem; background-color: rgba(0, 0, 0, 0.8); padding: 12px 24px; border-radius: 8px; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }}\n\
+         .viewer-info-panel {{ background-color: rgba(0, 0, 0, 0.75); color: white; }}\n\
+         .viewer-info-panel label {{ color: white; }}\n\
          .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
          .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n"
     );
@@ -317,11 +334,13 @@ fn build_window(app: &adw::Application) {
         browser_path: RefCell::new(String::new()),
         browser_search: browser_widgets.7,
         search_source: RefCell::new(None),
-        gallery_model: gallery_widgets.0,
-        gallery_status: gallery_widgets.1,
-        gallery_retry: gallery_widgets.4,
-        gallery_more: gallery_widgets.2,
-        gallery_upload: gallery_widgets.5,
+        gallery_model: gallery_widgets.model.clone(),
+        gallery_groups: gallery_widgets.groups.clone(),
+        gallery_tile: Cell::new(TILE_DEFAULT),
+        gallery_status: gallery_widgets.status.clone(),
+        gallery_retry: gallery_widgets.retry.clone(),
+        gallery_more: gallery_widgets.more.clone(),
+        gallery_upload: gallery_widgets.upload.clone(),
     });
 
     wire_login(&ui);
@@ -334,7 +353,7 @@ fn build_window(app: &adw::Application) {
     wire_browser(&ui, &browser_widgets.4, &browser_widgets.5);
     wire_browser_actions(&ui, &browser_widgets.8, &browser_widgets.9);
     wire_search(&ui);
-    wire_gallery(&ui, &gallery_widgets.3);
+    wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
     wire_retry(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
@@ -2295,54 +2314,48 @@ fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     }
 }
 
-/// The Photos page: a [`gtk4::GridView`] of thumbnails backed by a
-/// [`gio::ListStore`] of [`BoxedAnyObject`]-wrapped [`PhotoItem`]s, plus a
-/// "Load more" button and a status label.
-fn build_gallery_page() -> (
-    gtk4::Widget,
-    (
-        gio::ListStore,
-        gtk4::Label,
-        gtk4::Button,
-        gtk4::GridView,
-        gtk4::Button,
-        gtk4::Button, // Upload Photo
-    ),
-) {
+/// One day-section of the photos timeline: a heading plus the photos captured
+/// that day, in timeline order. Built from the flat [`Ui::gallery_model`] by
+/// [`group_photos`] and rendered as one [`gtk4::ListView`] row.
+struct PhotoGroup {
+    /// "Today", "Yesterday", or e.g. "3 June 2026".
+    heading: String,
+    photos: Vec<PhotoItem>,
+}
+
+/// The widgets [`build_gallery_page`] hands back to [`build_window`].
+struct GalleryWidgets {
+    /// Flat, newest-first list of every loaded photo. Backs the lightbox's
+    /// prev/next navigation; the visible sections are derived from it.
+    model: gio::ListStore,
+    /// Day sections rendered by the ListView, derived from `model`.
+    groups: gio::ListStore,
+    status: gtk4::Label,
+    more: gtk4::Button,
+    list: gtk4::ListView,
+    scroll: gtk4::ScrolledWindow,
+    retry: gtk4::Button,
+    upload: gtk4::Button,
+}
+
+/// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over a
+/// [`gtk4::FlowBox`] collage of that day's thumbnails at their original aspect
+/// ratios, plus a "Load more" button and a status label.
+///
+/// A ListView of sections rather than one flat GridView because GTK's grid has no
+/// row headers and forces square cells: the collage and the date headings both
+/// need per-row structure. The factory is installed by [`wire_gallery`], which has
+/// the [`Ui`] the tiles need (zoom level, click-to-open).
+fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
+    let groups = gio::ListStore::new::<BoxedAnyObject>();
 
-    let factory = gtk4::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let picture = gtk4::Picture::builder()
-            .content_fit(gtk4::ContentFit::Cover)
-            .width_request(150)
-            .height_request(150)
-            .build();
-        picture.add_css_class("card");
-        item.set_child(Some(&picture));
-    });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let picture = item.child().and_downcast::<gtk4::Picture>().unwrap();
-        let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-        let photo = obj.borrow::<PhotoItem>();
-        match photo.thumb_path.as_deref() {
-            Some(p) => match gtk4::gdk::Texture::from_filename(p) {
-                Ok(texture) => picture.set_paintable(Some(&texture)),
-                Err(_) => picture.set_paintable(gtk4::gdk::Paintable::NONE),
-            },
-            None => picture.set_paintable(gtk4::gdk::Paintable::NONE),
-        }
-    });
-
-    let selection = gtk4::NoSelection::new(Some(model.clone()));
-    let grid = gtk4::GridView::builder()
+    let selection = gtk4::NoSelection::new(Some(groups.clone()));
+    let list = gtk4::ListView::builder()
         .model(&selection)
-        .factory(&factory)
-        .min_columns(2)
-        .max_columns(6)
+        .single_click_activate(false)
         .build();
+    list.add_css_class("gallery-sections");
 
     let status = gtk4::Label::builder().wrap(true).build();
     status.add_css_class("dim-label");
@@ -2365,7 +2378,7 @@ fn build_gallery_page() -> (
 
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
-        .child(&grid)
+        .child(&list)
         .build();
 
     // Modern header: "Photos" title + "Upload Photo" action button
@@ -2398,23 +2411,92 @@ fn build_gallery_page() -> (
     inner.append(&scroll);
     inner.append(&more);
 
-    (inner.upcast(), (model, status, more, grid, retry, upload))
+    (
+        inner.upcast(),
+        GalleryWidgets {
+            model,
+            groups,
+            status,
+            more,
+            list,
+            scroll,
+            retry,
+            upload,
+        },
+    )
 }
 
-/// Wire the gallery: activating a tile downloads the photo and opens it in our
-/// in-app lightbox viewer; the "Load more" button appends the next page.
-fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
-    let ui_open = ui.clone();
-    grid.connect_activate(move |grid, pos| {
-        let Some(obj) = grid.model().and_then(|m| m.item(pos)) else {
-            return;
-        };
-        let uid = obj
-            .downcast_ref::<BoxedAnyObject>()
-            .map(|o| o.borrow::<PhotoItem>().uid.clone());
-        let Some(uid) = uid else { return };
-        open_photo_viewer(&ui_open, uid);
+/// Wire the gallery: install the section factory, the zoom gestures, the pager
+/// and the upload button. Activating a thumbnail downloads the photo and opens it
+/// in the in-app lightbox.
+fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindow) {
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        let section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        section.set_margin_bottom(12);
+        let heading = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+        heading.add_css_class("heading");
+        section.append(&heading);
+        item.set_child(Some(&section));
+        item.set_activatable(false);
     });
+
+    let ui_bind = ui.clone();
+    factory.connect_bind(move |_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        let section = item.child().and_downcast::<gtk4::Box>().unwrap();
+        let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
+        let group = obj.borrow::<PhotoGroup>();
+
+        let heading = section.first_child().and_downcast::<gtk4::Label>().unwrap();
+        heading.set_label(&group.heading);
+
+        // Drop the previous day's collage and build this one's. The FlowBox is
+        // rebuilt (not repopulated) so its child-activated handler closes over the
+        // photos it actually shows — ListView recycles the row widget itself.
+        while let Some(old) = heading.next_sibling() {
+            section.remove(&old);
+        }
+        section.append(&photo_collage(&ui_bind, &group.photos));
+    });
+    list.set_factory(Some(&factory));
+
+    // Ctrl+scroll zoom. Capture phase so the ScrolledWindow doesn't eat the event
+    // and scroll the page out from under the gesture.
+    let zoom_scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+    zoom_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let ui_zoom = ui.clone();
+    zoom_scroll.connect_scroll(move |controller, _dx, dy| {
+        if !controller
+            .current_event_state()
+            .contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            || dy == 0.0
+        {
+            return glib::Propagation::Proceed;
+        }
+        // Scroll up (negative dy) zooms in, i.e. bigger tiles.
+        zoom_gallery(&ui_zoom, if dy < 0.0 { TILE_STEP } else { -TILE_STEP });
+        glib::Propagation::Stop
+    });
+    scroll.add_controller(zoom_scroll);
+
+    // Ctrl+plus / Ctrl+minus / Ctrl+0, the keyboard equivalents.
+    let zoom_keys = gtk4::EventControllerKey::new();
+    let ui_keys = ui.clone();
+    zoom_keys.connect_key_pressed(move |_, key, _code, state| {
+        if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        match key.name().as_deref() {
+            Some("plus" | "equal" | "KP_Add") => zoom_gallery(&ui_keys, TILE_STEP),
+            Some("minus" | "KP_Subtract") => zoom_gallery(&ui_keys, -TILE_STEP),
+            Some("0" | "KP_0") => set_gallery_tile(&ui_keys, TILE_DEFAULT),
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    });
+    list.add_controller(zoom_keys);
 
     let ui_more = ui.clone();
     ui.gallery_more.clone().connect_clicked(move |_| {
@@ -2507,6 +2589,125 @@ fn wire_gallery(ui: &Rc<Ui>, grid: &gtk4::GridView) {
     });
 }
 
+/// One day's thumbnails as a masonry collage: a [`gtk4::FlowBox`] of pictures all
+/// [`Ui::gallery_tile`] tall and as wide as their own aspect ratio makes them, so
+/// rows justify like a phone gallery instead of square-cropping every photo.
+fn photo_collage(ui: &Rc<Ui>, photos: &[PhotoItem]) -> gtk4::FlowBox {
+    let tile = ui.gallery_tile.get();
+    let flow = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .homogeneous(false)
+        .row_spacing(6)
+        .column_spacing(6)
+        .min_children_per_line(1)
+        .max_children_per_line(64)
+        .build();
+
+    for photo in photos {
+        let picture = gtk4::Picture::builder()
+            .content_fit(gtk4::ContentFit::Cover)
+            .build();
+        picture.add_css_class("card");
+
+        // Width follows the thumbnail's own aspect ratio, clamped so a panorama
+        // can't take a whole row and a tall portrait still stays clickable.
+        let mut width = tile;
+        if let Some(path) = photo.thumb_path.as_deref()
+            && let Ok(texture) = gtk4::gdk::Texture::from_filename(path)
+        {
+            if texture.height() > 0 {
+                let ratio = f64::from(texture.width()) / f64::from(texture.height());
+                width = (f64::from(tile) * ratio).round() as i32;
+            }
+            picture.set_paintable(Some(&texture));
+        }
+        picture.set_height_request(tile);
+        picture.set_width_request(width.clamp(tile / 2, tile * 3));
+
+        flow.append(&gtk4::FlowBoxChild::builder().child(&picture).build());
+    }
+
+    let ui_activate = ui.clone();
+    let photos: Vec<PhotoItem> = photos.to_vec();
+    flow.connect_child_activated(move |_, child| {
+        if let Some(photo) = photos.get(child.index() as usize) {
+            open_photo_viewer(&ui_activate, photo.uid.clone());
+        }
+    });
+
+    flow
+}
+
+/// Step the thumbnail size by `delta` px and repaint, clamped to the zoom range.
+fn zoom_gallery(ui: &Rc<Ui>, delta: i32) {
+    set_gallery_tile(ui, ui.gallery_tile.get() + delta);
+}
+
+/// Set the thumbnail size (clamped) and rebuild the sections at the new size.
+fn set_gallery_tile(ui: &Rc<Ui>, tile: i32) {
+    let tile = tile.clamp(TILE_MIN, TILE_MAX);
+    if tile == ui.gallery_tile.get() {
+        return;
+    }
+    ui.gallery_tile.set(tile);
+    repaint_gallery(ui);
+}
+
+/// Rebuild the day sections from the flat photo model. The timeline arrives
+/// newest-first, so photos of the same day are already contiguous — one pass
+/// splits them.
+fn repaint_gallery(ui: &Rc<Ui>) {
+    ui.gallery_groups.remove_all();
+    for group in group_photos(&ui.gallery_model) {
+        ui.gallery_groups.append(&BoxedAnyObject::new(group));
+    }
+}
+
+fn group_photos(model: &gio::ListStore) -> Vec<PhotoGroup> {
+    let mut groups: Vec<PhotoGroup> = Vec::new();
+    for i in 0..model.n_items() {
+        let Some(obj) = model.item(i) else { continue };
+        let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() else {
+            continue;
+        };
+        let photo = boxed.borrow::<PhotoItem>().clone();
+        let heading = day_heading(photo.capture_time);
+        match groups.last_mut() {
+            Some(group) if group.heading == heading => group.photos.push(photo),
+            _ => groups.push(PhotoGroup {
+                heading,
+                photos: vec![photo],
+            }),
+        }
+    }
+    groups
+}
+
+/// Section heading for a capture time: "Today", "Yesterday", or the local date.
+fn day_heading(secs: i64) -> String {
+    let Ok(date) = glib::DateTime::from_unix_local(secs) else {
+        return "Unknown date".into();
+    };
+    let same_day = |other: &glib::DateTime| {
+        other.year() == date.year()
+            && other.month() == date.month()
+            && other.day_of_month() == date.day_of_month()
+    };
+    if let Ok(now) = glib::DateTime::now_local() {
+        if same_day(&now) {
+            return "Today".into();
+        }
+        if let Ok(yesterday) = glib::DateTime::from_unix_local(now.to_unix() - 86_400)
+            && same_day(&yesterday)
+        {
+            return "Yesterday".into();
+        }
+    }
+    date.format("%-d %B %Y")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "Unknown date".into())
+}
+
 fn show_error_dialog(ui: &Rc<Ui>, message: &str) {
     alert(ui, "Photo Operation", message);
 }
@@ -2534,52 +2735,198 @@ fn format_capture_time(secs: i64) -> String {
     }
 }
 
-fn load_photo(
-    ui: &Rc<Ui>,
-    uid: String,
-    picture: &gtk4::Picture,
-    spinner: &gtk4::Spinner,
-    status_label: &gtk4::Label,
-    current_path: Rc<RefCell<Option<String>>>,
-) {
-    spinner.set_visible(true);
-    spinner.start();
-    picture.set_paintable(gtk4::gdk::Paintable::NONE);
-    status_label.set_visible(false);
-    *current_path.borrow_mut() = None;
+/// The lightbox's mutable parts, shared by [`load_photo`], [`navigate_photo`] and
+/// the button/key handlers so each one takes a single handle instead of a dozen
+/// widget arguments.
+struct Viewer {
+    picture: gtk4::Picture,
+    spinner: gtk4::Spinner,
+    status: gtk4::Label,
+    title: gtk4::Label,
+    prev: gtk4::Button,
+    next: gtk4::Button,
+    /// EXIF drawer: the toggle that reveals it, the body it fills in, and the
+    /// "Show on map" button (hidden when the photo carries no GPS tags).
+    info_toggle: gtk4::ToggleButton,
+    info_revealer: gtk4::Revealer,
+    info_body: gtk4::Label,
+    info_map: gtk4::Button,
+    /// Coordinates behind `info_map`, once a photo with GPS tags is shown.
+    coords: RefCell<Option<(f64, f64)>>,
+    /// uid of the photo currently on screen.
+    uid: RefCell<String>,
+    /// On-disk path of the full-size photo, once it has been downloaded.
+    path: RefCell<Option<String>>,
+}
+
+/// Camera/exposure/location facts pulled from a photo's own EXIF tags.
+struct ExifInfo {
+    /// Rendered "Camera: … / Exposure: …" lines, empty when the file has no EXIF.
+    lines: Vec<String>,
+    /// Decimal degrees, if the photo is geotagged.
+    coords: Option<(f64, f64)>,
+}
+
+/// Download the photo behind `uid` into the cache and show it, then fill the EXIF
+/// drawer from the file that lands on disk.
+fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
+    viewer.spinner.set_visible(true);
+    viewer.spinner.start();
+    viewer.picture.set_paintable(gtk4::gdk::Paintable::NONE);
+    viewer.status.set_visible(false);
+    *viewer.path.borrow_mut() = None;
+    clear_exif(viewer);
 
     let rx = spawn_request(
         ui.dirs.control_socket(),
         Request::OpenPhoto { uid: uid.clone() },
     );
-    let picture_clone = picture.clone();
-    let spinner_clone = spinner.clone();
-    let status_clone = status_label.clone();
+    let viewer = viewer.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
-        spinner_clone.stop();
-        spinner_clone.set_visible(false);
+        viewer.spinner.stop();
+        viewer.spinner.set_visible(false);
         match result {
             Ok(Ok(Response::FilePath { path })) => match gtk4::gdk::Texture::from_filename(&path) {
                 Ok(texture) => {
-                    picture_clone.set_paintable(Some(&texture));
-                    *current_path.borrow_mut() = Some(path);
+                    viewer.picture.set_paintable(Some(&texture));
+                    *viewer.path.borrow_mut() = Some(path.clone());
+                    show_exif(&viewer, read_exif(&path));
                 }
                 Err(e) => {
-                    status_clone.set_label(&format!("Failed to load image: {e}"));
-                    status_clone.set_visible(true);
+                    tracing::error!("Failed to load texture for {path}: {e}");
+                    viewer.status.set_label("Couldn't render this photo.");
+                    viewer.status.set_visible(true);
                 }
             },
             Ok(Ok(Response::Error { message })) => {
-                status_clone.set_label(&format!("Error downloading photo: {message}"));
-                status_clone.set_visible(true);
+                viewer.status.set_label(&message);
+                viewer.status.set_visible(true);
             }
-            _ => {
-                status_clone.set_label("Failed to connect to daemon");
-                status_clone.set_visible(true);
+            Ok(Ok(_)) => {
+                viewer.status.set_label("Unexpected reply from daemon.");
+                viewer.status.set_visible(true);
+            }
+            Ok(Err(_)) | Err(_) => {
+                viewer.status.set_label("Couldn't reach Proton Drive.");
+                viewer.status.set_visible(true);
             }
         }
     });
+}
+
+/// Reset the EXIF drawer while the next photo is in flight, so it never shows the
+/// previous photo's camera against the new image.
+fn clear_exif(viewer: &Rc<Viewer>) {
+    *viewer.coords.borrow_mut() = None;
+    viewer.info_body.set_label("Reading photo details…");
+    viewer.info_map.set_visible(false);
+}
+
+fn show_exif(viewer: &Rc<Viewer>, info: ExifInfo) {
+    if info.lines.is_empty() {
+        viewer
+            .info_body
+            .set_label("No EXIF metadata in this photo.");
+    } else {
+        viewer.info_body.set_label(&info.lines.join("\n"));
+    }
+    viewer.info_map.set_visible(info.coords.is_some());
+    *viewer.coords.borrow_mut() = info.coords;
+}
+
+/// Read the EXIF tags a gallery viewer cares about out of a decrypted photo on
+/// disk. Anything missing is simply left out — phone screenshots and re-encoded
+/// images legitimately carry no EXIF at all.
+fn read_exif(path: &str) -> ExifInfo {
+    let mut lines = Vec::new();
+    let mut coords = None;
+
+    let reader = match std::fs::File::open(path) {
+        Ok(file) => {
+            match exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    tracing::debug!("no exif in {path}: {e}");
+                    return ExifInfo { lines, coords };
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("cannot open {path} for exif: {e}");
+            return ExifInfo { lines, coords };
+        }
+    };
+
+    let field = |tag: exif::Tag| {
+        reader
+            .get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().with_unit(&reader).to_string())
+    };
+
+    let camera = [exif::Tag::Make, exif::Tag::Model]
+        .iter()
+        .filter_map(|tag| field(*tag))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !camera.is_empty() {
+        lines.push(format!("Camera: {camera}"));
+    }
+    if let Some(lens) = field(exif::Tag::LensModel) {
+        lines.push(format!("Lens: {lens}"));
+    }
+
+    let exposure: Vec<String> = [
+        exif::Tag::FNumber,
+        exif::Tag::ExposureTime,
+        exif::Tag::PhotographicSensitivity,
+        exif::Tag::FocalLength,
+    ]
+    .iter()
+    .filter_map(|tag| field(*tag))
+    .collect();
+    if !exposure.is_empty() {
+        lines.push(format!("Exposure: {}", exposure.join(" · ")));
+    }
+
+    if let Some(taken) = field(exif::Tag::DateTimeOriginal) {
+        lines.push(format!("Taken: {taken}"));
+    }
+    if let Some(size) = field(exif::Tag::PixelXDimension)
+        .zip(field(exif::Tag::PixelYDimension))
+        .map(|(w, h)| format!("{w} × {h}"))
+    {
+        lines.push(format!("Dimensions: {size}"));
+    }
+
+    if let Some(lat) = gps_degrees(&reader, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef)
+        && let Some(lon) = gps_degrees(&reader, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef)
+    {
+        lines.push(format!("Location: {lat:.5}, {lon:.5}"));
+        coords = Some((lat, lon));
+    }
+
+    ExifInfo { lines, coords }
+}
+
+/// Convert one GPS coordinate from EXIF's degrees/minutes/seconds rationals to
+/// decimal degrees, negating for the S/W hemispheres.
+fn gps_degrees(reader: &exif::Exif, tag: exif::Tag, ref_tag: exif::Tag) -> Option<f64> {
+    let field = reader.get_field(tag, exif::In::PRIMARY)?;
+    let exif::Value::Rational(dms) = &field.value else {
+        return None;
+    };
+    let [deg, min, sec] = dms.get(..3)? else {
+        return None;
+    };
+    let degrees = deg.to_f64() + min.to_f64() / 60.0 + sec.to_f64() / 3600.0;
+
+    let hemisphere = reader
+        .get_field(ref_tag, exif::In::PRIMARY)
+        .map(|f| f.display_value().to_string())
+        .unwrap_or_default();
+    let negative = hemisphere.starts_with('S') || hemisphere.starts_with('W');
+    Some(if negative { -degrees } else { degrees })
 }
 
 fn save_photo_to_disk(window: &gtk4::Window, source_path: &str, original_name: &str) {
@@ -2601,24 +2948,14 @@ fn save_photo_to_disk(window: &gtk4::Window, source_path: &str, original_name: &
     });
 }
 
-fn navigate_photo(
-    ui: &Rc<Ui>,
-    current_uid: &Rc<RefCell<String>>,
-    delta: i32,
-    picture: &gtk4::Picture,
-    spinner: &gtk4::Spinner,
-    status_label: &gtk4::Label,
-    title_label: &gtk4::Label,
-    prev_btn: &gtk4::Button,
-    next_btn: &gtk4::Button,
-    current_path: Rc<RefCell<Option<String>>>,
-) {
+/// Step `delta` photos through the flat timeline model and load what lands there.
+fn navigate_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, delta: i32) {
     let model = &ui.gallery_model;
     let n = model.n_items();
     if n == 0 {
         return;
     }
-    let uid_val = current_uid.borrow().clone();
+    let uid_val = viewer.uid.borrow().clone();
     let current_idx = find_photo_index(model, &uid_val).unwrap_or(0);
     let next_idx = (current_idx as i32 + delta).clamp(0, n as i32 - 1) as u32;
 
@@ -2630,22 +2967,17 @@ fn navigate_photo(
     };
     let photo = boxed.borrow::<PhotoItem>().clone();
 
-    *current_uid.borrow_mut() = photo.uid.clone();
+    *viewer.uid.borrow_mut() = photo.uid.clone();
 
-    prev_btn.set_sensitive(next_idx > 0);
-    next_btn.set_sensitive(next_idx < n - 1);
+    viewer.prev.set_sensitive(next_idx > 0);
+    viewer.next.set_sensitive(next_idx < n - 1);
 
     let date_str = format_capture_time(photo.capture_time);
-    title_label.set_label(&format!("Photo {} of {} • {}", next_idx + 1, n, date_str));
+    viewer
+        .title
+        .set_label(&format!("Photo {} of {} • {}", next_idx + 1, n, date_str));
 
-    load_photo(
-        ui,
-        photo.uid.clone(),
-        picture,
-        spinner,
-        status_label,
-        current_path,
-    );
+    load_photo(ui, viewer, photo.uid.clone());
 }
 
 fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
@@ -2704,6 +3036,14 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     title_label.add_css_class("viewer-title");
     top_bar.append(&title_label);
 
+    let info_toggle = gtk4::ToggleButton::builder()
+        .icon_name("info-symbolic")
+        .tooltip_text("Photo Details")
+        .build();
+    info_toggle.add_css_class("flat");
+    info_toggle.add_css_class("viewer-action-btn");
+    top_bar.append(&info_toggle);
+
     let download_btn = gtk4::Button::builder()
         .icon_name("document-save-symbolic")
         .tooltip_text("Download to Disk")
@@ -2730,6 +3070,45 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     overlay.add_overlay(&top_bar);
 
+    // EXIF drawer: slides in from the right over the photo, filled from the file
+    // once it lands on disk.
+    let info_body = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .build();
+    let info_map = gtk4::Button::builder()
+        .label("Show on map")
+        .halign(gtk4::Align::Start)
+        .build();
+    info_map.add_css_class("pill");
+    info_map.set_visible(false);
+
+    let info_panel = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    info_panel.add_css_class("viewer-info-panel");
+    info_panel.set_margin_top(56);
+    info_panel.set_margin_bottom(12);
+    info_panel.set_margin_start(12);
+    info_panel.set_margin_end(12);
+    info_panel.set_width_request(260);
+    let info_title = gtk4::Label::builder()
+        .label("Details")
+        .halign(gtk4::Align::Start)
+        .build();
+    info_title.add_css_class("heading");
+    info_panel.append(&info_title);
+    info_panel.append(&info_body);
+    info_panel.append(&info_map);
+
+    let info_revealer = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
+        .halign(gtk4::Align::End)
+        .valign(gtk4::Align::Fill)
+        .child(&info_panel)
+        .build();
+    overlay.add_overlay(&info_revealer);
+
     let spinner = gtk4::Spinner::builder()
         .halign(gtk4::Align::Center)
         .valign(gtk4::Align::Center)
@@ -2749,13 +3128,26 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     window.set_child(Some(&overlay));
 
-    let current_uid = Rc::new(RefCell::new(initial_uid.clone()));
-    let current_path = Rc::new(RefCell::new(None::<String>));
+    let viewer = Rc::new(Viewer {
+        picture,
+        spinner,
+        status: status_label,
+        title: title_label,
+        prev: prev_btn.clone(),
+        next: next_btn.clone(),
+        info_toggle: info_toggle.clone(),
+        info_revealer: info_revealer.clone(),
+        info_body,
+        info_map: info_map.clone(),
+        coords: RefCell::new(None),
+        uid: RefCell::new(initial_uid.clone()),
+        path: RefCell::new(None),
+    });
 
     let n = ui.gallery_model.n_items();
     let initial_idx = find_photo_index(&ui.gallery_model, &initial_uid).unwrap_or(0);
-    prev_btn.set_sensitive(initial_idx > 0);
-    next_btn.set_sensitive(initial_idx < n - 1);
+    viewer.prev.set_sensitive(initial_idx > 0);
+    viewer.next.set_sensitive(initial_idx < n - 1);
 
     let mut initial_capture_time = 0;
     if let Some(obj) = ui.gallery_model.item(initial_idx)
@@ -2764,143 +3156,91 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         initial_capture_time = boxed.borrow::<PhotoItem>().capture_time;
     }
     let date_str = format_capture_time(initial_capture_time);
-    title_label.set_label(&format!(
+    viewer.title.set_label(&format!(
         "Photo {} of {} • {}",
         initial_idx + 1,
         n,
         date_str
     ));
 
-    load_photo(
-        ui,
-        initial_uid,
-        &picture,
-        &spinner,
-        &status_label,
-        current_path.clone(),
-    );
+    load_photo(ui, &viewer, initial_uid);
 
     let w_close = window.clone();
     close_btn.connect_clicked(move |_| {
         w_close.close();
     });
 
+    let viewer_info = viewer.clone();
+    info_toggle.connect_toggled(move |toggle| {
+        viewer_info
+            .info_revealer
+            .set_reveal_child(toggle.is_active());
+    });
+
+    let viewer_map = viewer.clone();
+    info_map.connect_clicked(move |_| {
+        if let Some((lat, lon)) = *viewer_map.coords.borrow() {
+            open_path(&format!(
+                "https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}"
+            ));
+        }
+    });
+
     let w_download = window.clone();
-    let path_download = current_path.clone();
-    let uid_download = current_uid.clone();
+    let viewer_download = viewer.clone();
     download_btn.connect_clicked(move |_| {
-        if let Some(path) = path_download.borrow().as_deref() {
-            let uid_val = uid_download.borrow();
-            let name = format!("{}.jpg", uid_val);
+        if let Some(path) = viewer_download.path.borrow().as_deref() {
+            let name = format!("{}.jpg", viewer_download.uid.borrow());
             save_photo_to_disk(&w_download, path, &name);
         }
     });
 
-    let path_ext = current_path.clone();
+    let viewer_ext = viewer.clone();
     open_ext_btn.connect_clicked(move |_| {
-        if let Some(path) = path_ext.borrow().as_deref() {
+        if let Some(path) = viewer_ext.path.borrow().as_deref() {
             open_path(path);
         }
     });
 
     let ui_prev = ui.clone();
-    let uid_prev = current_uid.clone();
-    let pic_prev = picture.clone();
-    let spin_prev = spinner.clone();
-    let status_prev = status_label.clone();
-    let title_prev = title_label.clone();
-    let p_btn = prev_btn.clone();
-    let n_btn = next_btn.clone();
-    let path_prev = current_path.clone();
+    let viewer_prev = viewer.clone();
     prev_btn.connect_clicked(move |_| {
-        navigate_photo(
-            &ui_prev,
-            &uid_prev,
-            -1,
-            &pic_prev,
-            &spin_prev,
-            &status_prev,
-            &title_prev,
-            &p_btn,
-            &n_btn,
-            path_prev.clone(),
-        );
+        navigate_photo(&ui_prev, &viewer_prev, -1);
     });
 
     let ui_next = ui.clone();
-    let uid_next = current_uid.clone();
-    let pic_next = picture.clone();
-    let spin_next = spinner.clone();
-    let status_next = status_label.clone();
-    let title_next = title_label.clone();
-    let p_btn = prev_btn.clone();
-    let n_btn = next_btn.clone();
-    let path_next = current_path.clone();
+    let viewer_next = viewer.clone();
     next_btn.connect_clicked(move |_| {
-        navigate_photo(
-            &ui_next,
-            &uid_next,
-            1,
-            &pic_next,
-            &spin_next,
-            &status_next,
-            &title_next,
-            &p_btn,
-            &n_btn,
-            path_next.clone(),
-        );
+        navigate_photo(&ui_next, &viewer_next, 1);
     });
 
     let key_controller = gtk4::EventControllerKey::new();
     let ui_key = ui.clone();
-    let uid_key = current_uid.clone();
-    let pic_key = picture.clone();
-    let spin_key = spinner.clone();
-    let status_key = status_label.clone();
-    let title_key = title_label.clone();
-    let p_btn = prev_btn.clone();
-    let n_btn = next_btn.clone();
-    let path_key = current_path.clone();
+    let viewer_key = viewer.clone();
     let w_key = window.clone();
     key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
         match key.name().as_deref() {
             Some("Left") => {
                 let current_idx =
-                    find_photo_index(&ui_key.gallery_model, &uid_key.borrow()).unwrap_or(0);
+                    find_photo_index(&ui_key.gallery_model, &viewer_key.uid.borrow()).unwrap_or(0);
                 if current_idx > 0 {
-                    navigate_photo(
-                        &ui_key,
-                        &uid_key,
-                        -1,
-                        &pic_key,
-                        &spin_key,
-                        &status_key,
-                        &title_key,
-                        &p_btn,
-                        &n_btn,
-                        path_key.clone(),
-                    );
+                    navigate_photo(&ui_key, &viewer_key, -1);
                 }
                 glib::Propagation::Stop
             }
             Some("Right") => {
                 let n = ui_key.gallery_model.n_items();
                 let current_idx =
-                    find_photo_index(&ui_key.gallery_model, &uid_key.borrow()).unwrap_or(0);
-                if current_idx < n - 1 {
-                    navigate_photo(
-                        &ui_key,
-                        &uid_key,
-                        1,
-                        &pic_key,
-                        &spin_key,
-                        &status_key,
-                        &title_key,
-                        &p_btn,
-                        &n_btn,
-                        path_key.clone(),
-                    );
+                    find_photo_index(&ui_key.gallery_model, &viewer_key.uid.borrow()).unwrap_or(0);
+                if current_idx + 1 < n {
+                    navigate_photo(&ui_key, &viewer_key, 1);
                 }
+                glib::Propagation::Stop
+            }
+            Some("i") => {
+                viewer_key
+                    .info_toggle
+                    .set_active(!viewer_key.info_toggle.is_active());
                 glib::Propagation::Stop
             }
             Some("Escape") => {
@@ -2952,6 +3292,7 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 for item in &items {
                     ui.gallery_model.append(&BoxedAnyObject::new(item.clone()));
                 }
+                repaint_gallery(&ui);
                 if ui.gallery_model.n_items() == 0 {
                     gallery_message(&ui, "No photos yet.");
                 } else {

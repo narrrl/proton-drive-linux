@@ -292,39 +292,11 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         .block_on(auth::resume_client())
         .context("resume session (run `pdfs login` first)")?;
 
-    // Persist rotated tokens for the daemon's lifetime. Proton refresh tokens are
-    // single-use: the 401-refresh path swaps in a new access+refresh pair, and if
-    // that pair is never written back the keyring keeps a now-dead refresh token,
-    // so the next `pdfs mount` fails with `InvalidRefreshToken`. The session
-    // shares its token store with the Drive client (one `Arc`-backed token store),
-    // so both the poll below and the shutdown flush see every rotation.
-    //
-    // `ProtonApiSession` is `Clone` over that shared store, so the polling task
-    // gets its own handle and we keep `session` here for a final flush. The poll
-    // is a backstop for long-lived mounts; the flush after `mount` returns is what
-    // makes the common case correct — a refresh shortly before a clean unmount
-    // would otherwise be lost in the poll gap, leaving a dead token behind.
-    let poll_session = session.clone();
-    rt.spawn(async move {
-        let mut last = poll_session.current_tokens().await;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            let current = poll_session.current_tokens().await;
-            if current.access_token == last.access_token
-                && current.refresh_token == last.refresh_token
-            {
-                continue;
-            }
-            match auth::persist(&poll_session).await {
-                Ok(()) => {
-                    tracing::info!("persisted refreshed session tokens");
-                    last = current;
-                }
-                Err(e) => tracing::warn!(error = %e, "failed to persist refreshed tokens"),
-            }
-        }
-    });
-
+    // Token updates are persisted automatically in real-time. The SDK session has
+    // a token refresh callback registered during `resume_client` that writes updated
+    // credentials back to the OS keyring immediately upon rotation. This prevents
+    // the system keyring from holding stale refresh tokens even if the daemon crashes,
+    // the system is suspended, or the network changes.
     let handle = rt.handle().clone();
     let result = pdfs_fuse::mount(
         client,
@@ -336,11 +308,9 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         username,
     );
 
-    // Clean unmount: flush whatever tokens the store holds now so the keyring
-    // always ends a session with the live refresh token, not a stale one. Runs
-    // even if `mount` errored — a rotation may still have happened first.
+    // Clean unmount check (as a best-effort final backup).
     if let Err(e) = rt.block_on(auth::persist(&session)) {
-        tracing::warn!(error = %e, "failed to persist tokens on shutdown");
+        tracing::debug!(error = %e, "no new tokens to persist on shutdown");
     }
 
     let outcome = result.context("mount failed")?;

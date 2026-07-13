@@ -392,10 +392,10 @@ fn build_window(app: &adw::Application) {
         let hits = hits.clone();
         let raw_hits = raw_hits.clone();
         let status_label = status_label.clone();
-        
+
         Rc::new(move |filter: FileFilter| {
             current_filter.set(filter);
-            
+
             // Update active CSS class on buttons
             for (f, btn) in filter_buttons.borrow().iter() {
                 if *f == filter {
@@ -404,10 +404,10 @@ fn build_window(app: &adw::Application) {
                     btn.remove_css_class("active");
                 }
             }
-            
+
             // Re-apply filter
             apply_filter(&list_box, &hits, &raw_hits.borrow(), filter);
-            
+
             // Update status text based on filter matches
             let filtered_count = hits.borrow().len();
             let total_count = raw_hits.borrow().len();
@@ -433,20 +433,17 @@ fn build_window(app: &adw::Application) {
     ];
 
     for (filter_type, label, icon) in filter_names {
-        let btn = gtk4::Button::builder()
-            .label(label)
-            .icon_name(icon)
-            .build();
+        let btn = gtk4::Button::builder().label(label).icon_name(icon).build();
         btn.add_css_class("filter-chip");
         if filter_type == FileFilter::All {
             btn.add_css_class("active");
         }
-        
+
         let select_filter_clone = select_filter_rc.clone();
         btn.connect_clicked(move |_| {
             select_filter_clone(filter_type);
         });
-        
+
         filter_box.append(&btn);
         filter_buttons.borrow_mut().push((filter_type, btn));
     }
@@ -882,7 +879,11 @@ fn repaint_prompt_results(
             let ext = hit.name.split('.').last().unwrap_or("").to_lowercase();
             if ext == "pdf" {
                 ("document-symbolic", "icon-pdf")
-            } else if ["docx", "doc", "txt", "md", "odt", "xlsx", "xls", "csv", "pptx", "ppt"].contains(&ext.as_str()) {
+            } else if [
+                "docx", "doc", "txt", "md", "odt", "xlsx", "xls", "csv", "pptx", "ppt",
+            ]
+            .contains(&ext.as_str())
+            {
                 ("document-symbolic", "icon-doc")
             } else if ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"].contains(&ext.as_str()) {
                 ("image-symbolic", "icon-image")
@@ -927,18 +928,14 @@ fn repaint_prompt_results(
 
         if !hit.is_dir && hit.size > 0 {
             let size_str = format_size(hit.size);
-            let size_label = gtk4::Label::builder()
-                .label(&size_str)
-                .build();
+            let size_label = gtk4::Label::builder().label(&size_str).build();
             size_label.add_css_class("dim-label");
             right_box.append(&size_label);
         }
 
         if hit.modified > 0 {
             let time_str = format_relative_time(hit.modified);
-            let time_label = gtk4::Label::builder()
-                .label(&time_str)
-                .build();
+            let time_label = gtk4::Label::builder().label(&time_str).build();
             time_label.add_css_class("dim-label");
             right_box.append(&time_label);
         }
@@ -1043,7 +1040,7 @@ fn format_relative_time(epoch_secs: i64) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    
+
     let diff = now - epoch_secs;
     if diff <= 0 {
         return "Just now".to_string();
@@ -1063,7 +1060,7 @@ fn format_relative_time(epoch_secs: i64) -> String {
     if days < 7 {
         return format!("{days}d ago");
     }
-    
+
     if days < 30 {
         return format!("{days}d ago");
     }

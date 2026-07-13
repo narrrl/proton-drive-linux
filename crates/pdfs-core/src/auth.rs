@@ -84,6 +84,8 @@ pub async fn login(
         session.apply_second_factor_code(code.trim()).await?;
     }
 
+    register_refresh_handler(&session, password.to_owned());
+
     save(&session, password).await?;
     Ok(())
 }
@@ -137,6 +139,9 @@ pub fn logout() -> Result<()> {
 pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
     let stored = load()?;
     let session = ProtonApiSession::resume(client_config(), stored.to_params())?;
+
+    register_refresh_handler(&session, stored.mailbox_password.clone());
+
     let client = ProtonDriveClient::new(&session, stored.mailbox_password.clone().into_bytes());
     Ok((client, session))
 }
@@ -151,3 +156,37 @@ pub async fn persist(session: &ProtonApiSession) -> Result<()> {
     let mailbox_password = load()?.mailbox_password;
     save(session, &mailbox_password).await
 }
+
+fn register_refresh_handler(session: &ProtonApiSession, mailbox_password: String) {
+    let session_id = session.session_id().as_str().to_owned();
+    let username = session.username().to_owned();
+    let user_id = session.user_id().as_str().to_owned();
+    let scopes = session.scopes().to_vec();
+    let password_mode = match session.password_mode() {
+        PasswordMode::Single => 1,
+        PasswordMode::Dual => 2,
+    };
+
+    session.http().set_on_tokens_refreshed(move |tokens| {
+        let stored = StoredSession {
+            session_id: session_id.clone(),
+            username: username.clone(),
+            user_id: user_id.clone(),
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            scopes: scopes.clone(),
+            password_mode,
+            mailbox_password: mailbox_password.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&stored) {
+            if let Ok(entry) = keyring_entry() {
+                if let Err(e) = entry.set_password(&json) {
+                    tracing::warn!(error = %e, "failed to auto-persist refreshed tokens in keyring");
+                } else {
+                    tracing::info!("successfully auto-persisted refreshed tokens in keyring");
+                }
+            }
+        }
+    });
+}
+

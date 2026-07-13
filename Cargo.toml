@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
@@ -33,3 +33,6 @@ rpassword = "7"
 fuser = "0.17"
 libc = "0.2"
 
+[patch.crates-io]
+proton-sdk = { path = "../proton-sdk-rs/crates/proton-sdk" }
+proton-drive-rs = { path = "../proton-sdk-rs/crates/proton-drive-rs" }

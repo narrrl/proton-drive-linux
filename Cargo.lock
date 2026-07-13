@@ -2279,6 +2279,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kamadak-exif"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
+dependencies = [
+ "mutate_once",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2501,6 +2510,12 @@ dependencies = [
  "wasi",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "mutate_once"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13d2233c9842d08cfe13f9eac96e207ca6a2ea10b80259ebe8ad0268be27d2af"
 
 [[package]]
 name = "nix"
@@ -2825,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -2840,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "directories",
  "keyring",
@@ -2857,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-fuse"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "fuser",
  "libc",
@@ -2870,11 +2885,12 @@ dependencies = [
 
 [[package]]
 name = "pdfs-gui"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-channel",
  "gtk4",
+ "kamadak-exif",
  "ksni",
  "libadwaita",
  "pdfs-core",
@@ -3086,8 +3102,6 @@ dependencies = [
 [[package]]
 name = "proton-drive-rs"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2233c256d048c94bc6e59d5332b908e69852ee16690840d02d44e8b3c708aece"
 dependencies = [
  "async-trait",
  "base64",
@@ -3111,8 +3125,6 @@ dependencies = [
 [[package]]
 name = "proton-sdk"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a415594c96d3ca2d9c0db9fbd63b645447ed3565b0d683b5a403b42f54a64818"
 dependencies = [
  "aes-gcm",
  "async-trait",

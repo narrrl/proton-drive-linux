@@ -28,3 +28,4 @@ ksni = "0.2"
 gtk4 = { version = "0.9", features = ["v4_12"] }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 async-channel = "2"
+exif = { version = "0.6", package = "kamadak-exif" }
