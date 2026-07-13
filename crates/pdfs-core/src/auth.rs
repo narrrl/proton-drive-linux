@@ -178,15 +178,13 @@ fn register_refresh_handler(session: &ProtonApiSession, mailbox_password: String
             password_mode,
             mailbox_password: mailbox_password.clone(),
         };
-        if let Ok(json) = serde_json::to_string(&stored) {
-            if let Ok(entry) = keyring_entry() {
+        if let Ok(json) = serde_json::to_string(&stored)
+            && let Ok(entry) = keyring_entry() {
                 if let Err(e) = entry.set_password(&json) {
                     tracing::warn!(error = %e, "failed to auto-persist refreshed tokens in keyring");
                 } else {
                     tracing::info!("successfully auto-persisted refreshed tokens in keyring");
                 }
             }
-        }
     });
 }
-

@@ -142,6 +142,12 @@ impl AppDirs {
         self.state_dir().join("tray.sock")
     }
 
+    /// The user's home directory — the root the daemon indexes for local
+    /// (non-Drive) file search. `None` if it cannot be resolved.
+    pub fn home_dir(&self) -> Option<PathBuf> {
+        directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+    }
+
     /// Default mountpoint when the user does not pass one explicitly.
     pub fn default_mountpoint(&self) -> PathBuf {
         directories::UserDirs::new()

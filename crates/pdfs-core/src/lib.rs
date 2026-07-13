@@ -8,6 +8,7 @@ pub mod config;
 pub mod control;
 pub mod db;
 pub mod error;
+pub mod localindex;
 pub mod service;
 
 pub use error::{Error, Result};

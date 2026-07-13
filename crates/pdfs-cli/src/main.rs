@@ -251,7 +251,9 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
             Err(e) => {
-                tracing::error!(error = %e, "mount failed; retrying in 5s");
+                // `{:#}` so the whole anyhow chain lands in the log — the top
+                // context alone ("mount failed") never says *why*.
+                tracing::error!(error = format!("{e:#}"), "mount failed; retrying in 5s");
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         }

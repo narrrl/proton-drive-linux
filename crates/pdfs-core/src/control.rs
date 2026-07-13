@@ -63,6 +63,10 @@ pub enum Request {
     /// Full-text search node names against the daemon's local metadata index.
     /// `limit` caps the number of hits returned. Replies with [`Response::SearchResults`].
     Search { query: String, limit: usize },
+    /// Search the daemon's index of *local* (non-Drive) files on this machine.
+    /// Independent of [`Request::Search`] so a front-end can fire both at once and
+    /// render whichever lands first. Replies with [`Response::LocalResults`].
+    SearchLocal { query: String, limit: usize },
     /// Rename a file or folder. `path` is mountpoint-relative; `new_name` is a
     /// single path component (no separators). Replies with [`Response::Ok`].
     Rename { path: String, new_name: String },
@@ -162,6 +166,20 @@ pub struct SearchHit {
     pub uid: String,
 }
 
+/// One hit in a [`Request::SearchLocal`] result: a file on this machine, outside
+/// Proton Drive. Unlike [`SearchHit`] there is no uid or pin state — the file is
+/// already local, so the front-end opens `path` directly.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LocalHit {
+    pub name: String,
+    /// Absolute path on this machine.
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Modification time, epoch seconds.
+    pub modified: i64,
+}
+
 /// One photo in a [`Request::PhotosTimeline`] page.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoItem {
@@ -206,6 +224,10 @@ pub enum Response {
     FilePath { path: String },
     /// Full-text search results (reply to [`Request::Search`]).
     SearchResults { hits: Vec<SearchHit> },
+    /// Local-file search results (reply to [`Request::SearchLocal`]). `indexing`
+    /// is true while a scan of the machine is still running, so a front-end can
+    /// say "still indexing" instead of "no matches" on a cold first launch.
+    LocalResults { hits: Vec<LocalHit>, indexing: bool },
     /// A snapshot of in-flight transfers (reply to [`Request::GetQueueStatus`]).
     Transfers { items: Vec<TransferItem> },
     /// The request failed.

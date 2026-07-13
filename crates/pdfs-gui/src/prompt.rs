@@ -1,7 +1,11 @@
-//! `pdfs-prompt` — a fast, Google Drive-style launcher prompt for searching
-//! and opening files or folders in Proton Drive.
+//! `pdfs-prompt` — the launcher: one search field over both Proton Drive and the
+//! files on this machine, styled after Google Drive's search overlay.
 //!
-//! Designed to be bound to a system shortcut (e.g. in Hyprland) for quick HUD search.
+//! Bind it to a system shortcut (e.g. in Hyprland) for a quick HUD search. It is
+//! a short-lived process: it must draw *now*, so nothing here blocks the main
+//! loop. Every daemon round-trip runs on a worker thread and lands back through
+//! an async channel; the two searches (Drive and local) are fired in parallel and
+//! each section renders as its own reply arrives.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -10,36 +14,263 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk4::glib;
+use gtk4::{gio, glib};
 
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{Request, Response, SearchHit, send};
+use pdfs_core::control::{LocalHit, Request, Response, SearchHit, send};
 
 const APP_ID: &str = "io.narl.proton-drive-linux-prompt";
-const PROTON_PURPLE: &str = "#6d4aff";
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Debounce before a keystroke turns into a daemon round-trip. Short enough to
+/// feel live, long enough that typing a word is one search, not five.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// Per-section result cap. The list is a launcher, not a file manager: more rows
+/// than fit on screen only cost render time.
+const SEARCH_LIMIT: usize = 20;
+
+/// Which file kinds a chip narrows the results to. Applied client-side to hits
+/// the daemon already returned, so switching chips never re-queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileFilter {
+enum Filter {
     All,
     Folders,
-    PDFs,
     Documents,
     Images,
+    Media,
 }
 
-/// Run one blocking control-socket round-trip on a worker thread, returning a
-/// channel that yields the [`Response`] once.
-fn spawn_request(
+/// The chip row, in Tab-cycle order.
+const FILTERS: [(Filter, &str); 5] = [
+    (Filter::All, "All"),
+    (Filter::Folders, "Folders"),
+    (Filter::Documents, "Documents"),
+    (Filter::Images, "Images"),
+    (Filter::Media, "Media"),
+];
+
+impl Filter {
+    /// Whether a hit of this name/kind survives the chip.
+    fn accepts(self, name: &str, is_dir: bool) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Folders => is_dir,
+            Filter::Documents => !is_dir && is_document(name),
+            Filter::Images => !is_dir && is_image(name),
+            Filter::Media => !is_dir && is_media(name),
+        }
+    }
+}
+
+fn extension(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn is_document(name: &str) -> bool {
+    matches!(
+        extension(name).as_str(),
+        "pdf"
+            | "doc"
+            | "docx"
+            | "odt"
+            | "rtf"
+            | "txt"
+            | "md"
+            | "xls"
+            | "xlsx"
+            | "ods"
+            | "csv"
+            | "ppt"
+            | "pptx"
+            | "odp"
+            | "epub"
+    )
+}
+
+fn is_image(name: &str) -> bool {
+    matches!(
+        extension(name).as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "avif" | "heic" | "tiff"
+    )
+}
+
+fn is_media(name: &str) -> bool {
+    matches!(
+        extension(name).as_str(),
+        "mp4" | "mkv" | "webm" | "mov" | "avi" | "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a"
+    )
+}
+
+/// One row in the unified result list. The two sections hold different payloads
+/// — a Drive hit must be hydrated through the daemon before it can be opened, a
+/// local file is already on disk — but they share one keyboard cursor.
+#[derive(Clone)]
+enum Hit {
+    Drive(SearchHit),
+    Local(LocalHit),
+}
+
+impl Hit {
+    fn name(&self) -> &str {
+        match self {
+            Hit::Drive(h) => &h.name,
+            Hit::Local(h) => &h.name,
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        match self {
+            Hit::Drive(h) => h.is_dir,
+            Hit::Local(h) => h.is_dir,
+        }
+    }
+
+    /// The dimmed second line: the containing folder, as the user thinks of it.
+    fn location(&self) -> String {
+        match self {
+            Hit::Drive(h) => {
+                let parent = parent_of(&h.path);
+                if parent.is_empty() {
+                    "My files".to_string()
+                } else {
+                    format!("My files / {}", parent.replace('/', " / "))
+                }
+            }
+            Hit::Local(h) => {
+                let parent = parent_of(&h.path);
+                match dirs_home().and_then(|home| {
+                    Path::new(&parent)
+                        .strip_prefix(&home)
+                        .ok()
+                        .map(|rel| rel.display().to_string())
+                }) {
+                    Some(rel) if rel.is_empty() => "Home".to_string(),
+                    Some(rel) => format!("Home / {}", rel.replace('/', " / ")),
+                    None => parent,
+                }
+            }
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Hit::Drive(h) => h.size,
+            Hit::Local(h) => h.size,
+        }
+    }
+
+    fn modified(&self) -> i64 {
+        match self {
+            Hit::Drive(h) => h.modified,
+            Hit::Local(h) => h.modified,
+        }
+    }
+
+    fn pinned(&self) -> bool {
+        matches!(self, Hit::Drive(h) if h.pinned)
+    }
+}
+
+/// Everything the window needs to render and act, in one place so the many
+/// callbacks below capture a single `Rc` instead of a dozen clones each.
+struct Ui {
     socket: PathBuf,
-    req: Request,
-) -> async_channel::Receiver<Result<Response, String>> {
-    let (tx, rx) = async_channel::bounded(1);
-    std::thread::spawn(move || {
-        let result = send(&socket, &req).map_err(|e| e.to_string());
-        let _ = tx.send_blocking(result);
-    });
-    rx
+    mountpoint: RefCell<PathBuf>,
+
+    entry: gtk4::Entry,
+    spinner: gtk4::Spinner,
+    stack: gtk4::Stack,
+    scroller: gtk4::ScrolledWindow,
+    results: gtk4::Box,
+    drive_section: Section,
+    local_section: Section,
+    placeholder: adw::StatusPage,
+    hint: gtk4::Label,
+    chips: RefCell<Vec<(Filter, gtk4::ToggleButton)>>,
+
+    /// Raw (unfiltered) hits from the last reply of each search.
+    drive_hits: RefCell<Vec<SearchHit>>,
+    local_hits: RefCell<Vec<LocalHit>>,
+    /// The filtered, flattened list the cursor indexes into — Drive rows first,
+    /// then local ones, matching the visual order.
+    visible: RefCell<Vec<Hit>>,
+    cursor: Cell<Option<usize>>,
+
+    filter: Cell<Filter>,
+    /// Monotonic query id. A reply whose id is stale (the user typed again while
+    /// it was in flight) is dropped instead of overwriting fresher results.
+    query_id: Cell<u64>,
+    /// In-flight searches for the current query id, so the spinner stops only
+    /// once both sections have answered.
+    pending: Cell<u8>,
+    /// True once a Drive open is running: the window is about to close, so
+    /// further input is ignored.
+    opening: Cell<bool>,
+    indexing: Cell<bool>,
+}
+
+/// A titled group of rows: header (hidden when empty) plus its list.
+struct Section {
+    header: gtk4::Box,
+    title: gtk4::Label,
+    list: gtk4::ListBox,
+}
+
+impl Section {
+    fn new(title: &str, icon: &str) -> Self {
+        let header = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .visible(false)
+            .build();
+        header.add_css_class("section-header");
+
+        let image = gtk4::Image::from_icon_name(icon);
+        image.add_css_class("section-icon");
+        header.append(&image);
+
+        let label = gtk4::Label::builder().label(title).xalign(0.0).build();
+        label.add_css_class("section-title");
+        header.append(&label);
+
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .visible(false)
+            .build();
+        list.add_css_class("result-list");
+
+        Self {
+            header,
+            title: label,
+            list,
+        }
+    }
+
+    fn attach(&self, parent: &gtk4::Box) {
+        parent.append(&self.header);
+        parent.append(&self.list);
+    }
+
+    /// Swap in a new set of rows. Rebuilds the list — at [`SEARCH_LIMIT`] rows a
+    /// rebuild is a handful of widgets, far cheaper than diffing them.
+    fn set_rows(&self, hits: &[Hit], subtitle: Option<&str>) {
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        for hit in hits {
+            self.list.append(&build_row(hit));
+        }
+        let shown = !hits.is_empty();
+        self.header.set_visible(shown);
+        self.list.set_visible(shown);
+        if let Some(text) = subtitle {
+            self.title.set_label(text);
+        }
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -50,199 +281,9 @@ fn main() -> glib::ExitCode {
         .init();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
-
-    app.connect_startup(|_| {
-        load_prompt_theme();
-    });
-
+    app.connect_startup(|_| load_css());
     app.connect_activate(build_window);
-
     app.run()
-}
-
-/// Override accent colors and style the launcher for a premium HUD look.
-fn load_prompt_theme() {
-    let css = format!(
-        "@define-color accent_bg_color {PROTON_PURPLE};\n\
-         @define-color accent_color {PROTON_PURPLE};\n\
-         \n\
-         window.launcher-window {{\n\
-             background-color: transparent;\n\
-         }}\n\
-         \n\
-         .launcher-container {{\n\
-             background: linear-gradient(135deg, #1e1b2e 0%, #14121e 100%);\n\
-             border: 1px solid rgba(109, 74, 255, 0.3);\n\
-             border-radius: 16px;\n\
-             padding: 16px;\n\
-             box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 30px rgba(109, 74, 255, 0.15);\n\
-         }}\n\
-         \n\
-         .launcher-header-box {{\n\
-             padding: 10px 16px;\n\
-             background-color: rgba(255, 255, 255, 0.04);\n\
-             border-radius: 12px;\n\
-             border: 1px solid rgba(109, 74, 255, 0.2);\n\
-         }}\n\
-         \n\
-         .launcher-entry {{\n\
-             font-size: 1.25rem;\n\
-             font-weight: 500;\n\
-             background: transparent;\n\
-             border: none;\n\
-             box-shadow: none;\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .filter-bar {{\n\
-             margin: 8px 0px 4px 0px;\n\
-         }}\n\
-         \n\
-         .filter-chip {{\n\
-             background-color: rgba(255, 255, 255, 0.03);\n\
-             border: 1px solid rgba(255, 255, 255, 0.08);\n\
-             border-radius: 20px;\n\
-             padding: 6px 14px;\n\
-             color: rgba(255, 255, 255, 0.7);\n\
-             font-size: 0.85rem;\n\
-             font-weight: 500;\n\
-             transition: all 0.15s ease-in-out;\n\
-         }}\n\
-         \n\
-         .filter-chip:hover {{\n\
-             background-color: rgba(109, 74, 255, 0.15);\n\
-             border-color: rgba(109, 74, 255, 0.4);\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .filter-chip.active {{\n\
-             background-color: {PROTON_PURPLE};\n\
-             border-color: {PROTON_PURPLE};\n\
-             color: white;\n\
-             box-shadow: 0 2px 8px rgba(109, 74, 255, 0.4);\n\
-         }}\n\
-         \n\
-         .launcher-listbox {{\n\
-             background: transparent;\n\
-         }}\n\
-         \n\
-         .launcher-row {{\n\
-             padding: 12px 16px;\n\
-             border-radius: 10px;\n\
-             margin: 3px 0px;\n\
-             transition: background-color 0.15s ease, color 0.15s ease;\n\
-         }}\n\
-         \n\
-         .launcher-row:hover {{\n\
-             background-color: rgba(109, 74, 255, 0.08);\n\
-         }}\n\
-         \n\
-         .launcher-row:selected {{\n\
-             background-color: {PROTON_PURPLE};\n\
-             color: white;\n\
-             box-shadow: 0 4px 12px rgba(109, 74, 255, 0.3);\n\
-         }}\n\
-         \n\
-         .launcher-row:selected .dim-label {{\n\
-             color: rgba(255, 255, 255, 0.7);\n\
-             opacity: 0.9;\n\
-         }}\n\
-         \n\
-         .launcher-row:selected .icon-folder {{\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .launcher-row:selected .icon-pdf {{\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .launcher-row:selected .icon-doc {{\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .launcher-row:selected .icon-image {{\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .launcher-row:selected .icon-pin {{\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         .launcher-footer {{\n\
-             padding: 10px 12px 0px 12px;\n\
-             font-size: 0.82rem;\n\
-             border-top: 1px solid rgba(255, 255, 255, 0.08);\n\
-         }}\n\
-         \n\
-         .dim-label {{\n\
-             color: rgba(255, 255, 255, 0.45);\n\
-             font-size: 0.85rem;\n\
-         }}\n\
-         \n\
-         .icon-folder {{\n\
-             color: #35b3ff;\n\
-         }}\n\
-         \n\
-         .icon-pdf {{\n\
-             color: #ff4a4a;\n\
-         }}\n\
-         \n\
-         .icon-doc {{\n\
-             color: #2ecc71;\n\
-         }}\n\
-         \n\
-         .icon-image {{\n\
-             color: #e67e22;\n\
-         }}\n\
-         \n\
-         .icon-generic {{\n\
-             color: #a0a0b0;\n\
-         }}\n\
-         \n\
-         .icon-pin {{\n\
-             color: #f1c40f;\n\
-         }}\n\
-         \n\
-         .error-box {{\n\
-             padding: 24px;\n\
-         }}\n\
-         \n\
-         .error-title {{\n\
-             font-size: 1.25rem;\n\
-             font-weight: bold;\n\
-             margin-bottom: 8px;\n\
-             color: white;\n\
-         }}\n\
-         \n\
-         scrolledwindow viewport {{\n\
-             background: transparent;\n\
-         }}\n\
-         \n\
-         scrollbar {{\n\
-             background: transparent;\n\
-         }}\n\
-         \n\
-         scrollbar slider {{\n\
-             background: rgba(255, 255, 255, 0.1);\n\
-             border-radius: 4px;\n\
-             min-width: 6px;\n\
-             min-height: 6px;\n\
-         }}\n\
-         \n\
-         scrollbar slider:hover {{\n\
-             background: rgba(109, 74, 255, 0.4);\n\
-         }}\n"
-    );
-
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(&css);
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
 }
 
 fn build_window(app: &adw::Application) {
@@ -253,821 +294,885 @@ fn build_window(app: &adw::Application) {
             return;
         }
     };
-    let socket = dirs.control_socket();
-    let default_mountpoint = dirs.default_mountpoint();
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Proton Drive Launcher")
-        .default_width(650)
-        .default_height(450)
+        .title("Search Proton Drive")
+        .default_width(720)
+        .default_height(540)
+        .resizable(false)
         .decorated(false)
         .build();
-
     window.add_css_class("launcher-window");
 
-    // Prefer dark mode for high-tech HUD look
-    let style_manager = adw::StyleManager::default();
-    style_manager.set_color_scheme(adw::ColorScheme::PreferDark);
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    card.add_css_class("launcher-card");
+    window.set_content(Some(&card));
 
-    let container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    container.add_css_class("launcher-container");
-    window.set_content(Some(&container));
-
-    // Header box: search icon, entry field, and loading spinner
-    let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header_box.add_css_class("launcher-header-box");
+    // --- search bar -------------------------------------------------------
+    let search_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    search_bar.add_css_class("search-bar");
 
     let search_icon = gtk4::Image::from_icon_name("system-search-symbolic");
-    header_box.append(&search_icon);
+    search_icon.add_css_class("search-icon");
+    search_bar.append(&search_icon);
 
     let entry = gtk4::Entry::builder()
-        .placeholder_text("Search Proton Drive...")
+        .placeholder_text("Search in Drive and on this computer")
         .hexpand(true)
         .build();
-    entry.add_css_class("launcher-entry");
-    header_box.append(&entry);
+    entry.add_css_class("search-entry");
+    search_bar.append(&entry);
 
     let spinner = gtk4::Spinner::new();
     spinner.set_visible(false);
-    header_box.append(&spinner);
+    search_bar.append(&spinner);
 
-    container.append(&header_box);
+    let esc = gtk4::Label::new(Some("Esc"));
+    esc.add_css_class("key-hint");
+    search_bar.append(&esc);
+    card.append(&search_bar);
 
-    // Horizontal box for Google Drive style filter chips
-    let filter_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    filter_box.add_css_class("filter-bar");
-    container.append(&filter_box);
+    // --- filter chips -----------------------------------------------------
+    let chip_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    chip_row.add_css_class("chip-row");
+    card.append(&chip_row);
 
-    let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-    container.append(&separator);
+    // --- results ----------------------------------------------------------
+    let results = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    results.add_css_class("results");
 
-    // View stack to transition between results list and warning page
-    let stack = adw::ViewStack::new();
-    container.append(&stack);
+    let drive_section = Section::new("Proton Drive", "folder-remote-symbolic");
+    let local_section = Section::new("This computer", "drive-harddisk-symbolic");
+    drive_section.attach(&results);
+    local_section.attach(&results);
 
-    // Page 1: Scrolled window and listbox for results
-    let list_box = gtk4::ListBox::new();
-    list_box.add_css_class("launcher-listbox");
-
-    let scrolled_window = gtk4::ScrolledWindow::builder()
+    let scroller = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
         .vexpand(true)
-        .child(&list_box)
+        .child(&results)
         .build();
-    stack.add_named(&scrolled_window, Some("search"));
 
-    // Page 2: Error screen if daemon is offline
-    let error_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    error_box.add_css_class("error-box");
-    error_box.set_valign(gtk4::Align::Center);
-    error_box.set_halign(gtk4::Align::Center);
-
-    let error_icon = gtk4::Image::from_icon_name("dialog-warning-symbolic");
-    error_icon.set_pixel_size(48);
-    error_icon.add_css_class("brand-icon");
-    error_box.append(&error_icon);
-
-    let error_title = gtk4::Label::builder()
-        .label("Daemon Offline")
-        .justify(gtk4::Justification::Center)
+    let placeholder = adw::StatusPage::builder()
+        .icon_name("system-search-symbolic")
+        .title("No results")
         .build();
-    error_title.add_css_class("error-title");
-    error_box.append(&error_title);
+    placeholder.add_css_class("compact");
 
-    let error_desc = gtk4::Label::builder()
-        .label("Proton Drive mount daemon is not running.\nStart the daemon or run `pdfs mount` to connect.")
-        .justify(gtk4::Justification::Center)
+    // The daemon-offline page is a peer of the results, not a modal: the prompt
+    // is still usable for nothing else, so it owns the whole view.
+    let offline = adw::StatusPage::builder()
+        .icon_name("network-offline-symbolic")
+        .title("Proton Drive is not running")
+        .description("Start the mount daemon to search your Drive.")
         .build();
-    error_desc.add_css_class("dim-label");
-    error_box.append(&error_desc);
-
-    let retry_button = gtk4::Button::builder()
-        .label("Retry Connection")
+    offline.add_css_class("compact");
+    let retry = gtk4::Button::builder()
+        .label("Retry")
         .halign(gtk4::Align::Center)
         .build();
-    retry_button.add_css_class("suggested-action");
-    retry_button.add_css_class("pill");
-    error_box.append(&retry_button);
+    retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
+    offline.set_child(Some(&retry));
 
-    stack.add_named(&error_box, Some("error"));
+    let stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::Crossfade)
+        .transition_duration(120)
+        .vexpand(true)
+        .build();
+    stack.add_named(&scroller, Some("results"));
+    stack.add_named(&placeholder, Some("empty"));
+    stack.add_named(&offline, Some("offline"));
+    card.append(&stack);
 
-    // Footer box: status label and shortcut helper
-    let footer_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    footer_box.add_css_class("launcher-footer");
-
-    let status_label = gtk4::Label::builder()
-        .label("Initialising...")
-        .halign(gtk4::Align::Start)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
+    // --- footer -----------------------------------------------------------
+    let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    footer.add_css_class("footer");
+    let hint = gtk4::Label::builder()
+        .label("Connecting…")
+        .xalign(0.0)
         .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
-    status_label.add_css_class("dim-label");
-    footer_box.append(&status_label);
+    hint.add_css_class("footer-text");
+    footer.append(&hint);
+    let keys = gtk4::Label::new(Some("↑↓ navigate · ↵ open · Tab filter"));
+    keys.add_css_class("footer-text");
+    footer.append(&keys);
+    card.append(&footer);
 
-    let shortcut_guide = gtk4::Label::builder()
-        .label("Tab: cycle filters  •  Enter: open  •  Esc: close")
-        .halign(gtk4::Align::End)
-        .build();
-    shortcut_guide.add_css_class("dim-label");
-    footer_box.append(&shortcut_guide);
+    let ui = Rc::new(Ui {
+        socket: dirs.control_socket(),
+        mountpoint: RefCell::new(dirs.default_mountpoint()),
+        entry: entry.clone(),
+        spinner,
+        stack,
+        scroller,
+        results,
+        drive_section,
+        local_section,
+        placeholder,
+        hint,
+        chips: RefCell::new(Vec::new()),
+        drive_hits: RefCell::new(Vec::new()),
+        local_hits: RefCell::new(Vec::new()),
+        visible: RefCell::new(Vec::new()),
+        cursor: Cell::new(None),
+        filter: Cell::new(Filter::All),
+        query_id: Cell::new(0),
+        pending: Cell::new(0),
+        opening: Cell::new(false),
+        indexing: Cell::new(false),
+    });
 
-    container.append(&footer_box);
-
-    // Shared state variables
-    let hits = Rc::new(RefCell::new(Vec::<SearchHit>::new()));
-    let raw_hits = Rc::new(RefCell::new(Vec::<SearchHit>::new()));
-    let current_filter = Rc::new(Cell::new(FileFilter::All));
-    let mountpoint = Rc::new(RefCell::new(default_mountpoint.display().to_string()));
-    let is_opening = Rc::new(Cell::new(false));
-
-    // Define filter button mapping and setup select closure
-    let filter_buttons = Rc::new(RefCell::new(Vec::<(FileFilter, gtk4::Button)>::new()));
-
-    let select_filter_rc = {
-        let current_filter = current_filter.clone();
-        let filter_buttons = filter_buttons.clone();
-        let list_box = list_box.clone();
-        let hits = hits.clone();
-        let raw_hits = raw_hits.clone();
-        let status_label = status_label.clone();
-
-        Rc::new(move |filter: FileFilter| {
-            current_filter.set(filter);
-
-            // Update active CSS class on buttons
-            for (f, btn) in filter_buttons.borrow().iter() {
-                if *f == filter {
-                    btn.add_css_class("active");
-                } else {
-                    btn.remove_css_class("active");
-                }
-            }
-
-            // Re-apply filter
-            apply_filter(&list_box, &hits, &raw_hits.borrow(), filter);
-
-            // Update status text based on filter matches
-            let filtered_count = hits.borrow().len();
-            let total_count = raw_hits.borrow().len();
-            if total_count == 0 {
-                status_label.set_text("No files loaded.");
-            } else if filter == FileFilter::All {
-                status_label.set_text(&format!("Showing all {total_count} files."));
+    for (filter, label) in FILTERS {
+        let chip = gtk4::ToggleButton::builder()
+            .label(label)
+            .active(filter == Filter::All)
+            .build();
+        chip.add_css_class("chip");
+        let ui_chip = ui.clone();
+        chip.connect_clicked(move |btn| {
+            // A chip is a radio, not a switch: clicking the active one keeps it on.
+            if btn.is_active() {
+                ui_chip.set_filter(filter);
             } else {
-                status_label.set_text(&format!(
-                    "Found {filtered_count} matches (filtered from {total_count} total)."
-                ));
+                btn.set_active(true);
             }
-        })
-    };
-
-    // Populate filter bar
-    let filter_names = [
-        (FileFilter::All, "All", "system-search-symbolic"),
-        (FileFilter::Folders, "Folders", "folder-symbolic"),
-        (FileFilter::PDFs, "PDFs", "document-symbolic"),
-        (FileFilter::Documents, "Documents", "document-symbolic"),
-        (FileFilter::Images, "Images", "image-symbolic"),
-    ];
-
-    for (filter_type, label, icon) in filter_names {
-        let btn = gtk4::Button::builder().label(label).icon_name(icon).build();
-        btn.add_css_class("filter-chip");
-        if filter_type == FileFilter::All {
-            btn.add_css_class("active");
-        }
-
-        let select_filter_clone = select_filter_rc.clone();
-        btn.connect_clicked(move |_| {
-            select_filter_clone(filter_type);
         });
-
-        filter_box.append(&btn);
-        filter_buttons.borrow_mut().push((filter_type, btn));
+        chip_row.append(&chip);
+        ui.chips.borrow_mut().push((filter, chip));
     }
 
-    // Handle retry on connection failure
-    let stack_clone = stack.clone();
-    let socket_clone = socket.clone();
-    let mountpoint_clone = mountpoint.clone();
-    let status_label_clone = status_label.clone();
-    let spinner_clone = spinner.clone();
-    let raw_hits_clone = raw_hits.clone();
-    let current_filter_clone = current_filter.clone();
-    let select_filter_conn = select_filter_rc.clone();
-    let entry_clone = entry.clone();
+    // Clicking a row (or tapping it) opens it, same as Enter on the cursor. A
+    // local row's index is relative to its own list, so the Drive rows above it
+    // are added back to land on the same flattened index the cursor uses.
+    for (list, is_local) in [
+        (&ui.drive_section.list, false),
+        (&ui.local_section.list, true),
+    ] {
+        let ui_row = ui.clone();
+        let window_row = window.clone();
+        list.connect_row_activated(move |_, row| {
+            let offset = if is_local { ui_row.drive_count() } else { 0 };
+            ui_row.open(offset + row.index() as usize, &window_row);
+        });
+    }
 
-    let check_connection = {
-        let select_filter_conn = select_filter_conn.clone();
-        move || {
-            status_label_clone.set_text("Connecting to daemon...");
-            match send(&socket_clone, &Request::Status) {
-                Ok(Response::Status { mountpoint: mp, .. }) => {
-                    *mountpoint_clone.borrow_mut() = mp;
-                    stack_clone.set_visible_child_name("search");
-                    entry_clone.set_sensitive(true);
-                    load_initial_pins(
-                        &raw_hits_clone,
-                        &current_filter_clone,
-                        select_filter_conn.clone(),
-                        &socket_clone,
-                        &status_label_clone,
-                        &spinner_clone,
-                    );
-                    true
-                }
-                _ => {
-                    stack_clone.set_visible_child_name("error");
-                    entry_clone.set_sensitive(false);
-                    status_label_clone.set_text("Daemon offline.");
-                    false
-                }
-            }
-        }
-    };
-
-    let check_conn = check_connection.clone();
-    retry_button.connect_clicked(move |_| {
-        check_conn();
-    });
-
-    window.connect_is_active_notify(move |w| {
-        if !w.is_active() {
-            w.close();
-        }
-    });
-
-    // Auto-focus search entry on window show
-    let entry_focus = entry.clone();
-    window.connect_map(move |_| {
-        entry_focus.grab_focus();
-    });
-
-    // Event key controller on entry field for keyboard shortcuts
-    let key_controller = gtk4::EventControllerKey::new();
-    let list_box_keys = list_box.clone();
-    let window_keys = window.clone();
-    let entry_keys = entry.clone();
-    let hits_keys = hits.clone();
-    let is_opening_keys = is_opening.clone();
-    let current_filter_keys = current_filter.clone();
-    let select_filter_keys = select_filter_rc.clone();
-
-    key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
-        if is_opening_keys.get() {
+    let ui_key = ui.clone();
+    let window_key = window.clone();
+    let keys = gtk4::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, state| {
+        if ui_key.opening.get() {
             return glib::Propagation::Stop;
         }
-
         match key {
             gtk4::gdk::Key::Escape => {
-                window_keys.close();
-                glib::Propagation::Stop
-            }
-            gtk4::gdk::Key::Tab => {
-                let is_shift = _state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-                let next_filter = if is_shift {
-                    match current_filter_keys.get() {
-                        FileFilter::All => FileFilter::Images,
-                        FileFilter::Folders => FileFilter::All,
-                        FileFilter::PDFs => FileFilter::Folders,
-                        FileFilter::Documents => FileFilter::PDFs,
-                        FileFilter::Images => FileFilter::Documents,
-                    }
-                } else {
-                    match current_filter_keys.get() {
-                        FileFilter::All => FileFilter::Folders,
-                        FileFilter::Folders => FileFilter::PDFs,
-                        FileFilter::PDFs => FileFilter::Documents,
-                        FileFilter::Documents => FileFilter::Images,
-                        FileFilter::Images => FileFilter::All,
-                    }
-                };
-                select_filter_keys(next_filter);
+                window_key.close();
                 glib::Propagation::Stop
             }
             gtk4::gdk::Key::Down => {
-                let count = hits_keys.borrow().len();
-                if count > 0 {
-                    let selected = list_box_keys.selected_row();
-                    let next_idx = if let Some(row) = selected {
-                        (row.index() + 1) % count as i32
-                    } else {
-                        0
-                    };
-                    if let Some(row) = list_box_keys.row_at_index(next_idx) {
-                        list_box_keys.select_row(Some(&row));
-                        row.grab_focus();
-                        entry_keys.grab_focus();
-                    }
-                }
+                ui_key.move_cursor(1);
                 glib::Propagation::Stop
             }
             gtk4::gdk::Key::Up => {
-                let count = hits_keys.borrow().len();
-                if count > 0 {
-                    let selected = list_box_keys.selected_row();
-                    let next_idx = if let Some(row) = selected {
-                        (row.index() - 1 + count as i32) % count as i32
-                    } else {
-                        (count - 1) as i32
-                    };
-                    if let Some(row) = list_box_keys.row_at_index(next_idx) {
-                        list_box_keys.select_row(Some(&row));
-                        row.grab_focus();
-                        entry_keys.grab_focus();
-                    }
+                ui_key.move_cursor(-1);
+                glib::Propagation::Stop
+            }
+            gtk4::gdk::Key::Tab | gtk4::gdk::Key::ISO_Left_Tab => {
+                let back = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+                ui_key.cycle_filter(back);
+                glib::Propagation::Stop
+            }
+            gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
+                if let Some(index) = ui_key.cursor.get() {
+                    ui_key.open(index, &window_key);
                 }
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
         }
     });
-    entry.add_controller(key_controller);
+    // On the window, not the entry: arrow keys must steer the list even when the
+    // pointer has moved focus into it.
+    window.add_controller(keys);
 
-    // Entry activation (pressing Return/Enter)
-    let list_box_activate = list_box.clone();
-    let hits_activate = hits.clone();
-    let window_activate = window.clone();
-    let socket_activate = socket.clone();
-    let mountpoint_activate = mountpoint.clone();
-    let status_label_activate = status_label.clone();
-    let spinner_activate = spinner.clone();
-    let is_opening_activate = is_opening.clone();
-
-    entry.connect_activate(move |_| {
-        if is_opening_activate.get() {
-            return;
+    let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let ui_changed = ui.clone();
+    entry.connect_changed(move |entry| {
+        if let Some(source) = debounce.borrow_mut().take() {
+            source.remove();
         }
-        if let Some(row) = list_box_activate.selected_row() {
-            let idx = row.index() as usize;
-            let hits_borrow = hits_activate.borrow();
-            if idx < hits_borrow.len() {
-                let hit = &hits_borrow[idx];
-                open_hit(
-                    &window_activate,
-                    hit,
-                    &socket_activate,
-                    &mountpoint_activate,
-                    &status_label_activate,
-                    &spinner_activate,
-                    is_opening_activate.clone(),
-                );
-            }
-        }
-    });
-
-    // List box row activation (mouse clicks / touch taps)
-    let hits_act = hits.clone();
-    let window_act = window.clone();
-    let socket_act = socket.clone();
-    let mountpoint_act = mountpoint.clone();
-    let status_label_act = status_label.clone();
-    let spinner_act = spinner.clone();
-    let is_opening_act = is_opening.clone();
-
-    list_box.connect_row_activated(move |_, row| {
-        if is_opening_act.get() {
-            return;
-        }
-        let idx = row.index() as usize;
-        let hits_borrow = hits_act.borrow();
-        if idx < hits_borrow.len() {
-            let hit = &hits_borrow[idx];
-            open_hit(
-                &window_act,
-                hit,
-                &socket_act,
-                &mountpoint_act,
-                &status_label_act,
-                &spinner_act,
-                is_opening_act.clone(),
-            );
-        }
-    });
-
-    // Debounced search text entry listener
-    let search_source = Rc::new(RefCell::new(None::<glib::SourceId>));
-    let search_source_changed = search_source.clone();
-    let raw_hits_search = raw_hits.clone();
-    let current_filter_search = current_filter.clone();
-    let select_filter_search = select_filter_rc.clone();
-    let socket_search = socket.clone();
-    let status_label_search = status_label.clone();
-    let spinner_search = spinner.clone();
-
-    entry.connect_changed(move |ent| {
-        if let Some(src) = search_source_changed.borrow_mut().take() {
-            src.remove();
-        }
-
-        let ent_clone = ent.clone();
-        let raw_hits_clone = raw_hits_search.clone();
-        let current_filter_clone = current_filter_search.clone();
-        let select_filter_clone = select_filter_search.clone();
-        let socket_clone = socket_search.clone();
-        let status_label_clone = status_label_search.clone();
-        let spinner_clone = spinner_search.clone();
-        let search_source_cb = search_source_changed.clone();
-
-        let src = glib::timeout_add_local_once(SEARCH_DEBOUNCE, move || {
-            search_source_cb.borrow_mut().take();
-            let query = ent_clone.text().trim().to_string();
-            if query.is_empty() {
-                load_initial_pins(
-                    &raw_hits_clone,
-                    &current_filter_clone,
-                    select_filter_clone,
-                    &socket_clone,
-                    &status_label_clone,
-                    &spinner_clone,
-                );
-            } else {
-                run_prompt_search(
-                    &raw_hits_clone,
-                    &current_filter_clone,
-                    select_filter_clone,
-                    &socket_clone,
-                    &query,
-                    &status_label_clone,
-                    &spinner_clone,
-                );
-            }
+        let query = entry.text().trim().to_string();
+        let ui_timeout = ui_changed.clone();
+        let debounce_timeout = debounce.clone();
+        let source = glib::timeout_add_local_once(SEARCH_DEBOUNCE, move || {
+            debounce_timeout.borrow_mut().take();
+            ui_timeout.search(&query);
         });
-        *search_source_changed.borrow_mut() = Some(src);
+        *debounce.borrow_mut() = Some(source);
     });
 
-    // Perform the initial connection and load check
-    check_connection();
+    let ui_retry = ui.clone();
+    retry.connect_clicked(move |_| ui_retry.connect());
 
+    // A launcher is modal by convention: losing focus dismisses it.
+    window.connect_is_active_notify(|w| {
+        if !w.is_active() {
+            w.close();
+        }
+    });
+    let entry_map = entry.clone();
+    window.connect_map(move |_| {
+        entry_map.grab_focus();
+    });
+
+    ui.connect();
     window.present();
 }
 
-/// Retrieve pinned files from the daemon and render them in the results list.
-fn load_initial_pins(
-    raw_hits: &Rc<RefCell<Vec<SearchHit>>>,
-    current_filter: &Rc<Cell<FileFilter>>,
-    select_filter: Rc<dyn Fn(FileFilter)>,
-    socket: &Path,
-    status_label: &gtk4::Label,
-    spinner: &gtk4::Spinner,
-) {
-    status_label.set_text("Loading pinned files...");
-    spinner.set_visible(true);
-    spinner.start();
-
-    let rx = spawn_request(socket.to_path_buf(), Request::ListPins);
-    let raw_hits = raw_hits.clone();
-    let current_filter = current_filter.clone();
-    let select_filter = select_filter.clone();
-    let status_label = status_label.clone();
-    let spinner = spinner.clone();
-
-    glib::spawn_future_local(async move {
-        let res = rx.recv().await;
-        spinner.stop();
-        spinner.set_visible(false);
-
-        match res {
-            Ok(Ok(Response::Pins { pins })) => {
-                let mapped_hits: Vec<SearchHit> = pins
-                    .into_iter()
-                    .map(|p| {
-                        let path_obj = Path::new(&p.path);
-                        let name = path_obj
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&p.path)
-                            .to_string();
-                        SearchHit {
-                            name,
-                            path: p.path,
-                            is_dir: p.recursive,
-                            size: 0,
-                            modified: 0,
-                            pinned: true,
-                            uid: p.uid,
-                        }
-                    })
-                    .collect();
-
-                *raw_hits.borrow_mut() = mapped_hits;
-                select_filter(current_filter.get());
-            }
-            _ => {
-                status_label.set_text("Failed to load pinned files. Type to search.");
-            }
-        }
-    });
-}
-
-/// Run search on the daemon and update the results list.
-fn run_prompt_search(
-    raw_hits: &Rc<RefCell<Vec<SearchHit>>>,
-    current_filter: &Rc<Cell<FileFilter>>,
-    select_filter: Rc<dyn Fn(FileFilter)>,
-    socket: &Path,
-    query: &str,
-    status_label: &gtk4::Label,
-    spinner: &gtk4::Spinner,
-) {
-    status_label.set_text("Searching...");
-    spinner.set_visible(true);
-    spinner.start();
-
-    let rx = spawn_request(
-        socket.to_path_buf(),
-        Request::Search {
-            query: query.to_string(),
-            limit: 30,
-        },
-    );
-    let raw_hits = raw_hits.clone();
-    let current_filter = current_filter.clone();
-    let select_filter = select_filter.clone();
-    let status_label = status_label.clone();
-    let spinner = spinner.clone();
-
-    glib::spawn_future_local(async move {
-        let res = rx.recv().await;
-        spinner.stop();
-        spinner.set_visible(false);
-
-        match res {
-            Ok(Ok(Response::SearchResults { hits: search_hits })) => {
-                *raw_hits.borrow_mut() = search_hits;
-                select_filter(current_filter.get());
-            }
-            Ok(Ok(Response::Error { message })) => {
-                status_label.set_text(&format!("Search error: {message}"));
-            }
-            _ => {
-                status_label.set_text("Search request failed.");
-            }
-        }
-    });
-}
-
-/// Apply local filter criteria to raw hits and repaint list view.
-fn apply_filter(
-    list_box: &gtk4::ListBox,
-    hits: &Rc<RefCell<Vec<SearchHit>>>,
-    raw_hits: &[SearchHit],
-    filter: FileFilter,
-) {
-    let filtered: Vec<SearchHit> = raw_hits
-        .iter()
-        .filter(|hit| match filter {
-            FileFilter::All => true,
-            FileFilter::Folders => hit.is_dir,
-            FileFilter::PDFs => !hit.is_dir && hit.name.to_lowercase().ends_with(".pdf"),
-            FileFilter::Documents => {
-                !hit.is_dir
-                    && (hit.name.to_lowercase().ends_with(".docx")
-                        || hit.name.to_lowercase().ends_with(".doc")
-                        || hit.name.to_lowercase().ends_with(".txt")
-                        || hit.name.to_lowercase().ends_with(".md")
-                        || hit.name.to_lowercase().ends_with(".odt")
-                        || hit.name.to_lowercase().ends_with(".pdf")
-                        || hit.name.to_lowercase().ends_with(".xlsx")
-                        || hit.name.to_lowercase().ends_with(".xls")
-                        || hit.name.to_lowercase().ends_with(".csv")
-                        || hit.name.to_lowercase().ends_with(".pptx")
-                        || hit.name.to_lowercase().ends_with(".ppt"))
-            }
-            FileFilter::Images => {
-                !hit.is_dir
-                    && (hit.name.to_lowercase().ends_with(".png")
-                        || hit.name.to_lowercase().ends_with(".jpg")
-                        || hit.name.to_lowercase().ends_with(".jpeg")
-                        || hit.name.to_lowercase().ends_with(".webp")
-                        || hit.name.to_lowercase().ends_with(".gif")
-                        || hit.name.to_lowercase().ends_with(".bmp")
-                        || hit.name.to_lowercase().ends_with(".svg"))
-            }
-        })
-        .cloned()
-        .collect();
-
-    repaint_prompt_results(list_box, hits, &filtered);
-}
-
-/// Render the provided search hits into the ListBox.
-fn repaint_prompt_results(
-    list_box: &gtk4::ListBox,
-    hits: &Rc<RefCell<Vec<SearchHit>>>,
-    new_hits: &[SearchHit],
-) {
-    // Clear all rows
-    while let Some(child) = list_box.first_child() {
-        list_box.remove(&child);
-    }
-
-    *hits.borrow_mut() = new_hits.to_vec();
-
-    for hit in new_hits {
-        let row = gtk4::ListBoxRow::new();
-        row.add_css_class("launcher-row");
-
-        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-
-        // Select icon and add appropriate class for modern custom styling colors
-        let (icon_name, icon_class) = if hit.is_dir {
-            ("folder-symbolic", "icon-folder")
-        } else {
-            let ext = hit.name.split('.').last().unwrap_or("").to_lowercase();
-            if ext == "pdf" {
-                ("document-symbolic", "icon-pdf")
-            } else if [
-                "docx", "doc", "txt", "md", "odt", "xlsx", "xls", "csv", "pptx", "ppt",
-            ]
-            .contains(&ext.as_str())
-            {
-                ("document-symbolic", "icon-doc")
-            } else if ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"].contains(&ext.as_str()) {
-                ("image-symbolic", "icon-image")
-            } else {
-                ("document-symbolic", "icon-generic")
-            }
-        };
-        let icon = gtk4::Image::from_icon_name(icon_name);
-        icon.add_css_class(icon_class);
-        row_box.append(&icon);
-
-        let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-        text_box.set_hexpand(true);
-
-        let name_label = gtk4::Label::builder()
-            .label(&hit.name)
-            .halign(gtk4::Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .build();
-
-        let path_label = gtk4::Label::builder()
-            .label(&hit.path)
-            .halign(gtk4::Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .build();
-        path_label.add_css_class("dim-label");
-
-        text_box.append(&name_label);
-        text_box.append(&path_label);
-
-        row_box.append(&text_box);
-
-        // Right details box
-        let right_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        right_box.set_valign(gtk4::Align::Center);
-
-        if hit.pinned {
-            let pin_icon = gtk4::Image::from_icon_name("emblem-favorite-symbolic");
-            pin_icon.add_css_class("icon-pin");
-            right_box.append(&pin_icon);
-        }
-
-        if !hit.is_dir && hit.size > 0 {
-            let size_str = format_size(hit.size);
-            let size_label = gtk4::Label::builder().label(&size_str).build();
-            size_label.add_css_class("dim-label");
-            right_box.append(&size_label);
-        }
-
-        if hit.modified > 0 {
-            let time_str = format_relative_time(hit.modified);
-            let time_label = gtk4::Label::builder().label(&time_str).build();
-            time_label.add_css_class("dim-label");
-            right_box.append(&time_label);
-        }
-
-        row_box.append(&right_box);
-
-        row.set_child(Some(&row_box));
-        list_box.append(&row);
-    }
-
-    // Automatically select the first item
-    if !new_hits.is_empty() {
-        if let Some(row) = list_box.row_at_index(0) {
-            list_box.select_row(Some(&row));
-        }
-    }
-}
-
-/// Open the selected search hit. Directories open FUSE directly, files trigger cache download.
-fn open_hit(
-    window: &adw::ApplicationWindow,
-    hit: &SearchHit,
-    socket: &Path,
-    mountpoint: &Rc<RefCell<String>>,
-    status_label: &gtk4::Label,
-    spinner: &gtk4::Spinner,
-    is_opening: Rc<Cell<bool>>,
-) {
-    if hit.is_dir {
-        let mp = mountpoint.borrow();
-        let full_path = Path::new(&*mp).join(&hit.path);
-        tracing::info!("Opening directory: {}", full_path.display());
-        if let Err(e) = Command::new("xdg-open").arg(&full_path).spawn() {
-            tracing::error!("Failed to xdg-open directory: {e}");
-        }
-        window.close();
-    } else {
-        is_opening.set(true);
-        status_label.set_text(&format!("Downloading {}...", hit.name));
-        spinner.set_visible(true);
-        spinner.start();
-
-        let rx = spawn_request(
-            socket.to_path_buf(),
-            Request::OpenFile {
-                path: hit.path.clone(),
-            },
-        );
-        let window_clone = window.clone();
-        let status_label_clone = status_label.clone();
-        let spinner_clone = spinner.clone();
-        let is_opening_clone = is_opening.clone();
-
+impl Ui {
+    /// Ask the daemon for status and, if it answers, load the suggested (pinned)
+    /// files. Runs off-thread: a dead daemon must not freeze the first frame.
+    fn connect(self: &Rc<Self>) {
+        self.hint.set_label("Connecting…");
+        let rx = spawn_request(self.socket.clone(), Request::Status);
+        let ui = self.clone();
         glib::spawn_future_local(async move {
-            let res = rx.recv().await;
-            spinner_clone.stop();
-            spinner_clone.set_visible(false);
-            is_opening_clone.set(false);
-
-            match res {
-                Ok(Ok(Response::FilePath { path })) => {
-                    tracing::info!("Opening file: {}", path);
-                    if let Err(e) = Command::new("xdg-open").arg(&path).spawn() {
-                        tracing::error!("Failed to xdg-open file: {e}");
-                    }
-                    window_clone.close();
-                }
-                Ok(Ok(Response::Error { message })) => {
-                    status_label_clone.set_text(&format!("Error: {message}"));
+            match rx.recv().await {
+                Ok(Ok(Response::Status { mountpoint, .. })) => {
+                    *ui.mountpoint.borrow_mut() = PathBuf::from(mountpoint);
+                    ui.entry.set_sensitive(true);
+                    ui.stack.set_visible_child_name("results");
+                    ui.load_suggestions();
                 }
                 _ => {
-                    status_label_clone.set_text("Error: Failed to communicate with daemon.");
+                    ui.entry.set_sensitive(false);
+                    ui.hint.set_label("Daemon offline");
+                    ui.stack.set_visible_child_name("offline");
                 }
             }
         });
     }
+
+    /// The empty-query view: pinned files, which are the ones the user chose to
+    /// keep on this machine — the closest thing the daemon has to "recent".
+    fn load_suggestions(self: &Rc<Self>) {
+        let id = self.begin_query(1);
+        let rx = spawn_request(self.socket.clone(), Request::ListPins);
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let reply = rx.recv().await;
+            if !ui.finish_query(id) {
+                return;
+            }
+            let hits = match reply {
+                Ok(Ok(Response::Pins { pins })) => pins
+                    .into_iter()
+                    .map(|pin| SearchHit {
+                        name: file_name(&pin.path),
+                        path: pin.path,
+                        is_dir: pin.recursive,
+                        size: 0,
+                        modified: 0,
+                        pinned: true,
+                        uid: pin.uid,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            *ui.drive_hits.borrow_mut() = hits;
+            ui.local_hits.borrow_mut().clear();
+            ui.render();
+        });
+    }
+
+    /// Fire both searches for `query` in parallel. An empty query falls back to
+    /// the suggestions view.
+    fn search(self: &Rc<Self>, query: &str) {
+        if query.is_empty() {
+            self.load_suggestions();
+            return;
+        }
+
+        let id = self.begin_query(2);
+
+        let drive = spawn_request(
+            self.socket.clone(),
+            Request::Search {
+                query: query.to_string(),
+                limit: SEARCH_LIMIT,
+            },
+        );
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let reply = drive.recv().await;
+            if !ui.finish_query(id) {
+                return;
+            }
+            match reply {
+                Ok(Ok(Response::SearchResults { hits })) => *ui.drive_hits.borrow_mut() = hits,
+                _ => ui.drive_hits.borrow_mut().clear(),
+            }
+            ui.render();
+        });
+
+        let local = spawn_request(
+            self.socket.clone(),
+            Request::SearchLocal {
+                query: query.to_string(),
+                limit: SEARCH_LIMIT,
+            },
+        );
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let reply = local.recv().await;
+            if !ui.finish_query(id) {
+                return;
+            }
+            match reply {
+                Ok(Ok(Response::LocalResults { hits, indexing })) => {
+                    ui.indexing.set(indexing);
+                    *ui.local_hits.borrow_mut() = hits;
+                }
+                _ => ui.local_hits.borrow_mut().clear(),
+            }
+            ui.render();
+        });
+    }
+
+    /// Open a new query id, expecting `requests` replies. Any reply still in
+    /// flight for an older id is now stale and will be dropped by
+    /// [`finish_query`](Self::finish_query).
+    fn begin_query(&self, requests: u8) -> u64 {
+        let id = self.query_id.get() + 1;
+        self.query_id.set(id);
+        self.pending.set(requests);
+        self.spinner.set_visible(true);
+        self.spinner.start();
+        id
+    }
+
+    /// Account for one reply. Returns false if it belongs to a superseded query,
+    /// in which case the caller must discard it.
+    fn finish_query(&self, id: u64) -> bool {
+        if self.query_id.get() != id {
+            return false;
+        }
+        let left = self.pending.get().saturating_sub(1);
+        self.pending.set(left);
+        if left == 0 {
+            self.spinner.stop();
+            self.spinner.set_visible(false);
+        }
+        true
+    }
+
+    fn set_filter(self: &Rc<Self>, filter: Filter) {
+        if self.filter.get() == filter {
+            return;
+        }
+        self.filter.set(filter);
+        for (chip_filter, chip) in self.chips.borrow().iter() {
+            chip.set_active(*chip_filter == filter);
+        }
+        self.render();
+    }
+
+    fn cycle_filter(self: &Rc<Self>, backwards: bool) {
+        let current = FILTERS
+            .iter()
+            .position(|(f, _)| *f == self.filter.get())
+            .unwrap_or(0);
+        let count = FILTERS.len();
+        let next = if backwards {
+            (current + count - 1) % count
+        } else {
+            (current + 1) % count
+        };
+        self.set_filter(FILTERS[next].0);
+    }
+
+    fn drive_count(&self) -> usize {
+        self.visible
+            .borrow()
+            .iter()
+            .filter(|hit| matches!(hit, Hit::Drive(_)))
+            .count()
+    }
+
+    /// Rebuild both sections from the last replies under the active chip, then
+    /// restore the cursor to the top. Every state change funnels through here, so
+    /// the list, the placeholder, and the footer can never disagree.
+    fn render(self: &Rc<Self>) {
+        let filter = self.filter.get();
+
+        let drive: Vec<Hit> = self
+            .drive_hits
+            .borrow()
+            .iter()
+            .filter(|hit| filter.accepts(&hit.name, hit.is_dir))
+            .cloned()
+            .map(Hit::Drive)
+            .collect();
+        let local: Vec<Hit> = self
+            .local_hits
+            .borrow()
+            .iter()
+            .filter(|hit| filter.accepts(&hit.name, hit.is_dir))
+            .cloned()
+            .map(Hit::Local)
+            .collect();
+
+        let searching = !self.entry.text().trim().is_empty();
+        let drive_title = if searching {
+            "Proton Drive"
+        } else {
+            "Pinned in Proton Drive"
+        };
+        self.drive_section.set_rows(&drive, Some(drive_title));
+        self.local_section.set_rows(&local, None);
+
+        let total = drive.len() + local.len();
+        let mut visible = drive;
+        visible.extend(local);
+        *self.visible.borrow_mut() = visible;
+
+        if total == 0 {
+            self.placeholder.set_title(if searching {
+                "No results"
+            } else {
+                "Search your Drive"
+            });
+            self.placeholder
+                .set_description(Some(match (searching, self.indexing.get()) {
+                    (true, true) => {
+                        "Still indexing this computer — local results will fill in shortly."
+                    }
+                    (true, false) => "Try a different search, or another filter.",
+                    _ => "Start typing to search Proton Drive and the files on this computer.",
+                }));
+            self.stack.set_visible_child_name("empty");
+            self.cursor.set(None);
+        } else {
+            self.stack.set_visible_child_name("results");
+            self.select(0);
+        }
+
+        self.hint.set_label(&self.status_text(total, searching));
+    }
+
+    fn status_text(&self, total: usize, searching: bool) -> String {
+        if !searching {
+            return match total {
+                0 => "No pinned files".to_string(),
+                1 => "1 pinned file".to_string(),
+                n => format!("{n} pinned files"),
+            };
+        }
+        let drive = self.drive_count();
+        let local = total - drive;
+        let mut text = format!("{drive} in Drive · {local} on this computer");
+        if self.indexing.get() {
+            text.push_str(" · indexing…");
+        }
+        text
+    }
+
+    /// Move the cursor by `delta` rows, wrapping at both ends.
+    fn move_cursor(self: &Rc<Self>, delta: i32) {
+        let count = self.visible.borrow().len() as i32;
+        if count == 0 {
+            return;
+        }
+        let current = self.cursor.get().map_or(0, |c| c as i32);
+        let next = (current + delta).rem_euclid(count);
+        self.select(next as usize);
+    }
+
+    /// Put the cursor on row `index` of the flattened list: select it in whichever
+    /// section owns it, clear the other section's selection, and scroll it into
+    /// view. Focus stays in the entry so typing never breaks.
+    fn select(self: &Rc<Self>, index: usize) {
+        let drive_count = self.drive_count();
+        let (list, other, local_index) = if index < drive_count {
+            (
+                &self.drive_section.list,
+                &self.local_section.list,
+                index as i32,
+            )
+        } else {
+            (
+                &self.local_section.list,
+                &self.drive_section.list,
+                (index - drive_count) as i32,
+            )
+        };
+        other.unselect_all();
+        let Some(row) = list.row_at_index(local_index) else {
+            return;
+        };
+        list.select_row(Some(&row));
+        self.cursor.set(Some(index));
+        self.scroll_into_view(&row);
+    }
+
+    /// Keep the selected row inside the viewport, scrolling by the smallest
+    /// amount that reveals it (like a native list, unlike jumping it to centre).
+    fn scroll_into_view(&self, row: &gtk4::ListBoxRow) {
+        let Some(bounds) = row.compute_bounds(&self.results) else {
+            return;
+        };
+        let adjustment = self.scroller.vadjustment();
+        let (top, bottom) = (
+            f64::from(bounds.y()),
+            f64::from(bounds.y() + bounds.height()),
+        );
+        let (value, page) = (adjustment.value(), adjustment.page_size());
+        if top < value {
+            adjustment.set_value(top);
+        } else if bottom > value + page {
+            adjustment.set_value(bottom - page);
+        }
+    }
+
+    /// Open the hit at `index`. Local files are already on disk, so they hand
+    /// straight to the desktop; a Drive hit must first be hydrated into the cache
+    /// by the daemon (`OpenFile`), which can take a moment — the window stays up,
+    /// with the spinner running, until the path comes back.
+    fn open(self: &Rc<Self>, index: usize, window: &adw::ApplicationWindow) {
+        if self.opening.get() {
+            return;
+        }
+        let Some(hit) = self.visible.borrow().get(index).cloned() else {
+            return;
+        };
+
+        match hit {
+            Hit::Local(local) => {
+                xdg_open(Path::new(&local.path));
+                window.close();
+            }
+            // A Drive folder exists in the mount — open it in the file manager
+            // rather than downloading anything.
+            Hit::Drive(drive) if drive.is_dir => {
+                xdg_open(&self.mountpoint.borrow().join(&drive.path));
+                window.close();
+            }
+            Hit::Drive(drive) => {
+                self.opening.set(true);
+                self.spinner.set_visible(true);
+                self.spinner.start();
+                self.hint.set_label(&format!("Opening {}…", drive.name));
+
+                let rx = spawn_request(
+                    self.socket.clone(),
+                    Request::OpenFile {
+                        path: drive.path.clone(),
+                    },
+                );
+                let ui = self.clone();
+                let window = window.clone();
+                glib::spawn_future_local(async move {
+                    let reply = rx.recv().await;
+                    ui.spinner.stop();
+                    ui.spinner.set_visible(false);
+                    ui.opening.set(false);
+                    match reply {
+                        Ok(Ok(Response::FilePath { path })) => {
+                            xdg_open(Path::new(&path));
+                            window.close();
+                        }
+                        Ok(Ok(Response::Error { message })) => {
+                            ui.hint.set_label(&format!("Could not open: {message}"));
+                        }
+                        _ => ui.hint.set_label("Could not reach the daemon"),
+                    }
+                });
+            }
+        }
+    }
 }
 
-/// Helper function to format sizes in human-readable terms.
+/// One result row: type icon, name, location, then size/age on the right.
+fn build_row(hit: &Hit) -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::new();
+    row.add_css_class("result-row");
+
+    let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+
+    let icon = gtk4::Image::from_gicon(&icon_for(hit.name(), hit.is_dir()));
+    icon.set_pixel_size(24);
+    content.append(&icon);
+
+    let text = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+    text.set_hexpand(true);
+    text.set_valign(gtk4::Align::Center);
+
+    let name = gtk4::Label::builder()
+        .label(hit.name())
+        .xalign(0.0)
+        .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+        .build();
+    name.add_css_class("result-name");
+    text.append(&name);
+
+    let location = gtk4::Label::builder()
+        .label(hit.location())
+        .xalign(0.0)
+        .ellipsize(gtk4::pango::EllipsizeMode::Start)
+        .build();
+    location.add_css_class("result-location");
+    text.append(&location);
+    content.append(&text);
+
+    let meta = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    meta.set_valign(gtk4::Align::Center);
+    if hit.pinned() {
+        let pin = gtk4::Image::from_icon_name("view-pin-symbolic");
+        pin.add_css_class("pin-icon");
+        meta.append(&pin);
+    }
+    if !hit.is_dir() && hit.size() > 0 {
+        let size = gtk4::Label::new(Some(&format_size(hit.size())));
+        size.add_css_class("result-meta");
+        meta.append(&size);
+    }
+    if hit.modified() > 0 {
+        let modified = gtk4::Label::new(Some(&format_age(hit.modified())));
+        modified.add_css_class("result-meta");
+        meta.append(&modified);
+    }
+    content.append(&meta);
+
+    row.set_child(Some(&content));
+    row
+}
+
+/// The desktop's own icon for a file name, so results look like the user's file
+/// manager instead of a bespoke palette. Falls back to a generic document icon
+/// for names the content-type database cannot place.
+fn icon_for(name: &str, is_dir: bool) -> gio::Icon {
+    if is_dir {
+        return gio::ThemedIcon::new("folder").upcast();
+    }
+    let (content_type, _uncertain) = gio::functions::content_type_guess(Some(name), &[]);
+    gio::functions::content_type_get_icon(&content_type)
+}
+
+/// Run one blocking control-socket round-trip on a worker thread. The GTK main
+/// loop never blocks on the daemon: the reply arrives through the channel.
+fn spawn_request(
+    socket: PathBuf,
+    request: Request,
+) -> async_channel::Receiver<Result<Response, String>> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(send(&socket, &request).map_err(|e| e.to_string()));
+    });
+    rx
+}
+
+fn xdg_open(path: &Path) {
+    tracing::info!(path = %path.display(), "opening");
+    if let Err(e) = Command::new("xdg-open").arg(path).spawn() {
+        tracing::error!("xdg-open failed: {e}");
+    }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    AppDirs::new().ok().and_then(|dirs| dirs.home_dir())
+}
+
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn parent_of(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
 fn format_size(bytes: u64) -> String {
-    if bytes == 0 {
-        return String::new();
+    const UNITS: [(u64, &str); 3] = [
+        (1024 * 1024 * 1024, "GB"),
+        (1024 * 1024, "MB"),
+        (1024, "KB"),
+    ];
+    for (scale, unit) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+        }
     }
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    const GB: u64 = 1024 * 1024 * 1024;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
+    format!("{bytes} B")
+}
+
+/// Coarse relative age, in the granularity a launcher row has room for.
+fn format_age(epoch_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let diff = now - epoch_secs;
+    match diff {
+        d if d < 60 => "now".to_string(),
+        d if d < 3600 => format!("{}m", d / 60),
+        d if d < 86_400 => format!("{}h", d / 3600),
+        d if d < 2_592_000 => format!("{}d", d / 86_400),
+        d if d < 31_536_000 => format!("{}mo", d / 2_592_000),
+        d => format!("{}y", d / 31_536_000),
     }
 }
 
-/// Helper function to format relative timestamps.
-fn format_relative_time(epoch_secs: i64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+/// Styling. Everything is expressed against libadwaita's named colors, so the
+/// launcher follows the system light/dark theme instead of pinning its own.
+fn load_css() {
+    let css = "
+        window.launcher-window {
+            background: transparent;
+        }
 
-    let diff = now - epoch_secs;
-    if diff <= 0 {
-        return "Just now".to_string();
-    }
-    if diff < 60 {
-        return "Just now".to_string();
-    }
-    let mins = diff / 60;
-    if mins < 60 {
-        return format!("{mins}m ago");
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours}h ago");
-    }
-    let days = hours / 24;
-    if days < 7 {
-        return format!("{days}d ago");
-    }
+        .launcher-card {
+            background-color: @view_bg_color;
+            border: 1px solid alpha(@borders, 0.8);
+            border-radius: 14px;
+            box-shadow: 0 16px 48px alpha(black, 0.35);
+        }
 
-    if days < 30 {
-        return format!("{days}d ago");
+        .search-bar {
+            padding: 14px 18px;
+            border-bottom: 1px solid alpha(@borders, 0.6);
+        }
+
+        .search-icon {
+            -gtk-icon-size: 20px;
+            color: alpha(currentColor, 0.55);
+        }
+
+        .search-entry {
+            background: none;
+            border: none;
+            box-shadow: none;
+            outline: none;
+            padding: 2px 0;
+            font-size: 1.15rem;
+        }
+
+        .key-hint {
+            padding: 2px 8px;
+            border-radius: 6px;
+            background-color: alpha(currentColor, 0.08);
+            font-size: 0.75rem;
+            opacity: 0.55;
+        }
+
+        .chip-row {
+            padding: 10px 14px;
+            border-bottom: 1px solid alpha(@borders, 0.6);
+        }
+
+        .chip {
+            padding: 4px 14px;
+            min-height: 0;
+            border-radius: 999px;
+            background: none;
+            border: 1px solid alpha(@borders, 0.9);
+            box-shadow: none;
+            font-size: 0.86rem;
+            font-weight: 500;
+        }
+
+        .chip:hover {
+            background-color: alpha(currentColor, 0.06);
+        }
+
+        .chip:checked {
+            background-color: @accent_bg_color;
+            color: @accent_fg_color;
+            border-color: @accent_bg_color;
+        }
+
+        .results {
+            padding: 6px 8px 10px 8px;
+        }
+
+        .section-header {
+            padding: 12px 10px 6px 10px;
+        }
+
+        .section-title {
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            opacity: 0.55;
+        }
+
+        .section-icon {
+            -gtk-icon-size: 14px;
+            opacity: 0.55;
+        }
+
+        .result-list {
+            background: none;
+        }
+
+        .result-row {
+            padding: 9px 10px;
+            border-radius: 10px;
+        }
+
+        .result-row:hover {
+            background-color: alpha(currentColor, 0.05);
+        }
+
+        .result-row:selected {
+            background-color: @accent_bg_color;
+            color: @accent_fg_color;
+        }
+
+        .result-name {
+            font-weight: 500;
+        }
+
+        .result-location, .result-meta {
+            font-size: 0.8rem;
+            opacity: 0.55;
+        }
+
+        .result-row:selected .result-location,
+        .result-row:selected .result-meta {
+            opacity: 0.75;
+        }
+
+        .footer {
+            padding: 8px 16px;
+            border-top: 1px solid alpha(@borders, 0.6);
+        }
+
+        .footer-text {
+            font-size: 0.78rem;
+            opacity: 0.5;
+        }
+
+        statuspage.compact > scrolledwindow > viewport > box {
+            margin: 24px 12px;
+        }
+    ";
+
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(css);
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months}mo ago");
-    }
-    let years = months / 12;
-    format!("{years}y ago")
 }

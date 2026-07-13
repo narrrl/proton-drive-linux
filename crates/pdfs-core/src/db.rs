@@ -18,9 +18,10 @@ use proton_drive_rs::{Node, NodeKind};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
+use crate::localindex::LocalEntry;
 
 /// Current schema version. Bump on every forward migration added below.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Below this length the trigram tokenizer indexes nothing (it needs 3-char
 /// grams), so short queries fall back to a `LIKE` scan over `nodes.name`.
@@ -118,6 +119,9 @@ impl Db {
         }
         if current < 5 {
             tx.execute_batch(MIGRATION_V5)?;
+        }
+        if current < 6 {
+            tx.execute_batch(MIGRATION_V6)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -526,6 +530,161 @@ impl Db {
         }
         Ok(out)
     }
+
+    // ---- local (non-Drive) file index (schema v6) ----
+
+    /// Open a new local-index scan generation. Rows written under it survive
+    /// [`local_finish_scan`](Self::local_finish_scan); rows still carrying an
+    /// older generation are pruned there as "no longer on disk".
+    pub fn local_begin_scan(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let current: i64 = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'local_scan_gen'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let next = current + 1;
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES ('local_scan_gen', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [next.to_string()],
+        )?;
+        Ok(next)
+    }
+
+    /// Write one batch of walked entries under scan generation `generation`. The
+    /// FTS index is *not* touched here — it is rebuilt once in
+    /// [`local_finish_scan`](Self::local_finish_scan).
+    pub fn local_upsert_batch(&self, generation: i64, entries: &[LocalEntry]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO local_files (path, name, is_dir, size, mtime, scan_gen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                   name     = excluded.name,
+                   is_dir   = excluded.is_dir,
+                   size     = excluded.size,
+                   mtime    = excluded.mtime,
+                   scan_gen = excluded.scan_gen",
+            )?;
+            for e in entries {
+                stmt.execute(params![
+                    e.path,
+                    e.name,
+                    e.is_dir as i64,
+                    e.size,
+                    e.mtime,
+                    generation
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Close scan generation `generation`: drop every row an older scan wrote
+    /// (those paths are gone from disk), rebuild the FTS index over what remains,
+    /// and stamp the completion time. Returns the number of indexed entries.
+    pub fn local_finish_scan(&self, generation: i64, finished_at: i64) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM local_files WHERE scan_gen != ?1",
+            params![generation],
+        )?;
+        tx.execute_batch("INSERT INTO local_fts(local_fts) VALUES('rebuild');")?;
+        tx.execute(
+            "INSERT INTO sync_state (key, value) VALUES ('local_indexed_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [finished_at.to_string()],
+        )?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM local_files", [], |r| r.get(0))?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// When the last local scan completed (epoch seconds), or `None` if the index
+    /// has never been built. The daemon uses this to decide whether a fresh mount
+    /// needs an immediate rescan or can serve the existing index.
+    pub fn local_indexed_at(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'local_indexed_at'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok()))
+    }
+
+    /// Substring search over indexed local file names, newest-modified first
+    /// within a relevance tier. Mirrors [`search`](Self::search): the trigram
+    /// index handles queries of at least [`TRIGRAM_MIN`] chars, shorter ones fall
+    /// back to a `LIKE` scan.
+    pub fn search_local(&self, query: &str, limit: usize) -> Result<Vec<LocalFileHit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt;
+        let rows = if query.chars().count() < TRIGRAM_MIN {
+            let pat = format!("%{}%", like_escape(query));
+            stmt = conn.prepare(
+                "SELECT path, name, is_dir, size, mtime FROM local_files
+                 WHERE name LIKE ?1 ESCAPE '\\'
+                 ORDER BY mtime DESC LIMIT ?2",
+            )?;
+            stmt.query_map(params![pat, limit as i64], local_hit)?
+        } else {
+            let phrase = query
+                .split_whitespace()
+                .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            stmt = conn.prepare(
+                "SELECT f.path, f.name, f.is_dir, f.size, f.mtime
+                 FROM local_fts x JOIN local_files f ON f.id = x.rowid
+                 WHERE x.name MATCH ?1
+                 ORDER BY x.rank LIMIT ?2",
+            )?;
+            stmt.query_map(params![phrase, limit as i64], local_hit)?
+        };
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}
+
+/// One hit from [`Db::search_local`]: an indexed file on the machine itself, not
+/// in Drive. `path` is absolute.
+pub struct LocalFileHit {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+/// Row mapper for [`Db::search_local`]'s two query paths, which select the same
+/// columns in the same order.
+fn local_hit(row: &rusqlite::Row) -> rusqlite::Result<LocalFileHit> {
+    Ok(LocalFileHit {
+        path: row.get(0)?,
+        name: row.get(1)?,
+        is_dir: row.get::<_, i64>(2)? != 0,
+        size: row.get(3)?,
+        mtime: row.get(4)?,
+    })
 }
 
 /// Row mapper for the `(node_json, uid)` pairs both search paths return.
@@ -664,6 +823,32 @@ CREATE TABLE pins (
 );
 ";
 
+/// Schema v6: the index of *local* (non-Drive) files, so the launcher prompt can
+/// search the machine alongside Drive. `local_files` is keyed by absolute path;
+/// `scan_gen` stamps the scan that last saw a row, so a rescan prunes vanished
+/// files with one `DELETE` instead of diffing.
+///
+/// `local_fts` is an *external-content* FTS5 index over `local_files.name`: the
+/// text lives once in the base table and the index is rebuilt in bulk at the end
+/// of a scan (`INSERT INTO local_fts(local_fts) VALUES('rebuild')`). That is far
+/// cheaper than the delete-then-insert-per-row dance `nodes_fts` needs, because
+/// a scan rewrites most rows at once rather than trickling single updates.
+const MIGRATION_V6: &str = "
+CREATE TABLE local_files (
+  id       INTEGER PRIMARY KEY,
+  path     TEXT NOT NULL UNIQUE,
+  name     TEXT NOT NULL,
+  is_dir   INTEGER NOT NULL,
+  size     INTEGER NOT NULL DEFAULT 0,
+  mtime    INTEGER NOT NULL DEFAULT 0,
+  scan_gen INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE VIRTUAL TABLE local_fts USING fts5(
+  name, content='local_files', content_rowid='id', tokenize='trigram'
+);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +973,62 @@ mod tests {
         );
     }
 
+    fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {
+        LocalEntry {
+            path: path.into(),
+            name: name.into(),
+            is_dir,
+            size: 10,
+            mtime: 5,
+        }
+    }
+
+    /// A local scan is searchable by substring, and a *later* scan prunes the
+    /// paths it no longer sees — including out of the FTS index, so a deleted
+    /// file cannot keep surfacing in the prompt.
+    #[test]
+    fn local_scan_indexes_then_prunes_stale_paths() {
+        let db = Db::open_in_memory().unwrap();
+
+        let gen1 = db.local_begin_scan().unwrap();
+        db.local_upsert_batch(
+            gen1,
+            &[
+                local("/home/u/docs/report.pdf", "report.pdf", false),
+                local("/home/u/docs/notes.md", "notes.md", false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.local_finish_scan(gen1, 1_000).unwrap(), 2);
+
+        // Trigram index gives substring (not just prefix) matches.
+        let hits = db.search_local("port", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/home/u/docs/report.pdf");
+        assert!(!hits[0].is_dir);
+        assert_eq!(db.local_indexed_at().unwrap(), Some(1_000));
+
+        // Second scan sees only notes.md → report.pdf is gone from disk.
+        let gen2 = db.local_begin_scan().unwrap();
+        db.local_upsert_batch(gen2, &[local("/home/u/docs/notes.md", "notes.md", false)])
+            .unwrap();
+        assert_eq!(db.local_finish_scan(gen2, 2_000).unwrap(), 1);
+        assert!(db.search_local("report", 10).unwrap().is_empty());
+        assert_eq!(db.search_local("notes", 10).unwrap().len(), 1);
+    }
+
+    /// Queries below the trigram minimum still match, via the `LIKE` fallback.
+    #[test]
+    fn local_search_short_query_like_fallback() {
+        let db = Db::open_in_memory().unwrap();
+        let g = db.local_begin_scan().unwrap();
+        db.local_upsert_batch(g, &[local("/home/u/a.txt", "a.txt", false)])
+            .unwrap();
+        db.local_finish_scan(g, 1).unwrap();
+        assert_eq!(db.search_local("a", 10).unwrap().len(), 1);
+        assert!(db.search_local("", 10).unwrap().is_empty());
+    }
+
     #[test]
     fn event_cursor_roundtrip() {
         let db = Db::open_in_memory().unwrap();
@@ -809,7 +1050,13 @@ mod tests {
         db.upsert_node(&file("f1", "docs", "report.pdf", 1))
             .unwrap();
         db.upsert_node(&file("f2", "root", "notes.txt", 2)).unwrap();
-        db.upsert_node(&file("f3", "root", "Rampage Open Air 2026 - order 166765244.pdf", 3)).unwrap();
+        db.upsert_node(&file(
+            "f3",
+            "root",
+            "Rampage Open Air 2026 - order 166765244.pdf",
+            3,
+        ))
+        .unwrap();
 
         // Substring match (trigram), not just prefix.
         let hits = db.search("port", 10).unwrap();
@@ -825,7 +1072,10 @@ mod tests {
         // Multi-term FTS5 query matching (out of order, separated terms)
         let hits = db.search("rampage 2026", 10).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].node.name, "Rampage Open Air 2026 - order 166765244.pdf");
+        assert_eq!(
+            hits[0].node.name,
+            "Rampage Open Air 2026 - order 166765244.pdf"
+        );
     }
 
     #[test]

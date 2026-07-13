@@ -38,6 +38,7 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,10 +52,11 @@ use fuser::{
 use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    DirEntry, PhotoItem, Request as CtlRequest, Response as CtlResponse, SearchHit,
+    DirEntry, LocalHit, PhotoItem, Request as CtlRequest, Response as CtlResponse, SearchHit,
     TransferDirection,
 };
 use pdfs_core::db::{Db, StoredNode};
+use pdfs_core::localindex;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
@@ -77,6 +79,15 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// re-fetches it. The SDK hands back the whole timeline at once, so we cache it
 /// in [`Core`] and serve every page from memory until it goes stale.
 const TIMELINE_TTL: Duration = Duration::from_secs(60);
+
+/// How stale the local-file index may get before the background scanner rebuilds
+/// it. A rescan is a full walk of `$HOME`, so this trades index freshness against
+/// disk churn; the scanner also always rebuilds once per daemon start when the
+/// index is older than this.
+const LOCAL_INDEX_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the scanner thread wakes to check whether the index went stale.
+const LOCAL_INDEX_CHECK: Duration = Duration::from_secs(60);
 
 /// The FUSE root inode is always 1.
 const ROOT_INO: u64 = 1;
@@ -301,6 +312,9 @@ struct Core {
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
+    /// True while the background scanner is rebuilding the local-file index, so
+    /// `SearchLocal` can tell a front-end "still indexing" apart from "no match".
+    indexing: Arc<AtomicBool>,
 }
 
 /// The whole photos timeline plus when it was fetched, for TTL freshness.
@@ -997,6 +1011,26 @@ impl Core {
                 modified: h.node.modification_time,
                 pinned: self.cache.is_pinned(&h.node.uid),
                 uid: h.node.uid.to_string(),
+            })
+            .collect())
+    }
+
+    /// Search the index of files on this machine (outside Drive), built by the
+    /// background scanner in [`run_local_index`]. Pure local lookup, never hits
+    /// the network — and never touches the FUSE mount, which the scanner excludes.
+    fn search_local(&self, query: &str, limit: usize) -> Result<Vec<LocalHit>, String> {
+        let hits = self
+            .db
+            .search_local(query, limit)
+            .map_err(|e| format!("local search: {e}"))?;
+        Ok(hits
+            .into_iter()
+            .map(|h| LocalHit {
+                name: h.name,
+                path: h.path,
+                is_dir: h.is_dir,
+                size: h.size.max(0) as u64,
+                modified: h.mtime,
             })
             .collect())
     }
@@ -2293,6 +2327,73 @@ async fn run_event_sync(
     }
 }
 
+/// Keep the local-file index fresh for the launcher prompt's "This computer"
+/// results. Rebuilds the index whenever it is older than [`LOCAL_INDEX_TTL`],
+/// then sleeps; runs on its own thread for the life of the daemon.
+///
+/// The walk is the one part of the daemon that touches the wider filesystem, so
+/// it is deliberately kept off every hot path: it never runs on a FUSE or
+/// control-socket thread, and it excludes the mountpoint (walking it would fault
+/// every remote node in through FUSE, defeating on-demand hydration).
+fn run_local_index(db: Arc<Db>, indexing: Arc<AtomicBool>, mountpoint: PathBuf) {
+    loop {
+        let age = db.local_indexed_at().ok().flatten();
+        let stale =
+            age.is_none_or(|at| now_secs().saturating_sub(at) >= LOCAL_INDEX_TTL.as_secs() as i64);
+        if stale {
+            scan_local_once(&db, &indexing, &mountpoint);
+        }
+        std::thread::sleep(LOCAL_INDEX_CHECK);
+    }
+}
+
+/// Walk `$HOME` once and replace the local-file index with what it finds.
+/// Batches stream straight into SQLite, so peak memory is one batch — not the
+/// whole home directory.
+fn scan_local_once(db: &Db, indexing: &AtomicBool, mountpoint: &Path) {
+    let dirs = match AppDirs::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "local index: cannot resolve app dirs");
+            return;
+        }
+    };
+    let Some(home) = dirs.home_dir() else {
+        warn!("local index: cannot resolve home directory");
+        return;
+    };
+    let generation = match db.local_begin_scan() {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(error = %e, "local index: cannot open scan generation");
+            return;
+        }
+    };
+
+    let excludes = localindex::default_excludes(mountpoint, &dirs.state_dir(), &dirs.cache_dir());
+    indexing.store(true, Ordering::Relaxed);
+    let started = Instant::now();
+
+    let walked = localindex::scan(&[home], &excludes, |batch| {
+        if let Err(e) = db.local_upsert_batch(generation, &batch) {
+            warn!(error = %e, "local index: batch write failed");
+        }
+    });
+
+    // Prune what this scan did not see and rebuild the FTS index over the rest,
+    // even if some batches failed — a partial index still beats none.
+    match db.local_finish_scan(generation, now_secs()) {
+        Ok(indexed) => info!(
+            walked,
+            indexed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "local index rebuilt"
+        ),
+        Err(e) => warn!(error = %e, "local index: finish failed"),
+    }
+    indexing.store(false, Ordering::Relaxed);
+}
+
 /// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
 /// must live under `mountpoint`; a relative path is taken as already relative to
 /// the mount root.
@@ -2434,6 +2535,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::Search { query, limit }) => match core.search(&query, limit) {
             Ok(hits) => CtlResponse::SearchResults { hits },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::SearchLocal { query, limit }) => match core.search_local(&query, limit) {
+            Ok(hits) => CtlResponse::LocalResults {
+                hits,
+                indexing: core.indexing.load(Ordering::Relaxed),
+            },
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::Rename { path, new_name }) => match rel_to_mount(mountpoint, &path) {
@@ -2629,7 +2737,19 @@ pub fn mount(
         db,
         timeline: Arc::new(Mutex::new(None)),
         transfers: TransferRegistry::new(),
+        indexing: Arc::new(AtomicBool::new(false)),
     };
+
+    // Keep the launcher prompt's "This computer" index fresh. Its own thread:
+    // the walk is I/O-heavy and must never sit in front of a FUSE callback.
+    {
+        let db = core.db.clone();
+        let indexing = core.indexing.clone();
+        let mountpoint = mountpoint.to_path_buf();
+        std::thread::Builder::new()
+            .name("pdfs-localindex".into())
+            .spawn(move || run_local_index(db, indexing, mountpoint))?;
+    }
 
     let mut config = Config::default();
     config.mount_options = vec![
