@@ -19,7 +19,7 @@
 //! never touches the keyring.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -55,12 +55,38 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Cap on search hits requested from the daemon.
 const SEARCH_LIMIT: usize = 200;
 
-/// Gallery thumbnail height in px: the zoom range, its default, and the step one
-/// Ctrl+scroll notch (or Ctrl+±) moves it by.
+/// Gallery row height in px: the zoom range, its default, and the step one
+/// Ctrl+scroll notch (or Ctrl+±) moves it by. Rows are justified to the full
+/// content width, so this is the *target* height a row lands near, not an exact
+/// tile size (see [`justify_rows`]).
 const TILE_MIN: i32 = 90;
 const TILE_MAX: i32 = 300;
-const TILE_DEFAULT: i32 = 150;
+const TILE_DEFAULT: i32 = 180;
 const TILE_STEP: i32 = 30;
+/// Gap between tiles, horizontally and vertically.
+const TILE_GAP: i32 = 4;
+/// Aspect ratio (w/h) assumed for a photo whose thumbnail hasn't been decoded
+/// yet, so a tile can be laid out before its image exists. Landscape 3:2, the
+/// commonest camera/phone ratio; once the thumbnail lands the real ratio
+/// replaces it and the section re-justifies in place.
+const RATIO_UNKNOWN: f64 = 1.5;
+/// Aspect ratios are clamped to this range before a row is packed: one absurd
+/// panorama, or a sliver of a portrait, must not be able to squash the row it
+/// lands in down to nothing. The tile still shows the whole image.
+const RATIO_MIN: f64 = 0.4;
+const RATIO_MAX: f64 = 3.5;
+/// How many thumbnails one on-demand [`Request::PhotoThumbs`] batch asks for.
+/// Small, so the first tiles on screen fill in quickly rather than the whole
+/// page landing at once.
+const THUMB_BATCH: usize = 16;
+/// Idle pause before a thumbnail batch is sent, so a fast scroll coalesces into
+/// one request per settle instead of one per row that flickers past.
+const THUMB_DEBOUNCE: Duration = Duration::from_millis(60);
+/// Decoded thumbnails held in memory. Each is a few hundred KiB of GPU texture;
+/// this caps the gallery's footprint while covering several screens of scroll.
+const TEXTURE_CACHE_MAX: usize = 600;
+/// Pause after a resize/zoom before the visible sections are re-justified.
+const RELAYOUT_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
 /// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
@@ -85,6 +111,10 @@ struct TransferRow {
 struct Ui {
     dirs: AppDirs,
     stack: adw::ViewStack,
+    /// Wraps the whole window content; every non-blocking outcome (a completed
+    /// rename, a failed upload, a purge) is reported here rather than in a modal,
+    /// so an action never interrupts what the user is doing next.
+    toasts: adw::ToastOverlay,
     /// Header spinner shown while any open/load round-trip is in flight; ref-
     /// counted via [`Self::busy`] so concurrent operations don't stop it early.
     spinner: gtk4::Spinner,
@@ -136,12 +166,23 @@ struct Ui {
     /// The pin paths last rendered, the diff baseline for [`repaint_pins`].
     /// `None` = nothing built yet; `Some(empty)` = the placeholder is shown.
     pins_state: RefCell<Option<Vec<String>>>,
-    /// Whether the last refresh saw a live mount daemon. Gates the unpin
-    /// buttons, which need the daemon to evict + re-hydrate.
+    /// Whether the last refresh saw a live mount daemon. Gates the unpin buttons
+    /// (which need the daemon to evict + re-hydrate) and every mutating action.
     mounted: RefCell<bool>,
-    /// Bottom switcher between the Account / Files / Photos pages; hidden on the
-    /// login page so the user can't jump to pages that need a session.
-    switcher: adw::ViewSwitcherBar,
+    /// The mount state the *last* desktop notification reported, so a flap only
+    /// notifies on the edge. `None` until the first status reply, so a cold start
+    /// doesn't announce "disconnected" before the service has had a chance to come
+    /// up.
+    notified_mounted: Cell<Option<bool>>,
+    /// How many transfers were in flight on the previous poll. A drop to zero is
+    /// what "sync complete" means; there's no completion event on the wire.
+    active_transfers: Cell<usize>,
+    /// Sidebar destination list (Files / Photos / Settings). Selecting a row swaps
+    /// the page stack; [`sync_sidebar`] mirrors navigation that starts elsewhere.
+    sidebar: gtk4::ListBox,
+    /// The sidebar/content split. Collapsed while signed out, so the login page
+    /// owns the whole window and no destination is reachable without a session.
+    nav: adw::NavigationSplitView,
     // Files (browser) page.
     /// Shared model behind the grid and column views; repopulated per directory.
     browser_model: gio::ListStore,
@@ -149,14 +190,36 @@ struct Ui {
     /// Clickable breadcrumb trail (a button per path segment); rebuilt per load
     /// by [`repaint_crumb`] so each ancestor folder navigates on click.
     browser_crumb: gtk4::Box,
-    browser_status: gtk4::Label,
-    /// Shown beside [`Self::browser_status`] when a load failed because the mount
+    /// Swaps the Files content area between the grid/list views and the status
+    /// page below; see [`browser_status`].
+    browser_content: gtk4::Stack,
+    /// The Files empty/loading/error surface, shown in place of the views.
+    browser_status: adw::StatusPage,
+    /// Sits in [`Self::browser_status`]; shown when a load failed because the mount
     /// service is down (not merely starting); restarts the service and reloads.
     browser_retry: gtk4::Button,
+    /// The details pane's host; `show_sidebar` is what reveals/hides the pane.
+    browser_split: adw::OverlaySplitView,
+    /// Widgets in the details pane, repainted from the selected entry.
+    details: DetailsWidgets,
+    /// The entry the details pane is currently showing, so its buttons act on the
+    /// same one the user is looking at even after the model is repopulated.
+    details_entry: RefCell<Option<DirEntry>>,
+    /// Set while the details pane is being populated, so setting the offline
+    /// switch programmatically doesn't fire a pin/unpin round-trip.
+    details_suppress: Cell<bool>,
+    /// The grid's and list's selection models. Both wrap the one browser model, so
+    /// a selection in either drives the details pane.
+    grid_selection: gtk4::SingleSelection,
+    list_selection: gtk4::SingleSelection,
     /// Mountpoint-relative path the browser is showing (empty = root).
     browser_path: RefCell<String>,
     /// Debounced full-text search box in the browser header.
     browser_search: gtk4::SearchEntry,
+    /// The folder-level actions, insensitive while the mount is down: without a
+    /// daemon they can only fail, and a greyed button says so before the click.
+    browser_new_folder: gtk4::Button,
+    browser_upload: gtk4::Button,
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     search_source: RefCell<Option<glib::SourceId>>,
@@ -167,13 +230,64 @@ struct Ui {
     /// The day sections rendered by the Photos ListView, rebuilt from
     /// [`Self::gallery_model`] by [`repaint_gallery`].
     gallery_groups: gio::ListStore,
-    /// Thumbnail height in px, retuned by Ctrl+scroll / Ctrl+± (see
-    /// [`zoom_gallery`]). Widths follow each photo's own aspect ratio.
+    /// Target row height in px, retuned by Ctrl+scroll / Ctrl+± (see
+    /// [`zoom_gallery`]). Each tile keeps its own aspect ratio; rows are
+    /// justified to the content width around this height.
     gallery_tile: Cell<i32>,
-    gallery_status: gtk4::Label,
+    /// Swaps the Photos content area between the timeline and its status page.
+    gallery_content: gtk4::Stack,
+    gallery_status: adw::StatusPage,
     gallery_retry: gtk4::Button,
     gallery_more: gtk4::Button,
     gallery_upload: gtk4::Button,
+    /// "1,204 photos" under the page title.
+    gallery_subtitle: gtk4::Label,
+    /// True while a timeline page is in flight, so the scroll-to-the-end paging
+    /// can't fire a second request for the page already coming.
+    gallery_loading: Cell<bool>,
+    /// Content width the sections are currently justified to. Updated when the
+    /// ListView is resized, which re-justifies the visible sections.
+    gallery_width: Cell<i32>,
+    /// Decoded thumbnails by photo uid, with the insertion order that evicts the
+    /// oldest past [`TEXTURE_CACHE_MAX`]. Scrolling back over a day therefore
+    /// repaints from memory instead of re-decoding from disk.
+    photo_tex: RefCell<HashMap<String, gtk4::gdk::Texture>>,
+    photo_tex_order: RefCell<VecDeque<String>>,
+    /// Aspect ratio (w/h) per uid, learned when a thumbnail is decoded and
+    /// persisted to disk, so a relaunch justifies its rows correctly on the first
+    /// frame instead of reflowing as thumbnails arrive.
+    photo_ratio: RefCell<HashMap<String, f64>>,
+    /// Ratios learned since the last save, so the ratio file is only rewritten
+    /// when it actually changed.
+    photo_ratio_dirty: Cell<bool>,
+    /// Photos the daemon reported as having no thumbnail at all, so a tile that
+    /// can never be filled isn't requested again on every scroll past it.
+    photo_nothumb: RefCell<HashSet<String>>,
+    /// Tiles on screen still waiting for their thumbnail, by uid. Populated as
+    /// sections are bound, drained as batches land, cleared on unbind — so a
+    /// batch only ever paints a widget that is still showing that photo.
+    thumb_wanted: RefCell<HashMap<String, gtk4::Picture>>,
+    /// Uids queued for the next [`Request::PhotoThumbs`] batch, and whether a
+    /// batch is already in flight (only one at a time, so a long scroll can't
+    /// stack requests on the daemon).
+    thumb_queue: RefCell<VecDeque<String>>,
+    thumb_inflight: Cell<bool>,
+    /// Thumbnails on disk waiting to be turned into textures, as `(uid, path)`.
+    /// Decoding happens on the GTK thread (textures are not `Send`), so it is fed
+    /// a few at a time from an idle callback rather than in one blocking burst
+    /// that would stutter the scroll. [`Self::decode_idle`] is the "callback
+    /// already scheduled" guard.
+    decode_queue: RefCell<VecDeque<(String, String)>>,
+    decode_idle: Cell<bool>,
+    /// Pending debounce timers for the thumbnail queue flush and the section
+    /// re-justify, replaced on each new trigger so only the last one fires.
+    thumb_source: RefCell<Option<glib::SourceId>>,
+    relayout_source: RefCell<Option<glib::SourceId>>,
+    /// The day sections currently realised by the ListView, by their index in
+    /// [`Self::gallery_groups`]. A learned ratio or a resize re-justifies these
+    /// in place — rebuilding the ListStore instead would reset the scroll
+    /// position out from under the user.
+    gallery_bound: RefCell<HashMap<u32, gtk4::Box>>,
 }
 
 impl Ui {
@@ -193,6 +307,86 @@ impl Ui {
             self.spinner.set_visible(false);
         }
     }
+
+    /// The aspect ratio (w/h) to lay `uid`'s tile out at: the real one once its
+    /// thumbnail has been seen, otherwise [`RATIO_UNKNOWN`].
+    fn ratio(&self, uid: &str) -> f64 {
+        self.photo_ratio
+            .borrow()
+            .get(uid)
+            .copied()
+            .unwrap_or(RATIO_UNKNOWN)
+    }
+
+    /// Remember a decoded thumbnail and the aspect ratio it revealed. Returns
+    /// true when the ratio is *new information* — the caller re-justifies the
+    /// affected rows, since they were laid out against a guess.
+    fn store_texture(&self, uid: &str, texture: gtk4::gdk::Texture) -> bool {
+        let (w, h) = (texture.width(), texture.height());
+
+        let mut cache = self.photo_tex.borrow_mut();
+        let mut order = self.photo_tex_order.borrow_mut();
+        if cache.insert(uid.to_string(), texture).is_none() {
+            order.push_back(uid.to_string());
+        }
+        while order.len() > TEXTURE_CACHE_MAX {
+            if let Some(old) = order.pop_front() {
+                cache.remove(&old);
+            }
+        }
+        drop((cache, order));
+
+        if h <= 0 {
+            return false;
+        }
+        let ratio = f64::from(w) / f64::from(h);
+        let mut ratios = self.photo_ratio.borrow_mut();
+        match ratios.insert(uid.to_string(), ratio) {
+            // Only a *changed* ratio invalidates a layout; re-decoding a photo we
+            // already sized correctly must not trigger another pass.
+            Some(prev) if (prev - ratio).abs() < f64::EPSILON => false,
+            _ => {
+                self.photo_ratio_dirty.set(true);
+                true
+            }
+        }
+    }
+
+    /// Where the learned aspect ratios are persisted between runs.
+    fn ratio_path(&self) -> PathBuf {
+        self.dirs.cache_dir().join("photo-ratios.json")
+    }
+
+    /// Load the persisted aspect ratios. A missing or corrupt file just means the
+    /// first paint uses [`RATIO_UNKNOWN`] and re-justifies as thumbnails land.
+    fn load_ratios(&self) {
+        let path = self.ratio_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        match serde_json::from_str::<HashMap<String, f64>>(&text) {
+            Ok(map) => *self.photo_ratio.borrow_mut() = map,
+            Err(e) => tracing::debug!("ignoring {}: {e}", path.display()),
+        }
+    }
+
+    /// Persist the learned aspect ratios, if any were learned since the last save.
+    fn save_ratios(&self) {
+        if !self.photo_ratio_dirty.replace(false) {
+            return;
+        }
+        let path = self.ratio_path();
+        let ratios = self.photo_ratio.borrow();
+        let write = serde_json::to_vec(&*ratios)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
+                std::fs::write(&path, bytes)
+            });
+        if let Err(e) = write {
+            tracing::debug!("cannot save {}: {e}", path.display());
+        }
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -205,6 +399,9 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| {
         load_proton_theme();
+        // Refresh the file manager's right-click pin/unpin scripts, so they always
+        // match the installed `pdfs`.
+        pdfs_core::shell::install_file_manager_scripts();
         spawn_tray();
     });
     app.connect_activate(build_window);
@@ -235,18 +432,32 @@ fn load_proton_theme() {
          .badge-pinned {{ color: #f5c211; }}\n\
          .badge-cached {{ color: #2ec27e; }}\n\
          .badge-cloud {{ color: #9aa0a6; }}\n\
-         .photo-viewer-window {{ background-color: #000000; }}\n\
-         .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0)); padding: 12px 24px; color: white; }}\n\
-         .viewer-title {{ font-weight: bold; font-size: 1.1rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
-         .viewer-action-btn {{ color: white; background-color: rgba(255, 255, 255, 0.15); border-radius: 50%; padding: 8px; margin-left: 4px; }}\n\
-         .viewer-action-btn:hover {{ background-color: rgba(255, 255, 255, 0.3); color: white; }}\n\
-         .viewer-nav-btn {{ background-color: rgba(0, 0, 0, 0.5); color: white; margin: 24px; padding: 16px; border-radius: 50%; }}\n\
-         .viewer-nav-btn:hover {{ background-color: rgba(0, 0, 0, 0.8); color: white; }}\n\
-         .viewer-status {{ color: #ff5555; font-size: 1.1rem; background-color: rgba(0, 0, 0, 0.8); padding: 12px 24px; border-radius: 8px; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }}\n\
-         .viewer-info-panel {{ background-color: rgba(0, 0, 0, 0.75); color: white; }}\n\
-         .viewer-info-panel label {{ color: white; }}\n\
+         .photo-viewer-window {{ background-color: #111014; }}\n\
+         .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0)); padding: 10px 16px 28px 20px; color: white; }}\n\
+         .viewer-title {{ font-weight: 700; font-size: 1.05rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
+         .viewer-counter {{ font-size: 0.8rem; color: rgba(255, 255, 255, 0.72); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }}\n\
+         .viewer-action-btn {{ color: white; background-color: rgba(255, 255, 255, 0.12); border-radius: 50%; min-width: 34px; min-height: 34px; margin-left: 4px; }}\n\
+         .viewer-action-btn:hover {{ background-color: rgba(255, 255, 255, 0.28); color: white; }}\n\
+         .viewer-action-btn:checked {{ background-color: {PROTON_PURPLE}; color: white; }}\n\
+         .viewer-close-btn {{ background-color: rgba(255, 255, 255, 0.2); margin-left: 10px; }}\n\
+         .viewer-close-btn:hover {{ background-color: #e01b24; color: white; }}\n\
+         .viewer-nav-btn {{ background-color: rgba(0, 0, 0, 0.45); color: white; margin: 20px; min-width: 44px; min-height: 44px; border-radius: 50%; opacity: 0.7; transition: opacity 150ms ease, background-color 150ms ease; }}\n\
+         .viewer-nav-btn:hover {{ background-color: rgba(0, 0, 0, 0.85); color: white; opacity: 1; }}\n\
+         .viewer-nav-btn:disabled {{ opacity: 0; }}\n\
+         .viewer-spinner {{ color: white; }}\n\
+         .viewer-status {{ color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }}\n\
+         .viewer-info-panel {{ background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }}\n\
+         .gallery-day {{ font-size: 1.05rem; font-weight: 700; padding: 4px 2px; }}\n\
+         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 6px; background: alpha(currentColor, 0.08); transition: filter 150ms ease; }}\n\
+         .photo-tile:hover {{ filter: brightness(1.08); }}\n\
+         .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
+         .photo-missing {{ background: alpha(currentColor, 0.12); }}\n\
          .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
-         .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n"
+         .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n\
+         .navigation-sidebar row {{ border-radius: 8px; margin: 2px 6px; }}\n\
+         .navigation-sidebar row:selected {{ background: alpha({PROTON_PURPLE}, 0.16); color: {PROTON_PURPLE}; font-weight: 600; }}\n\
+         .navigation-sidebar row:selected image {{ color: {PROTON_PURPLE}; }}\n\
+         .file-tile:selected, .file-tile:hover:selected {{ background: alpha({PROTON_PURPLE}, 0.20); }}\n"
     );
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(&css);
@@ -275,32 +486,46 @@ fn build_window(app: &adw::Application) {
     let (main_page, main_widgets) = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
     let (gallery_page, gallery_widgets) = build_gallery_page();
-    // Login has no title, so it never appears in the switcher; the three signed-in
-    // pages are titled + iconed so the bottom switcher lists them.
     stack.add_named(&login_page, Some("login"));
-    stack.add_titled_with_icon(
-        &main_page,
-        Some("main"),
-        "Account",
-        "avatar-default-symbolic",
-    );
-    stack.add_titled_with_icon(&browser_page, Some("browser"), "Files", "folder-symbolic");
-    stack.add_titled_with_icon(
-        &gallery_page,
-        Some("gallery"),
-        "Photos",
-        "image-x-generic-symbolic",
-    );
+    stack.add_named(&main_page, Some("main"));
+    stack.add_named(&browser_page, Some("browser"));
+    stack.add_named(&gallery_page, Some("gallery"));
 
-    let switcher = adw::ViewSwitcherBar::builder().stack(&stack).build();
+    // Sidebar: the signed-in destinations. Selecting a row swaps the page stack;
+    // `sync_sidebar` pushes the other way when navigation happens elsewhere (e.g.
+    // login lands on Files).
+    let (sidebar_page, sidebar_list) = build_sidebar();
 
     // Header spinner, hidden until a background open/load is in flight.
     let spinner = gtk4::Spinner::new();
     spinner.set_visible(false);
+    let header = adw::HeaderBar::new();
+    header.pack_end(&build_primary_menu());
+    header.pack_end(&spinner);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&stack));
+
+    let content_page = adw::NavigationPage::builder()
+        .title("Proton Drive")
+        .child(&toolbar)
+        .build();
+    let split = adw::NavigationSplitView::builder()
+        .sidebar(&sidebar_page)
+        .content(&content_page)
+        .min_sidebar_width(200.0)
+        .max_sidebar_width(240.0)
+        .build();
+
+    // Toasts float over everything, so a report from a background action reaches
+    // the user whichever page they're on.
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&split));
 
     let ui = Rc::new(Ui {
         dirs,
         stack: stack.clone(),
+        toasts: toasts.clone(),
         spinner: spinner.clone(),
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
@@ -325,23 +550,53 @@ fn build_window(app: &adw::Application) {
         pin_rows: RefCell::new(Vec::new()),
         pins_state: RefCell::new(None),
         mounted: RefCell::new(false),
-        switcher: switcher.clone(),
-        browser_model: browser_widgets.0,
-        browser_back: browser_widgets.1,
-        browser_crumb: browser_widgets.2,
-        browser_status: browser_widgets.3,
-        browser_retry: browser_widgets.6,
+        notified_mounted: Cell::new(None),
+        active_transfers: Cell::new(0),
+        sidebar: sidebar_list.clone(),
+        nav: split.clone(),
+        browser_model: browser_widgets.model.clone(),
+        browser_back: browser_widgets.back.clone(),
+        browser_crumb: browser_widgets.crumb.clone(),
+        browser_content: browser_widgets.content.clone(),
+        browser_status: browser_widgets.status.clone(),
+        browser_retry: browser_widgets.retry.clone(),
+        browser_split: browser_widgets.split.clone(),
+        details: browser_widgets.details,
+        details_entry: RefCell::new(None),
+        details_suppress: Cell::new(false),
+        grid_selection: browser_widgets.grid_selection.clone(),
+        list_selection: browser_widgets.list_selection.clone(),
         browser_path: RefCell::new(String::new()),
-        browser_search: browser_widgets.7,
+        browser_search: browser_widgets.search.clone(),
+        browser_new_folder: browser_widgets.new_folder.clone(),
+        browser_upload: browser_widgets.upload.clone(),
         search_source: RefCell::new(None),
         gallery_model: gallery_widgets.model.clone(),
         gallery_groups: gallery_widgets.groups.clone(),
         gallery_tile: Cell::new(TILE_DEFAULT),
+        gallery_content: gallery_widgets.content.clone(),
         gallery_status: gallery_widgets.status.clone(),
         gallery_retry: gallery_widgets.retry.clone(),
         gallery_more: gallery_widgets.more.clone(),
         gallery_upload: gallery_widgets.upload.clone(),
+        gallery_subtitle: gallery_widgets.subtitle.clone(),
+        gallery_loading: Cell::new(false),
+        gallery_width: Cell::new(0),
+        photo_tex: RefCell::new(HashMap::new()),
+        photo_tex_order: RefCell::new(VecDeque::new()),
+        photo_ratio: RefCell::new(HashMap::new()),
+        photo_ratio_dirty: Cell::new(false),
+        photo_nothumb: RefCell::new(HashSet::new()),
+        thumb_wanted: RefCell::new(HashMap::new()),
+        thumb_queue: RefCell::new(VecDeque::new()),
+        thumb_inflight: Cell::new(false),
+        decode_queue: RefCell::new(VecDeque::new()),
+        decode_idle: Cell::new(false),
+        thumb_source: RefCell::new(None),
+        relayout_source: RefCell::new(None),
+        gallery_bound: RefCell::new(HashMap::new()),
     });
+    ui.load_ratios();
 
     wire_login(&ui);
     wire_logout(&ui, &main_widgets.logout_button);
@@ -350,8 +605,10 @@ fn build_window(app: &adw::Application) {
         &main_widgets.purge_button,
         &main_widgets.mountpoint_button,
     );
-    wire_browser(&ui, &browser_widgets.4, &browser_widgets.5);
-    wire_browser_actions(&ui, &browser_widgets.8, &browser_widgets.9);
+    wire_sidebar(&ui);
+    wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
+    wire_browser_actions(&ui, &browser_widgets.new_folder, &browser_widgets.upload);
+    wire_details(&ui);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
     wire_retry(&ui);
@@ -359,35 +616,24 @@ fn build_window(app: &adw::Application) {
     // Lazily load the Files / Photos pages the first time they're shown, so the
     // network round-trip only happens on demand rather than on every refresh.
     let ui_nav = ui.clone();
-    stack.connect_visible_child_name_notify(move |st| match st.visible_child_name().as_deref() {
-        Some("browser") => load_browser(&ui_nav),
-        Some("gallery") => load_gallery(&ui_nav, false),
-        _ => {}
+    stack.connect_visible_child_name_notify(move |st| {
+        sync_sidebar(&ui_nav);
+        match st.visible_child_name().as_deref() {
+            Some("browser") => load_browser(&ui_nav),
+            Some("gallery") => load_gallery(&ui_nav, false),
+            _ => {}
+        }
     });
-
-    // Header with a Proton-branded title; the content is the page stack inside a
-    // clamp so it stays comfortably narrow on a wide window, Google-Drive style.
-    let header = adw::HeaderBar::new();
-    let brand = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    let icon = gtk4::Image::from_icon_name("folder-remote-symbolic");
-    icon.add_css_class("brand-icon");
-    brand.append(&icon);
-    brand.append(&gtk4::Label::new(Some("Proton Drive")));
-    header.set_title_widget(Some(&brand));
-    header.pack_end(&spinner);
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&stack));
-    toolbar.add_bottom_bar(&switcher);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Proton Drive")
-        .default_width(760)
-        .default_height(620)
-        .content(&toolbar)
+        .default_width(980)
+        .default_height(680)
+        .content(&toasts)
         .build();
+    install_shortcuts(&ui, &window);
+    install_window_actions(&window);
 
     refresh(&ui);
     // Periodic refresh while the window lives. The closure holds a strong `Rc`;
@@ -398,14 +644,230 @@ fn build_window(app: &adw::Application) {
         glib::ControlFlow::Continue
     });
     let cell = RefCell::new(Some(source));
+    let ui_close = ui.clone();
     window.connect_close_request(move |_| {
         if let Some(id) = cell.borrow_mut().take() {
             id.remove();
         }
+        ui_close.save_ratios();
         glib::Propagation::Proceed
     });
 
     window.present();
+}
+
+/// The sidebar destinations, in order: the row index is the index into this table,
+/// and each entry is `(stack page name, label, icon)`.
+const DESTINATIONS: [(&str, &str, &str); 3] = [
+    ("browser", "Files", "folder-symbolic"),
+    ("gallery", "Photos", "image-x-generic-symbolic"),
+    ("main", "Settings", "emblem-system-symbolic"),
+];
+
+/// The navigation sidebar: a Proton-branded header over one row per destination.
+/// Returns the page (for the split view) and the list (to drive + reflect the
+/// current page).
+fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
+    let list = gtk4::ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::Single);
+    list.add_css_class("navigation-sidebar");
+    for (_, label, icon) in DESTINATIONS {
+        let row = adw::ActionRow::builder().title(label).build();
+        row.add_prefix(&gtk4::Image::from_icon_name(icon));
+        list.append(&row);
+    }
+
+    let brand = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let icon = gtk4::Image::from_icon_name("folder-remote-symbolic");
+    icon.add_css_class("brand-icon");
+    brand.append(&icon);
+    brand.append(&gtk4::Label::new(Some("Proton Drive")));
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&brand));
+
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&scroll));
+
+    let page = adw::NavigationPage::builder()
+        .title("Proton Drive")
+        .child(&toolbar)
+        .build();
+    (page, list)
+}
+
+/// Selecting a sidebar row navigates the page stack. The reverse direction (stack
+/// → sidebar highlight) is [`sync_sidebar`], so the two can't fight: this handler
+/// only ever writes the stack.
+fn wire_sidebar(ui: &Rc<Ui>) {
+    let ui_row = ui.clone();
+    ui.sidebar.connect_row_selected(move |_, row| {
+        let Some(row) = row else { return };
+        let Some((page, _, _)) = DESTINATIONS.get(row.index() as usize) else {
+            return;
+        };
+        if ui_row.stack.visible_child_name().as_deref() != Some(*page) {
+            ui_row.stack.set_visible_child_name(page);
+        }
+    });
+}
+
+/// Highlight the sidebar row for whichever page the stack is showing, so
+/// navigation that doesn't start in the sidebar (login landing on Files, the tray
+/// raising the window) still moves the selection.
+fn sync_sidebar(ui: &Rc<Ui>) {
+    let Some(current) = ui.stack.visible_child_name() else {
+        return;
+    };
+    let index = DESTINATIONS
+        .iter()
+        .position(|(page, _, _)| *page == current);
+    match index.and_then(|i| ui.sidebar.row_at_index(i as i32)) {
+        Some(row) => {
+            if ui.sidebar.selected_row().as_ref() != Some(&row) {
+                ui.sidebar.select_row(Some(&row));
+            }
+        }
+        // The login page has no destination row.
+        None => ui.sidebar.unselect_all(),
+    }
+}
+
+/// Show a transient toast. Non-blocking by design: an action's outcome is
+/// reported without stealing focus or forcing a click, so the user can keep
+/// working while a slow upload lands.
+fn toast(ui: &Rc<Ui>, message: &str) {
+    ui.toasts.add_toast(adw::Toast::new(message));
+}
+
+/// Show a toast for a failure. Same surface as [`toast`], but the message is
+/// prefixed with what was being attempted, since a bare daemon error ("no such
+/// file") reads as noise without it.
+fn toast_error(ui: &Rc<Ui>, what: &str, detail: &str) {
+    let detail = detail.trim();
+    let message = if detail.is_empty() {
+        what.to_string()
+    } else {
+        format!("{what}: {detail}")
+    };
+    tracing::warn!("{message}");
+    let toast = adw::Toast::builder().title(&message).timeout(6).build();
+    ui.toasts.add_toast(toast);
+}
+
+/// The header's primary (hamburger) menu: the app-level entries that don't belong
+/// on any one page.
+fn build_primary_menu() -> gtk4::MenuButton {
+    let menu = gio::Menu::new();
+    menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
+    menu.append(Some("About Proton Drive"), Some("win.about"));
+    gtk4::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Main menu")
+        .menu_model(&menu)
+        .build()
+}
+
+/// Back the primary menu's entries with window actions.
+fn install_window_actions(window: &adw::ApplicationWindow) {
+    let shortcuts = gio::SimpleAction::new("shortcuts", None);
+    let win = window.clone();
+    shortcuts.connect_activate(move |_, _| show_shortcuts(&win));
+    window.add_action(&shortcuts);
+
+    let about = gio::SimpleAction::new("about", None);
+    let win = window.clone();
+    about.connect_activate(move |_, _| {
+        let dialog = adw::AboutDialog::builder()
+            .application_name("Proton Drive")
+            .application_icon("folder-remote-symbolic")
+            .version(pdfs_core::config::APP_VERSION)
+            .developer_name("proton-drive-linux")
+            .comments("On-demand Proton Drive sync for Linux.")
+            .build();
+        dialog.present(Some(&win));
+    });
+    window.add_action(&about);
+}
+
+/// The keyboard-shortcut cheatsheet behind the menu entry, listing exactly what
+/// [`install_shortcuts`] binds.
+fn show_shortcuts(window: &adw::ApplicationWindow) {
+    const KEYS: [(&str, &str); 6] = [
+        ("Ctrl+F", "Search Drive"),
+        ("Ctrl+N", "New folder"),
+        ("Ctrl+U", "Upload file"),
+        ("F2", "Rename selection"),
+        ("Delete", "Move selection to Trash"),
+        ("Escape", "Close the details pane"),
+    ];
+    let group = adw::PreferencesGroup::builder().title("Files").build();
+    for (keys, action) in KEYS {
+        let row = adw::ActionRow::builder().title(action).build();
+        let label = gtk4::Label::builder()
+            .label(keys)
+            .valign(gtk4::Align::Center)
+            .build();
+        label.add_css_class("dim-label");
+        label.add_css_class("monospace");
+        row.add_suffix(&label);
+        group.add(&row);
+    }
+    let page = adw::PreferencesPage::new();
+    page.add(&group);
+
+    let dialog = adw::Dialog::builder()
+        .title("Keyboard Shortcuts")
+        .content_width(420)
+        .child(&{
+            let toolbar = adw::ToolbarView::new();
+            toolbar.add_top_bar(&adw::HeaderBar::new());
+            toolbar.set_content(Some(&page));
+            toolbar
+        })
+        .build();
+    dialog.present(Some(window));
+}
+
+/// Window-level keyboard shortcuts, so the browser is usable without the mouse:
+/// Ctrl+F focuses search, Ctrl+N makes a folder, Ctrl+U uploads, F2 renames and
+/// Delete trashes the selected entry, Escape closes the details pane.
+fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
+    let controller = gtk4::EventControllerKey::new();
+    let ui = ui.clone();
+    controller.connect_key_pressed(move |_, key, _, state| {
+        let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+        let on_browser = ui.stack.visible_child_name().as_deref() == Some("browser");
+        match key {
+            gtk4::gdk::Key::f | gtk4::gdk::Key::F if ctrl && on_browser => {
+                ui.browser_search.grab_focus();
+            }
+            gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
+            gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
+            gtk4::gdk::Key::F2 if on_browser => {
+                if let Some(entry) = selected_entry(&ui) {
+                    prompt_rename(&ui, &entry);
+                }
+            }
+            gtk4::gdk::Key::Delete if on_browser => {
+                if let Some(entry) = selected_entry(&ui) {
+                    prompt_delete(&ui, &entry);
+                }
+            }
+            gtk4::gdk::Key::Escape if on_browser && ui.browser_split.shows_sidebar() => {
+                hide_details(&ui);
+            }
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    });
+    window.add_controller(controller);
 }
 
 /// The login page: an email row, password row, a primary "Sign in" button and a
@@ -836,6 +1298,7 @@ fn wire_settings(ui: &Rc<Ui>, purge_button: &gtk4::Button, mountpoint_button: &g
         settings_request(
             &ui_budget,
             Request::SetCacheBudget { bytes },
+            "Cache budget updated",
             "Couldn't set cache budget",
         );
     });
@@ -855,7 +1318,12 @@ fn wire_settings(ui: &Rc<Ui>, purge_button: &gtk4::Button, mountpoint_button: &g
         dialog.set_close_response("cancel");
         dialog.connect_response(None, move |_, resp| {
             if resp == "purge" {
-                settings_request(&ui, Request::PurgeCache, "Couldn't purge cache");
+                settings_request(
+                    &ui,
+                    Request::PurgeCache,
+                    "Cache purged",
+                    "Couldn't purge cache",
+                );
             }
         });
         dialog.present(ui_window(&ui_purge).as_ref());
@@ -882,10 +1350,10 @@ fn wire_settings(ui: &Rc<Ui>, purge_button: &gtk4::Button, mountpoint_button: &g
 }
 
 /// Run a settings control-socket round-trip (budget / purge) on a worker thread,
-/// surfacing the daemon's error under `err_heading` on failure. Unlike
+/// confirming with `done` or reporting the daemon's error under `failed`. Unlike
 /// [`run_mutation`] there's no browser reload; the next refresh tick repaints the
 /// cache read-out.
-fn settings_request(ui: &Rc<Ui>, req: Request, err_heading: &'static str) {
+fn settings_request(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'static str) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();
@@ -893,9 +1361,9 @@ fn settings_request(ui: &Rc<Ui>, req: Request, err_heading: &'static str) {
         let result = rx.recv().await;
         ui.busy_end();
         match result {
-            Ok(Ok(Response::Ok { .. })) => {}
-            Ok(Ok(Response::Error { message })) => alert(&ui, err_heading, &message),
-            _ => alert(&ui, err_heading, "The mount service didn't respond."),
+            Ok(Ok(Response::Ok { .. })) => toast(&ui, done),
+            Ok(Ok(Response::Error { message })) => toast_error(&ui, failed, &message),
+            _ => toast_error(&ui, failed, "The mount service didn't respond."),
         }
     });
 }
@@ -917,7 +1385,7 @@ fn prompt_mountpoint(ui: &Rc<Ui>) {
         let mut config = ui.dirs.load_config();
         config.mountpoint = Some(path_str.clone());
         if let Err(e) = ui.dirs.save_config(&config) {
-            alert(&ui, "Couldn't save mountpoint", &e.to_string());
+            toast_error(&ui, "Couldn't save mountpoint", &e.to_string());
             return;
         }
         ui.mountpoint_row.set_subtitle(&path_str);
@@ -970,18 +1438,21 @@ fn refresh(ui: &Rc<Ui>) {
         let session = ui.session.borrow();
         match session.as_ref() {
             Some(s) => {
-                // Only pull the user onto "main" when they're sitting on the login
-                // page; otherwise leave whichever signed-in page they navigated to.
+                // Only pull the user onto a destination when they're sitting on the
+                // login page; otherwise leave whichever page they navigated to.
                 if ui.stack.visible_child_name().as_deref() == Some("login") {
-                    ui.stack.set_visible_child_name("main");
+                    ui.stack.set_visible_child_name("browser");
                 }
-                ui.switcher.set_reveal(true);
+                ui.nav.set_collapsed(false);
                 ui.account_row.set_title(&s.username);
                 ui.account_row.set_subtitle("Proton account");
             }
             None => {
                 ui.stack.set_visible_child_name("login");
-                ui.switcher.set_reveal(false);
+                // Collapsed + showing content = the login page owns the window and
+                // no destination is reachable without a session.
+                ui.nav.set_collapsed(true);
+                ui.nav.set_show_content(true);
                 return;
             }
         }
@@ -989,6 +1460,59 @@ fn refresh(ui: &Rc<Ui>) {
 
     refresh_status(ui);
     refresh_transfers(ui);
+}
+
+/// Record the mount state seen by the last status poll: gate every control that
+/// needs a live daemon, and notify the desktop when the state actually flips.
+///
+/// The gating is the point — without it, New Folder / Upload / the details pane's
+/// actions stay clickable while the mount is down and each click buys a round-trip
+/// that can only fail. A greyed control says so up front.
+fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
+    *ui.mounted.borrow_mut() = mounted;
+    ui.browser_new_folder.set_sensitive(mounted);
+    ui.browser_upload.set_sensitive(mounted);
+    ui.gallery_upload.set_sensitive(mounted);
+    ui.details.pin_row.set_sensitive(mounted);
+    ui.details.rename_button.set_sensitive(mounted);
+    ui.details.trash_button.set_sensitive(mounted);
+    ui.details.open_button.set_sensitive(mounted);
+
+    // Only notify on a real edge, and never for the first reading: at startup the
+    // service is usually still coming up, and "disconnected" would be a lie.
+    if ui.notified_mounted.get() == Some(mounted) {
+        return;
+    }
+    let first = ui.notified_mounted.replace(Some(mounted)).is_none();
+    if first {
+        return;
+    }
+    if mounted {
+        notify(
+            "mount-state",
+            "Proton Drive connected",
+            "Your Drive is mounted and available.",
+        );
+    } else {
+        notify(
+            "mount-state",
+            "Proton Drive disconnected",
+            "The mount service stopped. Files aren't available until it restarts.",
+        );
+    }
+}
+
+/// Send a desktop notification through the app's GIO channel. `id` replaces any
+/// earlier notification with the same id, so a flapping mount updates one
+/// notification instead of stacking a column of them.
+fn notify(id: &str, title: &str, body: &str) {
+    let Some(app) = gio::Application::default() else {
+        return;
+    };
+    let notification = gio::Notification::new(title);
+    notification.set_body(Some(body));
+    notification.set_priority(gio::NotificationPriority::Low);
+    app.send_notification(Some(id), &notification);
 }
 
 /// Poll the daemon's in-flight transfers on a worker thread and repaint the
@@ -1019,6 +1543,22 @@ fn refresh_transfers(ui: &Rc<Ui>) {
 /// bar's fraction and the name/speed label in place, so progress animates without
 /// flicker. Hides the whole group when nothing is in flight.
 fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
+    // The wire carries in-flight transfers only, with no completion event: the
+    // count falling to zero is what "the sync finished" looks like from here.
+    let previous = ui.active_transfers.replace(items.len());
+    if items.is_empty() && previous > 0 {
+        let files = if previous == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{previous} files")
+        };
+        notify(
+            "sync-complete",
+            "Sync complete",
+            &format!("{files} finished transferring."),
+        );
+    }
+
     if items.is_empty() {
         if !ui.transfer_rows.borrow().is_empty() {
             for tr in ui.transfer_rows.borrow_mut().drain(..) {
@@ -1107,7 +1647,7 @@ fn refresh_status(ui: &Rc<Ui>) {
                 pins,
                 ..
             })) => {
-                *ui.mounted.borrow_mut() = true;
+                set_mounted(&ui, true);
                 ui.mount_row
                     .set_subtitle(&format!("Mounted at {mountpoint}"));
                 let fraction = if budget == 0 {
@@ -1127,7 +1667,7 @@ fn refresh_status(ui: &Rc<Ui>) {
             // grey out the unpin buttons in place, but leave the last-known pin
             // rows and cache read-out so the page doesn't flicker on a blip.
             _ => {
-                *ui.mounted.borrow_mut() = false;
+                set_mounted(&ui, false);
                 ui.mount_row.set_subtitle("Not mounted");
                 for r in ui.pin_rows.borrow().iter() {
                     if let Some(b) = &r.unpin {
@@ -1236,22 +1776,36 @@ fn spawn_request(
 /// The factories that render entries — and the columns — need the [`Ui`] handle
 /// for activation and the right-click menu, so they're installed later in
 /// [`wire_browser`]; this builder only assembles the empty widgets.
-#[allow(clippy::type_complexity)]
-fn build_browser_page() -> (
-    gtk4::Widget,
-    (
-        gio::ListStore,
-        gtk4::Button,
-        gtk4::Box,
-        gtk4::Label,
-        gtk4::GridView,
-        gtk4::ColumnView,
-        gtk4::Button,
-        gtk4::SearchEntry,
-        gtk4::Button,
-        gtk4::Button,
-    ),
-) {
+///
+/// Empty / loading / error outcomes aren't a label under the header: the whole
+/// content area swaps to a centred [`adw::StatusPage`] (see [`browser_status`]),
+/// so "this folder is empty" and "the mount is down" read as first-class states
+/// rather than a stray line above a blank grid.
+struct BrowserWidgets {
+    model: gio::ListStore,
+    back: gtk4::Button,
+    crumb: gtk4::Box,
+    grid: gtk4::GridView,
+    column_view: gtk4::ColumnView,
+    /// Swaps the content area between the grid/list views and the status page.
+    content: gtk4::Stack,
+    /// The empty/loading/error surface shown in place of the views.
+    status: adw::StatusPage,
+    /// Sits in the status page; shown only when the mount service is down.
+    retry: gtk4::Button,
+    search: gtk4::SearchEntry,
+    new_folder: gtk4::Button,
+    upload: gtk4::Button,
+    /// Wraps the views + the details pane; the pane slides in on selection.
+    split: adw::OverlaySplitView,
+    details: DetailsWidgets,
+    /// The two selection models, so a selection change can drive the details pane
+    /// and so an action can re-read the entry the user has highlighted.
+    grid_selection: gtk4::SingleSelection,
+    list_selection: gtk4::SingleSelection,
+}
+
+fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
 
     let back = gtk4::Button::builder()
@@ -1318,25 +1872,29 @@ fn build_browser_page() -> (
     header.append(&search);
     header.append(&toggles);
 
-    let status = gtk4::Label::builder().wrap(true).build();
-    status.add_css_class("dim-label");
-    status.set_visible(false);
-
-    // Shown only when a load failed because the mount is down; restarts it.
+    // Empty / loading / error surface, shown in place of the views.
     let retry = gtk4::Button::builder()
         .label("Retry")
-        .halign(gtk4::Align::Start)
+        .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
     retry.set_visible(false);
-
-    let status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    status_box.append(&status);
-    status_box.append(&retry);
+    let status = adw::StatusPage::builder()
+        .icon_name("folder-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
 
     // Icon grid.
+    let grid_selection = gtk4::SingleSelection::builder()
+        .model(&model)
+        .autoselect(false)
+        .can_unselect(true)
+        .build();
     let grid = gtk4::GridView::builder()
-        .model(&gtk4::SingleSelection::new(Some(model.clone())))
+        .model(&grid_selection)
         .min_columns(2)
         .max_columns(10)
         .build();
@@ -1347,9 +1905,12 @@ fn build_browser_page() -> (
         .build();
 
     // Column list.
-    let column_view = gtk4::ColumnView::builder()
-        .model(&gtk4::SingleSelection::new(Some(model.clone())))
+    let list_selection = gtk4::SingleSelection::builder()
+        .model(&model)
+        .autoselect(false)
+        .can_unselect(true)
         .build();
+    let column_view = gtk4::ColumnView::builder().model(&list_selection).build();
     column_view.add_css_class("data-table");
     let column_scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
@@ -1374,30 +1935,304 @@ fn build_browser_page() -> (
         }
     });
 
+    // Outer stack: the views, or the status page when there's nothing to show.
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&view_stack, Some("views"));
+    content.add_named(&status, Some("status"));
+
+    // The details pane slides in from the right when an entry is selected.
+    let (details_pane, details) = build_details_pane();
+    let split = adw::OverlaySplitView::builder()
+        .sidebar_position(gtk4::PackType::End)
+        .collapsed(true)
+        .show_sidebar(false)
+        .max_sidebar_width(300.0)
+        .content(&content)
+        .sidebar(&details_pane)
+        .build();
+
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
     inner.set_margin_bottom(12);
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header);
-    inner.append(&status_box);
-    inner.append(&view_stack);
+    inner.append(&split);
 
     (
         inner.upcast(),
-        (
+        BrowserWidgets {
             model,
             back,
             crumb,
-            status,
             grid,
             column_view,
+            content,
+            status,
             retry,
             search,
             new_folder,
             upload,
-        ),
+            split,
+            details,
+            grid_selection,
+            list_selection,
+        },
     )
+}
+
+/// The widgets in the browser's details pane that a selection repaints.
+struct DetailsWidgets {
+    icon: gtk4::Image,
+    name: gtk4::Label,
+    kind: gtk4::Label,
+    size_row: adw::ActionRow,
+    modified_row: adw::ActionRow,
+    path_row: adw::ActionRow,
+    pin_row: adw::SwitchRow,
+    open_button: gtk4::Button,
+    rename_button: gtk4::Button,
+    trash_button: gtk4::Button,
+    close_button: gtk4::Button,
+}
+
+/// The details pane shown beside the file views: a big type icon over the entry's
+/// name, its properties, an offline (pin) toggle and the primary actions. Built
+/// empty; [`repaint_details`] fills it from the selected [`DirEntry`] and
+/// [`wire_details`] connects the buttons.
+fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
+    let close_button = gtk4::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Close details")
+        .halign(gtk4::Align::End)
+        .build();
+    close_button.add_css_class("flat");
+    close_button.add_css_class("circular");
+
+    let icon = gtk4::Image::builder()
+        .icon_name("text-x-generic-symbolic")
+        .pixel_size(64)
+        .build();
+    let name = gtk4::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .justify(gtk4::Justification::Center)
+        .build();
+    name.add_css_class("title-4");
+    let kind = gtk4::Label::new(None);
+    kind.add_css_class("dim-label");
+    kind.add_css_class("caption");
+
+    let head = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    head.set_margin_bottom(6);
+    head.append(&icon);
+    head.append(&name);
+    head.append(&kind);
+
+    let props = adw::PreferencesGroup::new();
+    let size_row = adw::ActionRow::builder()
+        .title("Size")
+        .subtitle("—")
+        .build();
+    size_row.add_css_class("property");
+    let modified_row = adw::ActionRow::builder()
+        .title("Modified")
+        .subtitle("—")
+        .build();
+    modified_row.add_css_class("property");
+    let path_row = adw::ActionRow::builder()
+        .title("Location")
+        .subtitle("—")
+        .subtitle_lines(3)
+        .build();
+    path_row.add_css_class("property");
+    props.add(&size_row);
+    props.add(&modified_row);
+    props.add(&path_row);
+
+    let offline = adw::PreferencesGroup::new();
+    let pin_row = adw::SwitchRow::builder()
+        .title("Available offline")
+        .subtitle("Keep a local copy on this device.")
+        .build();
+    offline.add(&pin_row);
+
+    let open_button = gtk4::Button::builder().label("Open").build();
+    open_button.add_css_class("suggested-action");
+    open_button.add_css_class("pill");
+    let rename_button = gtk4::Button::builder().label("Rename").build();
+    rename_button.add_css_class("pill");
+    let trash_button = gtk4::Button::builder().label("Move to Trash").build();
+    trash_button.add_css_class("destructive-action");
+    trash_button.add_css_class("pill");
+
+    let actions = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    actions.set_margin_top(6);
+    actions.append(&open_button);
+    actions.append(&rename_button);
+    actions.append(&trash_button);
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&close_button);
+    inner.append(&head);
+    inner.append(&props);
+    inner.append(&offline);
+    inner.append(&actions);
+
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&inner)
+        .build();
+    let pane = adw::ToolbarView::new();
+    pane.set_content(Some(&scroll));
+    pane.add_css_class("background");
+
+    (
+        pane.upcast(),
+        DetailsWidgets {
+            icon,
+            name,
+            kind,
+            size_row,
+            modified_row,
+            path_row,
+            pin_row,
+            open_button,
+            rename_button,
+            trash_button,
+            close_button,
+        },
+    )
+}
+
+/// Connect the details pane: mirror the grid's and list's selection into it, and
+/// wire its buttons back onto the entry it's showing.
+fn wire_details(ui: &Rc<Ui>) {
+    // Both views share one model but have their own selection, so watch both.
+    for selection in [ui.grid_selection.clone(), ui.list_selection.clone()] {
+        let ui_sel = ui.clone();
+        selection.connect_selection_changed(move |sel, _, _| {
+            match entry_at(sel.model().as_ref(), sel.selected()) {
+                Some(entry) => show_details(&ui_sel, &entry),
+                None => hide_details(&ui_sel),
+            }
+        });
+    }
+
+    let ui_close = ui.clone();
+    ui.details.close_button.connect_clicked(move |_| {
+        ui_close
+            .grid_selection
+            .set_selected(gtk4::INVALID_LIST_POSITION);
+        ui_close
+            .list_selection
+            .set_selected(gtk4::INVALID_LIST_POSITION);
+        hide_details(&ui_close);
+    });
+
+    let ui_open = ui.clone();
+    ui.details.open_button.connect_clicked(move |_| {
+        if let Some(entry) = ui_open.details_entry.borrow().clone() {
+            activate_entry(&ui_open, &entry);
+        }
+    });
+    let ui_rename = ui.clone();
+    ui.details.rename_button.connect_clicked(move |_| {
+        if let Some(entry) = ui_rename.details_entry.borrow().clone() {
+            prompt_rename(&ui_rename, &entry);
+        }
+    });
+    let ui_trash = ui.clone();
+    ui.details.trash_button.connect_clicked(move |_| {
+        if let Some(entry) = ui_trash.details_entry.borrow().clone() {
+            prompt_delete(&ui_trash, &entry);
+        }
+    });
+    let ui_pin = ui.clone();
+    ui.details.pin_row.connect_active_notify(move |row| {
+        if ui_pin.details_suppress.get() {
+            return;
+        }
+        let Some(entry) = ui_pin.details_entry.borrow().clone() else {
+            return;
+        };
+        // The switch reads the *desired* state; `toggle_pin` derives the request
+        // from the entry's current one, so only act when they actually differ.
+        if row.is_active() != entry.pinned {
+            toggle_pin(&ui_pin, &entry);
+        }
+    });
+}
+
+/// Reveal the details pane and paint it from `entry`.
+fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
+    ui.details_suppress.set(true);
+    let d = &ui.details;
+    d.icon.set_icon_name(Some(icon_base_for(entry)));
+    d.name.set_label(&entry.name);
+    d.kind
+        .set_label(if entry.is_dir { "Folder" } else { "File" });
+    d.size_row.set_subtitle(&if entry.is_dir {
+        "—".to_string()
+    } else {
+        human_bytes(entry.size)
+    });
+    d.size_row.set_visible(!entry.is_dir);
+    d.modified_row
+        .set_subtitle(&format_modified(entry.modified));
+    let rel = entry_rel(ui, entry);
+    let parent = match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    };
+    d.path_row.set_subtitle(if parent.is_empty() {
+        "Proton Drive"
+    } else {
+        parent
+    });
+    d.pin_row.set_active(entry.pinned);
+    d.pin_row.set_sensitive(*ui.mounted.borrow());
+    d.open_button
+        .set_label(if entry.is_dir { "Open folder" } else { "Open" });
+    ui.details_suppress.set(false);
+
+    *ui.details_entry.borrow_mut() = Some(entry.clone());
+    ui.browser_split.set_show_sidebar(true);
+}
+
+/// Hide the details pane and forget the entry it was showing, so a stale entry
+/// can't be acted on after the listing moves on.
+fn hide_details(ui: &Rc<Ui>) {
+    ui.browser_split.set_show_sidebar(false);
+    *ui.details_entry.borrow_mut() = None;
+}
+
+/// The entry highlighted in whichever browser view is on screen, if any. Backs the
+/// F2 / Delete shortcuts.
+fn selected_entry(ui: &Rc<Ui>) -> Option<DirEntry> {
+    ui.details_entry.borrow().clone()
+}
+
+/// Swap the Files content area to the status page, with a Retry button only when
+/// the failure is one the user can act on.
+fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.browser_status.set_icon_name(Some(icon));
+    ui.browser_status.set_title(title);
+    ui.browser_status.set_description(Some(description));
+    ui.browser_retry.set_visible(retry);
+    ui.browser_content.set_visible_child_name("status");
+    hide_details(ui);
+}
+
+/// Swap the Files content area back to the grid/list views.
+fn browser_views(ui: &Rc<Ui>) {
+    ui.browser_content.set_visible_child_name("views");
 }
 
 /// Install the entry factories, columns, activation handlers and the back
@@ -1703,9 +2538,13 @@ fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
             match result {
                 Ok(Ok(Response::FilePath { path })) => open_path(&path),
                 Ok(Ok(Response::Error { message })) => {
-                    tracing::error!("open file failed: {message}")
+                    toast_error(&ui, "Couldn't open file", &message)
                 }
-                _ => tracing::error!("open file request failed"),
+                _ => toast_error(
+                    &ui,
+                    "Couldn't open file",
+                    "The mount service didn't respond.",
+                ),
             }
         });
     }
@@ -1721,12 +2560,35 @@ fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
         Request::Pin { path: rel }
     };
     let rx = spawn_request(ui.dirs.control_socket(), req);
+    let name = entry.name.clone();
+    let pinned = entry.pinned;
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
-            Ok(Ok(Response::Error { message })) => tracing::error!("pin toggle failed: {message}"),
-            Ok(Ok(_)) => load_browser(&ui),
-            _ => tracing::error!("pin toggle request failed"),
+            Ok(Ok(Response::Error { message })) => {
+                toast_error(&ui, "Couldn't change offline state", &message);
+                // The details switch may be showing the state we failed to reach.
+                load_browser(&ui);
+            }
+            Ok(Ok(_)) => {
+                load_browser(&ui);
+                toast(
+                    &ui,
+                    &if pinned {
+                        format!("“{name}” is no longer kept offline")
+                    } else {
+                        format!("“{name}” is now available offline")
+                    },
+                );
+            }
+            _ => {
+                toast_error(
+                    &ui,
+                    "Couldn't change offline state",
+                    "The mount service didn't respond.",
+                );
+                load_browser(&ui);
+            }
         }
     });
 }
@@ -1809,9 +2671,14 @@ fn wire_browser_actions(ui: &Rc<Ui>, new_folder: &gtk4::Button, upload: &gtk4::B
 }
 
 /// Send a mutating browser request (rename / move / delete / mkdir / upload) on a
-/// worker thread, then reload the current listing on success or surface the
-/// daemon's error in a dialog. Mirrors the gallery upload flow.
-fn run_mutation(ui: &Rc<Ui>, req: Request) {
+/// worker thread, then reload the current listing and confirm with a toast, or
+/// report the daemon's error in one. `done` is the past-tense confirmation
+/// ("Renamed to “x”"); `failed` names the attempt ("Couldn't rename").
+fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'static str) {
+    if !*ui.mounted.borrow() {
+        toast_error(ui, failed, "Proton Drive isn't connected.");
+        return;
+    }
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();
@@ -1819,13 +2686,14 @@ fn run_mutation(ui: &Rc<Ui>, req: Request) {
         let result = rx.recv().await;
         ui.busy_end();
         match result {
-            Ok(Ok(Response::Ok { .. })) => load_browser(&ui),
-            Ok(Ok(Response::Error { message })) => alert(&ui, "Couldn't complete", &message),
-            _ => alert(
-                &ui,
-                "Couldn't complete",
-                "The mount service didn't respond.",
-            ),
+            Ok(Ok(Response::Ok { .. })) => {
+                // The listing the mutation changed is stale now; reload it, then
+                // confirm, so the toast lands over the updated view.
+                load_browser(&ui);
+                toast(&ui, &done);
+            }
+            Ok(Ok(Response::Error { message })) => toast_error(&ui, failed, &message),
+            _ => toast_error(&ui, failed, "The mount service didn't respond."),
         }
     });
 }
@@ -1859,12 +2727,15 @@ fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
         if new_name.is_empty() || new_name == original {
             return;
         }
+        let done = format!("Renamed to “{new_name}”");
         run_mutation(
             &ui,
             Request::Rename {
                 path: rel.clone(),
                 new_name,
             },
+            done,
+            "Couldn't rename",
         );
     });
     dialog.present(parent.as_ref());
@@ -1875,6 +2746,7 @@ fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
 fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
     let parent = ui_window(ui);
     let rel = entry_rel(ui, entry);
+    let name = entry.name.clone();
     let dialog = adw::AlertDialog::builder()
         .heading("Move")
         .body(format!(
@@ -1899,12 +2771,18 @@ fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
             return;
         }
         let new_parent = row.text().trim().trim_matches('/').to_string();
+        let done = match new_parent.as_str() {
+            "" => format!("Moved “{name}” to Proton Drive"),
+            dest => format!("Moved “{name}” to “{dest}”"),
+        };
         run_mutation(
             &ui,
             Request::Move {
                 path: rel.clone(),
                 new_parent,
             },
+            done,
+            "Couldn't move",
         );
     });
     dialog.present(parent.as_ref());
@@ -1914,6 +2792,7 @@ fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
 fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
     let win = ui_window(ui);
     let rel = entry_rel(ui, entry);
+    let name = entry.name.clone();
     let dialog = adw::AlertDialog::builder()
         .heading("Move to Trash")
         .body(format!("Move “{}” to Trash?", entry.name))
@@ -1927,7 +2806,12 @@ fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
     let ui = ui.clone();
     dialog.connect_response(None, move |_, resp| {
         if resp == "trash" {
-            run_mutation(&ui, Request::Delete { path: rel.clone() });
+            run_mutation(
+                &ui,
+                Request::Delete { path: rel.clone() },
+                format!("Moved “{name}” to Trash"),
+                "Couldn't move to Trash",
+            );
         }
     });
     dialog.present(win.as_ref());
@@ -1960,12 +2844,15 @@ fn prompt_new_folder(ui: &Rc<Ui>) {
         if name.is_empty() {
             return;
         }
+        let done = format!("Created “{name}”");
         run_mutation(
             &ui,
             Request::CreateFolder {
                 parent: parent.clone(),
                 name,
             },
+            done,
+            "Couldn't create folder",
         );
     });
     dialog.present(win.as_ref());
@@ -1988,10 +2875,11 @@ fn prompt_upload(ui: &Rc<Ui>) {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                alert(&ui, "Upload failed", &format!("Couldn't read file: {e}"));
+                toast_error(&ui, "Couldn't upload", &e.to_string());
                 return;
             }
         };
+        let done = format!("Uploaded “{name}”");
         run_mutation(
             &ui,
             Request::UploadFile {
@@ -1999,6 +2887,8 @@ fn prompt_upload(ui: &Rc<Ui>) {
                 name,
                 bytes,
             },
+            done,
+            "Couldn't upload",
         );
     });
 }
@@ -2006,16 +2896,6 @@ fn prompt_upload(ui: &Rc<Ui>) {
 /// The top-level window, for parenting dialogs.
 fn ui_window(ui: &Rc<Ui>) -> Option<gtk4::Window> {
     ui.stack.root().and_downcast::<gtk4::Window>()
-}
-
-/// Show a simple modal alert with a single OK button.
-fn alert(ui: &Rc<Ui>, heading: &str, body: &str) {
-    let dialog = adw::AlertDialog::builder()
-        .heading(heading)
-        .body(body)
-        .build();
-    dialog.add_response("ok", "OK");
-    dialog.present(ui_window(ui).as_ref());
 }
 
 /// The sync-state badge for an entry: `(icon, css-class)`, or `None` for folders
@@ -2091,12 +2971,15 @@ fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
         if src == dest_path || dest_path.starts_with(&format!("{src}/")) {
             return false;
         }
+        let done = format!("Moved into “{}”", dest.name);
         run_mutation(
             &ui,
             Request::Move {
                 path: src,
                 new_parent: dest_path,
             },
+            done,
+            "Couldn't move",
         );
         true
     });
@@ -2149,9 +3032,13 @@ fn load_browser(ui: &Rc<Ui>) {
     // Drop the previous folder's rows up front: a slow reply must not leave stale
     // entries visible, where clicking one would open with a wrong relative path.
     ui.browser_model.remove_all();
-    ui.browser_retry.set_visible(false);
-    ui.browser_status.set_label("Loading…");
-    ui.browser_status.set_visible(true);
+    browser_status(
+        ui,
+        "folder-symbolic",
+        "Loading…",
+        "Reading this folder.",
+        false,
+    );
 
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListDir { path });
@@ -2161,20 +3048,25 @@ fn load_browser(ui: &Rc<Ui>) {
         ui.busy_end();
         match result {
             Ok(Ok(Response::Entries { entries })) => repaint_browser(&ui, &entries),
-            Ok(Ok(Response::Error { message })) => browser_message(&ui, &message),
-            Ok(Ok(_)) => browser_message(&ui, "Unexpected reply from daemon."),
+            Ok(Ok(Response::Error { message })) => browser_failed(&ui, &message),
+            Ok(Ok(_)) => browser_failed(&ui, "Unexpected reply from the mount service."),
             Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
         }
     });
 }
 
-/// Clear the model and show a single status line instead. Hides the Retry button
-/// (used for "in-band" outcomes: empty folder, or an error the daemon returned).
-fn browser_message(ui: &Rc<Ui>, message: &str) {
+/// Clear the model and show the daemon's error on the status page. Used for
+/// in-band failures (a bad path, a permission error) — the mount is up, so Retry
+/// (which restarts the service) wouldn't help and isn't offered.
+fn browser_failed(ui: &Rc<Ui>, message: &str) {
     ui.browser_model.remove_all();
-    ui.browser_retry.set_visible(false);
-    ui.browser_status.set_label(message);
-    ui.browser_status.set_visible(true);
+    browser_status(
+        ui,
+        "dialog-warning-symbolic",
+        "Couldn't open this folder",
+        message,
+        false,
+    );
 }
 
 /// The daemon didn't answer. Distinguish *still starting* (auto-retry, no
@@ -2182,15 +3074,22 @@ fn browser_message(ui: &Rc<Ui>, message: &str) {
 /// once the systemd mount comes up but a real failure stays visible.
 fn browser_unreachable(ui: &Rc<Ui>) {
     if service::is_failed() || !service::is_active() {
-        ui.browser_status
-            .set_label("Couldn't reach Proton Drive. The mount service isn't running.");
-        ui.browser_status.set_visible(true);
-        ui.browser_retry.set_visible(true);
+        browser_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
         return;
     }
-    ui.browser_status.set_label("Connecting to Proton Drive…");
-    ui.browser_status.set_visible(true);
-    ui.browser_retry.set_visible(false);
+    browser_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
     let ui = ui.clone();
     glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
         // Only keep polling while the Files page is the one on screen.
@@ -2205,10 +3104,16 @@ fn browser_unreachable(ui: &Rc<Ui>) {
 fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ui.browser_model.remove_all();
     if entries.is_empty() {
-        browser_message(ui, "This folder is empty.");
+        browser_status(
+            ui,
+            "folder-open-symbolic",
+            "This folder is empty",
+            "Upload a file or create a folder to get started.",
+            false,
+        );
         return;
     }
-    ui.browser_status.set_visible(false);
+    browser_views(ui);
 
     let mut sorted = entries.to_vec();
     sorted.sort_by(|a, b| {
@@ -2249,9 +3154,13 @@ fn wire_search(ui: &Rc<Ui>) {
 /// (each hit carries its full path; see [`entry_rel`]).
 fn run_search(ui: &Rc<Ui>, query: &str) {
     ui.browser_model.remove_all();
-    ui.browser_retry.set_visible(false);
-    ui.browser_status.set_label("Searching…");
-    ui.browser_status.set_visible(true);
+    browser_status(
+        ui,
+        "system-search-symbolic",
+        "Searching…",
+        &format!("Looking for “{query}”."),
+        false,
+    );
 
     ui.busy_begin();
     let rx = spawn_request(
@@ -2272,8 +3181,8 @@ fn run_search(ui: &Rc<Ui>, query: &str) {
         }
         match result {
             Ok(Ok(Response::SearchResults { hits })) => repaint_search(&ui, &hits),
-            Ok(Ok(Response::Error { message })) => browser_message(&ui, &message),
-            Ok(Ok(_)) => browser_message(&ui, "Unexpected reply from daemon."),
+            Ok(Ok(Response::Error { message })) => browser_failed(&ui, &message),
+            Ok(Ok(_)) => browser_failed(&ui, "Unexpected reply from the mount service."),
             Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
         }
     });
@@ -2285,10 +3194,16 @@ fn run_search(ui: &Rc<Ui>, query: &str) {
 fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     ui.browser_model.remove_all();
     if hits.is_empty() {
-        browser_message(ui, "No matches.");
+        browser_status(
+            ui,
+            "system-search-symbolic",
+            "No matches",
+            "No files or folders match that search.",
+            false,
+        );
         return;
     }
-    ui.browser_status.set_visible(false);
+    browser_views(ui);
 
     let mut entries: Vec<DirEntry> = hits
         .iter()
@@ -2330,7 +3245,10 @@ struct GalleryWidgets {
     model: gio::ListStore,
     /// Day sections rendered by the ListView, derived from `model`.
     groups: gio::ListStore,
-    status: gtk4::Label,
+    /// Swaps between the timeline and the empty/loading/error status page.
+    content: gtk4::Stack,
+    status: adw::StatusPage,
+    subtitle: gtk4::Label,
     more: gtk4::Button,
     list: gtk4::ListView,
     scroll: gtk4::ScrolledWindow,
@@ -2338,14 +3256,16 @@ struct GalleryWidgets {
     upload: gtk4::Button,
 }
 
-/// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over a
-/// [`gtk4::FlowBox`] collage of that day's thumbnails at their original aspect
-/// ratios, plus a "Load more" button and a status label.
+/// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over
+/// that day's photos laid out as justified rows (see [`justify_rows`]) — every
+/// photo at its own aspect ratio, every row filled edge to edge.
 ///
 /// A ListView of sections rather than one flat GridView because GTK's grid has no
-/// row headers and forces square cells: the collage and the date headings both
-/// need per-row structure. The factory is installed by [`wire_gallery`], which has
-/// the [`Ui`] the tiles need (zoom level, click-to-open).
+/// row headers and forces square cells: the justified rows and the date headings
+/// both need per-row structure, and the ListView only realises the sections on
+/// screen, which is what keeps a 10,000-photo timeline cheap. The factory is
+/// installed by [`wire_gallery`], which has the [`Ui`] the tiles need (zoom
+/// level, thumbnail cache, click-to-open).
 fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
     let groups = gio::ListStore::new::<BoxedAnyObject>();
@@ -2357,18 +3277,25 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     list.add_css_class("gallery-sections");
 
-    let status = gtk4::Label::builder().wrap(true).build();
-    status.add_css_class("dim-label");
-    status.set_visible(false);
-
     // Shown only when a load failed because the mount is down; restarts it.
     let retry = gtk4::Button::builder()
         .label("Retry")
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
     retry.set_visible(false);
 
+    let status = adw::StatusPage::builder()
+        .icon_name("image-x-generic-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
+
+    // Kept as an explicit fallback: the timeline also pages itself in as the
+    // scroll nears the bottom (see [`wire_gallery`]), so reaching this button at
+    // all is unusual.
     let more = gtk4::Button::builder()
         .label("Load more")
         .halign(gtk4::Align::Center)
@@ -2376,29 +3303,54 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     more.add_css_class("pill");
     more.set_visible(false);
 
+    // Horizontal scrolling is never wanted: rows are justified to the viewport
+    // width, and a stray hscrollbar would fight the layout.
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&list)
         .build();
 
-    // Modern header: "Photos" title + "Upload Photo" action button
-    let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     let title_label = gtk4::Label::builder()
         .label("Photos")
         .halign(gtk4::Align::Start)
-        .hexpand(true)
         .build();
-    title_label.add_css_class("heading");
+    title_label.add_css_class("title-2");
+
+    let subtitle = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .visible(false)
+        .build();
+    subtitle.add_css_class("dim-label");
+    subtitle.add_css_class("caption");
+
+    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    titles.set_hexpand(true);
+    titles.append(&title_label);
+    titles.append(&subtitle);
 
     let upload = gtk4::Button::builder()
-        .label("Upload Photo")
+        .label("Upload")
         .icon_name("list-add-symbolic")
         .valign(gtk4::Align::Center)
         .build();
     upload.add_css_class("pill");
     upload.add_css_class("suggested-action");
-    header_box.append(&title_label);
+
+    let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header_box.append(&titles);
     header_box.append(&upload);
+
+    // The timeline (plus its pager) or the status page, never both.
+    let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    timeline.append(&scroll);
+    timeline.append(&more);
+
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&timeline, Some("timeline"));
+    content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
@@ -2406,17 +3358,16 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header_box);
-    inner.append(&status);
-    inner.append(&retry);
-    inner.append(&scroll);
-    inner.append(&more);
+    inner.append(&content);
 
     (
         inner.upcast(),
         GalleryWidgets {
             model,
             groups,
+            content,
             status,
+            subtitle,
             more,
             list,
             scroll,
@@ -2434,9 +3385,10 @@ fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindo
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
         let section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        section.set_margin_bottom(12);
+        section.set_margin_bottom(16);
         let heading = gtk4::Label::builder().halign(gtk4::Align::Start).build();
         heading.add_css_class("heading");
+        heading.add_css_class("gallery-day");
         section.append(&heading);
         item.set_child(Some(&section));
         item.set_activatable(false);
@@ -2452,15 +3404,57 @@ fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindo
         let heading = section.first_child().and_downcast::<gtk4::Label>().unwrap();
         heading.set_label(&group.heading);
 
-        // Drop the previous day's collage and build this one's. The FlowBox is
-        // rebuilt (not repopulated) so its child-activated handler closes over the
-        // photos it actually shows — ListView recycles the row widget itself.
-        while let Some(old) = heading.next_sibling() {
-            section.remove(&old);
+        fill_section(&ui_bind, &section, &group.photos);
+        // Remember the realised section so a learned aspect ratio or a resize can
+        // re-justify it in place, without rebuilding the ListStore (which would
+        // yank the scroll position back to the top).
+        ui_bind
+            .gallery_bound
+            .borrow_mut()
+            .insert(item.position(), section);
+    });
+
+    // ListView recycles section widgets, so a scrolled-away day must give up its
+    // claim on the widgets — otherwise a thumbnail landing late would paint into
+    // a tile that now shows a different day.
+    let ui_unbind = ui.clone();
+    factory.connect_unbind(move |_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        ui_unbind
+            .gallery_bound
+            .borrow_mut()
+            .remove(&item.position());
+        if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
+            let group = obj.borrow::<PhotoGroup>();
+            let mut wanted = ui_unbind.thumb_wanted.borrow_mut();
+            for photo in &group.photos {
+                wanted.remove(&photo.uid);
+            }
         }
-        section.append(&photo_collage(&ui_bind, &group.photos));
     });
     list.set_factory(Some(&factory));
+
+    // Rows are justified to the content width, so a resize re-justifies whatever
+    // is on screen (offscreen sections pick the new width up when they bind).
+    let ui_width = ui.clone();
+    list.connect_notify_local(Some("width"), move |list, _| {
+        let width = list.width();
+        if width > 0 && width != ui_width.gallery_width.get() {
+            ui_width.gallery_width.set(width);
+            schedule_relayout(&ui_width);
+        }
+    });
+
+    // Page the timeline in as the scroll nears the end, so "load more" is a
+    // fallback button rather than something the user has to hunt for.
+    let ui_scroll = ui.clone();
+    scroll.vadjustment().connect_value_changed(move |adj| {
+        let near_end = adj.value() + adj.page_size() >= adj.upper() - adj.page_size() * 0.5;
+        if near_end && ui_scroll.gallery_more.is_visible() && ui_scroll.gallery_more.is_sensitive()
+        {
+            load_gallery(&ui_scroll, true);
+        }
+    });
 
     // Ctrl+scroll zoom. Capture phase so the ScrolledWindow doesn't eat the event
     // and scroll the page out from under the gesture.
@@ -2570,16 +3564,16 @@ fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindo
                         Ok(Ok(Response::Ok { message })) => {
                             tracing::info!("Photo uploaded: {message}");
                             load_gallery(&ui_clone, false);
+                            toast(&ui_clone, "Photo uploaded");
                         }
                         Ok(Ok(Response::Error { message })) => {
-                            tracing::error!("Upload failed: {message}");
-                            show_error_dialog(&ui_clone, &format!("Upload failed: {message}"));
+                            toast_error(&ui_clone, "Couldn't upload photo", &message);
                         }
                         _ => {
-                            tracing::error!("Upload request failed");
-                            show_error_dialog(
+                            toast_error(
                                 &ui_clone,
-                                "Upload request failed (daemon unreachable).",
+                                "Couldn't upload photo",
+                                "The mount service didn't respond.",
                             );
                         }
                     }
@@ -2589,78 +3583,427 @@ fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindo
     });
 }
 
-/// One day's thumbnails as a masonry collage: a [`gtk4::FlowBox`] of pictures all
-/// [`Ui::gallery_tile`] tall and as wide as their own aspect ratio makes them, so
-/// rows justify like a phone gallery instead of square-cropping every photo.
-fn photo_collage(ui: &Rc<Ui>, photos: &[PhotoItem]) -> gtk4::FlowBox {
-    let tile = ui.gallery_tile.get();
-    let flow = gtk4::FlowBox::builder()
-        .selection_mode(gtk4::SelectionMode::None)
-        .homogeneous(false)
-        .row_spacing(6)
-        .column_spacing(6)
-        .min_children_per_line(1)
-        .max_children_per_line(64)
-        .build();
-
-    for photo in photos {
-        let picture = gtk4::Picture::builder()
-            .content_fit(gtk4::ContentFit::Cover)
-            .build();
-        picture.add_css_class("card");
-
-        // Width follows the thumbnail's own aspect ratio, clamped so a panorama
-        // can't take a whole row and a tall portrait still stays clickable.
-        let mut width = tile;
-        if let Some(path) = photo.thumb_path.as_deref()
-            && let Ok(texture) = gtk4::gdk::Texture::from_filename(path)
-        {
-            if texture.height() > 0 {
-                let ratio = f64::from(texture.width()) / f64::from(texture.height());
-                width = (f64::from(tile) * ratio).round() as i32;
-            }
-            picture.set_paintable(Some(&texture));
-        }
-        picture.set_height_request(tile);
-        picture.set_width_request(width.clamp(tile / 2, tile * 3));
-
-        flow.append(&gtk4::FlowBoxChild::builder().child(&picture).build());
-    }
-
-    let ui_activate = ui.clone();
-    let photos: Vec<PhotoItem> = photos.to_vec();
-    flow.connect_child_activated(move |_, child| {
-        if let Some(photo) = photos.get(child.index() as usize) {
-            open_photo_viewer(&ui_activate, photo.uid.clone());
-        }
-    });
-
-    flow
+/// One tile in a justified row: the photo, and the pixel size it was justified to.
+struct Tile {
+    photo: PhotoItem,
+    width: i32,
+    height: i32,
 }
 
-/// Step the thumbnail size by `delta` px and repaint, clamped to the zoom range.
+/// Break one day's photos into rows that each fill `width` exactly, at heights
+/// near [`Ui::gallery_tile`] — the layout every modern photo gallery uses, and
+/// the reason nothing here has to be cropped: each tile keeps its own aspect
+/// ratio, and it is the row *height* that flexes to make the widths add up.
+///
+/// Greedy, one pass: keep adding photos to the row: the more photos share it, the
+/// shorter it has to be to fit. The moment that height drops to the target, the
+/// row is as full as it should be and is emitted. The trailing row keeps the
+/// target height instead of being stretched, so a day with three photos doesn't
+/// blow them up to fill a screen-wide row.
+///
+/// Photos whose thumbnail hasn't been decoded yet are laid out at
+/// [`RATIO_UNKNOWN`]; [`Ui::store_texture`] reports the real ratio when it lands
+/// and the section is re-justified in place.
+fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec<Vec<Tile>> {
+    let ratios: Vec<f64> = photos.iter().map(|photo| ui.ratio(&photo.uid)).collect();
+    let target = f64::from(ui.gallery_tile.get());
+    let plan = plan_rows(&ratios, target, f64::from(width));
+
+    let mut photos = photos.iter();
+    plan.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .filter_map(|(width, height)| {
+                    photos.next().map(|photo| Tile {
+                        photo: photo.clone(),
+                        width,
+                        height,
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The row-packing math behind [`justify_rows`], over nothing but aspect ratios:
+/// takes each photo's ratio (w/h) in order and returns the pixel `(width,
+/// height)` of every tile, grouped into rows.
+fn plan_rows(ratios: &[f64], target: f64, width: f64) -> Vec<Vec<(i32, i32)>> {
+    let avail = width.max(f64::from(TILE_MIN));
+    let gap = f64::from(TILE_GAP);
+
+    // The height a row of `n` photos with `sum_ratio` total ratio must take for
+    // its widths (plus gaps) to add up to exactly `avail`.
+    let row_height = |sum_ratio: f64, n: usize| {
+        let gaps = gap * (n.saturating_sub(1)) as f64;
+        (avail - gaps) / sum_ratio
+    };
+
+    let mut rows: Vec<Vec<(i32, i32)>> = Vec::new();
+    let mut row: Vec<f64> = Vec::new();
+    let mut sum_ratio = 0.0;
+
+    for ratio in ratios {
+        let ratio = ratio.clamp(RATIO_MIN, RATIO_MAX);
+        row.push(ratio);
+        sum_ratio += ratio;
+
+        let height = row_height(sum_ratio, row.len());
+        if height <= target {
+            rows.push(size_row(&row, height, avail, true));
+            row.clear();
+            sum_ratio = 0.0;
+        }
+    }
+    if !row.is_empty() {
+        let height = row_height(sum_ratio, row.len()).min(target);
+        rows.push(size_row(&row, height, avail, false));
+    }
+    rows
+}
+
+/// Size one row's tiles at `height`. A `justified` row is nudged so its widths
+/// plus gaps hit `avail` exactly — rounding each width independently leaves a
+/// few px of ragged right edge, so the last tile absorbs the remainder.
+fn size_row(ratios: &[f64], height: f64, avail: f64, justified: bool) -> Vec<(i32, i32)> {
+    let height = height.round().max(1.0);
+    let mut sizes: Vec<(i32, i32)> = ratios
+        .iter()
+        .map(|ratio| ((ratio * height).round().max(1.0) as i32, height as i32))
+        .collect();
+
+    if justified {
+        let gaps = TILE_GAP * (sizes.len().saturating_sub(1)) as i32;
+        let used: i32 = sizes.iter().rev().skip(1).map(|(width, _)| *width).sum();
+        if let Some(last) = sizes.last_mut() {
+            last.0 = (avail as i32 - gaps - used).max(1);
+        }
+    }
+    sizes
+}
+
+/// (Re)build a bound day-section's tiles: justify this day's photos to the
+/// current content width and hand each tile whatever thumbnail is already in
+/// memory, queueing the rest. Replaces the section's rows in place, leaving the
+/// heading — so a re-justify never touches the ListView's model or scroll.
+fn fill_section(ui: &Rc<Ui>, section: &gtk4::Box, photos: &[PhotoItem]) {
+    let Some(heading) = section.first_child() else {
+        return;
+    };
+    while let Some(old) = heading.next_sibling() {
+        section.remove(&old);
+    }
+
+    let width = gallery_width(ui);
+    let rows = gtk4::Box::new(gtk4::Orientation::Vertical, TILE_GAP);
+    for row in justify_rows(ui, photos, width) {
+        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, TILE_GAP);
+        for tile in row {
+            row_box.append(&photo_tile(ui, tile));
+        }
+        rows.append(&row_box);
+    }
+    section.append(&rows);
+    schedule_thumbs(ui);
+}
+
+/// The width justified rows are laid out to: the ListView's own width, less a
+/// couple of px so a rounding error can't push a row into a horizontal overflow.
+/// Falls back to a sane guess before the first allocation.
+fn gallery_width(ui: &Rc<Ui>) -> i32 {
+    match ui.gallery_width.get() {
+        0 => 900,
+        w => (w - 2).max(TILE_MIN),
+    }
+}
+
+/// One photo tile: a fixed-size button wrapping the thumbnail. A button (rather
+/// than a bare picture) so the tile is focusable, keyboard-activatable and gets
+/// hover feedback for free.
+fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
+    let picture = gtk4::Picture::builder()
+        // The tile is exactly the thumbnail's own aspect ratio, so Cover scales
+        // it and crops nothing; it only bites during the brief window where the
+        // ratio is still a guess, and the re-justify then fixes the tile.
+        .content_fit(gtk4::ContentFit::Cover)
+        .can_shrink(true)
+        .build();
+
+    let button = gtk4::Button::builder()
+        .child(&picture)
+        .width_request(tile.width)
+        .height_request(tile.height)
+        .tooltip_text(format_capture_time(tile.photo.capture_time))
+        .build();
+    button.add_css_class("photo-tile");
+    button.add_css_class("flat");
+    // Clip the thumbnail to the tile's rounded corners.
+    button.set_overflow(gtk4::Overflow::Hidden);
+
+    want_thumb(ui, &tile.photo, &picture);
+
+    let ui_open = ui.clone();
+    let uid = tile.photo.uid.clone();
+    button.connect_clicked(move |_| open_photo_viewer(&ui_open, uid.clone()));
+    button
+}
+
+/// Give `picture` its thumbnail: straight from the texture cache when it's there,
+/// otherwise register the tile as waiting and get the thumbnail moving — decoding
+/// it if the daemon already had it cached on disk, or asking the daemon for it.
+///
+/// This is what makes the gallery on-demand: only tiles the ListView actually
+/// realises ever ask for an image.
+fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture) {
+    if let Some(texture) = ui.photo_tex.borrow().get(&photo.uid) {
+        picture.set_paintable(Some(texture));
+        return;
+    }
+    // No thumbnail will ever come for this one: leave the tile as its placeholder
+    // (still clickable — the full photo may open fine).
+    if ui.photo_nothumb.borrow().contains(&photo.uid) {
+        picture.add_css_class("photo-missing");
+        return;
+    }
+
+    ui.thumb_wanted
+        .borrow_mut()
+        .insert(photo.uid.clone(), picture.clone());
+
+    match photo.thumb_path.as_deref() {
+        Some(path) => {
+            ui.decode_queue
+                .borrow_mut()
+                .push_back((photo.uid.clone(), path.to_string()));
+            schedule_decode(ui);
+        }
+        None => {
+            let mut queue = ui.thumb_queue.borrow_mut();
+            if !queue.contains(&photo.uid) {
+                queue.push_back(photo.uid.clone());
+            }
+        }
+    }
+}
+
+/// Ask the daemon for the queued thumbnails after a short pause, so a fast scroll
+/// coalesces into one batch per settle rather than one per row it flew past.
+fn schedule_thumbs(ui: &Rc<Ui>) {
+    if ui.thumb_queue.borrow().is_empty() || ui.thumb_inflight.get() {
+        return;
+    }
+    if let Some(id) = ui.thumb_source.borrow_mut().take() {
+        id.remove();
+    }
+    let ui_flush = ui.clone();
+    let source = glib::timeout_add_local_once(THUMB_DEBOUNCE, move || {
+        ui_flush.thumb_source.borrow_mut().take();
+        flush_thumbs(&ui_flush);
+    });
+    *ui.thumb_source.borrow_mut() = Some(source);
+}
+
+/// Send one [`Request::PhotoThumbs`] batch for the tiles still on screen. Queued
+/// uids whose tile has scrolled away are dropped rather than fetched: the point
+/// of the batch is what the user is looking at *now*.
+fn flush_thumbs(ui: &Rc<Ui>) {
+    if ui.thumb_inflight.get() {
+        return;
+    }
+    let uids: Vec<String> = {
+        let mut queue = ui.thumb_queue.borrow_mut();
+        let wanted = ui.thumb_wanted.borrow();
+        let mut batch = Vec::new();
+        while batch.len() < THUMB_BATCH {
+            let Some(uid) = queue.pop_front() else { break };
+            if wanted.contains_key(&uid) {
+                batch.push(uid);
+            }
+        }
+        batch
+    };
+    if uids.is_empty() {
+        return;
+    }
+
+    ui.thumb_inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::PhotoThumbs { uids });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.thumb_inflight.set(false);
+        match result {
+            Ok(Ok(Response::Thumbs { items })) => {
+                let mut decode = ui.decode_queue.borrow_mut();
+                let mut nothumb = ui.photo_nothumb.borrow_mut();
+                for item in items {
+                    match item.path {
+                        Some(path) => decode.push_back((item.uid, path)),
+                        // The photo has no thumbnail at all (or its fetch failed):
+                        // remember that, so scrolling past it doesn't re-ask.
+                        None => {
+                            nothumb.insert(item.uid);
+                        }
+                    }
+                }
+                drop((decode, nothumb));
+                schedule_decode(&ui);
+            }
+            // A thumbnail that doesn't arrive is not worth a toast — the tile just
+            // stays a placeholder, and the next scroll past it tries again.
+            Ok(Ok(Response::Error { message })) => {
+                tracing::debug!("photo thumbs failed: {message}")
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => tracing::debug!("photo thumbs: no reply"),
+        }
+        // Whatever the batch did, more tiles may have queued up behind it.
+        schedule_thumbs(&ui);
+    });
+}
+
+/// Decode queued thumbnails into textures on an idle callback, a few per pass, so
+/// a big batch fills in progressively instead of freezing the scroll for the
+/// length of the whole decode.
+fn schedule_decode(ui: &Rc<Ui>) {
+    if ui.decode_idle.get() || ui.decode_queue.borrow().is_empty() {
+        return;
+    }
+    ui.decode_idle.set(true);
+
+    let ui = ui.clone();
+    glib::idle_add_local(move || {
+        let batch: Vec<(String, String)> = {
+            let mut queue = ui.decode_queue.borrow_mut();
+            (0..4).filter_map(|_| queue.pop_front()).collect()
+        };
+        let mut relayout = false;
+        for (uid, path) in batch {
+            let texture = match gtk4::gdk::Texture::from_filename(&path) {
+                Ok(texture) => texture,
+                Err(e) => {
+                    tracing::debug!("cannot decode thumbnail {path}: {e}");
+                    ui.photo_nothumb.borrow_mut().insert(uid);
+                    continue;
+                }
+            };
+            // A ratio we hadn't seen means the tile was sized against a guess.
+            relayout |= ui.store_texture(&uid, texture.clone());
+            if let Some(picture) = ui.thumb_wanted.borrow_mut().remove(&uid) {
+                picture.set_paintable(Some(&texture));
+            }
+        }
+        if relayout {
+            schedule_relayout(&ui);
+        }
+
+        if ui.decode_queue.borrow().is_empty() {
+            ui.decode_idle.set(false);
+            ui.save_ratios();
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Re-justify the sections on screen shortly. Debounced, because the triggers
+/// (a window resize, a zoom step, a burst of decoded thumbnails) all arrive in
+/// floods and only the final state matters.
+fn schedule_relayout(ui: &Rc<Ui>) {
+    if let Some(id) = ui.relayout_source.borrow_mut().take() {
+        id.remove();
+    }
+    let ui_relayout = ui.clone();
+    let source = glib::timeout_add_local_once(RELAYOUT_DEBOUNCE, move || {
+        ui_relayout.relayout_source.borrow_mut().take();
+        relayout_gallery(&ui_relayout);
+    });
+    *ui.relayout_source.borrow_mut() = Some(source);
+}
+
+/// Rebuild the tiles of the day sections currently on screen, at the current
+/// width, zoom and set of known aspect ratios. Sections that are *not* realised
+/// need no work: they justify themselves against the current state when the
+/// ListView binds them.
+fn relayout_gallery(ui: &Rc<Ui>) {
+    let bound: Vec<(u32, gtk4::Box)> = ui
+        .gallery_bound
+        .borrow()
+        .iter()
+        .map(|(pos, section)| (*pos, section.clone()))
+        .collect();
+    for (pos, section) in bound {
+        let Some(obj) = ui.gallery_groups.item(pos) else {
+            continue;
+        };
+        let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() else {
+            continue;
+        };
+        let photos = boxed.borrow::<PhotoGroup>().photos.clone();
+        fill_section(ui, &section, &photos);
+    }
+}
+
+/// Step the row height by `delta` px and re-justify, clamped to the zoom range.
 fn zoom_gallery(ui: &Rc<Ui>, delta: i32) {
     set_gallery_tile(ui, ui.gallery_tile.get() + delta);
 }
 
-/// Set the thumbnail size (clamped) and rebuild the sections at the new size.
+/// Set the row height (clamped) and re-justify the visible sections at it.
 fn set_gallery_tile(ui: &Rc<Ui>, tile: i32) {
     let tile = tile.clamp(TILE_MIN, TILE_MAX);
     if tile == ui.gallery_tile.get() {
         return;
     }
     ui.gallery_tile.set(tile);
-    repaint_gallery(ui);
+    schedule_relayout(ui);
 }
 
 /// Rebuild the day sections from the flat photo model. The timeline arrives
 /// newest-first, so photos of the same day are already contiguous — one pass
 /// splits them.
+///
+/// The groups are diffed into the existing store rather than replacing it: a
+/// "load more" only really changes the last day (the one the new page continues)
+/// and appends after it, and clearing the store instead would scroll the user
+/// back to the top of the timeline at the exact moment they asked for more.
 fn repaint_gallery(ui: &Rc<Ui>) {
-    ui.gallery_groups.remove_all();
-    for group in group_photos(&ui.gallery_model) {
-        ui.gallery_groups.append(&BoxedAnyObject::new(group));
+    let groups = group_photos(&ui.gallery_model);
+    let store = &ui.gallery_groups;
+
+    for (i, group) in groups.iter().enumerate() {
+        let i = i as u32;
+        let unchanged = store
+            .item(i)
+            .and_downcast::<BoxedAnyObject>()
+            .is_some_and(|old| {
+                let old = old.borrow::<PhotoGroup>();
+                old.heading == group.heading && old.photos.len() == group.photos.len()
+            });
+        if unchanged {
+            continue;
+        }
+        let boxed = BoxedAnyObject::new(PhotoGroup {
+            heading: group.heading.clone(),
+            photos: group.photos.clone(),
+        });
+        if i < store.n_items() {
+            store.splice(i, 1, &[boxed]);
+        } else {
+            store.append(&boxed);
+        }
     }
+    // Photos only ever get appended, so a shorter model means a fresh load.
+    if store.n_items() > groups.len() as u32 {
+        let len = groups.len() as u32;
+        store.splice(len, store.n_items() - len, &[] as &[BoxedAnyObject]);
+    }
+
+    let count = ui.gallery_model.n_items();
+    ui.gallery_subtitle.set_visible(count > 0);
+    ui.gallery_subtitle.set_label(&match count {
+        1 => "1 photo".to_string(),
+        n => format!("{n} photos"),
+    });
 }
 
 fn group_photos(model: &gio::ListStore) -> Vec<PhotoGroup> {
@@ -2708,10 +4051,6 @@ fn day_heading(secs: i64) -> String {
         .unwrap_or_else(|_| "Unknown date".into())
 }
 
-fn show_error_dialog(ui: &Rc<Ui>, message: &str) {
-    alert(ui, "Photo Operation", message);
-}
-
 fn find_photo_index(model: &gio::ListStore, uid: &str) -> Option<u32> {
     for i in 0..model.n_items() {
         if let Some(obj) = model.item(i)
@@ -2743,13 +4082,14 @@ struct Viewer {
     spinner: gtk4::Spinner,
     status: gtk4::Label,
     title: gtk4::Label,
+    counter: gtk4::Label,
     prev: gtk4::Button,
     next: gtk4::Button,
-    /// EXIF drawer: the toggle that reveals it, the body it fills in, and the
+    /// Details drawer: the toggle that reveals it, the rows it fills in, and the
     /// "Show on map" button (hidden when the photo carries no GPS tags).
     info_toggle: gtk4::ToggleButton,
     info_revealer: gtk4::Revealer,
-    info_body: gtk4::Label,
+    info_rows: gtk4::Box,
     info_map: gtk4::Button,
     /// Coordinates behind `info_map`, once a photo with GPS tags is shown.
     coords: RefCell<Option<(f64, f64)>>,
@@ -2757,25 +4097,41 @@ struct Viewer {
     uid: RefCell<String>,
     /// On-disk path of the full-size photo, once it has been downloaded.
     path: RefCell<Option<String>>,
+    /// True while the full-size photo is still downloading and what's on screen is
+    /// the upscaled thumbnail — a click-outside-to-close hit test has to size the
+    /// image from the *thumbnail's* ratio in that window, but more importantly a
+    /// late reply for a photo the user has already navigated away from must not
+    /// overwrite the new one. Guarded by comparing against `uid`.
+    loading: Cell<bool>,
 }
 
-/// Camera/exposure/location facts pulled from a photo's own EXIF tags.
+/// Camera/exposure/location facts pulled from a photo's own EXIF tags, as
+/// label/value pairs for the details drawer.
 struct ExifInfo {
-    /// Rendered "Camera: … / Exposure: …" lines, empty when the file has no EXIF.
-    lines: Vec<String>,
+    /// `("Camera", "Apple iPhone 15")` and friends; empty when the file has no
+    /// EXIF at all, which is normal for screenshots and re-encoded images.
+    fields: Vec<(&'static str, String)>,
     /// Decimal degrees, if the photo is geotagged.
     coords: Option<(f64, f64)>,
 }
 
-/// Download the photo behind `uid` into the cache and show it, then fill the EXIF
-/// drawer from the file that lands on disk.
+/// Show the photo behind `uid`: paint its (already cached) thumbnail immediately
+/// so the lightbox never opens on a blank screen, ask the daemon for the
+/// full-size file, and swap it in — plus its EXIF — when it lands.
 fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     viewer.spinner.set_visible(true);
     viewer.spinner.start();
-    viewer.picture.set_paintable(gtk4::gdk::Paintable::NONE);
     viewer.status.set_visible(false);
+    viewer.loading.set(true);
     *viewer.path.borrow_mut() = None;
-    clear_exif(viewer);
+    clear_info(viewer);
+
+    // The thumbnail the gallery already decoded stands in for the full photo
+    // while it downloads: blurry for a moment beats black for a second.
+    match ui.photo_tex.borrow().get(&uid) {
+        Some(texture) => viewer.picture.set_paintable(Some(texture)),
+        None => viewer.picture.set_paintable(gtk4::gdk::Paintable::NONE),
+    }
 
     let rx = spawn_request(
         ui.dirs.control_socket(),
@@ -2784,53 +4140,118 @@ fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     let viewer = viewer.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
+        // The user may have moved on while this was in flight; that photo's own
+        // request owns the viewer now.
+        if *viewer.uid.borrow() != uid {
+            return;
+        }
         viewer.spinner.stop();
         viewer.spinner.set_visible(false);
+        viewer.loading.set(false);
+
+        let fail = |message: &str| {
+            viewer.status.set_label(message);
+            viewer.status.set_visible(true);
+        };
         match result {
             Ok(Ok(Response::FilePath { path })) => match gtk4::gdk::Texture::from_filename(&path) {
                 Ok(texture) => {
                     viewer.picture.set_paintable(Some(&texture));
                     *viewer.path.borrow_mut() = Some(path.clone());
-                    show_exif(&viewer, read_exif(&path));
+                    show_info(&viewer, &path, read_exif(&path));
                 }
                 Err(e) => {
                     tracing::error!("Failed to load texture for {path}: {e}");
-                    viewer.status.set_label("Couldn't render this photo.");
-                    viewer.status.set_visible(true);
+                    fail("Couldn't render this photo.");
                 }
             },
-            Ok(Ok(Response::Error { message })) => {
-                viewer.status.set_label(&message);
-                viewer.status.set_visible(true);
-            }
-            Ok(Ok(_)) => {
-                viewer.status.set_label("Unexpected reply from daemon.");
-                viewer.status.set_visible(true);
-            }
-            Ok(Err(_)) | Err(_) => {
-                viewer.status.set_label("Couldn't reach Proton Drive.");
-                viewer.status.set_visible(true);
-            }
+            Ok(Ok(Response::Error { message })) => fail(&message),
+            Ok(Ok(_)) => fail("Unexpected reply from the mount service."),
+            Ok(Err(_)) | Err(_) => fail("Couldn't reach Proton Drive."),
         }
     });
 }
 
-/// Reset the EXIF drawer while the next photo is in flight, so it never shows the
-/// previous photo's camera against the new image.
-fn clear_exif(viewer: &Rc<Viewer>) {
-    *viewer.coords.borrow_mut() = None;
-    viewer.info_body.set_label("Reading photo details…");
-    viewer.info_map.set_visible(false);
+/// Warm the cache with the photo `delta` steps away, so stepping there is
+/// instant. Fire-and-forget: the daemon serves control connections concurrently,
+/// so this rides alongside whatever the user does next, and a failure here is
+/// simply a photo that downloads on arrival like it used to.
+fn prefetch_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, delta: i32) {
+    let model = &ui.gallery_model;
+    let current = find_photo_index(model, &viewer.uid.borrow()).unwrap_or(0) as i32;
+    let index = current + delta;
+    if index < 0 || index >= model.n_items() as i32 {
+        return;
+    }
+    let Some(photo) = model
+        .item(index as u32)
+        .and_downcast::<BoxedAnyObject>()
+        .map(|boxed| boxed.borrow::<PhotoItem>().clone())
+    else {
+        return;
+    };
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::OpenPhoto { uid: photo.uid },
+    );
+    glib::spawn_future_local(async move {
+        let _ = rx.recv().await;
+    });
 }
 
-fn show_exif(viewer: &Rc<Viewer>, info: ExifInfo) {
-    if info.lines.is_empty() {
-        viewer
-            .info_body
-            .set_label("No EXIF metadata in this photo.");
-    } else {
-        viewer.info_body.set_label(&info.lines.join("\n"));
+/// Reset the details drawer while the next photo is in flight, so it never shows
+/// the previous photo's camera against the new image.
+fn clear_info(viewer: &Rc<Viewer>) {
+    *viewer.coords.borrow_mut() = None;
+    viewer.info_map.set_visible(false);
+    while let Some(row) = viewer.info_rows.first_child() {
+        viewer.info_rows.remove(&row);
     }
+    let label = gtk4::Label::builder()
+        .label("Reading photo details…")
+        .halign(gtk4::Align::Start)
+        .build();
+    label.add_css_class("dim-label");
+    viewer.info_rows.append(&label);
+}
+
+/// Fill the details drawer for the photo now on screen: its own file facts
+/// (size, dimensions) plus whatever EXIF it carries.
+fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
+    while let Some(row) = viewer.info_rows.first_child() {
+        viewer.info_rows.remove(&row);
+    }
+
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    if let Ok(meta) = std::fs::metadata(path) {
+        fields.push(("Size", human_bytes(meta.len())));
+    }
+    fields.extend(info.fields.iter().map(|(k, v)| (*k, v.clone())));
+
+    if fields.is_empty() {
+        let label = gtk4::Label::builder()
+            .label("This photo carries no metadata.")
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .build();
+        label.add_css_class("dim-label");
+        viewer.info_rows.append(&label);
+    } else {
+        let group = gtk4::ListBox::new();
+        group.set_selection_mode(gtk4::SelectionMode::None);
+        group.add_css_class("boxed-list");
+        for (label, value) in fields {
+            let row = adw::ActionRow::builder()
+                .title(label)
+                .subtitle(value)
+                .subtitle_selectable(true)
+                .build();
+            row.add_css_class("property");
+            group.append(&row);
+        }
+        viewer.info_rows.append(&group);
+    }
+
     viewer.info_map.set_visible(info.coords.is_some());
     *viewer.coords.borrow_mut() = info.coords;
 }
@@ -2839,7 +4260,7 @@ fn show_exif(viewer: &Rc<Viewer>, info: ExifInfo) {
 /// disk. Anything missing is simply left out — phone screenshots and re-encoded
 /// images legitimately carry no EXIF at all.
 fn read_exif(path: &str) -> ExifInfo {
-    let mut lines = Vec::new();
+    let mut fields: Vec<(&'static str, String)> = Vec::new();
     let mut coords = None;
 
     let reader = match std::fs::File::open(path) {
@@ -2848,13 +4269,13 @@ fn read_exif(path: &str) -> ExifInfo {
                 Ok(reader) => reader,
                 Err(e) => {
                     tracing::debug!("no exif in {path}: {e}");
-                    return ExifInfo { lines, coords };
+                    return ExifInfo { fields, coords };
                 }
             }
         }
         Err(e) => {
             tracing::warn!("cannot open {path} for exif: {e}");
-            return ExifInfo { lines, coords };
+            return ExifInfo { fields, coords };
         }
     };
 
@@ -2864,16 +4285,26 @@ fn read_exif(path: &str) -> ExifInfo {
             .map(|f| f.display_value().with_unit(&reader).to_string())
     };
 
+    if let Some(size) = field(exif::Tag::PixelXDimension)
+        .zip(field(exif::Tag::PixelYDimension))
+        .map(|(w, h)| format!("{w} × {h}"))
+    {
+        fields.push(("Dimensions", size));
+    }
+    if let Some(taken) = field(exif::Tag::DateTimeOriginal) {
+        fields.push(("Taken", taken));
+    }
+
     let camera = [exif::Tag::Make, exif::Tag::Model]
         .iter()
         .filter_map(|tag| field(*tag))
         .collect::<Vec<_>>()
         .join(" ");
     if !camera.is_empty() {
-        lines.push(format!("Camera: {camera}"));
+        fields.push(("Camera", camera));
     }
     if let Some(lens) = field(exif::Tag::LensModel) {
-        lines.push(format!("Lens: {lens}"));
+        fields.push(("Lens", lens));
     }
 
     let exposure: Vec<String> = [
@@ -2886,27 +4317,17 @@ fn read_exif(path: &str) -> ExifInfo {
     .filter_map(|tag| field(*tag))
     .collect();
     if !exposure.is_empty() {
-        lines.push(format!("Exposure: {}", exposure.join(" · ")));
-    }
-
-    if let Some(taken) = field(exif::Tag::DateTimeOriginal) {
-        lines.push(format!("Taken: {taken}"));
-    }
-    if let Some(size) = field(exif::Tag::PixelXDimension)
-        .zip(field(exif::Tag::PixelYDimension))
-        .map(|(w, h)| format!("{w} × {h}"))
-    {
-        lines.push(format!("Dimensions: {size}"));
+        fields.push(("Exposure", exposure.join(" · ")));
     }
 
     if let Some(lat) = gps_degrees(&reader, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef)
         && let Some(lon) = gps_degrees(&reader, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef)
     {
-        lines.push(format!("Location: {lat:.5}, {lon:.5}"));
+        fields.push(("Location", format!("{lat:.5}, {lon:.5}")));
         coords = Some((lat, lon));
     }
 
-    ExifInfo { lines, coords }
+    ExifInfo { fields, coords }
 }
 
 /// Convert one GPS coordinate from EXIF's degrees/minutes/seconds rationals to
@@ -2968,27 +4389,37 @@ fn navigate_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, delta: i32) {
     let photo = boxed.borrow::<PhotoItem>().clone();
 
     *viewer.uid.borrow_mut() = photo.uid.clone();
-
-    viewer.prev.set_sensitive(next_idx > 0);
-    viewer.next.set_sensitive(next_idx < n - 1);
-
-    let date_str = format_capture_time(photo.capture_time);
-    viewer
-        .title
-        .set_label(&format!("Photo {} of {} • {}", next_idx + 1, n, date_str));
-
+    show_photo_position(viewer, next_idx, n, photo.capture_time);
     load_photo(ui, viewer, photo.uid.clone());
+    // Keep walking in the same direction: the next one is likely where they're
+    // headed, so have it in the cache before they ask.
+    prefetch_photo(ui, viewer, delta.signum());
 }
 
+/// Set the lightbox's title (the photo's date) and its "12 of 340" counter.
+fn show_photo_position(viewer: &Rc<Viewer>, index: u32, total: u32, capture_time: i64) {
+    viewer.prev.set_sensitive(index > 0);
+    viewer.next.set_sensitive(index + 1 < total);
+    viewer.title.set_label(&format_capture_time(capture_time));
+    viewer
+        .counter
+        .set_label(&format!("{} of {total}", index + 1));
+}
+
+/// The in-app lightbox: the photo, edge-to-edge on a dark backdrop, with a
+/// floating top bar, prev/next affordances and a details drawer.
+///
+/// Closing it is deliberately hard to get wrong — Escape, `q`, Ctrl+W, the close
+/// button, or a click on the backdrop beside the photo all dismiss it.
 fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
 
     let window = gtk4::Window::builder()
-        .title("Photo Viewer")
+        .title("Photo")
         .modal(true)
         .transient_for(&parent)
-        .default_width(800)
-        .default_height(600)
+        .default_width(1100)
+        .default_height(760)
         .build();
     window.add_css_class("photo-viewer-window");
 
@@ -3003,7 +4434,7 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let prev_btn = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Previous Photo")
+        .tooltip_text("Previous (←)")
         .halign(gtk4::Align::Start)
         .valign(gtk4::Align::Center)
         .build();
@@ -3014,7 +4445,7 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let next_btn = gtk4::Button::builder()
         .icon_name("go-next-symbolic")
-        .tooltip_text("Next Photo")
+        .tooltip_text("Next (→)")
         .halign(gtk4::Align::End)
         .valign(gtk4::Align::Center)
         .build();
@@ -3023,83 +4454,109 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     next_btn.add_css_class("viewer-nav-btn");
     overlay.add_overlay(&next_btn);
 
-    let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    top_bar.add_css_class("viewer-top-bar");
-    top_bar.set_valign(gtk4::Align::Start);
-    top_bar.set_hexpand(true);
-
+    // Top bar: the photo's date and position on the left, actions on the right,
+    // over a gradient so white controls stay legible on a bright photo.
     let title_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
-        .hexpand(true)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
     title_label.add_css_class("viewer-title");
-    top_bar.append(&title_label);
+
+    let counter_label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+    counter_label.add_css_class("viewer-counter");
+
+    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+    titles.set_hexpand(true);
+    titles.set_valign(gtk4::Align::Center);
+    titles.append(&title_label);
+    titles.append(&counter_label);
+
+    let action = |icon: &str, tooltip: &str| {
+        let button = gtk4::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(tooltip)
+            .valign(gtk4::Align::Center)
+            .build();
+        button.add_css_class("flat");
+        button.add_css_class("viewer-action-btn");
+        button
+    };
 
     let info_toggle = gtk4::ToggleButton::builder()
-        .icon_name("info-symbolic")
-        .tooltip_text("Photo Details")
+        .icon_name("info-outline-symbolic")
+        .tooltip_text("Details (i)")
+        .valign(gtk4::Align::Center)
         .build();
     info_toggle.add_css_class("flat");
     info_toggle.add_css_class("viewer-action-btn");
+
+    let download_btn = action("document-save-symbolic", "Save a copy…");
+    let open_ext_btn = action("document-open-symbolic", "Open with another app");
+    let close_btn = action("window-close-symbolic", "Close (Esc)");
+    close_btn.add_css_class("viewer-close-btn");
+
+    let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    top_bar.add_css_class("viewer-top-bar");
+    top_bar.set_valign(gtk4::Align::Start);
+    top_bar.set_hexpand(true);
+    top_bar.append(&titles);
     top_bar.append(&info_toggle);
-
-    let download_btn = gtk4::Button::builder()
-        .icon_name("document-save-symbolic")
-        .tooltip_text("Download to Disk")
-        .build();
-    download_btn.add_css_class("flat");
-    download_btn.add_css_class("viewer-action-btn");
     top_bar.append(&download_btn);
-
-    let open_ext_btn = gtk4::Button::builder()
-        .icon_name("document-open-symbolic")
-        .tooltip_text("Open in External App")
-        .build();
-    open_ext_btn.add_css_class("flat");
-    open_ext_btn.add_css_class("viewer-action-btn");
     top_bar.append(&open_ext_btn);
-
-    let close_btn = gtk4::Button::builder()
-        .icon_name("window-close-symbolic")
-        .tooltip_text("Close")
-        .build();
-    close_btn.add_css_class("flat");
-    close_btn.add_css_class("viewer-action-btn");
     top_bar.append(&close_btn);
-
     overlay.add_overlay(&top_bar);
 
-    // EXIF drawer: slides in from the right over the photo, filled from the file
-    // once it lands on disk.
-    let info_body = gtk4::Label::builder()
-        .halign(gtk4::Align::Start)
-        .xalign(0.0)
-        .wrap(true)
-        .selectable(true)
-        .build();
+    // Details drawer: slides in from the right as a real surface (not a wash of
+    // black over the photo), with its own header and its own way out.
+    let info_rows = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+
     let info_map = gtk4::Button::builder()
         .label("Show on map")
+        .icon_name("map-symbolic")
         .halign(gtk4::Align::Start)
         .build();
     info_map.add_css_class("pill");
     info_map.set_visible(false);
 
-    let info_panel = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    info_panel.add_css_class("viewer-info-panel");
-    info_panel.set_margin_top(56);
-    info_panel.set_margin_bottom(12);
-    info_panel.set_margin_start(12);
-    info_panel.set_margin_end(12);
-    info_panel.set_width_request(260);
     let info_title = gtk4::Label::builder()
         .label("Details")
         .halign(gtk4::Align::Start)
+        .hexpand(true)
         .build();
     info_title.add_css_class("heading");
-    info_panel.append(&info_title);
-    info_panel.append(&info_body);
-    info_panel.append(&info_map);
+
+    let info_close = gtk4::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Hide details")
+        .build();
+    info_close.add_css_class("flat");
+    info_close.add_css_class("circular");
+
+    let info_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    info_header.append(&info_title);
+    info_header.append(&info_close);
+
+    let info_body = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    info_body.set_margin_top(16);
+    info_body.set_margin_bottom(16);
+    info_body.set_margin_start(16);
+    info_body.set_margin_end(16);
+    info_body.append(&info_header);
+    info_body.append(&info_rows);
+    info_body.append(&info_map);
+
+    // Scrolled, because a photo with a full EXIF block plus a location can
+    // outgrow a short window.
+    let info_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&info_body)
+        .build();
+
+    let info_panel = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    info_panel.add_css_class("viewer-info-panel");
+    info_panel.set_width_request(320);
+    info_panel.append(&info_scroll);
 
     let info_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
@@ -3115,6 +4572,7 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         .width_request(48)
         .height_request(48)
         .build();
+    spinner.add_css_class("viewer-spinner");
     overlay.add_overlay(&spinner);
 
     let status_label = gtk4::Label::builder()
@@ -3129,41 +4587,34 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     window.set_child(Some(&overlay));
 
     let viewer = Rc::new(Viewer {
-        picture,
+        picture: picture.clone(),
         spinner,
         status: status_label,
         title: title_label,
+        counter: counter_label,
         prev: prev_btn.clone(),
         next: next_btn.clone(),
         info_toggle: info_toggle.clone(),
         info_revealer: info_revealer.clone(),
-        info_body,
+        info_rows,
         info_map: info_map.clone(),
         coords: RefCell::new(None),
         uid: RefCell::new(initial_uid.clone()),
         path: RefCell::new(None),
+        loading: Cell::new(false),
     });
 
     let n = ui.gallery_model.n_items();
     let initial_idx = find_photo_index(&ui.gallery_model, &initial_uid).unwrap_or(0);
-    viewer.prev.set_sensitive(initial_idx > 0);
-    viewer.next.set_sensitive(initial_idx < n - 1);
-
-    let mut initial_capture_time = 0;
-    if let Some(obj) = ui.gallery_model.item(initial_idx)
-        && let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>()
-    {
-        initial_capture_time = boxed.borrow::<PhotoItem>().capture_time;
-    }
-    let date_str = format_capture_time(initial_capture_time);
-    viewer.title.set_label(&format!(
-        "Photo {} of {} • {}",
-        initial_idx + 1,
-        n,
-        date_str
-    ));
+    let capture_time = ui
+        .gallery_model
+        .item(initial_idx)
+        .and_downcast::<BoxedAnyObject>()
+        .map_or(0, |boxed| boxed.borrow::<PhotoItem>().capture_time);
+    show_photo_position(&viewer, initial_idx, n, capture_time);
 
     load_photo(ui, &viewer, initial_uid);
+    prefetch_photo(ui, &viewer, 1);
 
     let w_close = window.clone();
     close_btn.connect_clicked(move |_| {
@@ -3176,6 +4627,9 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
             .info_revealer
             .set_reveal_child(toggle.is_active());
     });
+
+    let toggle_off = info_toggle.clone();
+    info_close.connect_clicked(move |_| toggle_off.set_active(false));
 
     let viewer_map = viewer.clone();
     info_map.connect_clicked(move |_| {
@@ -3214,60 +4668,93 @@ fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         navigate_photo(&ui_next, &viewer_next, 1);
     });
 
+    // Click the backdrop — the dark area beside the photo — to dismiss, the way
+    // every other lightbox behaves. Clicks on the photo itself are left alone, so
+    // reaching for the image doesn't fling the window shut.
+    let backdrop = gtk4::GestureClick::new();
+    let viewer_click = viewer.clone();
+    let w_click = window.clone();
+    backdrop.connect_released(move |_, _, x, y| {
+        if !over_photo(&viewer_click.picture, x, y) {
+            w_click.close();
+        }
+    });
+    picture.add_controller(backdrop);
+
     let key_controller = gtk4::EventControllerKey::new();
     let ui_key = ui.clone();
     let viewer_key = viewer.clone();
     let w_key = window.clone();
-    key_controller.connect_key_pressed(move |_, key, _keycode, _state| {
+    key_controller.connect_key_pressed(move |_, key, _keycode, state| {
+        let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         match key.name().as_deref() {
-            Some("Left") => {
-                let current_idx =
-                    find_photo_index(&ui_key.gallery_model, &viewer_key.uid.borrow()).unwrap_or(0);
-                if current_idx > 0 {
-                    navigate_photo(&ui_key, &viewer_key, -1);
+            Some("Left" | "Up" | "BackSpace") => navigate_photo(&ui_key, &viewer_key, -1),
+            Some("Right" | "Down" | "space") => navigate_photo(&ui_key, &viewer_key, 1),
+            Some("Home") => navigate_photo(&ui_key, &viewer_key, i32::MIN / 2),
+            Some("End") => navigate_photo(&ui_key, &viewer_key, i32::MAX / 2),
+            Some("i") => viewer_key
+                .info_toggle
+                .set_active(!viewer_key.info_toggle.is_active()),
+            Some("f" | "F11") => {
+                if w_key.is_fullscreen() {
+                    w_key.unfullscreen();
+                } else {
+                    w_key.fullscreen();
                 }
-                glib::Propagation::Stop
             }
-            Some("Right") => {
-                let n = ui_key.gallery_model.n_items();
-                let current_idx =
-                    find_photo_index(&ui_key.gallery_model, &viewer_key.uid.borrow()).unwrap_or(0);
-                if current_idx + 1 < n {
-                    navigate_photo(&ui_key, &viewer_key, 1);
-                }
-                glib::Propagation::Stop
-            }
-            Some("i") => {
-                viewer_key
-                    .info_toggle
-                    .set_active(!viewer_key.info_toggle.is_active());
-                glib::Propagation::Stop
-            }
-            Some("Escape") => {
-                w_key.close();
-                glib::Propagation::Stop
-            }
-            _ => glib::Propagation::Proceed,
+            Some("Escape" | "q") => w_key.close(),
+            Some("w") if ctrl => w_key.close(),
+            _ => return glib::Propagation::Proceed,
         }
+        glib::Propagation::Stop
     });
     window.add_controller(key_controller);
 
     window.present();
 }
 
+/// Whether `(x, y)` — in `picture`'s coordinates — lands on the photo itself
+/// rather than the backdrop around it. [`gtk4::ContentFit::Contain`] centres the
+/// image and letterboxes the rest, so the drawn rectangle is the widget scaled
+/// down by whichever axis binds.
+fn over_photo(picture: &gtk4::Picture, x: f64, y: f64) -> bool {
+    let (width, height) = (f64::from(picture.width()), f64::from(picture.height()));
+    let Some(paintable) = picture.paintable() else {
+        return false;
+    };
+    let (iw, ih) = (
+        f64::from(paintable.intrinsic_width()),
+        f64::from(paintable.intrinsic_height()),
+    );
+    if iw <= 0.0 || ih <= 0.0 {
+        return false;
+    }
+
+    let scale = (width / iw).min(height / ih);
+    let (drawn_w, drawn_h) = (iw * scale, ih * scale);
+    let (left, top) = ((width - drawn_w) / 2.0, (height - drawn_h) / 2.0);
+    x >= left && x <= left + drawn_w && y >= top && y <= top + drawn_h
+}
+
 /// Fetch a timeline page from the daemon. When `append` is false the model is
 /// cleared first (fresh load); otherwise the next page is tacked on.
 fn load_gallery(ui: &Rc<Ui>, append: bool) {
-    if append {
-        ui.gallery_status.set_visible(false);
-    } else {
-        // Fresh load: clear the grid and show Loading until the first page lands.
+    if ui.gallery_loading.get() {
+        return;
+    }
+    if !append {
+        // Fresh load: clear the timeline and show Loading until the first page lands.
         ui.gallery_model.remove_all();
-        ui.gallery_retry.set_visible(false);
-        ui.gallery_status.set_label("Loading…");
-        ui.gallery_status.set_visible(true);
+        gallery_status(
+            ui,
+            "image-x-generic-symbolic",
+            "Loading photos…",
+            "Reading your Proton Drive timeline.",
+            false,
+        );
     }
     let offset = ui.gallery_model.n_items() as usize;
+    ui.gallery_loading.set(true);
     ui.gallery_more.set_sensitive(false);
 
     ui.busy_begin();
@@ -3282,11 +4769,18 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
+        ui.gallery_loading.set(false);
         ui.gallery_more.set_sensitive(true);
         match result {
             Ok(Ok(Response::Photos { available, items })) => {
                 if !available {
-                    gallery_message(&ui, "This account has no photos.");
+                    gallery_status(
+                        &ui,
+                        "image-missing-symbolic",
+                        "No photo library",
+                        "This Proton account doesn't have Photos enabled.",
+                        false,
+                    );
                     return;
                 }
                 for item in &items {
@@ -3294,42 +4788,79 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 }
                 repaint_gallery(&ui);
                 if ui.gallery_model.n_items() == 0 {
-                    gallery_message(&ui, "No photos yet.");
-                } else {
-                    ui.gallery_status.set_visible(false);
+                    gallery_status(
+                        &ui,
+                        "image-x-generic-symbolic",
+                        "No photos yet",
+                        "Photos you upload to Proton Drive appear here.",
+                        false,
+                    );
+                    return;
                 }
+                ui.gallery_content.set_visible_child_name("timeline");
                 // Offer "Load more" only when the page came back full.
                 ui.gallery_more.set_visible(items.len() == PHOTOS_PAGE);
             }
-            Ok(Ok(Response::Error { message })) => gallery_message(&ui, &message),
-            Ok(Ok(_)) => gallery_message(&ui, "Unexpected reply from daemon."),
+            // A failed *next* page keeps the photos already on screen — the failure
+            // goes to a toast rather than wiping the timeline for a status page.
+            Ok(Ok(Response::Error { message })) if append => {
+                toast_error(&ui, "Couldn't load more photos", &message)
+            }
+            Ok(Ok(Response::Error { message })) => gallery_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't load photos",
+                &message,
+                false,
+            ),
+            Ok(Ok(_)) => gallery_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't load photos",
+                "Unexpected reply from the mount service.",
+                false,
+            ),
+            Ok(Err(_)) | Err(_) if append => toast_error(
+                &ui,
+                "Couldn't load more photos",
+                "The mount service didn't respond.",
+            ),
             Ok(Err(_)) | Err(_) => gallery_unreachable(&ui),
         }
     });
 }
 
-/// Show a gallery status line and hide the pager + Retry button.
-fn gallery_message(ui: &Rc<Ui>, message: &str) {
-    ui.gallery_retry.set_visible(false);
-    ui.gallery_status.set_label(message);
-    ui.gallery_status.set_visible(true);
+/// Swap the Photos content area to the status page, hiding the pager. Retry is
+/// offered only when restarting the mount service could actually fix it.
+fn gallery_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.gallery_status.set_icon_name(Some(icon));
+    ui.gallery_status.set_title(title);
+    ui.gallery_status.set_description(Some(description));
+    ui.gallery_retry.set_visible(retry);
     ui.gallery_more.set_visible(false);
+    ui.gallery_content.set_visible_child_name("status");
 }
 
 /// Photos counterpart of [`browser_unreachable`]: auto-retry while the mount is
 /// still starting, surface an actionable error + Retry once it's actually down.
 fn gallery_unreachable(ui: &Rc<Ui>) {
-    ui.gallery_more.set_visible(false);
     if service::is_failed() || !service::is_active() {
-        ui.gallery_status
-            .set_label("Couldn't reach Proton Drive. The mount service isn't running.");
-        ui.gallery_status.set_visible(true);
-        ui.gallery_retry.set_visible(true);
+        gallery_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
         return;
     }
-    ui.gallery_status.set_label("Connecting to Proton Drive…");
-    ui.gallery_status.set_visible(true);
-    ui.gallery_retry.set_visible(false);
+    gallery_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
     let ui = ui.clone();
     glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
         if ui.stack.visible_child_name().as_deref() == Some("gallery") {
@@ -3361,5 +4892,88 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A justified row must fill the content width exactly: tile widths plus the
+    /// gaps between them add up to the width, with nothing left ragged.
+    fn row_width(row: &[(i32, i32)]) -> i32 {
+        let gaps = TILE_GAP * (row.len().saturating_sub(1)) as i32;
+        row.iter().map(|(width, _)| *width).sum::<i32>() + gaps
+    }
+
+    #[test]
+    fn justified_rows_fill_the_width_exactly() {
+        let ratios = [
+            1.5, 0.75, 1.5, 1.33, 0.66, 1.5, 1.0, 2.2, 1.5, 0.8, 1.5, 1.6,
+        ];
+        let rows = plan_rows(&ratios, 180.0, 1000.0);
+
+        assert!(
+            rows.len() > 1,
+            "12 photos at 180px should need several rows"
+        );
+        // Every row but the trailing one is justified.
+        for row in &rows[..rows.len() - 1] {
+            assert_eq!(row_width(row), 1000);
+        }
+    }
+
+    #[test]
+    fn every_photo_lands_in_exactly_one_row() {
+        let ratios: Vec<f64> = (0..37).map(|i| 0.5 + f64::from(i % 5) * 0.4).collect();
+        let rows = plan_rows(&ratios, 180.0, 1000.0);
+        let tiles: usize = rows.iter().map(Vec::len).sum();
+        assert_eq!(tiles, ratios.len());
+    }
+
+    #[test]
+    fn tiles_keep_their_aspect_ratio() {
+        let rows = plan_rows(&[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5], 180.0, 1000.0);
+        // All but the last tile of a justified row are sized straight from the
+        // ratio, so w/h is the photo's own — no cropping needed to place it.
+        for row in &rows {
+            for (width, height) in &row[..row.len() - 1] {
+                let ratio = f64::from(*width) / f64::from(*height);
+                assert!((ratio - 1.5).abs() < 0.02, "{width}x{height} is not 3:2");
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_row_is_not_stretched() {
+        // Two photos can't fill a 1000px row at 180px tall, so they must keep the
+        // target height rather than being blown up to a screen-wide row.
+        let rows = plan_rows(&[1.5, 1.5], 180.0, 1000.0);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].iter().all(|(_, height)| *height == 180));
+        assert!(row_width(&rows[0]) < 1000);
+    }
+
+    #[test]
+    fn an_extreme_panorama_cannot_squash_its_row() {
+        // Unclamped, a 20:1 panorama would drag its whole row down to ~40px tall.
+        // Clamped at RATIO_MAX it stays a wide tile in a row of normal height.
+        let rows = plan_rows(&[20.0, 1.5, 1.5], 180.0, 1000.0);
+        let (width, height) = rows[0][0];
+        assert!(height > 120, "row squashed to {height}px");
+        assert!(width <= 1000, "tile overflows the row at {width}px");
+        assert_eq!(row_width(&rows[0]), 1000);
+    }
+
+    #[test]
+    fn narrow_widths_and_no_photos_are_survivable() {
+        assert!(plan_rows(&[], 180.0, 1000.0).is_empty());
+        // Width below the floor is clamped rather than producing zero-px tiles.
+        let rows = plan_rows(&[1.5, 1.5], 180.0, 0.0);
+        assert!(
+            rows.iter()
+                .flatten()
+                .all(|(width, height)| *width > 0 && *height > 0)
+        );
     }
 }

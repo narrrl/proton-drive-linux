@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod localindex;
 pub mod service;
+pub mod shell;
 
 pub use error::{Error, Result};
 

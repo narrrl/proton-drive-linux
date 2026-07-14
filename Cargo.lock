@@ -2953,6 +2953,7 @@ dependencies = [
  "ksni",
  "libadwaita",
  "pdfs-core",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3161,7 +3162,7 @@ dependencies = [
 [[package]]
 name = "proton-drive-rs"
 version = "0.1.4"
-source = "git+https://github.com/narrrl/proton-sdk-rs?branch=main#2e3c23803eecbdcb9f442c1e49229347f272596b"
+source = "git+https://github.com/narrrl/proton-sdk-rs?branch=main#a24785d1a911b539d1d148d712691c5a89d561b5"
 dependencies = [
  "async-trait",
  "base64",
@@ -3185,7 +3186,7 @@ dependencies = [
 [[package]]
 name = "proton-sdk"
 version = "0.1.4"
-source = "git+https://github.com/narrrl/proton-sdk-rs?branch=main#2e3c23803eecbdcb9f442c1e49229347f272596b"
+source = "git+https://github.com/narrrl/proton-sdk-rs?branch=main#a24785d1a911b539d1d148d712691c5a89d561b5"
 dependencies = [
  "aes-gcm",
  "async-trait",

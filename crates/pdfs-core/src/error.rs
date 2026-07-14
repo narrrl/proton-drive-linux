@@ -23,6 +23,12 @@ pub enum Error {
     #[error("not logged in (no saved session)")]
     NotLoggedIn,
 
+    /// The stored session can no longer unlock the account key chain: reading
+    /// the key salts needs the `locked` scope, which a refreshed access token
+    /// does not have. Only a fresh password login restores it.
+    #[error("saved session can no longer unlock your keys — run `pdfs login` again")]
+    ReloginRequired,
+
     #[error("{0}")]
     Other(String),
 }

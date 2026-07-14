@@ -44,9 +44,15 @@ pub enum Request {
     /// List a directory for the in-app file browser. `path` is
     /// mountpoint-relative (empty or "." = the mount root).
     ListDir { path: String },
-    /// Fetch a page of the photos timeline, newest first. Thumbnails for the
-    /// page are fetched into the cache and their on-disk paths returned.
+    /// Fetch a page of the photos timeline, newest first. Returns metadata only:
+    /// a thumbnail path comes back only for photos already in the cache, so the
+    /// reply never waits on the network. Front-ends ask for the thumbnails they
+    /// actually display with [`Request::PhotoThumbs`].
     PhotosTimeline { offset: usize, limit: usize },
+    /// Fetch thumbnails for the given photo uids, downloading the ones not
+    /// already cached (one batched round-trip) and replying with their on-disk
+    /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
+    PhotoThumbs { uids: Vec<String> },
     /// Download a photo's full content into the cache; replies with its path.
     OpenPhoto { uid: String },
     /// Upload a photo with the given name, media type, and content bytes.
@@ -187,8 +193,19 @@ pub struct PhotoItem {
     pub uid: String,
     /// Capture time, epoch seconds (the timeline is newest-first).
     pub capture_time: i64,
-    /// On-disk path to the cached thumbnail, if one was available/fetched.
+    /// On-disk path to the cached thumbnail, when one is *already* cached. A
+    /// `None` here means "not fetched yet", not "has no thumbnail" — ask for it
+    /// with [`Request::PhotoThumbs`].
     pub thumb_path: Option<String>,
+}
+
+/// One thumbnail in a [`Response::Thumbs`] batch.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoThumb {
+    pub uid: String,
+    /// On-disk path, or `None` when the photo genuinely has no thumbnail (or the
+    /// fetch failed) — a front-end can then stop asking for it.
+    pub path: Option<String>,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -220,6 +237,8 @@ pub enum Response {
         available: bool,
         items: Vec<PhotoItem>,
     },
+    /// Thumbnails for a [`Request::PhotoThumbs`] batch.
+    Thumbs { items: Vec<PhotoThumb> },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
     FilePath { path: String },
     /// Full-text search results (reply to [`Request::Search`]).

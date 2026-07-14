@@ -52,8 +52,8 @@ use fuser::{
 use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    DirEntry, LocalHit, PhotoItem, Request as CtlRequest, Response as CtlResponse, SearchHit,
-    TransferDirection,
+    DirEntry, LocalHit, PhotoItem, PhotoThumb, Request as CtlRequest, Response as CtlResponse,
+    SearchHit, TransferDirection,
 };
 use pdfs_core::db::{Db, StoredNode};
 use pdfs_core::localindex;
@@ -91,6 +91,11 @@ const LOCAL_INDEX_CHECK: Duration = Duration::from_secs(60);
 
 /// The FUSE root inode is always 1.
 const ROOT_INO: u64 = 1;
+
+/// Parent inode for a persisted node whose parent row is missing from the DB.
+/// No folder carries this inode, so such a node is listed by nobody and stays
+/// inert until a live enumeration re-parents it.
+const ORPHAN_INO: u64 = 0;
 
 /// Extended attribute exposing the small server-side thumbnail of a file.
 const XATTR_THUMBNAIL: &str = "user.proton.thumbnail";
@@ -367,21 +372,26 @@ impl Core {
             if ino == ROOT_INO {
                 continue;
             }
+            // A node whose parent row never made it to disk must not be adopted
+            // by the root: it would surface as a phantom top-level entry.
             let parent = node
                 .parent_uid
                 .as_ref()
                 .and_then(|p| st.by_uid.get(p).copied())
-                .unwrap_or(ROOT_INO);
+                .unwrap_or(ORPHAN_INO);
             let uid = node.uid.clone();
             st.entries.insert(ino, Entry { uid, parent, node });
         }
 
-        // Pass 3: rebuild child listings for fully-enumerated folders.
+        // Pass 3: rebuild child listings for fully-enumerated folders. The root
+        // is its own parent (that is what `..` resolves to), so it would match
+        // its own filter; a directory listed inside itself makes the kernel fail
+        // the lookup with EIO, taking the whole listing down with it.
         for dir_ino in listed_dirs {
             let kids: Vec<u64> = st
                 .entries
                 .iter()
-                .filter(|(_, e)| e.parent == dir_ino && !e.node.trashed)
+                .filter(|&(&ino, e)| ino != dir_ino && e.parent == dir_ino && !e.node.trashed)
                 .map(|(&ino, _)| ino)
                 .collect();
             st.children.insert(dir_ino, kids);
@@ -415,7 +425,7 @@ impl Core {
                 }
                 let mut child_inos = Vec::with_capacity(nodes.len());
                 for node in nodes {
-                    if node.trashed {
+                    if node.trashed || node.uid == folder_uid {
                         continue;
                     }
                     child_inos.push(st.intern(ino, node));
@@ -449,7 +459,9 @@ impl Core {
         }
         let mut child_inos = Vec::with_capacity(nodes.len());
         for node in nodes {
-            if node.trashed {
+            // A folder listed among its own children would alias its inode into
+            // its own listing, which the kernel rejects with EIO.
+            if node.trashed || node.uid == folder_uid {
                 continue;
             }
             child_inos.push(st.intern(ino, node));
@@ -1035,9 +1047,12 @@ impl Core {
             .collect())
     }
 
-    /// A page of the photos timeline (newest first), with the page's thumbnails
-    /// fetched into the cache and their paths attached. `Ok(None)` when the
-    /// account has no photos volume.
+    /// A page of the photos timeline (newest first). Metadata only: a thumbnail
+    /// path is attached for photos whose thumbnail is *already* cached, and no
+    /// thumbnail is downloaded here — the page comes back as fast as the cached
+    /// timeline can be sliced, and the front-end pulls the thumbnails it actually
+    /// paints via [`Core::photo_thumbs`]. `Ok(None)` when the account has no
+    /// photos volume.
     ///
     /// The SDK's `enumerate_timeline` returns the *whole* timeline, so the first
     /// request (or the first after [`TIMELINE_TTL`] elapses) fetches and caches
@@ -1083,37 +1098,6 @@ impl Core {
             }
         };
         let ttype = ThumbnailType::Thumbnail.as_i32();
-
-        // Batch-fetch only the thumbnails not already cached fresh.
-        let want: Vec<NodeUid> = page
-            .iter()
-            .filter(|it| {
-                self.cache
-                    .cached_thumbnail_path(&it.uid, ttype, it.capture_time)
-                    .is_none()
-            })
-            .map(|it| it.uid.clone())
-            .collect();
-        if !want.is_empty() {
-            let cap: HashMap<NodeUid, i64> = page
-                .iter()
-                .map(|it| (it.uid.clone(), it.capture_time))
-                .collect();
-            match self.rt.block_on(
-                self.photos()
-                    .enumerate_thumbnails(&want, ThumbnailType::Thumbnail),
-            ) {
-                Ok(thumbs) => {
-                    for ft in thumbs {
-                        if let (Ok(bytes), Some(&tag)) = (ft.result, cap.get(&ft.file_uid)) {
-                            let _ = self.cache.store_thumbnail(&ft.file_uid, ttype, tag, &bytes);
-                        }
-                    }
-                }
-                Err(e) => warn!(error = %e, "batch photo thumbnails failed"),
-            }
-        }
-
         Ok(Some(
             page.into_iter()
                 .map(|it| {
@@ -1129,6 +1113,64 @@ impl Core {
                 })
                 .collect(),
         ))
+    }
+
+    /// Thumbnails for `uids`, served from the cache and downloaded (in one
+    /// batched SDK call) for whatever is missing. Requested on demand as tiles
+    /// scroll into view, so a cold timeline paints immediately and only the
+    /// photos actually on screen cost a round-trip.
+    ///
+    /// The cache tags a thumbnail with its photo's capture time, which is what
+    /// the timeline carries — a uid absent from the cached timeline therefore
+    /// can't be validated and is skipped rather than guessed at.
+    fn photo_thumbs(&self, uids: &[NodeUid]) -> Vec<PhotoThumb> {
+        let ttype = ThumbnailType::Thumbnail.as_i32();
+        let tags: HashMap<NodeUid, i64> = {
+            let guard = self.timeline.lock().unwrap();
+            match guard.as_ref() {
+                Some(c) => c
+                    .items
+                    .iter()
+                    .map(|it| (it.uid.clone(), it.capture_time))
+                    .collect(),
+                None => HashMap::new(),
+            }
+        };
+
+        let want: Vec<NodeUid> = uids
+            .iter()
+            .filter(|uid| {
+                tags.get(*uid)
+                    .is_some_and(|&tag| self.cache.cached_thumbnail_path(uid, ttype, tag).is_none())
+            })
+            .cloned()
+            .collect();
+        if !want.is_empty() {
+            match self.rt.block_on(
+                self.photos()
+                    .enumerate_thumbnails(&want, ThumbnailType::Thumbnail),
+            ) {
+                Ok(thumbs) => {
+                    for ft in thumbs {
+                        if let (Ok(bytes), Some(&tag)) = (ft.result, tags.get(&ft.file_uid)) {
+                            let _ = self.cache.store_thumbnail(&ft.file_uid, ttype, tag, &bytes);
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, "batch photo thumbnails failed"),
+            }
+        }
+
+        uids.iter()
+            .map(|uid| PhotoThumb {
+                uid: uid.to_string(),
+                path: tags.get(uid).and_then(|&tag| {
+                    self.cache
+                        .cached_thumbnail_path(uid, ttype, tag)
+                        .map(|p| p.display().to_string())
+                }),
+            })
+            .collect()
     }
 
     /// Download a photo's full content into the content cache, returning its
@@ -2475,6 +2517,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::Error { message: e },
             }
         }
+        Ok(CtlRequest::PhotoThumbs { uids }) => {
+            let parsed: Vec<NodeUid> = uids.iter().filter_map(|u| parse_uid(u)).collect();
+            CtlResponse::Thumbs {
+                items: core.photo_thumbs(&parsed),
+            }
+        }
         Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
             Some(u) => match core.open_photo(&u) {
                 Ok(p) => CtlResponse::FilePath {
@@ -2646,13 +2694,29 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     let _ = stream.write_all(&out);
 }
 
-/// Listen on the control socket, serving one CLI command per connection. Runs on
-/// its own thread; returns only if the listener itself fails.
+/// Listen on the control socket, serving one command per connection, each on its
+/// own thread. Runs on its own thread; returns only if the listener itself fails.
+///
+/// Concurrent rather than serial because requests differ wildly in cost: an
+/// `OpenPhoto` downloads a whole photo, and while it ran the accept loop used to
+/// stall every other caller behind it — the GUI's 2s status poll, and the
+/// thumbnail batches the gallery needs to paint. [`Core`] is a bundle of handles
+/// (`Arc`/`Clone`), so each connection gets its own copy of it.
 fn run_control_socket(core: Core, username: String, mountpoint: PathBuf, listener: UnixListener) {
     info!("control socket listening");
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => handle_control_conn(&core, &username, &mountpoint, stream),
+            Ok(stream) => {
+                let core = core.clone();
+                let username = username.clone();
+                let mountpoint = mountpoint.clone();
+                if let Err(e) = std::thread::Builder::new()
+                    .name("pdfs-control".into())
+                    .spawn(move || handle_control_conn(&core, &username, &mountpoint, stream))
+                {
+                    warn!(error = %e, "control: spawn handler failed");
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "control: accept failed");
             }

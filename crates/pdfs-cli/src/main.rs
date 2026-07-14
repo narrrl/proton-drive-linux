@@ -1,5 +1,6 @@
 //! `pdfs` — command-line front-end for the Proton Drive Linux client.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -415,8 +416,22 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
         }
         CtlResponse::Photos { items, .. } if items.is_empty() => println!("No photos."),
         CtlResponse::Photos { items, .. } => {
+            // The timeline reply only carries thumbnails already in the cache, so
+            // pull the rest of the page's in one batch to print a path per photo.
+            let uids: Vec<String> = items.iter().map(|p| p.uid.clone()).collect();
+            let thumbs: HashMap<String, Option<String>> =
+                match control_request(CtlRequest::PhotoThumbs { uids })? {
+                    CtlResponse::Thumbs { items } => {
+                        items.into_iter().map(|t| (t.uid, t.path)).collect()
+                    }
+                    _ => HashMap::new(),
+                };
             for p in items {
-                let thumb = p.thumb_path.as_deref().unwrap_or("(no thumbnail)");
+                let thumb = thumbs
+                    .get(&p.uid)
+                    .and_then(|p| p.as_deref())
+                    .or(p.thumb_path.as_deref())
+                    .unwrap_or("(no thumbnail)");
                 println!("{}  {}  {thumb}", p.capture_time, p.uid);
             }
         }
