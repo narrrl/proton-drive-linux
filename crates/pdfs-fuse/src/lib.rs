@@ -31,7 +31,7 @@
 //! set, so a multi-GiB write never buffers in RAM and only the untouched
 //! remainder of the file is pulled from the remote — lazily, at commit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as _};
@@ -55,13 +55,13 @@ use pdfs_core::control::{
     DirEntry, LocalHit, PhotoItem, PhotoThumb, Request as CtlRequest, Response as CtlResponse,
     SearchHit, TransferDirection,
 };
-use pdfs_core::db::{Db, StoredNode};
+use pdfs_core::db::{self, Db, StoredNode, StoredPhoto, StoredTrash};
 use pdfs_core::localindex;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
-    DriveEvent, DriveEventScopeId, Node, NodeKind, PhotosTimelineItem, ProtonDriveClient,
-    ProtonPhotosClient, ThumbnailType,
+    DriveEvent, DriveEventScopeId, Node, NodeKind, ProtonDriveClient, ProtonPhotosClient,
+    ThumbnailType,
 };
 
 mod transfers;
@@ -75,10 +75,33 @@ const TTL: Duration = Duration::from_secs(30);
 
 /// How often the background task polls the remote event cursor.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// How long a fetched photos timeline stays good before the next page request
-/// re-fetches it. The SDK hands back the whole timeline at once, so we cache it
-/// in [`Core`] and serve every page from memory until it goes stale.
-const TIMELINE_TTL: Duration = Duration::from_secs(60);
+/// How long the persisted photos timeline stays good before a page request
+/// revalidates it. The SDK hands back the whole timeline at once, so it is stored
+/// in the DB and every page is sliced from there; a stale one is still served
+/// immediately and refreshed in the background.
+const TIMELINE_TTL: Duration = Duration::from_secs(5 * 60);
+/// The same, for the persisted trash listing. Shorter, because the trash is the
+/// one listing a user changes and then immediately looks at — though our own
+/// mutations also invalidate it outright, so this only covers other clients.
+const TRASH_TTL: Duration = Duration::from_secs(60);
+
+/// `sync_state` keys for the freshness stamps of the two persisted listings, and
+/// for whether the account has a photos volume at all (so an account without one
+/// doesn't re-ask the server on every page request).
+const PHOTOS_SYNCED_MS: &str = "photos_synced_ms";
+const PHOTOS_AVAILABLE: &str = "photos_available";
+const TRASH_SYNCED_MS: &str = "trash_synced_ms";
+
+/// Longest edge, in px, of a thumbnail generated locally for a photo the server
+/// has none for. Matches the server's own thumbnail scale closely enough that a
+/// tile can't tell them apart.
+const THUMB_EDGE: u32 = 512;
+/// JPEG quality of a locally generated thumbnail.
+const THUMB_QUALITY: u8 = 82;
+/// How many photos may be downloaded at once to generate their missing
+/// thumbnails. Bounded: a screenful of 20 MB digicam JPEGs would otherwise
+/// saturate the link and starve the rest of the daemon.
+const THUMB_GEN_CONCURRENCY: usize = 4;
 
 /// How stale the local-file index may get before the background scanner rebuilds
 /// it. A rescan is a full walk of `$HOME`, so this trades index freshness against
@@ -310,22 +333,22 @@ struct Core {
     /// `State` maps. Every mutation writes through here, and the maps rehydrate
     /// from it on mount (plan.md P1).
     db: Arc<Db>,
-    /// Cached full photos timeline (newest first), so paged `PhotosTimeline`
-    /// requests slice memory instead of re-fetching the whole timeline per page.
-    /// `None` until first fetched; refreshed once older than [`TIMELINE_TTL`].
-    timeline: Arc<Mutex<Option<TimelineCache>>>,
+    /// True while a background refresh of the photos timeline (resp. the trash) is
+    /// already running, so a burst of page requests against a stale listing kicks
+    /// off one refresh rather than one per request.
+    timeline_refreshing: Arc<AtomicBool>,
+    trash_refreshing: Arc<AtomicBool>,
+    /// Photos whose missing thumbnail is being generated right now. A tile that is
+    /// still on screen asks for its thumbnail again every few seconds, and each of
+    /// those downloads is a full-size photo — so an in-flight uid is never started
+    /// twice.
+    thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
     /// True while the background scanner is rebuilding the local-file index, so
     /// `SearchLocal` can tell a front-end "still indexing" apart from "no match".
     indexing: Arc<AtomicBool>,
-}
-
-/// The whole photos timeline plus when it was fetched, for TTL freshness.
-struct TimelineCache {
-    items: Vec<PhotosTimelineItem>,
-    fetched: Instant,
 }
 
 impl Core {
@@ -1047,130 +1070,312 @@ impl Core {
             .collect())
     }
 
-    /// A page of the photos timeline (newest first). Metadata only: a thumbnail
-    /// path is attached for photos whose thumbnail is *already* cached, and no
-    /// thumbnail is downloaded here — the page comes back as fast as the cached
-    /// timeline can be sliced, and the front-end pulls the thumbnails it actually
-    /// paints via [`Core::photo_thumbs`]. `Ok(None)` when the account has no
-    /// photos volume.
+    /// A page of the photos timeline (newest first), sliced out of the DB.
+    /// `Ok(None)` when the account has no photos volume.
     ///
-    /// The SDK's `enumerate_timeline` returns the *whole* timeline, so the first
-    /// request (or the first after [`TIMELINE_TTL`] elapses) fetches and caches
-    /// it in [`Core::timeline`]; every page then slices that cached vec, so
-    /// "load more" scrolling doesn't re-hit the network per page.
+    /// Stale-while-revalidate: a persisted timeline is served *immediately*, and
+    /// refreshed on the runtime if it is older than [`TIMELINE_TTL`] — so opening
+    /// the app paints from disk rather than waiting on a full `enumerate_timeline`
+    /// (which returns the whole timeline, not a page). Only an empty DB blocks on
+    /// the network, i.e. the very first run.
+    ///
+    /// Metadata only: a thumbnail path is attached for photos whose thumbnail is
+    /// already cached, and nothing is downloaded here — the front-end pulls the
+    /// thumbnails it actually paints via [`Core::photo_thumbs`].
     fn photos_timeline(
         &self,
         offset: usize,
         limit: usize,
     ) -> Result<Option<Vec<PhotoItem>>, String> {
-        let page: Vec<PhotosTimelineItem> = {
-            // Refresh the cached timeline if absent or stale. The lock is only
-            // held for the freshness check and the store, never across the fetch.
-            let stale = {
-                let guard = self.timeline.lock().unwrap();
-                guard
-                    .as_ref()
-                    .is_none_or(|c| c.fetched.elapsed() >= TIMELINE_TTL)
-            };
-            if stale {
-                let photos = self.photos();
-                if self
-                    .rt
-                    .block_on(photos.get_photos_root())
-                    .map_err(|e| format!("photos root: {e}"))?
-                    .is_none()
-                {
-                    return Ok(None);
-                }
-                let items = self
-                    .rt
-                    .block_on(photos.enumerate_timeline())
-                    .map_err(|e| format!("timeline: {e}"))?;
-                *self.timeline.lock().unwrap() = Some(TimelineCache {
-                    items,
-                    fetched: Instant::now(),
-                });
+        let count = self.db.photos_count().map_err(|e| e.to_string())?;
+        if count == 0 {
+            // Nothing to serve, so this one request has to wait for the fetch —
+            // unless we already know the account has no photos volume and the
+            // answer is a fresh "no".
+            let known_empty = self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() == Some(0);
+            if known_empty && !self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
+                return Ok(None);
             }
-            let guard = self.timeline.lock().unwrap();
-            match guard.as_ref() {
-                Some(c) => c.items.iter().skip(offset).take(limit).cloned().collect(),
-                None => return Ok(None),
+            if !self.rt.block_on(self.refresh_timeline())? {
+                return Ok(None);
             }
-        };
-        let ttype = ThumbnailType::Thumbnail.as_i32();
+        } else if self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
+            self.spawn_timeline_refresh();
+        }
+
+        let page = self
+            .db
+            .photos_page(offset, limit)
+            .map_err(|e| e.to_string())?;
         Ok(Some(
-            page.into_iter()
-                .map(|it| {
-                    let thumb_path = self
-                        .cache
-                        .cached_thumbnail_path(&it.uid, ttype, it.capture_time)
-                        .map(|p| p.display().to_string());
-                    PhotoItem {
-                        uid: it.uid.to_string(),
-                        capture_time: it.capture_time,
-                        thumb_path,
-                    }
-                })
-                .collect(),
+            page.into_iter().map(|p| self.photo_item(p)).collect(),
         ))
     }
 
-    /// Thumbnails for `uids`, served from the cache and downloaded (in one
-    /// batched SDK call) for whatever is missing. Requested on demand as tiles
-    /// scroll into view, so a cold timeline paints immediately and only the
-    /// photos actually on screen cost a round-trip.
+    /// Project a persisted photo into the wire item the front-end paints: its
+    /// learned aspect ratio, its thumbnail verdict, and the on-disk path of its
+    /// thumbnail when one is cached (tagged with the capture time, which is the
+    /// only revision handle a photo carries).
+    fn photo_item(&self, photo: StoredPhoto) -> PhotoItem {
+        let thumb_path = parse_uid(&photo.uid).and_then(|uid| {
+            self.cache
+                .cached_thumbnail_path(&uid, ThumbnailType::Thumbnail.as_i32(), photo.capture_time)
+                .map(|p| p.display().to_string())
+        });
+        PhotoItem {
+            uid: photo.uid,
+            capture_time: photo.capture_time,
+            thumb_path,
+            name: photo.name,
+            ratio: photo.ratio,
+            no_thumb: photo.thumb_state == db::THUMB_NONE,
+        }
+    }
+
+    /// Thumbnails for `uids`, served from the cache, fetched from the server for
+    /// whatever is missing, and — for the photos the server has no thumbnail for
+    /// at all — *generated locally* from the full file (see
+    /// [`Core::generate_thumbs`]). Requested on demand as tiles scroll into view,
+    /// so a cold timeline paints immediately and only the photos actually on
+    /// screen cost a round-trip.
     ///
-    /// The cache tags a thumbnail with its photo's capture time, which is what
-    /// the timeline carries — a uid absent from the cached timeline therefore
-    /// can't be validated and is skipped rather than guessed at.
+    /// A photo absent from the persisted timeline is skipped: its capture time is
+    /// the cache's validity tag, and guessing that would poison the cache.
     fn photo_thumbs(&self, uids: &[NodeUid]) -> Vec<PhotoThumb> {
         let ttype = ThumbnailType::Thumbnail.as_i32();
-        let tags: HashMap<NodeUid, i64> = {
-            let guard = self.timeline.lock().unwrap();
-            match guard.as_ref() {
-                Some(c) => c
-                    .items
-                    .iter()
-                    .map(|it| (it.uid.clone(), it.capture_time))
-                    .collect(),
-                None => HashMap::new(),
-            }
-        };
+        let keys: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+        let stored = self.db.photos_by_uid(&keys).unwrap_or_default();
+        let tags: HashMap<String, i64> = stored
+            .iter()
+            .map(|p| (p.uid.clone(), p.capture_time))
+            .collect();
 
+        // Ask the server only for photos that are missing a cached thumbnail and
+        // haven't already been written off as un-thumbnailable.
         let want: Vec<NodeUid> = uids
             .iter()
             .filter(|uid| {
-                tags.get(*uid)
-                    .is_some_and(|&tag| self.cache.cached_thumbnail_path(uid, ttype, tag).is_none())
+                let key = uid.to_string();
+                stored
+                    .iter()
+                    .find(|p| p.uid == key)
+                    .is_some_and(|p| p.thumb_state != db::THUMB_NONE)
+                    && tags.get(&key).is_some_and(|&tag| {
+                        self.cache.cached_thumbnail_path(uid, ttype, tag).is_none()
+                    })
             })
             .cloned()
             .collect();
+
         if !want.is_empty() {
+            let mut missing = want.clone();
             match self.rt.block_on(
                 self.photos()
                     .enumerate_thumbnails(&want, ThumbnailType::Thumbnail),
             ) {
                 Ok(thumbs) => {
                     for ft in thumbs {
-                        if let (Ok(bytes), Some(&tag)) = (ft.result, tags.get(&ft.file_uid)) {
-                            let _ = self.cache.store_thumbnail(&ft.file_uid, ttype, tag, &bytes);
+                        let Some(&tag) = tags.get(&ft.file_uid.to_string()) else {
+                            continue;
+                        };
+                        let Ok(bytes) = ft.result else { continue };
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if self
+                            .cache
+                            .store_thumbnail(&ft.file_uid, ttype, tag, &bytes)
+                            .is_ok()
+                        {
+                            missing.retain(|uid| uid != &ft.file_uid);
+                            self.record_thumb(&ft.file_uid, db::THUMB_HAVE, ratio_of(&bytes));
                         }
                     }
                 }
+                // A failed batch is not a verdict: leave every uid in `missing` so
+                // the local fallback still gives those tiles an image.
                 Err(e) => warn!(error = %e, "batch photo thumbnails failed"),
+            }
+
+            // Whatever the server had nothing for gets a thumbnail made from its
+            // own bytes — this is what fills in camera photos uploaded by clients
+            // that never generated one. Off the request path: a full-size photo
+            // takes far longer to fetch than the whole rest of the batch, and the
+            // thumbnails that *are* ready must not wait behind it.
+            if !missing.is_empty() {
+                self.spawn_generate_thumbs(missing, &tags);
             }
         }
 
+        let pending = self.thumb_gen.lock().unwrap();
         uids.iter()
             .map(|uid| PhotoThumb {
                 uid: uid.to_string(),
-                path: tags.get(uid).and_then(|&tag| {
+                path: tags.get(&uid.to_string()).and_then(|&tag| {
                     self.cache
                         .cached_thumbnail_path(uid, ttype, tag)
                         .map(|p| p.display().to_string())
                 }),
+                pending: pending.contains(uid),
             })
             .collect()
+    }
+
+    /// Generate the missing thumbnails on the runtime, skipping any photo already
+    /// being generated. The uids are marked in-flight before the task starts, so
+    /// the reply this call is about to send already reports them as pending.
+    fn spawn_generate_thumbs(&self, uids: Vec<NodeUid>, tags: &HashMap<String, i64>) {
+        let fresh: Vec<NodeUid> = {
+            let mut inflight = self.thumb_gen.lock().unwrap();
+            uids.into_iter()
+                .filter(|uid| inflight.insert(uid.clone()))
+                .collect()
+        };
+        if fresh.is_empty() {
+            return;
+        }
+
+        let core = self.clone();
+        let tags = tags.clone();
+        // `generate_thumbs` blocks on the runtime itself, so it belongs on the
+        // blocking pool rather than on an async worker.
+        self.rt.spawn_blocking(move || {
+            core.generate_thumbs(&fresh, &tags);
+            let mut inflight = core.thumb_gen.lock().unwrap();
+            for uid in &fresh {
+                inflight.remove(uid);
+            }
+        });
+    }
+
+    /// Make thumbnails for photos the server has none for: download each full
+    /// file once, scale it to [`THUMB_EDGE`], and store the result in the thumbnail
+    /// cache exactly as if the server had served it.
+    ///
+    /// Bounded by [`THUMB_GEN_CONCURRENCY`] — these are full-size originals, and a
+    /// screenful of them at once would saturate the link. A photo whose bytes
+    /// can't be decoded (a codec `image` doesn't speak) is marked
+    /// [`db::THUMB_NONE`] and never attempted again.
+    fn generate_thumbs(&self, uids: &[NodeUid], tags: &HashMap<String, i64>) {
+        info!(
+            count = uids.len(),
+            "generating thumbnails the server has none for"
+        );
+        let results: Vec<(NodeUid, ThumbAttempt)> = self.rt.block_on(async {
+            let mut out = Vec::with_capacity(uids.len());
+            for chunk in uids.chunks(THUMB_GEN_CONCURRENCY) {
+                let mut set = tokio::task::JoinSet::new();
+                for uid in chunk {
+                    let client = self.client.clone();
+                    let uid = uid.clone();
+                    set.spawn(async move {
+                        let bytes = match client.download_file(&uid).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warn!(%uid, error = %e, "photo download for thumbnail failed");
+                                return (uid, ThumbAttempt::Unavailable);
+                            }
+                        };
+                        // Decoding + scaling a 20 MP JPEG is CPU-bound and would
+                        // stall the runtime's worker; hand it to the blocking pool.
+                        let made = tokio::task::spawn_blocking(move || scale_thumbnail(&bytes))
+                            .await
+                            .unwrap_or(None);
+                        match made {
+                            Some(thumb) => (uid, ThumbAttempt::Made(thumb)),
+                            None => (uid, ThumbAttempt::Undecodable),
+                        }
+                    });
+                }
+                while let Some(joined) = set.join_next().await {
+                    if let Ok(result) = joined {
+                        out.push(result);
+                    }
+                }
+            }
+            out
+        });
+
+        let ttype = ThumbnailType::Thumbnail.as_i32();
+        for (uid, attempt) in results {
+            match attempt {
+                ThumbAttempt::Made(thumb) => {
+                    let Some(&tag) = tags.get(&uid.to_string()) else {
+                        continue;
+                    };
+                    match self.cache.store_thumbnail(&uid, ttype, tag, &thumb.bytes) {
+                        Ok(()) => self.record_thumb(&uid, db::THUMB_HAVE, Some(thumb.ratio)),
+                        Err(e) => warn!(%uid, error = %e, "storing generated thumbnail failed"),
+                    }
+                }
+                // The photo's own bytes aren't an image we can read: no thumbnail
+                // will ever exist for it, so stop trying.
+                ThumbAttempt::Undecodable => self.record_thumb(&uid, db::THUMB_NONE, None),
+                // The download failed — a dropped connection, an expired link. That
+                // is not a verdict on the photo: leave its state alone so the next
+                // scroll past it tries again.
+                ThumbAttempt::Unavailable => {}
+            }
+        }
+    }
+
+    /// Persist what a thumbnail attempt learned about a photo.
+    fn record_thumb(&self, uid: &NodeUid, state: i64, ratio: Option<f64>) {
+        if let Err(e) = self.db.photo_set_thumb(&uid.to_string(), state, ratio) {
+            warn!(%uid, error = %e, "recording thumbnail state failed");
+        }
+    }
+
+    /// Whether the listing stamped under `key` is older than `ttl` (or was never
+    /// fetched).
+    fn listing_stale(&self, key: &str, ttl: Duration) -> bool {
+        match self.db.state_i64(key).ok().flatten() {
+            Some(ms) => now_ms().saturating_sub(ms) >= ttl.as_millis() as i64,
+            None => true,
+        }
+    }
+
+    /// Re-fetch the whole photos timeline and persist it. Returns whether the
+    /// account has a photos volume at all.
+    async fn refresh_timeline(&self) -> Result<bool, String> {
+        let photos = self.photos();
+        if photos
+            .get_photos_root()
+            .await
+            .map_err(|e| format!("photos root: {e}"))?
+            .is_none()
+        {
+            let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 0);
+            let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
+            return Ok(false);
+        }
+        let items = photos
+            .enumerate_timeline()
+            .await
+            .map_err(|e| format!("timeline: {e}"))?;
+        let rows: Vec<(String, i64, Option<String>)> = items
+            .iter()
+            .map(|it| (it.uid.to_string(), it.capture_time, None))
+            .collect();
+        self.db.photos_replace(&rows).map_err(|e| e.to_string())?;
+        let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 1);
+        let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
+        Ok(true)
+    }
+
+    /// Refresh the timeline off the request path, so a stale page is still served
+    /// at DB speed. At most one refresh runs at a time.
+    fn spawn_timeline_refresh(&self) {
+        if self.timeline_refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let core = self.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = core.refresh_timeline().await {
+                warn!(error = %e, "background timeline refresh failed");
+            }
+            core.timeline_refreshing.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Download a photo's full content into the content cache, returning its
@@ -1300,40 +1505,99 @@ impl Core {
             .unwrap_or_default();
         self.cache.evict(&uid);
         self.invalidate_parent_listing(rel);
+        self.invalidate_trash();
         Ok(name)
     }
 
-    /// List the account's trash. Trashed nodes are outside the mounted tree — the
-    /// FUSE side forgot them when they were trashed — so this always goes to the
-    /// server rather than to `State` or the DB, and each entry is identified by
-    /// its uid (its only remaining handle) with an empty path.
+    /// List the account's trash, from the DB. Trashed nodes are outside the
+    /// mounted tree — the FUSE side forgot them when they were trashed — so the
+    /// listing is persisted in its own table rather than derived from `State`, and
+    /// each entry is identified by its uid (its only remaining handle) with an
+    /// empty path.
+    ///
+    /// Stale-while-revalidate, like the photos timeline: a persisted listing comes
+    /// back at DB speed and is refreshed in the background past [`TRASH_TTL`].
+    /// Our own trash mutations invalidate it outright (see
+    /// [`Core::invalidate_trash`]), so the TTL only covers changes made elsewhere.
     fn list_trash(&self) -> Result<Vec<DirEntry>, String> {
-        let uids = self
-            .rt
-            .block_on(self.client.enumerate_trash_node_uids())
-            .map_err(|e| format!("enumerate trash: {e}"))?;
-        if uids.is_empty() {
-            return Ok(Vec::new());
+        let stale = self.listing_stale(TRASH_SYNCED_MS, TRASH_TTL);
+        // Never fetched: this request has to wait for it.
+        if self.db.state_i64(TRASH_SYNCED_MS).ok().flatten().is_none() {
+            self.rt.block_on(self.refresh_trash())?;
+        } else if stale {
+            self.spawn_trash_refresh();
         }
-        let nodes = self
-            .rt
-            .block_on(self.client.enumerate_nodes(&uids))
-            .map_err(|e| format!("enumerate nodes: {e}"))?;
-        Ok(nodes
+
+        Ok(self
+            .db
+            .trash_list()
+            .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|node| DirEntry {
-                name: node.name.clone(),
-                is_dir: node.is_folder(),
-                size: node_size(&node),
-                modified: node.modification_time,
+            .map(|item| DirEntry {
+                name: item.name,
+                is_dir: item.is_dir,
+                size: item.size.max(0) as u64,
+                modified: item.mtime,
                 // A trashed node can't be pinned or served from the mount, so its
                 // content is never current cache: report neither.
                 pinned: false,
                 cached: false,
-                uid: node.uid.to_string(),
+                uid: item.uid,
                 path: String::new(),
             })
             .collect())
+    }
+
+    /// Re-fetch the trash listing from the server and persist it.
+    async fn refresh_trash(&self) -> Result<(), String> {
+        let uids = self
+            .client
+            .enumerate_trash_node_uids()
+            .await
+            .map_err(|e| format!("enumerate trash: {e}"))?;
+        let nodes = if uids.is_empty() {
+            Vec::new()
+        } else {
+            self.client
+                .enumerate_nodes(&uids)
+                .await
+                .map_err(|e| format!("enumerate nodes: {e}"))?
+        };
+        let items: Vec<StoredTrash> = nodes
+            .into_iter()
+            .map(|node| StoredTrash {
+                uid: node.uid.to_string(),
+                name: node.name.clone(),
+                is_dir: node.is_folder(),
+                size: node_size(&node) as i64,
+                mtime: node.modification_time,
+            })
+            .collect();
+        self.db.trash_replace(&items).map_err(|e| e.to_string())?;
+        let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
+        Ok(())
+    }
+
+    /// Refresh the trash off the request path. At most one refresh at a time.
+    fn spawn_trash_refresh(&self) {
+        if self.trash_refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let core = self.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = core.refresh_trash().await {
+                warn!(error = %e, "background trash refresh failed");
+            }
+            core.trash_refreshing.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Drop the persisted trash listing's freshness stamp after we changed the
+    /// trash ourselves. The next Trash page then *waits* for a fresh listing
+    /// rather than painting one from before the mutation — the user just made the
+    /// change and is about to look straight at it.
+    fn invalidate_trash(&self) {
+        let _ = self.db.clear_state(TRASH_SYNCED_MS);
     }
 
     /// Parse wire uids (`volume~link`) into [`NodeUid`]s, rejecting the whole
@@ -1363,12 +1627,15 @@ impl Core {
         self.rt
             .block_on(self.client.restore_nodes(&parsed))
             .map_err(|e| format!("restore: {e}"))?;
-        let mut st = self.state.lock().unwrap();
-        for parent in parents {
-            if let Some(&ino) = st.by_uid.get(&parent) {
-                st.invalidate_listing(ino);
+        {
+            let mut st = self.state.lock().unwrap();
+            for parent in parents {
+                if let Some(&ino) = st.by_uid.get(&parent) {
+                    st.invalidate_listing(ino);
+                }
             }
         }
+        self.invalidate_trash();
         Ok(parsed.len())
     }
 
@@ -1380,6 +1647,7 @@ impl Core {
             .block_on(self.client.delete_nodes(&parsed))
             .map_err(|e| format!("delete: {e}"))?;
         self.drop_local(&parsed);
+        self.invalidate_trash();
         Ok(parsed.len())
     }
 
@@ -1395,6 +1663,7 @@ impl Core {
             .block_on(self.client.empty_trash())
             .map_err(|e| format!("empty trash: {e}"))?;
         self.drop_local(&uids);
+        self.invalidate_trash();
         Ok(uids.len())
     }
 
@@ -1573,6 +1842,7 @@ impl ProtonFs {
         }
         self.core.state.lock().unwrap().forget(&uid);
         self.core.cache.evict(&uid);
+        self.core.invalidate_trash();
         reply.ok();
     }
 }
@@ -1611,6 +1881,72 @@ fn node_size(node: &Node) -> u64 {
             ..
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
     }
+}
+
+/// Wall clock in milliseconds since the epoch — the unit the persisted listings
+/// stamp their freshness in.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The aspect ratio (w/h) of an encoded image, read from its header alone — no
+/// pixels are decoded. `None` when the format is unknown or the header is torn.
+fn ratio_of(bytes: &[u8]) -> Option<f64> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    (height > 0).then(|| f64::from(width) / f64::from(height))
+}
+
+/// A thumbnail the daemon made itself, and the aspect ratio of the photo it was
+/// made from (free at that point — the full image had to be decoded anyway).
+struct GeneratedThumb {
+    bytes: Vec<u8>,
+    ratio: f64,
+}
+
+/// How one attempt at generating a missing thumbnail ended. The distinction that
+/// matters is *permanent* versus *transient*: only bytes we cannot decode prove
+/// the photo will never have a thumbnail, and only that verdict is persisted.
+enum ThumbAttempt {
+    Made(GeneratedThumb),
+    /// Decoded nothing — a format this build has no decoder for. Permanent.
+    Undecodable,
+    /// The photo couldn't be downloaded. Transient: try again next time.
+    Unavailable,
+}
+
+/// Scale a full-size photo down to a thumbnail: at most [`THUMB_EDGE`] on its
+/// longest side, JPEG, aspect ratio preserved. `None` when the bytes aren't an
+/// image this build can decode — the caller then writes the photo off as
+/// un-thumbnailable.
+///
+/// CPU-bound (a 20 MP JPEG is real work), so callers run it on the blocking pool.
+fn scale_thumbnail(bytes: &[u8]) -> Option<GeneratedThumb> {
+    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let ratio = f64::from(width) / f64::from(height);
+
+    // `thumbnail` fits the image *inside* the box, so the longest edge lands on
+    // THUMB_EDGE and the ratio is untouched.
+    let thumb = image.thumbnail(THUMB_EDGE, THUMB_EDGE).to_rgb8();
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, THUMB_QUALITY)
+        .encode_image(&thumb)
+        .ok()?;
+    Some(GeneratedThumb { bytes, ratio })
 }
 
 /// Convert a Unix timestamp (seconds, possibly negative) to a `SystemTime`.
@@ -2670,7 +3006,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 false,
             )) {
                 Ok(uid) => {
-                    *core.timeline.lock().unwrap() = None;
+                    // The photo we just uploaded belongs at the head of the
+                    // timeline, and the GUI reloads the gallery the moment this
+                    // reply lands — so refresh now rather than leaving it to a
+                    // background pass that would land just after that reload.
+                    if let Err(e) = core.rt.block_on(core.refresh_timeline()) {
+                        warn!(error = %e, "timeline refresh after upload failed");
+                    }
                     CtlResponse::Ok {
                         message: format!("uploaded photo with uid {uid}"),
                     }
@@ -2929,7 +3271,9 @@ pub fn mount(
         })),
         cache: Arc::new(cache),
         db,
-        timeline: Arc::new(Mutex::new(None)),
+        timeline_refreshing: Arc::new(AtomicBool::new(false)),
+        trash_refreshing: Arc::new(AtomicBool::new(false)),
+        thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         transfers: TransferRegistry::new(),
         indexing: Arc::new(AtomicBool::new(false)),
     };
@@ -3045,6 +3389,63 @@ pub fn mount(
 
     let _ = std::fs::remove_file(control_socket);
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::{THUMB_EDGE, ratio_of, scale_thumbnail};
+
+    /// A `width`×`height` JPEG, standing in for a camera photo the server never
+    /// generated a thumbnail for.
+    fn jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode_image(&image)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn scaling_fits_the_long_edge_and_keeps_the_aspect_ratio() {
+        let photo = jpeg(4000, 3000);
+        let thumb = scale_thumbnail(&photo).expect("a JPEG scales");
+
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&thumb.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!(width, THUMB_EDGE, "the long edge lands on the target");
+        assert_eq!(height, THUMB_EDGE * 3 / 4, "and nothing is cropped");
+        assert!((thumb.ratio - 4.0 / 3.0).abs() < 1e-6);
+        assert!(
+            thumb.bytes.len() < photo.len(),
+            "a thumbnail that isn't smaller than its photo is no thumbnail"
+        );
+    }
+
+    #[test]
+    fn a_portrait_photo_fits_its_long_edge_too() {
+        let thumb = scale_thumbnail(&jpeg(1000, 2000)).expect("a JPEG scales");
+        assert!(thumb.ratio < 1.0, "portrait stays portrait");
+        assert_eq!(ratio_of(&thumb.bytes).map(|r| r < 1.0), Some(true));
+    }
+
+    #[test]
+    fn undecodable_bytes_are_not_a_thumbnail() {
+        // What a photo in a format this build has no decoder for looks like: the
+        // caller writes it off as un-thumbnailable rather than retrying forever.
+        assert!(scale_thumbnail(b"not an image at all").is_none());
+        assert!(ratio_of(b"not an image at all").is_none());
+    }
+
+    #[test]
+    fn ratio_is_read_from_the_header_alone() {
+        assert_eq!(ratio_of(&jpeg(300, 200)), Some(1.5));
+    }
 }
 
 #[cfg(test)]

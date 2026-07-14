@@ -10,6 +10,7 @@
 //! applies the forward-only schema migrations. Write-through of nodes, the
 //! event cursor, FTS, and the cache index land in later phases on this schema.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -21,7 +22,16 @@ use crate::Result;
 use crate::localindex::LocalEntry;
 
 /// Current schema version. Bump on every forward migration added below.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+/// A photo whose thumbnail state is not known yet: it has never been asked for.
+pub const THUMB_UNKNOWN: i64 = 0;
+/// A thumbnail exists for this photo — served by the server, or generated locally
+/// from the full file when the server had none.
+pub const THUMB_HAVE: i64 = 1;
+/// This photo can never be given a thumbnail: the server has none and the bytes
+/// could not be decoded locally either. Never retried.
+pub const THUMB_NONE: i64 = 2;
 
 /// Below this length the trigram tokenizer indexes nothing (it needs 3-char
 /// grams), so short queries fall back to a `LIKE` scan over `nodes.name`.
@@ -40,6 +50,31 @@ pub struct StoredNode {
 pub struct SearchHit {
     pub node: Node,
     pub path: String,
+}
+
+/// One photo of the persisted timeline. The timeline itself is server-ordered
+/// (newest first) and stored with that order in `seq`; `ratio` and `thumb_state`
+/// are locally learned and survive a refresh of the timeline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredPhoto {
+    pub uid: String,
+    pub capture_time: i64,
+    pub name: Option<String>,
+    /// Aspect ratio (w/h), known once a thumbnail has been decoded.
+    pub ratio: Option<f64>,
+    /// One of [`THUMB_UNKNOWN`] / [`THUMB_HAVE`] / [`THUMB_NONE`].
+    pub thumb_state: i64,
+}
+
+/// One trashed node, as persisted for the Trash page. Trashed nodes live outside
+/// the mounted tree, so a uid is their only handle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredTrash {
+    pub uid: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: i64,
+    pub mtime: i64,
 }
 
 /// Handle to the unified metadata database.
@@ -122,6 +157,9 @@ impl Db {
         }
         if current < 6 {
             tx.execute_batch(MIGRATION_V6)?;
+        }
+        if current < 7 {
+            tx.execute_batch(MIGRATION_V7)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -297,6 +335,189 @@ impl Db {
             params![cursor],
         )?;
         Ok(())
+    }
+
+    /// Read a `sync_state` value as an integer (the freshness stamps of the
+    /// photos timeline and the trash listing are kept there).
+    pub fn state_i64(&self, key: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()))
+    }
+
+    /// Write a `sync_state` integer value.
+    pub fn set_state_i64(&self, key: &str, value: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a `sync_state` key, so whatever it stamped counts as never fetched.
+    pub fn clear_state(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sync_state WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Replace the persisted photos timeline with `items` (newest first), keeping
+    /// what was locally learned about the photos that are still there: a ratio or
+    /// a thumbnail verdict costs a download to rediscover, while the server order
+    /// and capture times are cheap and authoritative.
+    ///
+    /// Photos no longer in the timeline are dropped, so a deletion on another
+    /// client doesn't leave a ghost tile behind.
+    pub fn photos_replace(&self, items: &[(String, i64, Option<String>)]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let learned: HashMap<String, (Option<f64>, i64)> = {
+            let mut stmt = tx.prepare("SELECT uid, ratio, thumb_state FROM photos")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+
+        tx.execute("DELETE FROM photos", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO photos (uid, capture_time, name, ratio, thumb_state, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (seq, (uid, capture_time, name)) in items.iter().enumerate() {
+                let (ratio, thumb_state) = learned.get(uid).copied().unwrap_or((None, THUMB_UNKNOWN));
+                stmt.execute(params![uid, capture_time, name, ratio, thumb_state, seq as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One page of the persisted timeline, newest first.
+    pub fn photos_page(&self, offset: usize, limit: usize) -> Result<Vec<StoredPhoto>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT uid, capture_time, name, ratio, thumb_state FROM photos
+             ORDER BY seq LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], |r| {
+            Ok(StoredPhoto {
+                uid: r.get(0)?,
+                capture_time: r.get(1)?,
+                name: r.get(2)?,
+                ratio: r.get(3)?,
+                thumb_state: r.get(4)?,
+            })
+        })?;
+        let mut photos = Vec::new();
+        for row in rows {
+            photos.push(row?);
+        }
+        Ok(photos)
+    }
+
+    /// The stored photos for `uids`, in no particular order. Used by the thumbnail
+    /// path, which needs each photo's capture time (the cache validity tag) and
+    /// its thumbnail verdict.
+    pub fn photos_by_uid(&self, uids: &[String]) -> Result<Vec<StoredPhoto>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = vec!["?"; uids.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT uid, capture_time, name, ratio, thumb_state FROM photos
+             WHERE uid IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(uids), |r| {
+            Ok(StoredPhoto {
+                uid: r.get(0)?,
+                capture_time: r.get(1)?,
+                name: r.get(2)?,
+                ratio: r.get(3)?,
+                thumb_state: r.get(4)?,
+            })
+        })?;
+        let mut photos = Vec::new();
+        for row in rows {
+            photos.push(row?);
+        }
+        Ok(photos)
+    }
+
+    /// Record what a thumbnail attempt learned: whether the photo now has one
+    /// ([`THUMB_HAVE`] / [`THUMB_NONE`]), and its aspect ratio if the pixels were
+    /// seen. A `None` ratio leaves any previously learned one alone.
+    pub fn photo_set_thumb(&self, uid: &str, state: i64, ratio: Option<f64>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE photos SET thumb_state = ?2, ratio = COALESCE(?3, ratio) WHERE uid = ?1",
+            params![uid, state, ratio],
+        )?;
+        Ok(())
+    }
+
+    /// Number of photos in the persisted timeline.
+    pub fn photos_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Replace the persisted trash listing.
+    pub fn trash_replace(&self, items: &[StoredTrash]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM trash", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO trash (uid, name, is_dir, size, mtime) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for item in items {
+                stmt.execute(params![
+                    item.uid,
+                    item.name,
+                    item.is_dir as i64,
+                    item.size,
+                    item.mtime
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The persisted trash listing, folders first then by name — the order the
+    /// Trash page shows it in.
+    pub fn trash_list(&self) -> Result<Vec<StoredTrash>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT uid, name, is_dir, size, mtime FROM trash
+             ORDER BY is_dir DESC, name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(StoredTrash {
+                uid: r.get(0)?,
+                name: r.get(1)?,
+                is_dir: r.get::<_, i64>(2)? != 0,
+                size: r.get(3)?,
+                mtime: r.get(4)?,
+            })
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
     }
 
     /// Children of `parent`, for the offline `ensure_children` fast path when a
@@ -849,6 +1070,35 @@ CREATE VIRTUAL TABLE local_fts USING fts5(
 );
 ";
 
+/// Schema v7: the photos timeline and the trash listing become persistent, so
+/// opening the app paints them from disk instead of re-fetching the world (both
+/// were memory-only: the timeline behind a 60 s TTL, the trash not cached at all).
+///
+/// `photos.seq` preserves the server's newest-first order, which is the only order
+/// the timeline has — `capture_time` ties are common (a burst of shots) and would
+/// otherwise shuffle between refreshes. `ratio` and `thumb_state` are *locally
+/// learned*: they cost a download to rediscover, so `photos_replace` carries them
+/// across a refresh while capture times and order come from the server.
+const MIGRATION_V7: &str = "
+CREATE TABLE photos (
+  uid          TEXT PRIMARY KEY,
+  capture_time INTEGER NOT NULL,
+  name         TEXT,
+  ratio        REAL,
+  thumb_state  INTEGER NOT NULL DEFAULT 0,
+  seq          INTEGER NOT NULL
+);
+CREATE INDEX idx_photos_seq ON photos(seq);
+
+CREATE TABLE trash (
+  uid    TEXT PRIMARY KEY,
+  name   TEXT NOT NULL,
+  is_dir INTEGER NOT NULL,
+  size   INTEGER NOT NULL DEFAULT 0,
+  mtime  INTEGER NOT NULL DEFAULT 0
+);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,6 +1127,111 @@ mod tests {
             "signature_email": null,
         });
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
+        let db = Db::open_in_memory().unwrap();
+        db.photos_replace(&[
+            ("p1".into(), 300, None),
+            ("p2".into(), 200, None),
+            ("p3".into(), 100, None),
+        ])
+        .unwrap();
+
+        // A thumbnail attempt teaches us p1's ratio and that p2 can never have one.
+        db.photo_set_thumb("p1", THUMB_HAVE, Some(1.5)).unwrap();
+        db.photo_set_thumb("p2", THUMB_NONE, None).unwrap();
+
+        // The next refresh brings a new photo, keeps p1 and p2, and loses p3.
+        db.photos_replace(&[
+            ("p0".into(), 400, Some("new.jpg".into())),
+            ("p1".into(), 300, None),
+            ("p2".into(), 200, None),
+        ])
+        .unwrap();
+
+        let page = db.photos_page(0, 10).unwrap();
+        assert_eq!(
+            page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+            ["p0", "p1", "p2"],
+            "server order is preserved, and the dropped photo is gone"
+        );
+        assert_eq!(page[0].name.as_deref(), Some("new.jpg"));
+        // Ratios and verdicts cost a download to rediscover: they survive a refresh.
+        assert_eq!(page[1].ratio, Some(1.5));
+        assert_eq!(page[1].thumb_state, THUMB_HAVE);
+        assert_eq!(page[2].thumb_state, THUMB_NONE);
+        // A photo we know nothing about yet starts blank.
+        assert_eq!(page[0].ratio, None);
+        assert_eq!(page[0].thumb_state, THUMB_UNKNOWN);
+
+        assert_eq!(db.photos_count().unwrap(), 3);
+        let by_uid = db.photos_by_uid(&["p2".into()]).unwrap();
+        assert_eq!(by_uid.len(), 1);
+        assert_eq!(by_uid[0].capture_time, 200);
+    }
+
+    #[test]
+    fn photos_page_slices_the_timeline_in_order() {
+        let db = Db::open_in_memory().unwrap();
+        let items: Vec<_> = (0..5)
+            .map(|i| (format!("p{i}"), 500 - i as i64, None))
+            .collect();
+        db.photos_replace(&items).unwrap();
+
+        let page = db.photos_page(2, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+            ["p2", "p3"]
+        );
+        assert!(db.photos_page(9, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_replace_lists_folders_first() {
+        let db = Db::open_in_memory().unwrap();
+        db.trash_replace(&[
+            StoredTrash {
+                uid: "t1".into(),
+                name: "zeta.txt".into(),
+                is_dir: false,
+                size: 10,
+                mtime: 1,
+            },
+            StoredTrash {
+                uid: "t2".into(),
+                name: "Alpha".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 2,
+            },
+        ])
+        .unwrap();
+
+        let items = db.trash_list().unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "zeta.txt"]
+        );
+
+        // A replace is a replace: emptying the trash on the server empties it here.
+        db.trash_replace(&[]).unwrap();
+        assert!(db.trash_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_stamps_round_trip_and_clear() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.state_i64("photos_synced_ms").unwrap(), None);
+        db.set_state_i64("photos_synced_ms", 1234).unwrap();
+        assert_eq!(db.state_i64("photos_synced_ms").unwrap(), Some(1234));
+        db.clear_state("photos_synced_ms").unwrap();
+        assert_eq!(
+            db.state_i64("photos_synced_ms").unwrap(),
+            None,
+            "a cleared stamp reads as never fetched, so the next request blocks on a refresh"
+        );
     }
 
     fn folder(link: &str, parent: Option<&str>, name: &str) -> Node {

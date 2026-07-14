@@ -60,11 +60,11 @@ const SEARCH_LIMIT: usize = 200;
 /// content width, so this is the *target* height a row lands near, not an exact
 /// tile size (see [`justify_rows`]).
 const TILE_MIN: i32 = 90;
-const TILE_MAX: i32 = 300;
-const TILE_DEFAULT: i32 = 180;
+const TILE_MAX: i32 = 340;
+const TILE_DEFAULT: i32 = 220;
 const TILE_STEP: i32 = 30;
 /// Gap between tiles, horizontally and vertically.
-const TILE_GAP: i32 = 4;
+const TILE_GAP: i32 = 6;
 /// Aspect ratio (w/h) assumed for a photo whose thumbnail hasn't been decoded
 /// yet, so a tile can be laid out before its image exists. Landscape 3:2, the
 /// commonest camera/phone ratio; once the thumbnail lands the real ratio
@@ -82,6 +82,10 @@ const THUMB_BATCH: usize = 16;
 /// Idle pause before a thumbnail batch is sent, so a fast scroll coalesces into
 /// one request per settle instead of one per row that flickers past.
 const THUMB_DEBOUNCE: Duration = Duration::from_millis(60);
+/// How long to wait before asking again for a thumbnail the daemon is generating
+/// itself. That means downloading the photo's full file, so the wait is measured
+/// in seconds, not milliseconds.
+const THUMB_RETRY: Duration = Duration::from_secs(4);
 /// Decoded thumbnails held in memory. Each is a few hundred KiB of GPU texture;
 /// this caps the gallery's footprint while covering several screens of scroll.
 const TEXTURE_CACHE_MAX: usize = 600;
@@ -457,11 +461,13 @@ fn load_proton_theme() {
          .viewer-spinner {{ color: white; }}\n\
          .viewer-status {{ color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }}\n\
          .viewer-info-panel {{ background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }}\n\
-         .gallery-day {{ font-size: 1.05rem; font-weight: 700; padding: 4px 2px; }}\n\
-         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 6px; background: alpha(currentColor, 0.08); transition: filter 150ms ease; }}\n\
-         .photo-tile:hover {{ filter: brightness(1.08); }}\n\
+         .gallery-day {{ font-size: 1.05rem; font-weight: 700; padding: 2px 2px 6px 2px; }}\n\
+         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 10px; background: alpha(currentColor, 0.06); box-shadow: none; transition: filter 160ms ease, box-shadow 160ms ease; }}\n\
+         .photo-tile:hover {{ filter: brightness(1.06); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35); }}\n\
          .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
-         .photo-missing {{ background: alpha(currentColor, 0.12); }}\n\
+         .photo-placeholder {{ color: alpha(currentColor, 0.35); background: alpha(currentColor, 0.07); }}\n\
+         .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 160ms ease; }}\n\
+         .photo-tile:hover .photo-caption {{ opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }}\n\
          .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
          .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n\
          .navigation-sidebar row {{ border-radius: 8px; margin: 2px 6px; }}\n\
@@ -4134,9 +4140,14 @@ fn gallery_width(ui: &Rc<Ui>) -> i32 {
     }
 }
 
-/// One photo tile: a fixed-size button wrapping the thumbnail. A button (rather
-/// than a bare picture) so the tile is focusable, keyboard-activatable and gets
-/// hover feedback for free.
+/// One photo tile: a fixed-size button wrapping the thumbnail, with the capture
+/// time revealed on hover over a bottom scrim. A button (rather than a bare
+/// picture) so the tile is focusable, keyboard-activatable and gets hover feedback
+/// for free.
+///
+/// The picture sits in an overlay over a placeholder, so a tile is never a hole:
+/// until the thumbnail lands it shows a dim card, and a photo that can never have
+/// one keeps an image glyph instead of an empty rectangle.
 fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     let picture = gtk4::Picture::builder()
         // The tile is exactly the thumbnail's own aspect ratio, so Cover scales
@@ -4146,8 +4157,34 @@ fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
         .can_shrink(true)
         .build();
 
+    let placeholder = gtk4::Image::builder()
+        .icon_name("image-x-generic-symbolic")
+        .pixel_size(24)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .build();
+    placeholder.add_css_class("photo-placeholder");
+
+    // The capture time, on a gradient that only exists while the pointer is over
+    // the tile — legible over any photo, invisible the rest of the time.
+    let caption = gtk4::Label::builder()
+        // Fill horizontally so the scrim spans the tile; the text itself stays
+        // left-aligned inside it.
+        .halign(gtk4::Align::Fill)
+        .valign(gtk4::Align::End)
+        .xalign(0.0)
+        .label(short_capture_time(tile.photo.capture_time))
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
+    caption.add_css_class("photo-caption");
+
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&placeholder));
+    overlay.add_overlay(&picture);
+    overlay.add_overlay(&caption);
+
     let button = gtk4::Button::builder()
-        .child(&picture)
+        .child(&overlay)
         .width_request(tile.width)
         .height_request(tile.height)
         .tooltip_text(format_capture_time(tile.photo.capture_time))
@@ -4176,10 +4213,10 @@ fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture) {
         picture.set_paintable(Some(texture));
         return;
     }
-    // No thumbnail will ever come for this one: leave the tile as its placeholder
-    // (still clickable — the full photo may open fine).
+    // No thumbnail will ever come for this one — not from the server, and not
+    // from the daemon's own scaling of the file. The tile keeps its placeholder
+    // glyph, and stays clickable: the full photo may still open fine.
     if ui.photo_nothumb.borrow().contains(&photo.uid) {
-        picture.add_css_class("photo-missing");
         return;
     }
 
@@ -4201,6 +4238,25 @@ fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture) {
             }
         }
     }
+}
+
+/// Come back for thumbnails the daemon is still generating — it is downloading
+/// each photo's full file to scale it, which takes far longer than a batch. The
+/// tiles keep their placeholder until then, and a tile that has scrolled away is
+/// dropped by [`flush_thumbs`] like any other queued uid.
+fn retry_pending_thumbs(ui: &Rc<Ui>, uids: Vec<String>) {
+    let ui = ui.clone();
+    glib::timeout_add_local_once(THUMB_RETRY, move || {
+        {
+            let mut queue = ui.thumb_queue.borrow_mut();
+            for uid in uids {
+                if !queue.contains(&uid) {
+                    queue.push_back(uid);
+                }
+            }
+        }
+        schedule_thumbs(&ui);
+    });
 }
 
 /// Ask the daemon for the queued thumbnails after a short pause, so a fast scroll
@@ -4253,11 +4309,15 @@ fn flush_thumbs(ui: &Rc<Ui>) {
             Ok(Ok(Response::Thumbs { items })) => {
                 let mut decode = ui.decode_queue.borrow_mut();
                 let mut nothumb = ui.photo_nothumb.borrow_mut();
+                let mut pending = Vec::new();
                 for item in items {
                     match item.path {
                         Some(path) => decode.push_back((item.uid, path)),
-                        // The photo has no thumbnail at all (or its fetch failed):
-                        // remember that, so scrolling past it doesn't re-ask.
+                        // The daemon is making this one itself, from the photo's
+                        // full file — that takes a download, so come back for it.
+                        None if item.pending => pending.push(item.uid),
+                        // No thumbnail exists and none can be made: remember that,
+                        // so scrolling past the tile doesn't re-ask forever.
                         None => {
                             nothumb.insert(item.uid);
                         }
@@ -4265,6 +4325,9 @@ fn flush_thumbs(ui: &Rc<Ui>) {
                 }
                 drop((decode, nothumb));
                 schedule_decode(&ui);
+                if !pending.is_empty() {
+                    retry_pending_thumbs(&ui, pending);
+                }
             }
             // A thumbnail that doesn't arrive is not worth a toast — the tile just
             // stays a placeholder, and the next scroll past it tries again.
@@ -4489,6 +4552,15 @@ fn format_capture_time(secs: i64) -> String {
         },
         Err(_) => "Unknown Date".to_string(),
     }
+}
+
+/// The capture time as a tile caption: the clock time alone, since the day is
+/// already the section heading right above it.
+fn short_capture_time(secs: i64) -> String {
+    glib::DateTime::from_unix_local(secs)
+        .and_then(|d| d.format("%H:%M"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 /// The lightbox's mutable parts, shared by [`load_photo`], [`navigate_photo`] and
@@ -5199,6 +5271,22 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         false,
                     );
                     return;
+                }
+                // Take the daemon's word on ratios and thumbnail verdicts before
+                // anything is laid out: it persists both, so the very first frame
+                // justifies its rows correctly instead of guessing RATIO_UNKNOWN
+                // and reflowing as the images land.
+                {
+                    let mut ratios = ui.photo_ratio.borrow_mut();
+                    let mut nothumb = ui.photo_nothumb.borrow_mut();
+                    for item in &items {
+                        if let Some(ratio) = item.ratio {
+                            ratios.insert(item.uid.clone(), ratio);
+                        }
+                        if item.no_thumb {
+                            nothumb.insert(item.uid.clone());
+                        }
+                    }
                 }
                 for item in &items {
                     ui.gallery_model.append(&BoxedAnyObject::new(item.clone()));

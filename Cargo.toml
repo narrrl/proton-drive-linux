@@ -27,6 +27,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
 ignore = "0.4"
 sha2 = "0.10"
+# Thumbnail generation for photos the server has none for. Decoders only for the
+# formats a camera or phone actually produces — the rest of the crate's codecs
+# would be dead weight in the daemon.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "rayon"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 clap = { version = "4", features = ["derive"] }

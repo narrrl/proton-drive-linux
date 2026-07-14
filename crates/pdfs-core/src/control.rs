@@ -213,15 +213,34 @@ pub struct PhotoItem {
     /// `None` here means "not fetched yet", not "has no thumbnail" — ask for it
     /// with [`Request::PhotoThumbs`].
     pub thumb_path: Option<String>,
+    /// File name, when the daemon knows it.
+    pub name: Option<String>,
+    /// Aspect ratio (w/h), remembered by the daemon from the last time this
+    /// photo's thumbnail was decoded. Lets the gallery justify its rows correctly
+    /// on the first frame instead of guessing and reflowing as images land.
+    pub ratio: Option<f64>,
+    /// True when this photo can never be given a thumbnail — the server has none
+    /// and its bytes could not be decoded locally. The tile shows a placeholder
+    /// rather than waiting for an image that will never come.
+    pub no_thumb: bool,
 }
 
 /// One thumbnail in a [`Response::Thumbs`] batch.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoThumb {
     pub uid: String,
-    /// On-disk path, or `None` when the photo genuinely has no thumbnail (or the
-    /// fetch failed) — a front-end can then stop asking for it.
+    /// On-disk path, or `None` when there is no thumbnail to serve *yet*.
     pub path: Option<String>,
+    /// True when the daemon is making this thumbnail itself, because the server
+    /// has none: the photo's full file is downloading and will be scaled when it
+    /// lands. A `None` path with `pending` set means "ask again shortly"; a `None`
+    /// path *without* it means the photo can never have a thumbnail, and a
+    /// front-end should stop asking.
+    ///
+    /// Generation is not made to block the reply: one 20 MB camera photo takes
+    /// far longer to fetch than the whole rest of a batch, and holding the batch
+    /// for it would leave a screenful of ready thumbnails unpainted.
+    pub pending: bool,
 }
 
 /// The daemon's reply to a [`Request`].
