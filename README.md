@@ -26,13 +26,19 @@ The client includes several optimizations designed for high efficiency, a low me
 
 ### GUI Application & Launcher
 
-| Login Screen | Files Browser |
-| :---: | :---: |
-| ![Login Screen](images/login.png) | ![Files Browser](images/files.png) |
-
-| Photos Timeline | Search Launcher Prompt |
-| :---: | :---: |
-| ![Photos Timeline](images/photos.png) | ![Search Launcher Prompt](images/prompt.png) |
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="images/login.png" alt="Login Screen" width="100%"><br><sub><b>Login Screen</b></sub></td>
+    <td align="center" width="50%"><img src="images/files.png" alt="Files Browser" width="100%"><br><sub><b>Files Browser</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="images/photos.png" alt="Photos Timeline" width="100%"><br><sub><b>Photos Timeline</b></sub></td>
+    <td align="center" width="50%"><img src="images/prompt.png" alt="Search Launcher Prompt" width="100%"><br><sub><b>Search Launcher Prompt</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><img src="images/settings.png" alt="Settings" width="50%"><br><sub><b>Settings</b></sub></td>
+  </tr>
+</table>
 
 ---
 

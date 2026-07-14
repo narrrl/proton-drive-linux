@@ -10,8 +10,8 @@ authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
 
 [workspace.dependencies]
-proton-sdk = "0.1.4"
-proton-drive-rs = "0.1.4"
+proton-sdk = "0.1.5"
+proton-drive-rs = "0.1.5"
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }
@@ -33,10 +33,3 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 fuser = "0.17"
 libc = "0.2"
-
-[patch.crates-io]
-# Track the SDK's `main` on GitHub rather than a sibling checkout, so a clean
-# clone (and CI, and the PKGBUILD) builds without the working tree next door.
-# `cargo update -p proton-sdk -p proton-drive-rs` pulls newer pushes.
-proton-sdk = { git = "https://github.com/narrrl/proton-sdk-rs", branch = "main" }
-proton-drive-rs = { git = "https://github.com/narrrl/proton-sdk-rs", branch = "main" }
