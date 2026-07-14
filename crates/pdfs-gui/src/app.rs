@@ -223,6 +223,16 @@ struct Ui {
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     search_source: RefCell<Option<glib::SourceId>>,
+    // Trash page. Trashed nodes are addressed by uid, not by path, so this page
+    // keeps no current-directory state — it re-lists from the daemon on show.
+    trash_model: gio::ListStore,
+    trash_content: gtk4::Stack,
+    trash_status: adw::StatusPage,
+    trash_retry: gtk4::Button,
+    /// Empties the trash; insensitive while it is empty (or unread).
+    trash_empty: gtk4::Button,
+    /// "12 items" under the page title.
+    trash_subtitle: gtk4::Label,
     // Photos (gallery) page.
     /// Every photo loaded so far, newest first — the order the lightbox's
     /// prev/next walks. The visible day sections are derived from this.
@@ -486,10 +496,12 @@ fn build_window(app: &adw::Application) {
     let (main_page, main_widgets) = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
     let (gallery_page, gallery_widgets) = build_gallery_page();
+    let (trash_page, trash_widgets) = build_trash_page();
     stack.add_named(&login_page, Some("login"));
     stack.add_named(&main_page, Some("main"));
     stack.add_named(&browser_page, Some("browser"));
     stack.add_named(&gallery_page, Some("gallery"));
+    stack.add_named(&trash_page, Some("trash"));
 
     // Sidebar: the signed-in destinations. Selecting a row swaps the page stack;
     // `sync_sidebar` pushes the other way when navigation happens elsewhere (e.g.
@@ -571,6 +583,12 @@ fn build_window(app: &adw::Application) {
         browser_new_folder: browser_widgets.new_folder.clone(),
         browser_upload: browser_widgets.upload.clone(),
         search_source: RefCell::new(None),
+        trash_model: trash_widgets.model.clone(),
+        trash_content: trash_widgets.content.clone(),
+        trash_status: trash_widgets.status.clone(),
+        trash_retry: trash_widgets.retry.clone(),
+        trash_empty: trash_widgets.empty.clone(),
+        trash_subtitle: trash_widgets.subtitle.clone(),
         gallery_model: gallery_widgets.model.clone(),
         gallery_groups: gallery_widgets.groups.clone(),
         gallery_tile: Cell::new(TILE_DEFAULT),
@@ -611,6 +629,7 @@ fn build_window(app: &adw::Application) {
     wire_details(&ui);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
+    wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
     wire_retry(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
@@ -621,6 +640,7 @@ fn build_window(app: &adw::Application) {
         match st.visible_child_name().as_deref() {
             Some("browser") => load_browser(&ui_nav),
             Some("gallery") => load_gallery(&ui_nav, false),
+            Some("trash") => load_trash(&ui_nav),
             _ => {}
         }
     });
@@ -658,9 +678,10 @@ fn build_window(app: &adw::Application) {
 
 /// The sidebar destinations, in order: the row index is the index into this table,
 /// and each entry is `(stack page name, label, icon)`.
-const DESTINATIONS: [(&str, &str, &str); 3] = [
+const DESTINATIONS: [(&str, &str, &str); 4] = [
     ("browser", "Files", "folder-symbolic"),
     ("gallery", "Photos", "image-x-generic-symbolic"),
+    ("trash", "Trash", "user-trash-symbolic"),
     ("main", "Settings", "emblem-system-symbolic"),
 ];
 
@@ -1424,6 +1445,11 @@ fn wire_retry(ui: &Rc<Ui>) {
     ui.gallery_retry.clone().connect_clicked(move |_| {
         service::restart();
         load_gallery(&ui_gallery, false);
+    });
+    let ui_trash = ui.clone();
+    ui.trash_retry.clone().connect_clicked(move |_| {
+        service::restart();
+        load_trash(&ui_trash);
     });
 }
 
@@ -2670,10 +2696,11 @@ fn wire_browser_actions(ui: &Rc<Ui>, new_folder: &gtk4::Button, upload: &gtk4::B
     upload.connect_clicked(move |_| prompt_upload(&ui_up));
 }
 
-/// Send a mutating browser request (rename / move / delete / mkdir / upload) on a
-/// worker thread, then reload the current listing and confirm with a toast, or
-/// report the daemon's error in one. `done` is the past-tense confirmation
-/// ("Renamed to “x”"); `failed` names the attempt ("Couldn't rename").
+/// Send a mutating request (rename / move / delete / mkdir / upload, or a trash
+/// restore / purge) on a worker thread, then reload the listing it changed and
+/// confirm with a toast, or report the daemon's error in one. `done` is the
+/// past-tense confirmation ("Renamed to “x”"); `failed` names the attempt
+/// ("Couldn't rename").
 fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'static str) {
     if !*ui.mounted.borrow() {
         toast_error(ui, failed, "Proton Drive isn't connected.");
@@ -2689,13 +2716,23 @@ fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'static str) {
             Ok(Ok(Response::Ok { .. })) => {
                 // The listing the mutation changed is stale now; reload it, then
                 // confirm, so the toast lands over the updated view.
-                load_browser(&ui);
+                reload_listing(&ui);
                 toast(&ui, &done);
             }
             Ok(Ok(Response::Error { message })) => toast_error(&ui, failed, &message),
             _ => toast_error(&ui, failed, "The mount service didn't respond."),
         }
     });
+}
+
+/// Reload the listing a completed mutation invalidated: whichever of the two
+/// listing pages is on screen, since that is the one the action was raised from.
+fn reload_listing(ui: &Rc<Ui>) {
+    match ui.stack.visible_child_name().as_deref() {
+        Some("browser") => load_browser(ui),
+        Some("trash") => load_trash(ui),
+        _ => {}
+    }
 }
 
 /// Prompt for a new name and rename the entry through the daemon.
@@ -3227,6 +3264,386 @@ fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     for entry in entries {
         ui.browser_model.append(&BoxedAnyObject::new(entry));
     }
+}
+
+/// The widgets of the Trash page that a load repaints.
+struct TrashWidgets {
+    model: gio::ListStore,
+    list: gtk4::ListView,
+    content: gtk4::Stack,
+    status: adw::StatusPage,
+    retry: gtk4::Button,
+    empty: gtk4::Button,
+    subtitle: gtk4::Label,
+}
+
+/// The Trash page: a flat list of everything Drive is holding in the trash, each
+/// row offering Restore and Delete Forever, with Empty Trash in the header.
+///
+/// A trashed node has no path inside the mount — the daemon forgets it when it is
+/// trashed — so unlike the Files page this one addresses entries by uid and always
+/// re-lists from the server rather than from a cached listing. Row rendering needs
+/// the [`Ui`] handle for its buttons, so the factory is installed in [`wire_trash`].
+fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
+    let model = gio::ListStore::new::<BoxedAnyObject>();
+
+    let title = gtk4::Label::builder()
+        .label("Trash")
+        .halign(gtk4::Align::Start)
+        .build();
+    title.add_css_class("title-2");
+    let subtitle = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+    subtitle.add_css_class("dim-label");
+    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    titles.set_hexpand(true);
+    titles.append(&title);
+    titles.append(&subtitle);
+
+    let empty = gtk4::Button::builder()
+        .label("Empty Trash")
+        .valign(gtk4::Align::Center)
+        .sensitive(false)
+        .build();
+    empty.add_css_class("destructive-action");
+
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.append(&titles);
+    header.append(&empty);
+
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Center)
+        .build();
+    retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
+    retry.set_visible(false);
+    let status = adw::StatusPage::builder()
+        .icon_name("user-trash-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
+
+    // No selection model: every action lives on the row it acts on, so a
+    // mis-aimed Delete Forever isn't one click away from a stale selection.
+    let list = gtk4::ListView::builder()
+        .model(&gtk4::NoSelection::new(Some(model.clone())))
+        .build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&list)
+        .build();
+
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&scroll, Some("list"));
+    content.add_named(&status, Some("status"));
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&header);
+    inner.append(&content);
+
+    (
+        inner.upcast(),
+        TrashWidgets {
+            model,
+            list,
+            content,
+            status,
+            retry,
+            empty,
+            subtitle,
+        },
+    )
+}
+
+/// Install the row factory and the Empty Trash button. The row's two buttons read
+/// the entry off the [`gtk4::ListItem`] they were clicked on rather than a
+/// captured copy, so a recycled row always acts on the item it currently shows.
+fn wire_trash(ui: &Rc<Ui>, list: &gtk4::ListView, empty: &gtk4::Button) {
+    let factory = gtk4::SignalListItemFactory::new();
+    let ui_setup = ui.clone();
+    factory.connect_setup(move |_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+
+        let icon = gtk4::Image::builder().pixel_size(32).build();
+        let name = gtk4::Label::builder()
+            .halign(gtk4::Align::Start)
+            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .build();
+        let meta = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+        meta.add_css_class("dim-label");
+        meta.add_css_class("caption");
+        let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        text.set_valign(gtk4::Align::Center);
+        text.append(&name);
+        text.append(&meta);
+
+        let restore = gtk4::Button::builder()
+            .icon_name("edit-undo-symbolic")
+            .tooltip_text("Restore to its original folder")
+            .valign(gtk4::Align::Center)
+            .build();
+        restore.add_css_class("flat");
+        let purge = gtk4::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .tooltip_text("Delete permanently")
+            .valign(gtk4::Align::Center)
+            .build();
+        purge.add_css_class("flat");
+
+        let ui_restore = ui_setup.clone();
+        let item_restore = item.clone();
+        restore.connect_clicked(move |_| {
+            if let Some(entry) = bound_entry(&item_restore) {
+                restore_entry(&ui_restore, &entry);
+            }
+        });
+        let ui_purge = ui_setup.clone();
+        let item_purge = item.clone();
+        purge.connect_clicked(move |_| {
+            if let Some(entry) = bound_entry(&item_purge) {
+                prompt_delete_forever(&ui_purge, &entry);
+            }
+        });
+
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        row.set_margin_top(6);
+        row.set_margin_bottom(6);
+        row.set_margin_start(6);
+        row.set_margin_end(6);
+        row.append(&icon);
+        row.append(&text);
+        row.append(&restore);
+        row.append(&purge);
+        item.set_child(Some(&row));
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        let Some(entry) = bound_entry(item) else {
+            return;
+        };
+        let row = item.child().and_downcast::<gtk4::Box>().unwrap();
+        let Some(icon) = row.first_child().and_downcast::<gtk4::Image>() else {
+            return;
+        };
+        icon.set_icon_name(Some(&format!("{}-symbolic", icon_base_for(&entry))));
+        let Some(text) = icon.next_sibling().and_downcast::<gtk4::Box>() else {
+            return;
+        };
+        if let Some(name) = text.first_child().and_downcast::<gtk4::Label>() {
+            name.set_label(&entry.name);
+        }
+        if let Some(meta) = text.last_child().and_downcast::<gtk4::Label>() {
+            let kind = if entry.is_dir {
+                "Folder".to_string()
+            } else {
+                human_bytes(entry.size)
+            };
+            meta.set_label(&format!("{kind} · {}", format_modified(entry.modified)));
+        }
+    });
+    list.set_factory(Some(&factory));
+
+    let ui_empty = ui.clone();
+    empty.connect_clicked(move |_| prompt_empty_trash(&ui_empty));
+}
+
+/// The [`DirEntry`] a list item is currently bound to, or `None` for an unbound
+/// (recycled) row.
+fn bound_entry(item: &gtk4::ListItem) -> Option<DirEntry> {
+    let obj = item.item().and_downcast::<BoxedAnyObject>()?;
+    let entry = obj.borrow::<DirEntry>().clone();
+    Some(entry)
+}
+
+/// Fetch the trash listing and repaint the page.
+fn load_trash(ui: &Rc<Ui>) {
+    // Drop the old rows first: a stale row here would offer Restore on something
+    // that may already be gone.
+    ui.trash_model.remove_all();
+    ui.trash_empty.set_sensitive(false);
+    trash_status(
+        ui,
+        "user-trash-symbolic",
+        "Loading…",
+        "Reading the trash.",
+        false,
+    );
+
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListTrash);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::Entries { entries })) => repaint_trash(&ui, &entries),
+            Ok(Ok(Response::Error { message })) => trash_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read the trash",
+                &message,
+                false,
+            ),
+            Ok(Ok(_)) => trash_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read the trash",
+                "Unexpected reply from the mount service.",
+                false,
+            ),
+            Ok(Err(_)) | Err(_) => trash_unreachable(&ui),
+        }
+    });
+}
+
+/// The daemon didn't answer. Same split as the Files page: still starting (poll
+/// again, no button) versus actually down (Retry, which restarts the service).
+fn trash_unreachable(ui: &Rc<Ui>) {
+    if service::is_failed() || !service::is_active() {
+        trash_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
+        return;
+    }
+    trash_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        if ui.stack.visible_child_name().as_deref() == Some("trash") {
+            load_trash(&ui);
+        }
+    });
+}
+
+/// Show a status page in place of the trash list.
+fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.trash_status.set_icon_name(Some(icon));
+    ui.trash_status.set_title(title);
+    ui.trash_status.set_description(Some(description));
+    ui.trash_retry.set_visible(retry);
+    ui.trash_content.set_visible_child_name("status");
+    ui.trash_subtitle.set_label("");
+}
+
+/// Repopulate the trash list, most recently modified first — the order in which a
+/// user looks for what they just deleted.
+fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
+    ui.trash_model.remove_all();
+    ui.trash_empty.set_sensitive(!entries.is_empty());
+    if entries.is_empty() {
+        trash_status(
+            ui,
+            "user-trash-symbolic",
+            "Trash is empty",
+            "Items you delete from Proton Drive show up here.",
+            false,
+        );
+        return;
+    }
+    ui.trash_content.set_visible_child_name("list");
+    ui.trash_subtitle.set_label(&match entries.len() {
+        1 => "1 item".to_string(),
+        n => format!("{n} items"),
+    });
+
+    let mut sorted = entries.to_vec();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.modified));
+    for entry in sorted {
+        ui.trash_model.append(&BoxedAnyObject::new(entry));
+    }
+}
+
+/// Restore one trashed entry to the folder it was trashed from.
+fn restore_entry(ui: &Rc<Ui>, entry: &DirEntry) {
+    let name = entry.name.clone();
+    run_mutation(
+        ui,
+        Request::Restore {
+            uids: vec![entry.uid.clone()],
+        },
+        format!("Restored “{name}”"),
+        "Couldn't restore",
+    );
+}
+
+/// Confirm, then permanently delete one trashed entry. Irreversible, so it asks.
+fn prompt_delete_forever(ui: &Rc<Ui>, entry: &DirEntry) {
+    let win = ui_window(ui);
+    let uid = entry.uid.clone();
+    let name = entry.name.clone();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Delete permanently")
+        .body(format!(
+            "Permanently delete “{name}”? This cannot be undone."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete Permanently");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "delete" {
+            run_mutation(
+                &ui,
+                Request::DeleteForever {
+                    uids: vec![uid.clone()],
+                },
+                format!("Deleted “{name}” permanently"),
+                "Couldn't delete",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Confirm, then permanently delete everything in the trash.
+fn prompt_empty_trash(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let count = ui.trash_model.n_items();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Empty Trash")
+        .body(format!(
+            "Permanently delete all {count} item(s) in the trash? This cannot be undone."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("empty", "Empty Trash");
+    dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "empty" {
+            run_mutation(
+                &ui,
+                Request::EmptyTrash,
+                "Trash emptied".to_string(),
+                "Couldn't empty the trash",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
 }
 
 /// One day-section of the photos timeline: a heading plus the photos captured

@@ -122,6 +122,23 @@ enum Command {
     },
     /// Show the daemon's in-flight transfers (active uploads/downloads).
     Transfers,
+    /// List what is in the account's trash, with the uids the restore and
+    /// delete-forever commands take.
+    Trash,
+    /// Restore trashed items, by uid, to the folders they were trashed from.
+    Restore {
+        /// Node uids (`volume~link`), as printed by `pdfs trash`.
+        #[arg(required = true)]
+        uids: Vec<String>,
+    },
+    /// Permanently delete trashed items by uid. This cannot be undone.
+    DeleteForever {
+        /// Node uids (`volume~link`), as printed by `pdfs trash`.
+        #[arg(required = true)]
+        uids: Vec<String>,
+    },
+    /// Permanently delete everything in the trash. This cannot be undone.
+    EmptyTrash,
 }
 
 fn main() -> Result<()> {
@@ -155,6 +172,10 @@ fn main() -> Result<()> {
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
         Command::Upload { file, parent } => cmd_upload(file, parent),
         Command::Transfers => cmd_transfers(),
+        Command::Trash => cmd_trash(),
+        Command::Restore { uids } => cmd_restore(uids),
+        Command::DeleteForever { uids } => cmd_delete_forever(uids),
+        Command::EmptyTrash => cmd_empty_trash(),
     }
 }
 
@@ -497,6 +518,67 @@ fn cmd_rm(path: PathBuf) -> Result<()> {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_trash() -> Result<()> {
+    match control_request(CtlRequest::ListTrash)? {
+        CtlResponse::Entries { entries } if entries.is_empty() => println!("(trash is empty)"),
+        CtlResponse::Entries { entries } => {
+            for e in entries {
+                let kind = if e.is_dir { "d" } else { "-" };
+                println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
+            }
+        }
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_restore(uids: Vec<String>) -> Result<()> {
+    match control_request(CtlRequest::Restore { uids })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_delete_forever(uids: Vec<String>) -> Result<()> {
+    confirm(&format!(
+        "Permanently delete {} item(s)? This cannot be undone.",
+        uids.len()
+    ))?;
+    match control_request(CtlRequest::DeleteForever { uids })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_empty_trash() -> Result<()> {
+    confirm("Permanently delete everything in the trash? This cannot be undone.")?;
+    match control_request(CtlRequest::EmptyTrash)? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Ask for a typed `yes` before an irreversible destroy. Errors (aborting the
+/// command) on anything else, including a non-interactive stdin: a piped or
+/// scripted invocation must not silently wipe the trash.
+fn confirm(prompt: &str) -> Result<()> {
+    print!("{prompt} [type \"yes\" to confirm] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "yes" {
+        bail!("aborted");
     }
     Ok(())
 }

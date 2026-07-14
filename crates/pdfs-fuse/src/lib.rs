@@ -1303,6 +1303,114 @@ impl Core {
         Ok(name)
     }
 
+    /// List the account's trash. Trashed nodes are outside the mounted tree — the
+    /// FUSE side forgot them when they were trashed — so this always goes to the
+    /// server rather than to `State` or the DB, and each entry is identified by
+    /// its uid (its only remaining handle) with an empty path.
+    fn list_trash(&self) -> Result<Vec<DirEntry>, String> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_trash_node_uids())
+            .map_err(|e| format!("enumerate trash: {e}"))?;
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes = self
+            .rt
+            .block_on(self.client.enumerate_nodes(&uids))
+            .map_err(|e| format!("enumerate nodes: {e}"))?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| DirEntry {
+                name: node.name.clone(),
+                is_dir: node.is_folder(),
+                size: node_size(&node),
+                modified: node.modification_time,
+                // A trashed node can't be pinned or served from the mount, so its
+                // content is never current cache: report neither.
+                pinned: false,
+                cached: false,
+                uid: node.uid.to_string(),
+                path: String::new(),
+            })
+            .collect())
+    }
+
+    /// Parse wire uids (`volume~link`) into [`NodeUid`]s, rejecting the whole
+    /// batch if any is malformed — a partial trash mutation is worse than none.
+    fn parse_uids(uids: &[String]) -> Result<Vec<NodeUid>, String> {
+        if uids.is_empty() {
+            return Err("no nodes given".to_string());
+        }
+        uids.iter()
+            .map(|u| parse_uid(u).ok_or_else(|| format!("invalid uid: {u}")))
+            .collect()
+    }
+
+    /// Restore trashed nodes to the folders they were trashed from. The parents
+    /// are read *before* the restore — a restored node reappears in a listing the
+    /// daemon may already have cached, so each destination folder is invalidated
+    /// and re-enumerated on next access.
+    fn restore(&self, uids: &[String]) -> Result<usize, String> {
+        let parsed = Self::parse_uids(uids)?;
+        let parents: Vec<NodeUid> = self
+            .rt
+            .block_on(self.client.enumerate_nodes(&parsed))
+            .map_err(|e| format!("enumerate nodes: {e}"))?
+            .into_iter()
+            .filter_map(|n| n.parent_uid)
+            .collect();
+        self.rt
+            .block_on(self.client.restore_nodes(&parsed))
+            .map_err(|e| format!("restore: {e}"))?;
+        let mut st = self.state.lock().unwrap();
+        for parent in parents {
+            if let Some(&ino) = st.by_uid.get(&parent) {
+                st.invalidate_listing(ino);
+            }
+        }
+        Ok(parsed.len())
+    }
+
+    /// Permanently delete trashed nodes. Irreversible on the server; locally it
+    /// drops any metadata and cached content the node still owns.
+    fn delete_forever(&self, uids: &[String]) -> Result<usize, String> {
+        let parsed = Self::parse_uids(uids)?;
+        self.rt
+            .block_on(self.client.delete_nodes(&parsed))
+            .map_err(|e| format!("delete: {e}"))?;
+        self.drop_local(&parsed);
+        Ok(parsed.len())
+    }
+
+    /// Permanently delete everything in the trash. The uids are listed first so
+    /// the blobs of items trashed by *another* client — which this daemon may
+    /// still hold in its cache — are reclaimed too, not just the ones it trashed.
+    fn empty_trash(&self) -> Result<usize, String> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_trash_node_uids())
+            .map_err(|e| format!("enumerate trash: {e}"))?;
+        self.rt
+            .block_on(self.client.empty_trash())
+            .map_err(|e| format!("empty trash: {e}"))?;
+        self.drop_local(&uids);
+        Ok(uids.len())
+    }
+
+    /// Forget every trace of nodes that no longer exist anywhere: their inode and
+    /// DB row, and their cached content.
+    fn drop_local(&self, uids: &[NodeUid]) {
+        let mut st = self.state.lock().unwrap();
+        for uid in uids {
+            st.forget(uid);
+        }
+        drop(st);
+        for uid in uids {
+            self.cache.evict(uid);
+        }
+    }
+
     /// Create a folder named `name` under the mountpoint-relative `parent_rel`.
     /// Interns the new node directly so it shows up without a re-enumeration.
     fn create_folder(&self, parent_rel: &Path, name: &str) -> Result<String, String> {
@@ -2643,6 +2751,28 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     message: format!("uploaded {name}"),
                 },
                 Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListTrash) => match core.list_trash() {
+            Ok(entries) => CtlResponse::Entries { entries },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::Restore { uids }) => match core.restore(&uids) {
+            Ok(n) => CtlResponse::Ok {
+                message: format!("restored {n} item(s)"),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::DeleteForever { uids }) => match core.delete_forever(&uids) {
+            Ok(n) => CtlResponse::Ok {
+                message: format!("permanently deleted {n} item(s)"),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::EmptyTrash) => match core.empty_trash() {
+            Ok(n) => CtlResponse::Ok {
+                message: format!("emptied trash ({n} item(s))"),
             },
             Err(e) => CtlResponse::Error { message: e },
         },

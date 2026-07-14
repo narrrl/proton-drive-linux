@@ -103,6 +103,20 @@ pub enum Request {
     /// Replies with [`Response::Transfers`]. Cheap to poll: the daemon keeps the
     /// registry in memory, so a front-end can render a live progress widget.
     GetQueueStatus,
+    /// List what is in the account's trash. Replies with [`Response::Entries`];
+    /// a trashed node has no path inside the mount, so each entry carries only
+    /// its `uid` — the handle for [`Request::Restore`] and
+    /// [`Request::DeleteForever`] — and its `path` is empty.
+    ListTrash,
+    /// Restore trashed nodes, by uid, to the folders they were trashed from.
+    /// Replies with [`Response::Ok`].
+    Restore { uids: Vec<String> },
+    /// Permanently delete trashed nodes by uid. Irreversible: the content is
+    /// gone from Proton Drive, not moved. Replies with [`Response::Ok`].
+    DeleteForever { uids: Vec<String> },
+    /// Permanently delete everything in the trash. Irreversible.
+    /// Replies with [`Response::Ok`].
+    EmptyTrash,
 }
 
 /// Which way an active transfer is moving, in a [`TransferItem`].
@@ -150,8 +164,10 @@ pub struct DirEntry {
     pub uid: String,
     /// Full mountpoint-relative path. Empty for a [`Request::ListDir`] listing
     /// (the entry lives in the requested directory, so the caller derives the
-    /// path by joining its name); populated when an entry can live anywhere in
-    /// the tree, as for search hits rendered through the browser.
+    /// path by joining its name) and for a [`Request::ListTrash`] listing (a
+    /// trashed node has no path inside the mount at all); populated when an entry
+    /// can live anywhere in the tree, as for search hits rendered through the
+    /// browser.
     #[serde(default)]
     pub path: String,
 }
@@ -229,7 +245,8 @@ pub enum Response {
     Ok { message: String },
     /// The pin registry.
     Pins { pins: Vec<Pin> },
-    /// A directory listing (reply to [`Request::ListDir`]).
+    /// A directory listing (reply to [`Request::ListDir`]) or a trash listing
+    /// (reply to [`Request::ListTrash`]).
     Entries { entries: Vec<DirEntry> },
     /// A page of the photos timeline. `available` is false when the account
     /// has no photos volume.
@@ -306,6 +323,29 @@ mod tests {
             assert!(!line.contains('\n'), "wire form must be a single line");
             let back: Request = serde_json::from_str(&line).unwrap();
             // Round-trip is lossless: re-serializing yields the same bytes.
+            assert_eq!(line, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    /// The trash requests carry uids rather than paths; they must survive the same
+    /// line-delimited round-trip, since a mangled uid would restore or destroy the
+    /// wrong node.
+    #[test]
+    fn trash_requests_roundtrip() {
+        let reqs = [
+            Request::ListTrash,
+            Request::Restore {
+                uids: vec!["vol~link".into(), "vol~other".into()],
+            },
+            Request::DeleteForever {
+                uids: vec!["vol~link".into()],
+            },
+            Request::EmptyTrash,
+        ];
+        for req in reqs {
+            let line = serde_json::to_string(&req).unwrap();
+            assert!(!line.contains('\n'), "wire form must be a single line");
+            let back: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(line, serde_json::to_string(&back).unwrap());
         }
     }
