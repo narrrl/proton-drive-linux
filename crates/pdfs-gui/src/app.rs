@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk4::gio;
@@ -33,7 +33,9 @@ use gtk4::glib::BoxedAnyObject;
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    DirEntry, PhotoItem, Request, Response, SearchHit, TransferDirection, TransferItem, send,
+    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, PhotoItem,
+    PublicLinkInfo, Request, Response, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
+    TransferDirection, TransferItem, send,
 };
 use pdfs_core::service;
 
@@ -49,6 +51,13 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff between auto-retries of a Files/Photos load while the mount service
 /// is still coming up (see [`load_browser`] / [`load_gallery`]).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a network-backed page (Shared, Shared-by-me, Devices, Activity) is
+/// considered fresh. Re-navigating to it within this window reuses the rows
+/// already on screen instead of re-fetching and flashing the "Loading…"
+/// placeholder. The Retry button and every mutation still force an immediate
+/// reload by clearing the page's timestamp.
+const PAGE_TTL: Duration = Duration::from_secs(30);
 /// Idle pause after the last keystroke before a search query is sent, so typing
 /// doesn't fire a request per character.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -224,6 +233,7 @@ struct Ui {
     /// daemon they can only fail, and a greyed button says so before the click.
     browser_new_folder: gtk4::Button,
     browser_upload: gtk4::Button,
+    browser_upload_folder: gtk4::Button,
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     search_source: RefCell<Option<glib::SourceId>>,
@@ -302,6 +312,45 @@ struct Ui {
     /// in place — rebuilding the ListStore instead would reset the scroll
     /// position out from under the user.
     gallery_bound: RefCell<HashMap<u32, gtk4::Box>>,
+    // Shared page. Three sections rebuilt wholesale on each load: shared-with-me,
+    // incoming invitations, and bookmarks. Rows are tracked so a reload can remove
+    // the old ones before appending the new (adw groups have no clear-all).
+    shared_content: gtk4::Stack,
+    shared_status: adw::StatusPage,
+    shared_retry: gtk4::Button,
+    shared_with_me_group: adw::PreferencesGroup,
+    invitations_group: adw::PreferencesGroup,
+    bookmarks_group: adw::PreferencesGroup,
+    shared_rows: RefCell<Vec<(adw::PreferencesGroup, gtk4::Widget)>>,
+    /// Guards the Shared page's load so overlapping navigations don't stack.
+    shared_inflight: Cell<bool>,
+    /// When the Shared page last painted good data. `None` = never / invalidated,
+    /// forcing a fetch on next visit. See [`PAGE_TTL`].
+    shared_loaded_at: Cell<Option<Instant>>,
+    // Devices page: one section, rebuilt wholesale on each load.
+    devices_content: gtk4::Stack,
+    devices_status: adw::StatusPage,
+    devices_retry: gtk4::Button,
+    devices_group: adw::PreferencesGroup,
+    devices_rows: RefCell<Vec<gtk4::Widget>>,
+    devices_inflight: Cell<bool>,
+    devices_loaded_at: Cell<Option<Instant>>,
+    // Shared (by me) page: one section listing the items I've shared, each with a
+    // copy-link / manage affordance. Rebuilt wholesale on each load.
+    shared_by_me_content: gtk4::Stack,
+    shared_by_me_status: adw::StatusPage,
+    shared_by_me_retry: gtk4::Button,
+    shared_by_me_group: adw::PreferencesGroup,
+    shared_by_me_rows: RefCell<Vec<gtk4::Widget>>,
+    shared_by_me_inflight: Cell<bool>,
+    shared_by_me_loaded_at: Cell<Option<Instant>>,
+    // Activity page: one section, newest-first, rebuilt wholesale on each load.
+    activity_content: gtk4::Stack,
+    activity_status: adw::StatusPage,
+    activity_retry: gtk4::Button,
+    activity_group: adw::PreferencesGroup,
+    activity_rows: RefCell<Vec<gtk4::Widget>>,
+    activity_inflight: Cell<bool>,
 }
 
 impl Ui {
@@ -502,11 +551,19 @@ fn build_window(app: &adw::Application) {
     let (main_page, main_widgets) = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
     let (gallery_page, gallery_widgets) = build_gallery_page();
+    let (shared_page, shared_widgets) = build_shared_page();
+    let (shared_by_me_page, shared_by_me_widgets) = build_shared_by_me_page();
+    let (devices_page, devices_widgets) = build_devices_page();
+    let (activity_page, activity_widgets) = build_activity_page();
     let (trash_page, trash_widgets) = build_trash_page();
     stack.add_named(&login_page, Some("login"));
     stack.add_named(&main_page, Some("main"));
     stack.add_named(&browser_page, Some("browser"));
     stack.add_named(&gallery_page, Some("gallery"));
+    stack.add_named(&shared_by_me_page, Some("sharedbyme"));
+    stack.add_named(&shared_page, Some("shared"));
+    stack.add_named(&devices_page, Some("devices"));
+    stack.add_named(&activity_page, Some("activity"));
     stack.add_named(&trash_page, Some("trash"));
 
     // Sidebar: the signed-in destinations. Selecting a row swaps the page stack;
@@ -588,6 +645,7 @@ fn build_window(app: &adw::Application) {
         browser_search: browser_widgets.search.clone(),
         browser_new_folder: browser_widgets.new_folder.clone(),
         browser_upload: browser_widgets.upload.clone(),
+        browser_upload_folder: browser_widgets.upload_folder.clone(),
         search_source: RefCell::new(None),
         trash_model: trash_widgets.model.clone(),
         trash_content: trash_widgets.content.clone(),
@@ -619,6 +677,35 @@ fn build_window(app: &adw::Application) {
         thumb_source: RefCell::new(None),
         relayout_source: RefCell::new(None),
         gallery_bound: RefCell::new(HashMap::new()),
+        shared_content: shared_widgets.content.clone(),
+        shared_status: shared_widgets.status.clone(),
+        shared_retry: shared_widgets.retry.clone(),
+        shared_with_me_group: shared_widgets.shared_with_me.clone(),
+        invitations_group: shared_widgets.invitations.clone(),
+        bookmarks_group: shared_widgets.bookmarks.clone(),
+        shared_rows: RefCell::new(Vec::new()),
+        shared_inflight: Cell::new(false),
+        shared_loaded_at: Cell::new(None),
+        devices_content: devices_widgets.content.clone(),
+        devices_status: devices_widgets.status.clone(),
+        devices_retry: devices_widgets.retry.clone(),
+        devices_group: devices_widgets.group.clone(),
+        devices_rows: RefCell::new(Vec::new()),
+        devices_inflight: Cell::new(false),
+        devices_loaded_at: Cell::new(None),
+        shared_by_me_content: shared_by_me_widgets.content.clone(),
+        shared_by_me_status: shared_by_me_widgets.status.clone(),
+        shared_by_me_retry: shared_by_me_widgets.retry.clone(),
+        shared_by_me_group: shared_by_me_widgets.group.clone(),
+        shared_by_me_rows: RefCell::new(Vec::new()),
+        shared_by_me_inflight: Cell::new(false),
+        shared_by_me_loaded_at: Cell::new(None),
+        activity_content: activity_widgets.content.clone(),
+        activity_status: activity_widgets.status.clone(),
+        activity_retry: activity_widgets.retry.clone(),
+        activity_group: activity_widgets.group.clone(),
+        activity_rows: RefCell::new(Vec::new()),
+        activity_inflight: Cell::new(false),
     });
     ui.load_ratios();
 
@@ -631,11 +718,20 @@ fn build_window(app: &adw::Application) {
     );
     wire_sidebar(&ui);
     wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
-    wire_browser_actions(&ui, &browser_widgets.new_folder, &browser_widgets.upload);
+    wire_browser_actions(
+        &ui,
+        &browser_widgets.new_folder,
+        &browser_widgets.upload,
+        &browser_widgets.upload_folder,
+    );
     wire_details(&ui);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
     wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
+    wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
+    wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
+    wire_devices(&ui, &devices_widgets.retry);
+    wire_activity(&ui, &activity_widgets.retry);
     wire_retry(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
@@ -646,6 +742,19 @@ fn build_window(app: &adw::Application) {
         match st.visible_child_name().as_deref() {
             Some("browser") => load_browser(&ui_nav),
             Some("gallery") => load_gallery(&ui_nav, false),
+            // Network-backed pages skip the fetch (and the "Loading…" flash) when
+            // the rows on screen are still fresh; the Retry button and mutations
+            // invalidate the timestamp to force a reload.
+            Some("sharedbyme") if page_fresh(&ui_nav.shared_by_me_loaded_at) => {}
+            Some("sharedbyme") => load_shared_by_me(&ui_nav),
+            Some("shared") if page_fresh(&ui_nav.shared_loaded_at) => {}
+            Some("shared") => load_shared(&ui_nav),
+            Some("devices") if page_fresh(&ui_nav.devices_loaded_at) => {}
+            Some("devices") => load_devices(&ui_nav),
+            // Activity is intentionally not TTL-cached: it changes out from under
+            // the page as background uploads and edits complete, so it reloads on
+            // every visit to stay live.
+            Some("activity") => load_activity(&ui_nav),
             Some("trash") => load_trash(&ui_nav),
             _ => {}
         }
@@ -684,9 +793,13 @@ fn build_window(app: &adw::Application) {
 
 /// The sidebar destinations, in order: the row index is the index into this table,
 /// and each entry is `(stack page name, label, icon)`.
-const DESTINATIONS: [(&str, &str, &str); 4] = [
-    ("browser", "Files", "folder-symbolic"),
+const DESTINATIONS: [(&str, &str, &str); 8] = [
+    ("browser", "My files", "folder-symbolic"),
+    ("sharedbyme", "Shared", "emblem-shared-symbolic"),
+    ("shared", "Shared with me", "system-users-symbolic"),
+    ("devices", "Computers", "computer-symbolic"),
     ("gallery", "Photos", "image-x-generic-symbolic"),
+    ("activity", "Activity", "document-open-recent-symbolic"),
     ("trash", "Trash", "user-trash-symbolic"),
     ("main", "Settings", "emblem-system-symbolic"),
 ];
@@ -743,6 +856,13 @@ fn wire_sidebar(ui: &Rc<Ui>) {
             ui_row.stack.set_visible_child_name(page);
         }
     });
+}
+
+/// Whether a network-backed page painted good data within [`PAGE_TTL`] and so
+/// can be reused without re-fetching. A `None` timestamp (never loaded, or
+/// invalidated by a mutation) is always stale.
+fn page_fresh(loaded_at: &Cell<Option<Instant>>) -> bool {
+    loaded_at.get().is_some_and(|t| t.elapsed() < PAGE_TTL)
 }
 
 /// Highlight the sidebar row for whichever page the stack is showing, so
@@ -1504,6 +1624,7 @@ fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     *ui.mounted.borrow_mut() = mounted;
     ui.browser_new_folder.set_sensitive(mounted);
     ui.browser_upload.set_sensitive(mounted);
+    ui.browser_upload_folder.set_sensitive(mounted);
     ui.gallery_upload.set_sensitive(mounted);
     ui.details.pin_row.set_sensitive(mounted);
     ui.details.rename_button.set_sensitive(mounted);
@@ -1589,6 +1710,9 @@ fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
             "Sync complete",
             &format!("{files} finished transferring."),
         );
+        // A just-finished batch may have added files (bulk upload) the current
+        // listing doesn't show yet; refresh whichever listing is on screen.
+        reload_listing(ui);
     }
 
     if items.is_empty() {
@@ -1828,6 +1952,7 @@ struct BrowserWidgets {
     search: gtk4::SearchEntry,
     new_folder: gtk4::Button,
     upload: gtk4::Button,
+    upload_folder: gtk4::Button,
     /// Wraps the views + the details pane; the pane slides in on selection.
     split: adw::OverlaySplitView,
     details: DetailsWidgets,
@@ -1869,10 +1994,16 @@ fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     new_folder.add_css_class("flat");
     let upload = gtk4::Button::builder()
         .icon_name("document-send-symbolic")
-        .tooltip_text("Upload file")
+        .tooltip_text("Upload files")
         .valign(gtk4::Align::Center)
         .build();
     upload.add_css_class("flat");
+    let upload_folder = gtk4::Button::builder()
+        .icon_name("send-to-symbolic")
+        .tooltip_text("Upload folder")
+        .valign(gtk4::Align::Center)
+        .build();
+    upload_folder.add_css_class("flat");
 
     // Linked grid/list toggle, top-right, Nautilus-style.
     let grid_toggle = gtk4::ToggleButton::builder()
@@ -1901,6 +2032,7 @@ fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     header.append(&crumb_scroll);
     header.append(&new_folder);
     header.append(&upload);
+    header.append(&upload_folder);
     header.append(&search);
     header.append(&toggles);
 
@@ -2007,6 +2139,7 @@ fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             search,
             new_folder,
             upload,
+            upload_folder,
             split,
             details,
             grid_selection,
@@ -2170,19 +2303,25 @@ fn wire_details(ui: &Rc<Ui>) {
 
     let ui_open = ui.clone();
     ui.details.open_button.connect_clicked(move |_| {
-        if let Some(entry) = ui_open.details_entry.borrow().clone() {
+        // Bind the clone to a local so the `Ref` from `borrow()` is dropped before
+        // `activate_entry` runs; it navigates and repaints the details pane, which
+        // takes `details_entry.borrow_mut()` and would panic against a live borrow.
+        let entry = ui_open.details_entry.borrow().clone();
+        if let Some(entry) = entry {
             activate_entry(&ui_open, &entry);
         }
     });
     let ui_rename = ui.clone();
     ui.details.rename_button.connect_clicked(move |_| {
-        if let Some(entry) = ui_rename.details_entry.borrow().clone() {
+        let entry = ui_rename.details_entry.borrow().clone();
+        if let Some(entry) = entry {
             prompt_rename(&ui_rename, &entry);
         }
     });
     let ui_trash = ui.clone();
     ui.details.trash_button.connect_clicked(move |_| {
-        if let Some(entry) = ui_trash.details_entry.borrow().clone() {
+        let entry = ui_trash.details_entry.borrow().clone();
+        if let Some(entry) = entry {
             prompt_delete(&ui_trash, &entry);
         }
     });
@@ -2235,7 +2374,18 @@ fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     ui.details_suppress.set(false);
 
     *ui.details_entry.borrow_mut() = Some(entry.clone());
-    ui.browser_split.set_show_sidebar(true);
+    // Reveal the pane on idle, not inline. This runs from `selection_changed`,
+    // which fires on the *first* press of a double-click; mutating the widget
+    // tree here cancels GtkGridView's multi-press tracking, so the second press
+    // restarts the count and `activate` never fires — the folder needs two
+    // double-clicks. Deferring lets the click gesture finish first. Guard on the
+    // entry still being present so a navigation that clears it wins the race.
+    let ui = ui.clone();
+    glib::idle_add_local_once(move || {
+        if ui.details_entry.borrow().is_some() {
+            ui.browser_split.set_show_sidebar(true);
+        }
+    });
 }
 
 /// Hide the details pane and forget the entry it was showing, so a stale entry
@@ -2504,6 +2654,18 @@ fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Box, x: f64, 
     });
     menu.append(&move_it);
 
+    menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let share = menu_item("Share…", "emblem-shared-symbolic");
+    let ui_sh = ui.clone();
+    let entry_sh = entry.clone();
+    let pop = popover.clone();
+    share.connect_clicked(move |_| {
+        pop.popdown();
+        open_share_dialog(&ui_sh, &entry_sh);
+    });
+    menu.append(&share);
+
     let trash = menu_item("Move to Trash", "user-trash-symbolic");
     let ui_tr = ui.clone();
     let entry_tr = entry.clone();
@@ -2694,12 +2856,19 @@ fn crumb_node(ui: &Rc<Ui>, label: &str, target: &str, current: bool) -> gtk4::Wi
     button.upcast()
 }
 
-/// Wire the browser header's New-folder and Upload-file buttons.
-fn wire_browser_actions(ui: &Rc<Ui>, new_folder: &gtk4::Button, upload: &gtk4::Button) {
+/// Wire the browser header's New-folder, Upload-files and Upload-folder buttons.
+fn wire_browser_actions(
+    ui: &Rc<Ui>,
+    new_folder: &gtk4::Button,
+    upload: &gtk4::Button,
+    upload_folder: &gtk4::Button,
+) {
     let ui_nf = ui.clone();
     new_folder.connect_clicked(move |_| prompt_new_folder(&ui_nf));
     let ui_up = ui.clone();
     upload.connect_clicked(move |_| prompt_upload(&ui_up));
+    let ui_uf = ui.clone();
+    upload_folder.connect_clicked(move |_| prompt_upload_folder(&ui_uf));
 }
 
 /// Send a mutating request (rename / move / delete / mkdir / upload, or a trash
@@ -2901,38 +3070,73 @@ fn prompt_new_folder(ui: &Rc<Ui>) {
     dialog.present(win.as_ref());
 }
 
-/// Pick a local file and upload it into the current browser directory.
+/// Pick one or more local files and upload them into the current browser
+/// directory. The daemon streams them from disk itself, so nothing is read into
+/// the GUI — even a large multi-file selection.
 fn prompt_upload(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let parent = ui.browser_path.borrow().clone();
-    let dialog = gtk4::FileDialog::builder().title("Upload File").build();
+    let dialog = gtk4::FileDialog::builder().title("Upload Files").build();
     let ui = ui.clone();
-    dialog.open(win.as_ref(), gio::Cancellable::NONE, move |res| {
-        let Ok(file) = res else { return };
-        let Some(path) = file.path() else { return };
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                toast_error(&ui, "Couldn't upload", &e.to_string());
-                return;
-            }
+    dialog.open_multiple(win.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Ok(files) = res else { return };
+        let sources: Vec<String> = files
+            .into_iter()
+            .filter_map(|f| f.ok())
+            .filter_map(|obj| obj.downcast::<gio::File>().ok())
+            .filter_map(|f| f.path())
+            .filter_map(|p| p.to_str().map(str::to_string))
+            .collect();
+        start_upload(&ui, sources);
+    });
+}
+
+/// Pick a local folder and upload it — with its whole subtree — into the current
+/// browser directory. The daemon recreates the directory structure remotely.
+fn prompt_upload_folder(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let dialog = gtk4::FileDialog::builder().title("Upload Folder").build();
+    let ui = ui.clone();
+    dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Ok(folder) = res else { return };
+        let Some(path) = folder.path().and_then(|p| p.to_str().map(str::to_string)) else {
+            return;
         };
-        let done = format!("Uploaded “{name}”");
-        run_mutation(
-            &ui,
-            Request::UploadFile {
-                parent: parent.clone(),
-                name,
-                bytes,
-            },
-            done,
-            "Couldn't upload",
-        );
+        start_upload(&ui, vec![path]);
+    });
+}
+
+/// Hand a set of local source paths to the daemon for background bulk upload.
+/// The daemon acks at once and does the work off-socket, so we confirm the
+/// hand-off with a toast; the Activity group then shows live progress and the
+/// listing refreshes itself when the transfers finish (see [`repaint_transfers`]).
+fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
+    if sources.is_empty() {
+        return;
+    }
+    if !*ui.mounted.borrow() {
+        toast_error(ui, "Couldn't upload", "Proton Drive isn't connected.");
+        return;
+    }
+    let parent = ui.browser_path.borrow().clone();
+    let n = sources.len();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::UploadPaths { parent, sources },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => {
+                let what = if n == 1 {
+                    "Uploading…".to_string()
+                } else {
+                    format!("Uploading {n} items…")
+                };
+                toast(&ui, &what);
+            }
+            Ok(Ok(Response::Error { message })) => toast_error(&ui, "Couldn't upload", &message),
+            _ => toast_error(&ui, "Couldn't upload", "The mount service didn't respond."),
+        }
     });
 }
 
@@ -3281,6 +3485,167 @@ struct TrashWidgets {
     retry: gtk4::Button,
     empty: gtk4::Button,
     subtitle: gtk4::Label,
+}
+
+/// Widgets the Shared page's load/repaint touch.
+struct SharedWidgets {
+    content: gtk4::Stack,
+    status: adw::StatusPage,
+    shared_with_me: adw::PreferencesGroup,
+    invitations: adw::PreferencesGroup,
+    bookmarks: adw::PreferencesGroup,
+    retry: gtk4::Button,
+    add_bookmark: gtk4::Button,
+}
+
+/// Widgets the Devices page's load/repaint touch.
+struct DevicesWidgets {
+    content: gtk4::Stack,
+    status: adw::StatusPage,
+    group: adw::PreferencesGroup,
+    retry: gtk4::Button,
+}
+
+/// The Shared page: three stacked sections — items shared *with* me (each with a
+/// Leave action), invitations addressed to me pending accept/reject, and public
+/// links I've bookmarked (open / remove). All three live outside the mount tree,
+/// so the page addresses them by uid/id/token and always re-lists from the daemon.
+fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
+    let title = gtk4::Label::builder()
+        .label("Shared with me")
+        .halign(gtk4::Align::Start)
+        .build();
+    title.add_css_class("title-2");
+    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    titles.set_hexpand(true);
+    titles.append(&title);
+
+    let add_bookmark = gtk4::Button::builder()
+        .label("Add Bookmark")
+        .valign(gtk4::Align::Center)
+        .build();
+    add_bookmark.add_css_class("flat");
+
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.append(&titles);
+    header.append(&add_bookmark);
+
+    let shared_with_me = adw::PreferencesGroup::builder()
+        .title("Shared with me")
+        .build();
+    let invitations = adw::PreferencesGroup::builder()
+        .title("Invitations")
+        .build();
+    let bookmarks = adw::PreferencesGroup::builder().title("Bookmarks").build();
+
+    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    groups.append(&shared_with_me);
+    groups.append(&invitations);
+    groups.append(&bookmarks);
+    let clamp = adw::Clamp::builder().child(&groups).build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Center)
+        .build();
+    retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
+    retry.set_visible(false);
+    let status = adw::StatusPage::builder()
+        .icon_name("emblem-shared-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
+
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&scroll, Some("list"));
+    content.add_named(&status, Some("status"));
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&header);
+    inner.append(&content);
+
+    (
+        inner.upcast(),
+        SharedWidgets {
+            content,
+            status,
+            shared_with_me,
+            invitations,
+            bookmarks,
+            retry,
+            add_bookmark,
+        },
+    )
+}
+
+/// The Devices page: one section listing every device registered to the account,
+/// each row offering Rename and Remove.
+fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
+    let title = gtk4::Label::builder()
+        .label("Devices")
+        .halign(gtk4::Align::Start)
+        .build();
+    title.add_css_class("title-2");
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.set_hexpand(true);
+    header.append(&title);
+
+    let group = adw::PreferencesGroup::new();
+    let clamp = adw::Clamp::builder().child(&group).build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Center)
+        .build();
+    retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
+    retry.set_visible(false);
+    let status = adw::StatusPage::builder()
+        .icon_name("computer-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
+
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&scroll, Some("list"));
+    content.add_named(&status, Some("status"));
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&header);
+    inner.append(&content);
+
+    (
+        inner.upcast(),
+        DevicesWidgets {
+            content,
+            status,
+            group,
+            retry,
+        },
+    )
 }
 
 /// The Trash page: a flat list of everything Drive is holding in the trash, each
@@ -3650,6 +4015,1603 @@ fn prompt_empty_trash(ui: &Rc<Ui>) {
         }
     });
     dialog.present(win.as_ref());
+}
+
+// ---- Shared page ----------------------------------------------------------
+
+/// Install the Shared page's retry and Add-Bookmark buttons.
+fn wire_shared(ui: &Rc<Ui>, retry: &gtk4::Button, add_bookmark: &gtk4::Button) {
+    let ui_retry = ui.clone();
+    retry.connect_clicked(move |_| {
+        service::restart();
+        load_shared(&ui_retry);
+    });
+    let ui_add = ui.clone();
+    add_bookmark.connect_clicked(move |_| prompt_add_bookmark(&ui_add));
+}
+
+/// Show a status page in place of the Shared sections.
+fn shared_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.shared_status.set_icon_name(Some(icon));
+    ui.shared_status.set_title(title);
+    ui.shared_status.set_description(Some(description));
+    ui.shared_retry.set_visible(retry);
+    ui.shared_content.set_visible_child_name("status");
+}
+
+/// Fetch the three Shared sections (shared-with-me, invitations, bookmarks) in
+/// parallel and repaint the page once all three land.
+fn load_shared(ui: &Rc<Ui>) {
+    if ui.shared_inflight.get() {
+        return;
+    }
+    ui.shared_inflight.set(true);
+    shared_status(
+        ui,
+        "emblem-shared-symbolic",
+        "Loading…",
+        "Reading your shared items.",
+        false,
+    );
+
+    ui.busy_begin();
+    let socket = ui.dirs.control_socket();
+    let shared_rx = spawn_request(socket.clone(), Request::ListSharedWithMe);
+    let invites_rx = spawn_request(socket.clone(), Request::ListInvitations);
+    let bookmarks_rx = spawn_request(socket, Request::ListBookmarks);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let shared = shared_rx.recv().await;
+        let invites = invites_rx.recv().await;
+        let bookmarks = bookmarks_rx.recv().await;
+        ui.busy_end();
+        ui.shared_inflight.set(false);
+
+        // A transport failure on any of the three means the daemon isn't up.
+        if matches!(shared, Ok(Err(_)) | Err(_))
+            || matches!(invites, Ok(Err(_)) | Err(_))
+            || matches!(bookmarks, Ok(Err(_)) | Err(_))
+        {
+            ui.shared_loaded_at.set(None);
+            shared_unreachable(&ui);
+            return;
+        }
+
+        let shared_items = match shared {
+            Ok(Ok(Response::Entries { entries })) => entries,
+            _ => Vec::new(),
+        };
+        let invitations = match invites {
+            Ok(Ok(Response::Invitations { items })) => items,
+            _ => Vec::new(),
+        };
+        let bookmark_items = match bookmarks {
+            Ok(Ok(Response::Bookmarks { items })) => items,
+            _ => Vec::new(),
+        };
+        repaint_shared(&ui, &shared_items, &invitations, &bookmark_items);
+        ui.shared_loaded_at.set(Some(Instant::now()));
+    });
+}
+
+/// The daemon didn't answer the Shared page. Same still-starting vs. down split
+/// as the other pages.
+fn shared_unreachable(ui: &Rc<Ui>) {
+    if service::is_failed() || !service::is_active() {
+        shared_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
+        return;
+    }
+    shared_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        if ui.stack.visible_child_name().as_deref() == Some("shared") {
+            load_shared(&ui);
+        }
+    });
+}
+
+/// Rebuild the three Shared sections. Rows added last time are removed first —
+/// adw groups have no clear-all — then each section is repopulated, showing a
+/// dim placeholder row when empty.
+fn repaint_shared(
+    ui: &Rc<Ui>,
+    shared: &[DirEntry],
+    invitations: &[InvitationInfo],
+    bookmarks: &[BookmarkInfo],
+) {
+    for (group, row) in ui.shared_rows.borrow_mut().drain(..) {
+        group.remove(&row);
+    }
+    ui.shared_content.set_visible_child_name("list");
+    let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
+
+    // Shared with me: name + Leave.
+    if shared.is_empty() {
+        let row = dim_row("Nothing is shared with you.");
+        ui.shared_with_me_group.add(&row);
+        rows.push((ui.shared_with_me_group.clone(), row.upcast()));
+    } else {
+        for entry in shared {
+            let row = adw::ActionRow::builder().title(&entry.name).build();
+            row.add_prefix(&gtk4::Image::from_icon_name(if entry.is_dir {
+                "folder-symbolic"
+            } else {
+                "text-x-generic-symbolic"
+            }));
+            let leave = gtk4::Button::builder()
+                .label("Leave")
+                .valign(gtk4::Align::Center)
+                .build();
+            leave.add_css_class("flat");
+            let ui_leave = ui.clone();
+            let uid = entry.uid.clone();
+            let name = entry.name.clone();
+            leave.connect_clicked(move |_| prompt_leave_shared(&ui_leave, &uid, &name));
+            row.add_suffix(&leave);
+            ui.shared_with_me_group.add(&row);
+            rows.push((ui.shared_with_me_group.clone(), row.upcast()));
+        }
+    }
+
+    // Invitations: inviter + item, Accept / Reject.
+    if invitations.is_empty() {
+        let row = dim_row("No pending invitations.");
+        ui.invitations_group.add(&row);
+        rows.push((ui.invitations_group.clone(), row.upcast()));
+    } else {
+        for inv in invitations {
+            let item = inv
+                .name
+                .clone()
+                .unwrap_or_else(|| "a shared item".to_string());
+            let row = adw::ActionRow::builder()
+                .title(&item)
+                .subtitle(format!("from {}", inv.inviter_email))
+                .build();
+            row.add_prefix(&gtk4::Image::from_icon_name(if inv.is_dir {
+                "folder-symbolic"
+            } else {
+                "text-x-generic-symbolic"
+            }));
+            let reject = gtk4::Button::builder()
+                .icon_name("window-close-symbolic")
+                .tooltip_text("Reject")
+                .valign(gtk4::Align::Center)
+                .build();
+            reject.add_css_class("flat");
+            let accept = gtk4::Button::builder()
+                .label("Accept")
+                .valign(gtk4::Align::Center)
+                .build();
+            accept.add_css_class("suggested-action");
+            let ui_acc = ui.clone();
+            let id_acc = inv.id.clone();
+            accept.connect_clicked(move |_| {
+                respond_invitation(&ui_acc, &id_acc, true);
+            });
+            let ui_rej = ui.clone();
+            let id_rej = inv.id.clone();
+            reject.connect_clicked(move |_| {
+                respond_invitation(&ui_rej, &id_rej, false);
+            });
+            row.add_suffix(&accept);
+            row.add_suffix(&reject);
+            ui.invitations_group.add(&row);
+            rows.push((ui.invitations_group.clone(), row.upcast()));
+        }
+    }
+
+    // Bookmarks: name/URL, Open / Remove.
+    if bookmarks.is_empty() {
+        let row = dim_row("No saved bookmarks.");
+        ui.bookmarks_group.add(&row);
+        rows.push((ui.bookmarks_group.clone(), row.upcast()));
+    } else {
+        for bm in bookmarks {
+            let title = bm.name.clone().unwrap_or_else(|| "Shared link".to_string());
+            let row = adw::ActionRow::builder()
+                .title(&title)
+                .subtitle(&bm.url)
+                .build();
+            row.add_prefix(&gtk4::Image::from_icon_name("emblem-symbolic-link"));
+            let remove = gtk4::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text("Remove bookmark")
+                .valign(gtk4::Align::Center)
+                .build();
+            remove.add_css_class("flat");
+            let open = gtk4::Button::builder()
+                .icon_name("external-link-symbolic")
+                .tooltip_text("Open in browser")
+                .valign(gtk4::Align::Center)
+                .build();
+            open.add_css_class("flat");
+            let url_open = bm.url.clone();
+            open.connect_clicked(move |_| open_uri(&url_open));
+            let ui_rm = ui.clone();
+            let token = bm.token.clone();
+            let name_rm = title.clone();
+            remove.connect_clicked(move |_| prompt_remove_bookmark(&ui_rm, &token, &name_rm));
+            row.add_suffix(&open);
+            row.add_suffix(&remove);
+            ui.bookmarks_group.add(&row);
+            rows.push((ui.bookmarks_group.clone(), row.upcast()));
+        }
+    }
+
+    *ui.shared_rows.borrow_mut() = rows;
+}
+
+/// Accept or reject an invitation, then reload the Shared page.
+fn respond_invitation(ui: &Rc<Ui>, id: &str, accept: bool) {
+    let req = if accept {
+        Request::AcceptInvitation { id: id.to_string() }
+    } else {
+        Request::RejectInvitation { id: id.to_string() }
+    };
+    let (done, failed) = if accept {
+        ("Invitation accepted", "Couldn't accept the invitation")
+    } else {
+        ("Invitation rejected", "Couldn't reject the invitation")
+    };
+    run_shared_mutation(ui, req, done, failed);
+}
+
+/// Confirm, then leave a node shared with me.
+fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Leave shared item")
+        .body(format!(
+            "Leave “{name}”? You'll lose access until you're invited again."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("leave", "Leave");
+    dialog.set_response_appearance("leave", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "leave" {
+            run_shared_mutation(
+                &ui,
+                Request::LeaveShared { uid: uid.clone() },
+                "Left shared item",
+                "Couldn't leave the shared item",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Confirm, then remove a saved bookmark.
+fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Remove bookmark")
+        .body(format!("Remove the bookmark for “{name}”?"))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let token = token.to_string();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "remove" {
+            run_shared_mutation(
+                &ui,
+                Request::DeleteBookmark {
+                    token: token.clone(),
+                },
+                "Bookmark removed",
+                "Couldn't remove the bookmark",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Prompt for a public-link URL (and optional password) and save it as a bookmark.
+fn prompt_add_bookmark(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Add bookmark")
+        .body("Paste a Proton Drive public link to save it here.")
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let url_row = adw::EntryRow::builder().title("Public link URL").build();
+    let pw_row = adw::PasswordEntryRow::builder()
+        .title("Password (if the link has one)")
+        .build();
+    group.add(&url_row);
+    group.add(&pw_row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("add", "Add");
+    dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("add"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "add" {
+            return;
+        }
+        let url = url_row.text().trim().to_string();
+        if url.is_empty() {
+            toast_error(&ui, "Couldn't add bookmark", "A URL is required.");
+            return;
+        }
+        let pw = pw_row.text().to_string();
+        let password = if pw.is_empty() { None } else { Some(pw) };
+        run_shared_mutation(
+            &ui,
+            Request::CreateBookmark { url, password },
+            "Bookmark saved",
+            "Couldn't add the bookmark",
+        );
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Run a mutation raised from the Shared page and reload the page on success.
+fn run_shared_mutation(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'static str) {
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), req);
+    let ui = ui.clone();
+    let done = done.to_string();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::Ok { .. })) => {
+                load_shared(&ui);
+                toast(&ui, &done);
+            }
+            Ok(Ok(Response::Error { message })) => toast_error(&ui, failed, &message),
+            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+        }
+    });
+}
+
+// ---- Devices page ---------------------------------------------------------
+
+/// Install the Devices page's retry button.
+fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button) {
+    let ui_retry = ui.clone();
+    retry.connect_clicked(move |_| {
+        service::restart();
+        load_devices(&ui_retry);
+    });
+}
+
+/// Show a status page in place of the Devices list.
+fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.devices_status.set_icon_name(Some(icon));
+    ui.devices_status.set_title(title);
+    ui.devices_status.set_description(Some(description));
+    ui.devices_retry.set_visible(retry);
+    ui.devices_content.set_visible_child_name("status");
+}
+
+/// Fetch the device list and repaint the page.
+fn load_devices(ui: &Rc<Ui>) {
+    if ui.devices_inflight.get() {
+        return;
+    }
+    ui.devices_inflight.set(true);
+    devices_status(
+        ui,
+        "computer-symbolic",
+        "Loading…",
+        "Reading your devices.",
+        false,
+    );
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListDevices);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        ui.devices_inflight.set(false);
+        match result {
+            Ok(Ok(Response::Devices { items })) => {
+                repaint_devices(&ui, &items);
+                ui.devices_loaded_at.set(Some(Instant::now()));
+            }
+            Ok(Ok(Response::Error { message })) => devices_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read devices",
+                &message,
+                false,
+            ),
+            Ok(Ok(_)) => devices_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read devices",
+                "Unexpected reply from the mount service.",
+                false,
+            ),
+            Ok(Err(_)) | Err(_) => {
+                ui.devices_loaded_at.set(None);
+                devices_unreachable(&ui);
+            }
+        }
+    });
+}
+
+/// The daemon didn't answer the Devices page.
+fn devices_unreachable(ui: &Rc<Ui>) {
+    if service::is_failed() || !service::is_active() {
+        devices_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
+        return;
+    }
+    devices_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        if ui.stack.visible_child_name().as_deref() == Some("devices") {
+            load_devices(&ui);
+        }
+    });
+}
+
+/// Rebuild the Devices section from a fresh listing.
+fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
+    for row in ui.devices_rows.borrow_mut().drain(..) {
+        ui.devices_group.remove(&row);
+    }
+    if devices.is_empty() {
+        devices_status(
+            ui,
+            "computer-symbolic",
+            "No devices",
+            "Desktop apps that sync a folder to this account show up here.",
+            false,
+        );
+        return;
+    }
+    ui.devices_content.set_visible_child_name("list");
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+    for dev in devices {
+        let row = adw::ActionRow::builder()
+            .title(&dev.name)
+            .subtitle(&dev.device_type)
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
+        let remove = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove device")
+            .valign(gtk4::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        let rename = gtk4::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Rename device")
+            .valign(gtk4::Align::Center)
+            .build();
+        rename.add_css_class("flat");
+        let ui_ren = ui.clone();
+        let uid_ren = dev.uid.clone();
+        let name_ren = dev.name.clone();
+        rename.connect_clicked(move |_| prompt_rename_device(&ui_ren, &uid_ren, &name_ren));
+        let ui_rm = ui.clone();
+        let uid_rm = dev.uid.clone();
+        let name_rm = dev.name.clone();
+        remove.connect_clicked(move |_| prompt_remove_device(&ui_rm, &uid_rm, &name_rm));
+        row.add_suffix(&rename);
+        row.add_suffix(&remove);
+        ui.devices_group.add(&row);
+        rows.push(row.upcast());
+    }
+    *ui.devices_rows.borrow_mut() = rows;
+}
+
+/// Prompt for a new device name and rename it.
+fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Rename device")
+        .body(format!("Rename “{current}”."))
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let row = adw::EntryRow::builder().title("New name").build();
+    row.set_text(current);
+    group.add(&row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "rename" {
+            return;
+        }
+        let name = row.text().trim().to_string();
+        if name.is_empty() {
+            toast_error(&ui, "Couldn't rename device", "A name is required.");
+            return;
+        }
+        run_devices_mutation(
+            &ui,
+            Request::RenameDevice {
+                uid: uid.clone(),
+                name,
+            },
+            "Device renamed",
+            "Couldn't rename the device",
+        );
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Confirm, then remove (deregister) a device.
+fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Remove device")
+        .body(format!(
+            "Remove “{name}”? Its synced folder registration is deleted."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "remove" {
+            run_devices_mutation(
+                &ui,
+                Request::DeleteDevice { uid: uid.clone() },
+                "Device removed",
+                "Couldn't remove the device",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Run a mutation raised from the Devices page and reload the page on success.
+fn run_devices_mutation(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'static str) {
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), req);
+    let ui = ui.clone();
+    let done = done.to_string();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::Ok { .. })) => {
+                load_devices(&ui);
+                toast(&ui, &done);
+            }
+            Ok(Ok(Response::Error { message })) => toast_error(&ui, failed, &message),
+            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+        }
+    });
+}
+
+// ---- Shared (by me) page --------------------------------------------------
+
+/// Widgets the Shared (by-me) page's load/repaint touch.
+struct SharedByMeWidgets {
+    content: gtk4::Stack,
+    status: adw::StatusPage,
+    group: adw::PreferencesGroup,
+    retry: gtk4::Button,
+}
+
+/// The Shared page: one section listing the items I have shared with others —
+/// each row summarizing who has access and carrying its public link (copy/open)
+/// and a Manage shortcut into the per-node Share dialog.
+fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
+    let title = gtk4::Label::builder()
+        .label("Shared")
+        .halign(gtk4::Align::Start)
+        .build();
+    title.add_css_class("title-2");
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.set_hexpand(true);
+    header.append(&title);
+
+    let group = adw::PreferencesGroup::new();
+    let clamp = adw::Clamp::builder().child(&group).build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Center)
+        .build();
+    retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
+    retry.set_visible(false);
+    let status = adw::StatusPage::builder()
+        .icon_name("emblem-shared-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
+
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&scroll, Some("list"));
+    content.add_named(&status, Some("status"));
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&header);
+    inner.append(&content);
+
+    (
+        inner.upcast(),
+        SharedByMeWidgets {
+            content,
+            status,
+            group,
+            retry,
+        },
+    )
+}
+
+/// Install the Shared (by-me) page's retry button.
+fn wire_shared_by_me(ui: &Rc<Ui>, retry: &gtk4::Button) {
+    let ui_retry = ui.clone();
+    retry.connect_clicked(move |_| {
+        service::restart();
+        load_shared_by_me(&ui_retry);
+    });
+}
+
+/// Show a status page in place of the Shared (by-me) list.
+fn shared_by_me_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.shared_by_me_status.set_icon_name(Some(icon));
+    ui.shared_by_me_status.set_title(title);
+    ui.shared_by_me_status.set_description(Some(description));
+    ui.shared_by_me_retry.set_visible(retry);
+    ui.shared_by_me_content.set_visible_child_name("status");
+}
+
+/// Fetch the shared-by-me listing and repaint the page.
+fn load_shared_by_me(ui: &Rc<Ui>) {
+    if ui.shared_by_me_inflight.get() {
+        return;
+    }
+    ui.shared_by_me_inflight.set(true);
+    shared_by_me_status(
+        ui,
+        "emblem-shared-symbolic",
+        "Loading…",
+        "Reading what you've shared.",
+        false,
+    );
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListSharedByMe);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        ui.shared_by_me_inflight.set(false);
+        match result {
+            Ok(Ok(Response::SharedByMe { items })) => {
+                repaint_shared_by_me(&ui, &items);
+                ui.shared_by_me_loaded_at.set(Some(Instant::now()));
+            }
+            Ok(Ok(Response::Error { message })) => shared_by_me_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read your shares",
+                &message,
+                false,
+            ),
+            Ok(Ok(_)) => shared_by_me_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read your shares",
+                "Unexpected reply from the mount service.",
+                false,
+            ),
+            Ok(Err(_)) | Err(_) => {
+                ui.shared_by_me_loaded_at.set(None);
+                shared_by_me_unreachable(&ui);
+            }
+        }
+    });
+}
+
+/// The daemon didn't answer the Shared (by-me) page.
+fn shared_by_me_unreachable(ui: &Rc<Ui>) {
+    if service::is_failed() || !service::is_active() {
+        shared_by_me_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
+        return;
+    }
+    shared_by_me_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        if ui.stack.visible_child_name().as_deref() == Some("sharedbyme") {
+            load_shared_by_me(&ui);
+        }
+    });
+}
+
+/// Rebuild the Shared (by-me) section from a fresh listing.
+fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
+    for row in ui.shared_by_me_rows.borrow_mut().drain(..) {
+        ui.shared_by_me_group.remove(&row);
+    }
+    if items.is_empty() {
+        shared_by_me_status(
+            ui,
+            "emblem-shared-symbolic",
+            "Nothing shared yet",
+            "Items you share with people or by link show up here.",
+            false,
+        );
+        return;
+    }
+    ui.shared_by_me_content.set_visible_child_name("list");
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+    for item in items {
+        let row = adw::ActionRow::builder()
+            .title(&item.name)
+            .subtitle(shared_item_summary(item))
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name(if item.is_dir {
+            "folder-symbolic"
+        } else {
+            "text-x-generic-symbolic"
+        }));
+
+        // Copy / open the public link, when there is one with a recovered URL.
+        if let Some(url) = item.link.as_ref().and_then(|l| l.url.clone()) {
+            let copy = gtk4::Button::builder()
+                .icon_name("edit-copy-symbolic")
+                .tooltip_text("Copy link")
+                .valign(gtk4::Align::Center)
+                .build();
+            copy.add_css_class("flat");
+            let ui_copy = ui.clone();
+            let url_copy = url.clone();
+            copy.connect_clicked(move |btn| {
+                btn.clipboard().set_text(&url_copy);
+                toast(&ui_copy, "Link copied");
+            });
+            let open = gtk4::Button::builder()
+                .icon_name("external-link-symbolic")
+                .tooltip_text("Open link")
+                .valign(gtk4::Align::Center)
+                .build();
+            open.add_css_class("flat");
+            let url_open = url.clone();
+            open.connect_clicked(move |_| open_uri(&url_open));
+            row.add_suffix(&copy);
+            row.add_suffix(&open);
+        }
+
+        // Manage opens the per-node Share dialog — only when the node's path is
+        // known (it has been browsed to this session); the dialog is path-keyed.
+        if !item.path.is_empty() {
+            let manage = gtk4::Button::builder()
+                .label("Manage")
+                .valign(gtk4::Align::Center)
+                .build();
+            manage.add_css_class("flat");
+            let ui_manage = ui.clone();
+            let entry = shared_item_as_entry(item);
+            manage.connect_clicked(move |_| open_share_dialog(&ui_manage, &entry));
+            row.add_suffix(&manage);
+        }
+
+        ui.shared_by_me_group.add(&row);
+        rows.push(row.upcast());
+    }
+    *ui.shared_by_me_rows.borrow_mut() = rows;
+}
+
+/// A one-line summary of who can reach a shared item, for its row subtitle.
+fn shared_item_summary(item: &SharedItem) -> String {
+    let mut parts = Vec::new();
+    if item.member_count > 0 {
+        parts.push(format!(
+            "{} {}",
+            item.member_count,
+            if item.member_count == 1 {
+                "person"
+            } else {
+                "people"
+            }
+        ));
+    }
+    if item.invite_count > 0 {
+        parts.push(format!("{} pending", item.invite_count));
+    }
+    if item.link.is_some() {
+        parts.push("Public link".to_string());
+    }
+    if parts.is_empty() {
+        "Shared".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Build a [`DirEntry`] from a [`SharedItem`] so the path-keyed Share dialog can
+/// open on it. Only used when the item's path is known.
+fn shared_item_as_entry(item: &SharedItem) -> DirEntry {
+    DirEntry {
+        name: item.name.clone(),
+        is_dir: item.is_dir,
+        size: 0,
+        modified: 0,
+        pinned: false,
+        cached: false,
+        uid: item.uid.clone(),
+        path: item.path.clone(),
+    }
+}
+
+// ---- Activity page --------------------------------------------------------
+
+/// Widgets the Activity page's load/repaint touch.
+struct ActivityWidgets {
+    content: gtk4::Stack,
+    status: adw::StatusPage,
+    group: adw::PreferencesGroup,
+    retry: gtk4::Button,
+}
+
+/// The Activity page: a newest-first feed of the mutations and transfers the
+/// daemon performed this session (uploads, deletes, shares, …).
+fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
+    let title = gtk4::Label::builder()
+        .label("Activity")
+        .halign(gtk4::Align::Start)
+        .build();
+    title.add_css_class("title-2");
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.set_hexpand(true);
+    header.append(&title);
+
+    let group = adw::PreferencesGroup::new();
+    let clamp = adw::Clamp::builder().child(&group).build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+
+    let retry = gtk4::Button::builder()
+        .label("Retry")
+        .halign(gtk4::Align::Center)
+        .build();
+    retry.add_css_class("pill");
+    retry.add_css_class("suggested-action");
+    retry.set_visible(false);
+    let status = adw::StatusPage::builder()
+        .icon_name("document-open-recent-symbolic")
+        .vexpand(true)
+        .child(&retry)
+        .build();
+    status.add_css_class("compact");
+
+    let content = gtk4::Stack::new();
+    content.set_vexpand(true);
+    content.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    content.add_named(&scroll, Some("list"));
+    content.add_named(&status, Some("status"));
+
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.append(&header);
+    inner.append(&content);
+
+    (
+        inner.upcast(),
+        ActivityWidgets {
+            content,
+            status,
+            group,
+            retry,
+        },
+    )
+}
+
+/// Install the Activity page's retry button.
+fn wire_activity(ui: &Rc<Ui>, retry: &gtk4::Button) {
+    let ui_retry = ui.clone();
+    retry.connect_clicked(move |_| {
+        service::restart();
+        load_activity(&ui_retry);
+    });
+}
+
+/// Show a status page in place of the Activity list.
+fn activity_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+    ui.activity_status.set_icon_name(Some(icon));
+    ui.activity_status.set_title(title);
+    ui.activity_status.set_description(Some(description));
+    ui.activity_retry.set_visible(retry);
+    ui.activity_content.set_visible_child_name("status");
+}
+
+/// Fetch the recent activity and repaint the page.
+fn load_activity(ui: &Rc<Ui>) {
+    if ui.activity_inflight.get() {
+        return;
+    }
+    ui.activity_inflight.set(true);
+    activity_status(
+        ui,
+        "document-open-recent-symbolic",
+        "Loading…",
+        "Reading recent activity.",
+        false,
+    );
+    ui.busy_begin();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::ListActivity { limit: 200 },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        ui.activity_inflight.set(false);
+        match result {
+            Ok(Ok(Response::Activity { items })) => repaint_activity(&ui, &items),
+            Ok(Ok(Response::Error { message })) => activity_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read activity",
+                &message,
+                false,
+            ),
+            Ok(Ok(_)) => activity_status(
+                &ui,
+                "dialog-warning-symbolic",
+                "Couldn't read activity",
+                "Unexpected reply from the mount service.",
+                false,
+            ),
+            Ok(Err(_)) | Err(_) => activity_unreachable(&ui),
+        }
+    });
+}
+
+/// The daemon didn't answer the Activity page.
+fn activity_unreachable(ui: &Rc<Ui>) {
+    if service::is_failed() || !service::is_active() {
+        activity_status(
+            ui,
+            "network-offline-symbolic",
+            "Not connected",
+            "The Proton Drive mount service isn't running.",
+            true,
+        );
+        return;
+    }
+    activity_status(
+        ui,
+        "folder-remote-symbolic",
+        "Connecting…",
+        "Waiting for the Proton Drive mount service to come up.",
+        false,
+    );
+    let ui = ui.clone();
+    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+        if ui.stack.visible_child_name().as_deref() == Some("activity") {
+            load_activity(&ui);
+        }
+    });
+}
+
+/// Rebuild the Activity section from a fresh log.
+fn repaint_activity(ui: &Rc<Ui>, items: &[ActivityEntry]) {
+    for row in ui.activity_rows.borrow_mut().drain(..) {
+        ui.activity_group.remove(&row);
+    }
+    if items.is_empty() {
+        activity_status(
+            ui,
+            "document-open-recent-symbolic",
+            "Nothing yet",
+            "Uploads, moves, shares and other changes appear here as they happen.",
+            false,
+        );
+        return;
+    }
+    ui.activity_content.set_visible_child_name("list");
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+    for a in items {
+        let mut subtitle = activity_time(a.time);
+        if !a.detail.is_empty() {
+            subtitle = format!("{subtitle} · {}", a.detail);
+        }
+        let row = adw::ActionRow::builder()
+            .title(format!("{} {}", activity_verb(a.kind), a.target))
+            .subtitle(subtitle)
+            .build();
+        let icon = if a.ok {
+            activity_icon(a.kind)
+        } else {
+            "dialog-warning-symbolic"
+        };
+        row.add_prefix(&gtk4::Image::from_icon_name(icon));
+        row.set_activatable(false);
+        ui.activity_group.add(&row);
+        rows.push(row.upcast());
+    }
+    *ui.activity_rows.borrow_mut() = rows;
+}
+
+/// A human verb for an activity kind, used as the row title's lead word.
+fn activity_verb(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::Upload => "Uploaded",
+        ActivityKind::Rename => "Renamed",
+        ActivityKind::Move => "Moved",
+        ActivityKind::CreateFolder => "Created folder",
+        ActivityKind::Trash => "Trashed",
+        ActivityKind::Restore => "Restored",
+        ActivityKind::DeleteForever => "Deleted",
+        ActivityKind::EmptyTrash => "Emptied trash —",
+        ActivityKind::Share => "Shared",
+        ActivityKind::PublicLink => "Linked",
+        ActivityKind::Unshare => "Unshared",
+    }
+}
+
+/// A themed icon for an activity kind.
+fn activity_icon(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::Upload => "document-send-symbolic",
+        ActivityKind::Rename => "document-edit-symbolic",
+        ActivityKind::Move => "go-jump-symbolic",
+        ActivityKind::CreateFolder => "folder-new-symbolic",
+        ActivityKind::Trash | ActivityKind::DeleteForever | ActivityKind::EmptyTrash => {
+            "user-trash-symbolic"
+        }
+        ActivityKind::Restore => "edit-undo-symbolic",
+        ActivityKind::Share | ActivityKind::PublicLink => "emblem-shared-symbolic",
+        ActivityKind::Unshare => "action-unavailable-symbolic",
+    }
+}
+
+/// Format an epoch-seconds timestamp for the Activity feed, in local time.
+fn activity_time(secs: i64) -> String {
+    glib::DateTime::from_unix_local(secs)
+        .and_then(|dt| dt.format("%b %-d, %H:%M"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// A dim, non-interactive placeholder row for an empty section.
+fn dim_row(text: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(text).build();
+    row.add_css_class("dim-label");
+    row.set_activatable(false);
+    row
+}
+
+/// Open a URL in the user's default browser.
+fn open_uri(url: &str) {
+    if let Err(e) = gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>) {
+        tracing::warn!("open uri {url}: {e}");
+    }
+}
+
+// ---- per-node Share dialog ------------------------------------------------
+
+/// The roles offered in the Share dialog's dropdowns, in index order.
+const SHARE_ROLES: [&str; 3] = ["Viewer", "Editor", "Admin"];
+
+/// Map a role dropdown index to the wire role string.
+fn role_index_to_wire(idx: u32) -> &'static str {
+    match idx {
+        1 => "editor",
+        2 => "admin",
+        _ => "viewer",
+    }
+}
+
+/// Map a wire role string to its dropdown index.
+fn role_wire_to_index(role: &str) -> u32 {
+    match role {
+        "editor" => 1,
+        "admin" => 2,
+        _ => 0,
+    }
+}
+
+/// The mutable state behind an open Share dialog, so the invite/role/link
+/// handlers can rebuild the people and link sections after each change without
+/// tearing the whole dialog down.
+struct ShareDialog {
+    ui: Rc<Ui>,
+    /// The node's mountpoint-relative path — how every request addresses it.
+    rel: String,
+    people: adw::PreferencesGroup,
+    link_group: adw::PreferencesGroup,
+    people_rows: RefCell<Vec<gtk4::Widget>>,
+    link_rows: RefCell<Vec<gtk4::Widget>>,
+}
+
+/// Open the per-node Share dialog: invite Proton/external users, manage who has
+/// access and their roles, and create/copy/remove a public link.
+fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
+    if !*ui.mounted.borrow() {
+        toast_error(ui, "Can't share", "Proton Drive isn't connected.");
+        return;
+    }
+    let rel = entry_rel(ui, entry);
+
+    let toolbar = adw::ToolbarView::new();
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new("Share", &entry.name)));
+    toolbar.add_top_bar(&header);
+
+    // Invite section: emails + role + optional message.
+    let invite_group = adw::PreferencesGroup::builder()
+        .title("Invite people")
+        .description("Proton and non-Proton email addresses, separated by spaces or commas.")
+        .build();
+    let email_row = adw::EntryRow::builder().title("Email addresses").build();
+    let role_model = gtk4::StringList::new(&SHARE_ROLES);
+    let role_drop = gtk4::DropDown::builder()
+        .model(&role_model)
+        .selected(0)
+        .valign(gtk4::Align::Center)
+        .build();
+    let role_wrap = adw::ActionRow::builder().title("Role").build();
+    role_wrap.add_suffix(&role_drop);
+    let message_row = adw::EntryRow::builder().title("Message (optional)").build();
+    let invite_btn = gtk4::Button::builder()
+        .label("Send Invitations")
+        .halign(gtk4::Align::End)
+        .margin_top(6)
+        .build();
+    invite_btn.add_css_class("suggested-action");
+    let invite_wrap = adw::PreferencesRow::builder()
+        .activatable(false)
+        .child(&invite_btn)
+        .build();
+    invite_group.add(&email_row);
+    invite_group.add(&role_wrap);
+    invite_group.add(&message_row);
+    invite_group.add(&invite_wrap);
+
+    let people = adw::PreferencesGroup::builder()
+        .title("People with access")
+        .build();
+    let link_group = adw::PreferencesGroup::builder()
+        .title("Public link")
+        .build();
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&invite_group);
+    content.append(&people);
+    content.append(&link_group);
+    let clamp = adw::Clamp::builder().child(&content).build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&clamp)
+        .build();
+    toolbar.set_content(Some(&scroll));
+
+    let dialog = adw::Dialog::builder()
+        .title("Share")
+        .content_width(480)
+        .content_height(560)
+        .child(&toolbar)
+        .build();
+
+    let state = Rc::new(ShareDialog {
+        ui: ui.clone(),
+        rel,
+        people,
+        link_group,
+        people_rows: RefCell::new(Vec::new()),
+        link_rows: RefCell::new(Vec::new()),
+    });
+
+    // Invite button.
+    let state_inv = state.clone();
+    invite_btn.connect_clicked(move |_| {
+        let raw = email_row.text();
+        let emails: Vec<String> = raw
+            .split([',', ' ', ';'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if emails.is_empty() {
+            toast_error(&state_inv.ui, "Couldn't share", "Enter at least one email.");
+            return;
+        }
+        let role = role_index_to_wire(role_drop.selected()).to_string();
+        let msg = message_row.text().trim().to_string();
+        let message = if msg.is_empty() { None } else { Some(msg) };
+        let email_clear = email_row.clone();
+        let msg_clear = message_row.clone();
+        share_dialog_op(
+            &state_inv,
+            Request::ShareNode {
+                path: state_inv.rel.clone(),
+                emails,
+                role,
+                message,
+            },
+            "Invitations sent",
+            "Couldn't send invitations",
+            Some(Box::new(move || {
+                email_clear.set_text("");
+                msg_clear.set_text("");
+            })),
+        );
+    });
+
+    share_dialog_reload(&state);
+    dialog.present(ui_window(ui).as_ref());
+}
+
+/// Re-fetch the node's share and rebuild the people + public-link sections.
+fn share_dialog_reload(state: &Rc<ShareDialog>) {
+    let rx = spawn_request(
+        state.ui.dirs.control_socket(),
+        Request::ListShare {
+            path: state.rel.clone(),
+        },
+    );
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Share { entries, link })) => {
+                repaint_share_people(&state, &entries);
+                repaint_share_link(&state, link.as_ref());
+            }
+            Ok(Ok(Response::Error { message })) => {
+                toast_error(&state.ui, "Couldn't load sharing", &message)
+            }
+            _ => toast_error(
+                &state.ui,
+                "Couldn't load sharing",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
+/// Rebuild the "People with access" rows from a fresh share listing.
+fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntry]) {
+    for row in state.people_rows.borrow_mut().drain(..) {
+        state.people.remove(&row);
+    }
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+    if entries.is_empty() {
+        let row = dim_row("No one else has access yet.");
+        state.people.add(&row);
+        rows.push(row.upcast());
+        *state.people_rows.borrow_mut() = rows;
+        return;
+    }
+    for entry in entries {
+        let subtitle = match entry.kind {
+            ShareEntryKind::Member => "Member".to_string(),
+            ShareEntryKind::ProtonInvite => "Invited (pending)".to_string(),
+            ShareEntryKind::ExternalInvite => "Invited (external, pending)".to_string(),
+        };
+        let row = adw::ActionRow::builder()
+            .title(&entry.email)
+            .subtitle(&subtitle)
+            .build();
+
+        // External invites can't have their role changed; show it read-only.
+        // Members and Proton invites get a role dropdown.
+        if matches!(
+            entry.kind,
+            ShareEntryKind::Member | ShareEntryKind::ProtonInvite
+        ) {
+            let model = gtk4::StringList::new(&SHARE_ROLES);
+            let drop = gtk4::DropDown::builder()
+                .model(&model)
+                .selected(role_wire_to_index(&entry.role))
+                .valign(gtk4::Align::Center)
+                .build();
+            let state_role = state.clone();
+            let id = entry.id.clone();
+            let kind = entry.kind;
+            drop.connect_selected_notify(move |d| {
+                share_dialog_op(
+                    &state_role,
+                    Request::UpdateShareRole {
+                        path: state_role.rel.clone(),
+                        id: id.clone(),
+                        kind,
+                        role: role_index_to_wire(d.selected()).to_string(),
+                    },
+                    "Role updated",
+                    "Couldn't update the role",
+                    None,
+                );
+            });
+            row.add_suffix(&drop);
+        } else {
+            let label = gtk4::Label::builder()
+                .label(capitalize(&entry.role))
+                .valign(gtk4::Align::Center)
+                .build();
+            label.add_css_class("dim-label");
+            row.add_suffix(&label);
+        }
+
+        let remove = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove access")
+            .valign(gtk4::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        let state_rm = state.clone();
+        let id = entry.id.clone();
+        let kind = entry.kind;
+        remove.connect_clicked(move |_| {
+            share_dialog_op(
+                &state_rm,
+                Request::RemoveShareEntry {
+                    path: state_rm.rel.clone(),
+                    id: id.clone(),
+                    kind,
+                },
+                "Access removed",
+                "Couldn't remove access",
+                None,
+            );
+        });
+        row.add_suffix(&remove);
+
+        state.people.add(&row);
+        rows.push(row.upcast());
+    }
+    *state.people_rows.borrow_mut() = rows;
+}
+
+/// Rebuild the public-link section: an existing link (copy / remove) or a
+/// create control.
+fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLinkInfo>) {
+    for row in state.link_rows.borrow_mut().drain(..) {
+        state.link_group.remove(&row);
+    }
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+
+    match link {
+        Some(link) => {
+            let url = link.url.clone().unwrap_or_default();
+            let subtitle = if link.has_password {
+                format!("Anyone with the link ({}) · password-protected", link.role)
+            } else {
+                format!("Anyone with the link ({})", link.role)
+            };
+            let row = adw::ActionRow::builder()
+                .title(if url.is_empty() { "Public link" } else { &url })
+                .subtitle(&subtitle)
+                .build();
+            row.add_css_class("property");
+
+            if !url.is_empty() {
+                let copy = gtk4::Button::builder()
+                    .icon_name("edit-copy-symbolic")
+                    .tooltip_text("Copy link")
+                    .valign(gtk4::Align::Center)
+                    .build();
+                copy.add_css_class("flat");
+                let state_copy = state.clone();
+                let url_copy = url.clone();
+                copy.connect_clicked(move |btn| {
+                    btn.clipboard().set_text(&url_copy);
+                    toast(&state_copy.ui, "Link copied");
+                });
+                row.add_suffix(&copy);
+            }
+
+            let remove = gtk4::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text("Remove link")
+                .valign(gtk4::Align::Center)
+                .build();
+            remove.add_css_class("flat");
+            let state_rm = state.clone();
+            let id = link.id.clone();
+            remove.connect_clicked(move |_| {
+                share_dialog_op(
+                    &state_rm,
+                    Request::RemovePublicLink {
+                        path: state_rm.rel.clone(),
+                        id: id.clone(),
+                    },
+                    "Public link removed",
+                    "Couldn't remove the link",
+                    None,
+                );
+            });
+            row.add_suffix(&remove);
+
+            state.link_group.add(&row);
+            rows.push(row.upcast());
+        }
+        None => {
+            let role_model = gtk4::StringList::new(&["Viewer", "Editor"]);
+            let role_drop = gtk4::DropDown::builder()
+                .model(&role_model)
+                .selected(0)
+                .valign(gtk4::Align::Center)
+                .build();
+            let role_row = adw::ActionRow::builder().title("Link role").build();
+            role_row.add_suffix(&role_drop);
+            let pw_row = adw::PasswordEntryRow::builder()
+                .title("Password (optional)")
+                .build();
+            let create = gtk4::Button::builder()
+                .label("Create Public Link")
+                .halign(gtk4::Align::End)
+                .margin_top(6)
+                .build();
+            create.add_css_class("suggested-action");
+            let create_wrap = adw::PreferencesRow::builder()
+                .activatable(false)
+                .child(&create)
+                .build();
+
+            let state_c = state.clone();
+            let pw_for = pw_row.clone();
+            create.connect_clicked(move |_| {
+                let role = if role_drop.selected() == 1 {
+                    "editor"
+                } else {
+                    "viewer"
+                }
+                .to_string();
+                let pw = pw_for.text().to_string();
+                let password = if pw.is_empty() { None } else { Some(pw) };
+                share_dialog_create_link(&state_c, role, password);
+            });
+
+            state.link_group.add(&role_row);
+            state.link_group.add(&pw_row);
+            state.link_group.add(&create_wrap);
+            rows.push(role_row.upcast());
+            rows.push(pw_row.upcast());
+            rows.push(create_wrap.upcast());
+        }
+    }
+    *state.link_rows.borrow_mut() = rows;
+}
+
+/// Create a public link, then reload the dialog so the copy/remove controls
+/// replace the create form (and the freshly minted URL is shown).
+fn share_dialog_create_link(state: &Rc<ShareDialog>, role: String, password: Option<String>) {
+    let rx = spawn_request(
+        state.ui.dirs.control_socket(),
+        Request::CreatePublicLink {
+            path: state.rel.clone(),
+            role,
+            password,
+            expires: None,
+        },
+    );
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::PublicLink { .. })) => {
+                toast(&state.ui, "Public link created");
+                share_dialog_reload(&state);
+            }
+            Ok(Ok(Response::Error { message })) => {
+                toast_error(&state.ui, "Couldn't create the link", &message)
+            }
+            _ => toast_error(
+                &state.ui,
+                "Couldn't create the link",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
+/// Run a Share-dialog mutation, then reload the dialog on success. `on_success`
+/// runs an extra UI tweak (e.g. clearing the invite fields) before the reload.
+fn share_dialog_op(
+    state: &Rc<ShareDialog>,
+    req: Request,
+    done: &'static str,
+    failed: &'static str,
+    on_success: Option<Box<dyn Fn()>>,
+) {
+    let rx = spawn_request(state.ui.dirs.control_socket(), req);
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => {
+                if let Some(cb) = on_success {
+                    cb();
+                }
+                toast(&state.ui, done);
+                share_dialog_reload(&state);
+            }
+            Ok(Ok(Response::Error { message })) => toast_error(&state.ui, failed, &message),
+            _ => {
+                // A role dropdown that failed is now out of sync with the server;
+                // reload to snap it back.
+                toast_error(&state.ui, failed, "The mount service didn't respond.");
+                share_dialog_reload(&state);
+            }
+        }
+    });
+}
+
+/// Uppercase the first character of a role word for read-only display.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// One day-section of the photos timeline: a heading plus the photos captured

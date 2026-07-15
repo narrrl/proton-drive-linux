@@ -148,6 +148,31 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
+/// A [`Read`] that tallies bytes read and *owns* its [`TransferGuard`], so the
+/// transfer stays registered exactly as long as the reader lives. Used by the
+/// concurrent bulk uploader, where each task hands its reader to the SDK and has
+/// nowhere separate to park the guard; the transfer deregisters when the SDK
+/// drops the reader after sealing the revision. Owning (rather than borrowing)
+/// also keeps each upload future `Send + 'static` for [`tokio::task::spawn`].
+pub struct OwnedCountingReader<R> {
+    inner: R,
+    guard: TransferGuard,
+}
+
+impl<R: Read> OwnedCountingReader<R> {
+    pub fn new(inner: R, guard: TransferGuard) -> Self {
+        Self { inner, guard }
+    }
+}
+
+impl<R: Read> Read for OwnedCountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.guard.add(n as u64);
+        Ok(n)
+    }
+}
+
 /// A [`Read`] that tallies bytes read through a [`TransferGuard`] (upload path).
 pub struct CountingReader<'a, R> {
     inner: R,

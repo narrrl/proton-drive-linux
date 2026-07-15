@@ -31,7 +31,7 @@
 //! set, so a multi-GiB write never buffers in RAM and only the untouched
 //! remainder of the file is pulled from the remote — lazily, at commit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as _};
@@ -52,21 +52,22 @@ use fuser::{
 use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    DirEntry, LocalHit, PhotoItem, PhotoThumb, Request as CtlRequest, Response as CtlResponse,
-    SearchHit, TransferDirection,
+    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, LocalHit,
+    PhotoItem, PhotoThumb, PublicLinkInfo, Request as CtlRequest, Response as CtlResponse,
+    SearchHit, ShareEntry, ShareEntryKind, SharedItem, TransferDirection,
 };
 use pdfs_core::db::{self, Db, StoredNode, StoredPhoto, StoredTrash};
 use pdfs_core::localindex;
 use proton_drive_rs::proton_sdk::error::ProtonError;
-use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
+use proton_drive_rs::proton_sdk::ids::{DeviceUid, DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
-    DriveEvent, DriveEventScopeId, Node, NodeKind, ProtonDriveClient, ProtonPhotosClient,
-    ThumbnailType,
+    DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, ProtonDriveClient,
+    ProtonPhotosClient, ThumbnailType,
 };
 
 mod transfers;
 use tracing::{debug, error, info, warn};
-use transfers::{CountingReader, CountingWriter, TransferRegistry};
+use transfers::{CountingReader, CountingWriter, OwnedCountingReader, TransferRegistry};
 
 /// Attribute/entry cache lifetime handed back to the kernel. Long because the
 /// Phase 2 event poller actively invalidates changed inodes; without a remote
@@ -317,6 +318,92 @@ impl State {
     }
 }
 
+/// How many files the bulk uploader ships at once. Overlaps the per-file network
+/// round-trips without letting an unbounded number of block buffers pile up.
+const UPLOAD_CONCURRENCY: usize = 4;
+
+/// One file queued for bulk upload, resolved during the directory walk so the
+/// concurrent phase carries everything it needs (no shared state, no `block_on`).
+struct UploadTask {
+    /// Inode of the (already-created) remote parent folder, for interning the
+    /// uploaded node afterwards.
+    parent_ino: u64,
+    parent_uid: NodeUid,
+    name: String,
+    /// Local filesystem path to stream from.
+    path: PathBuf,
+    size: u64,
+}
+
+/// Tally of a completed [`Core::upload_paths`] batch, for the daemon log.
+#[derive(Default)]
+struct UploadStats {
+    uploaded: usize,
+    failed: usize,
+    /// Total plaintext bytes of the files that uploaded successfully.
+    bytes: u64,
+    /// Folders created (or reused) to mirror the local tree.
+    folders: usize,
+}
+
+/// Upload every [`UploadTask`] with at most `limit` in flight at once, each
+/// streamed straight from disk and ticking its own transfer-registry guard.
+/// Returns, per file, either `(parent_ino, new_uid)` for the caller to intern or
+/// `(name, error)` to log — one failure never sinks the batch.
+async fn run_uploads(
+    core: Core,
+    tasks: Vec<UploadTask>,
+    limit: usize,
+) -> Vec<Result<(u64, NodeUid, u64), (String, String)>> {
+    let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+    let mut set = tokio::task::JoinSet::new();
+    for t in tasks {
+        let core = core.clone();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+            let file = match std::fs::File::open(&t.path) {
+                Ok(f) => f,
+                Err(e) => return Err((t.name, format!("open {}: {e}", t.path.display()))),
+            };
+            let mtime = std::fs::metadata(&t.path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let guard = core
+                .transfers
+                .begin(&t.name, "", TransferDirection::Upload, t.size);
+            let reader = OwnedCountingReader::new(file, guard);
+            match core
+                .client
+                .upload_file_from(
+                    &t.parent_uid,
+                    &t.name,
+                    media_type_for(&t.name),
+                    reader,
+                    t.size as i64,
+                    Vec::new(),
+                    mtime,
+                    false,
+                )
+                .await
+            {
+                Ok(uid) => Ok((t.parent_ino, uid, t.size)),
+                Err(e) => Err((t.name, format!("upload: {e}"))),
+            }
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(result) => out.push(result),
+            Err(e) => warn!(error = %e, "upload task panicked"),
+        }
+    }
+    out
+}
+
 /// Shared engine behind both the FUSE callbacks and the control socket: the
 /// Drive client, a Tokio handle to bridge the synchronous FUSE/socket threads
 /// to the async SDK, the inode bookkeeping, and the on-disk content cache.
@@ -349,7 +436,16 @@ struct Core {
     /// True while the background scanner is rebuilding the local-file index, so
     /// `SearchLocal` can tell a front-end "still indexing" apart from "no match".
     indexing: Arc<AtomicBool>,
+    /// Recent activity, newest at the back, capped at [`ACTIVITY_CAP`]. In memory
+    /// only — a running feed of the mutations and transfers the daemon performed
+    /// this session, served to `ListActivity`. Not persisted: it is a convenience
+    /// view of "what just happened", not an audit trail.
+    activity: Arc<Mutex<VecDeque<ActivityEntry>>>,
 }
+
+/// How many activity entries the daemon keeps in memory. Older entries fall off
+/// the front as new ones arrive.
+const ACTIVITY_CAP: usize = 500;
 
 impl Core {
     /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
@@ -1107,9 +1203,7 @@ impl Core {
             .db
             .photos_page(offset, limit)
             .map_err(|e| e.to_string())?;
-        Ok(Some(
-            page.into_iter().map(|p| self.photo_item(p)).collect(),
-        ))
+        Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }
 
     /// Project a persisted photo into the wire item the front-end paints: its
@@ -1752,6 +1846,679 @@ impl Core {
         }
         Ok(name.to_string())
     }
+
+    /// Bulk-upload local files and directory trees under `sources` into the
+    /// mountpoint-relative `parent_rel` folder. Directories are recreated (or
+    /// merged into an existing same-named folder) and walked; the resulting flat
+    /// set of files is uploaded with bounded concurrency, each ticking the
+    /// transfer registry so a front-end sees live progress. Runs on a background
+    /// thread — a large tree far outlasts the control socket's read timeout — so
+    /// it reports only a summary for the log. Individual failures are counted and
+    /// logged rather than aborting the whole batch.
+    fn upload_paths(&self, parent_rel: &Path, sources: &[PathBuf]) -> Result<UploadStats, String> {
+        let (pino, parent_uid) = self
+            .resolve_path(parent_rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        self.ensure_children(pino)
+            .map_err(|e| format!("enumerate: {e:?}"))?;
+
+        // Phase 1 (sequential): build the remote folder skeleton and collect the
+        // flat list of files to upload. Folders must exist before their children,
+        // so this can't be parallelised.
+        let mut tasks = Vec::new();
+        let mut folders = 0usize;
+        for src in sources {
+            if let Err(e) = self.collect_uploads(pino, &parent_uid, src, &mut tasks, &mut folders) {
+                warn!(source = %src.display(), error = %e, "skipping source");
+            }
+        }
+
+        // Phase 2 (concurrent): upload the files, up to UPLOAD_CONCURRENCY at once.
+        let outcomes = self
+            .rt
+            .block_on(run_uploads(self.clone(), tasks, UPLOAD_CONCURRENCY));
+
+        // Phase 3 (sequential): intern each uploaded node so it shows up in the
+        // listing without a re-enumeration. fetch_node uses `block_on`, so it must
+        // run here rather than inside the async batch.
+        let mut stats = UploadStats {
+            folders,
+            ..UploadStats::default()
+        };
+        for outcome in outcomes {
+            match outcome {
+                Ok((parent_ino, uid, size)) => {
+                    stats.uploaded += 1;
+                    stats.bytes += size;
+                    match self.fetch_node(&uid) {
+                        Ok(node) => {
+                            let mut st = self.state.lock().unwrap();
+                            let ino = st.intern(parent_ino, node);
+                            if let Some(kids) = st.children.get_mut(&parent_ino)
+                                && !kids.contains(&ino)
+                            {
+                                kids.push(ino);
+                            }
+                        }
+                        // Uploaded fine but the metadata refresh failed; it will
+                        // appear on the next directory enumeration regardless.
+                        Err(e) => warn!(%uid, error = ?e, "uploaded node metadata refresh failed"),
+                    }
+                }
+                Err((name, msg)) => {
+                    stats.failed += 1;
+                    warn!(name, error = %msg, "file upload failed");
+                }
+            }
+        }
+        info!(
+            uploaded = stats.uploaded,
+            failed = stats.failed,
+            "bulk upload finished"
+        );
+        Ok(stats)
+    }
+
+    /// Resolve a remote child folder named `name` under `pino`, creating it if it
+    /// doesn't exist, and return its `(inode, uid)`. Reusing an existing same-named
+    /// folder makes re-uploading a directory merge into it rather than fail on a
+    /// duplicate name.
+    fn ensure_remote_folder(
+        &self,
+        pino: u64,
+        parent_uid: &NodeUid,
+        name: &str,
+    ) -> Result<(u64, NodeUid), String> {
+        if name.is_empty() || name.contains('/') {
+            return Err(format!("invalid folder name: {name:?}"));
+        }
+        self.ensure_children(pino)
+            .map_err(|e| format!("enumerate: {e:?}"))?;
+        {
+            let st = self.state.lock().unwrap();
+            if let Some(kids) = st.children.get(&pino) {
+                for &ino in kids {
+                    if let Some(e) = st.entries.get(&ino)
+                        && e.node.is_folder()
+                        && e.node.name == name
+                    {
+                        return Ok((ino, e.uid.clone()));
+                    }
+                }
+            }
+        }
+        let new_uid = self
+            .rt
+            .block_on(
+                self.client
+                    .create_folder(parent_uid, name, Some(now_secs())),
+            )
+            .map_err(|e| format!("create folder {name}: {e}"))?;
+        let node = self
+            .fetch_node(&new_uid)
+            .map_err(|e| format!("fetch node: {e:?}"))?;
+        let mut st = self.state.lock().unwrap();
+        let ino = st.intern(pino, node);
+        if let Some(kids) = st.children.get_mut(&pino)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        Ok((ino, new_uid))
+    }
+
+    /// Walk one local source path, appending its files to `tasks`. A file becomes
+    /// one task; a directory is recreated remotely and recursed into (children
+    /// sorted for a stable order). Symlinks and other special files are skipped.
+    fn collect_uploads(
+        &self,
+        pino: u64,
+        parent_uid: &NodeUid,
+        src: &Path,
+        tasks: &mut Vec<UploadTask>,
+        folders: &mut usize,
+    ) -> Result<(), String> {
+        let meta =
+            std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("unusable name: {}", src.display()))?
+            .to_string();
+
+        if meta.is_dir() {
+            let (child_ino, child_uid) = self.ensure_remote_folder(pino, parent_uid, &name)?;
+            *folders += 1;
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(src)
+                .map_err(|e| format!("read dir {}: {e}", src.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                if let Err(e) = self.collect_uploads(child_ino, &child_uid, &entry, tasks, folders)
+                {
+                    warn!(source = %entry.display(), error = %e, "skipping entry");
+                }
+            }
+        } else if meta.is_file() {
+            if name.contains('/') {
+                return Err(format!("invalid file name: {name:?}"));
+            }
+            tasks.push(UploadTask {
+                parent_ino: pino,
+                parent_uid: parent_uid.clone(),
+                name,
+                path: src.to_path_buf(),
+                size: meta.len(),
+            });
+        }
+        Ok(())
+    }
+
+    // ---- devices ----------------------------------------------------------
+
+    /// List the account's registered devices.
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, String> {
+        let devices = self
+            .rt
+            .block_on(self.client.enumerate_devices())
+            .map_err(|e| format!("list devices: {e}"))?;
+        Ok(devices
+            .into_iter()
+            .map(|d| DeviceInfo {
+                uid: d.uid.to_string(),
+                name: d.name.unwrap_or_else(|_| "(unnamed device)".to_string()),
+                device_type: device_type_str(d.device_type).to_string(),
+                last_sync: d.last_sync_time,
+            })
+            .collect())
+    }
+
+    /// Rename a device by its uid.
+    fn rename_device(&self, uid: &str, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("device name must not be empty".to_string());
+        }
+        let device_uid = DeviceUid::from(uid);
+        self.rt
+            .block_on(self.client.rename_device(&device_uid, name))
+            .map_err(|e| format!("rename device: {e}"))?;
+        Ok(())
+    }
+
+    /// Delete (deregister) a device by its uid.
+    fn delete_device(&self, uid: &str) -> Result<(), String> {
+        let device_uid = DeviceUid::from(uid);
+        self.rt
+            .block_on(self.client.delete_device(&device_uid))
+            .map_err(|e| format!("delete device: {e}"))?;
+        Ok(())
+    }
+
+    // ---- sharing a node ---------------------------------------------------
+
+    /// Invite Proton and/or external emails to the node at `rel` at `role`.
+    /// Returns `(proton_invited, external_invited)`.
+    fn share_node(
+        &self,
+        rel: &Path,
+        emails: &[String],
+        role: &str,
+        message: Option<&str>,
+    ) -> Result<(usize, usize), String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let role = role_from_str(role)?;
+        let invitees: Vec<(String, MemberRole)> =
+            emails.iter().map(|e| (e.clone(), role)).collect();
+        self.rt
+            .block_on(self.client.invite_users(&uid, &invitees, message))
+            .map_err(|e| format!("share: {e}"))
+    }
+
+    /// List the members, pending invitations and public link of the node at `rel`.
+    fn list_share(&self, rel: &Path) -> Result<(Vec<ShareEntry>, Option<PublicLinkInfo>), String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+
+        let mut entries = Vec::new();
+        for m in self
+            .rt
+            .block_on(self.client.list_share_members(&uid))
+            .map_err(|e| format!("list members: {e}"))?
+        {
+            entries.push(ShareEntry {
+                id: m.membership_id.to_string(),
+                email: m.email,
+                role: role_to_str(m.role).to_string(),
+                kind: ShareEntryKind::Member,
+            });
+        }
+        for inv in self
+            .rt
+            .block_on(self.client.list_share_invitations(&uid))
+            .map_err(|e| format!("list invitations: {e}"))?
+        {
+            entries.push(ShareEntry {
+                id: inv.invitation_id,
+                email: inv.invitee_email,
+                role: role_to_str(inv.role).to_string(),
+                kind: ShareEntryKind::ProtonInvite,
+            });
+        }
+        for ext in self
+            .rt
+            .block_on(self.client.list_external_invitations(&uid))
+            .map_err(|e| format!("list external invitations: {e}"))?
+        {
+            entries.push(ShareEntry {
+                id: ext.invitation_id,
+                email: ext.invitee_email,
+                role: role_to_str(ext.role).to_string(),
+                kind: ShareEntryKind::ExternalInvite,
+            });
+        }
+
+        let link = self
+            .rt
+            .block_on(self.client.get_public_link(&uid))
+            .map_err(|e| format!("get public link: {e}"))?
+            .map(public_link_info);
+
+        Ok((entries, link))
+    }
+
+    /// Change the role of a member or pending Proton invitation on the node at
+    /// `rel`. External invitations have no role-update endpoint.
+    fn update_share_role(
+        &self,
+        rel: &Path,
+        id: &str,
+        kind: ShareEntryKind,
+        role: &str,
+    ) -> Result<(), String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let role = role_from_str(role)?;
+        match kind {
+            ShareEntryKind::Member => {
+                let member = self
+                    .rt
+                    .block_on(self.client.list_share_members(&uid))
+                    .map_err(|e| format!("list members: {e}"))?
+                    .into_iter()
+                    .find(|m| m.membership_id.to_string() == id)
+                    .ok_or_else(|| "member not found".to_string())?;
+                self.rt
+                    .block_on(self.client.update_member_role(&member, role))
+                    .map_err(|e| format!("update role: {e}"))
+            }
+            ShareEntryKind::ProtonInvite => {
+                let inv = self
+                    .rt
+                    .block_on(self.client.list_share_invitations(&uid))
+                    .map_err(|e| format!("list invitations: {e}"))?
+                    .into_iter()
+                    .find(|i| i.invitation_id == id)
+                    .ok_or_else(|| "invitation not found".to_string())?;
+                self.rt
+                    .block_on(self.client.update_invitation_role(&inv, role))
+                    .map_err(|e| format!("update role: {e}"))
+            }
+            ShareEntryKind::ExternalInvite => {
+                Err("an external invitation's role cannot be changed".to_string())
+            }
+        }
+    }
+
+    /// Remove a member, pending Proton invite, or external invite from the node
+    /// at `rel`.
+    fn remove_share_entry(&self, rel: &Path, id: &str, kind: ShareEntryKind) -> Result<(), String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        match kind {
+            ShareEntryKind::Member => {
+                let member = self
+                    .rt
+                    .block_on(self.client.list_share_members(&uid))
+                    .map_err(|e| format!("list members: {e}"))?
+                    .into_iter()
+                    .find(|m| m.membership_id.to_string() == id)
+                    .ok_or_else(|| "member not found".to_string())?;
+                self.rt
+                    .block_on(self.client.remove_member(&member))
+                    .map_err(|e| format!("remove member: {e}"))
+            }
+            ShareEntryKind::ProtonInvite => {
+                let inv = self
+                    .rt
+                    .block_on(self.client.list_share_invitations(&uid))
+                    .map_err(|e| format!("list invitations: {e}"))?
+                    .into_iter()
+                    .find(|i| i.invitation_id == id)
+                    .ok_or_else(|| "invitation not found".to_string())?;
+                self.rt
+                    .block_on(self.client.delete_invitation(&inv))
+                    .map_err(|e| format!("revoke invitation: {e}"))
+            }
+            ShareEntryKind::ExternalInvite => {
+                let ext = self
+                    .rt
+                    .block_on(self.client.list_external_invitations(&uid))
+                    .map_err(|e| format!("list external invitations: {e}"))?
+                    .into_iter()
+                    .find(|i| i.invitation_id == id)
+                    .ok_or_else(|| "external invitation not found".to_string())?;
+                self.rt
+                    .block_on(self.client.delete_external_invitation(&ext))
+                    .map_err(|e| format!("revoke external invitation: {e}"))
+            }
+        }
+    }
+
+    /// Create a public link on the node at `rel`, returning its info (with URL).
+    fn create_public_link(
+        &self,
+        rel: &Path,
+        role: &str,
+        password: Option<&str>,
+        expires: Option<i64>,
+    ) -> Result<PublicLinkInfo, String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let role = role_from_str(role)?;
+        let link = self
+            .rt
+            .block_on(
+                self.client
+                    .create_public_link(&uid, role, password, expires),
+            )
+            .map_err(|e| format!("create public link: {e}"))?;
+        Ok(public_link_info(link))
+    }
+
+    /// Remove the public link `id` from the node at `rel`.
+    fn remove_public_link(&self, rel: &Path, id: &str) -> Result<(), String> {
+        let (_ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let link = self
+            .rt
+            .block_on(self.client.get_public_link(&uid))
+            .map_err(|e| format!("get public link: {e}"))?
+            .filter(|l| l.public_link_id == id)
+            .ok_or_else(|| "public link not found".to_string())?;
+        self.rt
+            .block_on(self.client.remove_public_link(&link))
+            .map_err(|e| format!("remove public link: {e}"))
+    }
+
+    // ---- shared with me ---------------------------------------------------
+
+    /// List nodes shared with me that I have accepted.
+    fn list_shared_with_me(&self) -> Result<Vec<DirEntry>, String> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_shared_with_me_node_uids())
+            .map_err(|e| format!("enumerate shared: {e}"))?;
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes = self
+            .rt
+            .block_on(self.client.enumerate_nodes(&uids))
+            .map_err(|e| format!("enumerate nodes: {e}"))?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| {
+                let is_dir = n.is_folder();
+                let size = match &n.kind {
+                    NodeKind::File {
+                        claimed_size,
+                        total_size_on_storage,
+                        ..
+                    } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+                    NodeKind::Folder => 0,
+                };
+                DirEntry {
+                    name: n.name,
+                    is_dir,
+                    size,
+                    modified: 0,
+                    pinned: false,
+                    cached: false,
+                    uid: n.uid.to_string(),
+                    path: String::new(),
+                }
+            })
+            .collect())
+    }
+
+    /// Leave a shared node by its uid.
+    fn leave_shared(&self, uid: &str) -> Result<(), String> {
+        let uid = parse_uid(uid).ok_or_else(|| format!("invalid uid: {uid}"))?;
+        self.rt
+            .block_on(self.client.leave_shared_node(&uid))
+            .map_err(|e| format!("leave shared: {e}"))
+    }
+
+    // ---- incoming invitations ---------------------------------------------
+
+    /// List invitations addressed to me, pending accept or reject.
+    fn list_invitations(&self) -> Result<Vec<InvitationInfo>, String> {
+        let invitations = self
+            .rt
+            .block_on(self.client.list_incoming_invitations())
+            .map_err(|e| format!("list invitations: {e}"))?;
+        Ok(invitations
+            .into_iter()
+            .map(|i| InvitationInfo {
+                id: i.invitation_id,
+                inviter_email: i.inviter_email,
+                name: i.node_name,
+                is_dir: i.is_folder,
+            })
+            .collect())
+    }
+
+    /// Accept an invitation addressed to me by its id.
+    fn accept_invitation(&self, id: &str) -> Result<(), String> {
+        self.rt
+            .block_on(self.client.accept_invitation(id))
+            .map_err(|e| format!("accept invitation: {e}"))
+    }
+
+    /// Reject an invitation addressed to me by its id.
+    fn reject_invitation(&self, id: &str) -> Result<(), String> {
+        self.rt
+            .block_on(self.client.reject_invitation(id))
+            .map_err(|e| format!("reject invitation: {e}"))
+    }
+
+    // ---- bookmarks --------------------------------------------------------
+
+    /// List public links saved to my account.
+    fn list_bookmarks(&self) -> Result<Vec<BookmarkInfo>, String> {
+        let bookmarks = self
+            .rt
+            .block_on(self.client.list_bookmarks())
+            .map_err(|e| format!("list bookmarks: {e}"))?;
+        Ok(bookmarks
+            .into_iter()
+            .map(|b| BookmarkInfo {
+                token: b.token,
+                url: b.url,
+                name: b.node_name,
+                is_dir: b.is_folder,
+            })
+            .collect())
+    }
+
+    /// Save a public link (optionally password-protected) as a bookmark.
+    fn create_bookmark(&self, url: &str, password: Option<&str>) -> Result<(), String> {
+        self.rt
+            .block_on(self.client.create_bookmark(url, password))
+            .map_err(|e| format!("create bookmark: {e}"))
+    }
+
+    /// Remove a saved bookmark by its token.
+    fn delete_bookmark(&self, token: &str) -> Result<(), String> {
+        self.rt
+            .block_on(self.client.delete_bookmark(token))
+            .map_err(|e| format!("delete bookmark: {e}"))
+    }
+
+    // ---- shared by me -----------------------------------------------------
+
+    /// List the nodes I have shared with others, each with a summary of its share
+    /// state (members, pending invitations, public link). One list call enumerates
+    /// the shared uids; the per-node detail is then gathered best-effort — a single
+    /// node racing with an unshare drops from the list rather than failing the whole
+    /// request.
+    fn list_shared_by_me(&self) -> Result<Vec<SharedItem>, String> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_shared_by_me_node_uids())
+            .map_err(|e| format!("enumerate shared-by-me: {e}"))?;
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes = self
+            .rt
+            .block_on(self.client.enumerate_nodes(&uids))
+            .map_err(|e| format!("enumerate nodes: {e}"))?;
+        let mut items = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            let uid = n.uid.clone();
+            let members = self
+                .rt
+                .block_on(self.client.list_share_members(&uid))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let proton_invites = self
+                .rt
+                .block_on(self.client.list_share_invitations(&uid))
+                .map(|i| i.len())
+                .unwrap_or(0);
+            let external_invites = self
+                .rt
+                .block_on(self.client.list_external_invitations(&uid))
+                .map(|i| i.len())
+                .unwrap_or(0);
+            let link = self
+                .rt
+                .block_on(self.client.get_public_link(&uid))
+                .ok()
+                .flatten()
+                .map(public_link_info);
+            items.push(SharedItem {
+                uid: uid.to_string(),
+                is_dir: n.is_folder(),
+                name: n.name,
+                path: self.rel_path_for_uid(&uid).unwrap_or_default(),
+                member_count: members,
+                invite_count: proton_invites + external_invites,
+                link,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Best-effort mountpoint-relative path for a node already interned in the live
+    /// tree, by walking parent inodes to the root. `None` when the node has never
+    /// been seen through the mount (e.g. shared but not browsed to this session) —
+    /// the caller then leaves the path empty.
+    fn rel_path_for_uid(&self, uid: &NodeUid) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        let mut ino = *st.by_uid.get(uid)?;
+        let mut parts = Vec::new();
+        while ino != ROOT_INO {
+            let entry = st.entries.get(&ino)?;
+            parts.push(entry.node.name.clone());
+            ino = entry.parent;
+        }
+        parts.reverse();
+        Some(parts.join("/"))
+    }
+
+    // ---- activity log -----------------------------------------------------
+
+    /// Record one entry in the in-memory activity log, evicting the oldest when the
+    /// buffer is full. Lock-guarded and cheap; callable from any thread (the bulk
+    /// upload logs its summary from a background thread).
+    fn log_activity(
+        &self,
+        kind: ActivityKind,
+        target: impl Into<String>,
+        detail: impl Into<String>,
+        ok: bool,
+    ) {
+        let entry = ActivityEntry {
+            time: now_secs(),
+            kind,
+            target: target.into(),
+            detail: detail.into(),
+            ok,
+        };
+        let mut log = self.activity.lock().unwrap();
+        if log.len() >= ACTIVITY_CAP {
+            log.pop_front();
+        }
+        log.push_back(entry);
+    }
+
+    /// The recent activity, newest first, capped at `limit` entries.
+    fn list_activity(&self, limit: usize) -> Vec<ActivityEntry> {
+        let log = self.activity.lock().unwrap();
+        log.iter().rev().take(limit).cloned().collect()
+    }
+}
+
+/// Map a [`MemberRole`] to its wire string.
+fn role_to_str(role: MemberRole) -> &'static str {
+    match role {
+        MemberRole::Viewer => "viewer",
+        MemberRole::Editor => "editor",
+        MemberRole::Admin => "admin",
+        MemberRole::Inherited => "inherited",
+    }
+}
+
+/// Parse a wire role string into a [`MemberRole`]. "inherited" is read-only and
+/// rejected here, since it cannot be sent when inviting or updating.
+fn role_from_str(role: &str) -> Result<MemberRole, String> {
+    match role.to_lowercase().as_str() {
+        "viewer" => Ok(MemberRole::Viewer),
+        "editor" => Ok(MemberRole::Editor),
+        "admin" => Ok(MemberRole::Admin),
+        other => Err(format!("invalid role: {other}")),
+    }
+}
+
+/// Map a device type to a display string.
+fn device_type_str(t: proton_drive_rs::DeviceType) -> &'static str {
+    match t {
+        proton_drive_rs::DeviceType::Windows => "Windows",
+        proton_drive_rs::DeviceType::MacOs => "MacOs",
+        proton_drive_rs::DeviceType::Linux => "Linux",
+    }
+}
+
+/// Convert an SDK [`PublicLink`](proton_drive_rs::PublicLink) into the wire form.
+fn public_link_info(link: proton_drive_rs::PublicLink) -> PublicLinkInfo {
+    PublicLinkInfo {
+        id: link.public_link_id,
+        url: link.url,
+        role: role_to_str(link.role).to_string(),
+        expires: link.expiration_time,
+        has_password: link.has_custom_password,
+    }
 }
 
 /// Parse a `volume~link` uid display string back into a [`NodeUid`]. Front-ends
@@ -1880,6 +2647,42 @@ fn node_size(node: &Node) -> u64 {
             total_size_on_storage,
             ..
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+    }
+}
+
+/// `"1 file"` / `"3 files"` — a count with a correctly pluralised noun, for
+/// human-readable activity-log lines.
+fn count_noun(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),
+/// for the activity log. Uses 1024-based steps but the shorter SI labels.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut val = bytes as f64;
+    let mut unit = 0;
+    while val >= 1024.0 && unit < UNITS.len() - 1 {
+        val /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{val:.1} {}", UNITS[unit])
+    }
+}
+
+/// A compact elapsed-time label for the activity log: `"820ms"`, `"43s"`, or
+/// `"2m 5s"`.
+fn human_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
     }
 }
 
@@ -3044,10 +3847,16 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::Rename { path, new_name }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.rename(&rel, &new_name) {
-                Ok(name) => CtlResponse::Ok {
-                    message: format!("renamed to {name}"),
-                },
-                Err(e) => CtlResponse::Error { message: e },
+                Ok(name) => {
+                    core.log_activity(ActivityKind::Rename, &name, format!("was {path}"), true);
+                    CtlResponse::Ok {
+                        message: format!("renamed to {name}"),
+                    }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::Rename, &path, &e, false);
+                    CtlResponse::Error { message: e }
+                }
             },
             Err(e) => CtlResponse::Error { message: e },
         },
@@ -3057,29 +3866,52 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 rel_to_mount(mountpoint, &new_parent),
             ) {
                 (Ok(rel), Ok(parent_rel)) => match core.move_to(&rel, &parent_rel) {
-                    Ok(name) => CtlResponse::Ok {
-                        message: format!("moved {name}"),
-                    },
-                    Err(e) => CtlResponse::Error { message: e },
+                    Ok(name) => {
+                        let dest = if new_parent.is_empty() {
+                            "My files".to_string()
+                        } else {
+                            new_parent.clone()
+                        };
+                        core.log_activity(ActivityKind::Move, &name, format!("to {dest}"), true);
+                        CtlResponse::Ok {
+                            message: format!("moved {name}"),
+                        }
+                    }
+                    Err(e) => {
+                        core.log_activity(ActivityKind::Move, &path, &e, false);
+                        CtlResponse::Error { message: e }
+                    }
                 },
                 (Err(e), _) | (_, Err(e)) => CtlResponse::Error { message: e },
             }
         }
         Ok(CtlRequest::Delete { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.delete(&rel) {
-                Ok(name) => CtlResponse::Ok {
-                    message: format!("trashed {name}"),
-                },
-                Err(e) => CtlResponse::Error { message: e },
+                Ok(name) => {
+                    core.log_activity(ActivityKind::Trash, &name, "", true);
+                    CtlResponse::Ok {
+                        message: format!("trashed {name}"),
+                    }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::Trash, &path, &e, false);
+                    CtlResponse::Error { message: e }
+                }
             },
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::CreateFolder { parent, name }) => match rel_to_mount(mountpoint, &parent) {
             Ok(parent_rel) => match core.create_folder(&parent_rel, &name) {
-                Ok(name) => CtlResponse::Ok {
-                    message: format!("created folder {name}"),
-                },
-                Err(e) => CtlResponse::Error { message: e },
+                Ok(name) => {
+                    core.log_activity(ActivityKind::CreateFolder, &name, "", true);
+                    CtlResponse::Ok {
+                        message: format!("created folder {name}"),
+                    }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::CreateFolder, &name, &e, false);
+                    CtlResponse::Error { message: e }
+                }
             },
             Err(e) => CtlResponse::Error { message: e },
         },
@@ -3089,33 +3921,107 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             bytes,
         }) => match rel_to_mount(mountpoint, &parent) {
             Ok(parent_rel) => match core.upload(&parent_rel, &name, &bytes) {
-                Ok(name) => CtlResponse::Ok {
-                    message: format!("uploaded {name}"),
-                },
-                Err(e) => CtlResponse::Error { message: e },
+                Ok(name) => {
+                    core.log_activity(ActivityKind::Upload, &name, "", true);
+                    CtlResponse::Ok {
+                        message: format!("uploaded {name}"),
+                    }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::Upload, &name, &e, false);
+                    CtlResponse::Error { message: e }
+                }
             },
             Err(e) => CtlResponse::Error { message: e },
         },
+        Ok(CtlRequest::UploadPaths { parent, sources }) => {
+            match rel_to_mount(mountpoint, &parent) {
+                // Ack immediately and upload on a background thread: a directory tree
+                // far outlasts the socket read timeout. Progress and completion are
+                // observed through GetQueueStatus; the activity log gets the summary
+                // when the whole batch finishes.
+                Ok(parent_rel) => {
+                    let core = core.clone();
+                    let paths: Vec<PathBuf> = sources.into_iter().map(PathBuf::from).collect();
+                    let n = paths.len();
+                    std::thread::spawn(move || {
+                        let started = Instant::now();
+                        match core.upload_paths(&parent_rel, &paths) {
+                            Ok(stats) => {
+                                // e.g. "Uploaded 700 files to Photos" — name the destination
+                                // so the log reads like a sentence rather than a bare count.
+                                let dest = parent_rel
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("your Drive");
+                                let target = format!(
+                                    "{} to {dest}",
+                                    count_noun(stats.uploaded, "file", "files")
+                                );
+                                // Size · folders · elapsed, with a trailing failure count
+                                // when some files didn't make it.
+                                let mut parts = vec![human_bytes(stats.bytes)];
+                                if stats.folders > 0 {
+                                    parts.push(count_noun(stats.folders, "folder", "folders"));
+                                }
+                                parts.push(human_duration(started.elapsed()));
+                                if stats.failed > 0 {
+                                    parts.push(format!("{} failed", stats.failed));
+                                }
+                                core.log_activity(
+                                    ActivityKind::Upload,
+                                    target,
+                                    parts.join(" · "),
+                                    stats.failed == 0,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "bulk upload failed");
+                                core.log_activity(ActivityKind::Upload, "bulk upload", &e, false);
+                            }
+                        }
+                    });
+                    CtlResponse::Ok {
+                        message: format!("uploading {n} item(s)"),
+                    }
+                }
+                Err(e) => CtlResponse::Error { message: e },
+            }
+        }
         Ok(CtlRequest::ListTrash) => match core.list_trash() {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::Restore { uids }) => match core.restore(&uids) {
-            Ok(n) => CtlResponse::Ok {
-                message: format!("restored {n} item(s)"),
-            },
+            Ok(n) => {
+                core.log_activity(ActivityKind::Restore, format!("{n} item(s)"), "", true);
+                CtlResponse::Ok {
+                    message: format!("restored {n} item(s)"),
+                }
+            }
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::DeleteForever { uids }) => match core.delete_forever(&uids) {
-            Ok(n) => CtlResponse::Ok {
-                message: format!("permanently deleted {n} item(s)"),
-            },
+            Ok(n) => {
+                core.log_activity(
+                    ActivityKind::DeleteForever,
+                    format!("{n} item(s)"),
+                    "",
+                    true,
+                );
+                CtlResponse::Ok {
+                    message: format!("permanently deleted {n} item(s)"),
+                }
+            }
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::EmptyTrash) => match core.empty_trash() {
-            Ok(n) => CtlResponse::Ok {
-                message: format!("emptied trash ({n} item(s))"),
-            },
+            Ok(n) => {
+                core.log_activity(ActivityKind::EmptyTrash, format!("{n} item(s)"), "", true);
+                CtlResponse::Ok {
+                    message: format!("emptied trash ({n} item(s))"),
+                }
+            }
             Err(e) => CtlResponse::Error { message: e },
         },
         Ok(CtlRequest::PurgeCache) => {
@@ -3150,6 +4056,166 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 },
             }
         }
+        Ok(CtlRequest::ListDevices) => match core.list_devices() {
+            Ok(items) => CtlResponse::Devices { items },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::RenameDevice { uid, name }) => match core.rename_device(&uid, &name) {
+            Ok(()) => CtlResponse::Ok {
+                message: format!("renamed device to {name}"),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::DeleteDevice { uid }) => match core.delete_device(&uid) {
+            Ok(()) => CtlResponse::Ok {
+                message: "device deleted".to_string(),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ShareNode {
+            path,
+            emails,
+            role,
+            message,
+        }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.share_node(&rel, &emails, &role, message.as_deref()) {
+                Ok((proton, external)) => {
+                    core.log_activity(
+                        ActivityKind::Share,
+                        &path,
+                        format!("{} recipient(s) as {role}", proton + external),
+                        true,
+                    );
+                    CtlResponse::Ok {
+                        message: format!("invited {proton} Proton and {external} external user(s)"),
+                    }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::Share, &path, &e, false);
+                    CtlResponse::Error { message: e }
+                }
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListShare { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.list_share(&rel) {
+                Ok((entries, link)) => CtlResponse::Share { entries, link },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::UpdateShareRole {
+            path,
+            id,
+            kind,
+            role,
+        }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.update_share_role(&rel, &id, kind, &role) {
+                Ok(()) => CtlResponse::Ok {
+                    message: format!("role updated to {role}"),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::RemoveShareEntry { path, id, kind }) => {
+            match rel_to_mount(mountpoint, &path) {
+                Ok(rel) => match core.remove_share_entry(&rel, &id, kind) {
+                    Ok(()) => {
+                        core.log_activity(ActivityKind::Unshare, &path, "access removed", true);
+                        CtlResponse::Ok {
+                            message: "removed".to_string(),
+                        }
+                    }
+                    Err(e) => CtlResponse::Error { message: e },
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            }
+        }
+        Ok(CtlRequest::CreatePublicLink {
+            path,
+            role,
+            password,
+            expires,
+        }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.create_public_link(&rel, &role, password.as_deref(), expires) {
+                Ok(link) => {
+                    core.log_activity(ActivityKind::PublicLink, &path, "link created", true);
+                    CtlResponse::PublicLink { link }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::PublicLink, &path, &e, false);
+                    CtlResponse::Error { message: e }
+                }
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::RemovePublicLink { path, id }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.remove_public_link(&rel, &id) {
+                Ok(()) => {
+                    core.log_activity(ActivityKind::Unshare, &path, "link removed", true);
+                    CtlResponse::Ok {
+                        message: "public link removed".to_string(),
+                    }
+                }
+                Err(e) => CtlResponse::Error { message: e },
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListSharedWithMe) => match core.list_shared_with_me() {
+            Ok(entries) => CtlResponse::Entries { entries },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::LeaveShared { uid }) => match core.leave_shared(&uid) {
+            Ok(()) => {
+                core.log_activity(ActivityKind::Unshare, "shared item", "left", true);
+                CtlResponse::Ok {
+                    message: "left shared item".to_string(),
+                }
+            }
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListInvitations) => match core.list_invitations() {
+            Ok(items) => CtlResponse::Invitations { items },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::AcceptInvitation { id }) => match core.accept_invitation(&id) {
+            Ok(()) => CtlResponse::Ok {
+                message: "invitation accepted".to_string(),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::RejectInvitation { id }) => match core.reject_invitation(&id) {
+            Ok(()) => CtlResponse::Ok {
+                message: "invitation rejected".to_string(),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListBookmarks) => match core.list_bookmarks() {
+            Ok(items) => CtlResponse::Bookmarks { items },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::CreateBookmark { url, password }) => {
+            match core.create_bookmark(&url, password.as_deref()) {
+                Ok(()) => CtlResponse::Ok {
+                    message: "bookmark saved".to_string(),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            }
+        }
+        Ok(CtlRequest::DeleteBookmark { token }) => match core.delete_bookmark(&token) {
+            Ok(()) => CtlResponse::Ok {
+                message: "bookmark removed".to_string(),
+            },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListSharedByMe) => match core.list_shared_by_me() {
+            Ok(items) => CtlResponse::SharedByMe { items },
+            Err(e) => CtlResponse::Error { message: e },
+        },
+        Ok(CtlRequest::ListActivity { limit }) => CtlResponse::Activity {
+            items: core.list_activity(limit),
+        },
         Err(e) => CtlResponse::Error {
             message: format!("bad request: {e}"),
         },
@@ -3276,6 +4342,7 @@ pub fn mount(
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         transfers: TransferRegistry::new(),
         indexing: Arc::new(AtomicBool::new(false)),
+        activity: Arc::new(Mutex::new(VecDeque::with_capacity(ACTIVITY_CAP))),
     };
 
     // Keep the launcher prompt's "This computer" index fresh. Its own thread:

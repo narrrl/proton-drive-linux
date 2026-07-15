@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{Request as CtlRequest, Response as CtlResponse};
+use pdfs_core::control::{Request as CtlRequest, Response as CtlResponse, ShareEntryKind};
 use pdfs_core::db::Db;
 
 #[derive(Parser)]
@@ -113,11 +113,15 @@ enum Command {
         /// New folder name (a single path component).
         name: String,
     },
-    /// Upload a local file into a Drive folder via the running daemon.
+    /// Upload local files and/or folders into a Drive folder via the running
+    /// daemon. Folders are uploaded recursively. The daemon uploads in the
+    /// background; watch progress with `pdfs transfers`.
     Upload {
-        /// Local file to upload.
-        file: PathBuf,
-        /// Destination folder path, inside the mountpoint or relative to it.
+        /// Local files and/or folders to upload.
+        #[arg(required = true)]
+        sources: Vec<PathBuf>,
+        /// Destination folder, inside the mountpoint or relative to it.
+        #[arg(short = 't', long = "to", default_value = ".")]
         parent: PathBuf,
     },
     /// Show the daemon's in-flight transfers (active uploads/downloads).
@@ -139,6 +143,163 @@ enum Command {
     },
     /// Permanently delete everything in the trash. This cannot be undone.
     EmptyTrash,
+
+    /// Manage the account's registered devices.
+    Devices {
+        #[command(subcommand)]
+        action: DeviceCmd,
+    },
+    /// Share a file or folder with Proton and/or external email addresses.
+    Share {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// One or more invitee emails (Proton or external, auto-detected).
+        #[arg(required = true)]
+        emails: Vec<String>,
+        /// Role to grant: viewer, editor or admin.
+        #[arg(long, default_value = "viewer")]
+        role: String,
+        /// Optional message included in the invitation email.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// List a node's members, pending invitations and public link.
+    Members {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+    },
+    /// Change the role of a member or pending invitation on a node's share.
+    ShareRole {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Entry id (membership or invitation id), from `pdfs members`.
+        id: String,
+        /// Entry kind: member, proton or external.
+        kind: ShareKindArg,
+        /// New role: viewer, editor or admin.
+        role: String,
+    },
+    /// Remove a member or pending invitation from a node's share.
+    Unshare {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Entry id (membership or invitation id), from `pdfs members`.
+        id: String,
+        /// Entry kind: member, proton or external.
+        kind: ShareKindArg,
+    },
+    /// Manage a node's public link.
+    PublicLink {
+        #[command(subcommand)]
+        action: PublicLinkCmd,
+    },
+    /// List the items I have shared with others (members, invites or a link).
+    Shared,
+    /// List nodes shared with me that I have accepted.
+    SharedWithMe,
+    /// Leave a shared node by its uid (from `pdfs shared-with-me`).
+    Leave {
+        /// Node uid in `volume~link` form.
+        uid: String,
+    },
+    /// Manage invitations addressed to me.
+    Invitations {
+        #[command(subcommand)]
+        action: InvitationCmd,
+    },
+    /// Manage saved public-link bookmarks.
+    Bookmarks {
+        #[command(subcommand)]
+        action: BookmarkCmd,
+    },
+    /// Show the daemon's recent activity, newest first.
+    Activity {
+        /// Maximum entries to show.
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+/// Which collection a share entry lives in, for `share-role` / `unshare`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ShareKindArg {
+    /// An accepted member.
+    Member,
+    /// A pending invitation to a Proton user.
+    Proton,
+    /// A pending invitation to a non-Proton email.
+    External,
+}
+
+impl ShareKindArg {
+    fn to_kind(self) -> ShareEntryKind {
+        match self {
+            ShareKindArg::Member => ShareEntryKind::Member,
+            ShareKindArg::Proton => ShareEntryKind::ProtonInvite,
+            ShareKindArg::External => ShareEntryKind::ExternalInvite,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// List registered devices.
+    List,
+    /// Rename a device by uid.
+    Rename { uid: String, name: String },
+    /// Delete (deregister) a device by uid.
+    Rm { uid: String },
+}
+
+#[derive(Subcommand)]
+enum PublicLinkCmd {
+    /// Create a public link on a node.
+    Create {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Role: viewer or editor.
+        #[arg(long, default_value = "viewer")]
+        role: String,
+        /// Optional custom password protecting the link.
+        #[arg(long)]
+        password: Option<String>,
+        /// Optional expiry, Unix epoch seconds.
+        #[arg(long)]
+        expires: Option<i64>,
+    },
+    /// Remove a node's public link.
+    Remove {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Public-link id, from `pdfs members`.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InvitationCmd {
+    /// List invitations addressed to me.
+    List,
+    /// Accept an invitation by id.
+    Accept { id: String },
+    /// Reject an invitation by id.
+    Reject { id: String },
+}
+
+#[derive(Subcommand)]
+enum BookmarkCmd {
+    /// List saved public-link bookmarks.
+    List,
+    /// Save a public link (optionally password-protected) as a bookmark.
+    Add {
+        /// Public link URL, including the `#password` fragment.
+        url: String,
+        /// Optional custom password for the link.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Remove a saved bookmark by its token.
+    Rm { token: String },
 }
 
 fn main() -> Result<()> {
@@ -170,13 +331,333 @@ fn main() -> Result<()> {
         Command::Move { path, new_parent } => cmd_move(path, new_parent),
         Command::Rm { path } => cmd_rm(path),
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
-        Command::Upload { file, parent } => cmd_upload(file, parent),
+        Command::Upload { sources, parent } => cmd_upload(sources, parent),
         Command::Transfers => cmd_transfers(),
         Command::Trash => cmd_trash(),
         Command::Restore { uids } => cmd_restore(uids),
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
         Command::EmptyTrash => cmd_empty_trash(),
+        Command::Devices { action } => cmd_devices(action),
+        Command::Share {
+            path,
+            emails,
+            role,
+            message,
+        } => cmd_share(path, emails, role, message),
+        Command::Members { path } => cmd_members(path),
+        Command::ShareRole {
+            path,
+            id,
+            kind,
+            role,
+        } => cmd_share_role(path, id, kind, role),
+        Command::Unshare { path, id, kind } => cmd_unshare(path, id, kind),
+        Command::PublicLink { action } => cmd_public_link(action),
+        Command::Shared => cmd_shared(),
+        Command::SharedWithMe => cmd_shared_with_me(),
+        Command::Leave { uid } => cmd_leave(uid),
+        Command::Invitations { action } => cmd_invitations(action),
+        Command::Bookmarks { action } => cmd_bookmarks(action),
+        Command::Activity { limit } => cmd_activity(limit),
     }
+}
+
+fn cmd_devices(action: DeviceCmd) -> Result<()> {
+    match action {
+        DeviceCmd::List => match control_request(CtlRequest::ListDevices)? {
+            CtlResponse::Devices { items } if items.is_empty() => println!("No devices."),
+            CtlResponse::Devices { items } => {
+                for d in items {
+                    let sync = d
+                        .last_sync
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "never".to_string());
+                    println!(
+                        "{}  {}  (synced: {sync})  [{}]",
+                        d.device_type, d.name, d.uid
+                    );
+                }
+            }
+            CtlResponse::Error { message } => bail!("{message}"),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        DeviceCmd::Rename { uid, name } => {
+            ok_or_bail(control_request(CtlRequest::RenameDevice { uid, name })?)?
+        }
+        DeviceCmd::Rm { uid } => ok_or_bail(control_request(CtlRequest::DeleteDevice { uid })?)?,
+    }
+    Ok(())
+}
+
+fn cmd_share(
+    path: PathBuf,
+    emails: Vec<String>,
+    role: String,
+    message: Option<String>,
+) -> Result<()> {
+    ok_or_bail(control_request(CtlRequest::ShareNode {
+        path: path_arg(&path)?,
+        emails,
+        role,
+        message,
+    })?)
+}
+
+fn cmd_members(path: PathBuf) -> Result<()> {
+    match control_request(CtlRequest::ListShare {
+        path: path_arg(&path)?,
+    })? {
+        CtlResponse::Share { entries, link } => {
+            if entries.is_empty() {
+                println!("No members or pending invitations.");
+            }
+            for e in entries {
+                let kind = match e.kind {
+                    ShareEntryKind::Member => "member",
+                    ShareEntryKind::ProtonInvite => "invited (proton)",
+                    ShareEntryKind::ExternalInvite => "invited (external)",
+                };
+                println!("{:<18} {:<8} {}  [{}]", kind, e.role, e.email, e.id);
+            }
+            match link {
+                Some(l) => {
+                    let url = l.url.as_deref().unwrap_or("(url hidden)");
+                    let pw = if l.has_password { " +password" } else { "" };
+                    println!("public link ({}{pw}): {url}  [{}]", l.role, l.id);
+                }
+                None => println!("public link: none"),
+            }
+        }
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_share_role(path: PathBuf, id: String, kind: ShareKindArg, role: String) -> Result<()> {
+    ok_or_bail(control_request(CtlRequest::UpdateShareRole {
+        path: path_arg(&path)?,
+        id,
+        kind: kind.to_kind(),
+        role,
+    })?)
+}
+
+fn cmd_unshare(path: PathBuf, id: String, kind: ShareKindArg) -> Result<()> {
+    ok_or_bail(control_request(CtlRequest::RemoveShareEntry {
+        path: path_arg(&path)?,
+        id,
+        kind: kind.to_kind(),
+    })?)
+}
+
+fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
+    match action {
+        PublicLinkCmd::Create {
+            path,
+            role,
+            password,
+            expires,
+        } => match control_request(CtlRequest::CreatePublicLink {
+            path: path_arg(&path)?,
+            role,
+            password,
+            expires,
+        })? {
+            CtlResponse::PublicLink { link } => {
+                println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
+            }
+            CtlResponse::Error { message } => bail!("{message}"),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        PublicLinkCmd::Remove { path, id } => {
+            ok_or_bail(control_request(CtlRequest::RemovePublicLink {
+                path: path_arg(&path)?,
+                id,
+            })?)?
+        }
+    }
+    Ok(())
+}
+
+fn cmd_shared() -> Result<()> {
+    match control_request(CtlRequest::ListSharedByMe)? {
+        CtlResponse::SharedByMe { items } if items.is_empty() => {
+            println!("You haven't shared anything.")
+        }
+        CtlResponse::SharedByMe { items } => {
+            for it in items {
+                let kind = if it.is_dir { "d" } else { "-" };
+                let mut tags = Vec::new();
+                if it.member_count > 0 {
+                    tags.push(format!("{} member(s)", it.member_count));
+                }
+                if it.invite_count > 0 {
+                    tags.push(format!("{} pending", it.invite_count));
+                }
+                if let Some(link) = &it.link {
+                    tags.push(match &link.url {
+                        Some(url) => format!("link: {url}"),
+                        None => "link".to_string(),
+                    });
+                }
+                let tags = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", tags.join(", "))
+                };
+                println!("{kind} {}{tags}  [{}]", it.name, it.uid);
+            }
+        }
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_shared_with_me() -> Result<()> {
+    match control_request(CtlRequest::ListSharedWithMe)? {
+        CtlResponse::Entries { entries } if entries.is_empty() => {
+            println!("Nothing shared with you.")
+        }
+        CtlResponse::Entries { entries } => {
+            for e in entries {
+                let kind = if e.is_dir { "d" } else { "-" };
+                println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
+            }
+        }
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_activity(limit: usize) -> Result<()> {
+    match control_request(CtlRequest::ListActivity { limit })? {
+        CtlResponse::Activity { items } if items.is_empty() => println!("No recent activity."),
+        CtlResponse::Activity { items } => {
+            for a in items {
+                let when = format_epoch(a.time);
+                let verb = activity_verb(a.kind);
+                let mark = if a.ok { " " } else { "!" };
+                let detail = if a.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", a.detail)
+                };
+                println!("{mark} {when}  {verb:<8} {}{detail}", a.target);
+            }
+        }
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// A short verb for an activity kind, for the CLI's one-line-per-event feed.
+fn activity_verb(kind: pdfs_core::control::ActivityKind) -> &'static str {
+    use pdfs_core::control::ActivityKind::*;
+    match kind {
+        Upload => "upload",
+        Rename => "rename",
+        Move => "move",
+        CreateFolder => "mkdir",
+        Trash => "trash",
+        Restore => "restore",
+        DeleteForever => "delete",
+        EmptyTrash => "empty",
+        Share => "share",
+        PublicLink => "link",
+        Unshare => "unshare",
+    }
+}
+
+/// Format an epoch-seconds timestamp as a compact local-ish `MM-DD HH:MM`.
+/// Deliberately dependency-free: derived directly from the Unix time via UTC.
+fn format_epoch(secs: i64) -> String {
+    // Minimal civil-time conversion (UTC) — good enough for an activity feed.
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi) = (tod / 3600, (tod % 3600) / 60);
+    // Days since 1970-01-01 → y/m/d (Howard Hinnant's civil_from_days).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let _ = y;
+    format!("{m:02}-{d:02} {h:02}:{mi:02}")
+}
+
+fn cmd_leave(uid: String) -> Result<()> {
+    ok_or_bail(control_request(CtlRequest::LeaveShared { uid })?)
+}
+
+fn cmd_invitations(action: InvitationCmd) -> Result<()> {
+    match action {
+        InvitationCmd::List => match control_request(CtlRequest::ListInvitations)? {
+            CtlResponse::Invitations { items } if items.is_empty() => {
+                println!("No pending invitations.")
+            }
+            CtlResponse::Invitations { items } => {
+                for i in items {
+                    let kind = if i.is_dir { "folder" } else { "file" };
+                    let name = i.name.as_deref().unwrap_or("(name hidden)");
+                    println!("{} shared {kind} \"{name}\"  [{}]", i.inviter_email, i.id);
+                }
+            }
+            CtlResponse::Error { message } => bail!("{message}"),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        InvitationCmd::Accept { id } => {
+            ok_or_bail(control_request(CtlRequest::AcceptInvitation { id })?)?
+        }
+        InvitationCmd::Reject { id } => {
+            ok_or_bail(control_request(CtlRequest::RejectInvitation { id })?)?
+        }
+    }
+    Ok(())
+}
+
+fn cmd_bookmarks(action: BookmarkCmd) -> Result<()> {
+    match action {
+        BookmarkCmd::List => match control_request(CtlRequest::ListBookmarks)? {
+            CtlResponse::Bookmarks { items } if items.is_empty() => println!("No bookmarks."),
+            CtlResponse::Bookmarks { items } => {
+                for b in items {
+                    let name = b.name.as_deref().unwrap_or("(name hidden)");
+                    println!("{name}  {}  [{}]", b.url, b.token);
+                }
+            }
+            CtlResponse::Error { message } => bail!("{message}"),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        BookmarkCmd::Add { url, password } => {
+            ok_or_bail(control_request(CtlRequest::CreateBookmark {
+                url,
+                password,
+            })?)?
+        }
+        BookmarkCmd::Rm { token } => {
+            ok_or_bail(control_request(CtlRequest::DeleteBookmark { token })?)?
+        }
+    }
+    Ok(())
+}
+
+/// Print an `Ok` message or bail on an `Error`, for the many commands whose only
+/// reply is one of those two.
+fn ok_or_bail(resp: CtlResponse) -> Result<()> {
+    match resp {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
 }
 
 /// Read a line from stdin with a prompt (echoed).
@@ -595,17 +1076,21 @@ fn cmd_mkdir(parent: PathBuf, name: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_upload(file: PathBuf, parent: PathBuf) -> Result<()> {
-    let bytes = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-    let name = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("source file has no valid name"))?
-        .to_owned();
-    match control_request(CtlRequest::UploadFile {
+fn cmd_upload(sources: Vec<PathBuf>, parent: PathBuf) -> Result<()> {
+    // The daemon reads the sources off its own (local) filesystem, so send it
+    // absolute, canonicalized paths.
+    let mut abs = Vec::with_capacity(sources.len());
+    for src in &sources {
+        let p = std::fs::canonicalize(src).with_context(|| format!("resolve {}", src.display()))?;
+        abs.push(
+            p.to_str()
+                .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", p.display()))?
+                .to_owned(),
+        );
+    }
+    match control_request(CtlRequest::UploadPaths {
         parent: path_arg(&parent)?,
-        name,
-        bytes,
+        sources: abs,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message } => bail!("{message}"),

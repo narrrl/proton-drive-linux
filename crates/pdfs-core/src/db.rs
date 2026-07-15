@@ -381,9 +381,8 @@ impl Db {
         let tx = conn.transaction()?;
         let learned: HashMap<String, (Option<f64>, i64)> = {
             let mut stmt = tx.prepare("SELECT uid, ratio, thumb_state FROM photos")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
-            })?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
 
@@ -394,8 +393,16 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for (seq, (uid, capture_time, name)) in items.iter().enumerate() {
-                let (ratio, thumb_state) = learned.get(uid).copied().unwrap_or((None, THUMB_UNKNOWN));
-                stmt.execute(params![uid, capture_time, name, ratio, thumb_state, seq as i64])?;
+                let (ratio, thumb_state) =
+                    learned.get(uid).copied().unwrap_or((None, THUMB_UNKNOWN));
+                stmt.execute(params![
+                    uid,
+                    capture_time,
+                    name,
+                    ratio,
+                    thumb_state,
+                    seq as i64
+                ])?;
             }
         }
         tx.commit()?;
