@@ -33,9 +33,9 @@ use gtk4::glib::BoxedAnyObject;
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, PhotoItem,
-    PublicLinkInfo, Request, Response, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
-    TransferDirection, TransferItem, send,
+    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
+    PhotoItem, PublicLinkInfo, Request, Response, SearchHit, ShareEntry, ShareEntryKind,
+    SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, send,
 };
 use pdfs_core::service;
 
@@ -109,13 +109,22 @@ struct PinRow {
     unpin: Option<gtk4::Button>,
 }
 
-/// One rendered transfer row in the Activity group: a name + speed line over a
-/// progress bar. Retained so [`repaint_transfers`] can update the bar and label
-/// in place each tick when the active set is unchanged, instead of rebuilding.
+/// One rendered row in the Activity group: a description over a progress bar.
+/// Retained so [`repaint_transfers`] can update the bar and label in place each
+/// tick when the active set is unchanged, instead of rebuilding.
 struct TransferRow {
     row: adw::PreferencesRow,
     label: gtk4::Label,
     bar: gtk4::ProgressBar,
+}
+
+/// What one Activity row should say this tick, and how far along it is —
+/// `None` meaning "no total known", which the bar shows by pulsing. Jobs and
+/// transfers both render to this, so the group is one list in the order the
+/// daemon reports: the jobs that frame the work, then the files moving under it.
+struct ActivityLine {
+    text: String,
+    fraction: Option<f64>,
 }
 
 /// All widgets the periodic refresh and the action handlers mutate, plus the
@@ -327,12 +336,15 @@ struct Ui {
     /// When the Shared page last painted good data. `None` = never / invalidated,
     /// forcing a fetch on next visit. See [`PAGE_TTL`].
     shared_loaded_at: Cell<Option<Instant>>,
-    // Devices page: one section, rebuilt wholesale on each load.
+    // Devices page: two sections (synced folders + other devices), rebuilt
+    // wholesale on each load.
     devices_content: gtk4::Stack,
     devices_status: adw::StatusPage,
     devices_retry: gtk4::Button,
     devices_group: adw::PreferencesGroup,
     devices_rows: RefCell<Vec<gtk4::Widget>>,
+    devices_sync_group: adw::PreferencesGroup,
+    devices_sync_rows: RefCell<Vec<gtk4::Widget>>,
     devices_inflight: Cell<bool>,
     devices_loaded_at: Cell<Option<Instant>>,
     // Shared (by me) page: one section listing the items I've shared, each with a
@@ -351,6 +363,11 @@ struct Ui {
     activity_group: adw::PreferencesGroup,
     activity_rows: RefCell<Vec<gtk4::Widget>>,
     activity_inflight: Cell<bool>,
+    /// Fingerprint of the feed currently on screen (see [`activity_key`]). The
+    /// page polls every couple of seconds and usually gets back exactly what it
+    /// is already showing; rebuilding all 200 rows for that would throw away the
+    /// user's scroll position several times a minute.
+    activity_key: RefCell<Option<String>>,
 }
 
 impl Ui {
@@ -483,6 +500,15 @@ fn spawn_tray() {
 /// purple, app-wide. Named-colour overrides recolour the stock widgets (switch,
 /// buttons, progress fill) without per-widget styling.
 fn load_proton_theme() {
+    // Compile-in and register our custom GResources (e.g. custom icons)
+    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/pdfs.gresource"));
+    let resource_data = glib::Bytes::from_static(bytes);
+    if let Ok(resource) = gio::Resource::from_data(&resource_data) {
+        gio::resources_register(&resource);
+    } else {
+        tracing::error!("failed to load gresource bundle");
+    }
+
     let css = format!(
         "@define-color accent_bg_color {PROTON_PURPLE};\n\
          @define-color accent_color {PROTON_PURPLE};\n\
@@ -532,6 +558,10 @@ fn load_proton_theme() {
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+
+        // Register custom icons directory from our GResource with the icon theme
+        let icon_theme = gtk4::IconTheme::for_display(&display);
+        icon_theme.add_resource_path("/de/nils/protondrivelinux/icons");
     }
 }
 
@@ -691,6 +721,8 @@ fn build_window(app: &adw::Application) {
         devices_retry: devices_widgets.retry.clone(),
         devices_group: devices_widgets.group.clone(),
         devices_rows: RefCell::new(Vec::new()),
+        devices_sync_group: devices_widgets.sync_group.clone(),
+        devices_sync_rows: RefCell::new(Vec::new()),
         devices_inflight: Cell::new(false),
         devices_loaded_at: Cell::new(None),
         shared_by_me_content: shared_by_me_widgets.content.clone(),
@@ -706,6 +738,7 @@ fn build_window(app: &adw::Application) {
         activity_group: activity_widgets.group.clone(),
         activity_rows: RefCell::new(Vec::new()),
         activity_inflight: Cell::new(false),
+        activity_key: RefCell::new(None),
     });
     ui.load_ratios();
 
@@ -730,7 +763,7 @@ fn build_window(app: &adw::Application) {
     wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
-    wire_devices(&ui, &devices_widgets.retry);
+    wire_devices(&ui, &devices_widgets.retry, &devices_widgets.add_folder);
     wire_activity(&ui, &activity_widgets.retry);
     wire_retry(&ui);
 
@@ -1612,6 +1645,13 @@ fn refresh(ui: &Rc<Ui>) {
 
     refresh_status(ui);
     refresh_transfers(ui);
+    // Both of these pages show work as it happens, so they follow the tick while
+    // they are on screen. Every other page loads on navigation only.
+    match ui.stack.visible_child_name().as_deref() {
+        Some("devices") => refresh_sync_folders(ui),
+        Some("activity") => refresh_activity(ui),
+        _ => {}
+    }
 }
 
 /// Record the mount state seen by the last status poll: gate every control that
@@ -1683,21 +1723,30 @@ fn refresh_transfers(ui: &Rc<Ui>) {
         let result = rx.recv().await;
         ui.transfers_inflight.set(false);
         match result {
-            Ok(Ok(Response::Transfers { items })) => repaint_transfers(&ui, &items),
+            Ok(Ok(Response::Transfers { items, jobs })) => repaint_transfers(&ui, &items, &jobs),
             // Daemon unreachable or odd reply: clear the section rather than
             // leave stale progress bars frozen on screen.
-            _ => repaint_transfers(&ui, &[]),
+            _ => repaint_transfers(&ui, &[], &[]),
         }
     });
 }
 
-/// Render the Activity group from `items`. Rebuilds the rows only when the set of
-/// transfers changes (count differs); on the common steady tick it updates each
-/// bar's fraction and the name/speed label in place, so progress animates without
-/// flicker. Hides the whole group when nothing is in flight.
-fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
+/// Render the Activity group from a work snapshot: the daemon's jobs (scans,
+/// batch counts, the local index) above the files moving under them. Rebuilds the
+/// rows only when the set changes (count differs); on the common steady tick it
+/// updates each bar's fraction and the label in place, so progress animates
+/// without flicker. Hides the whole group when the daemon is idle.
+fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[JobItem]) {
+    let lines: Vec<ActivityLine> = jobs
+        .iter()
+        .map(job_line)
+        .chain(items.iter().map(transfer_line))
+        .collect();
+
     // The wire carries in-flight transfers only, with no completion event: the
     // count falling to zero is what "the sync finished" looks like from here.
+    // Jobs are deliberately not counted — a bulk upload retires its scan job and
+    // starts its upload job mid-flight, which is not a thing finishing.
     let previous = ui.active_transfers.replace(items.len());
     if items.is_empty() && previous > 0 {
         let files = if previous == 1 {
@@ -1715,7 +1764,7 @@ fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
         reload_listing(ui);
     }
 
-    if items.is_empty() {
+    if lines.is_empty() {
         if !ui.transfer_rows.borrow().is_empty() {
             for tr in ui.transfer_rows.borrow_mut().drain(..) {
                 ui.transfers_group.remove(&tr.row);
@@ -1728,11 +1777,11 @@ fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
     ui.transfers_group.set_visible(true);
 
     // Rebuild rows only when the count changes; otherwise reuse them in place.
-    if ui.transfer_rows.borrow().len() != items.len() {
+    if ui.transfer_rows.borrow().len() != lines.len() {
         for tr in ui.transfer_rows.borrow_mut().drain(..) {
             ui.transfers_group.remove(&tr.row);
         }
-        for _ in items {
+        for _ in &lines {
             let row_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
             row_box.set_margin_top(8);
             row_box.set_margin_bottom(8);
@@ -1752,30 +1801,57 @@ fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem]) {
         }
     }
 
-    for (item, tr) in items.iter().zip(ui.transfer_rows.borrow().iter()) {
-        let arrow = match item.direction {
-            TransferDirection::Download => "↓",
-            TransferDirection::Upload => "↑",
-        };
-        if item.bytes_total == 0 {
-            // Unknown size: pulse instead of a fraction, and omit the percentage.
-            tr.bar.pulse();
-            tr.label.set_text(&format!(
+    for (line, tr) in lines.iter().zip(ui.transfer_rows.borrow().iter()) {
+        tr.label.set_text(&line.text);
+        match line.fraction {
+            Some(f) => tr.bar.set_fraction(f),
+            // No total to divide by: pulse so the bar still reads as "working".
+            None => tr.bar.pulse(),
+        }
+    }
+}
+
+/// One Activity row for a daemon job: its title, plus whatever it can say about
+/// where it is — a count when it has one, else what it is currently chewing on.
+fn job_line(j: &JobItem) -> ActivityLine {
+    let text = match (j.total > 0, j.detail.is_empty()) {
+        (true, true) => format!("{} — {} of {}", j.title, j.done, j.total),
+        (true, false) => format!("{} — {} ({} of {})", j.title, j.detail, j.done, j.total),
+        (false, true) => format!("{}…", j.title),
+        (false, false) => format!("{} — {}…", j.title, j.detail),
+    };
+    ActivityLine {
+        text,
+        fraction: (j.total > 0).then(|| (j.done as f64 / j.total as f64).min(1.0)),
+    }
+}
+
+/// One Activity row for a file in flight: which way it's going, how far, how fast.
+fn transfer_line(t: &TransferItem) -> ActivityLine {
+    let arrow = match t.direction {
+        TransferDirection::Download => "↓",
+        TransferDirection::Upload => "↑",
+    };
+    if t.bytes_total == 0 {
+        ActivityLine {
+            text: format!(
                 "{arrow} {} — {} ({}/s)",
-                item.name,
-                human_bytes(item.bytes_completed),
-                human_bytes(item.speed_bytes_sec),
-            ));
-        } else {
-            let fraction = (item.bytes_completed as f64 / item.bytes_total as f64).min(1.0);
-            tr.bar.set_fraction(fraction);
-            tr.label.set_text(&format!(
+                t.name,
+                human_bytes(t.bytes_completed),
+                human_bytes(t.speed_bytes_sec),
+            ),
+            fraction: None,
+        }
+    } else {
+        ActivityLine {
+            text: format!(
                 "{arrow} {} — {} of {} ({}/s)",
-                item.name,
-                human_bytes(item.bytes_completed),
-                human_bytes(item.bytes_total),
-                human_bytes(item.speed_bytes_sec),
-            ));
+                t.name,
+                human_bytes(t.bytes_completed),
+                human_bytes(t.bytes_total),
+                human_bytes(t.speed_bytes_sec),
+            ),
+            fraction: Some((t.bytes_completed as f64 / t.bytes_total as f64).min(1.0)),
         }
     }
 }
@@ -1999,7 +2075,7 @@ fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .build();
     upload.add_css_class("flat");
     let upload_folder = gtk4::Button::builder()
-        .icon_name("send-to-symbolic")
+        .icon_name("pdfs-folder-upload-symbolic")
         .tooltip_text("Upload folder")
         .valign(gtk4::Align::Center)
         .build();
@@ -3502,7 +3578,11 @@ struct SharedWidgets {
 struct DevicesWidgets {
     content: gtk4::Stack,
     status: adw::StatusPage,
+    /// "This computer" — the local folders synced to this machine's device.
+    sync_group: adw::PreferencesGroup,
+    /// "Other devices" — the account's other registered devices (read-only).
     group: adw::PreferencesGroup,
+    add_folder: gtk4::Button,
     retry: gtk4::Button,
 }
 
@@ -3590,20 +3670,41 @@ fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     )
 }
 
-/// The Devices page: one section listing every device registered to the account,
-/// each row offering Rename and Remove.
+/// The Computers page: a "This computer" section listing the local folders synced
+/// to this machine's device (each row offering a mode toggle and Remove), plus an
+/// "Other devices" section listing the account's other registered devices.
 fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     let title = gtk4::Label::builder()
-        .label("Devices")
+        .label("Computers")
         .halign(gtk4::Align::Start)
         .build();
     title.add_css_class("title-2");
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.set_hexpand(true);
-    header.append(&title);
+    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    titles.set_hexpand(true);
+    titles.append(&title);
 
-    let group = adw::PreferencesGroup::new();
-    let clamp = adw::Clamp::builder().child(&group).build();
+    let add_folder = gtk4::Button::builder()
+        .label("Add Folder")
+        .valign(gtk4::Align::Center)
+        .build();
+    add_folder.add_css_class("flat");
+
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.append(&titles);
+    header.append(&add_folder);
+
+    let sync_group = adw::PreferencesGroup::builder()
+        .title("This computer")
+        .description("Local folders backed up to this device.")
+        .build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Other devices")
+        .build();
+
+    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    groups.append(&sync_group);
+    groups.append(&group);
+    let clamp = adw::Clamp::builder().child(&groups).build();
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
         .child(&clamp)
@@ -3642,7 +3743,9 @@ fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
         DevicesWidgets {
             content,
             status,
+            sync_group,
             group,
+            add_folder,
             retry,
         },
     )
@@ -4391,13 +4494,15 @@ fn run_shared_mutation(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'
 
 // ---- Devices page ---------------------------------------------------------
 
-/// Install the Devices page's retry button.
-fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button) {
+/// Install the Devices page's retry button and the "Add Folder" action.
+fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk4::Button) {
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
         service::restart();
         load_devices(&ui_retry);
     });
+    let ui_add = ui.clone();
+    add_folder.connect_clicked(move |_| prompt_add_sync_folder(&ui_add));
 }
 
 /// Show a status page in place of the Devices list.
@@ -4409,7 +4514,9 @@ fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry
     ui.devices_content.set_visible_child_name("status");
 }
 
-/// Fetch the device list and repaint the page.
+/// Fetch this machine's synced folders and the account's other devices, then
+/// repaint both sections. The two requests are chained so a single unreachable
+/// daemon collapses the whole page to a status view.
 fn load_devices(ui: &Rc<Ui>) {
     if ui.devices_inflight.get() {
         return;
@@ -4423,35 +4530,64 @@ fn load_devices(ui: &Rc<Ui>) {
         false,
     );
     ui.busy_begin();
-    let rx = spawn_request(ui.dirs.control_socket(), Request::ListDevices);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListSyncFolders);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let sync = rx.recv().await;
+        let folders = match sync {
+            Ok(Ok(Response::SyncFolders { items })) => items,
+            // The daemon answered but not as expected — treat as empty and carry
+            // on to the devices list rather than failing the whole page.
+            Ok(Ok(_)) => Vec::new(),
+            Ok(Err(_)) | Err(_) => {
+                ui.busy_end();
+                ui.devices_inflight.set(false);
+                ui.devices_loaded_at.set(None);
+                devices_unreachable(&ui);
+                return;
+            }
+        };
+        // Daemon reachable: show the list and paint the synced-folders section.
+        ui.devices_content.set_visible_child_name("list");
+        repaint_sync_folders(&ui, &folders);
+
+        let rx2 = spawn_request(ui.dirs.control_socket(), Request::ListDevices);
+        let devices = match rx2.recv().await {
+            Ok(Ok(Response::Devices { items })) => items,
+            _ => Vec::new(),
+        };
+        ui.busy_end();
+        ui.devices_inflight.set(false);
+        repaint_devices(&ui, &devices);
+        ui.devices_loaded_at.set(Some(Instant::now()));
+    });
+}
+
+/// Refresh just the synced-folders section, with no status flash, no spinner and
+/// no devices round-trip. Driven by the periodic tick while the Devices page is
+/// on screen: a folder's sync progress is only live if something re-reads it.
+///
+/// A hiccup leaves the page as it is — the next tick tries again, and a real
+/// outage is reported by [`load_devices`] on the next visit.
+fn refresh_sync_folders(ui: &Rc<Ui>) {
+    if ui.devices_inflight.get() {
+        return;
+    }
+    ui.devices_inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListSyncFolders);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
-        ui.busy_end();
         ui.devices_inflight.set(false);
-        match result {
-            Ok(Ok(Response::Devices { items })) => {
-                repaint_devices(&ui, &items);
-                ui.devices_loaded_at.set(Some(Instant::now()));
-            }
-            Ok(Ok(Response::Error { message })) => devices_status(
-                &ui,
-                "dialog-warning-symbolic",
-                "Couldn't read devices",
-                &message,
-                false,
-            ),
-            Ok(Ok(_)) => devices_status(
-                &ui,
-                "dialog-warning-symbolic",
-                "Couldn't read devices",
-                "Unexpected reply from the mount service.",
-                false,
-            ),
-            Ok(Err(_)) | Err(_) => {
-                ui.devices_loaded_at.set(None);
-                devices_unreachable(&ui);
-            }
+        let Ok(Ok(Response::SyncFolders { items })) = result else {
+            return;
+        };
+        // The page may have been navigated away from, or collapsed to a status
+        // view, while the request was in flight.
+        if ui.stack.visible_child_name().as_deref() == Some("devices")
+            && ui.devices_content.visible_child_name().as_deref() == Some("list")
+        {
+            repaint_sync_folders(&ui, &items);
         }
     });
 }
@@ -4483,22 +4619,23 @@ fn devices_unreachable(ui: &Rc<Ui>) {
     });
 }
 
-/// Rebuild the Devices section from a fresh listing.
+/// Rebuild the "Other devices" section from a fresh listing. Empty is a normal
+/// state (this machine may be the only device), so it shows a placeholder row
+/// rather than collapsing the page.
 fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
     for row in ui.devices_rows.borrow_mut().drain(..) {
         ui.devices_group.remove(&row);
     }
     if devices.is_empty() {
-        devices_status(
-            ui,
-            "computer-symbolic",
-            "No devices",
-            "Desktop apps that sync a folder to this account show up here.",
-            false,
-        );
+        let row = adw::ActionRow::builder()
+            .title("No other devices")
+            .subtitle("Desktop apps syncing to this account appear here.")
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
+        ui.devices_group.add(&row);
+        *ui.devices_rows.borrow_mut() = vec![row.upcast()];
         return;
     }
-    ui.devices_content.set_visible_child_name("list");
     let mut rows: Vec<gtk4::Widget> = Vec::new();
     for dev in devices {
         let row = adw::ActionRow::builder()
@@ -4532,6 +4669,263 @@ fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
         rows.push(row.upcast());
     }
     *ui.devices_rows.borrow_mut() = rows;
+}
+
+/// Rebuild the "This computer" section from a fresh synced-folders listing.
+fn repaint_sync_folders(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
+    for row in ui.devices_sync_rows.borrow_mut().drain(..) {
+        ui.devices_sync_group.remove(&row);
+    }
+    if folders.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("No synced folders")
+            .subtitle("Add a folder to back it up to this device.")
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
+        ui.devices_sync_group.add(&row);
+        *ui.devices_sync_rows.borrow_mut() = vec![row.upcast()];
+        return;
+    }
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+    for f in folders {
+        // A running pass describes itself ("Uploading photo.jpg — 12 of 40");
+        // otherwise fall back to the folder's resting state.
+        let status = match &f.progress {
+            Some(p) => sync_progress_label(p),
+            None => sync_state_label(&f.state).to_string(),
+        };
+        let subtitle = match f.mode.as_str() {
+            "ondemand" => format!("On-demand · {status}"),
+            _ => format!("Synced · {status}"),
+        };
+        let row = adw::ActionRow::builder()
+            .title(&f.local_path)
+            .subtitle(&subtitle)
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
+        let id = f.id;
+
+        // A pass that is applying knows how far it has got, so show it: the
+        // subtitle alone ("syncing photo.jpg — 12 of 40") never conveys that the
+        // end is near. A scanning pass has no counts to draw, and this row is
+        // repainted on the 2s tick — too slow for a pulse to read as motion — so
+        // it stays text-only until the counts exist.
+        if let Some(p) = &f.progress
+            && p.phase == SyncPhase::Applying
+            && p.total > 0
+        {
+            let bar = gtk4::ProgressBar::builder()
+                .fraction((p.done as f64 / p.total as f64).min(1.0))
+                .valign(gtk4::Align::Center)
+                .width_request(120)
+                .build();
+            row.add_suffix(&bar);
+        }
+
+        // Sync now — only meaningful for mirror folders (on-demand has no local
+        // copy to reconcile). The engine also syncs on file changes and on a
+        // 120s poll; this is the "don't wait" button.
+        if f.mode != "ondemand" {
+            let sync_now = gtk4::Button::builder()
+                .icon_name("view-refresh-symbolic")
+                .tooltip_text("Sync this folder now")
+                .valign(gtk4::Align::Center)
+                .build();
+            sync_now.add_css_class("flat");
+            let ui_sync = ui.clone();
+            sync_now.connect_clicked(move |_| {
+                let rx = spawn_request(
+                    ui_sync.dirs.control_socket(),
+                    Request::SyncNow { id: Some(id) },
+                );
+                let ui_sync = ui_sync.clone();
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(Response::Ok { .. })) => toast(&ui_sync, "Syncing folder…"),
+                        Ok(Ok(Response::Error { message })) => {
+                            toast_error(&ui_sync, "Couldn't sync", &message)
+                        }
+                        _ => toast_error(
+                            &ui_sync,
+                            "Couldn't sync",
+                            "The mount service didn't respond.",
+                        ),
+                    }
+                });
+            });
+            row.add_suffix(&sync_now);
+        }
+
+        // On-demand toggle: off = full local copy (mirror), on = FUSE mount that
+        // frees the disk. Set the state before wiring the handler so painting the
+        // current mode doesn't fire a spurious request.
+        let ondemand = gtk4::Switch::builder()
+            .tooltip_text("On-demand: keep files in the cloud, free local disk")
+            .valign(gtk4::Align::Center)
+            .active(f.mode == "ondemand")
+            .build();
+        let ui_mode = ui.clone();
+        ondemand.connect_state_set(move |_, on| {
+            set_sync_folder_mode(&ui_mode, id, if on { "ondemand" } else { "mirror" });
+            glib::Propagation::Proceed
+        });
+        row.add_suffix(&ondemand);
+
+        let remove = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Stop syncing this folder")
+            .valign(gtk4::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        let ui_rm = ui.clone();
+        let path = f.local_path.clone();
+        remove.connect_clicked(move |_| prompt_remove_sync_folder(&ui_rm, id, &path));
+        row.add_suffix(&remove);
+        ui.devices_sync_group.add(&row);
+        rows.push(row.upcast());
+    }
+    *ui.devices_sync_rows.borrow_mut() = rows;
+}
+
+/// Human label for a synced folder's `state` column.
+fn sync_state_label(state: &str) -> &str {
+    match state {
+        "syncing" => "syncing…",
+        "error" => "sync error",
+        "conflict" => "needs attention",
+        _ => "up to date",
+    }
+}
+
+/// Human label for a sync pass in flight: what it is doing, to which file, and
+/// how far along it is. The total grows as deeper paths are classified, so this
+/// reads "12 of 40" rather than showing a percentage that could go backwards.
+fn sync_progress_label(p: &SyncProgress) -> String {
+    match p.phase {
+        SyncPhase::Scanning => "checking for changes…".to_string(),
+        SyncPhase::Applying => {
+            let count = format!("{} of {}", p.done + 1, p.total.max(p.done + 1));
+            if p.current.is_empty() {
+                format!("syncing {count}")
+            } else {
+                format!("syncing {} — {count}", p.current)
+            }
+        }
+    }
+}
+
+/// Pick a local folder and hand it to the daemon to sync to this device.
+fn prompt_add_sync_folder(ui: &Rc<Ui>) {
+    let win = ui_window(ui);
+    let dialog = gtk4::FileDialog::builder()
+        .title("Add Folder to Sync")
+        .build();
+    let ui = ui.clone();
+    dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Ok(folder) = res else { return };
+        let Some(local_path) = folder.path().and_then(|p| p.to_str().map(str::to_string)) else {
+            return;
+        };
+        let rx = spawn_request(
+            ui.dirs.control_socket(),
+            Request::AddSyncFolder {
+                local_path: local_path.clone(),
+            },
+        );
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => {
+                    toast(&ui, "Syncing folder…");
+                    // The upload runs off-socket; reload shortly so the new row
+                    // appears once the daemon has registered it.
+                    let ui = ui.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                        if ui.stack.visible_child_name().as_deref() == Some("devices") {
+                            load_devices(&ui);
+                        }
+                    });
+                }
+                Ok(Ok(Response::Error { message })) => {
+                    toast_error(&ui, "Couldn't add folder", &message)
+                }
+                _ => toast_error(
+                    &ui,
+                    "Couldn't add folder",
+                    "The mount service didn't respond.",
+                ),
+            }
+        });
+    });
+}
+
+/// Flip a synced folder between `mirror` and `ondemand`. Reloads after so the
+/// row's subtitle and switch reflect the daemon's real state (the request may be
+/// rejected, e.g. switching to on-demand while a folder is mid-sync).
+fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &str) {
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::SetSyncFolderMode {
+            id,
+            mode: mode.to_string(),
+        },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { message })) => toast(&ui, &message),
+            Ok(Ok(Response::Error { message })) => {
+                toast_error(&ui, "Couldn't change mode", &message)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't change mode",
+                "The mount service didn't respond.",
+            ),
+        }
+        if ui.stack.visible_child_name().as_deref() == Some("devices") {
+            load_devices(&ui);
+        }
+    });
+}
+
+/// Confirm, then stop syncing a folder. Offers to also delete the cloud copy.
+fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Stop syncing folder")
+        .body(format!(
+            "Stop syncing “{path}”? Your local files stay; choose whether to also \
+             delete the copy in Proton Drive."
+        ))
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let delete_remote = adw::SwitchRow::builder()
+        .title("Also delete from Proton Drive")
+        .active(false)
+        .build();
+    group.add(&delete_remote);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Stop Syncing");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "remove" {
+            run_devices_mutation(
+                &ui,
+                Request::RemoveSyncFolder {
+                    id,
+                    delete_remote: delete_remote.is_active(),
+                },
+                "Stopped syncing folder",
+                "Couldn't stop syncing the folder",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
 }
 
 /// Prompt for a new device name and rename it.
@@ -4985,9 +5379,38 @@ fn activity_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retr
     ui.activity_status.set_description(Some(description));
     ui.activity_retry.set_visible(retry);
     ui.activity_content.set_visible_child_name("status");
+    // The list is no longer what is on screen, so the next repaint must not skip
+    // itself as a no-op and leave this status view up.
+    *ui.activity_key.borrow_mut() = None;
 }
 
-/// Fetch the recent activity and repaint the page.
+/// Refresh the Activity feed in place, with no status flash and no spinner.
+/// Driven by the periodic tick while the page is on screen, so a running sync
+/// pass fills the feed as it works rather than only once it is done. Anything
+/// other than a good answer leaves the rows alone until the next tick.
+fn refresh_activity(ui: &Rc<Ui>) {
+    if ui.activity_inflight.get() {
+        return;
+    }
+    ui.activity_inflight.set(true);
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::ListActivity { limit: 200 },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.activity_inflight.set(false);
+        // The page may have been navigated away from while the request was in
+        // flight.
+        if let Ok(Ok(Response::Activity { items })) = result
+            && ui.stack.visible_child_name().as_deref() == Some("activity")
+        {
+            repaint_activity(&ui, &items);
+        }
+    });
+}
+
 fn load_activity(ui: &Rc<Ui>) {
     if ui.activity_inflight.get() {
         return;
@@ -5058,8 +5481,24 @@ fn activity_unreachable(ui: &Rc<Ui>) {
     });
 }
 
-/// Rebuild the Activity section from a fresh log.
+/// A cheap fingerprint of a feed: how many entries, and what the newest one is.
+/// The log is append-only and newest-first, so a feed with the same length and
+/// the same newest entry is the same feed.
+fn activity_key(items: &[ActivityEntry]) -> String {
+    match items.first() {
+        Some(a) => format!("{}:{}:{}:{}", items.len(), a.time, a.target, a.detail),
+        None => String::new(),
+    }
+}
+
+/// Rebuild the Activity section from a fresh log, unless it is already showing
+/// exactly this feed.
 fn repaint_activity(ui: &Rc<Ui>, items: &[ActivityEntry]) {
+    let key = activity_key(items);
+    if ui.activity_key.borrow().as_deref() == Some(key.as_str()) {
+        return;
+    }
+    *ui.activity_key.borrow_mut() = Some(key);
     for row in ui.activity_rows.borrow_mut().drain(..) {
         ui.activity_group.remove(&row);
     }
@@ -5101,6 +5540,8 @@ fn repaint_activity(ui: &Rc<Ui>, items: &[ActivityEntry]) {
 fn activity_verb(kind: ActivityKind) -> &'static str {
     match kind {
         ActivityKind::Upload => "Uploaded",
+        ActivityKind::Download => "Downloaded",
+        ActivityKind::Sync => "Synced",
         ActivityKind::Rename => "Renamed",
         ActivityKind::Move => "Moved",
         ActivityKind::CreateFolder => "Created folder",
@@ -5118,6 +5559,8 @@ fn activity_verb(kind: ActivityKind) -> &'static str {
 fn activity_icon(kind: ActivityKind) -> &'static str {
     match kind {
         ActivityKind::Upload => "document-send-symbolic",
+        ActivityKind::Download => "document-save-symbolic",
+        ActivityKind::Sync => "emblem-synchronizing-symbolic",
         ActivityKind::Rename => "document-edit-symbolic",
         ActivityKind::Move => "go-jump-symbolic",
         ActivityKind::CreateFolder => "folder-new-symbolic",

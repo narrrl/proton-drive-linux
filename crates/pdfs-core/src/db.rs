@@ -19,10 +19,20 @@ use proton_drive_rs::{Node, NodeKind};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
+use crate::control::{ActivityEntry, ActivityKind};
 use crate::localindex::LocalEntry;
 
 /// Current schema version. Bump on every forward migration added below.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 9;
+
+/// How many activity rows to keep. Older rows are pruned on insert, so the feed
+/// stays a bounded "recent history" rather than growing without limit.
+const ACTIVITY_KEEP: i64 = 2000;
+
+/// Size the WAL is truncated back to after a checkpoint. Comfortably above the
+/// steady-state working set (a few MB), so the truncation only claws back the
+/// outliers rather than fighting the normal write path for disk.
+const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// A photo whose thumbnail state is not known yet: it has never been asked for.
 pub const THUMB_UNKNOWN: i64 = 0;
@@ -77,6 +87,46 @@ pub struct StoredTrash {
     pub mtime: i64,
 }
 
+/// The one Proton Drive Device this machine is registered as (devices.md).
+/// Cached so restarts reuse the same device rather than creating a new one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredDevice {
+    pub uid: String,
+    pub share_id: String,
+    pub root_uid: String,
+    pub name: String,
+    pub created: i64,
+}
+
+/// One local folder the user added to this device's sync set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredSyncFolder {
+    pub id: i64,
+    pub local_path: String,
+    pub remote_uid: String,
+    pub remote_share_id: String,
+    /// `mirror` (full local copy, two-way synced) or `ondemand` (FUSE mount).
+    pub mode: String,
+    /// `idle` | `syncing` | `error` | `conflict`.
+    pub state: String,
+    pub last_sync: i64,
+}
+
+/// One per-file sync baseline row: what a path looked like on both sides at the
+/// last successful sync, so the next reconcile can tell which side changed
+/// (devices.md Phase 2). `remote_rev`/`remote_hash` hold the remote signature —
+/// its modification time and size as strings — since no cheap content hash is
+/// exposed; change detection is `(mtime, size)` on each side.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredSyncEntry {
+    pub rel_path: String,
+    pub remote_uid: Option<String>,
+    pub local_mtime: i64,
+    pub local_size: i64,
+    pub remote_rev: Option<String>,
+    pub remote_hash: Option<String>,
+}
+
 /// Handle to the unified metadata database.
 ///
 /// Cheap to wrap in an `Arc`; clone the `Arc`, not this. All access goes through
@@ -95,6 +145,13 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Hand the WAL's disk back after a checkpoint. Without a limit SQLite
+        // reuses the file in place but never shrinks it, so a single large
+        // transaction (a full-index FTS rebuild in `local_finish_scan` is the
+        // one that reaches this size) leaves the WAL at its high-water mark
+        // forever — a multi-GB file next to a database two orders of magnitude
+        // smaller. Checkpointing is unaffected; only the file is truncated back.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
 
         let db = Self {
             conn: Mutex::new(conn),
@@ -160,6 +217,12 @@ impl Db {
         }
         if current < 7 {
             tx.execute_batch(MIGRATION_V7)?;
+        }
+        if current < 8 {
+            tx.execute_batch(MIGRATION_V8)?;
+        }
+        if current < 9 {
+            tx.execute_batch(MIGRATION_V9)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -525,6 +588,266 @@ impl Db {
             items.push(row?);
         }
         Ok(items)
+    }
+
+    // ---- device sync (devices.md) -----------------------------------------
+
+    /// The registered device for this machine, if one has been created/cached.
+    pub fn device_get(&self) -> Result<Option<StoredDevice>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT uid, share_id, root_uid, name, created FROM device LIMIT 1",
+            [],
+            |r| {
+                Ok(StoredDevice {
+                    uid: r.get(0)?,
+                    share_id: r.get(1)?,
+                    root_uid: r.get(2)?,
+                    name: r.get(3)?,
+                    created: r.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Persist (or replace) this machine's device. The table holds a single row.
+    pub fn device_set(&self, dev: &StoredDevice) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM device", [])?;
+        conn.execute(
+            "INSERT INTO device (uid, share_id, root_uid, name, created)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![dev.uid, dev.share_id, dev.root_uid, dev.name, dev.created],
+        )?;
+        Ok(())
+    }
+
+    /// Add a synced folder, returning its new row id.
+    pub fn sync_folder_add(
+        &self,
+        local_path: &str,
+        remote_uid: &str,
+        remote_share_id: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_folder (local_path, remote_uid, remote_share_id)
+             VALUES (?1, ?2, ?3)",
+            params![local_path, remote_uid, remote_share_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Every synced folder, oldest first.
+    pub fn sync_folder_list(&self) -> Result<Vec<StoredSyncFolder>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, local_path, remote_uid, remote_share_id, mode, state, last_sync
+             FROM sync_folder ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(StoredSyncFolder {
+                id: r.get(0)?,
+                local_path: r.get(1)?,
+                remote_uid: r.get(2)?,
+                remote_share_id: r.get(3)?,
+                mode: r.get(4)?,
+                state: r.get(5)?,
+                last_sync: r.get(6)?,
+            })
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Look up one synced folder by id.
+    pub fn sync_folder_get(&self, id: i64) -> Result<Option<StoredSyncFolder>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, local_path, remote_uid, remote_share_id, mode, state, last_sync
+             FROM sync_folder WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(StoredSyncFolder {
+                    id: r.get(0)?,
+                    local_path: r.get(1)?,
+                    remote_uid: r.get(2)?,
+                    remote_share_id: r.get(3)?,
+                    mode: r.get(4)?,
+                    state: r.get(5)?,
+                    last_sync: r.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Remove a synced folder and its per-file baseline.
+    pub fn sync_folder_remove(&self, id: i64) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sync_entry WHERE folder_id = ?1", params![id])?;
+        let n = tx.execute("DELETE FROM sync_folder WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// Update a synced folder's mode (`mirror`/`ondemand`).
+    pub fn sync_folder_set_mode(&self, id: i64, mode: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sync_folder SET mode = ?2 WHERE id = ?1",
+            params![id, mode],
+        )?;
+        Ok(())
+    }
+
+    /// Update a synced folder's state and stamp `last_sync` to now.
+    pub fn sync_folder_set_state(&self, id: i64, state: &str, last_sync: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sync_folder SET state = ?2, last_sync = ?3 WHERE id = ?1",
+            params![id, state, last_sync],
+        )?;
+        Ok(())
+    }
+
+    /// The whole per-file sync baseline for a folder, keyed by relative path.
+    pub fn sync_entries(&self, folder_id: i64) -> Result<HashMap<String, StoredSyncEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash
+             FROM sync_entry WHERE folder_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![folder_id], |r| {
+            Ok(StoredSyncEntry {
+                rel_path: r.get(0)?,
+                remote_uid: r.get(1)?,
+                local_mtime: r.get(2)?,
+                local_size: r.get(3)?,
+                remote_rev: r.get(4)?,
+                remote_hash: r.get(5)?,
+            })
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let e = row?;
+            map.insert(e.rel_path.clone(), e);
+        }
+        Ok(map)
+    }
+
+    /// Insert or replace one baseline row.
+    pub fn sync_entry_upsert(&self, folder_id: i64, e: &StoredSyncEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_entry
+               (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(folder_id, rel_path) DO UPDATE SET
+               remote_uid  = excluded.remote_uid,
+               local_mtime = excluded.local_mtime,
+               local_size  = excluded.local_size,
+               remote_rev  = excluded.remote_rev,
+               remote_hash = excluded.remote_hash",
+            params![
+                folder_id,
+                e.rel_path,
+                e.remote_uid,
+                e.local_mtime,
+                e.local_size,
+                e.remote_rev,
+                e.remote_hash,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop one baseline row (a path that left the sync set on both sides).
+    pub fn sync_entry_remove(&self, folder_id: i64, rel_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM sync_entry WHERE folder_id = ?1 AND rel_path = ?2",
+            params![folder_id, rel_path],
+        )?;
+        Ok(())
+    }
+
+    // ---- activity ---------------------------------------------------------
+
+    /// Append one entry to the activity log, pruning back to [`ACTIVITY_KEEP`]
+    /// rows. `kind` round-trips through serde rather than a hand-written string
+    /// table, so adding an [`ActivityKind`] variant needs no change here.
+    pub fn activity_add(&self, entry: &ActivityEntry) -> Result<()> {
+        let kind = serde_json::to_string(&entry.kind)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO activity (time, kind, target, detail, ok) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entry.time, kind, entry.target, entry.detail, entry.ok],
+        )?;
+        tx.execute(
+            "DELETE FROM activity WHERE id <= (
+               SELECT id FROM activity ORDER BY id DESC LIMIT 1 OFFSET ?1
+             )",
+            params![ACTIVITY_KEEP],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The most recent activity, newest first, capped at `limit` entries. Rows
+    /// whose stored `kind` no longer parses (written by an older build) are
+    /// skipped rather than failing the whole read.
+    pub fn activity_list(&self, limit: usize) -> Result<Vec<ActivityEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT time, kind, target, detail, ok FROM activity
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (time, kind, target, detail, ok) = row?;
+            let Ok(kind) = serde_json::from_str::<ActivityKind>(&kind) else {
+                continue;
+            };
+            out.push(ActivityEntry {
+                time,
+                kind,
+                target,
+                detail,
+                ok,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Drop the entire baseline for a folder. Used when flipping ondemand→mirror:
+    /// the local tree was evicted, so the old baseline is stale and would make the
+    /// next reconcile mistake "locally deleted" for "must re-download". Clearing it
+    /// leaves an empty baseline + full remote = pure download (devices.md P3).
+    pub fn sync_entries_clear(&self, folder_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM sync_entry WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
     }
 
     /// Children of `parent`, for the offline `ensure_children` fast path when a
@@ -1106,9 +1429,86 @@ CREATE TABLE trash (
 );
 ";
 
+/// Schema v8: device sync (devices.md). This machine registers as one Proton Drive
+/// **Device** (a share + root folder on the main volume); `device` is a singleton
+/// row cached so we reuse the same device across restarts instead of creating a
+/// new one each run. `sync_folder` is one row per local folder the user added,
+/// each mapped to a folder under the device root; `mode` is `mirror` (full local
+/// copy, two-way synced) or `ondemand` (FUSE mount at `local_path`, no local
+/// storage). `sync_entry` is the per-file baseline for three-way merge — added in
+/// this migration so Phase 2 has the table, though Phase 1 leaves it empty.
+const MIGRATION_V8: &str = "
+CREATE TABLE device (
+  uid      TEXT PRIMARY KEY,
+  share_id TEXT NOT NULL,
+  root_uid TEXT NOT NULL,
+  name     TEXT NOT NULL,
+  created  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE sync_folder (
+  id              INTEGER PRIMARY KEY,
+  local_path      TEXT NOT NULL UNIQUE,
+  remote_uid      TEXT NOT NULL,
+  remote_share_id TEXT NOT NULL,
+  mode            TEXT NOT NULL DEFAULT 'mirror',
+  state           TEXT NOT NULL DEFAULT 'idle',
+  last_sync       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE sync_entry (
+  folder_id   INTEGER NOT NULL,
+  rel_path    TEXT NOT NULL,
+  remote_uid  TEXT,
+  local_mtime INTEGER NOT NULL DEFAULT 0,
+  local_size  INTEGER NOT NULL DEFAULT 0,
+  remote_hash TEXT,
+  remote_rev  TEXT,
+  PRIMARY KEY (folder_id, rel_path)
+);
+";
+
+const MIGRATION_V9: &str = "
+CREATE TABLE activity (
+  id     INTEGER PRIMARY KEY,
+  time   INTEGER NOT NULL,
+  kind   TEXT NOT NULL,
+  target TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  ok     INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX activity_time ON activity(time DESC);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Db::open` applies the pragmas that `open_in_memory` skips, so the WAL
+    /// settings can only be checked against a real file.
+    #[test]
+    fn open_bounds_the_wal_size() {
+        let path = std::env::temp_dir().join(format!("pdfs-db-wal-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        // Without this the WAL is reused in place but never shrinks, so one
+        // oversized transaction strands its high-water mark on disk forever.
+        let limit: i64 = conn
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, WAL_SIZE_LIMIT);
+
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
     use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
 
     fn uid(link: &str) -> NodeUid {
@@ -1488,6 +1888,49 @@ mod tests {
         assert_eq!(db.search("unique", 10).unwrap().len(), 1);
         db.delete_node(&uid("f1")).unwrap();
         assert_eq!(db.search("unique", 10).unwrap().len(), 0);
+    }
+
+    fn activity(target: &str, kind: ActivityKind, ok: bool) -> ActivityEntry {
+        ActivityEntry {
+            time: 1700,
+            kind,
+            target: target.into(),
+            detail: "detail".into(),
+            ok,
+        }
+    }
+
+    #[test]
+    fn activity_reads_back_newest_first() {
+        let db = Db::open_in_memory().unwrap();
+        db.activity_add(&activity("a.txt", ActivityKind::Upload, true))
+            .unwrap();
+        db.activity_add(&activity("b.txt", ActivityKind::Download, false))
+            .unwrap();
+
+        let items = db.activity_list(10).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].target, "b.txt");
+        assert_eq!(items[0].kind, ActivityKind::Download);
+        assert!(!items[0].ok);
+        assert_eq!(items[0].detail, "detail");
+        assert_eq!(items[0].time, 1700);
+        assert_eq!(items[1].target, "a.txt");
+
+        assert_eq!(db.activity_list(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn activity_prunes_to_the_keep_limit() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..(ACTIVITY_KEEP + 10) {
+            db.activity_add(&activity(&format!("f{i}"), ActivityKind::Upload, true))
+                .unwrap();
+        }
+        let items = db.activity_list(ACTIVITY_KEEP as usize * 2).unwrap();
+        assert_eq!(items.len(), ACTIVITY_KEEP as usize);
+        // The newest survive; the oldest are the ones dropped.
+        assert_eq!(items[0].target, format!("f{}", ACTIVITY_KEEP + 9));
     }
 
     #[test]

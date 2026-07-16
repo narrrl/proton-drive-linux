@@ -111,9 +111,11 @@ pub enum Request {
     /// persist it to config so the next mount keeps it. Replies with
     /// [`Response::Ok`].
     SetCacheBudget { bytes: u64 },
-    /// Snapshot the daemon's in-flight transfers (active uploads/downloads).
-    /// Replies with [`Response::Transfers`]. Cheap to poll: the daemon keeps the
-    /// registry in memory, so a front-end can render a live progress widget.
+    /// Snapshot what the daemon is working on: in-flight transfers (active
+    /// uploads/downloads) and the longer jobs around them (scans, folder
+    /// skeletons, the local index, sync passes). Replies with
+    /// [`Response::Transfers`]. Cheap to poll: the daemon keeps the registry in
+    /// memory, so a front-end can render a live progress widget.
     GetQueueStatus,
     /// List what is in the account's trash. Replies with [`Response::Entries`];
     /// a trashed node has no path inside the mount, so each entry carries only
@@ -137,6 +139,22 @@ pub enum Request {
     RenameDevice { uid: String, name: String },
     /// Delete (deregister) a device by its uid. Replies with [`Response::Ok`].
     DeleteDevice { uid: String },
+
+    // ---- device folder sync (devices.md) ----------------------------------
+    /// Add a local folder to this machine's device, uploading its tree and
+    /// registering the device on first use. Replies with [`Response::Ok`].
+    AddSyncFolder { local_path: String },
+    /// List this device's synced folders. Replies with [`Response::SyncFolders`].
+    ListSyncFolders,
+    /// Remove a synced folder by id; `delete_remote` also trashes its cloud copy.
+    /// Replies with [`Response::Ok`].
+    RemoveSyncFolder { id: i64, delete_remote: bool },
+    /// Switch a synced folder between `mirror` and `ondemand` (Phase 3). Replies
+    /// with [`Response::Ok`].
+    SetSyncFolderMode { id: i64, mode: String },
+    /// Force a reconcile pass: one folder by id, or all when `id` is `None`.
+    /// Replies with [`Response::Ok`].
+    SyncNow { id: Option<i64> },
 
     // ---- sharing a node ---------------------------------------------------
     /// Invite `emails` (Proton and/or external addresses, auto-detected) to the
@@ -220,10 +238,11 @@ pub enum Request {
 
     // ---- activity ---------------------------------------------------------
     /// Fetch the daemon's recent activity log, newest first, capped at `limit`
-    /// entries. Replies with [`Response::Activity`]. The log lives in memory for
-    /// the life of the daemon: it records the mutations and transfers the daemon
-    /// performs (uploads, deletes, renames, shares, …), so a front-end can show a
-    /// running "what happened" feed without re-deriving it from anywhere.
+    /// entries. Replies with [`Response::Activity`]. The log is persisted, so it
+    /// survives a daemon restart: it records the mutations and transfers the
+    /// daemon performs (uploads, downloads, deletes, renames, shares, sync
+    /// passes, …), so a front-end can show a running "what happened" feed
+    /// without re-deriving it from anywhere.
     ListActivity { limit: usize },
 }
 
@@ -250,6 +269,54 @@ pub struct DeviceInfo {
     pub device_type: String,
     /// Last sync time, epoch seconds; `None` if it never synced.
     pub last_sync: Option<i64>,
+}
+
+/// One synced local folder on this machine's device (in [`Response::SyncFolders`]).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncFolderInfo {
+    /// Row id — the handle for [`Request::RemoveSyncFolder`]/[`Request::SetSyncFolderMode`].
+    pub id: i64,
+    /// Absolute local folder path.
+    pub local_path: String,
+    /// The uid of the folder's remote root under the device root.
+    pub remote_uid: String,
+    /// `mirror` (full local copy, two-way synced) or `ondemand` (FUSE mount).
+    pub mode: String,
+    /// `idle` | `syncing` | `error` | `conflict`.
+    pub state: String,
+    /// Last successful sync, epoch seconds; `0` if never.
+    pub last_sync: i64,
+    /// What the folder's sync pass is doing right now, or `None` when no pass is
+    /// running. Live daemon state, not a stored column.
+    #[serde(default)]
+    pub progress: Option<SyncProgress>,
+}
+
+/// Which stage a running sync pass is in, in a [`SyncProgress`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// Walking the local tree, the remote tree and the stored baseline to work
+    /// out what changed. No per-item counts exist yet.
+    Scanning,
+    /// Applying the diff: creating folders, uploading, downloading, deleting.
+    Applying,
+}
+
+/// A snapshot of a sync pass in flight (in [`SyncFolderInfo::progress`]), so a
+/// front-end can say what the daemon is doing rather than just "syncing".
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncProgress {
+    pub phase: SyncPhase,
+    /// Items applied so far this pass.
+    pub done: usize,
+    /// Items known to need applying. This *grows* during a pass: paths are
+    /// classified depth by depth (a folder must exist remotely before its
+    /// children can be queued), so the total is what has been discovered so far,
+    /// not a figure fixed up front.
+    pub total: usize,
+    /// The name of an item currently being applied, or empty between items.
+    /// Several run at once; this is just the most recently started.
+    pub current: String,
 }
 
 /// One member or pending invitation on a node's share (in [`Response::Share`]).
@@ -337,6 +404,9 @@ pub struct SharedItem {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
     Upload,
+    Download,
+    /// A whole sync pass over one folder, summarising what it moved.
+    Sync,
     Rename,
     Move,
     CreateFolder,
@@ -373,6 +443,23 @@ pub struct ActivityEntry {
 pub enum TransferDirection {
     Download,
     Upload,
+}
+
+/// One long-running daemon job in a [`Response::Transfers`] snapshot: work that
+/// takes long enough to need reporting but doesn't move bytes over the wire —
+/// walking a local tree, building a remote folder skeleton, indexing `$HOME`.
+/// Byte-moving work is a [`TransferItem`] instead.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct JobItem {
+    /// What the job is, as a front-end would title it ("Uploading files").
+    pub title: String,
+    /// What it is doing right now ("Scanning Photos/2024"), or empty.
+    pub detail: String,
+    /// Steps finished so far.
+    pub done: u64,
+    /// Steps known to need doing, or `0` when unknown (indeterminate progress).
+    /// May *grow* mid-job as more work is discovered.
+    pub total: u64,
 }
 
 /// One in-flight transfer in a [`Response::Transfers`] snapshot.
@@ -532,10 +619,19 @@ pub enum Response {
     /// is true while a scan of the machine is still running, so a front-end can
     /// say "still indexing" instead of "no matches" on a cold first launch.
     LocalResults { hits: Vec<LocalHit>, indexing: bool },
-    /// A snapshot of in-flight transfers (reply to [`Request::GetQueueStatus`]).
-    Transfers { items: Vec<TransferItem> },
+    /// A snapshot of what the daemon is working on (reply to
+    /// [`Request::GetQueueStatus`]): `items` are byte-moving transfers, `jobs`
+    /// the longer non-transfer work around them (scans, folder skeletons, the
+    /// local index, sync passes). Both empty means the daemon is idle.
+    Transfers {
+        items: Vec<TransferItem>,
+        #[serde(default)]
+        jobs: Vec<JobItem>,
+    },
     /// The account's devices (reply to [`Request::ListDevices`]).
     Devices { items: Vec<DeviceInfo> },
+    /// This device's synced folders (reply to [`Request::ListSyncFolders`]).
+    SyncFolders { items: Vec<SyncFolderInfo> },
     /// A node's share: members + pending invitations, and its public link if any
     /// (reply to [`Request::ListShare`]).
     Share {
@@ -655,6 +751,19 @@ mod tests {
             Request::DeleteDevice {
                 uid: "dev-1".into(),
             },
+            Request::AddSyncFolder {
+                local_path: "/home/me/Docs".into(),
+            },
+            Request::ListSyncFolders,
+            Request::RemoveSyncFolder {
+                id: 3,
+                delete_remote: true,
+            },
+            Request::SetSyncFolderMode {
+                id: 3,
+                mode: "ondemand".into(),
+            },
+            Request::SyncNow { id: Some(3) },
             Request::ShareNode {
                 path: "a/b".into(),
                 emails: vec!["x@proton.me".into(), "y@example.com".into()],

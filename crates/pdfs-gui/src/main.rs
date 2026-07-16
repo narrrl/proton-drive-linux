@@ -18,7 +18,7 @@ use ksni::menu::StandardItem;
 use ksni::{MenuItem, Tray, TrayService};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{Request, Response, TransferDirection, TransferItem, send};
+use pdfs_core::control::{JobItem, Request, Response, TransferDirection, TransferItem, send};
 use pdfs_core::service;
 
 /// How often the tray re-polls the daemon to refresh its menu.
@@ -38,12 +38,18 @@ struct DriveState {
     sync: String,
 }
 
-/// Summarise a transfer snapshot into one menu line, or empty when idle. A single
+/// Summarise a work snapshot into one menu line, or empty when idle. A single
 /// transfer names the file and its percentage; several collapse to counts so the
-/// menu stays one line regardless of queue depth.
-fn sync_line(items: &[TransferItem]) -> String {
+/// menu stays one line regardless of queue depth. With nothing moving bytes, a
+/// running job speaks for itself — a scan or an index rebuild is still "busy",
+/// and the tray saying nothing there reads as "finished".
+fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
     match items {
-        [] => String::new(),
+        [] => match jobs.first() {
+            Some(j) if j.total > 0 => format!("{} ({} of {})", j.title, j.done, j.total),
+            Some(j) => format!("{}…", j.title),
+            None => String::new(),
+        },
         [t] => {
             let arrow = match t.direction {
                 TransferDirection::Download => "↓",
@@ -87,7 +93,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             mountpoint: PathBuf::from(mountpoint),
             // Same daemon is up, so a cheap follow-up poll gives the sync line.
             sync: match send(socket, &Request::GetQueueStatus) {
-                Ok(Response::Transfers { items }) => sync_line(&items),
+                Ok(Response::Transfers { items, jobs }) => sync_line(&items, &jobs),
                 _ => String::new(),
             },
         },

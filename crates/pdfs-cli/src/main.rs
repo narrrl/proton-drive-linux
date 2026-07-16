@@ -10,7 +10,9 @@ use clap::{Parser, Subcommand};
 use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{Request as CtlRequest, Response as CtlResponse, ShareEntryKind};
+use pdfs_core::control::{
+    Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
+};
 use pdfs_core::db::Db;
 
 #[derive(Parser)]
@@ -149,6 +151,11 @@ enum Command {
         #[command(subcommand)]
         action: DeviceCmd,
     },
+    /// Sync local folders to this machine's Proton Drive device.
+    Sync {
+        #[command(subcommand)]
+        action: SyncCmd,
+    },
     /// Share a file or folder with Proton and/or external email addresses.
     Share {
         /// File/folder path, inside the mountpoint or relative to it.
@@ -252,6 +259,38 @@ enum DeviceCmd {
 }
 
 #[derive(Subcommand)]
+enum SyncCmd {
+    /// Add a local folder to this machine's device and upload its contents.
+    Add {
+        /// Local directory to sync.
+        path: PathBuf,
+    },
+    /// List this machine's synced folders.
+    List,
+    /// Remove a synced folder by id.
+    Rm {
+        /// Synced-folder id (from `sync list`).
+        id: i64,
+        /// Also delete the folder's copy in Proton Drive.
+        #[arg(long)]
+        delete_remote: bool,
+    },
+    /// Force a sync pass now (all folders, or one by id).
+    Now {
+        /// Optional synced-folder id; omit to reconcile every folder.
+        id: Option<i64>,
+    },
+    /// Switch a folder between full-copy sync and on-demand (FUSE, no local storage).
+    Mode {
+        /// Synced-folder id (from `sync list`).
+        id: i64,
+        /// `mirror` (full local copy) or `ondemand` (FUSE mount, reclaims disk).
+        #[arg(value_parser = ["mirror", "ondemand"])]
+        mode: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum PublicLinkCmd {
     /// Create a public link on a node.
     Create {
@@ -338,6 +377,7 @@ fn main() -> Result<()> {
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
         Command::EmptyTrash => cmd_empty_trash(),
         Command::Devices { action } => cmd_devices(action),
+        Command::Sync { action } => cmd_sync(action),
         Command::Share {
             path,
             emails,
@@ -385,6 +425,63 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
             ok_or_bail(control_request(CtlRequest::RenameDevice { uid, name })?)?
         }
         DeviceCmd::Rm { uid } => ok_or_bail(control_request(CtlRequest::DeleteDevice { uid })?)?,
+    }
+    Ok(())
+}
+
+fn cmd_sync(action: SyncCmd) -> Result<()> {
+    match action {
+        SyncCmd::Add { path } => {
+            let abs = std::fs::canonicalize(&path)
+                .with_context(|| format!("resolve {}", path.display()))?;
+            let local_path = abs
+                .to_str()
+                .ok_or_else(|| anyhow!("path is not valid UTF-8"))?
+                .to_string();
+            ok_or_bail(control_request(CtlRequest::AddSyncFolder { local_path })?)?
+        }
+        SyncCmd::List => match control_request(CtlRequest::ListSyncFolders)? {
+            CtlResponse::SyncFolders { items } if items.is_empty() => {
+                println!("No synced folders.")
+            }
+            CtlResponse::SyncFolders { items } => {
+                for f in items {
+                    let sync = if f.last_sync == 0 {
+                        "never".to_string()
+                    } else {
+                        f.last_sync.to_string()
+                    };
+                    println!(
+                        "[{}]  {}  ({}, {}, synced: {sync})",
+                        f.id, f.local_path, f.mode, f.state
+                    );
+                    // A pass in flight says what it is doing, indented under it.
+                    if let Some(p) = &f.progress {
+                        match p.phase {
+                            SyncPhase::Scanning => println!("      scanning…"),
+                            SyncPhase::Applying => println!(
+                                "      {} of {}  {}",
+                                p.done + 1,
+                                p.total.max(p.done + 1),
+                                p.current
+                            ),
+                        }
+                    }
+                }
+            }
+            CtlResponse::Error { message } => bail!("{message}"),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        SyncCmd::Rm { id, delete_remote } => {
+            ok_or_bail(control_request(CtlRequest::RemoveSyncFolder {
+                id,
+                delete_remote,
+            })?)?
+        }
+        SyncCmd::Now { id } => ok_or_bail(control_request(CtlRequest::SyncNow { id })?)?,
+        SyncCmd::Mode { id, mode } => {
+            ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
+        }
     }
     Ok(())
 }
@@ -559,6 +656,8 @@ fn activity_verb(kind: pdfs_core::control::ActivityKind) -> &'static str {
     use pdfs_core::control::ActivityKind::*;
     match kind {
         Upload => "upload",
+        Download => "download",
+        Sync => "sync",
         Rename => "rename",
         Move => "move",
         CreateFolder => "mkdir",
@@ -847,8 +946,25 @@ fn cmd_unpin(path: PathBuf) -> Result<()> {
 fn cmd_transfers() -> Result<()> {
     use pdfs_core::control::TransferDirection;
     match control_request(CtlRequest::GetQueueStatus)? {
-        CtlResponse::Transfers { items } if items.is_empty() => println!("No active transfers."),
-        CtlResponse::Transfers { items } => {
+        CtlResponse::Transfers { items, jobs } if items.is_empty() && jobs.is_empty() => {
+            println!("Nothing in progress.")
+        }
+        CtlResponse::Transfers { items, jobs } => {
+            // Jobs first: they are the context for the transfers under them ("of
+            // 40 files", "still scanning") rather than a separate list.
+            for j in jobs {
+                let count = if j.total > 0 {
+                    format!("{} of {}", j.done, j.total)
+                } else {
+                    "—".to_string()
+                };
+                let detail = if j.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", j.detail)
+                };
+                println!("… {:>9}  {}{detail}", count, j.title);
+            }
             for t in items {
                 let arrow = match t.direction {
                     TransferDirection::Download => "↓",
