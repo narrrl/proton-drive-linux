@@ -39,7 +39,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::ReplyXattr;
@@ -49,27 +49,29 @@ use fuser::{
     RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
-use pdfs_core::cache::{BLOCK_SIZE, ContentCache};
+use pdfs_core::cache::{BLOCK_SIZE, ContentCache, StagedWrite};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
-    LocalHit, PhotoItem, PhotoThumb, PublicLinkInfo, Request as CtlRequest,
+    LocalHit, PhotoItem, PhotoThumb, PublicLinkInfo, RefreshScope, Request as CtlRequest,
     Response as CtlResponse, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo,
     SyncPhase, SyncProgress, TransferDirection,
 };
 use pdfs_core::db::{
-    self, Db, StoredDevice, StoredNode, StoredPhoto, StoredSyncFolder, StoredTrash,
+    self, Db, OP_REVISION, PendingOp, StoredDevice, StoredNode, StoredPhoto, StoredSyncFolder,
+    StoredTrash,
 };
 use pdfs_core::localindex;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
     DeviceType, DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, ProtonDriveClient,
-    ProtonPhotosClient, ThumbnailType,
+    ProtonPhotosClient, RevisionReader, ThumbnailType,
 };
 
 mod sync;
 mod transfers;
+use sync::base_name;
 use tracing::{debug, error, info, warn};
 use transfers::{CountingReader, CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
 
@@ -80,6 +82,22 @@ const TTL: Duration = Duration::from_secs(30);
 
 /// How often the background task polls the remote event cursor.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// First and longest delay between probes for the network coming back after an
+/// offline mount (offline.md Phase 1). Doubles from min to max: a laptop shut in
+/// a bag is the common case, so the steady state must be cheap, while a brief
+/// blip should still recover in seconds.
+/// Retry backoff for a queued upload, doubling per attempt between these. The
+/// floor is short because the common failure is a brief network blip; the
+/// ceiling keeps a persistently failing op from spinning.
+const DRAIN_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const DRAIN_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// How long the drain worker sleeps when it has nothing due. It is woken
+/// directly on a new write or a reconnect, so this only bounds how late a
+/// backoff can fire.
+const DRAIN_IDLE_POLL: Duration = Duration::from_secs(30);
+
+const ONLINE_PROBE_MIN: Duration = Duration::from_secs(5);
+const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
 /// How long the persisted photos timeline stays good before a page request
 /// revalidates it. The SDK hands back the whole timeline at once, so it is stored
 /// in the DB and every page is sliced from there; a stale one is still served
@@ -222,6 +240,19 @@ struct WriteHandle {
     base_mtime: i64,
     /// Whether anything diverged from the remote and needs an upload.
     dirty: bool,
+}
+
+/// A released write whose upload has not happened yet (offline.md Phase 3).
+///
+/// The bytes live in the content cache's staging dir and the intent lives in the
+/// `pending_op` table; this pairs them in memory so a read can be served without
+/// a database round trip.
+#[derive(Clone)]
+struct PendingRevision {
+    /// Staged blob holding the written bytes.
+    path: PathBuf,
+    /// Which of those bytes are real, and what base the gaps refer to.
+    meta: StagedWrite,
 }
 
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
@@ -414,6 +445,28 @@ async fn run_uploads(
 }
 
 /// Shared engine behind both the FUSE callbacks and the control socket: the
+/// How many [`RevisionReader`]s stay open at once.
+///
+/// A reader holds its revision's content key and block table — a few KB even for
+/// a large file, so this is bounded for tidiness and staleness rather than
+/// memory. Evicted least-recently-used; a dropped reader costs one re-open
+/// (two API calls and a node-key unlock) the next time that file is read.
+const MAX_OPEN_READERS: usize = 64;
+
+/// An open reader plus the node metadata it was opened against.
+///
+/// The SDK pins a reader to the revision that was active at `open_revision`, so
+/// a reader is only reusable while the node still reports the same
+/// `(mtime, size)` — the same validity pair the content cache uses (a new
+/// revision bumps mtime). On a mismatch the reader is dropped and reopened.
+struct CachedReader {
+    reader: Arc<RevisionReader>,
+    mtime: i64,
+    size: u64,
+    /// For LRU eviction.
+    last_used: Instant,
+}
+
 /// Drive client, a Tokio handle to bridge the synchronous FUSE/socket threads
 /// to the async SDK, the inode bookkeeping, and the on-disk content cache.
 ///
@@ -425,10 +478,31 @@ struct Core {
     rt: tokio::runtime::Handle,
     state: Arc<Mutex<State>>,
     cache: Arc<ContentCache>,
+    /// Open [`RevisionReader`]s keyed by node, so the block fetches of a file
+    /// resolve its keys and block table once instead of once per block.
+    /// Validated by `(mtime, size)` exactly like the content cache, and bounded
+    /// by [`MAX_OPEN_READERS`].
+    readers: Arc<Mutex<HashMap<NodeUid, CachedReader>>>,
     /// Unified SQLite metadata cache: the persistence layer behind the in-memory
     /// `State` maps. Every mutation writes through here, and the maps rehydrate
     /// from it on mount (plan.md P1).
     db: Arc<Db>,
+    /// False while the API is unreachable and we are serving the cached tree
+    /// (offline.md Phase 1). Set by the probe thread; read by front-ends through
+    /// `Response::Status` so the UI can say so rather than leaving the user to
+    /// infer it from a wall of EIO.
+    online: Arc<AtomicBool>,
+    /// Writes accepted from the kernel but not yet uploaded, keyed by node
+    /// (offline.md Phase 3). The in-memory face of the `pending_op` table, from
+    /// which it is rebuilt on mount.
+    ///
+    /// Two things read it: [`Core::read_range`], because until the op drains the
+    /// staged blob *is* the file's content and the remote still holds the old
+    /// revision; and the drain worker, which performs the uploads.
+    pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
+    /// Nudges the drain worker: set true and notify to have it re-examine the
+    /// queue instead of waiting out its backoff.
+    drain_wake: Arc<(Mutex<bool>, Condvar)>,
     /// True while a background refresh of the photos timeline (resp. the trash) is
     /// already running, so a burst of page requests against a stale listing kicks
     /// off one refresh rather than one per request.
@@ -464,6 +538,17 @@ struct Core {
     /// uploading that same tree — the engine would upload files as they vanish
     /// and then walk the FUSE mount as if it were local.
     sync_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+}
+
+/// Why [`Core::apply_sync_folder_mode`] did not switch a folder. The two cases are
+/// answered very differently: `NotNow` is the normal state of a folder that is busy
+/// or has local changes still to push, and the caller queues the request; `Failed`
+/// is a real fault the user has to hear about.
+enum SwitchBlocked {
+    /// The folder is mid-pass, or not yet safe to switch. Try again after a pass.
+    NotNow,
+    /// The switch was attempted and broke.
+    Failed(String),
 }
 
 impl Core {
@@ -535,6 +620,86 @@ impl Core {
             st.children.insert(dir_ino, kids);
         }
         info!(nodes = st.entries.len(), "hydrated metadata cache from db");
+    }
+
+    /// Rebuild the in-memory pending map from the `pending_op` table on mount
+    /// (offline.md Phase 3).
+    ///
+    /// A queued write survives a restart — that is the point of persisting it —
+    /// so until the drain worker gets to it, reads of that file must still come
+    /// from its staged blob rather than the remote's older revision.
+    ///
+    /// A row whose blob has gone missing is dropped: there is nothing left to
+    /// upload, and keeping it would fail forever.
+    fn hydrate_pending(&self) {
+        let ops = match self.db.pending_ops() {
+            Ok(ops) => ops,
+            Err(e) => {
+                error!(error = %e, "loading pending uploads failed");
+                return;
+            }
+        };
+        let mut map = self.pending.lock().unwrap();
+        for op in ops {
+            let parsed = op
+                .meta_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<StagedWrite>(j).ok())
+                .zip(op.blob_path.as_deref().map(PathBuf::from))
+                .zip(parse_node_uid(&op.uid));
+            let Some(((meta, path), uid)) = parsed else {
+                error!(uid = %op.uid, id = op.id, "pending op is unreadable; dropping");
+                let _ = self.db.delete_op(op.id);
+                continue;
+            };
+            if !path.exists() {
+                error!(%uid, path = %path.display(), "staged blob is gone; dropping pending op");
+                let _ = self.db.delete_op(op.id);
+                continue;
+            }
+            map.insert(uid, PendingRevision { path, meta });
+        }
+        if !map.is_empty() {
+            info!(count = map.len(), "restored pending uploads");
+        }
+    }
+
+    /// Poll for the API becoming reachable again after an offline mount, then
+    /// flip `online` and refresh the root (offline.md Phase 1). Runs on its own
+    /// thread and returns once we are back online: nothing sets `online` false
+    /// again, because a mount that has been online once keeps its live event
+    /// sync, which does its own retrying.
+    ///
+    /// Backs off to [`ONLINE_PROBE_MAX`] rather than hammering a fixed interval —
+    /// a laptop can sit offline for days, and each probe is a real API round trip.
+    fn run_online_probe(&self) {
+        let mut delay = ONLINE_PROBE_MIN;
+        loop {
+            std::thread::sleep(delay);
+            match self.rt.block_on(self.client.get_my_files_folder()) {
+                Ok(root) => {
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        if let Some(e) = st.entries.get_mut(&ROOT_INO) {
+                            e.node = root.clone();
+                        }
+                    }
+                    if let Err(e) = self.db.upsert_node(&root) {
+                        warn!(error = %e, "refresh root after reconnect failed");
+                    }
+                    self.online.store(true, Ordering::Relaxed);
+                    // Anything written while offline is queued and waiting on
+                    // exactly this.
+                    self.wake_drain();
+                    info!("back online");
+                    return;
+                }
+                Err(e) => {
+                    debug!(error = %e, ?delay, "online probe failed; still offline");
+                    delay = (delay * 2).min(ONLINE_PROBE_MAX);
+                }
+            }
+        }
     }
 
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
@@ -669,12 +834,167 @@ impl Core {
         nodes.into_iter().next().ok_or(Errno::ENOENT)
     }
 
+    /// An open [`RevisionReader`] for `uid`, reusing the cached one when it is
+    /// still valid for `(mtime, fsize)` and opening a fresh one otherwise.
+    ///
+    /// Opening resolves the file's link details, ancestor keys, node key (an S2K
+    /// unlock) and block table. Doing that once per file rather than once per
+    /// block is the whole point: a cold 100 MB read is 25 block misses, which
+    /// used to mean 25 full resolutions (50 API calls, 25 unlocks) and now means
+    /// one.
+    ///
+    /// Two threads racing on the same cold file may both open a reader; the
+    /// loser's is dropped. That costs one redundant open and is cheaper than
+    /// holding a lock across the network call.
+    async fn revision_reader(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+    ) -> Result<Arc<RevisionReader>, Errno> {
+        // Fast path: a valid reader is already open. The guard is dropped before
+        // any await — network I/O must never run under it.
+        if let Some(hit) = {
+            let mut readers = self.readers.lock().unwrap();
+            match readers.get_mut(uid) {
+                Some(entry) if entry.mtime == mtime && entry.size == fsize => {
+                    entry.last_used = Instant::now();
+                    Some(entry.reader.clone())
+                }
+                _ => None,
+            }
+        } {
+            return Ok(hit);
+        }
+
+        let reader = Arc::new(self.client.open_revision(uid).await.map_err(|e| {
+            warn!(%uid, error = %e, "open_revision failed");
+            Errno::EIO
+        })?);
+
+        let mut readers = self.readers.lock().unwrap();
+        // Someone may have opened one while we were on the network; either is
+        // equally fresh, so prefer theirs and let ours drop.
+        if let Some(entry) = readers.get_mut(uid)
+            && entry.mtime == mtime
+            && entry.size == fsize
+        {
+            entry.last_used = Instant::now();
+            return Ok(entry.reader.clone());
+        }
+
+        readers.insert(
+            uid.clone(),
+            CachedReader {
+                reader: reader.clone(),
+                mtime,
+                size: fsize,
+                last_used: Instant::now(),
+            },
+        );
+
+        // Bound the map: drop the least recently used until we are back at cap.
+        while readers.len() > MAX_OPEN_READERS {
+            let Some(victim) = readers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(uid, _)| uid.clone())
+            else {
+                break;
+            };
+            readers.remove(&victim);
+        }
+
+        Ok(reader)
+    }
+
+    /// Drop any open reader for `uid`, so the next read reopens against the
+    /// current revision. Called wherever cached content is evicted.
+    fn evict_reader(&self, uid: &NodeUid) {
+        self.readers.lock().unwrap().remove(uid);
+    }
+
     /// Serve bytes `[offset, offset + len)` of `uid`'s active revision, hitting
     /// the on-disk caches before the network: a whole-file blob (pinned files)
     /// first, then the block cache — fetching only the [`BLOCK_SIZE`]-aligned
     /// blocks that overlap the request and caching each. `mtime`/`fsize` validate
     /// both caches. Network I/O runs without any lock held.
     fn read_range(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, Errno> {
+        // A queued write has not reached the remote yet, so the remote's current
+        // revision is stale and the staged blob is the truth. Serve from it until
+        // the drain worker lands the upload (offline.md Phase 3).
+        if let Some(pending) = self.pending.lock().unwrap().get(uid).cloned() {
+            return self.read_pending(&pending, offset, len);
+        }
+        self.read_range_remote(uid, mtime, fsize, offset, len)
+    }
+
+    /// Serve a read from a staged blob, falling back to the remote base for any
+    /// range the write did not author (an incomplete [`StagedWrite`] holds zeros
+    /// there, which must never be handed out as content).
+    fn read_pending(
+        &self,
+        pending: &PendingRevision,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, Errno> {
+        let m = &pending.meta;
+        if offset >= m.len || len == 0 {
+            return Ok(Vec::new());
+        }
+        let uid = parse_node_uid(&m.uid).ok_or(Errno::EIO)?;
+        let file = File::open(&pending.path).map_err(|e| {
+            error!(%uid, path = %pending.path.display(), error = %e, "open staged blob failed");
+            Errno::EIO
+        })?;
+        let mut written = Intervals::default();
+        for &(s, e) in &m.authored {
+            written.add(s, e);
+        }
+        // Same merge as `serve_open_read`, but resolving gaps against the remote
+        // rather than through `read_range` — going through `read_range` would find
+        // this very pending op and recurse.
+        let end = offset.saturating_add(len).min(m.len);
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        for (s, e, authored) in written.segments(offset, end) {
+            if authored {
+                let mut buf = vec![0u8; (e - s) as usize];
+                file.read_exact_at(&mut buf, s).map_err(|err| {
+                    warn!(%uid, error = %err, "staged blob read failed");
+                    Errno::EIO
+                })?;
+                out.extend_from_slice(&buf);
+                continue;
+            }
+            let bend = e.min(m.base_size);
+            if s < bend {
+                out.extend_from_slice(&self.read_range_remote(
+                    &uid,
+                    m.base_mtime,
+                    m.base_size,
+                    s,
+                    bend - s,
+                )?);
+            }
+            // Past the base: a hole the write extended over.
+            out.resize(out.len() + e.saturating_sub(s.max(m.base_size)) as usize, 0);
+        }
+        Ok(out)
+    }
+
+    /// Read from the content cache, else the remote. The base-content path, with
+    /// no awareness of queued writes — callers wanting the file's *current*
+    /// content want [`Core::read_range`]. Gap-filling a staged blob is the one
+    /// caller that genuinely means "the base", since that is what its zeroed
+    /// ranges have to be filled from.
+    fn read_range_remote(
         &self,
         uid: &NodeUid,
         mtime: i64,
@@ -713,19 +1033,24 @@ impl Core {
 
         if !misses.is_empty() {
             let fetched = self.rt.block_on(async {
+                // Resolve the file's keys and block table once, then read every
+                // missing block through the shared reader. Previously each block
+                // called `download_range`, which redid that resolution per block.
+                let reader = self.revision_reader(uid, mtime, fsize).await?;
+
                 let mut set = tokio::task::JoinSet::new();
                 for &bidx in &misses {
-                    let client = self.client.clone();
+                    let reader = reader.clone();
                     let uid = uid.clone();
                     let bstart = bidx * BLOCK_SIZE;
                     let blen = BLOCK_SIZE.min(fsize - bstart);
                     set.spawn(async move {
-                        client
-                            .download_range(&uid, bstart, blen)
+                        reader
+                            .read_at(bstart, blen)
                             .await
                             .map(|bytes| (bidx, bytes))
                             .map_err(|e| {
-                                warn!(%uid, bstart, blen, error = %e, "download_range failed");
+                                warn!(%uid, bstart, blen, error = %e, "block read failed");
                                 Errno::EIO
                             })
                     });
@@ -804,32 +1129,23 @@ impl Core {
         Ok(out)
     }
 
-    /// Upload a write handle's scratch file as a new revision if it is dirty.
-    /// Untouched bytes within the base are filled from the remote first (reusing
-    /// the block cache), so a partial overwrite never had to pre-download the
-    /// whole file. On success the handle's base is advanced to the just-sealed
-    /// revision and `written` cleared, so later reads of untouched regions see
-    /// the new content. No-op for a clean (or unknown) handle. Network I/O runs
-    /// without the lock held.
-    fn commit(&self, fh: u64) -> Result<(), Errno> {
-        let (uid, file, path, len, base_mtime, base_size, written, ino) = {
-            let st = self.state.lock().unwrap();
-            match st.handles.get(&fh) {
-                Some(h) if h.dirty => (
-                    h.uid.clone(),
-                    h.file.clone(),
-                    h.path.clone(),
-                    h.len,
-                    h.base_mtime,
-                    h.base_size,
-                    h.written.clone(),
-                    h.ino,
-                ),
-                _ => return Ok(()),
-            }
-        };
-        // Materialize the full new content in the scratch file: ensure its length,
-        // then fill every untouched range that overlaps the base with base bytes.
+    /// Fill every unauthored range of a scratch/staged file that overlaps its
+    /// base with the base's bytes, so the file becomes the complete new content.
+    ///
+    /// This is the step a partial overwrite cannot skip: only the authored bytes
+    /// were ever written to disk, and a revision upload sends the whole file.
+    /// The gaps come from the *remote base* (through the block cache, so a small
+    /// edit of a large file does not pull all of it), which is exactly why this
+    /// can fail with no network — see `StagedWrite`.
+    fn fill_gaps(
+        &self,
+        uid: &NodeUid,
+        file: &File,
+        len: u64,
+        base_mtime: i64,
+        base_size: u64,
+        written: &Intervals,
+    ) -> Result<(), Errno> {
         file.set_len(len).map_err(|e| {
             error!(%uid, error = %e, "resize scratch file failed");
             Errno::EIO
@@ -842,64 +1158,280 @@ impl Core {
             if s >= bend {
                 continue; // wholly past the base: already zero-filled on disk
             }
-            let bytes = self.read_range(&uid, base_mtime, base_size, s, bend - s)?;
+            let bytes = self.read_range_remote(uid, base_mtime, base_size, s, bend - s)?;
             file.write_all_at(&bytes, s).map_err(|err| {
                 error!(%uid, error = %err, "scratch gap-fill write failed");
                 Errno::EIO
             })?;
         }
-        // Stream the scratch file up as one revision (fresh handle reads from 0).
-        let reader = File::open(&path).map_err(|e| {
-            error!(%uid, error = %e, "reopen scratch file failed");
+        Ok(())
+    }
+
+    /// Accept a released write handle's bytes and queue their upload
+    /// (offline.md Phase 3).
+    ///
+    /// This is what makes a copy into the mount run at disk speed: the caller's
+    /// `close` returns once the bytes are staged on local disk and the intent is
+    /// in `pending_op`, instead of waiting out a full upload inside the FUSE
+    /// handler. It is also what makes an offline write succeed rather than EIO —
+    /// the queued op simply waits for the network.
+    ///
+    /// The scratch file is *moved* into staging, never copied: it is the only
+    /// copy of what the user wrote.
+    fn queue_revision(&self, h: &WriteHandle) -> Result<(), Errno> {
+        if !h.dirty {
+            let _ = std::fs::remove_file(&h.path);
+            return Ok(());
+        }
+        // Materialize the full content now if we can. A complete blob is
+        // uploadable without the network and, crucially, lets a later write to
+        // the same file supersede this one safely.
+        let filled = self
+            .fill_gaps(
+                &h.uid,
+                &h.file,
+                h.len,
+                h.base_mtime,
+                h.base_size,
+                &h.written,
+            )
+            .is_ok();
+        let authored: Vec<(u64, u64)> = if filled {
+            vec![(0, h.len)]
+        } else {
+            h.written
+                .segments(0, h.len)
+                .into_iter()
+                .filter(|&(_, _, authored)| authored)
+                .map(|(s, e, _)| (s, e))
+                .collect()
+        };
+        let meta = StagedWrite {
+            uid: h.uid.to_string(),
+            len: h.len,
+            base_size: h.base_size,
+            base_mtime: h.base_mtime,
+            complete: authored == [(0, h.len)],
+            authored,
+        };
+        // An incomplete blob's gaps refer to the *remote* base. If an earlier
+        // write to this file is still queued, the remote no longer holds that
+        // base — the previous staged blob does — so superseding it would fill
+        // those gaps from the wrong revision. Rather than corrupt the file,
+        // refuse the write and keep the bytes recoverable (Phase 2 behaviour).
+        // Only reachable offline, editing in place a file whose previous edit
+        // has not drained and whose base is not cached.
+        if !meta.complete && self.pending.lock().unwrap().contains_key(&h.uid) {
+            self.stage_orphaned_write(h, &meta);
+            return Err(Errno::EIO);
+        }
+        let path = self.cache.stage_write(&meta, &h.path).map_err(|e| {
+            error!(uid = %h.uid, error = %e, "staging write failed");
             Errno::EIO
         })?;
-        let name = {
-            let st = self.state.lock().unwrap();
-            st.entries
-                .get(&ino)
-                .map(|e| e.node.name.clone())
-                .unwrap_or_default()
+        let op = PendingOp {
+            id: 0,
+            kind: OP_REVISION.to_string(),
+            uid: h.uid.to_string(),
+            blob_path: Some(path.to_string_lossy().into_owned()),
+            meta_json: Some(serde_json::to_string(&meta).unwrap_or_default()),
+            created_at: now_millis(),
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
         };
-        let guard = self
-            .transfers
-            .begin(name, uid.to_string(), TransferDirection::Upload, len);
-        let reader = CountingReader::new(reader, &guard);
-        self.rt
-            .block_on(self.client.upload_new_revision_from(
-                &uid,
-                reader,
-                len as i64,
-                Vec::new(),
-                None,
-            ))
-            .map_err(|e| {
-                error!(%uid, error = %e, "upload new revision failed");
-                Errno::EIO
-            })?;
-        drop(guard);
+        let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
+            error!(uid = %h.uid, error = %e, "queueing upload failed");
+            Errno::EIO
+        })?;
+        if let Some(old) = superseded {
+            self.cache.discard_staged(Path::new(&old));
+        }
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(h.uid.clone(), PendingRevision { path, meta });
+        // Reflect the write in the tree straight away: `ls` must show the new
+        // size and mtime even though the remote still holds the old revision.
         let now = now_secs();
         {
             let mut st = self.state.lock().unwrap();
-            if let Some(h) = st.handles.get_mut(&fh) {
-                h.dirty = false;
-                // The scratch file now equals the sealed revision; treat it all as
-                // base so further reads of untouched bytes hit the new content.
-                h.written = Intervals::default();
-                h.base_mtime = now;
-                h.base_size = len;
-            }
-            st.set_size(ino, len);
-            st.touch_mtime(ino, now);
+            st.set_size(h.ino, h.len);
+            st.touch_mtime(h.ino, now);
         }
-        // The sealed content differs from any cached blob/blocks; refresh a pinned
-        // file's whole-file blob, otherwise evict so reads re-fetch fresh.
-        if self.cache.is_pinned(&uid) {
-            if let Ok(bytes) = std::fs::read(&path) {
-                let _ = self.cache.store(&uid, now, len, &bytes);
+        // Cached blobs and open readers describe the superseded revision. Reads
+        // come from the staged blob until the op drains, so just drop them.
+        self.cache.evict(&h.uid);
+        self.evict_reader(&h.uid);
+        self.wake_drain();
+        debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
+        Ok(())
+    }
+
+    /// Nudge the drain worker to re-examine the queue now.
+    fn wake_drain(&self) {
+        let (lock, cv) = &*self.drain_wake;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    /// Keep a write we cannot safely queue, so the bytes are recoverable even
+    /// though the caller is getting an error. See [`Core::queue_revision`].
+    fn stage_orphaned_write(&self, h: &WriteHandle, meta: &StagedWrite) {
+        match self.cache.stage_write(meta, &h.path) {
+            Ok(staged) => {
+                error!(
+                    uid = %h.uid,
+                    staged = %staged.display(),
+                    "cannot queue write over an undrained edit; bytes kept in staging"
+                );
+                let name = {
+                    let st = self.state.lock().unwrap();
+                    st.entries
+                        .get(&h.ino)
+                        .map(|e| e.node.name.clone())
+                        .unwrap_or_default()
+                };
+                self.log_activity(
+                    ActivityKind::Upload,
+                    &name,
+                    format!("write not queued; changes kept at {}", staged.display()),
+                    false,
+                );
             }
-        } else {
-            self.cache.evict(&uid);
+            Err(e) => {
+                error!(uid = %h.uid, error = %e, "staging write failed; bytes lost");
+                let _ = std::fs::remove_file(&h.path);
+            }
         }
+    }
+
+    /// Drain the pending-op queue: the background half of every write
+    /// (offline.md Phase 3).
+    ///
+    /// Runs for the life of the mount. Ops are replayed oldest-first, each
+    /// retried with doubling backoff and *never* dropped on failure — the staged
+    /// blob is the only copy of the user's bytes, so a failed op stays queued
+    /// until it lands or the user deletes the file.
+    fn run_pending_drain(&self) {
+        loop {
+            let now = now_millis();
+            let due = self
+                .db
+                .pending_ops()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|op| op.next_attempt_at <= now);
+
+            let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
+                self.wait_for_drain_work();
+                continue;
+            };
+            if let Err(e) = self.drain_op(&op) {
+                // Backoff is per-op, so one wedged file cannot starve the rest:
+                // the next pass picks whichever op is due.
+                let attempts = op.attempts + 1;
+                let backoff = DRAIN_BACKOFF_MIN
+                    .saturating_mul(1u32 << attempts.min(6))
+                    .min(DRAIN_BACKOFF_MAX);
+                warn!(uid = %op.uid, attempts, error = %e, "pending upload failed; will retry");
+                let _ = self.db.record_op_failure(
+                    op.id,
+                    &e.to_string(),
+                    now_millis() + backoff.as_millis() as i64,
+                );
+                self.wait_for_drain_work();
+            }
+        }
+    }
+
+    /// Block until there is plausibly something to do: a new op, a reconnect, or
+    /// the shortest outstanding backoff elapsing.
+    fn wait_for_drain_work(&self) {
+        let (lock, cv) = &*self.drain_wake;
+        let mut woken = lock.lock().unwrap();
+        if !*woken {
+            let (guard, _) = cv.wait_timeout(woken, DRAIN_IDLE_POLL).unwrap();
+            woken = guard;
+        }
+        *woken = false;
+    }
+
+    /// Perform one queued op and retire it.
+    fn drain_op(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        if op.kind != OP_REVISION {
+            return Err(format!("unknown pending op kind {:?}", op.kind).into());
+        }
+        let blob = op
+            .blob_path
+            .clone()
+            .ok_or("pending op has no staged blob")?;
+        let blob = PathBuf::from(blob);
+        let meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
+        let uid = parse_node_uid(&meta.uid).ok_or("staged write has an unparseable uid")?;
+
+        // An incomplete blob is authored bytes over zeros; the untouched ranges
+        // have to be filled from the base before it can be sent. This is the case
+        // the write could not resolve at release time (it was offline), and the
+        // reason it is safe to do now is that we are not.
+        if !meta.complete {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&blob)?;
+            let mut written = Intervals::default();
+            for &(s, e) in &meta.authored {
+                written.add(s, e);
+            }
+            self.fill_gaps(
+                &uid,
+                &file,
+                meta.len,
+                meta.base_mtime,
+                meta.base_size,
+                &written,
+            )
+            .map_err(|e| format!("gap-fill from base failed: {e:?}"))?;
+        }
+
+        let name = {
+            let st = self.state.lock().unwrap();
+            st.by_uid
+                .get(&uid)
+                .and_then(|ino| st.entries.get(ino))
+                .map(|e| e.node.name.clone())
+                .unwrap_or_else(|| meta.uid.clone())
+        };
+        let guard =
+            self.transfers
+                .begin(&name, meta.uid.clone(), TransferDirection::Upload, meta.len);
+        let reader = CountingReader::new(File::open(&blob)?, &guard);
+        self.rt.block_on(self.client.upload_new_revision_from(
+            &uid,
+            reader,
+            meta.len as i64,
+            Vec::new(),
+            None,
+        ))?;
+        drop(guard);
+
+        // Retire the op before dropping the blob: a crash between the two leaves
+        // an orphaned file (harmless), whereas the reverse would leave a queued
+        // op pointing at nothing.
+        self.db.delete_op(op.id)?;
+        self.pending.lock().unwrap().remove(&uid);
+
+        // The staged blob now matches the sealed revision, so a pinned file keeps
+        // it as its cached content rather than re-downloading what we just sent.
+        if self.cache.is_pinned(&uid)
+            && let Ok(bytes) = std::fs::read(&blob)
+        {
+            let _ = self.cache.store(&uid, now_secs(), meta.len, &bytes);
+        }
+        self.cache.discard_staged(&blob);
+        self.evict_reader(&uid);
+        self.log_activity(ActivityKind::Upload, &name, "uploaded", true);
+        info!(%uid, len = meta.len, "pending upload landed");
         Ok(())
     }
 
@@ -1081,6 +1613,7 @@ impl Core {
             for s in uids {
                 if let Some(u) = parse_uid(&s) {
                     self.cache.evict(&u);
+                    self.evict_reader(&u);
                 }
             }
         }
@@ -1617,6 +2150,7 @@ impl Core {
             .map(|(_, n)| n)
             .unwrap_or_default();
         self.cache.evict(&uid);
+        self.evict_reader(&uid);
         self.invalidate_parent_listing(rel);
         self.invalidate_trash();
         Ok(name)
@@ -1713,6 +2247,31 @@ impl Core {
         let _ = self.db.clear_state(TRASH_SYNCED_MS);
     }
 
+    /// Drop the persisted photos timeline's freshness stamp, so the next timeline
+    /// read fetches rather than serving what it already has.
+    fn invalidate_photos(&self) {
+        let _ = self.db.clear_state(PHOTOS_SYNCED_MS);
+    }
+
+    /// Drop one folder's cached child listing (`rel` is mountpoint-relative), so
+    /// the next `ListDir`/`readdir` re-enumerates it from the server. Backs
+    /// [`CtlRequest::Refresh`] with a [`RefreshScope::Dir`] scope.
+    fn refresh_dir(&self, rel: &Path) -> Result<(), String> {
+        let (ino, uid) = self
+            .resolve_path(rel)
+            .map_err(|e| format!("resolve path: {e:?}"))?;
+        // Clear the DB flag directly rather than through
+        // `State::invalidate_listing`, which no-ops when the folder has no
+        // in-memory listing to drop — exactly the case for a folder hydrated
+        // from the DB but not read yet this run, which is precisely the stale
+        // listing worth refreshing.
+        self.db
+            .set_listed(&uid, false)
+            .map_err(|e| format!("db: {e:?}"))?;
+        self.state.lock().unwrap().children.remove(&ino);
+        Ok(())
+    }
+
     /// Parse wire uids (`volume~link`) into [`NodeUid`]s, rejecting the whole
     /// batch if any is malformed — a partial trash mutation is worse than none.
     fn parse_uids(uids: &[String]) -> Result<Vec<NodeUid>, String> {
@@ -1790,6 +2349,7 @@ impl Core {
         drop(st);
         for uid in uids {
             self.cache.evict(uid);
+            self.evict_reader(uid);
         }
     }
 
@@ -2068,19 +2628,28 @@ impl Core {
 
     // ---- devices ----------------------------------------------------------
 
-    /// List the account's registered devices.
+    /// List the account's registered devices, flagging the one *this* machine
+    /// syncs to so a front-end can treat it as more than another computer in the
+    /// list — deleting it takes this machine's synced folders down with it.
     fn list_devices(&self) -> Result<Vec<DeviceInfo>, String> {
         let devices = self
             .rt
             .block_on(self.client.enumerate_devices())
             .map_err(|e| format!("list devices: {e}"))?;
+        // No cached device row yet means this machine syncs nothing, so none of
+        // the listed devices is ours.
+        let this_uid = self.db.device_get().ok().flatten().map(|d| d.uid);
         Ok(devices
             .into_iter()
-            .map(|d| DeviceInfo {
-                uid: d.uid.to_string(),
-                name: d.name.unwrap_or_else(|_| "(unnamed device)".to_string()),
-                device_type: device_type_str(d.device_type).to_string(),
-                last_sync: d.last_sync_time,
+            .map(|d| {
+                let uid = d.uid.to_string();
+                DeviceInfo {
+                    this_device: this_uid.as_deref() == Some(uid.as_str()),
+                    uid,
+                    name: d.name.unwrap_or_else(|_| "(unnamed device)".to_string()),
+                    device_type: device_type_str(d.device_type).to_string(),
+                    last_sync: d.last_sync_time,
+                }
             })
             .collect())
     }
@@ -2316,13 +2885,19 @@ impl Core {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "folder".to_string());
             jobs.push(match p.phase {
-                // No counts exist until the walk has classified something, so a
-                // scan reports indeterminate rather than a fake 0 of 0.
+                // The scan's total is the last pass's baseline, so a folder that
+                // has never synced still reports indeterminate (`total: 0`) — but
+                // every later pass has a real bar. A grown folder can push `done`
+                // past the estimate; clamp so the row never reads "600 of 500".
                 SyncPhase::Scanning => JobItem {
                     title: format!("Checking {folder}"),
                     detail: "Looking for changes".to_string(),
-                    done: 0,
-                    total: 0,
+                    done: p.done as u64,
+                    total: if p.total == 0 {
+                        0
+                    } else {
+                        p.total.max(p.done) as u64
+                    },
                 },
                 SyncPhase::Applying => JobItem {
                     title: format!("Syncing {folder}"),
@@ -2353,6 +2928,18 @@ impl Core {
             .sync_folder_get(id)
             .map_err(|e| format!("db: {e:?}"))?
             .ok_or_else(|| format!("no synced folder with id {id}"))?;
+        // An `ondemand` folder *is* a FUSE mount over its local path, so dropping
+        // only the row would strand the mount: the path would keep serving a
+        // folder the daemon no longer tracks, and nothing would ever unmount it.
+        // Tear it down first — including before trashing the remote tree it
+        // serves, which would otherwise leave it answering for deleted nodes.
+        if let Some(session) = self.mounts.lock().unwrap().remove(&id) {
+            if let Err(e) = session.umount_and_join() {
+                warn!(id, error = %e, "unmount on-demand folder failed");
+            } else {
+                info!(id, path = %folder.local_path, "unmounted on-demand folder");
+            }
+        }
         if delete_remote
             && let Some(uid) = parse_uid(&folder.remote_uid)
             && let Err(e) = self.rt.block_on(self.client.trash_nodes(&[uid]))
@@ -2398,19 +2985,116 @@ impl Core {
         fork
     }
 
+    /// Ask for a synced folder to move to `mode`, applying it now if the folder is
+    /// free and safe to switch, and **queueing** it otherwise. Returns the human
+    /// message for the reply.
+    ///
+    /// Queueing rather than rejecting is what makes the toggle usable: a folder
+    /// that syncs continuously (a busy Downloads folder) is almost never caught in
+    /// the narrow window where it is both unlocked and `idle`, so a `try_lock`
+    /// rejection asks the user to keep retrying until they get lucky. Instead the
+    /// intent is recorded and the engine applies it at the end of the pass already
+    /// running — which, seeing a queued `ondemand`, also stops pulling down files
+    /// it is about to evict ([`Core::push_pass`]).
+    pub(crate) fn request_sync_folder_mode(&self, id: i64, mode: &str) -> Result<String, String> {
+        if mode != "mirror" && mode != "ondemand" {
+            return Err(format!("unknown mode {mode:?} (want mirror|ondemand)"));
+        }
+        let folder = self
+            .db
+            .sync_folder_get(id)
+            .map_err(|e| format!("db: {e:?}"))?
+            .ok_or_else(|| format!("no synced folder with id {id}"))?;
+        if folder.mode == mode {
+            // Already there. A queued switch the other way is the user changing
+            // their mind back before it landed, so withdraw it.
+            if folder.pending_mode.is_some() {
+                self.db
+                    .sync_folder_set_pending_mode(id, None)
+                    .map_err(|e| format!("db: {e:?}"))?;
+                let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+                return Ok(format!("staying {mode}"));
+            }
+            return Ok(format!("already {mode}"));
+        }
+
+        match self.apply_sync_folder_mode(id, mode) {
+            Ok(message) => Ok(message),
+            // Not switchable this instant — remember the intent instead of making
+            // the user retry, and kick a pass to clear whatever is in the way.
+            Err(SwitchBlocked::NotNow) => {
+                self.db
+                    .sync_folder_set_pending_mode(id, Some(mode))
+                    .map_err(|e| format!("db: {e:?}"))?;
+                let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+                Ok(match mode {
+                    "ondemand" => format!(
+                        "{} will go on-demand once its local changes are uploaded",
+                        base_name(&folder.local_path)
+                    ),
+                    _ => format!(
+                        "{} will start mirroring once the current sync finishes",
+                        base_name(&folder.local_path)
+                    ),
+                })
+            }
+            Err(SwitchBlocked::Failed(e)) => Err(e),
+        }
+    }
+
+    /// Apply a queued mode switch if the folder has one and is now able to take it.
+    /// Called by the sync engine after every pass, so a switch the user asked for
+    /// mid-sync lands as soon as the pass that blocked it is done. A folder that is
+    /// still not ready (its push failed, so the local copy is not safe to evict)
+    /// keeps its `pending_mode` and is retried after the next pass.
+    pub(crate) fn settle_pending_mode(&self, id: i64) {
+        let Ok(Some(folder)) = self.db.sync_folder_get(id) else {
+            return;
+        };
+        let Some(mode) = folder.pending_mode.as_deref() else {
+            return;
+        };
+        if folder.mode == mode {
+            let _ = self.db.sync_folder_set_pending_mode(id, None);
+            return;
+        }
+        match self.apply_sync_folder_mode(id, mode) {
+            Ok(message) => {
+                info!(id, mode, "applied queued mode switch");
+                self.log_activity(ActivityKind::Sync, &message, "", true);
+            }
+            // Still blocked: the pass could not get everything up, so the local copy
+            // is not safe to evict yet. Leave the request standing — the next pass
+            // (poll, or the retry the engine schedules) tries again.
+            Err(SwitchBlocked::NotNow) => {
+                info!(id, mode, "queued mode switch still waiting");
+            }
+            Err(SwitchBlocked::Failed(e)) => {
+                warn!(id, mode, error = %e, "queued mode switch failed; withdrawing");
+                let _ = self.db.sync_folder_set_pending_mode(id, None);
+                self.log_activity(
+                    ActivityKind::Sync,
+                    format!("couldn't switch {}", base_name(&folder.local_path)),
+                    e,
+                    false,
+                );
+            }
+        }
+    }
+
     /// Flip a synced folder between `mirror` (full local copy + two-way sync) and
     /// `ondemand` (a FUSE mount over the local path; no local storage). Returns a
-    /// human message for the reply.
+    /// human message on success.
     ///
     /// - **mirror→ondemand**: require the folder in-sync (`idle`), stop watching it,
     ///   evict the local files to reclaim disk, then mount a secondary `ProtonFs`
     ///   rooted at the folder's remote node over its local path.
     /// - **ondemand→mirror**: unmount, clear the stale baseline (the local tree was
     ///   evicted), then hand the folder back to the engine, which re-downloads it.
-    fn set_sync_folder_mode(&self, id: i64, mode: &str) -> Result<String, String> {
-        if mode != "mirror" && mode != "ondemand" {
-            return Err(format!("unknown mode {mode:?} (want mirror|ondemand)"));
-        }
+    ///
+    /// [`SwitchBlocked::NotNow`] means "not yet, try after a pass" and is never an
+    /// error the user needs to see — callers queue on it.
+    fn apply_sync_folder_mode(&self, id: i64, mode: &str) -> Result<String, SwitchBlocked> {
         // Hold the folder's lock for the whole switch so no reconcile pass can be
         // running over the tree we are about to evict (or start while we mount over
         // it). A pass in flight holds the lock for its full duration, so `try_lock`
@@ -2419,15 +3103,15 @@ impl Core {
         // inserting the row and the engine picking it up.
         let lock = self.sync_lock(id);
         let Ok(_guard) = lock.try_lock() else {
-            return Err("folder is syncing right now — wait for it to finish".to_string());
+            return Err(SwitchBlocked::NotNow);
         };
         // Re-read under the lock: a pass that finished while we waited may have
         // changed `state`.
         let folder = self
             .db
             .sync_folder_get(id)
-            .map_err(|e| format!("db: {e:?}"))?
-            .ok_or_else(|| format!("no synced folder with id {id}"))?;
+            .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?
+            .ok_or_else(|| SwitchBlocked::Failed(format!("no synced folder with id {id}")))?;
         if folder.mode == mode {
             return Ok(format!("already {mode}"));
         }
@@ -2437,28 +3121,30 @@ impl Core {
             "ondemand" => {
                 // Only flip a folder that is fully in sync — a failed reconcile means
                 // local edits could still be un-uploaded, and we are about to delete
-                // the local copy.
+                // the local copy. Not an error: a pass makes this true, and the queued
+                // request is applied once one does.
                 if folder.state != "idle" {
-                    return Err(format!(
-                        "folder is '{}', not idle — sync it before switching to on-demand",
-                        folder.state
-                    ));
+                    return Err(SwitchBlocked::NotNow);
                 }
-                let root_uid = parse_uid(&folder.remote_uid)
-                    .ok_or_else(|| format!("bad remote uid: {}", folder.remote_uid))?;
+                let root_uid = parse_uid(&folder.remote_uid).ok_or_else(|| {
+                    SwitchBlocked::Failed(format!("bad remote uid: {}", folder.remote_uid))
+                })?;
                 let root = self
                     .rt
                     .block_on(self.client.enumerate_nodes(std::slice::from_ref(&root_uid)))
-                    .map_err(|e| format!("fetch remote root: {e}"))?
+                    .map_err(|e| SwitchBlocked::Failed(format!("fetch remote root: {e}")))?
                     .into_iter()
                     .next()
-                    .ok_or_else(|| "remote folder not found".to_string())?;
+                    .ok_or_else(|| SwitchBlocked::Failed("remote folder not found".to_string()))?;
 
                 // Reclaim the disk: empty the local dir (keep it as the mountpoint).
-                evict_dir_contents(&local)
-                    .map_err(|e| format!("evict {}: {e}", local.display()))?;
+                evict_dir_contents(&local).map_err(|e| {
+                    SwitchBlocked::Failed(format!("evict {}: {e}", local.display()))
+                })?;
 
-                let session = self.spawn_ondemand_mount(&local, root)?;
+                let session = self
+                    .spawn_ondemand_mount(&local, root)
+                    .map_err(SwitchBlocked::Failed)?;
                 self.mounts.lock().unwrap().insert(id, session);
                 // Persist the mode only now that the mount is actually up. Writing it
                 // first would strand the folder on any failure below: the engine skips
@@ -2468,7 +3154,7 @@ impl Core {
                 // re-downloads whatever eviction removed.
                 self.db
                     .sync_folder_set_mode(id, "ondemand")
-                    .map_err(|e| format!("db: {e:?}"))?;
+                    .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
                 let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
                 self.db.sync_folder_set_state(id, "idle", now_secs()).ok();
                 info!(id, path = %local.display(), "mounted sync folder on-demand");
@@ -2485,10 +3171,10 @@ impl Core {
                 // deleted locally"); clear it so the reconcile is a pure download.
                 self.db
                     .sync_entries_clear(id)
-                    .map_err(|e| format!("db: {e:?}"))?;
+                    .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
                 self.db
                     .sync_folder_set_mode(id, "mirror")
-                    .map_err(|e| format!("db: {e:?}"))?;
+                    .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
                 let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
                 let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
                 info!(id, path = %local.display(), "restored sync folder to mirror");
@@ -3060,11 +3746,35 @@ impl Core {
         }
     }
 
+    /// Set the number of items the scan expects to check, from the size of the
+    /// last pass's baseline. Only an estimate — the folder may have grown since —
+    /// but it turns the scan from an indeterminate pulse into a bar that moves,
+    /// which is the difference between "it's stuck" and "it's working" on a folder
+    /// whose walk takes minutes.
+    pub(crate) fn progress_scan_total(&self, folder_id: i64, n: usize) {
+        self.progress_update(folder_id, |p| p.total = n);
+    }
+
+    /// Note that the scan has checked one more item, named `name`.
+    pub(crate) fn progress_scanned(&self, folder_id: i64, name: &str) {
+        self.progress_update(folder_id, |p| {
+            p.done += 1;
+            p.current = name.to_string();
+        });
+    }
+
     /// Note that `n` more items have been queued for this pass, and that it has
-    /// moved on from scanning to applying the diff.
+    /// moved on from scanning to applying the diff. The scan's counts are dropped:
+    /// they measured a different quantity (items checked, not items to apply), so
+    /// carrying them over would start the applying bar at a meaningless fraction.
     pub(crate) fn progress_queued(&self, folder_id: i64, n: usize) {
         self.progress_update(folder_id, |p| {
-            p.phase = SyncPhase::Applying;
+            if p.phase == SyncPhase::Scanning {
+                p.phase = SyncPhase::Applying;
+                p.done = 0;
+                p.total = 0;
+                p.current.clear();
+            }
             p.total += n;
         });
     }
@@ -3218,6 +3928,7 @@ impl ProtonFs {
         }
         self.core.state.lock().unwrap().forget(&uid);
         self.core.cache.evict(&uid);
+        self.core.evict_reader(&uid);
         self.core.invalidate_trash();
         reply.ok();
     }
@@ -3229,6 +3940,23 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Current wall-clock time as epoch milliseconds, the resolution `pending_op`
+/// timestamps and backoff deadlines are kept in.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse a [`NodeUid`] back from its `Display` form (`volume~link`), which is
+/// how one is persisted in `pending_op.uid` and a [`StagedWrite`] sidecar. The
+/// SDK has no `FromStr`, and neither id contains a `~`.
+fn parse_node_uid(s: &str) -> Option<NodeUid> {
+    let (vol, link) = s.split_once('~')?;
+    Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
 }
 
 /// This machine's hostname, used to name (and later recover) its Proton Drive
@@ -3269,6 +3997,7 @@ fn sync_folder_info(f: StoredSyncFolder, progress: Option<SyncProgress>) -> Sync
         local_path: f.local_path,
         remote_uid: f.remote_uid,
         mode: f.mode,
+        pending_mode: f.pending_mode,
         state: f.state,
         last_sync: f.last_sync,
         progress,
@@ -3853,6 +4582,7 @@ impl Filesystem for ProtonFs {
                 } else {
                     self.core.cache.evict(&uid);
                 }
+                self.core.evict_reader(&uid);
             }
             self.core.state.lock().unwrap().set_size(ino.0, size);
         }
@@ -3866,20 +4596,24 @@ impl Filesystem for ProtonFs {
         }
     }
 
+    /// `close(2)` calls flush before release. The upload is queued in `release`
+    /// and performed in the background (offline.md Phase 3), so there is nothing
+    /// to push here — the written bytes are already in the scratch file.
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        fh: FileHandle,
+        _fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.core.commit(fh.0) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
+        reply.ok();
     }
 
+    /// Durability here means the scratch file, not the remote: a caller asking
+    /// for fsync wants its bytes to survive a crash, and blocking it on an upload
+    /// (which offline would never finish) buys nothing the queue does not already
+    /// guarantee.
     fn fsync(
         &self,
         _req: &Request,
@@ -3888,9 +4622,23 @@ impl Filesystem for ProtonFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.core.commit(fh.0) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        let file = self
+            .core
+            .state
+            .lock()
+            .unwrap()
+            .handles
+            .get(&fh.0)
+            .map(|h| h.file.clone());
+        match file {
+            Some(f) => match f.sync_all() {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    error!(fh = fh.0, error = %e, "fsync of scratch file failed");
+                    reply.error(Errno::EIO);
+                }
+            },
+            None => reply.error(Errno::EBADF),
         }
     }
 
@@ -3904,14 +4652,17 @@ impl Filesystem for ProtonFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let res = self.core.commit(fh.0);
         let handle = self.core.state.lock().unwrap().handles.remove(&fh.0);
-        if let Some(h) = handle {
-            let _ = std::fs::remove_file(&h.path);
-        }
-        match res {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        // Hand the bytes to the queue rather than uploading them here: the
+        // scratch file is the only copy of what was just written, and blocking
+        // the caller on the network is what made a copy into the mount run at
+        // upload speed (and fail outright offline).
+        match handle {
+            Some(h) => match self.core.queue_revision(&h) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            },
+            None => reply.ok(),
         }
     }
 
@@ -4126,6 +4877,7 @@ impl Filesystem for ProtonFs {
 fn apply_event(
     state: &Mutex<State>,
     content: &ContentCache,
+    pending: &Mutex<HashMap<NodeUid, PendingRevision>>,
     notifier: &Notifier,
     event: &DriveEvent,
 ) {
@@ -4152,6 +4904,14 @@ fn apply_event(
                         }
                     }
                 }
+            } else if pending.lock().unwrap().contains_key(node_uid) {
+                // A node we owe an upload for is *ahead* of the remote, not
+                // behind it: this event is almost always the echo of our own
+                // empty-file create, and re-fetching would replace the size and
+                // mtime of the write we just accepted with the stale revision's
+                // — making a file that was copied in seconds ago read as empty
+                // until its upload lands (offline.md Phase 3).
+                debug!(uid = %node_uid, "ignoring remote event for a node with a queued write");
             } else if let Some(&ino) = st.by_uid.get(node_uid) {
                 // Known node changed: drop its cached attrs/data (and listing if
                 // it is a directory) so the next access re-fetches. Its content
@@ -4214,6 +4974,7 @@ async fn run_event_sync(
     state: Arc<Mutex<State>>,
     content: Arc<ContentCache>,
     db: Arc<Db>,
+    pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
     notifier: Notifier,
 ) {
     let mut cursor: Option<DriveEventId> = match db.get_event_cursor() {
@@ -4222,21 +4983,30 @@ async fn run_event_sync(
         // First mount: a `None` cursor yields a single `CursorAdvanced` at the
         // server head; persist it so the next restart resumes instead of
         // reseeding (which would skip everything that changed offline).
-        Ok(None) => match client.enumerate_events(&scope, None).await {
-            Ok(events) => {
-                let head = events.last().map(|e| e.id().clone());
-                if let Some(c) = &head
-                    && let Err(e) = db.set_event_cursor(c.as_str())
-                {
-                    warn!(error = %e, "persist seed cursor failed");
+        // Seeding needs the network, and this task also runs on mounts that
+        // started offline (offline.md Phase 1) — so retry rather than giving up,
+        // which used to disable live sync for the life of the daemon.
+        Ok(None) => {
+            let mut delay = ONLINE_PROBE_MIN;
+            loop {
+                match client.enumerate_events(&scope, None).await {
+                    Ok(events) => {
+                        let head = events.last().map(|e| e.id().clone());
+                        if let Some(c) = &head
+                            && let Err(e) = db.set_event_cursor(c.as_str())
+                        {
+                            warn!(error = %e, "persist seed cursor failed");
+                        }
+                        break head;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, ?delay, "seed event cursor failed; retrying");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(ONLINE_PROBE_MAX);
+                    }
                 }
-                head
             }
-            Err(e) => {
-                error!(error = %e, "failed to seed event cursor; live sync disabled");
-                return;
-            }
-        },
+        }
         Err(e) => {
             error!(error = %e, "read persisted cursor failed; live sync disabled");
             return;
@@ -4258,7 +5028,7 @@ async fn run_event_sync(
         }
         debug!(count = events.len(), "applying remote events");
         for event in &events {
-            apply_event(&state, &content, &notifier, event);
+            apply_event(&state, &content, &pending, &notifier, event);
         }
         cursor = events.last().map(|e| e.id().clone());
         if let Some(c) = &cursor
@@ -4393,6 +5163,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 used: core.cache.usage(),
                 budget: core.cache.budget(),
                 pins,
+                online: core.online.load(Ordering::Relaxed),
+                pending_uploads: core.db.pending_op_count().unwrap_or(0).max(0) as u64,
             }
         }
         Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
@@ -4423,6 +5195,27 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::Error { message: e },
         },
+        Ok(CtlRequest::Refresh { scope }) => {
+            let result = match &scope {
+                RefreshScope::Dir { path } => {
+                    rel_to_mount(mountpoint, path).and_then(|rel| core.refresh_dir(&rel))
+                }
+                RefreshScope::Trash => {
+                    core.invalidate_trash();
+                    Ok(())
+                }
+                RefreshScope::Photos => {
+                    core.invalidate_photos();
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => CtlResponse::Ok {
+                    message: "refreshed".to_string(),
+                },
+                Err(e) => CtlResponse::Error { message: e },
+            }
+        }
         Ok(CtlRequest::PhotosTimeline { offset, limit }) => {
             match core.photos_timeline(offset, limit) {
                 Ok(Some(items)) => CtlResponse::Photos {
@@ -4791,7 +5584,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             }
         }
         Ok(CtlRequest::SetSyncFolderMode { id, mode }) => {
-            match core.set_sync_folder_mode(id, &mode) {
+            match core.request_sync_folder_mode(id, &mode) {
                 Ok(message) => {
                     core.log_activity(ActivityKind::Upload, &message, "", true);
                     CtlResponse::Ok { message }
@@ -5034,11 +5827,54 @@ fn clear_stale_mount(mountpoint: &Path) {
     }
 }
 
+/// `sync_state` key holding the uid of the My Files root, so a later run can
+/// recover it from `nodes` without the API (offline.md Phase 1).
+const ROOT_UID_KEY: &str = "root_uid";
+
+/// The My Files root, and whether we got it from the API (`true`) or from the
+/// cache because the API was unreachable (`false`).
+///
+/// A successful fetch also records the root's uid, which is what makes the
+/// fallback possible on a later run: `nodes` is keyed by uid, so without this we
+/// would have the root's row on disk and no way to tell which one it is.
+///
+/// Failing to fetch is only fatal on a genuinely cold start — no cached root
+/// means an empty tree, and mounting that would show the user an empty Drive
+/// rather than an honest error.
+fn fetch_or_recall_root(
+    client: &ProtonDriveClient,
+    rt: &tokio::runtime::Handle,
+    db: &Db,
+) -> std::io::Result<(Node, bool)> {
+    let err = match rt.block_on(client.get_my_files_folder()) {
+        Ok(root) => {
+            if let Err(e) = db.set_state_str(ROOT_UID_KEY, &root.uid.to_string()) {
+                warn!(error = %e, "persist root uid failed");
+            }
+            return Ok((root, true));
+        }
+        Err(e) => e,
+    };
+    let cached = db
+        .state_str(ROOT_UID_KEY)
+        .ok()
+        .flatten()
+        .and_then(|uid| db.node_by_uid(&uid).ok().flatten());
+    match cached {
+        Some(root) => {
+            warn!(error = %err, "fetch My Files root failed; mounting from cache (offline)");
+            Ok((root, false))
+        }
+        None => Err(std::io::Error::other(format!("fetch My Files root: {err}"))),
+    }
+}
+
 /// Mount the filesystem at `mountpoint` and block until it is unmounted or the
 /// daemon is asked to stop.
 ///
-/// Fetches the My Files root up front (so an auth/network failure surfaces
-/// before the kernel mount), then spawns the Phase 2 event-sync task, the
+/// Resolves the My Files root up front — from the API, or from the cached tree
+/// when the API is unreachable ([`fetch_or_recall_root`]) — then spawns the
+/// Phase 2 event-sync task, the
 /// Phase 4 control socket, and runs the FUSE session on its own thread while
 /// this thread waits for either a stop signal (SIGTERM/SIGINT) or the kernel
 /// mount ending on its own. On a stop signal we lazily unmount ourselves
@@ -5054,9 +5890,7 @@ pub fn mount(
     db: Arc<Db>,
     username: String,
 ) -> std::io::Result<MountOutcome> {
-    let root = rt
-        .block_on(client.get_my_files_folder())
-        .map_err(|e| std::io::Error::other(format!("fetch My Files root: {e}")))?;
+    let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
     let scope = root.tree_event_scope_id();
 
     // The folder-sync engine (devices.md Phase 2) runs on its own thread and is
@@ -5077,7 +5911,11 @@ pub fn mount(
             db: db.clone(),
         })),
         cache: Arc::new(cache),
+        readers: Arc::new(Mutex::new(HashMap::new())),
         db,
+        online: Arc::new(AtomicBool::new(online)),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
@@ -5089,9 +5927,28 @@ pub fn mount(
         sync_locks: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    // Writes queued by a previous run (or left behind by a crash) are still owed
+    // an upload, and reads must be served from their staged blobs until they land.
+    core.hydrate_pending();
+    {
+        let core = core.clone();
+        std::thread::Builder::new()
+            .name("pdfs-drain".into())
+            .spawn(move || core.run_pending_drain())?;
+    }
+
     // Start the folder-sync engine. It watches every mirror folder, polls the
     // remotes, and reconciles on its own thread — never in front of a FUSE call.
     sync::spawn(core.clone(), sync_rx);
+
+    // Mounted from the cache: watch for the network coming back so the mount can
+    // stop being read-only-ish without the user restarting the daemon.
+    if !online {
+        let core = core.clone();
+        std::thread::Builder::new()
+            .name("pdfs-online-probe".into())
+            .spawn(move || core.run_online_probe())?;
+    }
 
     // Re-establish on-demand mounts left over from a previous run (devices.md
     // Phase 4). On its own thread: each remount fetches a remote node, and we
@@ -5151,7 +6008,13 @@ pub fn mount(
     let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
     let notifier = bg.notifier();
     rt.spawn(run_event_sync(
-        client, scope, core.state, core.cache, core.db, notifier,
+        client,
+        scope,
+        core.state,
+        core.cache,
+        core.db,
+        core.pending,
+        notifier,
     ));
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)

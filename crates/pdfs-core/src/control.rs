@@ -132,6 +132,14 @@ pub enum Request {
     /// Replies with [`Response::Ok`].
     EmptyTrash,
 
+    /// Drop a cached listing so the *next* read of it re-enumerates from the
+    /// server. Replies with [`Response::Ok`]. This is what a front-end's Refresh
+    /// button raises: the daemon serves listings from its persisted cache, which
+    /// only notices another client's changes when its TTL lapses, so a user who
+    /// knows the cache is stale needs a way to say so. Cheap and idempotent —
+    /// it invalidates, it does not fetch.
+    Refresh { scope: RefreshScope },
+
     // ---- devices ----------------------------------------------------------
     /// List the account's registered devices. Replies with [`Response::Devices`].
     ListDevices,
@@ -258,6 +266,23 @@ pub enum ShareEntryKind {
     ExternalInvite,
 }
 
+/// Which cached listing a [`Request::Refresh`] drops.
+///
+/// Only the listings the daemon caches need naming here — the sharing, devices
+/// and activity listings are always fetched live, so a front-end refreshes those
+/// by simply re-asking.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum RefreshScope {
+    /// One folder's child listing, by mountpoint-relative path (`""` = root).
+    /// Only the folder itself, not its subtree: refreshing what the user is
+    /// looking at shouldn't re-walk everything below it.
+    Dir { path: String },
+    /// The trash listing.
+    Trash,
+    /// The photos timeline.
+    Photos,
+}
+
 /// A registered device in a [`Response::Devices`] listing.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceInfo {
@@ -269,6 +294,11 @@ pub struct DeviceInfo {
     pub device_type: String,
     /// Last sync time, epoch seconds; `None` if it never synced.
     pub last_sync: Option<i64>,
+    /// Whether this is the device *this* machine syncs to. Deleting it would
+    /// delete the cloud copy of the folders this machine is syncing, so a
+    /// front-end must not offer that as casually as removing another computer.
+    #[serde(default)]
+    pub this_device: bool,
 }
 
 /// One synced local folder on this machine's device (in [`Response::SyncFolders`]).
@@ -282,6 +312,12 @@ pub struct SyncFolderInfo {
     pub remote_uid: String,
     /// `mirror` (full local copy, two-way synced) or `ondemand` (FUSE mount).
     pub mode: String,
+    /// A mode switch the user asked for that the daemon has queued: it applies
+    /// once the folder's current pass has pushed any local changes up. `None`
+    /// when nothing is queued. A front-end should paint the folder as already
+    /// heading there — the request was accepted, not rejected.
+    #[serde(default)]
+    pub pending_mode: Option<String>,
     /// `idle` | `syncing` | `error` | `conflict`.
     pub state: String,
     /// Last successful sync, epoch seconds; `0` if never.
@@ -296,7 +332,8 @@ pub struct SyncFolderInfo {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPhase {
     /// Walking the local tree, the remote tree and the stored baseline to work
-    /// out what changed. No per-item counts exist yet.
+    /// out what changed. `done` counts the items checked so far; `total` is how
+    /// many the last pass saw, so it is an estimate the walk can overshoot.
     Scanning,
     /// Applying the diff: creating folders, uploading, downloading, deleting.
     Applying,
@@ -307,12 +344,15 @@ pub enum SyncPhase {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncProgress {
     pub phase: SyncPhase,
-    /// Items applied so far this pass.
+    /// Items checked ([`SyncPhase::Scanning`]) or applied ([`SyncPhase::Applying`])
+    /// so far this pass.
     pub done: usize,
-    /// Items known to need applying. This *grows* during a pass: paths are
-    /// classified depth by depth (a folder must exist remotely before its
-    /// children can be queued), so the total is what has been discovered so far,
-    /// not a figure fixed up front.
+    /// How many items `done` is counting towards. Neither phase can fix this up
+    /// front, so it moves: while scanning it is the size of the last pass's
+    /// baseline — an estimate the walk may overshoot when the folder has grown —
+    /// and while applying it *grows*, because paths are classified depth by depth
+    /// (a folder must exist remotely before its children can be queued). `0` means
+    /// no estimate exists (a folder that has never synced), i.e. indeterminate.
     pub total: usize,
     /// The name of an item currently being applied, or empty between items.
     /// Several run at once; this is just the most recently started.
@@ -579,6 +619,12 @@ pub struct PhotoThumb {
     pub pending: bool,
 }
 
+/// A daemon too old to report connectivity is assumed online — it could not
+/// have mounted at all otherwise.
+fn default_online() -> bool {
+    true
+}
+
 /// The daemon's reply to a [`Request`].
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
@@ -595,6 +641,16 @@ pub enum Response {
         budget: u64,
         /// The pin registry.
         pins: Vec<Pin>,
+        /// False when the daemon is serving the cached tree because the API is
+        /// unreachable (offline.md Phase 1). Cached and pinned content still
+        /// reads; anything else fails until the network is back.
+        #[serde(default = "default_online")]
+        online: bool,
+        /// Writes accepted locally but not yet uploaded (offline.md Phase 3).
+        /// Non-zero means the mount is ahead of the remote — either a copy is
+        /// still draining, or it cannot drain because we are offline.
+        #[serde(default)]
+        pending_uploads: u64,
     },
     /// A human-readable success message.
     Ok { message: String },
@@ -729,6 +785,20 @@ mod tests {
                 uids: vec!["vol~link".into()],
             },
             Request::EmptyTrash,
+            Request::Refresh {
+                scope: RefreshScope::Dir { path: "a/b".into() },
+            },
+            Request::Refresh {
+                scope: RefreshScope::Dir {
+                    path: String::new(),
+                },
+            },
+            Request::Refresh {
+                scope: RefreshScope::Trash,
+            },
+            Request::Refresh {
+                scope: RefreshScope::Photos,
+            },
         ];
         for req in reqs {
             let line = serde_json::to_string(&req).unwrap();

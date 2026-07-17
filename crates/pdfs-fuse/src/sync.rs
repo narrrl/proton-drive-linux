@@ -327,6 +327,9 @@ enum Pending {
         mtime: i64,
         size: i64,
     },
+    /// Both sides changed during a [`push pass`](Core::push_pass): upload the local
+    /// copy into `parent` under a conflict name, leaving the remote file as it is.
+    PushConflict { rel: String, parent: NodeUid },
 }
 
 impl Pending {
@@ -337,7 +340,8 @@ impl Pending {
             | Pending::UploadNew { rel, .. }
             | Pending::UploadRevision { rel, .. }
             | Pending::Download { rel, .. }
-            | Pending::Conflict { rel, .. } => rel,
+            | Pending::Conflict { rel, .. }
+            | Pending::PushConflict { rel, .. } => rel,
         }
     }
 
@@ -345,7 +349,9 @@ impl Pending {
     fn kind(&self) -> ActivityKind {
         match self {
             Pending::CreateDir { .. } => ActivityKind::CreateFolder,
-            Pending::UploadNew { .. } | Pending::UploadRevision { .. } => ActivityKind::Upload,
+            Pending::UploadNew { .. }
+            | Pending::UploadRevision { .. }
+            | Pending::PushConflict { .. } => ActivityKind::Upload,
             Pending::Download { .. } | Pending::Conflict { .. } => ActivityKind::Download,
         }
     }
@@ -358,7 +364,25 @@ impl Pending {
             Pending::UploadRevision { .. } => "new version",
             Pending::Download { .. } => "from Drive",
             Pending::Conflict { .. } => "local changes kept as a conflict copy",
+            Pending::PushConflict { .. } => "local changes uploaded as a conflict copy",
         }
+    }
+}
+
+/// Why a full reconcile pass stopped without a result.
+enum PassAbort {
+    /// An on-demand switch was queued while the pass was running. Everything left
+    /// to do is work on a local copy about to be evicted, so the pass gives up its
+    /// remaining work to a [`push pass`](Core::push_pass) instead. Not a failure —
+    /// nothing is left half-applied, because each step is applied whole.
+    Interrupted,
+    /// The pass could not establish its diff (a walk or the baseline load failed).
+    Failed(String),
+}
+
+impl From<String> for PassAbort {
+    fn from(e: String) -> Self {
+        PassAbort::Failed(e)
     }
 }
 
@@ -376,27 +400,42 @@ enum Applied {
 }
 
 impl Core {
-    /// Reconcile one synced folder, updating its `state` column. `ondemand`
-    /// folders are live FUSE mounts, not mirrored, so they are skipped here.
+    /// Reconcile one synced folder, then apply any mode switch queued while it was
+    /// busy. Both halves live here because the switch has to happen with the pass
+    /// finished and its lock released, and the engine thread is the only place that
+    /// is guaranteed — a switch requested over the control socket cannot wait for a
+    /// pass that may run for minutes.
     pub(crate) fn reconcile_folder(&self, folder: &StoredSyncFolder) {
-        if folder.mode != "mirror" {
-            return;
+        // `ondemand` folders are live FUSE mounts, not mirrored, so there is nothing
+        // to reconcile — but one may still carry a queued switch back to `mirror`,
+        // so the settle below is not skipped with it.
+        if folder.mode == "mirror" {
+            self.reconcile_pass(folder);
         }
+        self.settle_pending_mode(folder.id);
+    }
+
+    /// One reconcile pass over a mirror folder, updating its `state` column.
+    fn reconcile_pass(&self, folder: &StoredSyncFolder) {
         // Hold the folder's lock for the whole pass so a mode switch can't evict the
         // local tree (and mount FUSE over it) while we walk and upload it.
         let lock = self.sync_lock(folder.id);
         let _guard = lock.lock().unwrap();
         // `folder` was read before the lock; a switch may have landed in between, so
         // re-read and re-check the mode rather than trusting the snapshot.
-        match self.db.sync_folder_get(folder.id) {
-            Ok(Some(current)) if current.mode == "mirror" => {}
+        let current = match self.db.sync_folder_get(folder.id) {
+            Ok(Some(current)) if current.mode == "mirror" => current,
             Ok(Some(_)) => return,
             Ok(None) => return,
             Err(e) => {
                 warn!(id = folder.id, error = ?e, "sync: cannot re-read folder; skipping");
                 return;
             }
-        }
+        };
+        // A folder waiting to go on-demand is about to have its local copy deleted,
+        // so pulling the remote side down is work whose only result is more to evict.
+        // All that pass owes the user is getting local changes up.
+        let mut push_only = current.pending_mode.as_deref() == Some("ondemand");
         let Some(remote_root) = parse_uid(&folder.remote_uid) else {
             warn!(id = folder.id, "sync: bad remote uid; skipping");
             return;
@@ -415,16 +454,42 @@ impl Core {
             .sync_folder_set_state(folder.id, "syncing", folder.last_sync);
         let name = base_name(&folder.local_path);
         self.progress_begin(folder.id);
-        let result = self.do_reconcile(folder.id, &local_root, &remote_root);
+        let result = if push_only {
+            self.push_pass(folder.id, &local_root, &remote_root)
+        } else {
+            match self.do_reconcile(folder.id, &local_root, &remote_root) {
+                Ok(outcome) => Ok(outcome),
+                Err(PassAbort::Failed(e)) => Err(e),
+                // The user asked for on-demand while this pass was running. Rather
+                // than make them wait out a walk-and-download whose results are
+                // about to be deleted, drop it here and do the only part that still
+                // matters — getting local changes up — so the switch lands now
+                // instead of after the pass and another poll.
+                Err(PassAbort::Interrupted) => {
+                    info!(
+                        id = folder.id,
+                        "sync: on-demand queued mid-pass; pushing instead"
+                    );
+                    push_only = true;
+                    self.progress_begin(folder.id);
+                    self.push_pass(folder.id, &local_root, &remote_root)
+                }
+            }
+        };
         self.progress_end(folder.id);
         match result {
             Ok(outcome) => {
                 // A folder only reaches `idle` when every path applied cleanly —
                 // an un-uploaded file must keep it out of `idle` so it can't be
                 // switched to on-demand (which evicts the local copy).
+                //
+                // A push pass is the exception on conflicts: it resolves them by
+                // uploading the local copy under a conflict name rather than leaving
+                // one on disk, so nothing local is left needing attention. Parking it
+                // in `conflict` would block the very switch the pass was run for.
                 let state = if outcome.errors > 0 {
                     "error"
-                } else if outcome.conflicts > 0 {
+                } else if outcome.conflicts > 0 && !push_only {
                     "conflict"
                 } else {
                     "idle"
@@ -478,6 +543,283 @@ impl Core {
         }
     }
 
+    /// Whether a switch to on-demand is waiting on this folder — i.e. whether a
+    /// pass in flight is still doing work worth doing. Read from the db rather than
+    /// held in memory because the request arrives on the control-socket thread while
+    /// the pass runs on the engine thread, and the db row is already the one place
+    /// both agree on.
+    fn ondemand_queued(&self, folder_id: i64) -> bool {
+        matches!(
+            self.db.sync_folder_get(folder_id),
+            Ok(Some(f)) if f.pending_mode.as_deref() == Some("ondemand")
+        )
+    }
+
+    /// Get every local change up to Drive, and nothing else — the pass run for a
+    /// folder waiting to go on-demand, whose local copy is about to be evicted.
+    ///
+    /// This exists because a full [`do_reconcile`](Self::do_reconcile) is both too
+    /// slow and too wasteful to stand between the user and the switch they asked
+    /// for. It walks the whole remote tree (the minutes-long part of a pass over a
+    /// large folder) to answer a question the switch makes irrelevant — what the
+    /// remote side has that we don't — and then downloads those files onto a disk
+    /// we are about to clear. A push pass answers only "is anything here not on
+    /// Drive yet?", which the local tree and the baseline already know, so it needs
+    /// no remote walk at all and finishes in the time the local walk takes.
+    ///
+    /// The remote is consulted for exactly one thing: the files whose local copy
+    /// changed. Those, and only those, could be a two-sided edit, so their nodes are
+    /// fetched (cheaply, in one batch) to check whether the remote moved too. If it
+    /// did, the local copy goes up under a conflict name rather than overwriting the
+    /// other side. Everything else — remote edits, remote deletions, remote-only
+    /// files — is left for the FUSE mount to show live once the switch lands.
+    ///
+    /// Per-path failures are counted, never fatal, exactly as in `do_reconcile`; a
+    /// non-zero [`Outcome::errors`] leaves the folder out of `idle`, which keeps the
+    /// queued switch waiting rather than evicting a file that never made it up.
+    fn push_pass(
+        &self,
+        folder_id: i64,
+        local_root: &Path,
+        remote_root: &NodeUid,
+    ) -> Result<Outcome, String> {
+        let baseline = self
+            .db
+            .sync_entries(folder_id)
+            .map_err(|e| format!("load baseline: {e:?}"))?;
+        // Only the local side is walked here, so each baseline path is checked once.
+        self.progress_scan_total(folder_id, baseline.len());
+
+        let mut local: HashMap<String, LocalItem> = HashMap::new();
+        self.walk_local(folder_id, local_root, local_root, &mut local)?;
+
+        // The remote folder uids come from the baseline instead of a walk: every
+        // directory this device has synced recorded its uid there when it was
+        // created or first matched up.
+        let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
+        remote_dirs.insert(String::new(), remote_root.clone());
+        for (rel, item) in &local {
+            if !item.is_dir {
+                continue;
+            }
+            if let Some(uid) = baseline
+                .get(rel)
+                .and_then(|e| e.remote_uid.as_deref())
+                .and_then(parse_uid)
+            {
+                remote_dirs.insert(rel.clone(), uid);
+            }
+        }
+        // A local directory the baseline has no uid for is either brand new or one
+        // whose first pass never finished — and those look identical from here.
+        // Creating it blindly would duplicate a remote folder we simply haven't
+        // looked at, so when any exist, the remote folder tree is walked for real.
+        // It costs one light listing per folder and no file keys, and a folder whose
+        // baseline is complete — the case this pass is written for — skips it
+        // entirely and touches the network only for the files it uploads.
+        if local
+            .iter()
+            .any(|(rel, item)| item.is_dir && !remote_dirs.contains_key(rel))
+        {
+            self.walk_remote_dirs(folder_id, remote_root, "", &mut remote_dirs)?;
+        }
+
+        // Files whose local copy has moved since the baseline: the only ones with
+        // anything to push, and the only ones that could be a two-sided edit.
+        let changed: Vec<&String> = local
+            .iter()
+            .filter(|(_, item)| !item.is_dir)
+            .filter(|(rel, item)| {
+                baseline
+                    .get(*rel)
+                    .is_none_or(|b| b.local_mtime != item.mtime || b.local_size != item.size)
+            })
+            .map(|(rel, _)| rel)
+            .collect();
+
+        // One light batch tells us which of those also changed remotely. A light
+        // node carries the modification time without unlocking the node key, and
+        // mtime alone is what the baseline compares against.
+        let check: Vec<NodeUid> = changed
+            .iter()
+            .filter_map(|rel| baseline.get(*rel))
+            .filter_map(|e| e.remote_uid.as_deref())
+            .filter_map(parse_uid)
+            .collect();
+        let remote_mtimes: HashMap<String, i64> = if check.is_empty() {
+            HashMap::new()
+        } else {
+            self.rt
+                .block_on(self.client.enumerate_nodes_light(&check))
+                .map_err(|e| format!("resolve changed nodes: {e}"))?
+                .into_iter()
+                .filter(|n| !n.trashed)
+                .map(|n| (n.uid.to_string(), n.modification_time))
+                .collect()
+        };
+        let changed: HashSet<&String> = changed.into_iter().collect();
+
+        let mut outcome = Outcome::default();
+        let mut order: Vec<&String> = local.keys().collect();
+        order.sort_by_key(|p| p.matches('/').count());
+
+        // Same depth-ascending batching as `do_reconcile`: a folder is created
+        // remotely before the paths inside it are classified, so their parent uid is
+        // in `remote_dirs` by the time they need it.
+        let mut batch: Vec<Pending> = Vec::new();
+        let mut batch_depth = 0usize;
+        for rel in order {
+            let depth = rel.matches('/').count();
+            if depth > batch_depth {
+                self.flush_batch(
+                    folder_id,
+                    local_root,
+                    &mut remote_dirs,
+                    std::mem::take(&mut batch),
+                    &mut outcome,
+                );
+                batch_depth = depth;
+            }
+            let item = &local[rel];
+            if item.is_dir {
+                // The folder is already on Drive, so only its children carry work —
+                // but if the walk above is what found it, record the uid now so the
+                // next pass over this folder needs no walk at all.
+                if let Some(uid) = remote_dirs.get(rel) {
+                    if baseline
+                        .get(rel)
+                        .and_then(|e| e.remote_uid.as_deref())
+                        .is_none()
+                        && let Err(e) = self.baseline_dir(folder_id, rel, uid)
+                    {
+                        warn!(rel, error = %e, "sync: folder step failed; continuing");
+                        outcome.errors += 1;
+                    }
+                    continue;
+                }
+                match remote_dirs.get(parent_rel(rel)) {
+                    Some(parent) => batch.push(Pending::CreateDir {
+                        rel: rel.clone(),
+                        parent: parent.clone(),
+                    }),
+                    None => {
+                        warn!(rel, "sync: no remote parent for folder; continuing");
+                        outcome.errors += 1;
+                    }
+                }
+                continue;
+            }
+            if !changed.contains(rel) {
+                // Local copy matches the baseline, so it is already on Drive.
+                continue;
+            }
+
+            let base = baseline.get(rel);
+            let uid = base
+                .and_then(|e| e.remote_uid.as_deref())
+                .and_then(parse_uid);
+            match uid {
+                // Never uploaded (or the remote node is gone): it goes up as a new file.
+                None => match remote_dirs.get(parent_rel(rel)) {
+                    Some(parent) => batch.push(Pending::UploadNew {
+                        rel: rel.clone(),
+                        parent: parent.clone(),
+                    }),
+                    None => {
+                        warn!(rel, "sync: no remote parent for file; continuing");
+                        outcome.errors += 1;
+                    }
+                },
+                Some(uid) => {
+                    let remote_moved = match remote_mtimes.get(&uid.to_string()) {
+                        Some(mtime) => base.and_then(remote_sig).is_none_or(|(m, _)| m != *mtime),
+                        // Trashed or unreadable remotely — treat as gone and re-upload
+                        // the local copy as a new file rather than losing it.
+                        None => {
+                            match remote_dirs.get(parent_rel(rel)) {
+                                Some(parent) => batch.push(Pending::UploadNew {
+                                    rel: rel.clone(),
+                                    parent: parent.clone(),
+                                }),
+                                None => {
+                                    warn!(rel, "sync: no remote parent for file; continuing");
+                                    outcome.errors += 1;
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    if remote_moved {
+                        match remote_dirs.get(parent_rel(rel)) {
+                            Some(parent) => batch.push(Pending::PushConflict {
+                                rel: rel.clone(),
+                                parent: parent.clone(),
+                            }),
+                            None => {
+                                warn!(rel, "sync: no remote parent for file; continuing");
+                                outcome.errors += 1;
+                            }
+                        }
+                    } else {
+                        batch.push(Pending::UploadRevision {
+                            rel: rel.clone(),
+                            uid,
+                        });
+                    }
+                }
+            }
+        }
+        self.flush_batch(
+            folder_id,
+            local_root,
+            &mut remote_dirs,
+            std::mem::take(&mut batch),
+            &mut outcome,
+        );
+
+        // Paths the baseline knows that are no longer on disk: the user deleted them
+        // locally, and the deletion has to reach Drive before the mount starts
+        // showing the folder's remote contents — otherwise everything they deleted
+        // comes back the moment the switch lands. Shallowest first, skipping anything
+        // under a folder already trashed (its children went with it).
+        let mut missing: Vec<&String> = baseline
+            .keys()
+            .filter(|rel| !local.contains_key(*rel))
+            .collect();
+        missing.sort_by_key(|p| p.matches('/').count());
+        let mut trashed: Vec<String> = Vec::new();
+        for rel in missing {
+            if trashed
+                .iter()
+                .any(|dir| rel.starts_with(&format!("{dir}/")))
+            {
+                let _ = self.db.sync_entry_remove(folder_id, rel);
+                continue;
+            }
+            let Some(uid) = baseline[rel].remote_uid.as_deref().and_then(parse_uid) else {
+                let _ = self.db.sync_entry_remove(folder_id, rel);
+                continue;
+            };
+            if let Err(e) = self.rt.block_on(self.client.trash_nodes(&[uid])) {
+                warn!(rel, error = %e, "sync: trash remote failed");
+                self.log_activity(ActivityKind::Trash, base_name(rel), e.to_string(), false);
+                outcome.errors += 1;
+                continue;
+            }
+            trashed.push(rel.clone());
+            let _ = self.db.sync_entry_remove(folder_id, rel);
+            self.log_activity(
+                ActivityKind::Trash,
+                base_name(rel),
+                "removed on Drive",
+                true,
+            );
+            outcome.deleted += 1;
+        }
+
+        Ok(outcome)
+    }
+
     /// The diff-and-apply core. A single path failing to apply (a transient
     /// upload error, an unreadable file, a name collision) must not abort the
     /// whole pass and strand every other path — otherwise one bad file in a
@@ -490,21 +832,32 @@ impl Core {
         folder_id: i64,
         local_root: &Path,
         remote_root: &NodeUid,
-    ) -> Result<Outcome, String> {
-        let mut local: HashMap<String, LocalItem> = HashMap::new();
-        walk_local(local_root, local_root, &mut local)?;
-
-        // Loaded before the walk, which uses it to tell which remote files are
-        // unchanged and so can skip decrypting their claimed size.
+    ) -> Result<Outcome, PassAbort> {
+        // Loaded before the walks: the remote one uses it to tell which files are
+        // unchanged and so can skip decrypting their claimed size, and its size is
+        // the only estimate available of how much this pass has to check — the walks
+        // discover the real figure only by finishing.
         let baseline = self
             .db
             .sync_entries(folder_id)
             .map_err(|e| format!("load baseline: {e:?}"))?;
+        // Both sides are walked, so each baseline path is checked about twice.
+        self.progress_scan_total(folder_id, baseline.len() * 2);
+
+        let mut local: HashMap<String, LocalItem> = HashMap::new();
+        self.walk_local(folder_id, local_root, local_root, &mut local)?;
 
         let mut remote: HashMap<String, RemoteItem> = HashMap::new();
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
         remote_dirs.insert(String::new(), remote_root.clone());
-        self.walk_remote(remote_root, "", &mut remote, &mut remote_dirs, &baseline)?;
+        self.walk_remote(
+            folder_id,
+            remote_root,
+            "",
+            &mut remote,
+            &mut remote_dirs,
+            &baseline,
+        )?;
 
         // Union of every path across the three states, shallow paths first so a
         // parent folder is created before its children are placed inside it.
@@ -545,6 +898,11 @@ impl Core {
                     &mut outcome,
                 );
                 batch_depth = depth;
+                // A depth boundary is the pass's natural checkpoint — everything
+                // queued has been applied, so stopping here leaves nothing half done.
+                if self.ondemand_queued(folder_id) {
+                    return Err(PassAbort::Interrupted);
+                }
             }
 
             let l = local.get(rel);
@@ -745,6 +1103,94 @@ impl Core {
         Ok(outcome)
     }
 
+    /// Recursively walk a local directory into `out`, keyed by `/`-joined relative
+    /// path. Symlinks and other special files are skipped. Reports each entry to the
+    /// pass's scan progress.
+    fn walk_local(
+        &self,
+        folder_id: i64,
+        root: &Path,
+        dir: &Path,
+        out: &mut HashMap<String, LocalItem>,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let Ok(stripped) = path.strip_prefix(root) else {
+                continue;
+            };
+            let Some(rel) = stripped.to_str() else {
+                continue;
+            };
+            // Ignore our own in-flight download temp files.
+            if rel.contains(".pdfs-tmp-") {
+                continue;
+            }
+            if meta.is_dir() {
+                out.insert(
+                    rel.to_string(),
+                    LocalItem {
+                        is_dir: true,
+                        mtime: 0,
+                        size: 0,
+                    },
+                );
+                self.progress_scanned(folder_id, base_name(rel));
+                self.walk_local(folder_id, root, &path, out)?;
+            } else if meta.is_file() {
+                out.insert(
+                    rel.to_string(),
+                    LocalItem {
+                        is_dir: false,
+                        mtime: system_mtime(&meta),
+                        size: meta.len() as i64,
+                    },
+                );
+                self.progress_scanned(folder_id, base_name(rel));
+            }
+        }
+        Ok(())
+    }
+
+    /// Map every remote folder under `folder` to its uid by rel path, ignoring
+    /// files. The cheap half of [`walk_remote`](Self::walk_remote): folders carry no
+    /// content signature, so a light listing answers this without unlocking a single
+    /// node key. Used by [`push_pass`](Self::push_pass) to tell a folder it must
+    /// create from one it just hasn't recorded yet.
+    fn walk_remote_dirs(
+        &self,
+        folder_id: i64,
+        folder: &NodeUid,
+        prefix: &str,
+        dirs: &mut HashMap<String, NodeUid>,
+    ) -> Result<(), String> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_folder_children_node_uids(folder))
+            .map_err(|e| format!("enumerate {folder}: {e}"))?;
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let nodes = self
+            .rt
+            .block_on(self.client.enumerate_nodes_light(&uids))
+            .map_err(|e| format!("resolve nodes: {e}"))?;
+        for node in nodes {
+            if node.trashed || !node.is_folder() {
+                continue;
+            }
+            let rel = join_rel(prefix, &node.name);
+            self.progress_scanned(folder_id, base_name(&rel));
+            dirs.insert(rel.clone(), node.uid.clone());
+            self.walk_remote_dirs(folder_id, &node.uid, &rel, dirs)?;
+        }
+        Ok(())
+    }
+
     /// Recursively walk a remote folder into `out`, recording every descendant's
     /// relative path, and mapping each subfolder's rel path to its uid in `dirs`.
     ///
@@ -758,12 +1204,22 @@ impl Core {
     /// [`enumerate_nodes_light`]: proton_drive_rs::ProtonDriveClient::enumerate_nodes_light
     fn walk_remote(
         &self,
+        folder_id: i64,
         folder: &NodeUid,
         prefix: &str,
         out: &mut HashMap<String, RemoteItem>,
         dirs: &mut HashMap<String, NodeUid>,
         baseline: &HashMap<String, StoredSyncEntry>,
-    ) -> Result<(), String> {
+    ) -> Result<(), PassAbort> {
+        // Checked per folder, not per pass: this walk is the long pole on a large
+        // tree, and a user who asks for on-demand three minutes into it should not
+        // wait out the rest of a survey of files they want deleted. Bailing out here
+        // is safe precisely because the walk has applied nothing — a *partial*
+        // remote map, on the other hand, would be read as "the remote deleted
+        // everything we haven't reached yet", so it must never reach the diff.
+        if self.ondemand_queued(folder_id) {
+            return Err(PassAbort::Interrupted);
+        }
         let uids = self
             .rt
             .block_on(self.client.enumerate_folder_children_node_uids(folder))
@@ -804,6 +1260,7 @@ impl Core {
                 continue;
             }
             let rel = join_rel(prefix, &node.name);
+            self.progress_scanned(folder_id, base_name(&rel));
             if node.is_folder() {
                 dirs.insert(rel.clone(), node.uid.clone());
                 out.insert(
@@ -815,7 +1272,7 @@ impl Core {
                         size: 0,
                     },
                 );
-                self.walk_remote(&node.uid, &rel, out, dirs, baseline)?;
+                self.walk_remote(folder_id, &node.uid, &rel, out, dirs, baseline)?;
             } else {
                 let size = if stale.contains(&node.uid.to_string()) {
                     match sized.get(&node.uid.to_string()) {
@@ -998,6 +1455,26 @@ impl Core {
                     .await?;
                 Ok(Applied::Conflict)
             }
+            Pending::PushConflict { rel, parent } => {
+                // The ordinary conflict resolution — rename the local copy aside and
+                // let the next pass upload it — loses the file here: the folder is
+                // going on-demand, so "next pass" comes after the local tree has been
+                // evicted. Push the conflict copy now, while it still exists, and
+                // leave the remote file holding the original path.
+                let path = local_root.join(rel_to_path(rel));
+                let conflict = conflict_path(&path, now_secs());
+                std::fs::rename(&path, &conflict)
+                    .map_err(|e| format!("set aside conflict copy for {rel}: {e}"))?;
+                let name = conflict
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .ok_or_else(|| format!("conflict copy for {rel} has no name"))?;
+                let conflict_rel = join_rel(parent_rel(rel), &name);
+                self.upload_new(folder_id, local_root, &conflict_rel, parent)
+                    .await?;
+                info!(rel, "sync: uploaded local changes as a conflict copy");
+                Ok(Applied::Conflict)
+            }
         }
     }
 
@@ -1162,50 +1639,6 @@ impl Core {
 
 // ---- helpers --------------------------------------------------------------
 
-/// Recursively walk a local directory into `out`, keyed by `/`-joined relative
-/// path. Symlinks and other special files are skipped.
-fn walk_local(root: &Path, dir: &Path, out: &mut HashMap<String, LocalItem>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let Ok(stripped) = path.strip_prefix(root) else {
-            continue;
-        };
-        let Some(rel) = stripped.to_str() else {
-            continue;
-        };
-        // Ignore our own in-flight download temp files.
-        if rel.contains(".pdfs-tmp-") {
-            continue;
-        }
-        if meta.is_dir() {
-            out.insert(
-                rel.to_string(),
-                LocalItem {
-                    is_dir: true,
-                    mtime: 0,
-                    size: 0,
-                },
-            );
-            walk_local(root, &path, out)?;
-        } else if meta.is_file() {
-            out.insert(
-                rel.to_string(),
-                LocalItem {
-                    is_dir: false,
-                    mtime: system_mtime(&meta),
-                    size: meta.len() as i64,
-                },
-            );
-        }
-    }
-    Ok(())
-}
-
 /// A remote node's `(mtime, size)` change signature. Size prefers the plaintext
 /// `claimed_size`; otherwise the encrypted storage size (stable either way, and
 /// only ever compared against the same node's own baseline).
@@ -1273,7 +1706,7 @@ fn parent_rel(rel: &str) -> &str {
 }
 
 /// The final component of a `/`-joined relative path.
-fn base_name(rel: &str) -> &str {
+pub(crate) fn base_name(rel: &str) -> &str {
     match rel.rfind('/') {
         Some(i) => &rel[i + 1..],
         None => rel,

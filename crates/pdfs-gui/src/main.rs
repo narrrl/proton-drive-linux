@@ -86,9 +86,18 @@ struct DriveTray {
 fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
     match send(socket, &Request::Status) {
         Ok(Response::Status {
-            mountpoint, pinned, ..
+            mountpoint,
+            pinned,
+            online,
+            pending_uploads,
+            ..
         }) => DriveState {
-            line: format!("Mounted at {mountpoint} ({pinned} pinned)"),
+            line: match (online, pending_uploads) {
+                (true, 0) => format!("Mounted at {mountpoint} ({pinned} pinned)"),
+                (true, n) => format!("Uploading {n} file(s) ({pinned} pinned)"),
+                (false, 0) => format!("Offline — cached files only ({pinned} pinned)"),
+                (false, n) => format!("Offline — {n} file(s) waiting to upload"),
+            },
             mounted: true,
             mountpoint: PathBuf::from(mountpoint),
             // Same daemon is up, so a cheap follow-up poll gives the sync line.

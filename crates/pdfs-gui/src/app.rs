@@ -34,8 +34,9 @@ use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
-    PhotoItem, PublicLinkInfo, Request, Response, SearchHit, ShareEntry, ShareEntryKind,
-    SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, send,
+    PhotoItem, PublicLinkInfo, RefreshScope, Request, Response, SearchHit, ShareEntry,
+    ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection,
+    TransferItem, send,
 };
 use pdfs_core::service;
 
@@ -765,6 +766,18 @@ fn build_window(app: &adw::Application) {
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
     wire_devices(&ui, &devices_widgets.retry, &devices_widgets.add_folder);
     wire_activity(&ui, &activity_widgets.retry);
+    wire_refresh(
+        &ui,
+        &[
+            &browser_widgets.refresh,
+            &gallery_widgets.refresh,
+            &trash_widgets.refresh,
+            &shared_widgets.refresh,
+            &shared_by_me_widgets.refresh,
+            &devices_widgets.refresh,
+            &activity_widgets.refresh,
+        ],
+    );
     wire_retry(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
@@ -898,6 +911,75 @@ fn page_fresh(loaded_at: &Cell<Option<Instant>>) -> bool {
     loaded_at.get().is_some_and(|t| t.elapsed() < PAGE_TTL)
 }
 
+/// A page header's Refresh button. Every page that can show stale rows carries
+/// one, so the user never has to guess whether what they're looking at is
+/// current or wait out a TTL they can't see.
+fn refresh_button() -> gtk4::Button {
+    let button = gtk4::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Refresh (F5)")
+        .valign(gtk4::Align::Center)
+        .build();
+    button.add_css_class("flat");
+    button
+}
+
+/// Point every page's Refresh button at the current page. One handler for all of
+/// them: the button acts on whatever is on screen, so it can't refresh a page the
+/// user has since navigated away from.
+fn wire_refresh(ui: &Rc<Ui>, buttons: &[&gtk4::Button]) {
+    for button in buttons {
+        let ui = ui.clone();
+        button.connect_clicked(move |_| reload_current_page(&ui));
+    }
+}
+
+/// Re-fetch the visible page from the server, bypassing every layer of cache
+/// between it and the account.
+///
+/// The two layers are separate: the daemon's own persisted listings (folders,
+/// trash, photos) are dropped with [`Request::Refresh`] before re-asking, while
+/// the pages the daemon always fetches live (sharing, devices, activity) only
+/// need this front-end's [`PAGE_TTL`] stamp cleared.
+fn reload_current_page(ui: &Rc<Ui>) {
+    match ui.stack.visible_child_name().as_deref() {
+        Some("browser") => {
+            let path = ui.browser_path.borrow().clone();
+            refresh_then(ui, RefreshScope::Dir { path }, load_browser);
+        }
+        Some("gallery") => refresh_then(ui, RefreshScope::Photos, |ui| load_gallery(ui, false)),
+        Some("trash") => refresh_then(ui, RefreshScope::Trash, load_trash),
+        Some("shared") => {
+            ui.shared_loaded_at.set(None);
+            load_shared(ui);
+        }
+        Some("sharedbyme") => {
+            ui.shared_by_me_loaded_at.set(None);
+            load_shared_by_me(ui);
+        }
+        Some("devices") => {
+            ui.devices_loaded_at.set(None);
+            load_devices(ui);
+        }
+        Some("activity") => load_activity(ui),
+        _ => {}
+    }
+}
+
+/// Drop a daemon-side cached listing, then run the page's loader to re-fetch it.
+///
+/// The loader runs even when the invalidation failed: it is the loader that knows
+/// how to report an unreachable daemon on its own page, and a refresh that fails
+/// silently would read as a dead button.
+fn refresh_then(ui: &Rc<Ui>, scope: RefreshScope, load: fn(&Rc<Ui>)) {
+    let rx = spawn_request(ui.dirs.control_socket(), Request::Refresh { scope });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let _ = rx.recv().await;
+        load(&ui);
+    });
+}
+
 /// Highlight the sidebar row for whichever page the stack is showing, so
 /// navigation that doesn't start in the sidebar (login landing on Files, the tray
 /// raising the window) still moves the selection.
@@ -1025,6 +1107,10 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let on_browser = ui.stack.visible_child_name().as_deref() == Some("browser");
         match key {
+            // Refresh works on every page, so it is matched before the
+            // browser-only bindings.
+            gtk4::gdk::Key::F5 => reload_current_page(&ui),
+            gtk4::gdk::Key::r | gtk4::gdk::Key::R if ctrl => reload_current_page(&ui),
             gtk4::gdk::Key::f | gtk4::gdk::Key::F if ctrl && on_browser => {
                 ui.browser_search.grab_focus();
             }
@@ -1877,11 +1963,22 @@ fn refresh_status(ui: &Rc<Ui>) {
                 used,
                 budget,
                 pins,
+                online,
+                pending_uploads,
                 ..
             })) => {
                 set_mounted(&ui, true);
-                ui.mount_row
-                    .set_subtitle(&format!("Mounted at {mountpoint}"));
+                // Queued uploads are the more useful thing to say when there are
+                // any: they are why a file that looks saved is not on the remote
+                // yet, and offline is usually the reason they are still queued.
+                ui.mount_row.set_subtitle(&match (online, pending_uploads) {
+                    (true, 0) => format!("Mounted at {mountpoint}"),
+                    (true, n) => format!("Mounted at {mountpoint} — uploading {n} file(s)"),
+                    (false, 0) => format!("Mounted at {mountpoint} — offline, cached files only"),
+                    (false, n) => {
+                        format!("Mounted at {mountpoint} — offline, {n} file(s) waiting to upload")
+                    }
+                });
                 let fraction = if budget == 0 {
                     0.0
                 } else {
@@ -2029,6 +2126,7 @@ struct BrowserWidgets {
     new_folder: gtk4::Button,
     upload: gtk4::Button,
     upload_folder: gtk4::Button,
+    refresh: gtk4::Button,
     /// Wraps the views + the details pane; the pane slides in on selection.
     split: adw::OverlaySplitView,
     details: DetailsWidgets,
@@ -2103,9 +2201,12 @@ fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .build();
     search.set_width_chars(18);
 
+    let refresh = refresh_button();
+
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&back);
     header.append(&crumb_scroll);
+    header.append(&refresh);
     header.append(&new_folder);
     header.append(&upload);
     header.append(&upload_folder);
@@ -2216,6 +2317,7 @@ fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             new_folder,
             upload,
             upload_folder,
+            refresh,
             split,
             details,
             grid_selection,
@@ -3560,6 +3662,7 @@ struct TrashWidgets {
     status: adw::StatusPage,
     retry: gtk4::Button,
     empty: gtk4::Button,
+    refresh: gtk4::Button,
     subtitle: gtk4::Label,
 }
 
@@ -3572,6 +3675,7 @@ struct SharedWidgets {
     bookmarks: adw::PreferencesGroup,
     retry: gtk4::Button,
     add_bookmark: gtk4::Button,
+    refresh: gtk4::Button,
 }
 
 /// Widgets the Devices page's load/repaint touch.
@@ -3580,10 +3684,13 @@ struct DevicesWidgets {
     status: adw::StatusPage,
     /// "This computer" — the local folders synced to this machine's device.
     sync_group: adw::PreferencesGroup,
-    /// "Other devices" — the account's other registered devices (read-only).
+    /// "Other computers" — the account's *other* registered devices. This
+    /// machine's own device is deliberately not among them; see
+    /// [`repaint_devices`].
     group: adw::PreferencesGroup,
     add_folder: gtk4::Button,
     retry: gtk4::Button,
+    refresh: gtk4::Button,
 }
 
 /// The Shared page: three stacked sections — items shared *with* me (each with a
@@ -3605,9 +3712,11 @@ fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     add_bookmark.add_css_class("flat");
+    let refresh = refresh_button();
 
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&titles);
+    header.append(&refresh);
     header.append(&add_bookmark);
 
     let shared_with_me = adw::PreferencesGroup::builder()
@@ -3666,6 +3775,7 @@ fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
             bookmarks,
             retry,
             add_bookmark,
+            refresh,
         },
     )
 }
@@ -3688,17 +3798,27 @@ fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     add_folder.add_css_class("flat");
+    let refresh = refresh_button();
 
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&titles);
+    header.append(&refresh);
     header.append(&add_folder);
 
+    // The description spells out what the per-row On-demand switch does to the
+    // local copy, because the switch itself can't: turning it on *deletes* the
+    // files from this disk, which is not something to discover afterwards.
     let sync_group = adw::PreferencesGroup::builder()
         .title("This computer")
-        .description("Local folders backed up to this device.")
+        .description(
+            "Local folders backed up to this device. Synced folders keep a full copy on \
+             this disk; on-demand folders keep the files in Proton Drive only and fetch \
+             them as you open them.",
+        )
         .build();
     let group = adw::PreferencesGroup::builder()
-        .title("Other devices")
+        .title("Other computers")
+        .description("Other devices backing up to this account.")
         .build();
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
@@ -3747,6 +3867,7 @@ fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
             group,
             add_folder,
             retry,
+            refresh,
         },
     )
 }
@@ -3779,9 +3900,11 @@ fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
         .sensitive(false)
         .build();
     empty.add_css_class("destructive-action");
+    let refresh = refresh_button();
 
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&titles);
+    header.append(&refresh);
     header.append(&empty);
 
     let retry = gtk4::Button::builder()
@@ -3831,6 +3954,7 @@ fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
             status,
             retry,
             empty,
+            refresh,
             subtitle,
         },
     )
@@ -4619,16 +4743,24 @@ fn devices_unreachable(ui: &Rc<Ui>) {
     });
 }
 
-/// Rebuild the "Other devices" section from a fresh listing. Empty is a normal
+/// Rebuild the "Other computers" section from a fresh listing. Empty is a normal
 /// state (this machine may be the only device), so it shows a placeholder row
 /// rather than collapsing the page.
+///
+/// This machine's own device is filtered out. Deleting a device deletes its root
+/// folder — every file backed up from it — and for *this* machine that would also
+/// pull the ground out from under the synced folders listed directly above, so it
+/// is not offered as a peer of "remove some other laptop". Removing this
+/// computer's backup means removing its folders, each of which asks about its
+/// cloud copy on its own terms.
 fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
     for row in ui.devices_rows.borrow_mut().drain(..) {
         ui.devices_group.remove(&row);
     }
-    if devices.is_empty() {
+    let others: Vec<&DeviceInfo> = devices.iter().filter(|d| !d.this_device).collect();
+    if others.is_empty() {
         let row = adw::ActionRow::builder()
-            .title("No other devices")
+            .title("No other computers")
             .subtitle("Desktop apps syncing to this account appear here.")
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
@@ -4637,21 +4769,21 @@ fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
         return;
     }
     let mut rows: Vec<gtk4::Widget> = Vec::new();
-    for dev in devices {
+    for dev in others {
         let row = adw::ActionRow::builder()
             .title(&dev.name)
-            .subtitle(&dev.device_type)
+            .subtitle(device_subtitle(dev))
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
         let remove = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove device")
+            .tooltip_text("Remove this computer and everything it backed up")
             .valign(gtk4::Align::Center)
             .build();
         remove.add_css_class("flat");
         let rename = gtk4::Button::builder()
             .icon_name("document-edit-symbolic")
-            .tooltip_text("Rename device")
+            .tooltip_text("Rename computer")
             .valign(gtk4::Align::Center)
             .build();
         rename.add_css_class("flat");
@@ -4669,6 +4801,18 @@ fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
         rows.push(row.upcast());
     }
     *ui.devices_rows.borrow_mut() = rows;
+}
+
+/// A device row's subtitle: its platform, and when it last synced. A device that
+/// has never synced says so — an unexplained missing date reads as a bug, and
+/// "never" is the fact that tells the user this computer isn't backing anything up.
+fn device_subtitle(dev: &DeviceInfo) -> String {
+    match dev.last_sync {
+        Some(secs) if secs > 0 => {
+            format!("{} · last synced {}", dev.device_type, activity_time(secs))
+        }
+        _ => format!("{} · never synced", dev.device_type),
+    }
 }
 
 /// Rebuild the "This computer" section from a fresh synced-folders listing.
@@ -4694,9 +4838,14 @@ fn repaint_sync_folders(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
             Some(p) => sync_progress_label(p),
             None => sync_state_label(&f.state).to_string(),
         };
-        let subtitle = match f.mode.as_str() {
-            "ondemand" => format!("On-demand · {status}"),
-            _ => format!("Synced · {status}"),
+        // A queued switch is where the folder is *going*, which is what the user
+        // just asked for and is waiting to see happen — so it leads the subtitle
+        // instead of the mode the folder is still technically in.
+        let subtitle = match (f.pending_mode.as_deref(), f.mode.as_str()) {
+            (Some("ondemand"), _) => format!("Going on-demand · {status}"),
+            (Some(_), _) => format!("Switching to synced · {status}"),
+            (None, "ondemand") => format!("On-demand · {status}"),
+            (None, _) => format!("Synced · {status}"),
         };
         let row = adw::ActionRow::builder()
             .title(&f.local_path)
@@ -4705,17 +4854,17 @@ fn repaint_sync_folders(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
         row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
         let id = f.id;
 
-        // A pass that is applying knows how far it has got, so show it: the
-        // subtitle alone ("syncing photo.jpg — 12 of 40") never conveys that the
-        // end is near. A scanning pass has no counts to draw, and this row is
-        // repainted on the 2s tick — too slow for a pulse to read as motion — so
-        // it stays text-only until the counts exist.
+        // A pass that knows how far it has got shows it: the subtitle alone
+        // ("syncing photo.jpg — 12 of 40") never conveys that the end is near. This
+        // holds for scanning as much as applying — a big folder spends minutes there
+        // — but a folder syncing for the first time has no estimate to draw against
+        // (`total == 0`), and this row is repainted on the 2s tick, too slow for a
+        // pulse to read as motion. So it stays text-only until real counts exist.
         if let Some(p) = &f.progress
-            && p.phase == SyncPhase::Applying
             && p.total > 0
         {
             let bar = gtk4::ProgressBar::builder()
-                .fraction((p.done as f64 / p.total as f64).min(1.0))
+                .fraction((p.done as f64 / p.total.max(p.done) as f64).min(1.0))
                 .valign(gtk4::Align::Center)
                 .width_request(120)
                 .build();
@@ -4759,10 +4908,19 @@ fn repaint_sync_folders(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
         // On-demand toggle: off = full local copy (mirror), on = FUSE mount that
         // frees the disk. Set the state before wiring the handler so painting the
         // current mode doesn't fire a spurious request.
+        //
+        // A queued switch paints as already flipped: the daemon accepted the
+        // request and will act on it, so snapping the switch back to the current
+        // mode would read as "it didn't take" and invite the user to toggle again.
+        let target = f.pending_mode.as_deref().unwrap_or(&f.mode);
         let ondemand = gtk4::Switch::builder()
-            .tooltip_text("On-demand: keep files in the cloud, free local disk")
+            .tooltip_text(
+                "On-demand: free this disk by keeping the files in Proton Drive only, \
+                 fetching each as you open it. Turn off to download them back and keep a \
+                 full local copy.",
+            )
             .valign(gtk4::Align::Center)
-            .active(f.mode == "ondemand")
+            .active(target == "ondemand")
             .build();
         let ui_mode = ui.clone();
         ondemand.connect_state_set(move |_, on| {
@@ -4779,7 +4937,10 @@ fn repaint_sync_folders(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
         remove.add_css_class("flat");
         let ui_rm = ui.clone();
         let path = f.local_path.clone();
-        remove.connect_clicked(move |_| prompt_remove_sync_folder(&ui_rm, id, &path));
+        // The folder's *current* mode, not a queued one: a switch that hasn't
+        // landed yet has not moved the files anywhere.
+        let ondemand = f.mode == "ondemand";
+        remove.connect_clicked(move |_| prompt_remove_sync_folder(&ui_rm, id, &path, ondemand));
         row.add_suffix(&remove);
         ui.devices_sync_group.add(&row);
         rows.push(row.upcast());
@@ -4798,11 +4959,19 @@ fn sync_state_label(state: &str) -> &str {
 }
 
 /// Human label for a sync pass in flight: what it is doing, to which file, and
-/// how far along it is. The total grows as deeper paths are classified, so this
-/// reads "12 of 40" rather than showing a percentage that could go backwards.
+/// how far along it is. Neither phase's total is exact — the scan's is an estimate
+/// from the last pass, and the applying total grows as deeper paths are classified
+/// — so both read "12 of 40" rather than a percentage that could go backwards.
 fn sync_progress_label(p: &SyncProgress) -> String {
     match p.phase {
-        SyncPhase::Scanning => "checking for changes…".to_string(),
+        // Before the first pass finishes there is no estimate, so the count would
+        // be "checked 12 of 12" — worse than saying nothing.
+        SyncPhase::Scanning if p.total == 0 => "checking for changes…".to_string(),
+        SyncPhase::Scanning => format!(
+            "checking for changes — {} of {}",
+            p.done,
+            p.total.max(p.done)
+        ),
         SyncPhase::Applying => {
             let count = format!("{} of {}", p.done + 1, p.total.max(p.done + 1));
             if p.current.is_empty() {
@@ -4890,18 +5059,39 @@ fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &str) {
 }
 
 /// Confirm, then stop syncing a folder. Offers to also delete the cloud copy.
-fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str) {
+fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondemand: bool) {
     let win = ui_window(ui);
+    // The two modes leave the user in opposite places, so they can't share a
+    // sentence. A mirror folder's files are already on this disk and stay there.
+    // An on-demand folder's are not: the path is a mount over content that lives
+    // in Proton Drive, so unmounting it leaves an empty directory — which is a
+    // nasty surprise if the dialog claimed the local files were safe, and is
+    // recoverable only by turning On-demand off *first* and letting it download.
+    let body = if ondemand {
+        format!(
+            "Stop syncing “{path}”?\n\nThis folder is on-demand: its files live in Proton \
+             Drive, not on this disk, so the folder will be empty once it is unmounted. To \
+             keep a local copy, cancel, turn off On-demand, and wait for the download to \
+             finish before removing it."
+        )
+    } else {
+        format!(
+            "Stop syncing “{path}”?\n\nThe local files stay on this disk and simply stop \
+             being synced. Choose whether to also delete the copy in Proton Drive."
+        )
+    };
     let dialog = adw::AlertDialog::builder()
         .heading("Stop syncing folder")
-        .body(format!(
-            "Stop syncing “{path}”? Your local files stay; choose whether to also \
-             delete the copy in Proton Drive."
-        ))
+        .body(body)
         .build();
     let group = adw::PreferencesGroup::new();
     let delete_remote = adw::SwitchRow::builder()
         .title("Also delete from Proton Drive")
+        .subtitle(if ondemand {
+            "Deletes the only copy of these files."
+        } else {
+            "The local copy is unaffected."
+        })
         .active(false)
         .build();
     group.add(&delete_remote);
@@ -4973,9 +5163,11 @@ fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
 fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Remove device")
+        .heading("Remove computer")
         .body(format!(
-            "Remove “{name}”? Its synced folder registration is deleted."
+            "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is \
+             deleted along with it. The files on that computer itself are not touched — but \
+             this cannot be undone from here."
         ))
         .build();
     dialog.add_response("cancel", "Cancel");
@@ -5026,6 +5218,7 @@ struct SharedByMeWidgets {
     status: adw::StatusPage,
     group: adw::PreferencesGroup,
     retry: gtk4::Button,
+    refresh: gtk4::Button,
 }
 
 /// The Shared page: one section listing the items I have shared with others —
@@ -5035,11 +5228,14 @@ fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
     let title = gtk4::Label::builder()
         .label("Shared")
         .halign(gtk4::Align::Start)
+        .hexpand(true)
         .build();
     title.add_css_class("title-2");
+    let refresh = refresh_button();
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.set_hexpand(true);
     header.append(&title);
+    header.append(&refresh);
 
     let group = adw::PreferencesGroup::new();
     let clamp = adw::Clamp::builder().child(&group).build();
@@ -5083,6 +5279,7 @@ fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
             status,
             group,
             retry,
+            refresh,
         },
     )
 }
@@ -5303,6 +5500,7 @@ struct ActivityWidgets {
     status: adw::StatusPage,
     group: adw::PreferencesGroup,
     retry: gtk4::Button,
+    refresh: gtk4::Button,
 }
 
 /// The Activity page: a newest-first feed of the mutations and transfers the
@@ -5311,11 +5509,14 @@ fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     let title = gtk4::Label::builder()
         .label("Activity")
         .halign(gtk4::Align::Start)
+        .hexpand(true)
         .build();
     title.add_css_class("title-2");
+    let refresh = refresh_button();
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.set_hexpand(true);
     header.append(&title);
+    header.append(&refresh);
 
     let group = adw::PreferencesGroup::new();
     let clamp = adw::Clamp::builder().child(&group).build();
@@ -5359,6 +5560,7 @@ fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
             status,
             group,
             retry,
+            refresh,
         },
     )
 }
@@ -6082,6 +6284,7 @@ struct GalleryWidgets {
     scroll: gtk4::ScrolledWindow,
     retry: gtk4::Button,
     upload: gtk4::Button,
+    refresh: gtk4::Button,
 }
 
 /// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over
@@ -6164,9 +6367,11 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     upload.add_css_class("pill");
     upload.add_css_class("suggested-action");
+    let refresh = refresh_button();
 
     let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header_box.append(&titles);
+    header_box.append(&refresh);
     header_box.append(&upload);
 
     // The timeline (plus its pager) or the status page, never both.
@@ -6201,6 +6406,7 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             scroll,
             retry,
             upload,
+            refresh,
         },
     )
 }

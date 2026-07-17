@@ -82,6 +82,34 @@ struct PinFile {
     pins: BTreeMap<String, Pin>,
 }
 
+/// What a staged file actually contains, written beside it as `<name>.json`
+/// (offline.md Phase 2).
+///
+/// A staged file is **not** necessarily valid whole-file content, and that is
+/// the whole reason this exists. A partial overwrite commits by filling the
+/// untouched regions from the remote base — which is exactly what fails when the
+/// network is down, so what lands in staging is the authored bytes with *zeros*
+/// in the gaps. Uploading that as-is would silently corrupt the file.
+/// `authored` says which ranges are real; `complete` says whether the file can
+/// be uploaded as it stands.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StagedWrite {
+    /// Node the write targeted, in `volume~link` display form.
+    pub uid: String,
+    /// Length of the intended new content.
+    pub len: u64,
+    /// Size and mtime of the base revision the write was made against, so a
+    /// retry can tell whether the remote moved on in the meantime.
+    pub base_size: u64,
+    pub base_mtime: i64,
+    /// Locally authored `[start, end)` ranges. Everything else in the file is a
+    /// zero-filled hole, not content.
+    pub authored: Vec<(u64, u64)>,
+    /// True when `authored` covers the whole file, i.e. the staged bytes are the
+    /// complete new content and can be uploaded directly.
+    pub complete: bool,
+}
+
 /// Content cache rooted at a directory, with a sibling pin-registry file.
 pub struct ContentCache {
     /// Directory holding `<key>` blobs and `<key>.meta` tags.
@@ -96,6 +124,12 @@ pub struct ContentCache {
     /// Subdirectory for write-handle scratch files (disk-backed write buffers).
     /// Emptied on open so a crashed run leaves no orphans.
     scratch_dir: PathBuf,
+    /// Subdirectory holding the bytes of writes that have not been uploaded yet
+    /// (offline.md Phase 2/3) — every released write passes through here, since
+    /// the upload is a queued op performed later. Unlike `scratch_dir` this is
+    /// **never** emptied on open: these are the only copy of content the user
+    /// authored, and the whole point is that they outlive the daemon.
+    staging_dir: PathBuf,
     /// JSON pin registry path.
     pins_path: PathBuf,
     /// Soft cap on total blob bytes. Exceeded only transiently: a `store`
@@ -133,6 +167,9 @@ impl ContentCache {
         let scratch_dir = content_dir.join("scratch");
         let _ = std::fs::remove_dir_all(&scratch_dir);
         std::fs::create_dir_all(&scratch_dir)?;
+        // Staging, by contrast, is deliberately preserved across runs.
+        let staging_dir = content_dir.join("staging");
+        std::fs::create_dir_all(&staging_dir)?;
         if let Some(parent) = pins_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -141,6 +178,7 @@ impl ContentCache {
             thumb_dir,
             block_dir,
             scratch_dir,
+            staging_dir,
             pins_path,
             max_bytes: AtomicU64::new(max_bytes),
             db,
@@ -412,6 +450,53 @@ impl ContentCache {
             .write(true)
             .open(&path)?;
         Ok((file, path))
+    }
+
+    /// Move a released scratch file into the staging directory with a
+    /// [`StagedWrite`] sidecar, and return where it landed.
+    ///
+    /// This is what makes a write survive its upload: the caller is releasing a
+    /// write handle and would otherwise delete the file, so until the bytes are
+    /// on the remote, staging holds the only copy. Every dirty handle goes
+    /// through here — the upload is a queued op performed later (offline.md
+    /// Phase 3), and a staged file is also what a human can recover from if the
+    /// queue never drains.
+    ///
+    /// Falls back to a copy when the rename crosses a filesystem boundary; a
+    /// failure here means we could not save the bytes at all, so it is reported
+    /// rather than swallowed.
+    pub fn stage_write(&self, meta: &StagedWrite, scratch: &Path) -> Result<PathBuf> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        // The uid goes in the name so a staged file can be tied back to its node
+        // without a database; `/` in a uid would otherwise open a path.
+        let safe_uid = meta.uid.replace(['/', '\\'], "_");
+        let path = self.staging_dir.join(format!(
+            "{}-{}-{}",
+            safe_uid,
+            now_millis(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        if let Err(e) = std::fs::rename(scratch, &path) {
+            // Cross-device: rename cannot move it, so copy and drop the original.
+            let _ = e;
+            std::fs::copy(scratch, &path)?;
+            let _ = std::fs::remove_file(scratch);
+        }
+        // Sidecar last: a staged file without one is still recoverable bytes,
+        // while a sidecar without a file would describe nothing.
+        std::fs::write(
+            path.with_extension("json"),
+            serde_json::to_vec_pretty(meta)?,
+        )?;
+        Ok(path)
+    }
+
+    /// Drop a staged blob and its sidecar, once its bytes are safely on the
+    /// remote (or the op that owned them has been superseded). Best effort:
+    /// leftovers cost disk, while failing here would strand a drained op.
+    pub fn discard_staged(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("json"));
     }
 
     /// Remove any cached blob + meta for `uid`, including its thumbnails (best
@@ -986,6 +1071,54 @@ mod tests {
         );
         assert!(c.cached_block(&u, 1, 12, 1).is_none(), "LRU block evicted");
         assert!(c.cached_block(&u, 1, 12, 2).is_some(), "newest survives");
+    }
+
+    /// A failed upload must never cost the user their bytes (offline.md Phase 2):
+    /// the scratch file moves to staging intact, and staging survives a reopen
+    /// the way scratch deliberately does not.
+    #[test]
+    fn failed_write_is_staged_and_survives_reopen() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let c = ContentCache::open(content.clone(), dir.path().join("pins.json"), 0, db.clone())
+            .unwrap();
+
+        let (mut f, scratch) = c.create_scratch().unwrap();
+        f.write_all(b"unsent work").unwrap();
+        drop(f);
+
+        // A partial overwrite: only the first 11 bytes are real, so the staged
+        // file must not be mistaken for uploadable whole-file content.
+        let meta = StagedWrite {
+            uid: uid("a").to_string(),
+            len: 40,
+            base_size: 40,
+            base_mtime: 100,
+            authored: vec![(0, 11)],
+            complete: false,
+        };
+        let staged = c.stage_write(&meta, &scratch).unwrap();
+        assert!(!scratch.exists(), "scratch is moved, not copied");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"unsent work");
+
+        let sidecar: StagedWrite =
+            serde_json::from_slice(&std::fs::read(staged.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(sidecar.authored, vec![(0, 11)]);
+        assert!(
+            !sidecar.complete,
+            "gaps are zeros, not content: uploading this as-is would corrupt the file"
+        );
+
+        // Reopening wipes scratch (worthless leftovers) but must keep staging.
+        drop(c);
+        let _c2 = ContentCache::open(content, dir.path().join("pins.json"), 0, db).unwrap();
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"unsent work",
+            "staged bytes outlive the daemon that failed to upload them"
+        );
     }
 
     #[test]

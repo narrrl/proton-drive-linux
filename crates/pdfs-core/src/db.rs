@@ -23,11 +23,43 @@ use crate::control::{ActivityEntry, ActivityKind};
 use crate::localindex::LocalEntry;
 
 /// Current schema version. Bump on every forward migration added below.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 11;
 
 /// How many activity rows to keep. Older rows are pruned on insert, so the feed
 /// stays a bounded "recent history" rather than growing without limit.
 const ACTIVITY_KEEP: i64 = 2000;
+
+/// The `kind` of a [`PendingOp`] that uploads a staged file as a new revision.
+/// The only kind so far: metadata mutations still go straight to the API and so
+/// still need the network (offline.md Phase 3 is landing in two halves).
+pub const OP_REVISION: &str = "revision";
+
+/// A mutation that has been accepted locally but not yet performed against the
+/// API — the durable half of the write-back queue (offline.md Phase 3).
+///
+/// The daemon answers the FUSE call the moment this row and its staged blob are
+/// on disk, so a `cp` into the mount runs at disk speed and the upload happens
+/// behind it. That also makes an offline write succeed rather than EIO: the row
+/// simply waits for the network.
+#[derive(Debug, Clone)]
+pub struct PendingOp {
+    /// Row id, `0` on a value being inserted.
+    pub id: i64,
+    /// See [`OP_REVISION`].
+    pub kind: String,
+    /// Node this op targets.
+    pub uid: String,
+    /// Staged blob holding the bytes to upload.
+    pub blob_path: Option<String>,
+    /// Serialized [`StagedWrite`](crate::cache::StagedWrite).
+    pub meta_json: Option<String>,
+    /// When the op was queued (ms since epoch).
+    pub created_at: i64,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    /// Earliest ms at which to retry, for backoff.
+    pub next_attempt_at: i64,
+}
 
 /// Size the WAL is truncated back to after a checkpoint. Comfortably above the
 /// steady-state working set (a few MB), so the truncation only claws back the
@@ -107,6 +139,11 @@ pub struct StoredSyncFolder {
     pub remote_share_id: String,
     /// `mirror` (full local copy, two-way synced) or `ondemand` (FUSE mount).
     pub mode: String,
+    /// A mode the user asked for that could not be applied on the spot — the
+    /// folder was mid-pass, or had un-uploaded changes. The engine applies it
+    /// once the folder is safe to switch, so the request is queued rather than
+    /// rejected. `None` when the folder is where the user wants it.
+    pub pending_mode: Option<String>,
     /// `idle` | `syncing` | `error` | `conflict`.
     pub state: String,
     pub last_sync: i64,
@@ -223,6 +260,12 @@ impl Db {
         }
         if current < 9 {
             tx.execute_batch(MIGRATION_V9)?;
+        }
+        if current < 10 {
+            tx.execute_batch(MIGRATION_V10)?;
+        }
+        if current < 11 {
+            tx.execute_batch(MIGRATION_V11)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -374,6 +417,24 @@ impl Db {
         Ok(out)
     }
 
+    /// Load one persisted node back by uid. Used to recover the My Files root
+    /// when the API is unreachable, so the mount can still serve the cached tree
+    /// (offline.md Phase 1).
+    pub fn node_by_uid(&self, uid: &str) -> Result<Option<Node>> {
+        let conn = self.conn.lock().unwrap();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT node_json FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL",
+                params![uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match json {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Read the persisted incremental-sync cursor (a `DriveEventId`), if any.
     /// The daemon resumes from this on restart instead of reseeding to the
     /// server head, so changes made while unmounted are still applied (P2).
@@ -396,6 +457,108 @@ impl Db {
             "INSERT INTO sync_state (key, value) VALUES ('event_cursor', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![cursor],
+        )?;
+        Ok(())
+    }
+
+    /// Read a `sync_state` value as a string.
+    pub fn state_str(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Write a `sync_state` string value.
+    pub fn set_state_str(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Queue an upload to be performed by the drain worker, returning its row id.
+    ///
+    /// One pending op per node: a second write to the same file before the first
+    /// has drained replaces it, since the newer blob already contains everything
+    /// the older one did. The superseded blob's path is returned so the caller can
+    /// delete it.
+    pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let superseded: Option<String> = conn
+            .query_row(
+                "SELECT blob_path FROM pending_op WHERE uid = ?1",
+                params![op.uid],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        conn.execute("DELETE FROM pending_op WHERE uid = ?1", params![op.uid])?;
+        conn.execute(
+            "INSERT INTO pending_op (kind, uid, blob_path, meta_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![op.kind, op.uid, op.blob_path, op.meta_json, op.created_at],
+        )?;
+        Ok((conn.last_insert_rowid(), superseded))
+    }
+
+    /// Every queued op, oldest first. The drain worker replays them in this order
+    /// so a file's writes land in the order they were made.
+    pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, uid, blob_path, meta_json, created_at, attempts,
+                    last_error, next_attempt_at
+             FROM pending_op ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    uid: r.get(2)?,
+                    blob_path: r.get(3)?,
+                    meta_json: r.get(4)?,
+                    created_at: r.get(5)?,
+                    attempts: r.get(6)?,
+                    last_error: r.get(7)?,
+                    next_attempt_at: r.get(8)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// How many uploads are still waiting, for `Response::Status`.
+    pub fn pending_op_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))?)
+    }
+
+    /// Drop a queued op, once its upload has actually landed.
+    pub fn delete_op(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM pending_op WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Record a failed attempt and when to next try. Leaves the row in place —
+    /// the staged bytes are still the only copy of the user's write.
+    pub fn record_op_failure(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pending_op
+             SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3
+             WHERE id = ?1",
+            params![id, error, next_attempt_at],
         )?;
         Ok(())
     }
@@ -644,7 +807,7 @@ impl Db {
     pub fn sync_folder_list(&self) -> Result<Vec<StoredSyncFolder>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, local_path, remote_uid, remote_share_id, mode, state, last_sync
+            "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
              FROM sync_folder ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -654,8 +817,9 @@ impl Db {
                 remote_uid: r.get(2)?,
                 remote_share_id: r.get(3)?,
                 mode: r.get(4)?,
-                state: r.get(5)?,
-                last_sync: r.get(6)?,
+                pending_mode: r.get(5)?,
+                state: r.get(6)?,
+                last_sync: r.get(7)?,
             })
         })?;
         let mut items = Vec::new();
@@ -669,7 +833,7 @@ impl Db {
     pub fn sync_folder_get(&self, id: i64) -> Result<Option<StoredSyncFolder>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, local_path, remote_uid, remote_share_id, mode, state, last_sync
+            "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
              FROM sync_folder WHERE id = ?1",
             params![id],
             |r| {
@@ -679,8 +843,9 @@ impl Db {
                     remote_uid: r.get(2)?,
                     remote_share_id: r.get(3)?,
                     mode: r.get(4)?,
-                    state: r.get(5)?,
-                    last_sync: r.get(6)?,
+                    pending_mode: r.get(5)?,
+                    state: r.get(6)?,
+                    last_sync: r.get(7)?,
                 })
             },
         )
@@ -698,11 +863,25 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Update a synced folder's mode (`mirror`/`ondemand`).
+    /// Update a synced folder's mode (`mirror`/`ondemand`). The folder has
+    /// reached the mode it was asked for, so any queued request is satisfied and
+    /// cleared in the same write — a `pending_mode` outliving the switch it asked
+    /// for would have the engine try to apply it again on the next pass.
     pub fn sync_folder_set_mode(&self, id: i64, mode: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE sync_folder SET mode = ?2 WHERE id = ?1",
+            "UPDATE sync_folder SET mode = ?2, pending_mode = NULL WHERE id = ?1",
+            params![id, mode],
+        )?;
+        Ok(())
+    }
+
+    /// Queue (or, with `None`, withdraw) a mode the folder should move to once it
+    /// is safe to switch.
+    pub fn sync_folder_set_pending_mode(&self, id: i64, mode: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sync_folder SET pending_mode = ?2 WHERE id = ?1",
             params![id, mode],
         )?;
         Ok(())
@@ -1481,6 +1660,41 @@ CREATE TABLE activity (
 CREATE INDEX activity_time ON activity(time DESC);
 ";
 
+/// Schema v10: a mode switch the user asked for is queued rather than rejected
+/// when the folder is mid-pass or has un-uploaded changes, so `pending_mode`
+/// records the intent until the engine can act on it. NULL is the resting state:
+/// the folder is already where the user wants it.
+const MIGRATION_V10: &str = "
+ALTER TABLE sync_folder ADD COLUMN pending_mode TEXT;
+";
+
+/// Schema v11: writes no longer upload inside the FUSE handler. `release` stages
+/// the bytes and records the intended upload here, and a drain worker performs it
+/// (offline.md Phase 3). The row outlives the process, so a write survives both a
+/// dead network and a restart.
+///
+/// `blob_path` points into the content cache's `staging/` dir and `meta_json` is
+/// the [`StagedWrite`] sidecar describing which of its bytes are real — an
+/// incomplete blob must be gap-filled from the remote base before it can be
+/// uploaded. `next_attempt_at` is a ms deadline implementing retry backoff.
+///
+/// [`StagedWrite`]: crate::cache::StagedWrite
+const MIGRATION_V11: &str = "
+CREATE TABLE pending_op (
+  id              INTEGER PRIMARY KEY,
+  kind            TEXT NOT NULL,
+  uid             TEXT NOT NULL,
+  blob_path       TEXT,
+  meta_json       TEXT,
+  created_at      INTEGER NOT NULL,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX pending_op_uid ON pending_op(uid);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1664,6 +1878,26 @@ mod tests {
             name,
             kind,
         )
+    }
+
+    /// Recovering the root by uid is what lets the daemon mount offline
+    /// (offline.md Phase 1): the uid is remembered in `sync_state`, the node
+    /// itself comes back out of `nodes`.
+    #[test]
+    fn node_by_uid_recovers_a_stored_node() {
+        let db = Db::open_in_memory().unwrap();
+        let root = folder("root", None, "My Files");
+        db.upsert_node(&root).unwrap();
+        db.set_state_str("root_uid", &root.uid.to_string()).unwrap();
+
+        let key = db.state_str("root_uid").unwrap().unwrap();
+        let got = db.node_by_uid(&key).unwrap().expect("root recovered");
+        assert_eq!(got.uid, root.uid);
+        assert_eq!(got.name, "My Files");
+        assert!(got.is_folder());
+
+        assert!(db.node_by_uid("vol~nope").unwrap().is_none());
+        assert!(db.state_str("never_written").unwrap().is_none());
     }
 
     #[test]
@@ -1949,10 +2183,117 @@ mod tests {
     }
 
     #[test]
+    fn a_second_write_supersedes_the_first_pending_op() {
+        let db = Db::open_in_memory().unwrap();
+        let op = |blob: &str| PendingOp {
+            id: 0,
+            kind: OP_REVISION.to_string(),
+            uid: uid("a").to_string(),
+            blob_path: Some(blob.to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+
+        let (_, superseded) = db.enqueue_op(&op("/staging/first")).unwrap();
+        assert_eq!(superseded, None, "nothing to supersede on the first write");
+
+        // The newer blob already contains everything the older one did, so the
+        // older op must go — and its blob must be reported so it can be deleted
+        // rather than leaked.
+        let (id2, superseded) = db.enqueue_op(&op("/staging/second")).unwrap();
+        assert_eq!(superseded.as_deref(), Some("/staging/first"));
+
+        let ops = db.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1, "one queued upload per node");
+        assert_eq!(ops[0].id, id2);
+        assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
+        assert_eq!(db.pending_op_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_failed_op_stays_queued_with_backoff() {
+        let db = Db::open_in_memory().unwrap();
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_REVISION.to_string(),
+            uid: uid("a").to_string(),
+            blob_path: Some("/staging/blob".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+        let id = db.pending_ops().unwrap()[0].id;
+
+        db.record_op_failure(id, "network unreachable", 5_000)
+            .unwrap();
+
+        // The staged blob is the only copy of the user's bytes: a failure must
+        // never drop the row, only defer it.
+        let ops = db.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].attempts, 1);
+        assert_eq!(ops[0].last_error.as_deref(), Some("network unreachable"));
+        assert_eq!(ops[0].next_attempt_at, 5_000);
+
+        db.record_op_failure(id, "still down", 9_000).unwrap();
+        assert_eq!(db.pending_ops().unwrap()[0].attempts, 2);
+
+        db.delete_op(id).unwrap();
+        assert_eq!(db.pending_op_count().unwrap(), 0);
+    }
+
+    #[test]
     fn migrate_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
         // Second migrate is a no-op (already at head) and must not error.
         db.migrate().unwrap();
+    }
+
+    /// A queued mode switch is a promise the daemon has to keep across a restart,
+    /// so it lives in the row, and reaching the mode is what retires it.
+    #[test]
+    fn pending_mode_is_queued_until_the_mode_is_reached() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .sync_folder_add("/home/me/Downloads", "v~l", "s")
+            .unwrap();
+        assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
+
+        db.sync_folder_set_pending_mode(id, Some("ondemand"))
+            .unwrap();
+        assert_eq!(
+            db.sync_folder_get(id)
+                .unwrap()
+                .unwrap()
+                .pending_mode
+                .as_deref(),
+            Some("ondemand")
+        );
+        // The listing carries it too — it is what the front-ends paint from.
+        assert_eq!(
+            db.sync_folder_list().unwrap()[0].pending_mode.as_deref(),
+            Some("ondemand")
+        );
+
+        // Landing the switch satisfies the request: a `pending_mode` outliving it
+        // would have the engine try to apply the same switch on every later pass.
+        db.sync_folder_set_mode(id, "ondemand").unwrap();
+        let folder = db.sync_folder_get(id).unwrap().unwrap();
+        assert_eq!(folder.mode, "ondemand");
+        assert_eq!(folder.pending_mode, None);
+
+        // And the user can withdraw a request that hasn't landed yet.
+        db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+        db.sync_folder_set_pending_mode(id, None).unwrap();
+        let folder = db.sync_folder_get(id).unwrap().unwrap();
+        assert_eq!(folder.mode, "ondemand");
+        assert_eq!(folder.pending_mode, None);
     }
 
     #[test]

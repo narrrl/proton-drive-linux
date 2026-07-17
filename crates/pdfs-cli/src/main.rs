@@ -11,7 +11,7 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
+    RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
 };
 use pdfs_core::db::Db;
 
@@ -145,6 +145,15 @@ enum Command {
     },
     /// Permanently delete everything in the trash. This cannot be undone.
     EmptyTrash,
+
+    /// Drop a cached listing so the next read re-fetches it from the server.
+    /// Use it when another client changed something and the daemon hasn't
+    /// noticed yet.
+    Refresh {
+        /// What to refresh: a folder path (inside the mountpoint or relative to
+        /// it), `trash`, or `photos`. The mount root if omitted.
+        target: Option<String>,
+    },
 
     /// Manage the account's registered devices.
     Devices {
@@ -376,6 +385,7 @@ fn main() -> Result<()> {
         Command::Restore { uids } => cmd_restore(uids),
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
         Command::EmptyTrash => cmd_empty_trash(),
+        Command::Refresh { target } => cmd_refresh(target),
         Command::Devices { action } => cmd_devices(action),
         Command::Sync { action } => cmd_sync(action),
         Command::Share {
@@ -451,14 +461,23 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                     } else {
                         f.last_sync.to_string()
                     };
+                    // A queued switch is reported as the mode the folder is moving
+                    // to, so `sync list` never reads as if the request was dropped.
+                    let mode = match &f.pending_mode {
+                        Some(pending) => format!("{} → {pending}", f.mode),
+                        None => f.mode.clone(),
+                    };
                     println!(
-                        "[{}]  {}  ({}, {}, synced: {sync})",
-                        f.id, f.local_path, f.mode, f.state
+                        "[{}]  {}  ({mode}, {}, synced: {sync})",
+                        f.id, f.local_path, f.state
                     );
                     // A pass in flight says what it is doing, indented under it.
                     if let Some(p) = &f.progress {
                         match p.phase {
-                            SyncPhase::Scanning => println!("      scanning…"),
+                            SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
+                            SyncPhase::Scanning => {
+                                println!("      scanning: {} of {}", p.done, p.total.max(p.done))
+                            }
                             SyncPhase::Applying => println!(
                                 "      {} of {}  {}",
                                 p.done + 1,
@@ -809,9 +828,19 @@ fn cmd_status() -> Result<()> {
     // If a mount daemon is running, report live status from its control socket.
     match control_request(CtlRequest::Status) {
         Ok(CtlResponse::Status {
-            mountpoint, pinned, ..
+            mountpoint,
+            pinned,
+            online,
+            pending_uploads,
+            ..
         }) => {
-            println!("Mounted at {mountpoint} ({pinned} pinned)");
+            let state = if online { "" } else { ", offline" };
+            let queued = match pending_uploads {
+                0 => String::new(),
+                1 => ", 1 upload queued".to_string(),
+                n => format!(", {n} uploads queued"),
+            };
+            println!("Mounted at {mountpoint} ({pinned} pinned{state}{queued})");
         }
         Ok(other) => println!("Mount: unexpected response {other:?}"),
         Err(_) => println!("Mount: not running."),
@@ -1159,6 +1188,25 @@ fn cmd_delete_forever(uids: Vec<String>) -> Result<()> {
 fn cmd_empty_trash() -> Result<()> {
     confirm("Permanently delete everything in the trash? This cannot be undone.")?;
     match control_request(CtlRequest::EmptyTrash)? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Drop a cached listing. `trash` and `photos` name those two listings; anything
+/// else is read as a folder path, so a folder actually called "trash" is still
+/// reachable as `./trash`.
+fn cmd_refresh(target: Option<String>) -> Result<()> {
+    let scope = match target.as_deref() {
+        Some("trash") => RefreshScope::Trash,
+        Some("photos") => RefreshScope::Photos,
+        path => RefreshScope::Dir {
+            path: path.unwrap_or("").to_string(),
+        },
+    };
+    match control_request(CtlRequest::Refresh { scope })? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
