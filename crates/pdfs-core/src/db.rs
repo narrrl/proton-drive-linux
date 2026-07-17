@@ -129,6 +129,19 @@ pub struct PendingCounts {
     pub changes: i64,
 }
 
+/// One cached blob or block as [`Db::cache_rebuild`] wants it: borrowed, because
+/// the caller builds the whole list from a directory walk before handing it over.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheEntryInput<'a> {
+    /// On-disk filename of the blob or block.
+    pub key: &'a str,
+    /// `'blob'` or `'block'` — the two byte budgets are counted separately.
+    pub kind: &'a str,
+    pub size: u64,
+    /// Initial LRU key, in unix milliseconds.
+    pub last_accessed: i64,
+}
+
 /// The outcome of folding freshly written bytes into a queued create.
 #[derive(Debug, Clone)]
 pub struct AttachedBlob {
@@ -368,48 +381,17 @@ impl Db {
     /// hot-cache maps rehydrate losslessly on the next mount. `listed` is never
     /// changed here — it is owned by [`set_listed`](Self::set_listed).
     pub fn upsert_node(&self, node: &Node) -> Result<()> {
-        let json = serde_json::to_string(node)?;
-        let uid = node.uid.to_string();
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO nodes
-               (uid, parent_uid, name, is_dir, size, mtime, trashed, node_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(uid) DO UPDATE SET
-               parent_uid = excluded.parent_uid,
-               name       = excluded.name,
-               is_dir     = excluded.is_dir,
-               size       = excluded.size,
-               mtime      = excluded.mtime,
-               trashed    = excluded.trashed,
-               node_json  = excluded.node_json",
-            params![
-                uid,
-                node.parent_uid.as_ref().map(|u| u.to_string()),
-                node.name,
-                node.is_folder() as i64,
-                node_size(node),
-                node.modification_time,
-                node.trashed as i64,
-                json,
-            ],
-        )?;
-        // FTS5 has no UPSERT, so refresh the row by delete-then-insert. Trashed
-        // nodes are kept out of the index entirely so they never surface in
-        // search results.
-        tx.execute("DELETE FROM nodes_fts WHERE uid = ?1", params![uid])?;
-        if !node.trashed {
-            tx.execute(
-                "INSERT INTO nodes_fts (uid, name) VALUES (?1, ?2)",
-                params![uid, node.name],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.upsert_nodes(std::slice::from_ref(node))
     }
 
-    /// Write-through multiple nodes in a single database transaction for performance.
+    /// Write-through a batch of nodes as one transaction — a whole directory
+    /// listing, typically. Otherwise identical to [`upsert_node`](Self::upsert_node),
+    /// which is the single-node case of it.
+    ///
+    /// The commit count is the point: SQLite autocommits every statement that is
+    /// not in an explicit transaction, so interning a folder of a thousand
+    /// children row-by-row cost a thousand fsyncs, and `ls` waited for all of
+    /// them.
     pub fn upsert_nodes(&self, nodes: &[Node]) -> Result<()> {
         if nodes.is_empty() {
             return Ok(());
@@ -442,6 +424,9 @@ impl Db {
                     json,
                 ],
             )?;
+            // FTS5 has no UPSERT, so refresh the row by delete-then-insert.
+            // Trashed nodes are kept out of the index entirely so they never
+            // surface in search results.
             tx.execute("DELETE FROM nodes_fts WHERE uid = ?1", params![uid])?;
             if !node.trashed {
                 tx.execute(
@@ -1412,12 +1397,36 @@ impl Db {
         Ok(out)
     }
 
-    /// Wipe the entire cache index. The daemon calls this on open before
-    /// rebuilding the index from the on-disk cache, so a crash or external file
-    /// deletion can never leave a phantom row inflating the budget total.
-    pub fn cache_clear(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM cache_entries", [])?;
+    /// Replace the whole cache index with `entries`, as one transaction. The
+    /// daemon calls this on open, so a crash or an external file deletion can
+    /// never leave a phantom row inflating the budget total.
+    ///
+    /// The clear and the refill are the same commit deliberately: they are one
+    /// operation — "the index now describes what is on disk" — and a crash
+    /// between them would otherwise leave an empty index against a full cache
+    /// directory, i.e. a budget total of zero and nothing eviction can see.
+    ///
+    /// One commit also matters for speed. A mount is the only caller and it runs
+    /// on the open path, so a cache of thousands of blobs used to pay thousands
+    /// of autocommit fsyncs before the mountpoint appeared.
+    pub fn cache_rebuild(&self, entries: &[CacheEntryInput<'_>]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM cache_entries", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO cache_entries (cache_key, kind, size_bytes, last_accessed)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(cache_key) DO UPDATE SET
+                   kind          = excluded.kind,
+                   size_bytes    = excluded.size_bytes,
+                   last_accessed = excluded.last_accessed",
+            )?;
+            for e in entries {
+                stmt.execute(params![e.key, e.kind, e.size as i64, e.last_accessed])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2893,14 +2902,31 @@ mod tests {
         assert_eq!(blobs, vec![("xyz".into(), 1)]);
     }
 
+    /// A rebuild is a replacement, not a merge: whatever the index said before
+    /// is what a stale or externally-deleted cache file would leave behind.
     #[test]
-    fn cache_index_clear() {
+    fn cache_index_rebuild_replaces_every_row() {
         let db = Db::open_in_memory().unwrap();
-        db.cache_touch("k1", "blob", 1, 1).unwrap();
-        db.cache_touch("k2", "block", 1, 1).unwrap();
-        db.cache_clear().unwrap();
-        assert!(db.cache_entries_by_kind("blob").unwrap().is_empty());
+        db.cache_touch("gone", "blob", 1, 1).unwrap();
+        db.cache_touch("also-gone", "block", 1, 1).unwrap();
+
+        db.cache_rebuild(&[CacheEntryInput {
+            key: "kept",
+            kind: "blob",
+            size: 7,
+            last_accessed: 42,
+        }])
+        .unwrap();
+
+        assert_eq!(
+            db.cache_entries_by_kind("blob").unwrap(),
+            vec![("kept".to_string(), 7)]
+        );
         assert!(db.cache_entries_by_kind("block").unwrap().is_empty());
+
+        // An empty rebuild is how a cache directory that vanished reports itself.
+        db.cache_rebuild(&[]).unwrap();
+        assert!(db.cache_entries_by_kind("blob").unwrap().is_empty());
     }
 
     #[test]

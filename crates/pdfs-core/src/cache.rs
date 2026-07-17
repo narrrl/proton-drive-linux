@@ -27,7 +27,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::db::Db;
+use crate::db::{CacheEntryInput, Db};
 use crate::error::Result;
 
 /// `cache_entries.kind` tag for whole-file content blobs.
@@ -233,7 +233,11 @@ impl ContentCache {
     /// crash or an external file deletion, and picks up caches written by builds
     /// predating the index. In-run accesses then refine the ordering.
     fn reconcile(&self) -> Result<()> {
-        self.db.cache_clear()?;
+        // Both directories are walked before anything is written: the index is
+        // replaced in a single transaction (see [`Db::cache_rebuild`]), so the
+        // rows have to be in hand first. Names are owned for the same reason —
+        // `DirEntry::file_name` does not outlive the iteration.
+        let mut names: Vec<(String, &str, u64, i64)> = Vec::new();
         for (dir, kind) in [
             (&self.content_dir, KIND_BLOB),
             (&self.block_dir, KIND_BLOCK),
@@ -257,9 +261,19 @@ impl ContentCache {
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                self.db.cache_touch(name, kind, meta.len(), at)?;
+                names.push((name.to_string(), kind, meta.len(), at));
             }
         }
+        let entries: Vec<CacheEntryInput<'_>> = names
+            .iter()
+            .map(|(key, kind, size, at)| CacheEntryInput {
+                key,
+                kind,
+                size: *size,
+                last_accessed: *at,
+            })
+            .collect();
+        self.db.cache_rebuild(&entries)?;
         Ok(())
     }
 

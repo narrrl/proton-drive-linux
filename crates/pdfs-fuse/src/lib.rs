@@ -282,6 +282,13 @@ impl State {
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(uid = %node.uid, error = %e, "db upsert_node failed");
         }
+        self.intern_mem(parent, node)
+    }
+
+    /// Allocate (or reuse) a stable inode for a node, updating the hot-cache maps
+    /// only. Every caller owes the DB a write-through — see the callers below;
+    /// the split exists so a batch can pay for one transaction instead of `n`.
+    fn intern_mem(&mut self, parent: u64, node: Node) -> u64 {
         if let Some(&ino) = self.by_uid.get(&node.uid) {
             if let Some(e) = self.entries.get_mut(&ino) {
                 e.node = node;
@@ -303,60 +310,25 @@ impl State {
         ino
     }
 
-    /// Allocate (or reuse) a stable inode for a node loaded from the database
-    /// without writing it back.
+    /// Allocate (or reuse) a stable inode for a node that came *from* the
+    /// database, which is why nothing is written back.
     fn intern_from_db(&mut self, parent: u64, node: Node) -> u64 {
-        if let Some(&ino) = self.by_uid.get(&node.uid) {
-            if let Some(e) = self.entries.get_mut(&ino) {
-                e.node = node;
-                e.parent = parent;
-            }
-            return ino;
-        }
-        let ino = self.next_ino;
-        self.next_ino += 1;
-        self.by_uid.insert(node.uid.clone(), ino);
-        self.entries.insert(
-            ino,
-            Entry {
-                uid: node.uid.clone(),
-                parent,
-                node,
-            },
-        );
-        ino
+        self.intern_mem(parent, node)
     }
 
-    /// Allocate (or reuse) stable inodes for a batch of nodes, writing all of them
-    /// to the DB in a single transaction.
+    /// Allocate (or reuse) stable inodes for a whole listing, writing every node
+    /// through in a single transaction.
+    ///
+    /// This is what keeps `ls` on a large folder quick: one commit for the
+    /// listing, rather than one autocommit — and one fsync — per child.
     fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
         if let Err(e) = self.db.upsert_nodes(&nodes) {
             warn!(error = %e, "db upsert_nodes failed");
         }
-        let mut inos = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            if let Some(&ino) = self.by_uid.get(&node.uid) {
-                if let Some(e) = self.entries.get_mut(&ino) {
-                    e.node = node;
-                    e.parent = parent;
-                }
-                inos.push(ino);
-                continue;
-            }
-            let ino = self.next_ino;
-            self.next_ino += 1;
-            self.by_uid.insert(node.uid.clone(), ino);
-            self.entries.insert(
-                ino,
-                Entry {
-                    uid: node.uid.clone(),
-                    parent,
-                    node,
-                },
-            );
-            inos.push(ino);
-        }
-        inos
+        nodes
+            .into_iter()
+            .map(|node| self.intern_mem(parent, node))
+            .collect()
     }
 
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
@@ -561,6 +533,68 @@ async fn run_uploads(
 /// (two API calls and a node-key unlock) the next time that file is read.
 const MAX_OPEN_READERS: usize = 64;
 
+/// How many FUSE handlers may run off the dispatch loop at once.
+///
+/// `fuser`'s session loop is non-concurrent: it reads one request, calls the
+/// handler, and only then reads the next. A handler that touches the network
+/// therefore stalls every `getattr`/`lookup` on the mount behind it. The slow
+/// handlers hand their `Reply` to this pool instead and answer from a worker,
+/// which frees the loop immediately.
+///
+/// Bounded on purpose: one worker can hold a 4 MiB block in flight, and an
+/// unbounded pool would let read-ahead on a big file spawn threads without
+/// limit. Sized just above the SDK's in-flight block cap so the semaphore
+/// there, not thread count, is what bounds download memory.
+const FUSE_WORKERS: usize = 8;
+
+/// Bounded thread pool behind the network-touching FUSE handlers.
+///
+/// Shared by every session forked off one [`Core`] (the main mount plus each
+/// on-demand sync folder), so the bound is per daemon rather than per mount.
+struct Workers {
+    tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl Workers {
+    fn new(n: usize) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..n {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("pdfs-fuse-{i}"))
+                .spawn(move || {
+                    loop {
+                        // Held only to take the next job, never across it.
+                        let job = rx.lock().unwrap().recv();
+                        match job {
+                            // A panicking handler must not cost the pool a
+                            // worker for the rest of the run. The dropped
+                            // `Reply` answers EIO on its own, so the caller of
+                            // the failed op is told; the next job is unaffected.
+                            Ok(job) => {
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            }
+                            // Every sender is gone: the daemon is shutting down.
+                            Err(_) => break,
+                        }
+                    }
+                })?;
+        }
+        Ok(Self { tx })
+    }
+
+    /// Run `job` on a worker. Falls back to running it inline — the pre-pool
+    /// behaviour — if no worker is left to take it, so a shut-down pool degrades
+    /// to a slow mount rather than a mount that answers every read with EIO.
+    fn run(&self, job: impl FnOnce() + Send + 'static) {
+        if let Err(e) = self.tx.send(Box::new(job)) {
+            warn!("fuse worker pool is gone; serving inline");
+            (e.0)();
+        }
+    }
+}
+
 /// An open reader plus the node metadata it was opened against.
 ///
 /// The SDK pins a reader to the revision that was active at `open_revision`, so
@@ -591,6 +625,10 @@ struct Core {
     /// Validated by `(mtime, size)` exactly like the content cache, and bounded
     /// by [`MAX_OPEN_READERS`].
     readers: Arc<Mutex<HashMap<NodeUid, CachedReader>>>,
+    /// Threads that serve the FUSE handlers which touch the network, so the
+    /// session's dispatch loop stays free to answer cheap metadata calls while a
+    /// cold read is on the wire. See [`Workers`].
+    workers: Arc<Workers>,
     /// Unified SQLite metadata cache: the persistence layer behind the in-memory
     /// `State` maps. Every mutation writes through here, and the maps rehydrate
     /// from it on mount (plan.md P1).
@@ -841,6 +879,14 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// Whether `ino`'s listing is already in memory, i.e. whether
+    /// [`Core::ensure_children`] would return without touching the network.
+    /// Lets a handler decide between answering inline and handing off to a
+    /// worker, at the cost of one uncontended map lookup.
+    fn children_cached(&self, ino: u64) -> bool {
+        self.state.lock().unwrap().children.contains_key(&ino)
     }
 
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
@@ -1760,6 +1806,12 @@ impl Core {
     /// retried with doubling backoff and *never* dropped on failure — the staged
     /// blob is the only copy of the user's bytes, so a failed op stays queued
     /// until it lands or the user deletes the file.
+    ///
+    /// A failure does not pause the queue. Recording it pushes that op's
+    /// `next_attempt_at` past `now`, so the next pass simply picks the next op
+    /// that is due — one file wedged against a folder that no longer exists must
+    /// not hold up an unrelated upload behind it. The worker only blocks once
+    /// nothing is due at all.
     fn run_pending_drain(&self) {
         loop {
             let now = now_millis();
@@ -1775,19 +1827,22 @@ impl Core {
                 continue;
             };
             if let Err(e) = self.drain_op(&op) {
-                // Backoff is per-op, so one wedged file cannot starve the rest:
-                // the next pass picks whichever op is due.
                 let attempts = op.attempts + 1;
                 let backoff = DRAIN_BACKOFF_MIN
                     .saturating_mul(1u32 << attempts.min(6))
                     .min(DRAIN_BACKOFF_MAX);
                 warn!(uid = %op.uid, attempts, error = %e, "pending upload failed; will retry");
-                let _ = self.db.record_op_failure(
+                if let Err(e) = self.db.record_op_failure(
                     op.id,
                     &e.to_string(),
                     now_millis() + backoff.as_millis() as i64,
-                );
-                self.wait_for_drain_work();
+                ) {
+                    // The backoff is the only thing keeping a failing op from
+                    // being picked again immediately, so without it the loop
+                    // would spin on this op as fast as the API can refuse it.
+                    error!(uid = %op.uid, error = %e, "recording a drain failure failed");
+                    self.wait_for_drain_work();
+                }
             }
         }
     }
@@ -1842,12 +1897,13 @@ impl Core {
                 return Ok(());
             }
         };
-        if node.parent_uid.as_ref() != Some(&parent) {
-            self.rt.block_on(self.client.move_node(&uid, &parent))?;
-        }
-        if node.name != name {
+        // The name half goes first, so that a collision on the move half below is
+        // about the name the node will actually land under rather than the one it
+        // is about to lose.
+        let mut landed = node.name.clone();
+        if landed != name {
             match self.rt.block_on(self.client.rename_node(&uid, &name, None)) {
-                Ok(()) => {}
+                Ok(()) => landed = name.clone(),
                 // Someone took the name while we were offline. Renaming to a
                 // *different* name is the non-destructive resolution: it neither
                 // clobbers their file nor drops ours, and it is visible.
@@ -1856,6 +1912,7 @@ impl Core {
                     warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
                     self.rt
                         .block_on(self.client.rename_node(&uid, &alt, None))?;
+                    landed = alt.clone();
                     self.adopt_drained_name(&uid, &alt);
                     self.log_activity(
                         ActivityKind::Rename,
@@ -1867,8 +1924,46 @@ impl Core {
                 Err(e) => return Err(e.into()),
             }
         }
+        if node.parent_uid.as_ref() != Some(&parent) {
+            match self.rt.block_on(self.client.move_node(&uid, &parent)) {
+                Ok(()) => {}
+                // The destination holds a `landed` of its own. Same resolution as
+                // a name collision, and it has to happen before the move: the API
+                // has no move-and-rename, so the node is renamed out of the way
+                // here and moved second.
+                Err(e) if is_already_exists(&e) => {
+                    let alt = conflict_name(&landed, now_secs());
+                    warn!(%uid, name = %landed, alt, "destination already holds that name; using a conflict name");
+                    self.rt
+                        .block_on(self.client.rename_node(&uid, &alt, None))?;
+                    self.rt.block_on(self.client.move_node(&uid, &parent))?;
+                    self.adopt_drained_name(&uid, &alt);
+                    self.log_activity(
+                        ActivityKind::Rename,
+                        &landed,
+                        format!("destination already had that name; moved as {alt}"),
+                        false,
+                    );
+                }
+                // The destination folder is gone. Leaving the node in its current
+                // parent is the honest outcome: it is not where the user asked for
+                // it, but it exists, it is where it has always been, and the
+                // rename half above still applied. Retrying could only fail again
+                // — the folder is not coming back — and would wedge the queue.
+                Err(e) if is_gone(&e) => {
+                    warn!(%uid, name = %landed, %parent, "move destination is gone; leaving the node where it is");
+                    self.log_activity(
+                        ActivityKind::Rename,
+                        &landed,
+                        "destination folder no longer exists; the file was left in place".to_string(),
+                        false,
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         self.db.delete_op(op.id)?;
-        info!(%uid, name, "pending rename landed");
+        info!(%uid, name = %landed, "pending rename landed");
         Ok(())
     }
 
@@ -4799,6 +4894,9 @@ fn parse_uid(s: &str) -> Option<NodeUid> {
 /// The Proton Drive VFS. FUSE callbacks are synchronous, so the Tokio handle
 /// bridges each one to the async SDK via [`Handle::block_on`]; the fuser
 /// session thread is not a runtime worker, so blocking on it is sound.
+/// Cloneable so a handler can move a copy onto a [`Workers`] thread and answer
+/// from there; every field is a handle or a plain id.
+#[derive(Clone)]
 pub struct ProtonFs {
     core: Core,
     uid: u32,
@@ -4826,6 +4924,67 @@ impl ProtonFs {
         // SAFETY: geteuid/getegid are infallible and have no preconditions.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Self { core, uid, gid }
+    }
+
+    /// The body of [`Filesystem::lookup`], on whichever thread ends up serving it.
+    fn serve_lookup(&self, parent: u64, name: &str, reply: ReplyEntry) {
+        if let Err(e) = self.core.ensure_children(parent) {
+            reply.error(e);
+            return;
+        }
+        let st = self.core.state.lock().unwrap();
+        let hit = st.children.get(&parent).and_then(|kids| {
+            kids.iter().copied().find_map(|ino| {
+                st.entries
+                    .get(&ino)
+                    .filter(|e| e.node.name == name)
+                    .map(|e| (ino, &e.node))
+            })
+        });
+        match hit {
+            Some((ino, node)) => {
+                let attr = self.attr(ino, node);
+                reply.entry(&TTL, &attr, Generation(0));
+            }
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    /// The body of [`Filesystem::readdir`], on whichever thread ends up serving it.
+    fn serve_readdir(&self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
+        if let Err(e) = self.core.ensure_children(ino) {
+            reply.error(e);
+            return;
+        }
+        let st = self.core.state.lock().unwrap();
+        let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
+
+        // "." and ".." occupy offsets 0 and 1; real children follow.
+        let mut listing: Vec<(u64, FileType, String)> = vec![
+            (ino, FileType::Directory, ".".to_string()),
+            (parent, FileType::Directory, "..".to_string()),
+        ];
+        if let Some(kids) = st.children.get(&ino) {
+            for &kid in kids {
+                if let Some(e) = st.entries.get(&kid) {
+                    let ft = if e.node.is_folder() {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
+                    listing.push((kid, ft, e.node.name.clone()));
+                }
+            }
+        }
+        drop(st);
+
+        for (i, (ino, ft, name)) in listing.into_iter().enumerate().skip(offset as usize) {
+            // The stored offset is that of the *next* entry to resume at.
+            if reply.add(INodeNo(ino), (i + 1) as u64, ft, &name) {
+                break;
+            }
+        }
+        reply.ok();
     }
 
     fn attr(&self, ino: u64, node: &Node) -> FileAttr {
@@ -5230,27 +5389,19 @@ fn unix_secs(secs: i64) -> SystemTime {
 impl Filesystem for ProtonFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
-        if let Err(e) = self.core.ensure_children(parent) {
-            reply.error(e);
+        let name = name.to_string_lossy().into_owned();
+        // A folder that has not been listed yet is enumerated from the remote,
+        // so serve it from a worker rather than stalling the dispatch loop. A
+        // listed folder — the common case — is a map hit, and answering it
+        // inline costs less than the handoff would.
+        if self.core.children_cached(parent) {
+            self.serve_lookup(parent, &name, reply);
             return;
         }
-        let name = name.to_string_lossy();
-        let st = self.core.state.lock().unwrap();
-        let hit = st.children.get(&parent).and_then(|kids| {
-            kids.iter().copied().find_map(|ino| {
-                st.entries
-                    .get(&ino)
-                    .filter(|e| e.node.name == name)
-                    .map(|e| (ino, &e.node))
-            })
-        });
-        match hit {
-            Some((ino, node)) => {
-                let attr = self.attr(ino, node);
-                reply.entry(&TTL, &attr, Generation(0));
-            }
-            None => reply.error(Errno::ENOENT),
-        }
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(move || fs.serve_lookup(parent, &name, reply));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -5270,42 +5421,19 @@ impl Filesystem for ProtonFs {
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
         let ino = ino.0;
-        if let Err(e) = self.core.ensure_children(ino) {
-            reply.error(e);
+        // Same split as `lookup`: only the cold, remote-enumerating path pays
+        // for a worker.
+        if self.core.children_cached(ino) {
+            self.serve_readdir(ino, offset, reply);
             return;
         }
-        let st = self.core.state.lock().unwrap();
-        let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
-
-        // "." and ".." occupy offsets 0 and 1; real children follow.
-        let mut listing: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".to_string()),
-            (parent, FileType::Directory, "..".to_string()),
-        ];
-        if let Some(kids) = st.children.get(&ino) {
-            for &kid in kids {
-                if let Some(e) = st.entries.get(&kid) {
-                    let ft = if e.node.is_folder() {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    listing.push((kid, ft, e.node.name.clone()));
-                }
-            }
-        }
-        drop(st);
-
-        for (i, (ino, ft, name)) in listing.into_iter().enumerate().skip(offset as usize) {
-            // The stored offset is that of the *next* entry to resume at.
-            if reply.add(INodeNo(ino), (i + 1) as u64, ft, &name) {
-                break;
-            }
-        }
-        reply.ok();
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(move || fs.serve_readdir(ino, offset, reply));
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -5376,6 +5504,11 @@ impl Filesystem for ProtonFs {
         // A file open for writing is served from its handle so reads see the
         // in-flight (possibly unsaved) content: authored bytes come from the
         // scratch file, untouched bytes from the base.
+        //
+        // This path stays on the dispatch loop. `write` runs there too, so
+        // keeping its reads there as well preserves the ordering the write path
+        // has always had between a write and a read of the same handle; a mostly
+        // local read is not worth reasoning about that for.
         let handle = {
             let st = self.core.state.lock().unwrap();
             st.handles.values().find(|h| h.ino == ino.0).map(|h| {
@@ -5421,13 +5554,18 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
-        match self
-            .core
-            .read_range(&uid, mtime, fsize, offset, size as u64)
-        {
-            Ok(bytes) => reply.data(&bytes),
-            Err(e) => reply.error(e),
-        }
+        // Off the dispatch loop: this is the one handler that routinely goes to
+        // the network (block fetch + decrypt, hundreds of ms on a cold file),
+        // and until it returns the kernel's next request for this mount is not
+        // even read off the FUSE device. It only reads `state`, so moving it
+        // races with nothing. FUSE does not require replies in request order.
+        let core = self.core.clone();
+        self.core.workers.run(move || {
+            match core.read_range(&uid, mtime, fsize, offset, size as u64) {
+                Ok(bytes) => reply.data(&bytes),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn create(
@@ -7056,6 +7194,7 @@ pub fn mount(
         })),
         cache: Arc::new(cache),
         readers: Arc::new(Mutex::new(HashMap::new())),
+        workers: Arc::new(Workers::new(FUSE_WORKERS)?),
         db,
         online: Arc::new(AtomicBool::new(online)),
         pending: Arc::new(Mutex::new(HashMap::new())),
