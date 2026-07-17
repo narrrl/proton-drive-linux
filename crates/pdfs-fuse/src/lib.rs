@@ -609,6 +609,37 @@ struct CachedReader {
     last_used: Instant,
 }
 
+/// What the `readers` map holds for a node: an open reader, or the fact that
+/// someone is already opening one.
+///
+/// The `Pending` arm is what makes the map single-flight rather than merely a
+/// cache. Opening resolves link details, ancestor keys, an S2K node-key unlock
+/// and the block table — five round-trips — and read-ahead on a cold file puts
+/// several workers into the open at the same moment, so without this each
+/// racer would redo all of it and discard every result but one.
+enum ReaderSlot {
+    Ready(CachedReader),
+    Pending(PendingOpen),
+}
+
+/// An `open_revision` in flight. Racers clone `rx` and await the leader's result
+/// instead of opening their own.
+struct PendingOpen {
+    /// Identifies this attempt so the leader can tell "my slot is still there"
+    /// from "someone evicted or replaced it while I was on the network", and
+    /// only publish its reader in the first case.
+    id: u64,
+    /// What the leader is opening against. A racer wanting a different revision
+    /// must not join this open — it would get a reader for the wrong bytes.
+    mtime: i64,
+    size: u64,
+    rx: tokio::sync::watch::Receiver<Option<Result<Arc<RevisionReader>, Errno>>>,
+}
+
+/// Distinguishes `PendingOpen`s. Only uniqueness matters, so a plain counter
+/// does; ids are never compared for order.
+static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Drive client, a Tokio handle to bridge the synchronous FUSE/socket threads
 /// to the async SDK, the inode bookkeeping, and the on-disk content cache.
 ///
@@ -624,7 +655,7 @@ struct Core {
     /// resolve its keys and block table once instead of once per block.
     /// Validated by `(mtime, size)` exactly like the content cache, and bounded
     /// by [`MAX_OPEN_READERS`].
-    readers: Arc<Mutex<HashMap<NodeUid, CachedReader>>>,
+    readers: Arc<Mutex<HashMap<NodeUid, ReaderSlot>>>,
     /// Threads that serve the FUSE handlers which touch the network, so the
     /// session's dispatch loop stays free to answer cheap metadata calls while a
     /// cold read is on the wire. See [`Workers`].
@@ -1044,73 +1075,151 @@ impl Core {
     /// used to mean 25 full resolutions (50 API calls, 25 unlocks) and now means
     /// one.
     ///
-    /// Two threads racing on the same cold file may both open a reader; the
-    /// loser's is dropped. That costs one redundant open and is cheaper than
-    /// holding a lock across the network call.
+    /// Racing reads of one cold file open it **once**: the first caller claims
+    /// the slot and the rest await its result. That matters now that `read` is
+    /// served off the dispatch loop, because read-ahead on a first touch issues
+    /// several parallel reads of the same file as a matter of course.
     async fn revision_reader(
         &self,
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
     ) -> Result<Arc<RevisionReader>, Errno> {
-        // Fast path: a valid reader is already open. The guard is dropped before
-        // any await — network I/O must never run under it.
-        if let Some(hit) = {
-            let mut readers = self.readers.lock().unwrap();
-            match readers.get_mut(uid) {
-                Some(entry) if entry.mtime == mtime && entry.size == fsize => {
-                    entry.last_used = Instant::now();
-                    Some(entry.reader.clone())
-                }
-                _ => None,
+        loop {
+            // Decide under the lock, act outside it — network I/O must never run
+            // under a std `Mutex`, and an await must never hold one.
+            enum Act {
+                Hit(Arc<RevisionReader>),
+                Join(tokio::sync::watch::Receiver<Option<Result<Arc<RevisionReader>, Errno>>>),
+                Lead(
+                    u64,
+                    tokio::sync::watch::Sender<Option<Result<Arc<RevisionReader>, Errno>>>,
+                ),
             }
-        } {
-            return Ok(hit);
+            let act = {
+                let mut readers = self.readers.lock().unwrap();
+                match readers.get_mut(uid) {
+                    Some(ReaderSlot::Ready(entry))
+                        if entry.mtime == mtime && entry.size == fsize =>
+                    {
+                        entry.last_used = Instant::now();
+                        Act::Hit(entry.reader.clone())
+                    }
+                    Some(ReaderSlot::Pending(p)) if p.mtime == mtime && p.size == fsize => {
+                        Act::Join(p.rx.clone())
+                    }
+                    // Either nothing here, or something for a revision we no
+                    // longer want (a stale reader, or an open for one). Ours
+                    // replaces it: the newer `(mtime, size)` is the truth.
+                    _ => {
+                        let id = NEXT_OPEN_ID.fetch_add(1, Ordering::Relaxed);
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        readers.insert(
+                            uid.clone(),
+                            ReaderSlot::Pending(PendingOpen {
+                                id,
+                                mtime,
+                                size: fsize,
+                                rx,
+                            }),
+                        );
+                        Act::Lead(id, tx)
+                    }
+                }
+            };
+
+            match act {
+                Act::Hit(reader) => return Ok(reader),
+                Act::Join(mut rx) => {
+                    // `changed()` errors only if the leader dropped its sender
+                    // without publishing — it panicked. Retry from the top
+                    // rather than fail: the slot it left is gone, so this pass
+                    // leads its own open.
+                    loop {
+                        if let Some(result) = rx.borrow_and_update().clone() {
+                            return result;
+                        }
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Act::Lead(id, tx) => {
+                    debug!(%uid, mtime, fsize, "opening revision");
+                    let result = match self.client.open_revision(uid).await {
+                        Ok(reader) => Ok(Arc::new(reader)),
+                        Err(e) => {
+                            warn!(%uid, error = %e, "open_revision failed");
+                            Err(Errno::EIO)
+                        }
+                    };
+                    {
+                        let mut readers = self.readers.lock().unwrap();
+                        // Publish only into the slot we claimed. If it is gone
+                        // or belongs to a later attempt, an eviction or a newer
+                        // revision overtook us: our reader still answers the
+                        // callers waiting on it, but it must not be cached.
+                        let ours = matches!(
+                            readers.get(uid),
+                            Some(ReaderSlot::Pending(p)) if p.id == id
+                        );
+                        if ours {
+                            match &result {
+                                Ok(reader) => {
+                                    readers.insert(
+                                        uid.clone(),
+                                        ReaderSlot::Ready(CachedReader {
+                                            reader: reader.clone(),
+                                            mtime,
+                                            size: fsize,
+                                            last_used: Instant::now(),
+                                        }),
+                                    );
+                                }
+                                // Never cache a failure: the next read retries.
+                                Err(_) => {
+                                    readers.remove(uid);
+                                }
+                            }
+                        }
+                        Self::trim_readers(&mut readers);
+                    }
+                    // After the map is updated, so a racer that wakes and
+                    // re-enters finds the finished slot rather than racing us.
+                    let _ = tx.send(Some(result.clone()));
+                    return result;
+                }
+            }
         }
+    }
 
-        let reader = Arc::new(self.client.open_revision(uid).await.map_err(|e| {
-            warn!(%uid, error = %e, "open_revision failed");
-            Errno::EIO
-        })?);
-
-        let mut readers = self.readers.lock().unwrap();
-        // Someone may have opened one while we were on the network; either is
-        // equally fresh, so prefer theirs and let ours drop.
-        if let Some(entry) = readers.get_mut(uid)
-            && entry.mtime == mtime
-            && entry.size == fsize
-        {
-            entry.last_used = Instant::now();
-            return Ok(entry.reader.clone());
-        }
-
-        readers.insert(
-            uid.clone(),
-            CachedReader {
-                reader: reader.clone(),
-                mtime,
-                size: fsize,
-                last_used: Instant::now(),
-            },
-        );
-
-        // Bound the map: drop the least recently used until we are back at cap.
+    /// Bound the reader map: drop least-recently-used entries until it is back
+    /// at [`MAX_OPEN_READERS`]. Only `Ready` slots are eviction candidates — a
+    /// `Pending` has callers waiting on it and no reader to drop yet.
+    fn trim_readers(readers: &mut HashMap<NodeUid, ReaderSlot>) {
         while readers.len() > MAX_OPEN_READERS {
-            let Some(victim) = readers
+            let victim = readers
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(uid, _)| uid.clone())
-            else {
-                break;
+                .filter_map(|(uid, slot)| match slot {
+                    ReaderSlot::Ready(entry) => Some((uid, entry.last_used)),
+                    ReaderSlot::Pending(_) => None,
+                })
+                .min_by_key(|(_, last_used)| *last_used)
+                .map(|(uid, _)| uid.clone());
+            let Some(victim) = victim else {
+                break; // every slot is an open in flight; nothing to drop
             };
             readers.remove(&victim);
         }
-
-        Ok(reader)
     }
 
     /// Drop any open reader for `uid`, so the next read reopens against the
     /// current revision. Called wherever cached content is evicted.
+    ///
+    /// Drops an in-flight open too: its leader finds the slot gone and declines
+    /// to cache what it opened, which is what we want — the eviction says that
+    /// revision is no longer the truth.
     fn evict_reader(&self, uid: &NodeUid) {
         self.readers.lock().unwrap().remove(uid);
     }
@@ -1955,7 +2064,8 @@ impl Core {
                     self.log_activity(
                         ActivityKind::Rename,
                         &landed,
-                        "destination folder no longer exists; the file was left in place".to_string(),
+                        "destination folder no longer exists; the file was left in place"
+                            .to_string(),
                         false,
                     );
                 }
@@ -2474,9 +2584,56 @@ impl Core {
         }
         self.cache.discard_staged(&blob);
         self.evict_reader(&uid);
+        self.refresh_after_upload(&uid);
         self.log_activity(ActivityKind::Upload, &name, "uploaded", true);
         info!(%uid, len = meta.len, "pending upload landed");
         Ok(())
+    }
+
+    /// Adopt the server's metadata for a node we have just uploaded a revision
+    /// for.
+    ///
+    /// [`State::record_pending_write`] deliberately stamps the node with the
+    /// moment we *accepted* the write, so `ls` reflects it before the upload
+    /// lands. The server stamps the sealed revision with its own time, and the
+    /// two differ by however long the upload took. That difference is not
+    /// cosmetic: [`Core::remote_baseline`] reads this node to build
+    /// [`StagedWrite::based_on`], and [`Core::revision_conflict`] compares that
+    /// baseline against the remote — so leaving our optimistic time in place
+    /// makes the *next* write to this file look like another device changed it
+    /// underneath us, and diverts it into a conflict copy over nothing.
+    ///
+    /// Best effort: a failure here costs a spurious conflict copy on the next
+    /// write, not this upload, which has already landed.
+    fn refresh_after_upload(&self, uid: &NodeUid) {
+        // A write queued while this one was on the wire is ahead of the remote
+        // again, and its optimistic size/mtime must win — the same reason
+        // `apply_event` refuses to overwrite a node with a queued write.
+        if self.pending.lock().unwrap().contains_key(uid) {
+            return;
+        }
+        let node = match self.fetch_node_remote(uid) {
+            Ok(Some(node)) => node,
+            // Trashed or deleted under us: the tree will hear it from the event
+            // sync, which is better placed to unhook the inode than we are.
+            Ok(None) => return,
+            Err(e) => {
+                warn!(%uid, error = %e,
+                      "refreshing metadata after an upload failed; \
+                       the next write to this file may conflict with itself");
+                return;
+            }
+        };
+        let mut st = self.state.lock().unwrap();
+        let Some(parent) = st
+            .by_uid
+            .get(uid)
+            .and_then(|ino| st.entries.get(ino))
+            .map(|e| e.parent)
+        else {
+            return;
+        };
+        st.intern(parent, node);
     }
 
     /// Download a whole file's plaintext, registering the transfer so
@@ -5453,6 +5610,7 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
+        debug!(ino = ino.0, ?flags, base_size, base_mtime, "open");
         // Read-only opens stay stateless (fh 0). A write open allocates a
         // disk-backed handle; bytes are authored into a scratch file and the
         // untouched remainder is pulled from the base lazily (on read / commit).
@@ -5633,6 +5791,15 @@ impl Filesystem for ProtonFs {
             }
         };
         let new_uid = node.uid.clone();
+        // The base this handle writes over is the node as it actually exists —
+        // the empty file the server just minted — so its modification time comes
+        // from the node, never from the local clock. `queue_revision` turns this
+        // into `StagedWrite::based_on` and the drain compares that against the
+        // remote: a `now_secs()` here differs from the server's stamp by however
+        // long the create round-trip took, so the first write to a brand-new file
+        // conflicts with its own create whenever the second happens to tick in
+        // between.
+        let base_mtime = node.modification_time;
         let (file, path) = match self.core.cache.create_scratch() {
             Ok(x) => x,
             Err(e) => {
@@ -5661,7 +5828,7 @@ impl Filesystem for ProtonFs {
                 written: Intervals::default(),
                 len: 0,
                 base_size: 0,
-                base_mtime: now_secs(),
+                base_mtime,
                 dirty: false,
             },
         );
@@ -5753,29 +5920,44 @@ impl Filesystem for ProtonFs {
         // accepted and ignored so tools that chmod/utimes after writing succeed.
         if let Some(size) = size {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
-            let handled = match fh {
-                Some(fh) => {
-                    let mut st = self.core.state.lock().unwrap();
-                    match st.handles.get_mut(&fh) {
-                        Some(h) => {
-                            if size < h.len {
-                                // Shrink: drop authored ranges past the new end.
-                                h.written.clip(size);
-                            } else if size > h.len {
-                                // Grow: the new tail is defined as zeros, so claim
-                                // it as authored rather than base content.
-                                h.written.add(h.len, size);
-                            }
-                            let _ = h.file.set_len(size);
-                            h.len = size;
-                            h.dirty = true;
-                            true
+            let handled = {
+                let mut st = self.core.state.lock().unwrap();
+                // The kernel does not put `O_TRUNC` in the `open` flags unless
+                // the mount enables `atomic_o_trunc`; it opens, then truncates
+                // with a *separate* `setattr` carrying no file handle. So an fh
+                // is a hint, not a precondition — fall back to the write handle
+                // for this inode, the same lookup `read` does and for the same
+                // reason. Without it a `cp` over an existing file becomes two
+                // independent queued ops: a truncate, plus a release that still
+                // believes the file is its old length. They then conflict with
+                // each other and the write is diverted into a conflict copy.
+                let target = match fh {
+                    Some(fh) if st.handles.contains_key(&fh) => Some(fh),
+                    _ => st
+                        .handles
+                        .iter()
+                        .find(|(_, h)| h.ino == ino.0)
+                        .map(|(&fh, _)| fh),
+                };
+                match target.and_then(|fh| st.handles.get_mut(&fh)) {
+                    Some(h) => {
+                        if size < h.len {
+                            // Shrink: drop authored ranges past the new end.
+                            h.written.clip(size);
+                        } else if size > h.len {
+                            // Grow: the new tail is defined as zeros, so claim
+                            // it as authored rather than base content.
+                            h.written.add(h.len, size);
                         }
-                        None => false,
+                        let _ = h.file.set_len(size);
+                        h.len = size;
+                        h.dirty = true;
+                        true
                     }
+                    None => false,
                 }
-                None => false,
             };
+            debug!(ino = ino.0, size, fh = ?fh, handled, "setattr resize");
             if !handled {
                 // Path-based truncate with no open write handle — a shell's
                 // `> file`. This is the second write path into the API, and
