@@ -38,7 +38,7 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,8 +58,8 @@ use pdfs_core::control::{
     SyncPhase, SyncProgress, TransferDirection,
 };
 use pdfs_core::db::{
-    self, Db, OP_REVISION, PendingOp, StoredDevice, StoredNode, StoredPhoto, StoredSyncFolder,
-    StoredTrash,
+    self, Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_REVISION, PendingOp, StoredDevice, StoredNode,
+    StoredPhoto, StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
 use proton_drive_rs::proton_sdk::error::ProtonError;
@@ -351,6 +351,25 @@ impl State {
             e.node.modification_time = secs;
         }
     }
+
+    /// Record the size and mtime of a write that has been accepted but not yet
+    /// uploaded, persisting them like any other node mutation.
+    ///
+    /// The write-through is what makes the new size outlive the process: until
+    /// the op drains, the remote still holds the old revision (or, for a node
+    /// created offline, nothing at all), so this row is the only record that the
+    /// file is as long as the caller was told it is. Without it a restart serves
+    /// the stale size and the file reads as truncated — or empty — while its
+    /// bytes sit safely in staging (offline.md Phase 3).
+    fn record_pending_write(&mut self, ino: u64, size: u64, mtime: i64) {
+        self.set_size(ino, size);
+        self.touch_mtime(ino, mtime);
+        if let Some(e) = self.entries.get(&ino)
+            && let Err(err) = self.db.upsert_node(&e.node)
+        {
+            warn!(uid = %e.uid, error = %err, "db upsert_node failed for a queued write");
+        }
+    }
 }
 
 /// How many files the bulk uploader ships at once. Overlaps the per-file network
@@ -640,27 +659,59 @@ impl Core {
             }
         };
         let mut map = self.pending.lock().unwrap();
+        let mut restored = 0usize;
         for op in ops {
+            let Some(uid) = parse_node_uid(&op.uid) else {
+                error!(uid = %op.uid, id = op.id, "pending op has an unparseable uid; dropping");
+                let _ = self.db.delete_op(op.id);
+                continue;
+            };
+            restored += 1;
+            // A queued create carries no blob until something is written to it —
+            // `touch` offline is a legitimate op with nothing to serve. It still
+            // has to be replayed, so only its blob (if any) is checked here.
+            if op.blob_path.is_none() && op.kind != OP_REVISION {
+                continue;
+            }
             let parsed = op
                 .meta_json
                 .as_deref()
                 .and_then(|j| serde_json::from_str::<StagedWrite>(j).ok())
-                .zip(op.blob_path.as_deref().map(PathBuf::from))
-                .zip(parse_node_uid(&op.uid));
-            let Some(((meta, path), uid)) = parsed else {
+                .zip(op.blob_path.as_deref().map(PathBuf::from));
+            let Some((meta, path)) = parsed else {
                 error!(uid = %op.uid, id = op.id, "pending op is unreadable; dropping");
-                let _ = self.db.delete_op(op.id);
+                self.drop_unrecoverable_op(&op, &uid);
+                restored -= 1;
                 continue;
             };
             if !path.exists() {
                 error!(%uid, path = %path.display(), "staged blob is gone; dropping pending op");
-                let _ = self.db.delete_op(op.id);
+                self.drop_unrecoverable_op(&op, &uid);
+                restored -= 1;
                 continue;
             }
             map.insert(uid, PendingRevision { path, meta });
         }
-        if !map.is_empty() {
-            info!(count = map.len(), "restored pending uploads");
+        if restored > 0 {
+            info!(count = restored, "restored pending uploads");
+        }
+    }
+
+    /// Discard an op that can never be performed, because the bytes it was to
+    /// upload are gone from staging (something outside the daemon deleted them).
+    ///
+    /// For a node that only ever existed locally, the placeholder goes too. Its
+    /// content is unrecoverable and nothing will ever mint it a real uid, so
+    /// leaving the row would strand a file in the tree that can be listed but
+    /// never read and never uploaded.
+    fn drop_unrecoverable_op(&self, op: &PendingOp, uid: &NodeUid) {
+        let _ = self.db.delete_op(op.id);
+        if is_local_uid(uid) {
+            error!(%uid, name = op.name.as_deref().unwrap_or("?"),
+                   "discarding a node whose only copy was lost");
+            if let Err(e) = self.db.delete_node(uid) {
+                warn!(%uid, error = %e, "db delete_node failed for lost local node");
+            }
         }
     }
 
@@ -933,6 +984,12 @@ impl Core {
         if let Some(pending) = self.pending.lock().unwrap().get(uid).cloned() {
             return self.read_pending(&pending, offset, len);
         }
+        // A node created offline and never written has no blob and no remote: it
+        // is an empty file, and asking the API about a `local~` uid would only
+        // earn a 404 (offline.md Phase 3b).
+        if is_local_uid(uid) {
+            return Ok(Vec::new());
+        }
         self.read_range_remote(uid, mtime, fsize, offset, len)
     }
 
@@ -1186,8 +1243,19 @@ impl Core {
         // Materialize the full content now if we can. A complete blob is
         // uploadable without the network and, crucially, lets a later write to
         // the same file supersede this one safely.
-        let filled = self
-            .fill_gaps(
+        //
+        // A node that exists only locally has no remote base to fill from: its
+        // untouched ranges live in the blob queued by an earlier write, not on
+        // any server. Filling is only safe — and only needed — while it is still
+        // empty, which is exactly when `fill_gaps` skips the network anyway.
+        let filled = if is_local_uid(&h.uid) && h.base_size > 0 {
+            if let Err(e) = h.file.set_len(h.len) {
+                error!(uid = %h.uid, error = %e, "resize scratch file failed");
+                return Err(Errno::EIO);
+            }
+            false
+        } else {
+            self.fill_gaps(
                 &h.uid,
                 &h.file,
                 h.len,
@@ -1195,7 +1263,8 @@ impl Core {
                 h.base_size,
                 &h.written,
             )
-            .is_ok();
+            .is_ok()
+        };
         let authored: Vec<(u64, u64)> = if filled {
             vec![(0, h.len)]
         } else {
@@ -1229,21 +1298,48 @@ impl Core {
             error!(uid = %h.uid, error = %e, "staging write failed");
             Errno::EIO
         })?;
-        let op = PendingOp {
-            id: 0,
-            kind: OP_REVISION.to_string(),
-            uid: h.uid.to_string(),
-            blob_path: Some(path.to_string_lossy().into_owned()),
-            meta_json: Some(serde_json::to_string(&meta).unwrap_or_default()),
-            created_at: now_millis(),
-            attempts: 0,
-            last_error: None,
-            next_attempt_at: 0,
+        let meta_json = serde_json::to_string(&meta).unwrap_or_default();
+        let superseded = if is_local_uid(&h.uid) {
+            // The node has no server-side identity to hang a revision on, so the
+            // bytes ride on the create that will mint it.
+            let attached = self
+                .db
+                .attach_blob_to_create(&h.uid.to_string(), &path.to_string_lossy(), &meta_json)
+                .map_err(|e| {
+                    error!(uid = %h.uid, error = %e, "attaching write to queued create failed");
+                    Errno::EIO
+                })?;
+            match attached {
+                Some(a) => a.superseded,
+                None => {
+                    // The create drained between `release` and here, so the node
+                    // has a real uid now and this handle's is stale. The bytes are
+                    // safe in staging, but nothing here can address them.
+                    error!(uid = %h.uid, staged = %path.display(),
+                           "queued create vanished under a write; bytes kept in staging");
+                    return Err(Errno::EIO);
+                }
+            }
+        } else {
+            let op = PendingOp {
+                id: 0,
+                kind: OP_REVISION.to_string(),
+                uid: h.uid.to_string(),
+                parent_uid: None,
+                name: None,
+                blob_path: Some(path.to_string_lossy().into_owned()),
+                meta_json: Some(meta_json),
+                created_at: now_millis(),
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            };
+            let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
+                error!(uid = %h.uid, error = %e, "queueing upload failed");
+                Errno::EIO
+            })?;
+            superseded
         };
-        let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
-            error!(uid = %h.uid, error = %e, "queueing upload failed");
-            Errno::EIO
-        })?;
         if let Some(old) = superseded {
             self.cache.discard_staged(Path::new(&old));
         }
@@ -1256,8 +1352,7 @@ impl Core {
         let now = now_secs();
         {
             let mut st = self.state.lock().unwrap();
-            st.set_size(h.ino, h.len);
-            st.touch_mtime(h.ino, now);
+            st.record_pending_write(h.ino, h.len, now);
         }
         // Cached blobs and open readers describe the superseded revision. Reads
         // come from the staged blob until the op drains, so just drop them.
@@ -1266,6 +1361,46 @@ impl Core {
         self.wake_drain();
         debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
         Ok(())
+    }
+
+    /// Invent a node under `parent_uid` and queue the op that will make it real
+    /// (offline.md Phase 3b). Returns the node to intern, exactly as the online
+    /// path returns the one the server minted.
+    ///
+    /// The parent may itself be a placeholder — `mkdir -p` offline, or `cp -r` of
+    /// a tree. That is fine: the op records the parent it was made under, and the
+    /// parent's own drain rewrites it to the real uid before this op can run.
+    fn queue_local_node(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        is_dir: bool,
+    ) -> Result<Node, Errno> {
+        let uid = mint_local_uid();
+        let op = PendingOp {
+            id: 0,
+            kind: if is_dir { OP_MKDIR } else { OP_CREATE }.to_string(),
+            uid: uid.to_string(),
+            parent_uid: Some(parent_uid.to_string()),
+            name: Some(name.to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: now_millis(),
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        self.db.enqueue_op(&op).map_err(|e| {
+            error!(%parent_uid, name, error = %e, "queueing local node failed");
+            Errno::EIO
+        })?;
+        debug!(%uid, %parent_uid, name, is_dir, "created node offline; queued");
+        Ok(local_node(
+            uid,
+            parent_uid.clone(),
+            name.to_string(),
+            is_dir,
+        ))
     }
 
     /// Nudge the drain worker to re-examine the queue now.
@@ -1321,7 +1456,7 @@ impl Core {
                 .pending_ops()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|op| op.next_attempt_at <= now);
+                .find(|op| op.next_attempt_at <= now && op_is_ready(op));
 
             let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
                 self.wait_for_drain_work();
@@ -1359,9 +1494,129 @@ impl Core {
 
     /// Perform one queued op and retire it.
     fn drain_op(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
-        if op.kind != OP_REVISION {
-            return Err(format!("unknown pending op kind {:?}", op.kind).into());
+        match op.kind.as_str() {
+            OP_REVISION => self.drain_revision(op),
+            OP_CREATE | OP_MKDIR => self.drain_local_node(op),
+            other => Err(format!("unknown pending op kind {other:?}").into()),
         }
+    }
+
+    /// Make a node that so far exists only on this machine real, and adopt the
+    /// uid the server gives it (offline.md Phase 3b).
+    fn drain_local_node(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        let local = parse_node_uid(&op.uid).ok_or("pending op has an unparseable uid")?;
+        let parent_str = op.parent_uid.as_deref().ok_or("create op has no parent")?;
+        // `run_pending_drain` will not offer an op whose parent is still a
+        // placeholder, so reaching here with one is a bug, not a wait.
+        if is_local_uid_str(parent_str) {
+            return Err(format!("parent {parent_str} has not been created yet").into());
+        }
+        let parent = parse_node_uid(parent_str).ok_or("create op has an unparseable parent")?;
+        let name = op.name.clone().ok_or("create op has no name")?;
+
+        let real = if op.kind == OP_MKDIR {
+            self.rt
+                .block_on(self.client.create_folder(&parent, &name, Some(now_secs())))?
+        } else {
+            self.upload_created_file(op, &parent, &name)?
+        };
+
+        // Retire the op before touching anything else: if we crash here the node
+        // exists remotely and the local placeholder is reconciled by the event
+        // sync, whereas a surviving op would create the file a second time.
+        self.db.delete_op(op.id)?;
+        self.adopt_real_uid(&local, &real)?;
+        if let Some(blob) = op.blob_path.as_deref() {
+            self.cache.discard_staged(Path::new(blob));
+        }
+        self.pending.lock().unwrap().remove(&local);
+        self.log_activity(ActivityKind::Upload, &name, "created", true);
+        info!(%local, %real, name, kind = %op.kind, "pending create landed");
+        Ok(())
+    }
+
+    /// Upload the bytes a queued create accumulated, if any. A file that was
+    /// created but never written (`touch`) has no blob and uploads as empty.
+    fn upload_created_file(
+        &self,
+        op: &PendingOp,
+        parent: &NodeUid,
+        name: &str,
+    ) -> Result<NodeUid, Box<dyn std::error::Error>> {
+        let Some(blob) = op.blob_path.as_deref() else {
+            return Ok(self.rt.block_on(self.client.upload_file(
+                parent,
+                name,
+                media_type_for(name),
+                b"",
+            ))?);
+        };
+        let meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
+        // An incomplete blob would be authored bytes over zeros, and there is no
+        // base to repair it from — the file has never existed remotely. Refusing
+        // to queue that is `queue_revision`'s job, so reaching here means the blob
+        // is whole.
+        if !meta.complete {
+            return Err("queued create holds an incomplete blob".into());
+        }
+        let guard = self
+            .transfers
+            .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);
+        let reader = CountingReader::new(File::open(blob)?, &guard);
+        let uid = self.rt.block_on(self.client.upload_file_from(
+            parent,
+            name,
+            media_type_for(name),
+            reader,
+            meta.len as i64,
+            Vec::new(),
+            None,
+            false,
+        ))?;
+        Ok(uid)
+    }
+
+    /// Swap a placeholder uid for the real one across everything that keyed off
+    /// it: queued children, the DB, the in-memory tree, and the caches.
+    ///
+    /// The inode is deliberately kept, so anything already holding the file open
+    /// keeps working across the drain.
+    fn adopt_real_uid(
+        &self,
+        local: &NodeUid,
+        real: &NodeUid,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let node = self.fetch_node(real).map_err(|e| format!("{e:?}"))?;
+        // Repoints queued children and node rows, and drops the placeholder row.
+        self.db
+            .remap_local_uid(&local.to_string(), &real.to_string())?;
+
+        let mut st = self.state.lock().unwrap();
+        if let Some(ino) = st.by_uid.remove(local) {
+            st.by_uid.insert(real.clone(), ino);
+            if let Some(e) = st.entries.get_mut(&ino) {
+                e.uid = real.clone();
+                e.node = node.clone();
+            }
+        }
+        drop(st);
+        // Write the real node through, now that nothing points at the old uid.
+        if let Err(e) = self.db.upsert_node(&node) {
+            warn!(%real, error = %e, "db upsert_node failed after remap");
+        }
+        if node.is_folder() {
+            // It was recorded as listed while local (it was empty and had nothing
+            // to enumerate). That still holds: its queued children re-intern under
+            // the real uid as they drain.
+            if let Err(e) = self.db.set_listed(real, true) {
+                warn!(%real, error = %e, "db set_listed(true) failed after remap");
+            }
+        }
+        Ok(())
+    }
+
+    /// Upload a staged revision of a file the server already knows about.
+    fn drain_revision(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
         let blob = op
             .blob_path
             .clone()
@@ -3917,6 +4172,28 @@ impl ProtonFs {
                 return;
             }
         };
+        // A node the server has never heard of cannot be trashed there; deleting
+        // it just means its queued creation is no longer wanted. This works
+        // offline, which the remote path below cannot (offline.md Phase 3b).
+        if is_local_uid(&uid) {
+            match self.core.db.delete_ops_for_uid(&uid.to_string()) {
+                Ok(blobs) => {
+                    for blob in blobs {
+                        self.core.cache.discard_staged(Path::new(&blob));
+                    }
+                }
+                Err(e) => {
+                    error!(%uid, error = %e, "dropping queued ops for a local node failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+            self.core.pending.lock().unwrap().remove(&uid);
+            self.core.state.lock().unwrap().forget(&uid);
+            debug!(%uid, name, "deleted a node that had not been created remotely yet");
+            reply.ok();
+            return;
+        }
         if let Err(e) = self
             .core
             .rt
@@ -3957,6 +4234,79 @@ fn now_millis() -> i64 {
 fn parse_node_uid(s: &str) -> Option<NodeUid> {
     let (vol, link) = s.split_once('~')?;
     Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
+}
+
+/// Distinguishes placeholder uids minted by [`mint_local_uid`] within one run.
+static LOCAL_UID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Invent a uid for a node created while offline, so it can be interned, listed
+/// and written to before the server has ever heard of it (offline.md Phase 3b).
+///
+/// Uniqueness only has to hold among this machine's undrained ops, so the clock
+/// (which separates runs) plus a counter (which separates nodes within a run) is
+/// enough without taking on a uuid dependency.
+fn mint_local_uid() -> NodeUid {
+    let seq = LOCAL_UID_SEQ.fetch_add(1, Ordering::Relaxed);
+    NodeUid::new(
+        VolumeId::from(LOCAL_VOLUME),
+        LinkId::from(format!("{}-{seq}", now_millis())),
+    )
+}
+
+/// Whether this node exists only on this machine, so far. Such a uid is
+/// meaningless to the API and must never be sent to it.
+fn is_local_uid(uid: &NodeUid) -> bool {
+    uid.volume_id.as_str() == LOCAL_VOLUME
+}
+
+/// [`is_local_uid`] for a uid in its persisted `Display` form.
+fn is_local_uid_str(s: &str) -> bool {
+    s.split_once('~')
+        .is_some_and(|(vol, _)| vol == LOCAL_VOLUME)
+}
+
+/// Whether an op can be attempted now, as opposed to waiting on another op.
+///
+/// A node created inside a folder that was itself created offline cannot be sent
+/// anywhere until that folder is real — the API has never heard of `local~…`.
+/// Ops replay in queue order, so the parent normally drains first and rewrites
+/// this one; the check matters when the parent is instead backing off after a
+/// failure, where the child must wait rather than burn its own retries.
+fn op_is_ready(op: &PendingOp) -> bool {
+    !op.parent_uid.as_deref().is_some_and(is_local_uid_str)
+}
+
+/// Fabricate the node the server would have returned, for a `create`/`mkdir`
+/// that could not reach it. Everything the kernel asks about a fresh node —
+/// name, kind, size, times — is knowable locally; the uid is the only invention,
+/// and the drain replaces it with the real one.
+fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> Node {
+    let now = now_secs();
+    Node {
+        uid,
+        parent_uid: Some(parent_uid),
+        kind: if is_dir {
+            NodeKind::Folder
+        } else {
+            NodeKind::File {
+                media_type: media_type_for(&name).to_string(),
+                total_size_on_storage: 0,
+                // No revision has been sealed: nothing has been uploaded yet.
+                active_revision_state: None,
+                claimed_size: Some(0),
+                claimed_modification_time: None,
+            }
+        },
+        name,
+        creation_time: now,
+        modification_time: now,
+        trashed: false,
+        is_shared: false,
+        is_shared_publicly: false,
+        signature_email: None,
+        // Nothing signed it: it has never been near the crypto layer.
+        verification: Default::default(),
+    }
 }
 
 /// This machine's hostname, used to name (and later recover) its Proton Drive
@@ -4372,28 +4722,45 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
-        // Create an empty file on the remote so it has a real uid immediately;
-        // written bytes are buffered and sealed as a new revision on close.
-        let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
-            &parent_uid,
-            &name,
-            media_type_for(&name),
-            b"",
-        )) {
-            Ok(u) => u,
-            Err(e) => {
-                error!(%parent_uid, name, error = %e, "create file failed");
-                reply.error(Errno::EIO);
-                return;
+        // Offline the server cannot mint a uid, so invent one and queue the
+        // create. The file is real to the caller either way; only its identity is
+        // provisional until the drain (offline.md Phase 3b).
+        //
+        // A parent that is itself still queued forces the same path even when we
+        // are online: the API has no folder to put this in yet.
+        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
+            // Create an empty file on the remote so it has a real uid immediately;
+            // written bytes are buffered and sealed as a new revision on close.
+            let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
+                &parent_uid,
+                &name,
+                media_type_for(&name),
+                b"",
+            )) {
+                Ok(u) => u,
+                Err(e) => {
+                    error!(%parent_uid, name, error = %e, "create file failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+            match self.core.fetch_node(&new_uid) {
+                Ok(n) => n,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+        } else {
+            match self.core.queue_local_node(&parent_uid, &name, false) {
+                Ok(n) => n,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             }
         };
-        let node = match self.core.fetch_node(&new_uid) {
-            Ok(n) => n,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
+        let new_uid = node.uid.clone();
         let (file, path) = match self.core.cache.create_scratch() {
             Ok(x) => x,
             Err(e) => {
@@ -4703,32 +5070,56 @@ impl Filesystem for ProtonFs {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .ok();
-        let new_uid =
-            match self
-                .core
-                .rt
-                .block_on(self.core.client.create_folder(&parent_uid, &name, now))
-            {
-                Ok(u) => u,
+        // As in `create`: offline — or under a parent that is itself still
+        // queued — the folder becomes a placeholder that the drain turns into a
+        // real one (offline.md Phase 3b).
+        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
+            let new_uid =
+                match self
+                    .core
+                    .rt
+                    .block_on(self.core.client.create_folder(&parent_uid, &name, now))
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!(%parent_uid, name, error = %e, "create folder failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+            match self.core.fetch_node(&new_uid) {
+                Ok(n) => n,
                 Err(e) => {
-                    error!(%parent_uid, name, error = %e, "create folder failed");
-                    reply.error(Errno::EIO);
+                    reply.error(e);
                     return;
                 }
-            };
-        let node = match self.core.fetch_node(&new_uid) {
-            Ok(n) => n,
-            Err(e) => {
-                reply.error(e);
-                return;
+            }
+        } else {
+            match self.core.queue_local_node(&parent_uid, &name, true) {
+                Ok(n) => n,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
             }
         };
         let mut st = self.core.state.lock().unwrap();
+        let local = is_local_uid(&node.uid);
+        let uid = node.uid.clone();
         let ino = st.intern(parent, node);
         if let Some(kids) = st.children.get_mut(&parent)
             && !kids.contains(&ino)
         {
             kids.push(ino);
+        }
+        // A folder that exists only here has nothing to enumerate, and asking the
+        // API to enumerate a `local~` uid would 404. Record it as fully listed and
+        // empty, which it is, so reads stay offline-clean across a restart too.
+        if local {
+            st.children.insert(ino, Vec::new());
+            if let Err(e) = self.core.db.set_listed(&uid, true) {
+                warn!(%uid, error = %e, "db set_listed(true) failed for local folder");
+            }
         }
         let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
         reply.entry(&TTL, &attr, Generation(0));
@@ -4755,6 +5146,15 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
+        // Renaming a node whose creation is still queued would send a `local~`
+        // uid to the API. Doing this properly means rewriting the queued op
+        // rather than calling the API at all; until then, refuse rather than
+        // 404 or silently diverge (offline.md Phase 3b).
+        if is_local_uid(&uid) {
+            warn!(%uid, name, newname, "cannot rename a node whose create is still queued");
+            reply.error(Errno::EBUSY);
+            return;
+        }
         // Move first if the parent changed, then rename if the name changed.
         if newparent != parent {
             if let Err(e) = self.core.ensure_children(newparent) {
@@ -4771,6 +5171,13 @@ impl Filesystem for ProtonFs {
                     }
                 }
             };
+            // Same reasoning as above, from the other side: the destination
+            // folder may not exist remotely yet.
+            if is_local_uid(&new_parent_uid) {
+                warn!(%uid, %new_parent_uid, "cannot move into a folder whose create is still queued");
+                reply.error(Errno::EBUSY);
+                return;
+            }
             if let Err(e) = self
                 .core
                 .rt
@@ -6143,6 +6550,96 @@ mod thumb_tests {
     #[test]
     fn ratio_is_read_from_the_header_alone() {
         assert_eq!(ratio_of(&jpeg(300, 200)), Some(1.5));
+    }
+}
+
+#[cfg(test)]
+mod local_uid_tests {
+    use super::*;
+
+    #[test]
+    fn a_minted_uid_is_recognisable_and_round_trips() {
+        let uid = mint_local_uid();
+        assert!(is_local_uid(&uid));
+        assert!(is_local_uid_str(&uid.to_string()));
+
+        // It has to survive the trip through `pending_op.uid` as text, like any
+        // other uid does.
+        let parsed = parse_node_uid(&uid.to_string()).expect("parses back");
+        assert_eq!(parsed, uid);
+    }
+
+    #[test]
+    fn minted_uids_are_distinct_within_a_run() {
+        // Two files created in the same millisecond must not collide — the whole
+        // queue is keyed by uid.
+        let a = mint_local_uid();
+        let b = mint_local_uid();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_real_uid_is_never_mistaken_for_a_placeholder() {
+        let real = NodeUid::new(VolumeId::from("vol1"), LinkId::from("link1"));
+        assert!(!is_local_uid(&real));
+        assert!(!is_local_uid_str("vol1~link1"));
+        // Not a uid at all.
+        assert!(!is_local_uid_str("local"));
+        // The sentinel is the *volume*; a link that merely says "local" is real.
+        assert!(!is_local_uid_str("vol1~local"));
+    }
+
+    #[test]
+    fn an_op_waits_for_a_parent_that_is_still_a_placeholder() {
+        let op = |parent: Option<&str>| PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~child".to_string(),
+            parent_uid: parent.map(str::to_string),
+            name: Some("f.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 0,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        // Sending this to the API would 404: the folder does not exist yet.
+        assert!(!op_is_ready(&op(Some("local~dir"))));
+        assert!(op_is_ready(&op(Some("vol1~dir"))));
+        // A revision op names no parent and is always ready.
+        assert!(op_is_ready(&op(None)));
+    }
+
+    #[test]
+    fn a_placeholder_file_reports_itself_as_empty_and_unsealed() {
+        let parent = NodeUid::new(VolumeId::from("vol1"), LinkId::from("dir"));
+        let node = local_node(mint_local_uid(), parent.clone(), "notes.txt".into(), false);
+
+        assert_eq!(node.name, "notes.txt");
+        assert_eq!(node.parent_uid, Some(parent));
+        assert!(!node.trashed);
+        match node.kind {
+            NodeKind::File {
+                claimed_size,
+                active_revision_state,
+                ref media_type,
+                ..
+            } => {
+                assert_eq!(claimed_size, Some(0));
+                // Nothing has been uploaded, so there is no sealed revision.
+                assert!(active_revision_state.is_none());
+                assert_eq!(media_type, "text/plain");
+            }
+            NodeKind::Folder => panic!("expected a file"),
+        }
+    }
+
+    #[test]
+    fn a_placeholder_folder_is_a_folder() {
+        let parent = NodeUid::new(VolumeId::from("vol1"), LinkId::from("root"));
+        let node = local_node(mint_local_uid(), parent, "photos".into(), true);
+        assert!(node.is_folder());
     }
 }
 

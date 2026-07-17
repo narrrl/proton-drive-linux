@@ -23,16 +23,36 @@ use crate::control::{ActivityEntry, ActivityKind};
 use crate::localindex::LocalEntry;
 
 /// Current schema version. Bump on every forward migration added below.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// How many activity rows to keep. Older rows are pruned on insert, so the feed
 /// stays a bounded "recent history" rather than growing without limit.
 const ACTIVITY_KEEP: i64 = 2000;
 
 /// The `kind` of a [`PendingOp`] that uploads a staged file as a new revision.
-/// The only kind so far: metadata mutations still go straight to the API and so
-/// still need the network (offline.md Phase 3 is landing in two halves).
 pub const OP_REVISION: &str = "revision";
+
+/// The `kind` of a [`PendingOp`] that creates a file that so far exists only
+/// locally, under a `local:` placeholder uid (offline.md Phase 3b).
+///
+/// The written bytes ride along on the same row rather than as a follow-on
+/// [`OP_REVISION`]: draining the create mints the node's real uid, which would
+/// leave a separate revision op addressed to a uid that no longer exists.
+pub const OP_CREATE: &str = "create";
+
+/// The `kind` of a [`PendingOp`] that creates a folder that so far exists only
+/// locally. Ordering matters: a child's op is queued after its parent's and
+/// [`Db::pending_ops`] replays by row id, so the parent has a real uid by the
+/// time the child drains.
+pub const OP_MKDIR: &str = "mkdir";
+
+/// The volume id given to a node that exists only on this machine, so far. A
+/// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
+/// round-trips through the same `Display`/parse path as any other uid.
+///
+/// Nothing bearing this volume may be handed to the API — it would 404. The
+/// drain replaces it with the uid the server assigns.
+pub const LOCAL_VOLUME: &str = "local";
 
 /// A mutation that has been accepted locally but not yet performed against the
 /// API — the durable half of the write-back queue (offline.md Phase 3).
@@ -45,10 +65,17 @@ pub const OP_REVISION: &str = "revision";
 pub struct PendingOp {
     /// Row id, `0` on a value being inserted.
     pub id: i64,
-    /// See [`OP_REVISION`].
+    /// See [`OP_REVISION`], [`OP_CREATE`], [`OP_MKDIR`].
     pub kind: String,
-    /// Node this op targets.
+    /// Node this op targets. For [`OP_CREATE`]/[`OP_MKDIR`] this is the
+    /// `local~<uuid>` placeholder the node is known by until it drains.
     pub uid: String,
+    /// Where the new node goes; only set for [`OP_CREATE`]/[`OP_MKDIR`]. May
+    /// itself be a placeholder when the parent folder is also still queued, in
+    /// which case it is rewritten when the parent drains.
+    pub parent_uid: Option<String>,
+    /// The new node's name; only set for [`OP_CREATE`]/[`OP_MKDIR`].
+    pub name: Option<String>,
     /// Staged blob holding the bytes to upload.
     pub blob_path: Option<String>,
     /// Serialized [`StagedWrite`](crate::cache::StagedWrite).
@@ -59,6 +86,15 @@ pub struct PendingOp {
     pub last_error: Option<String>,
     /// Earliest ms at which to retry, for backoff.
     pub next_attempt_at: i64,
+}
+
+/// The outcome of folding freshly written bytes into a queued create.
+#[derive(Debug, Clone)]
+pub struct AttachedBlob {
+    /// Row id of the create the bytes were attached to.
+    pub id: i64,
+    /// Blob the create held before, now orphaned.
+    pub superseded: Option<String>,
 }
 
 /// Size the WAL is truncated back to after a checkpoint. Comfortably above the
@@ -266,6 +302,9 @@ impl Db {
         }
         if current < 11 {
             tx.execute_batch(MIGRATION_V11)?;
+        }
+        if current < 12 {
+            tx.execute_batch(MIGRATION_V12)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -485,29 +524,124 @@ impl Db {
         Ok(())
     }
 
-    /// Queue an upload to be performed by the drain worker, returning its row id.
+    /// Queue an op to be performed by the drain worker, returning its row id.
     ///
-    /// One pending op per node: a second write to the same file before the first
-    /// has drained replaces it, since the newer blob already contains everything
-    /// the older one did. The superseded blob's path is returned so the caller can
-    /// delete it.
+    /// One *revision* op per node: a second write to the same file before the
+    /// first has drained replaces it, since the newer blob already contains
+    /// everything the older one did. The superseded blob's path is returned so
+    /// the caller can delete it.
+    ///
+    /// Only revision rows supersede, and only each other. A create op for the
+    /// same uid must survive — dropping it would leave a file that exists
+    /// nowhere but this machine with nothing left to create it. (Writes to a
+    /// node that is itself still queued fold into the create row instead; see
+    /// [`Db::attach_blob_to_create`].)
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
         let conn = self.conn.lock().unwrap();
         let superseded: Option<String> = conn
             .query_row(
-                "SELECT blob_path FROM pending_op WHERE uid = ?1",
-                params![op.uid],
+                "SELECT blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
+                params![op.uid, OP_REVISION],
                 |r| r.get(0),
             )
             .optional()?
             .flatten();
-        conn.execute("DELETE FROM pending_op WHERE uid = ?1", params![op.uid])?;
+        if op.kind == OP_REVISION {
+            conn.execute(
+                "DELETE FROM pending_op WHERE uid = ?1 AND kind = ?2",
+                params![op.uid, OP_REVISION],
+            )?;
+        }
         conn.execute(
-            "INSERT INTO pending_op (kind, uid, blob_path, meta_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![op.kind, op.uid, op.blob_path, op.meta_json, op.created_at],
+            "INSERT INTO pending_op
+               (kind, uid, parent_uid, name, blob_path, meta_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                op.kind,
+                op.uid,
+                op.parent_uid,
+                op.name,
+                op.blob_path,
+                op.meta_json,
+                op.created_at
+            ],
         )?;
         Ok((conn.last_insert_rowid(), superseded))
+    }
+
+    /// Point a queued create at the bytes that were just written to it, returning
+    /// any blob it previously held so the caller can discard it.
+    ///
+    /// This is what `release` does for a file that only exists locally: the node
+    /// has no uid to hang a revision op on yet, so the bytes ride on the create.
+    /// Repeated writes before the drain simply replace the blob.
+    ///
+    /// Returns `Ok(None)` and touches nothing if the create has already drained —
+    /// the caller must then queue an ordinary revision against the real uid.
+    pub fn attach_blob_to_create(
+        &self,
+        uid: &str,
+        blob_path: &str,
+        meta_json: &str,
+    ) -> Result<Option<AttachedBlob>> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT id, blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
+                params![uid, OP_CREATE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, superseded)) = existing else {
+            return Ok(None);
+        };
+        conn.execute(
+            "UPDATE pending_op
+             SET blob_path = ?2, meta_json = ?3, attempts = 0, next_attempt_at = 0
+             WHERE id = ?1",
+            params![id, blob_path, meta_json],
+        )?;
+        Ok(Some(AttachedBlob { id, superseded }))
+    }
+
+    /// Drop every op targeting a node, returning the staged blobs they held so
+    /// the caller can delete them.
+    ///
+    /// Used when a node that only ever existed locally is deleted: there is
+    /// nothing on the server to trash, so the queued work simply stops being
+    /// wanted.
+    pub fn delete_ops_for_uid(&self, uid: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let blobs: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT blob_path FROM pending_op WHERE uid = ?1 AND blob_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![uid], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.execute("DELETE FROM pending_op WHERE uid = ?1", params![uid])?;
+        tx.commit()?;
+        Ok(blobs)
+    }
+
+    /// Rewrite every queued op that points at a placeholder parent, once that
+    /// parent has drained and has a real uid. Also moves the node rows whose
+    /// parent column still names the placeholder, so listings keep resolving.
+    pub fn remap_local_uid(&self, local: &str, real: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
+            params![local, real],
+        )?;
+        tx.execute(
+            "UPDATE nodes SET parent_uid = ?2 WHERE parent_uid = ?1",
+            params![local, real],
+        )?;
+        tx.execute("DELETE FROM nodes WHERE uid = ?1", params![local])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every queued op, oldest first. The drain worker replays them in this order
@@ -515,8 +649,8 @@ impl Db {
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, kind, uid, blob_path, meta_json, created_at, attempts,
-                    last_error, next_attempt_at
+            "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                    attempts, last_error, next_attempt_at
              FROM pending_op ORDER BY id",
         )?;
         let rows = stmt
@@ -525,12 +659,14 @@ impl Db {
                     id: r.get(0)?,
                     kind: r.get(1)?,
                     uid: r.get(2)?,
-                    blob_path: r.get(3)?,
-                    meta_json: r.get(4)?,
-                    created_at: r.get(5)?,
-                    attempts: r.get(6)?,
-                    last_error: r.get(7)?,
-                    next_attempt_at: r.get(8)?,
+                    parent_uid: r.get(3)?,
+                    name: r.get(4)?,
+                    blob_path: r.get(5)?,
+                    meta_json: r.get(6)?,
+                    created_at: r.get(7)?,
+                    attempts: r.get(8)?,
+                    last_error: r.get(9)?,
+                    next_attempt_at: r.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1695,6 +1831,24 @@ CREATE TABLE pending_op (
 CREATE INDEX pending_op_uid ON pending_op(uid);
 ";
 
+/// Schema v12: `pending_op` also carries mutations that *create* a node, which a
+/// revision op never had to describe — it always addressed a node the server had
+/// already minted a uid for (offline.md Phase 3b).
+///
+/// An offline `create`/`mkdir` cannot get a real uid, so the node is invented
+/// locally under a `local~<uuid>` placeholder and the op records where it goes
+/// (`parent_uid`) and what it is called (`name`). Both are nullable because a
+/// revision op sets neither.
+///
+/// `parent_uid` is indexed: draining a folder rewrites every queued child that
+/// points at its placeholder.
+const MIGRATION_V12: &str = "
+ALTER TABLE pending_op ADD COLUMN parent_uid TEXT;
+ALTER TABLE pending_op ADD COLUMN name TEXT;
+
+CREATE INDEX pending_op_parent ON pending_op(parent_uid);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2189,6 +2343,8 @@ mod tests {
             id: 0,
             kind: OP_REVISION.to_string(),
             uid: uid("a").to_string(),
+            parent_uid: None,
+            name: None,
             blob_path: Some(blob.to_string()),
             meta_json: Some("{}".to_string()),
             created_at: 1,
@@ -2214,12 +2370,95 @@ mod tests {
     }
 
     #[test]
+    fn a_write_folds_into_a_queued_create_instead_of_superseding_it() {
+        let db = Db::open_in_memory().unwrap();
+        let local = "local~abc";
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("parent").to_string()),
+            name: Some("new.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+        let first = db
+            .attach_blob_to_create(local, "/staging/first", "{}")
+            .unwrap()
+            .expect("create is still queued");
+        assert_eq!(first.superseded, None);
+
+        // Rewriting the file before it drains replaces the bytes but must leave
+        // the create itself alone: it is the only thing that will ever bring this
+        // file into existence remotely.
+        let second = db
+            .attach_blob_to_create(local, "/staging/second", "{}")
+            .unwrap()
+            .expect("create is still queued");
+        assert_eq!(second.superseded.as_deref(), Some("/staging/first"));
+
+        let ops = db.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1, "still exactly one create");
+        assert_eq!(ops[0].kind, OP_CREATE);
+        assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
+        assert_eq!(ops[0].name.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn attaching_to_an_already_drained_create_reports_it_is_gone() {
+        let db = Db::open_in_memory().unwrap();
+        // No create queued: the caller must fall back to a revision op rather
+        // than silently dropping the bytes.
+        let out = db
+            .attach_blob_to_create("local~gone", "/staging/x", "{}")
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn draining_a_folder_repoints_its_queued_children() {
+        let db = Db::open_in_memory().unwrap();
+        let local_dir = "local~dir";
+        let real_dir = uid("realdir").to_string();
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~child".to_string(),
+            parent_uid: Some(local_dir.to_string()),
+            name: Some("inside.txt".to_string()),
+            blob_path: Some("/staging/child".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 2,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+        db.remap_local_uid(local_dir, &real_dir).unwrap();
+
+        // The child was queued against a folder that did not exist yet. Once the
+        // folder is real, the child must target the server's uid — otherwise the
+        // upload would address `local~dir` and 404.
+        let ops = db.pending_ops().unwrap();
+        assert_eq!(ops[0].parent_uid.as_deref(), Some(real_dir.as_str()));
+    }
+
+    #[test]
     fn a_failed_op_stays_queued_with_backoff() {
         let db = Db::open_in_memory().unwrap();
         db.enqueue_op(&PendingOp {
             id: 0,
             kind: OP_REVISION.to_string(),
             uid: uid("a").to_string(),
+            parent_uid: None,
+            name: None,
             blob_path: Some("/staging/blob".to_string()),
             meta_json: Some("{}".to_string()),
             created_at: 1,
