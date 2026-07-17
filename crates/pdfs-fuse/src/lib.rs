@@ -49,7 +49,7 @@ use fuser::{
     RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
-use pdfs_core::cache::{BLOCK_SIZE, ContentCache, StagedWrite};
+use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
@@ -58,10 +58,11 @@ use pdfs_core::control::{
     SyncPhase, SyncProgress, TransferDirection,
 };
 use pdfs_core::db::{
-    self, Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_REVISION, PendingOp, StoredDevice, StoredNode,
-    StoredPhoto, StoredSyncFolder, StoredTrash,
+    self, Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp,
+    StoredDevice, StoredNode, StoredPhoto, StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
+use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, DriveEventId, LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{
@@ -277,8 +278,6 @@ struct State {
 }
 
 impl State {
-    /// Allocate (or reuse) a stable inode for a node and store its metadata,
-    /// writing the node through to the DB.
     fn intern(&mut self, parent: u64, node: Node) -> u64 {
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(uid = %node.uid, error = %e, "db upsert_node failed");
@@ -304,6 +303,62 @@ impl State {
         ino
     }
 
+    /// Allocate (or reuse) a stable inode for a node loaded from the database
+    /// without writing it back.
+    fn intern_from_db(&mut self, parent: u64, node: Node) -> u64 {
+        if let Some(&ino) = self.by_uid.get(&node.uid) {
+            if let Some(e) = self.entries.get_mut(&ino) {
+                e.node = node;
+                e.parent = parent;
+            }
+            return ino;
+        }
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.by_uid.insert(node.uid.clone(), ino);
+        self.entries.insert(
+            ino,
+            Entry {
+                uid: node.uid.clone(),
+                parent,
+                node,
+            },
+        );
+        ino
+    }
+
+    /// Allocate (or reuse) stable inodes for a batch of nodes, writing all of them
+    /// to the DB in a single transaction.
+    fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
+        if let Err(e) = self.db.upsert_nodes(&nodes) {
+            warn!(error = %e, "db upsert_nodes failed");
+        }
+        let mut inos = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if let Some(&ino) = self.by_uid.get(&node.uid) {
+                if let Some(e) = self.entries.get_mut(&ino) {
+                    e.node = node;
+                    e.parent = parent;
+                }
+                inos.push(ino);
+                continue;
+            }
+            let ino = self.next_ino;
+            self.next_ino += 1;
+            self.by_uid.insert(node.uid.clone(), ino);
+            self.entries.insert(
+                ino,
+                Entry {
+                    uid: node.uid.clone(),
+                    parent,
+                    node,
+                },
+            );
+            inos.push(ino);
+        }
+        inos
+    }
+
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
     /// listing, its slot in its parent's listing, and its DB row. Returns
     /// `(parent_ino, name)` when the node was known, so the caller can notify
@@ -319,6 +374,40 @@ impl State {
             kids.retain(|&k| k != ino);
         }
         Some((entry.parent, entry.node.name))
+    }
+
+    /// Move a node to a new parent and/or name within the tree, writing it
+    /// through like any other mutation.
+    ///
+    /// The online rename instead forgets the node and lets the destination
+    /// re-enumerate, which is the cheaper way to stay honest about what the
+    /// server did. A queued rename cannot: re-enumerating needs the network, and
+    /// the server has not been told yet in any case — so this *is* the tree's
+    /// new truth until the op drains (offline.md Phase 3b).
+    fn rename_in_place(&mut self, ino: u64, new_parent: u64, new_parent_uid: &NodeUid, name: &str) {
+        let Some(entry) = self.entries.get_mut(&ino) else {
+            return;
+        };
+        let old_parent = entry.parent;
+        entry.parent = new_parent;
+        entry.node.name = name.to_string();
+        entry.node.parent_uid = Some(new_parent_uid.clone());
+        let node = entry.node.clone();
+        if old_parent != new_parent {
+            if let Some(kids) = self.children.get_mut(&old_parent) {
+                kids.retain(|&k| k != ino);
+            }
+            // Only if the destination is listed: pushing into a listing that was
+            // never enumerated would invent a one-child folder.
+            if let Some(kids) = self.children.get_mut(&new_parent)
+                && !kids.contains(&ino)
+            {
+                kids.push(ino);
+            }
+        }
+        if let Err(e) = self.db.upsert_node(&node) {
+            warn!(uid = %node.uid, error = %e, "db upsert_node failed for a queued rename");
+        }
     }
 
     /// Drop a directory's cached child listing and mark it unlisted in the DB,
@@ -667,9 +756,10 @@ impl Core {
                 continue;
             };
             restored += 1;
-            // A queued create carries no blob until something is written to it —
-            // `touch` offline is a legitimate op with nothing to serve. It still
-            // has to be replayed, so only its blob (if any) is checked here.
+            // Only a revision must have a blob. A create carries none until
+            // something is written to it (`touch` offline is a legitimate op
+            // with nothing to serve), and a rename or trash never has one. All
+            // still have to be replayed, so only the blob — if any — is checked.
             if op.blob_path.is_none() && op.kind != OP_REVISION {
                 continue;
             }
@@ -693,7 +783,7 @@ impl Core {
             map.insert(uid, PendingRevision { path, meta });
         }
         if restored > 0 {
-            info!(count = restored, "restored pending uploads");
+            info!(count = restored, "restored pending ops");
         }
     }
 
@@ -782,7 +872,7 @@ impl Core {
                     if node.trashed || node.uid == folder_uid {
                         continue;
                     }
-                    child_inos.push(st.intern(ino, node));
+                    child_inos.push(st.intern_from_db(ino, node));
                 }
                 st.children.insert(ino, child_inos);
                 return Ok(());
@@ -812,14 +902,12 @@ impl Core {
             return Ok(());
         }
         let mut child_inos = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            // A folder listed among its own children would alias its inode into
-            // its own listing, which the kernel rejects with EIO.
-            if node.trashed || node.uid == folder_uid {
-                continue;
-            }
-            child_inos.push(st.intern(ino, node));
-        }
+        let filtered_nodes: Vec<Node> = nodes
+            .into_iter()
+            .filter(|node| !node.trashed && node.uid != folder_uid)
+            .collect();
+        let inos = st.intern_batch(ino, filtered_nodes);
+        child_inos.extend(inos);
         st.children.insert(ino, child_inos);
         // Record the listing as complete so a later restart (or a trimmed hot
         // cache) can rebuild it from the DB without the API.
@@ -875,14 +963,30 @@ impl Core {
 
     /// Fetch a single node's current metadata from the remote.
     fn fetch_node(&self, uid: &NodeUid) -> Result<Node, Errno> {
-        let nodes = self
+        match self.fetch_node_remote(uid) {
+            Ok(Some(node)) => Ok(node),
+            Ok(None) => Err(Errno::ENOENT),
+            Err(e) => {
+                error!(%uid, error = %e, "enumerate node failed");
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    /// [`Core::fetch_node`] without the collapse to an `Errno`, for the drain:
+    /// resolving a conflict turns on *why* a call failed, and "the node is not
+    /// there" (`Ok(None)`) is a different outcome from "we could not ask".
+    fn fetch_node_remote(&self, uid: &NodeUid) -> Result<Option<Node>, ProtonError> {
+        match self
             .rt
             .block_on(self.client.enumerate_nodes(std::slice::from_ref(uid)))
-            .map_err(|e| {
-                error!(%uid, error = %e, "enumerate node failed");
-                Errno::EIO
-            })?;
-        nodes.into_iter().next().ok_or(Errno::ENOENT)
+        {
+            Ok(nodes) => Ok(nodes.into_iter().next()),
+            // An unknown uid is reported either as an empty result or as an
+            // outright refusal, depending on the endpoint.
+            Err(e) if is_gone(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// An open [`RevisionReader`] for `uid`, reusing the cached one when it is
@@ -1282,7 +1386,55 @@ impl Core {
             base_mtime: h.base_mtime,
             complete: authored == [(0, h.len)],
             authored,
+            based_on: self.remote_baseline(&h.uid, h.base_mtime, h.base_size),
         };
+        self.enqueue_staged_write(&h.uid, h.ino, &h.path, meta)?;
+        debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
+        Ok(())
+    }
+
+    /// The remote revision a change to `uid` is being made against, for
+    /// [`StagedWrite::based_on`].
+    ///
+    /// Normally that is simply the base the handle opened over. The exception is
+    /// a write that supersedes a still-queued one: its "base" is the previous
+    /// *staged blob*, whose size and mtime are ours, not the server's — so the
+    /// baseline is inherited from the op being superseded, which is the last one
+    /// that actually observed the remote. Without that, chaining two writes
+    /// before the queue drains would leave the drain comparing the remote
+    /// against a revision it never had, and cutting a conflict copy over
+    /// nothing.
+    ///
+    /// `None` for a node that has never existed remotely: there is no revision
+    /// to conflict with until its create drains.
+    fn remote_baseline(&self, uid: &NodeUid, base_mtime: i64, base_size: u64) -> Option<Baseline> {
+        if is_local_uid(uid) {
+            return None;
+        }
+        match self.pending.lock().unwrap().get(uid) {
+            Some(p) => p.meta.based_on,
+            None => Some(Baseline {
+                mtime: base_mtime,
+                size: base_size,
+            }),
+        }
+    }
+
+    /// Move a file holding a node's intended new content into staging and queue
+    /// the upload that will make it the remote's content. Shared by the release
+    /// of a write handle and by a path-based truncate.
+    ///
+    /// `src` is consumed either way: on success it is *moved* into staging, and
+    /// on the refusal below it is moved there too, just without an op to upload
+    /// it. It is the only copy of what the user wrote, so nothing here may
+    /// simply delete it.
+    fn enqueue_staged_write(
+        &self,
+        uid: &NodeUid,
+        ino: u64,
+        src: &Path,
+        meta: StagedWrite,
+    ) -> Result<(), Errno> {
         // An incomplete blob's gaps refer to the *remote* base. If an earlier
         // write to this file is still queued, the remote no longer holds that
         // base — the previous staged blob does — so superseding it would fill
@@ -1290,23 +1442,23 @@ impl Core {
         // refuse the write and keep the bytes recoverable (Phase 2 behaviour).
         // Only reachable offline, editing in place a file whose previous edit
         // has not drained and whose base is not cached.
-        if !meta.complete && self.pending.lock().unwrap().contains_key(&h.uid) {
-            self.stage_orphaned_write(h, &meta);
+        if !meta.complete && self.pending.lock().unwrap().contains_key(uid) {
+            self.stage_orphaned_write(uid, ino, src, &meta);
             return Err(Errno::EIO);
         }
-        let path = self.cache.stage_write(&meta, &h.path).map_err(|e| {
-            error!(uid = %h.uid, error = %e, "staging write failed");
+        let path = self.cache.stage_write(&meta, src).map_err(|e| {
+            error!(%uid, error = %e, "staging write failed");
             Errno::EIO
         })?;
         let meta_json = serde_json::to_string(&meta).unwrap_or_default();
-        let superseded = if is_local_uid(&h.uid) {
+        let superseded = if is_local_uid(uid) {
             // The node has no server-side identity to hang a revision on, so the
             // bytes ride on the create that will mint it.
             let attached = self
                 .db
-                .attach_blob_to_create(&h.uid.to_string(), &path.to_string_lossy(), &meta_json)
+                .attach_blob_to_create(&uid.to_string(), &path.to_string_lossy(), &meta_json)
                 .map_err(|e| {
-                    error!(uid = %h.uid, error = %e, "attaching write to queued create failed");
+                    error!(%uid, error = %e, "attaching write to queued create failed");
                     Errno::EIO
                 })?;
             match attached {
@@ -1315,7 +1467,7 @@ impl Core {
                     // The create drained between `release` and here, so the node
                     // has a real uid now and this handle's is stale. The bytes are
                     // safe in staging, but nothing here can address them.
-                    error!(uid = %h.uid, staged = %path.display(),
+                    error!(%uid, staged = %path.display(),
                            "queued create vanished under a write; bytes kept in staging");
                     return Err(Errno::EIO);
                 }
@@ -1324,7 +1476,7 @@ impl Core {
             let op = PendingOp {
                 id: 0,
                 kind: OP_REVISION.to_string(),
-                uid: h.uid.to_string(),
+                uid: uid.to_string(),
                 parent_uid: None,
                 name: None,
                 blob_path: Some(path.to_string_lossy().into_owned()),
@@ -1335,7 +1487,7 @@ impl Core {
                 next_attempt_at: 0,
             };
             let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
-                error!(uid = %h.uid, error = %e, "queueing upload failed");
+                error!(%uid, error = %e, "queueing upload failed");
                 Errno::EIO
             })?;
             superseded
@@ -1343,23 +1495,89 @@ impl Core {
         if let Some(old) = superseded {
             self.cache.discard_staged(Path::new(&old));
         }
+        let len = meta.len;
         self.pending
             .lock()
             .unwrap()
-            .insert(h.uid.clone(), PendingRevision { path, meta });
+            .insert(uid.clone(), PendingRevision { path, meta });
         // Reflect the write in the tree straight away: `ls` must show the new
         // size and mtime even though the remote still holds the old revision.
         let now = now_secs();
         {
             let mut st = self.state.lock().unwrap();
-            st.record_pending_write(h.ino, h.len, now);
+            st.record_pending_write(ino, len, now);
         }
         // Cached blobs and open readers describe the superseded revision. Reads
         // come from the staged blob until the op drains, so just drop them.
-        self.cache.evict(&h.uid);
-        self.evict_reader(&h.uid);
+        self.cache.evict(uid);
+        self.evict_reader(uid);
         self.wake_drain();
-        debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
+        Ok(())
+    }
+
+    /// Queue the new content of a path-based truncate — `> file`, or any
+    /// `setattr(size=…)` arriving without a write handle.
+    ///
+    /// No bytes have been authored at truncate time, which is why this path was
+    /// never staged and instead resized the remote content inline. That is also
+    /// why a shell redirect failed offline *before* the write that follows it:
+    /// the truncate itself needed the network. Staging a blob describing the
+    /// result puts it on the same queue as every other write.
+    ///
+    /// The blob is a hole of the new length; what is real about it is `authored`:
+    ///
+    /// - `> file` (size 0) is the whole point and needs nothing at all — an
+    ///   empty file is complete content, so it queues and drains offline.
+    /// - Extending past the end authors the new tail (zeros, by definition) and
+    ///   leaves the head to be gap-filled from the base.
+    /// - Shrinking authors nothing: every remaining byte still comes from the
+    ///   base, so it is the drain that has to fetch it.
+    fn queue_truncate(&self, ino: u64, size: u64) -> Result<(), Errno> {
+        let (uid, base_mtime, base_size) = {
+            let st = self.state.lock().unwrap();
+            match st.entries.get(&ino) {
+                Some(e) if e.node.is_file() => {
+                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
+                }
+                Some(_) => return Err(Errno::EISDIR),
+                None => return Err(Errno::ENOENT),
+            }
+        };
+        if size == base_size {
+            return Ok(());
+        }
+        let (authored, complete) = if size == 0 {
+            // An empty file has no content to be missing.
+            (Vec::new(), true)
+        } else if base_size == 0 {
+            // Nothing to gap-fill from: every byte is a zero this truncate
+            // defines.
+            (vec![(0, size)], true)
+        } else if size > base_size {
+            (vec![(base_size, size)], false)
+        } else {
+            (Vec::new(), false)
+        };
+        let (file, path) = self.cache.create_scratch().map_err(|e| {
+            error!(%uid, error = %e, "create scratch file for truncate failed");
+            Errno::EIO
+        })?;
+        file.set_len(size).map_err(|e| {
+            error!(%uid, error = %e, "resize scratch file for truncate failed");
+            let _ = std::fs::remove_file(&path);
+            Errno::EIO
+        })?;
+        let meta = StagedWrite {
+            uid: uid.to_string(),
+            len: size,
+            base_size,
+            base_mtime,
+            authored,
+            complete,
+            based_on: self.remote_baseline(&uid, base_mtime, base_size),
+        };
+        self.enqueue_staged_write(&uid, ino, &path, meta)?;
+        debug!(%uid, size, complete, "queued truncate");
         Ok(())
     }
 
@@ -1403,6 +1621,100 @@ impl Core {
         ))
     }
 
+    /// Queue giving a node a new parent and/or name, and apply it to the tree
+    /// now (offline.md Phase 3b).
+    ///
+    /// The op records the desired end state rather than the step, so it both
+    /// supersedes any earlier queued rename and lets the drain skip whichever
+    /// half the remote already agrees with.
+    ///
+    /// `new_parent_uid` may be a placeholder — moving a file into a folder
+    /// created offline — which is why this cannot simply be the online call with
+    /// a retry around it: the API would 404 on a `local~` parent. The op waits
+    /// for that folder's drain to rewrite it, exactly as a queued create does.
+    fn queue_rename(
+        &self,
+        ino: u64,
+        uid: &NodeUid,
+        new_parent_ino: u64,
+        new_parent_uid: &NodeUid,
+        new_name: &str,
+    ) -> Result<(), Errno> {
+        let op = PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: uid.to_string(),
+            parent_uid: Some(new_parent_uid.to_string()),
+            name: Some(new_name.to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: now_millis(),
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        self.db.enqueue_op(&op).map_err(|e| {
+            error!(%uid, new_name, error = %e, "queueing rename failed");
+            Errno::EIO
+        })?;
+        self.state
+            .lock()
+            .unwrap()
+            .rename_in_place(ino, new_parent_ino, new_parent_uid, new_name);
+        self.wake_drain();
+        debug!(%uid, %new_parent_uid, new_name, "renamed offline; queued");
+        Ok(())
+    }
+
+    /// Queue trashing a node the server knows about, and drop it from the tree
+    /// now (offline.md Phase 3b).
+    ///
+    /// Anything else queued for this node is discarded first: the user has said
+    /// the file should not exist, so uploading bytes to it or renaming it are
+    /// both work towards an outcome nobody wants any more. That does throw away
+    /// staged bytes that never landed — which is precisely what deleting an
+    /// un-uploaded file means, and the alternative (upload it, then trash it) is
+    /// worse in every way.
+    fn queue_trash(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
+        self.discard_queued_ops(uid);
+        let op = PendingOp {
+            id: 0,
+            kind: OP_TRASH.to_string(),
+            uid: uid.to_string(),
+            parent_uid: None,
+            name: Some(name.to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: now_millis(),
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        self.db.enqueue_op(&op).map_err(|e| {
+            error!(%uid, error = %e, "queueing trash failed");
+            Errno::EIO
+        })?;
+        self.state.lock().unwrap().forget(uid);
+        self.cache.evict(uid);
+        self.evict_reader(uid);
+        self.wake_drain();
+        debug!(%uid, name, "trashed offline; queued");
+        Ok(())
+    }
+
+    /// Drop every op queued against a node, and the staged bytes they own.
+    fn discard_queued_ops(&self, uid: &NodeUid) {
+        match self.db.delete_ops_for_uid(&uid.to_string()) {
+            Ok(blobs) => {
+                for blob in blobs {
+                    self.cache.discard_staged(Path::new(&blob));
+                }
+            }
+            Err(e) => error!(%uid, error = %e, "dropping queued ops failed"),
+        }
+        self.pending.lock().unwrap().remove(uid);
+    }
+
     /// Nudge the drain worker to re-examine the queue now.
     fn wake_drain(&self) {
         let (lock, cv) = &*self.drain_wake;
@@ -1412,18 +1724,18 @@ impl Core {
 
     /// Keep a write we cannot safely queue, so the bytes are recoverable even
     /// though the caller is getting an error. See [`Core::queue_revision`].
-    fn stage_orphaned_write(&self, h: &WriteHandle, meta: &StagedWrite) {
-        match self.cache.stage_write(meta, &h.path) {
+    fn stage_orphaned_write(&self, uid: &NodeUid, ino: u64, src: &Path, meta: &StagedWrite) {
+        match self.cache.stage_write(meta, src) {
             Ok(staged) => {
                 error!(
-                    uid = %h.uid,
+                    %uid,
                     staged = %staged.display(),
                     "cannot queue write over an undrained edit; bytes kept in staging"
                 );
                 let name = {
                     let st = self.state.lock().unwrap();
                     st.entries
-                        .get(&h.ino)
+                        .get(&ino)
                         .map(|e| e.node.name.clone())
                         .unwrap_or_default()
                 };
@@ -1435,8 +1747,8 @@ impl Core {
                 );
             }
             Err(e) => {
-                error!(uid = %h.uid, error = %e, "staging write failed; bytes lost");
-                let _ = std::fs::remove_file(&h.path);
+                error!(%uid, error = %e, "staging write failed; bytes lost");
+                let _ = std::fs::remove_file(src);
             }
         }
     }
@@ -1497,7 +1809,109 @@ impl Core {
         match op.kind.as_str() {
             OP_REVISION => self.drain_revision(op),
             OP_CREATE | OP_MKDIR => self.drain_local_node(op),
+            OP_RENAME => self.drain_rename(op),
+            OP_TRASH => self.drain_trash(op),
             other => Err(format!("unknown pending op kind {other:?}").into()),
+        }
+    }
+
+    /// Apply a queued rename/move to the remote.
+    ///
+    /// The op is the desired end state, so the remote's current state decides
+    /// what actually has to be called: either half may already match (the event
+    /// sync saw someone else do it, or an earlier attempt got half way through
+    /// before failing). That also makes the whole thing idempotent, which a
+    /// retrying queue needs.
+    fn drain_rename(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        let uid = parse_node_uid(&op.uid).ok_or("rename op has an unparseable uid")?;
+        let parent_str = op.parent_uid.as_deref().ok_or("rename op has no parent")?;
+        if is_local_uid_str(parent_str) {
+            return Err(format!("destination {parent_str} has not been created yet").into());
+        }
+        let parent = parse_node_uid(parent_str).ok_or("rename op has an unparseable parent")?;
+        let name = op.name.clone().ok_or("rename op has no name")?;
+
+        // The node we were asked to rename may be gone or trashed by now. Either
+        // way there is nothing to rename and nothing to lose — a rename holds no
+        // bytes — so the op is satisfied rather than retried forever.
+        let node = match self.fetch_node_remote(&uid)? {
+            Some(n) if !n.trashed => n,
+            _ => {
+                warn!(%uid, name, "renamed node is gone or trashed remotely; dropping the rename");
+                self.db.delete_op(op.id)?;
+                return Ok(());
+            }
+        };
+        if node.parent_uid.as_ref() != Some(&parent) {
+            self.rt.block_on(self.client.move_node(&uid, &parent))?;
+        }
+        if node.name != name {
+            match self.rt.block_on(self.client.rename_node(&uid, &name, None)) {
+                Ok(()) => {}
+                // Someone took the name while we were offline. Renaming to a
+                // *different* name is the non-destructive resolution: it neither
+                // clobbers their file nor drops ours, and it is visible.
+                Err(e) if is_already_exists(&e) => {
+                    let alt = conflict_name(&name, now_secs());
+                    warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
+                    self.rt
+                        .block_on(self.client.rename_node(&uid, &alt, None))?;
+                    self.adopt_drained_name(&uid, &alt);
+                    self.log_activity(
+                        ActivityKind::Rename,
+                        &name,
+                        format!("name was taken remotely; renamed to {alt}"),
+                        false,
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.db.delete_op(op.id)?;
+        info!(%uid, name, "pending rename landed");
+        Ok(())
+    }
+
+    /// Apply a queued trash to the remote.
+    ///
+    /// A node that is already gone is a success, not a failure: the outcome the
+    /// op asked for holds either way, and retrying forever against a node the
+    /// server has forgotten would wedge the queue.
+    fn drain_trash(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        let uid = parse_node_uid(&op.uid).ok_or("trash op has an unparseable uid")?;
+        let name = op.name.clone().unwrap_or_else(|| op.uid.clone());
+        match self
+            .rt
+            .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
+        {
+            Ok(()) => {}
+            Err(e) if is_gone(&e) => {
+                debug!(%uid, name, "node was already gone remotely; trash op satisfied");
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.db.delete_op(op.id)?;
+        self.invalidate_trash();
+        self.log_activity(ActivityKind::Trash, &name, "trashed", true);
+        info!(%uid, name, "pending trash landed");
+        Ok(())
+    }
+
+    /// Record the name the remote actually gave a node, after a conflict forced
+    /// it away from the one the user asked for. Best effort: the event sync
+    /// would correct the tree anyway, but not before the user has looked at it.
+    fn adopt_drained_name(&self, uid: &NodeUid, name: &str) {
+        let mut st = self.state.lock().unwrap();
+        let Some(&ino) = st.by_uid.get(uid) else {
+            return;
+        };
+        let Some(entry) = st.entries.get_mut(&ino) else {
+            return;
+        };
+        entry.node.name = name.to_string();
+        let node = entry.node.clone();
+        if let Err(e) = st.db.upsert_node(&node) {
+            warn!(%uid, error = %e, "db upsert_node failed after a conflict rename");
         }
     }
 
@@ -1512,14 +1926,52 @@ impl Core {
             return Err(format!("parent {parent_str} has not been created yet").into());
         }
         let parent = parse_node_uid(parent_str).ok_or("create op has an unparseable parent")?;
-        let name = op.name.clone().ok_or("create op has no name")?;
+        let wanted = op.name.clone().ok_or("create op has no name")?;
 
-        let real = if op.kind == OP_MKDIR {
-            self.rt
-                .block_on(self.client.create_folder(&parent, &name, Some(now_secs())))?
-        } else {
-            self.upload_created_file(op, &parent, &name)?
-        };
+        // Someone else may have taken the name while this sat in the queue —
+        // reachable only because the op waited, which is the whole point of the
+        // queue. Never overwrite theirs and never drop ours: land under a
+        // conflict name, exactly as the sync engine does.
+        let mut name = wanted.clone();
+        let mut real = self.create_drained_node(op, &parent, &name);
+        if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref())) {
+            name = conflict_name(&wanted, now_secs());
+            warn!(%local, wanted, name, "name is taken remotely; creating under a conflict name");
+            real = self.create_drained_node(op, &parent, &name);
+            if real.is_ok() {
+                self.log_activity(
+                    ActivityKind::Upload,
+                    &wanted,
+                    format!("name was taken remotely; created as {name}"),
+                    false,
+                );
+            }
+        }
+        // The folder this node was created in may have been trashed remotely
+        // while the op waited, in which case nothing will ever make the op
+        // succeed as written and retrying it forever wedges the queue behind a
+        // file that has bytes to save. Re-home it to the root: not where the
+        // user put it, but it exists, it is visible, and the bytes are intact.
+        if let Some(root) = self.root_uid()
+            && real.is_err()
+            && self.parent_is_gone(&parent)
+        {
+            warn!(%local, name, "parent folder is gone remotely; creating in the root instead");
+            real = self.create_drained_node(op, &root, &name);
+            if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref())) {
+                name = conflict_name(&wanted, now_secs());
+                real = self.create_drained_node(op, &root, &name);
+            }
+            if real.is_ok() {
+                self.log_activity(
+                    ActivityKind::Upload,
+                    &wanted,
+                    format!("its folder was trashed remotely; created in the root as {name}"),
+                    false,
+                );
+            }
+        }
+        let real = real?;
 
         // Retire the op before touching anything else: if we crash here the node
         // exists remotely and the local placeholder is reconciled by the event
@@ -1533,6 +1985,27 @@ impl Core {
         self.log_activity(ActivityKind::Upload, &name, "created", true);
         info!(%local, %real, name, kind = %op.kind, "pending create landed");
         Ok(())
+    }
+
+    /// Make one queued `create`/`mkdir` real under a given name, and hand back
+    /// the API's own error so the caller can tell a name clash from a failure.
+    ///
+    /// Split out because the conflict path has to run it twice: the second time
+    /// under a different name.
+    fn create_drained_node(
+        &self,
+        op: &PendingOp,
+        parent: &NodeUid,
+        name: &str,
+    ) -> Result<NodeUid, Box<dyn std::error::Error>> {
+        match op.kind == OP_MKDIR {
+            true => {
+                Ok(self
+                    .rt
+                    .block_on(self.client.create_folder(parent, name, Some(now_secs())))?)
+            }
+            false => self.upload_created_file(op, parent, name),
+        }
     }
 
     /// Upload the bytes a queued create accumulated, if any. A file that was
@@ -1598,6 +2071,28 @@ impl Core {
                 e.uid = real.clone();
                 e.node = node.clone();
             }
+            // Where the op said the node goes and where it actually landed can
+            // differ — a conflict re-homes it — so the tree follows the parent
+            // the server reports rather than the one we asked for.
+            if let Some(parent) = node.parent_uid.clone()
+                && let Some(&pino) = st.by_uid.get(&parent)
+                && st.entries.get(&ino).is_some_and(|e| e.parent != pino)
+            {
+                let old = st.entries.get(&ino).map(|e| e.parent);
+                if let Some(old) = old
+                    && let Some(kids) = st.children.get_mut(&old)
+                {
+                    kids.retain(|&k| k != ino);
+                }
+                if let Some(e) = st.entries.get_mut(&ino) {
+                    e.parent = pino;
+                }
+                if let Some(kids) = st.children.get_mut(&pino)
+                    && !kids.contains(&ino)
+                {
+                    kids.push(ino);
+                }
+            }
         }
         drop(st);
         // Write the real node through, now that nothing points at the old uid.
@@ -1615,6 +2110,201 @@ impl Core {
         Ok(())
     }
 
+    /// Why a queued write must not be applied to its node, or `None` when it
+    /// still can be.
+    ///
+    /// A queued write is an edit of a specific revision. Time passes before it
+    /// drains — indefinitely, if that is how long the network is gone — and in
+    /// that window the node can be rewritten by another device, trashed, or
+    /// deleted outright. Sending the blob anyway would silently drop whatever
+    /// happened in between, which is exactly the thing the sync engine refuses
+    /// to do (offline.md Phase 3b).
+    ///
+    /// Only checkable against a recorded baseline: a write staged before
+    /// [`StagedWrite::based_on`] existed, or one against a node that has never
+    /// existed remotely, has nothing to compare and is applied as before.
+    fn revision_conflict(
+        &self,
+        uid: &NodeUid,
+        meta: &StagedWrite,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let Some(base) = meta.based_on else {
+            return Ok(None);
+        };
+        let Some(node) = self.fetch_node_remote(uid)? else {
+            return Ok(Some("the file no longer exists remotely".into()));
+        };
+        if node.trashed {
+            return Ok(Some("the file was trashed remotely".into()));
+        }
+        let (mtime, size) = (node.modification_time, node_size(&node));
+        if mtime != base.mtime || size != base.size {
+            return Ok(Some(format!(
+                "the remote revision changed under the queued write \
+                 (expected {} bytes at mtime {}, found {size} at {mtime})",
+                base.size, base.mtime
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Land a queued write that can no longer be applied to its own node as a
+    /// *new* file beside it, and retire the op.
+    ///
+    /// The non-destructive resolution, and the same one the sync engine reaches
+    /// for: the remote keeps whatever it has, the user keeps their bytes, and
+    /// the name says which is which.
+    ///
+    /// An incomplete blob is gap-filled from whatever the node holds *now* —
+    /// mixing revisions, which is only defensible because the result is
+    /// explicitly a conflict copy rather than anyone's file. When even that is
+    /// impossible the op is dropped but the staged bytes are deliberately left
+    /// on disk: unreachable through the mount, but not destroyed, and the
+    /// activity log says where they are.
+    fn keep_as_conflict_copy(
+        &self,
+        op: &PendingOp,
+        blob: &Path,
+        meta: &StagedWrite,
+        uid: &NodeUid,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let place = self.node_place(uid);
+        let name = place
+            .as_ref()
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| meta.uid.clone());
+        // A node the tree has forgotten still has bytes worth keeping, so the
+        // copy falls back to the root rather than being abandoned.
+        let Some(parent) = place.map(|(p, _)| p).or_else(|| self.root_uid()) else {
+            return self.abandon_to_staging(op, blob, uid, &name, reason);
+        };
+        warn!(%uid, name, reason, "queued write conflicts; keeping a conflict copy");
+
+        if !meta.complete {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(blob)?;
+            let mut written = Intervals::default();
+            for &(s, e) in &meta.authored {
+                written.add(s, e);
+            }
+            if let Err(e) = self.fill_gaps(
+                uid,
+                &file,
+                meta.len,
+                meta.base_mtime,
+                meta.base_size,
+                &written,
+            ) {
+                error!(%uid, name, error = ?e, "cannot complete a conflicted partial write");
+                return self.abandon_to_staging(op, blob, uid, &name, reason);
+            }
+        }
+
+        let alt = conflict_name(&name, now_secs());
+        let guard =
+            self.transfers
+                .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
+        let reader = CountingReader::new(File::open(blob)?, &guard);
+        self.rt.block_on(self.client.upload_file_from(
+            &parent,
+            &alt,
+            media_type_for(&alt),
+            reader,
+            meta.len as i64,
+            Vec::new(),
+            None,
+            false,
+        ))?;
+        drop(guard);
+
+        self.db.delete_op(op.id)?;
+        // Dropping the pending entry hands the node back to the remote's truth:
+        // reads stop coming from the staged blob, and the event sync stops
+        // skipping it as "ahead of the server" (offline.md Phase 3a).
+        self.pending.lock().unwrap().remove(uid);
+        self.cache.discard_staged(blob);
+        self.cache.evict(uid);
+        self.evict_reader(uid);
+        // The conflict copy is a node the tree has never seen.
+        let mut st = self.state.lock().unwrap();
+        if let Some(&ino) = st.by_uid.get(&parent) {
+            st.invalidate_listing(ino);
+        }
+        drop(st);
+        self.log_activity(
+            ActivityKind::Upload,
+            &name,
+            format!("{reason}; local changes uploaded as {alt}"),
+            false,
+        );
+        info!(%uid, name, alt, "queued write landed as a conflict copy");
+        Ok(())
+    }
+
+    /// Give up on placing a queued write anywhere the mount can see, without
+    /// destroying it: the op goes (it could only fail forever) but the staged
+    /// blob deliberately stays on disk, and the activity log says where.
+    ///
+    /// The last resort of the conflict path, and the same bargain
+    /// [`Core::stage_orphaned_write`] strikes at the other end: bytes we cannot
+    /// place are still bytes we do not get to delete.
+    fn abandon_to_staging(
+        &self,
+        op: &PendingOp,
+        blob: &Path,
+        uid: &NodeUid,
+        name: &str,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        error!(%uid, name, reason, staged = %blob.display(),
+               "cannot place a conflicted write; bytes kept in staging");
+        self.db.delete_op(op.id)?;
+        self.pending.lock().unwrap().remove(uid);
+        self.cache.evict(uid);
+        self.evict_reader(uid);
+        self.log_activity(
+            ActivityKind::Upload,
+            name,
+            format!("{reason}; local changes kept at {}", blob.display()),
+            false,
+        );
+        Ok(())
+    }
+
+    /// Whether a folder a queued op targets has stopped being a place a node can
+    /// go. A failure to ask is not an answer: only a definite "trashed" or "not
+    /// there" counts, so a network fault leaves the op to retry normally.
+    fn parent_is_gone(&self, parent: &NodeUid) -> bool {
+        match self.fetch_node_remote(parent) {
+            Ok(Some(node)) => node.trashed,
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// A node's parent uid and name, as the tree currently has them.
+    fn node_place(&self, uid: &NodeUid) -> Option<(NodeUid, String)> {
+        let st = self.state.lock().unwrap();
+        let ino = st.by_uid.get(uid)?;
+        let entry = st.entries.get(ino)?;
+        let parent = entry.node.parent_uid.clone()?;
+        Some((parent, entry.node.name.clone()))
+    }
+
+    /// The uid of the My Files root, which every node in the mount descends
+    /// from — the last resort for placing a file whose own parent is unknown.
+    ///
+    /// `None` only for a [`Core::fork_state`] sibling that has not interned its
+    /// root yet, which is not where the drain runs; the drain must not panic
+    /// over it regardless, since that would stop the queue for good.
+    fn root_uid(&self) -> Option<NodeUid> {
+        let st = self.state.lock().unwrap();
+        st.entries.get(&ROOT_INO).map(|e| e.uid.clone())
+    }
+
     /// Upload a staged revision of a file the server already knows about.
     fn drain_revision(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
         let blob = op
@@ -1624,6 +2314,10 @@ impl Core {
         let blob = PathBuf::from(blob);
         let meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
         let uid = parse_node_uid(&meta.uid).ok_or("staged write has an unparseable uid")?;
+
+        if let Some(reason) = self.revision_conflict(&uid, &meta)? {
+            return self.keep_as_conflict_copy(op, &blob, &meta, &uid, &reason);
+        }
 
         // An incomplete blob is authored bytes over zeros; the untouched ranges
         // have to be filled from the base before it can be sent. This is the case
@@ -4176,22 +4870,20 @@ impl ProtonFs {
         // it just means its queued creation is no longer wanted. This works
         // offline, which the remote path below cannot (offline.md Phase 3b).
         if is_local_uid(&uid) {
-            match self.core.db.delete_ops_for_uid(&uid.to_string()) {
-                Ok(blobs) => {
-                    for blob in blobs {
-                        self.core.cache.discard_staged(Path::new(&blob));
-                    }
-                }
-                Err(e) => {
-                    error!(%uid, error = %e, "dropping queued ops for a local node failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
-            self.core.pending.lock().unwrap().remove(&uid);
+            self.core.discard_queued_ops(&uid);
             self.core.state.lock().unwrap().forget(&uid);
             debug!(%uid, name, "deleted a node that had not been created remotely yet");
             reply.ok();
+            return;
+        }
+        // Offline: queue it. Trashing is the one mutation a user expects to work
+        // regardless — the file is gone from their point of view the moment the
+        // command returns (offline.md Phase 3b).
+        if !self.core.online.load(Ordering::Relaxed) {
+            match self.core.queue_trash(&uid, name) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
             return;
         }
         if let Err(e) = self
@@ -4203,6 +4895,7 @@ impl ProtonFs {
             reply.error(Errno::EIO);
             return;
         }
+        self.core.discard_queued_ops(&uid);
         self.core.state.lock().unwrap().forget(&uid);
         self.core.cache.evict(&uid);
         self.core.evict_reader(&uid);
@@ -4263,6 +4956,47 @@ fn is_local_uid(uid: &NodeUid) -> bool {
 fn is_local_uid_str(s: &str) -> bool {
     s.split_once('~')
         .is_some_and(|(vol, _)| vol == LOCAL_VOLUME)
+}
+
+/// The API's response code for a failed call, when it failed *at* the API.
+///
+/// Takes `&dyn Error` so it reads a [`ProtonError`] equally well through the
+/// boxes the drain deals in, where the concrete type survives but the static one
+/// does not. `None` covers both "not an API error at all" (a transport failure,
+/// which is what being offline looks like) and "not a `ProtonError`".
+fn api_code(e: &(dyn std::error::Error + 'static)) -> Option<ResponseCode> {
+    match e.downcast_ref::<ProtonError>() {
+        Some(ProtonError::Api(api)) => Some(api.code),
+        _ => None,
+    }
+}
+
+/// Whether a call failed because the name it asked for is already in use.
+///
+/// The queue makes this reachable in a way the synchronous path never was: a
+/// mutation queued while offline is applied against a server that may have
+/// gained a file of that name in the meantime.
+fn is_already_exists(e: &(dyn std::error::Error + 'static)) -> bool {
+    api_code(e) == Some(ResponseCode::AlreadyExists)
+}
+
+/// Whether a call failed because the node it addressed is not there.
+fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
+    api_code(e) == Some(ResponseCode::DoesNotExist)
+}
+
+/// A variant of `name` to fall back on when the remote already has that name.
+///
+/// Deliberately the same shape the sync engine uses for its conflict copies
+/// (`sync.rs`, `conflict_path`), so the two halves of the product name the same
+/// situation the same way and a user only has to learn it once.
+fn conflict_name(name: &str, stamp: i64) -> String {
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    match path.extension().and_then(|s| s.to_str()) {
+        Some(ext) => format!("{stem} (sync-conflict {stamp}).{ext}"),
+        None => format!("{stem} (sync-conflict {stamp})"),
+    }
 }
 
 /// Whether an op can be attempted now, as opposed to waiting on another op.
@@ -4905,53 +5639,18 @@ impl Filesystem for ProtonFs {
                 None => false,
             };
             if !handled {
-                // Path-based truncate with no open write handle: resize the
-                // remote content and seal it now.
-                let uid = {
-                    let st = self.core.state.lock().unwrap();
-                    match st.entries.get(&ino.0) {
-                        Some(e) if e.node.is_file() => e.uid.clone(),
-                        Some(_) => {
-                            reply.error(Errno::EISDIR);
-                            return;
-                        }
-                        None => {
-                            reply.error(Errno::ENOENT);
-                            return;
-                        }
-                    }
-                };
-                let mut content = if size == 0 {
-                    Vec::new()
-                } else {
-                    match self.core.rt.block_on(self.core.client.download_file(&uid)) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(%uid, error = %e, "truncate base download failed");
-                            reply.error(Errno::EIO);
-                            return;
-                        }
-                    }
-                };
-                content.resize(size as usize, 0);
-                if let Err(e) = self
-                    .core
-                    .rt
-                    .block_on(self.core.client.upload_new_revision(&uid, &content))
-                {
-                    error!(%uid, error = %e, "truncate upload failed");
-                    reply.error(Errno::EIO);
+                // Path-based truncate with no open write handle — a shell's
+                // `> file`. This is the second write path into the API, and
+                // queueing it is what lets a redirect work offline at all: it
+                // never reaches `release`, so without this it failed before any
+                // byte was written (offline.md Phase 2/3b).
+                if let Err(e) = self.core.queue_truncate(ino.0, size) {
+                    reply.error(e);
                     return;
                 }
-                // Keep any pinned cache consistent with the new content.
-                if self.core.cache.is_pinned(&uid) {
-                    let _ = self.core.cache.store(&uid, now_secs(), size, &content);
-                } else {
-                    self.core.cache.evict(&uid);
-                }
-                self.core.evict_reader(&uid);
+            } else {
+                self.core.state.lock().unwrap().set_size(ino.0, size);
             }
-            self.core.state.lock().unwrap().set_size(ino.0, size);
         }
         let st = self.core.state.lock().unwrap();
         match st.entries.get(&ino.0) {
@@ -5139,54 +5838,90 @@ impl Filesystem for ProtonFs {
         let newparent = newparent.0;
         let name = name.to_string_lossy().into_owned();
         let newname = newname.to_string_lossy().into_owned();
-        let (_ino, uid) = match self.core.lookup_child(parent, &name) {
+        let (ino, uid) = match self.core.lookup_child(parent, &name) {
             Ok(x) => x,
             Err(e) => {
                 reply.error(e);
                 return;
             }
         };
-        // Renaming a node whose creation is still queued would send a `local~`
-        // uid to the API. Doing this properly means rewriting the queued op
-        // rather than calling the API at all; until then, refuse rather than
-        // 404 or silently diverge (offline.md Phase 3b).
+        // The destination has to be listed either way: the queued path pushes
+        // the node into that listing, and the online one drops it to force a
+        // re-enumeration.
+        if newparent != parent
+            && let Err(e) = self.core.ensure_children(newparent)
+        {
+            reply.error(e);
+            return;
+        }
+        let new_parent_uid = {
+            let st = self.core.state.lock().unwrap();
+            match st.entries.get(&newparent) {
+                Some(e) => e.uid.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        // A node whose own creation is still queued has no server-side identity
+        // to rename: the queued op *is* the node, so rewriting its target is the
+        // whole rename. Nothing reaches the API, which is why this works offline
+        // (offline.md Phase 3b).
         if is_local_uid(&uid) {
-            warn!(%uid, name, newname, "cannot rename a node whose create is still queued");
-            reply.error(Errno::EBUSY);
+            match self.core.db.rewrite_op_target(
+                &uid.to_string(),
+                &new_parent_uid.to_string(),
+                &newname,
+            ) {
+                Ok(true) => {
+                    self.core.state.lock().unwrap().rename_in_place(
+                        ino,
+                        newparent,
+                        &new_parent_uid,
+                        &newname,
+                    );
+                    debug!(%uid, newname, "renamed a node whose create is still queued");
+                    reply.ok();
+                }
+                // The create drained underneath us, so the node has a real uid
+                // now and this handle's is stale. A retry resolves it.
+                Ok(false) => {
+                    warn!(%uid, name, newname, "queued create vanished under a rename");
+                    reply.error(Errno::EBUSY);
+                }
+                Err(e) => {
+                    error!(%uid, error = %e, "rewriting a queued create's target failed");
+                    reply.error(Errno::EIO);
+                }
+            }
+            return;
+        }
+        // Offline, or into a folder that does not exist remotely yet: queue the
+        // rename rather than 404 or fail. Online moves into a real parent still
+        // take the synchronous path, so a genuine API refusal (permissions, a
+        // name clash) surfaces to the caller instead of becoming a queued op
+        // that can only ever conflict.
+        if !self.core.online.load(Ordering::Relaxed) || is_local_uid(&new_parent_uid) {
+            match self
+                .core
+                .queue_rename(ino, &uid, newparent, &new_parent_uid, &newname)
+            {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
             return;
         }
         // Move first if the parent changed, then rename if the name changed.
-        if newparent != parent {
-            if let Err(e) = self.core.ensure_children(newparent) {
-                reply.error(e);
-                return;
-            }
-            let new_parent_uid = {
-                let st = self.core.state.lock().unwrap();
-                match st.entries.get(&newparent) {
-                    Some(e) => e.uid.clone(),
-                    None => {
-                        reply.error(Errno::ENOENT);
-                        return;
-                    }
-                }
-            };
-            // Same reasoning as above, from the other side: the destination
-            // folder may not exist remotely yet.
-            if is_local_uid(&new_parent_uid) {
-                warn!(%uid, %new_parent_uid, "cannot move into a folder whose create is still queued");
-                reply.error(Errno::EBUSY);
-                return;
-            }
-            if let Err(e) = self
+        if newparent != parent
+            && let Err(e) = self
                 .core
                 .rt
                 .block_on(self.core.client.move_node(&uid, &new_parent_uid))
-            {
-                error!(%uid, error = %e, "move failed");
-                reply.error(Errno::EIO);
-                return;
-            }
+        {
+            error!(%uid, error = %e, "move failed");
+            reply.error(Errno::EIO);
+            return;
         }
         if newname != name
             && let Err(e) = self
@@ -5563,6 +6298,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
         Ok(CtlRequest::Status) => {
             let pins = core.cache.list_pins();
+            let queued = core.db.pending_op_counts().unwrap_or_default();
             CtlResponse::Status {
                 username: username.to_string(),
                 mountpoint: mountpoint.display().to_string(),
@@ -5571,7 +6307,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 budget: core.cache.budget(),
                 pins,
                 online: core.online.load(Ordering::Relaxed),
-                pending_uploads: core.db.pending_op_count().unwrap_or(0).max(0) as u64,
+                pending_uploads: queued.uploads.max(0) as u64,
+                pending_changes: queued.changes.max(0) as u64,
             }
         }
         Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
@@ -6645,11 +7382,28 @@ mod local_uid_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::Intervals;
+    use super::{Intervals, conflict_name};
 
     /// Flatten `segments` into a readable form for assertions.
     fn segs(iv: &Intervals, start: u64, end: u64) -> Vec<(u64, u64, bool)> {
         iv.segments(start, end)
+    }
+
+    /// The conflict copy has to stay openable, so the extension survives — and
+    /// the shape matches the sync engine's `conflict_path` so the two features
+    /// name the same situation the same way.
+    #[test]
+    fn conflict_name_keeps_the_extension() {
+        assert_eq!(
+            conflict_name("notes.txt", 1700),
+            "notes (sync-conflict 1700).txt"
+        );
+        assert_eq!(conflict_name("README", 42), "README (sync-conflict 42)");
+        assert_eq!(
+            conflict_name("archive.tar.gz", 7),
+            "archive.tar (sync-conflict 7).gz",
+            "only the last extension is one, as everywhere else"
+        );
     }
 
     #[test]

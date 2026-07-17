@@ -12,6 +12,7 @@ use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
+    pending_summary,
 };
 use pdfs_core::db::Db;
 
@@ -832,13 +833,13 @@ fn cmd_status() -> Result<()> {
             pinned,
             online,
             pending_uploads,
+            pending_changes,
             ..
         }) => {
             let state = if online { "" } else { ", offline" };
-            let queued = match pending_uploads {
-                0 => String::new(),
-                1 => ", 1 upload queued".to_string(),
-                n => format!(", {n} uploads queued"),
+            let queued = match pending_summary(pending_uploads, pending_changes) {
+                Some(s) => format!(", {s}"),
+                None => String::new(),
             };
             println!("Mounted at {mountpoint} ({pinned} pinned{state}{queued})");
         }

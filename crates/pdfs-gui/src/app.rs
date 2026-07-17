@@ -36,7 +36,7 @@ use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
     PhotoItem, PublicLinkInfo, RefreshScope, Request, Response, SearchHit, ShareEntry,
     ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection,
-    TransferItem, send,
+    TransferItem, pending_summary, send,
 };
 use pdfs_core::service;
 
@@ -1965,19 +1965,21 @@ fn refresh_status(ui: &Rc<Ui>) {
                 pins,
                 online,
                 pending_uploads,
+                pending_changes,
                 ..
             })) => {
                 set_mounted(&ui, true);
-                // Queued uploads are the more useful thing to say when there are
-                // any: they are why a file that looks saved is not on the remote
-                // yet, and offline is usually the reason they are still queued.
-                ui.mount_row.set_subtitle(&match (online, pending_uploads) {
-                    (true, 0) => format!("Mounted at {mountpoint}"),
-                    (true, n) => format!("Mounted at {mountpoint} — uploading {n} file(s)"),
-                    (false, 0) => format!("Mounted at {mountpoint} — offline, cached files only"),
-                    (false, n) => {
-                        format!("Mounted at {mountpoint} — offline, {n} file(s) waiting to upload")
+                // The queue is the more useful thing to say when it has anything
+                // in it: it is why a file that looks saved is not on the remote
+                // yet, and offline is usually the reason it is still queued.
+                let queued = pending_summary(pending_uploads, pending_changes);
+                ui.mount_row.set_subtitle(&match (online, queued) {
+                    (true, None) => format!("Mounted at {mountpoint}"),
+                    (true, Some(q)) => format!("Mounted at {mountpoint} — {q}"),
+                    (false, None) => {
+                        format!("Mounted at {mountpoint} — offline, cached files only")
                     }
+                    (false, Some(q)) => format!("Mounted at {mountpoint} — offline, {q}"),
                 });
                 let fraction = if budget == 0 {
                     0.0

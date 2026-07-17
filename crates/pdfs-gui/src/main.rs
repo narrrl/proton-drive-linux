@@ -18,7 +18,9 @@ use ksni::menu::StandardItem;
 use ksni::{MenuItem, Tray, TrayService};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{JobItem, Request, Response, TransferDirection, TransferItem, send};
+use pdfs_core::control::{
+    JobItem, Request, Response, TransferDirection, TransferItem, pending_summary, send,
+};
 use pdfs_core::service;
 
 /// How often the tray re-polls the daemon to refresh its menu.
@@ -90,13 +92,14 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             pinned,
             online,
             pending_uploads,
+            pending_changes,
             ..
         }) => DriveState {
-            line: match (online, pending_uploads) {
-                (true, 0) => format!("Mounted at {mountpoint} ({pinned} pinned)"),
-                (true, n) => format!("Uploading {n} file(s) ({pinned} pinned)"),
-                (false, 0) => format!("Offline — cached files only ({pinned} pinned)"),
-                (false, n) => format!("Offline — {n} file(s) waiting to upload"),
+            line: match (online, pending_summary(pending_uploads, pending_changes)) {
+                (true, None) => format!("Mounted at {mountpoint} ({pinned} pinned)"),
+                (true, Some(q)) => format!("Syncing — {q} ({pinned} pinned)"),
+                (false, None) => format!("Offline — cached files only ({pinned} pinned)"),
+                (false, Some(q)) => format!("Offline — {q}"),
             },
             mounted: true,
             mountpoint: PathBuf::from(mountpoint),

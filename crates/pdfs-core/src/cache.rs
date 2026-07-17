@@ -98,8 +98,8 @@ pub struct StagedWrite {
     pub uid: String,
     /// Length of the intended new content.
     pub len: u64,
-    /// Size and mtime of the base revision the write was made against, so a
-    /// retry can tell whether the remote moved on in the meantime.
+    /// Size and mtime of the revision the file's *untouched* ranges came from,
+    /// i.e. what a gap-fill reads. Meaningless once `complete` is true.
     pub base_size: u64,
     pub base_mtime: i64,
     /// Locally authored `[start, end)` ranges. Everything else in the file is a
@@ -108,6 +108,28 @@ pub struct StagedWrite {
     /// True when `authored` covers the whole file, i.e. the staged bytes are the
     /// complete new content and can be uploaded directly.
     pub complete: bool,
+    /// The remote revision this change was made against, if it is known.
+    ///
+    /// Distinct from `base_size`/`base_mtime`, which describe wherever the
+    /// untouched bytes are to be read from — for a write that supersedes an
+    /// earlier queued one, that is the *previous staged blob*, not the remote.
+    /// This instead always names the server's revision, carried across
+    /// supersedes, so the drain can tell whether the remote moved on under a
+    /// queued change and keep a conflict copy rather than clobber it.
+    ///
+    /// `None` on a sidecar written before this field existed, and for a node
+    /// that has never existed remotely; both mean "do not conflict-check".
+    #[serde(default)]
+    pub based_on: Option<Baseline>,
+}
+
+/// The identity of a remote revision, as far as we can observe it: a file whose
+/// size and mtime both still match the ones a queued change was made against has
+/// not been rewritten by anyone else in the meantime.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Baseline {
+    pub mtime: i64,
+    pub size: u64,
 }
 
 /// Content cache rooted at a directory, with a sibling pin-registry file.
@@ -1098,6 +1120,10 @@ mod tests {
             base_mtime: 100,
             authored: vec![(0, 11)],
             complete: false,
+            based_on: Some(Baseline {
+                mtime: 100,
+                size: 40,
+            }),
         };
         let staged = c.stage_write(&meta, &scratch).unwrap();
         assert!(!scratch.exists(), "scratch is moved, not copied");

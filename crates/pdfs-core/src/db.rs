@@ -46,6 +46,37 @@ pub const OP_CREATE: &str = "create";
 /// time the child drains.
 pub const OP_MKDIR: &str = "mkdir";
 
+/// The `kind` of a [`PendingOp`] that gives a node a new name, a new parent, or
+/// both — the queued form of `mv` (offline.md Phase 3b).
+///
+/// `parent_uid` and `name` hold the node's *desired end state*, not a delta, so
+/// a second rename simply replaces the row (see [`Db::enqueue_op`]) and the
+/// drain can compare them against the remote and skip whichever half already
+/// matches. The parent may be a `local~` placeholder — moving a file into a
+/// folder that was itself created offline — in which case it is rewritten by
+/// that folder's own drain, exactly as for [`OP_CREATE`].
+pub const OP_RENAME: &str = "rename";
+
+/// The `kind` of a [`PendingOp`] that trashes a node the server knows about
+/// (offline.md Phase 3b).
+///
+/// A node that only ever existed locally never gets one of these: there is
+/// nothing to trash remotely, so deleting it just drops its queued ops
+/// ([`Db::delete_ops_for_uid`]).
+pub const OP_TRASH: &str = "trash";
+
+/// Whether at most one op of this `kind` may be queued per node, so that a newer
+/// one replaces the older rather than queueing behind it.
+///
+/// True exactly of the kinds that describe a node's desired *end state* rather
+/// than a step towards it: the newest revision already contains every earlier
+/// one's bytes, the newest name is the only name wanted, and a trash subsumes
+/// anything queued before it. A `create`/`mkdir` is the opposite — it is the one
+/// thing that will ever make the node exist, so it must never be replaced.
+pub fn op_supersedes(kind: &str) -> bool {
+    matches!(kind, OP_REVISION | OP_RENAME | OP_TRASH)
+}
+
 /// The volume id given to a node that exists only on this machine, so far. A
 /// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
 /// round-trips through the same `Display`/parse path as any other uid.
@@ -86,6 +117,16 @@ pub struct PendingOp {
     pub last_error: Option<String>,
     /// Earliest ms at which to retry, for backoff.
     pub next_attempt_at: i64,
+}
+
+/// How much work the queue owes the server, by whether it carries bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PendingCounts {
+    /// Queued `create`/`revision` ops: files whose content is not on the remote.
+    pub uploads: i64,
+    /// Queued `mkdir`/`rename`/`trash` ops: metadata the remote has not been
+    /// told about.
+    pub changes: i64,
 }
 
 /// The outcome of folding freshly written bytes into a queued create.
@@ -368,6 +409,51 @@ impl Db {
         Ok(())
     }
 
+    /// Write-through multiple nodes in a single database transaction for performance.
+    pub fn upsert_nodes(&self, nodes: &[Node]) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for node in nodes {
+            let json = serde_json::to_string(node)?;
+            let uid = node.uid.to_string();
+            tx.execute(
+                "INSERT INTO nodes
+                   (uid, parent_uid, name, is_dir, size, mtime, trashed, node_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(uid) DO UPDATE SET
+                   parent_uid = excluded.parent_uid,
+                   name       = excluded.name,
+                   is_dir     = excluded.is_dir,
+                   size       = excluded.size,
+                   mtime      = excluded.mtime,
+                   trashed    = excluded.trashed,
+                   node_json  = excluded.node_json",
+                params![
+                    uid,
+                    node.parent_uid.as_ref().map(|u| u.to_string()),
+                    node.name,
+                    node.is_folder() as i64,
+                    node_size(node),
+                    node.modification_time,
+                    node.trashed as i64,
+                    json,
+                ],
+            )?;
+            tx.execute("DELETE FROM nodes_fts WHERE uid = ?1", params![uid])?;
+            if !node.trashed {
+                tx.execute(
+                    "INSERT INTO nodes_fts (uid, name) VALUES (?1, ?2)",
+                    params![uid, node.name],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop a node row (delete or trash from the hot cache). Children rows are
     /// not cascaded here; the daemon forgets a whole subtree node-by-node.
     pub fn delete_node(&self, uid: &NodeUid) -> Result<()> {
@@ -531,27 +617,30 @@ impl Db {
     /// everything the older one did. The superseded blob's path is returned so
     /// the caller can delete it.
     ///
-    /// Only revision rows supersede, and only each other. A create op for the
-    /// same uid must survive — dropping it would leave a file that exists
-    /// nowhere but this machine with nothing left to create it. (Writes to a
-    /// node that is itself still queued fold into the create row instead; see
-    /// [`Db::attach_blob_to_create`].)
+    /// Rows supersede only their own kind, and only the kinds
+    /// [`op_supersedes`] names. A create op for the same uid must survive —
+    /// dropping it would leave a file that exists nowhere but this machine with
+    /// nothing left to create it. (Writes to a node that is itself still queued
+    /// fold into the create row instead; see [`Db::attach_blob_to_create`].)
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
         let conn = self.conn.lock().unwrap();
-        let superseded: Option<String> = conn
-            .query_row(
-                "SELECT blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
-                params![op.uid, OP_REVISION],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        if op.kind == OP_REVISION {
+        let superseded: Option<String> = if op_supersedes(&op.kind) {
+            let blob: Option<String> = conn
+                .query_row(
+                    "SELECT blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
+                    params![op.uid, op.kind],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
             conn.execute(
                 "DELETE FROM pending_op WHERE uid = ?1 AND kind = ?2",
-                params![op.uid, OP_REVISION],
+                params![op.uid, op.kind],
             )?;
-        }
+            blob
+        } else {
+            None
+        };
         conn.execute(
             "INSERT INTO pending_op
                (kind, uid, parent_uid, name, blob_path, meta_json, created_at)
@@ -604,23 +693,62 @@ impl Db {
         Ok(Some(AttachedBlob { id, superseded }))
     }
 
-    /// Drop every op targeting a node, returning the staged blobs they held so
-    /// the caller can delete them.
+    /// Point a queued create at a new parent and name, for a node renamed or
+    /// moved before it ever reached the server.
+    ///
+    /// A `local~` uid means nothing to the API, so there is no rename call to
+    /// make — the node is still only a queued intent, and rewriting that intent
+    /// *is* the rename. Returns false when the create has already drained, in
+    /// which case the node has a real uid and the caller must rename it there
+    /// instead (offline.md Phase 3b).
+    pub fn rewrite_op_target(&self, uid: &str, parent_uid: &str, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE pending_op SET parent_uid = ?2, name = ?3
+             WHERE uid = ?1 AND kind IN (?4, ?5)",
+            params![uid, parent_uid, name, OP_CREATE, OP_MKDIR],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Drop every op targeting a node **or anything queued beneath it**,
+    /// returning the staged blobs they held so the caller can delete them.
     ///
     /// Used when a node that only ever existed locally is deleted: there is
     /// nothing on the server to trash, so the queued work simply stops being
     /// wanted.
+    ///
+    /// The descent is what keeps the queue alive. Deleting a folder created
+    /// offline drops the `mkdir` that would have given it a real uid, and any
+    /// op still queued under that placeholder is then unreachable forever: it
+    /// can never be attempted (its parent is a `local~` uid, so `op_is_ready`
+    /// refuses it) and nothing is left to remap it. It would sit in the queue,
+    /// and in the user's pending count, for the life of the database.
+    ///
+    /// Only `create`/`mkdir` ops carry a `parent_uid`, so for a file this
+    /// recursion finds nothing and costs one query.
     pub fn delete_ops_for_uid(&self, uid: &str) -> Result<Vec<String>> {
+        const SUBTREE: &str = "
+            WITH RECURSIVE doomed(uid) AS (
+              SELECT ?1
+              UNION
+              SELECT p.uid FROM pending_op p JOIN doomed d ON p.parent_uid = d.uid
+            )";
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let blobs: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT blob_path FROM pending_op WHERE uid = ?1 AND blob_path IS NOT NULL",
-            )?;
+            let mut stmt = tx.prepare(&format!(
+                "{SUBTREE}
+                 SELECT blob_path FROM pending_op
+                 WHERE uid IN (SELECT uid FROM doomed) AND blob_path IS NOT NULL"
+            ))?;
             let rows = stmt.query_map(params![uid], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        tx.execute("DELETE FROM pending_op WHERE uid = ?1", params![uid])?;
+        tx.execute(
+            &format!("{SUBTREE} DELETE FROM pending_op WHERE uid IN (SELECT uid FROM doomed)"),
+            params![uid],
+        )?;
         tx.commit()?;
         Ok(blobs)
     }
@@ -673,10 +801,25 @@ impl Db {
         Ok(rows)
     }
 
-    /// How many uploads are still waiting, for `Response::Status`.
-    pub fn pending_op_count(&self) -> Result<i64> {
+    /// How many queued ops there are of each kind, for `Response::Status`.
+    ///
+    /// Split because "3 uploads queued" has to mean three files whose bytes are
+    /// not on the remote yet. A queued `mkdir`/`rename`/`trash` is also work the
+    /// mount owes the server, but it carries no bytes and reporting it as an
+    /// upload is simply untrue.
+    pub fn pending_op_counts(&self) -> Result<PendingCounts> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))?)
+        let uploads = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE kind IN (?1, ?2)",
+            params![OP_REVISION, OP_CREATE],
+            |r| r.get(0),
+        )?;
+        let changes = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE kind NOT IN (?1, ?2)",
+            params![OP_REVISION, OP_CREATE],
+            |r| r.get(0),
+        )?;
+        Ok(PendingCounts { uploads, changes })
     }
 
     /// Drop a queued op, once its upload has actually landed.
@@ -2074,6 +2217,22 @@ mod tests {
     }
 
     #[test]
+    fn upsert_nodes_and_load_all_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let root = folder("root", None, "My Files");
+        let child1 = file("f1", "root", "hello.txt", 42);
+        let child2 = file("f2", "root", "world.txt", 100);
+        db.upsert_nodes(&[root, child1, child2]).unwrap();
+
+        let loaded = db.load_all().unwrap();
+        assert_eq!(loaded.len(), 3);
+        let f1 = loaded.iter().find(|s| s.node.uid == uid("f1")).unwrap();
+        assert_eq!(f1.node.name, "hello.txt");
+        let f2 = loaded.iter().find(|s| s.node.uid == uid("f2")).unwrap();
+        assert_eq!(f2.node.name, "world.txt");
+    }
+
+    #[test]
     fn upsert_is_idempotent_update() {
         let db = Db::open_in_memory().unwrap();
         let mut n = folder("root", None, "My Files");
@@ -2366,7 +2525,156 @@ mod tests {
         assert_eq!(ops.len(), 1, "one queued upload per node");
         assert_eq!(ops[0].id, id2);
         assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
-        assert_eq!(db.pending_op_count().unwrap(), 1);
+        assert_eq!(db.pending_op_counts().unwrap().uploads, 1);
+    }
+
+    /// Deleting a folder that was created offline must take the ops queued
+    /// underneath it with it: they name a placeholder parent that will now never
+    /// become real, so nothing could ever drain them and nothing is left to
+    /// rewrite them.
+    #[test]
+    fn deleting_a_queued_folder_takes_its_queued_children_with_it() {
+        let db = Db::open_in_memory().unwrap();
+        let op = |kind: &str, uid: &str, parent: &str, blob: Option<&str>| PendingOp {
+            id: 0,
+            kind: kind.to_string(),
+            uid: uid.to_string(),
+            parent_uid: Some(parent.to_string()),
+            name: Some("n".to_string()),
+            blob_path: blob.map(str::to_string),
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        let root = uid("root").to_string();
+        db.enqueue_op(&op(OP_MKDIR, "local~dir", &root, None))
+            .unwrap();
+        db.enqueue_op(&op(OP_MKDIR, "local~sub", "local~dir", None))
+            .unwrap();
+        db.enqueue_op(&op(
+            OP_CREATE,
+            "local~deep",
+            "local~sub",
+            Some("/staging/deep"),
+        ))
+        .unwrap();
+        // A sibling outside the doomed subtree must survive.
+        db.enqueue_op(&op(OP_CREATE, "local~other", &root, Some("/staging/other")))
+            .unwrap();
+
+        let blobs = db.delete_ops_for_uid("local~dir").unwrap();
+        assert_eq!(
+            blobs,
+            vec!["/staging/deep"],
+            "the subtree's bytes come back"
+        );
+
+        let left: Vec<String> = db
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.uid)
+            .collect();
+        assert_eq!(left, vec!["local~other"]);
+    }
+
+    /// A rename is the node's desired end state, so the newest one is the only
+    /// one worth performing — but it must not disturb the queued *upload* of the
+    /// same node, which is unrelated work.
+    #[test]
+    fn a_second_rename_supersedes_the_first_but_leaves_the_upload_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let rename = |name: &str| PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: uid("a").to_string(),
+            parent_uid: Some(uid("parent").to_string()),
+            name: Some(name.to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_REVISION.to_string(),
+            uid: uid("a").to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: Some("/staging/blob".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+        db.enqueue_op(&rename("first")).unwrap();
+        let (_, superseded) = db.enqueue_op(&rename("second")).unwrap();
+        assert_eq!(superseded, None, "a rename owns no blob to clean up");
+
+        let ops = db.pending_ops().unwrap();
+        assert_eq!(ops.len(), 2, "the queued upload survives the rename");
+        let renames: Vec<_> = ops.iter().filter(|o| o.kind == OP_RENAME).collect();
+        assert_eq!(renames.len(), 1, "one rename per node");
+        assert_eq!(renames[0].name.as_deref(), Some("second"));
+
+        let counts = db.pending_op_counts().unwrap();
+        assert_eq!(counts.uploads, 1, "the revision is the only upload");
+        assert_eq!(counts.changes, 1, "the rename carries no bytes");
+    }
+
+    /// Renaming a node whose create has not drained rewrites the intent rather
+    /// than queueing a rename against a uid the server has never issued.
+    #[test]
+    fn renaming_a_queued_create_rewrites_its_target() {
+        let db = Db::open_in_memory().unwrap();
+        let local = "local~abc";
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("old").to_string()),
+            name: Some("draft.txt".to_string()),
+            blob_path: Some("/staging/blob".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+        let rewritten = db
+            .rewrite_op_target(local, &uid("new").to_string(), "final.txt")
+            .unwrap();
+        assert!(rewritten);
+
+        let ops = db.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1, "a rewrite is not a second op");
+        assert_eq!(ops[0].name.as_deref(), Some("final.txt"));
+        assert_eq!(
+            ops[0].parent_uid.as_deref(),
+            Some(uid("new").to_string()).as_deref()
+        );
+        assert_eq!(
+            ops[0].blob_path.as_deref(),
+            Some("/staging/blob"),
+            "the bytes riding on the create are untouched"
+        );
+
+        // Once the create has drained there is no intent left to rewrite, and the
+        // caller has to rename the real node instead.
+        db.delete_op(ops[0].id).unwrap();
+        assert!(
+            !db.rewrite_op_target(local, &uid("new").to_string(), "final.txt")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2484,7 +2792,7 @@ mod tests {
         assert_eq!(db.pending_ops().unwrap()[0].attempts, 2);
 
         db.delete_op(id).unwrap();
-        assert_eq!(db.pending_op_count().unwrap(), 0);
+        assert_eq!(db.pending_op_counts().unwrap().uploads, 0);
     }
 
     #[test]

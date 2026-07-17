@@ -625,6 +625,31 @@ fn default_online() -> bool {
     true
 }
 
+/// Phrase the queue depth of a [`Response::Status`] for a human, or `None` when
+/// there is nothing queued and the caller should say nothing at all.
+///
+/// Lives here, next to the counts it describes, because the tray, the CLI and
+/// the manager window all have to draw the same distinction between bytes that
+/// have not reached the remote and metadata that has not.
+pub fn pending_summary(uploads: u64, changes: u64) -> Option<String> {
+    let part = |n: u64, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let parts: Vec<String> = [
+        part(uploads, "upload", "uploads"),
+        part(changes, "change", "changes"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match parts.is_empty() {
+        true => None,
+        false => Some(format!("{} queued", parts.join(", "))),
+    }
+}
+
 /// The daemon's reply to a [`Request`].
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
@@ -651,6 +676,11 @@ pub enum Response {
         /// still draining, or it cannot drain because we are offline.
         #[serde(default)]
         pending_uploads: u64,
+        /// Queued mutations that carry no bytes: `mkdir`, `rename`, `trash`
+        /// (offline.md Phase 3b). Counted apart from `pending_uploads` because
+        /// calling a queued `mkdir` an upload is a lie.
+        #[serde(default)]
+        pending_changes: u64,
     },
     /// A human-readable success message.
     Ok { message: String },
@@ -731,6 +761,20 @@ pub fn send(socket: &Path, req: &Request) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the split counts: a queued `mkdir` is work, but it is
+    /// not an upload and must never be reported as one.
+    #[test]
+    fn pending_summary_separates_uploads_from_other_changes() {
+        assert_eq!(pending_summary(0, 0), None);
+        assert_eq!(pending_summary(1, 0).as_deref(), Some("1 upload queued"));
+        assert_eq!(pending_summary(3, 0).as_deref(), Some("3 uploads queued"));
+        assert_eq!(pending_summary(0, 1).as_deref(), Some("1 change queued"));
+        assert_eq!(
+            pending_summary(2, 4).as_deref(),
+            Some("2 uploads, 4 changes queued")
+        );
+    }
 
     /// The mutation requests must survive a line-delimited JSON round-trip, since
     /// that is exactly how they cross the control socket.
