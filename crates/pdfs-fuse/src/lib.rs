@@ -745,6 +745,21 @@ impl Core {
         if stored.is_empty() {
             return;
         }
+        // A write queued by a previous run carries the optimistic size the file
+        // grew to, which the sealed remote revision does not yet reflect. The DB
+        // node still holds the pre-write `claimed_size` (often 0 for a fresh
+        // file), so without this a queued 500 MB file `stat`s as 0 bytes until
+        // the drain lands — reads still serve from the staged blob, but `ls`
+        // lying about the size reads as data loss. `hydrate_pending` ran before
+        // us, so the pending map is populated; snapshot it here rather than hold
+        // both locks at once.
+        let pending_sizes: HashMap<NodeUid, u64> = {
+            let pending = self.pending.lock().unwrap();
+            pending
+                .iter()
+                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
+                .collect()
+        };
         let mut st = self.state.lock().unwrap();
 
         // Pass 1: assign a stable inode to every uid (root is already mapped).
@@ -761,10 +776,17 @@ impl Core {
         // Track folders flagged complete so their listings rebuild in pass 3.
         let mut listed_dirs: Vec<u64> = Vec::new();
         for sn in stored {
-            let StoredNode { node, listed } = sn;
+            let StoredNode { mut node, listed } = sn;
             let Some(&ino) = st.by_uid.get(&node.uid) else {
                 continue;
             };
+            // Re-apply a queued write's optimistic size so `stat` matches what
+            // reads (served from the staged blob) already return.
+            if let Some(&len) = pending_sizes.get(&node.uid)
+                && let NodeKind::File { claimed_size, .. } = &mut node.kind
+            {
+                *claimed_size = Some(len as i64);
+            }
             if listed && node.is_folder() {
                 listed_dirs.push(ino);
             }
@@ -6490,6 +6512,14 @@ async fn run_event_sync(
         }
         debug!(count = events.len(), "applying remote events");
         for event in &events {
+            // Converge the SDK's own caches (folder keys, entity cache) on the
+            // server before applying the event to our tree. Without this, a node
+            // re-keyed/moved by another client keeps a stale key in the SDK for
+            // the life of the daemon (SDK plan #9). `apply_event` only touches
+            // our FUSE state, so nothing else does this.
+            if let Err(e) = client.invalidate_caches_for_event(event).await {
+                warn!(error = %e, "sdk cache invalidation for event failed");
+            }
             apply_event(&state, &content, &pending, &notifier, event);
         }
         cursor = events.last().map(|e| e.id().clone());
