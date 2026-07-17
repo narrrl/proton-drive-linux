@@ -1501,7 +1501,11 @@ impl Core {
         );
         let uid = self
             .client
-            .upload_file_from(
+            // Mirror push: the local file is authoritative. If a prior attempt was
+            // interrupted mid-upload it left an unsealed draft of this name; recover
+            // it even across a daemon restart (which rotates our client uid), so the
+            // folder can reach idle instead of `AlreadyExists`-looping forever.
+            .upload_file_replacing_draft_from(
                 parent,
                 name,
                 crate::media_type_for(name),

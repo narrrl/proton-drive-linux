@@ -173,6 +173,15 @@ impl Hit {
     fn pinned(&self) -> bool {
         matches!(self, Hit::Drive(h) if h.pinned)
     }
+
+    /// Stable identity used to preserve the keyboard cursor across re-renders.
+    /// The bool keeps a Drive and a local hit at the same path distinct.
+    fn key(&self) -> (bool, String) {
+        match self {
+            Hit::Drive(h) => (false, h.path.clone()),
+            Hit::Local(h) => (true, h.path.clone()),
+        }
+    }
 }
 
 /// Everything the window needs to render and act, in one place so the many
@@ -199,6 +208,10 @@ struct Ui {
     /// then local ones, matching the visual order.
     visible: RefCell<Vec<Hit>>,
     cursor: Cell<Option<usize>>,
+    /// The trimmed query the currently-rendered rows belong to. Enter compares
+    /// against it so a keystroke that lands just before a fresher render can't
+    /// open a file from a result set the user has already typed past.
+    rendered_query: RefCell<String>,
 
     filter: Cell<Filter>,
     /// Monotonic query id. A reply whose id is stale (the user typed again while
@@ -419,6 +432,7 @@ fn build_window(app: &adw::Application) {
         local_hits: RefCell::new(Vec::new()),
         visible: RefCell::new(Vec::new()),
         cursor: Cell::new(None),
+        rendered_query: RefCell::new(String::new()),
         filter: Cell::new(Filter::All),
         query_id: Cell::new(0),
         pending: Cell::new(0),
@@ -469,7 +483,13 @@ fn build_window(app: &adw::Application) {
         }
         match key {
             gtk4::gdk::Key::Escape => {
-                window_key.close();
+                // Spotlight-style: first Escape clears a non-empty query, a
+                // second (or an already-empty box) dismisses the launcher.
+                if ui_key.entry.text().is_empty() {
+                    window_key.close();
+                } else {
+                    ui_key.entry.set_text("");
+                }
                 glib::Propagation::Stop
             }
             gtk4::gdk::Key::Down => {
@@ -556,6 +576,17 @@ impl Ui {
         });
     }
 
+    /// The daemon stopped answering after the window was already open. Flip to
+    /// the offline page and lock the entry; the retry button re-runs `connect`.
+    fn go_offline(self: &Rc<Self>) {
+        self.pending.set(0);
+        self.spinner.stop();
+        self.spinner.set_visible(false);
+        self.entry.set_sensitive(false);
+        self.hint.set_label("Daemon offline");
+        self.stack.set_visible_child_name("offline");
+    }
+
     /// The empty-query view: pinned files, which are the ones the user chose to
     /// keep on this machine — the closest thing the daemon has to "recent".
     fn load_suggestions(self: &Rc<Self>) {
@@ -565,6 +596,10 @@ impl Ui {
         glib::spawn_future_local(async move {
             let reply = rx.recv().await;
             if !ui.finish_query(id) {
+                return;
+            }
+            if matches!(reply, Ok(Err(_)) | Err(_)) {
+                ui.go_offline();
                 return;
             }
             let hits = match reply {
@@ -612,10 +647,18 @@ impl Ui {
                 return;
             }
             match reply {
-                Ok(Ok(Response::SearchResults { hits })) => *ui.drive_hits.borrow_mut() = hits,
-                _ => ui.drive_hits.borrow_mut().clear(),
+                Ok(Ok(Response::SearchResults { hits })) => {
+                    *ui.drive_hits.borrow_mut() = hits;
+                    ui.render();
+                }
+                // Transport failure: the daemon is gone. Don't paint "No
+                // results" over a crash — say so.
+                Ok(Err(_)) | Err(_) => ui.go_offline(),
+                _ => {
+                    ui.drive_hits.borrow_mut().clear();
+                    ui.render();
+                }
             }
-            ui.render();
         });
 
         let local = spawn_request(
@@ -635,10 +678,14 @@ impl Ui {
                 Ok(Ok(Response::LocalResults { hits, indexing })) => {
                     ui.indexing.set(indexing);
                     *ui.local_hits.borrow_mut() = hits;
+                    ui.render();
                 }
-                _ => ui.local_hits.borrow_mut().clear(),
+                Ok(Err(_)) | Err(_) => ui.go_offline(),
+                _ => {
+                    ui.local_hits.borrow_mut().clear();
+                    ui.render();
+                }
             }
-            ui.render();
         });
     }
 
@@ -708,6 +755,13 @@ impl Ui {
     fn render(self: &Rc<Self>) {
         let filter = self.filter.get();
 
+        // Identity of the row under the cursor before we rebuild the list, so a
+        // late-arriving second search can't yank the selection back to the top.
+        let selected_key = self
+            .cursor
+            .get()
+            .and_then(|i| self.visible.borrow().get(i).map(Hit::key));
+
         let drive: Vec<Hit> = self
             .drive_hits
             .borrow()
@@ -725,7 +779,8 @@ impl Ui {
             .map(Hit::Local)
             .collect();
 
-        let searching = !self.entry.text().trim().is_empty();
+        let query = self.entry.text().trim().to_string();
+        let searching = !query.is_empty();
         let drive_title = if searching {
             "Proton Drive"
         } else {
@@ -737,7 +792,12 @@ impl Ui {
         let total = drive.len() + local.len();
         let mut visible = drive;
         visible.extend(local);
+
+        // Find where the previously-selected row landed in the rebuilt list.
+        let restored = selected_key.and_then(|key| visible.iter().position(|hit| hit.key() == key));
+
         *self.visible.borrow_mut() = visible;
+        *self.rendered_query.borrow_mut() = query;
 
         if total == 0 {
             self.placeholder.set_title(if searching {
@@ -757,7 +817,7 @@ impl Ui {
             self.cursor.set(None);
         } else {
             self.stack.set_visible_child_name("results");
-            self.select(0);
+            self.select(restored.unwrap_or(0));
         }
 
         self.hint.set_label(&self.status_text(total, searching));
@@ -843,6 +903,12 @@ impl Ui {
     /// with the spinner running, until the path comes back.
     fn open(self: &Rc<Self>, index: usize, window: &adw::ApplicationWindow) {
         if self.opening.get() {
+            return;
+        }
+        // The rows on screen may belong to an older query whose reply is still
+        // settling. Refuse to act until the visible list matches what's typed,
+        // so Enter can never launch a file the user has already typed past.
+        if self.entry.text().trim() != *self.rendered_query.borrow() {
             return;
         }
         let Some(hit) = self.visible.borrow().get(index).cloned() else {
@@ -1034,6 +1100,13 @@ fn format_age(epoch_secs: i64) -> String {
 /// launcher follows the system light/dark theme instead of pinning its own.
 fn load_css() {
     let css = "
+        /* Pin the accent to Proton Purple so the HUD matches the main app,
+           which its own process/theme would otherwise leave at the system
+           default (often blue or orange). */
+        @define-color accent_bg_color #6d4aff;
+        @define-color accent_color #6d4aff;
+        @define-color accent_fg_color #ffffff;
+
         window.launcher-window {
             background: transparent;
         }

@@ -1386,6 +1386,15 @@ fn build_main_page() -> (gtk4::Widget, MainWidgets) {
 /// Connect the sign-in button: read the fields, run [`auth::login`] on a worker
 /// thread, and report the outcome back on the main loop.
 fn wire_login(ui: &Rc<Ui>) {
+    // Pressing Enter in either field submits the form, so signing in never needs
+    // a reach for the mouse. Both fields route to the same button.
+    let btn = ui.login_button.clone();
+    ui.email
+        .connect_entry_activated(move |_| btn.emit_clicked());
+    let btn = ui.login_button.clone();
+    ui.password
+        .connect_entry_activated(move |_| btn.emit_clicked());
+
     let ui = ui.clone();
     let button = ui.login_button.clone();
     button.connect_clicked(move |_| {
@@ -1493,6 +1502,7 @@ fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
     let group = adw::PreferencesGroup::new();
     let entry = adw::EntryRow::builder()
         .title("Authentication code")
+        .activates_default(true)
         .build();
     group.add(&entry);
     dialog.set_extra_child(Some(&group));
@@ -3100,7 +3110,10 @@ fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
         .body(format!("Rename “{original}”."))
         .build();
     let group = adw::PreferencesGroup::new();
-    let row = adw::EntryRow::builder().title("New name").build();
+    let row = adw::EntryRow::builder()
+        .title("New name")
+        .activates_default(true)
+        .build();
     row.set_text(&original);
     group.add(&row);
     dialog.set_extra_child(Some(&group));
@@ -3148,7 +3161,10 @@ fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
         ))
         .build();
     let group = adw::PreferencesGroup::new();
-    let row = adw::EntryRow::builder().title("Destination folder").build();
+    let row = adw::EntryRow::builder()
+        .title("Destination folder")
+        .activates_default(true)
+        .build();
     group.add(&row);
     dialog.set_extra_child(Some(&group));
     dialog.add_response("cancel", "Cancel");
@@ -3218,7 +3234,10 @@ fn prompt_new_folder(ui: &Rc<Ui>) {
         .body("Create a folder in the current directory.")
         .build();
     let group = adw::PreferencesGroup::new();
-    let row = adw::EntryRow::builder().title("Folder name").build();
+    let row = adw::EntryRow::builder()
+        .title("Folder name")
+        .activates_default(true)
+        .build();
     group.add(&row);
     dialog.set_extra_child(Some(&group));
     dialog.add_response("cancel", "Cancel");
@@ -3468,11 +3487,20 @@ fn load_browser(ui: &Rc<Ui>) {
     );
 
     ui.busy_begin();
-    let rx = spawn_request(ui.dirs.control_socket(), Request::ListDir { path });
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::ListDir { path: path.clone() },
+    );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
+        // The user may have navigated on while this folder was loading. A stale
+        // out-of-order reply must not repaint rows for a folder we've left, or
+        // the breadcrumb and the grid would disagree.
+        if *ui.browser_path.borrow() != path {
+            return;
+        }
         match result {
             Ok(Ok(Response::Entries { entries })) => repaint_browser(&ui, &entries),
             Ok(Ok(Response::Error { message })) => browser_failed(&ui, &message),
@@ -3590,10 +3618,11 @@ fn run_search(ui: &Rc<Ui>, query: &str) {
     );
 
     ui.busy_begin();
+    let query = query.to_string();
     let rx = spawn_request(
         ui.dirs.control_socket(),
         Request::Search {
-            query: query.to_string(),
+            query: query.clone(),
             limit: SEARCH_LIMIT,
         },
     );
@@ -3601,9 +3630,10 @@ fn run_search(ui: &Rc<Ui>, query: &str) {
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
-        // The box may have been cleared (or changed) while the reply was in
-        // flight; if so a fresh load/search already owns the model — drop this.
-        if ui.browser_search.text().trim().is_empty() {
+        // The box may have been cleared or typed past while the reply was in
+        // flight; if the query no longer matches, a fresher load/search already
+        // owns the model — drop this stale, possibly out-of-order result.
+        if ui.browser_search.text().trim() != query {
             return;
         }
         match result {
@@ -4564,9 +4594,13 @@ fn prompt_add_bookmark(ui: &Rc<Ui>) {
         .body("Paste a Proton Drive public link to save it here.")
         .build();
     let group = adw::PreferencesGroup::new();
-    let url_row = adw::EntryRow::builder().title("Public link URL").build();
+    let url_row = adw::EntryRow::builder()
+        .title("Public link URL")
+        .activates_default(true)
+        .build();
     let pw_row = adw::PasswordEntryRow::builder()
         .title("Password (if the link has one)")
+        .activates_default(true)
         .build();
     group.add(&url_row);
     group.add(&pw_row);
@@ -4656,10 +4690,15 @@ fn load_devices(ui: &Rc<Ui>) {
         false,
     );
     ui.busy_begin();
+    // The two lists are independent and the daemon serves requests concurrently,
+    // so fire both up front and collect them, rather than paying two round trips
+    // back to back.
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListSyncFolders);
+    let rx2 = spawn_request(ui.dirs.control_socket(), Request::ListDevices);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let sync = rx.recv().await;
+        let devices_reply = rx2.recv().await;
         let folders = match sync {
             Ok(Ok(Response::SyncFolders { items })) => items,
             // The daemon answered but not as expected — treat as empty and carry
@@ -4677,8 +4716,7 @@ fn load_devices(ui: &Rc<Ui>) {
         ui.devices_content.set_visible_child_name("list");
         repaint_sync_folders(&ui, &folders);
 
-        let rx2 = spawn_request(ui.dirs.control_socket(), Request::ListDevices);
-        let devices = match rx2.recv().await {
+        let devices = match devices_reply {
             Ok(Ok(Response::Devices { items })) => items,
             _ => Vec::new(),
         };
@@ -5007,15 +5045,13 @@ fn prompt_add_sync_folder(ui: &Rc<Ui>) {
         glib::spawn_future_local(async move {
             match rx.recv().await {
                 Ok(Ok(Response::Ok { .. })) => {
+                    // The daemon acks before the row exists — registering the
+                    // device and creating the remote folder is off-socket network
+                    // work. A fixed delay here either fires too early (empty list)
+                    // or too late (row flashes in). Instead let the periodic
+                    // `refresh_sync_folders` tick pick the row up whenever it
+                    // actually lands, which is what keeps a running pass live too.
                     toast(&ui, "Syncing folder…");
-                    // The upload runs off-socket; reload shortly so the new row
-                    // appears once the daemon has registered it.
-                    let ui = ui.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
-                        if ui.stack.visible_child_name().as_deref() == Some("devices") {
-                            load_devices(&ui);
-                        }
-                    });
                 }
                 Ok(Ok(Response::Error { message })) => {
                     toast_error(&ui, "Couldn't add folder", &message)
@@ -5128,7 +5164,10 @@ fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
         .body(format!("Rename “{current}”."))
         .build();
     let group = adw::PreferencesGroup::new();
-    let row = adw::EntryRow::builder().title("New name").build();
+    let row = adw::EntryRow::builder()
+        .title("New name")
+        .activates_default(true)
+        .build();
     row.set_text(current);
     group.add(&row);
     dialog.set_extra_child(Some(&group));
@@ -5919,6 +5958,12 @@ fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         link_rows: RefCell::new(Vec::new()),
     });
 
+    // Enter in either free-text field sends the invitations, no mouse needed.
+    let btn = invite_btn.clone();
+    email_row.connect_entry_activated(move |_| btn.emit_clicked());
+    let btn = invite_btn.clone();
+    message_row.connect_entry_activated(move |_| btn.emit_clicked());
+
     // Invite button.
     let state_inv = state.clone();
     invite_btn.connect_clicked(move |_| {
@@ -6164,6 +6209,10 @@ fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLinkInfo>) {
                 .activatable(false)
                 .child(&create)
                 .build();
+
+            // Enter in the password field creates the link.
+            let btn = create.clone();
+            pw_row.connect_entry_activated(move |_| btn.emit_clicked());
 
             let state_c = state.clone();
             let pw_for = pw_row.clone();
