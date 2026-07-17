@@ -1,12 +1,17 @@
-//! In-memory registry of in-flight transfers, behind [`Request::GetQueueStatus`].
+//! In-memory registry of in-flight work, behind [`Request::GetQueueStatus`].
 //!
-//! The daemon downloads and uploads whole files through the SDK's streaming
-//! [`Read`]/[`Write`] variants. Wrapping that reader/writer in a
+//! Two kinds of work live here. **Transfers** move bytes: the daemon downloads
+//! and uploads whole files through the SDK's streaming [`Read`]/[`Write`]
+//! variants, and wrapping that reader/writer in a
 //! [`CountingReader`]/[`CountingWriter`] lets each block of bytes tick a
-//! per-transfer counter without the SDK knowing anything about progress. A
-//! [`TransferGuard`] registers a transfer on creation and deregisters it on
-//! drop, so the registry always reflects exactly what is in flight — even if a
-//! transfer fails partway and unwinds.
+//! per-transfer counter without the SDK knowing anything about progress.
+//! **Jobs** ([`JobGuard`]) cover the long stretches around them that move no
+//! bytes — walking a local tree, creating the remote folder skeleton, indexing
+//! `$HOME` — which otherwise look to a front-end exactly like an idle daemon.
+//!
+//! Both register on creation and deregister on guard drop, so the registry
+//! always reflects exactly what is in flight — even if the work fails partway
+//! and unwinds.
 //!
 //! [`Request::GetQueueStatus`]: pdfs_core::control::Request::GetQueueStatus
 
@@ -16,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use pdfs_core::control::{TransferDirection, TransferItem};
+use pdfs_core::control::{JobItem, TransferDirection, TransferItem};
 
 /// One registered transfer. `done` is bumped from the I/O wrapper without the
 /// registry lock; the rest is immutable for the transfer's lifetime.
@@ -29,11 +34,22 @@ struct Entry {
     started: Instant,
 }
 
-/// The set of transfers currently in flight. Cloned `Arc`-style across the FUSE
-/// session and the control-socket task (both share one registry via [`Core`]).
+/// One registered job. `detail`/`done`/`total` all move as the job runs; `total`
+/// may grow when more work is discovered mid-job.
+struct JobEntry {
+    title: String,
+    detail: Mutex<String>,
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+/// The set of transfers and jobs currently in flight. Cloned `Arc`-style across
+/// the FUSE session and the control-socket task (both share one registry via
+/// [`Core`]).
 #[derive(Default)]
 pub struct TransferRegistry {
     inner: Mutex<HashMap<u64, Arc<Entry>>>,
+    jobs: Mutex<HashMap<u64, Arc<JobEntry>>>,
     next: AtomicU64,
 }
 
@@ -68,14 +84,58 @@ impl TransferRegistry {
         }
     }
 
-    /// Snapshot every in-flight transfer for [`Response::Transfers`]. Speed is the
+    /// Register a long-running non-transfer job titled `title`, returning a guard
+    /// that carries its progress and deregisters the job when dropped. The job
+    /// starts indeterminate; give it a `total` once one is known.
+    pub fn begin_job(self: &Arc<Self>, title: impl Into<String>) -> JobGuard {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let entry = Arc::new(JobEntry {
+            title: title.into(),
+            detail: Mutex::new(String::new()),
+            done: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+        });
+        self.jobs.lock().unwrap().insert(id, entry.clone());
+        JobGuard {
+            reg: self.clone(),
+            id,
+            entry,
+        }
+    }
+
+    /// Snapshot every in-flight job for [`Response::Transfers`], oldest first, so
+    /// a front-end's rows keep their order across polls.
+    ///
+    /// [`Response::Transfers`]: pdfs_core::control::Response::Transfers
+    pub fn jobs_snapshot(&self) -> Vec<JobItem> {
+        let map = self.jobs.lock().unwrap();
+        let mut ids: Vec<_> = map.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| {
+                let e = &map[id];
+                JobItem {
+                    title: e.title.clone(),
+                    detail: e.detail.lock().unwrap().clone(),
+                    done: e.done.load(Ordering::Relaxed),
+                    total: e.total.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    /// Snapshot every in-flight transfer for [`Response::Transfers`], oldest
+    /// first so a front-end's rows keep their order across polls. Speed is the
     /// running average since the transfer began — simple, and stable enough for a
     /// progress widget without per-tick sampling state.
     ///
     /// [`Response::Transfers`]: pdfs_core::control::Response::Transfers
     pub fn snapshot(&self) -> Vec<TransferItem> {
         let map = self.inner.lock().unwrap();
-        map.values()
+        let mut ids: Vec<_> = map.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| &map[id])
             .map(|e| {
                 let done = e.done.load(Ordering::Relaxed);
                 let secs = e.started.elapsed().as_secs_f64();
@@ -120,6 +180,44 @@ impl Drop for TransferGuard {
     }
 }
 
+/// Lifetime handle for a registered job: describe what it is doing with
+/// [`detail`], size it with [`set_total`], advance it with [`step`], and the job
+/// leaves the registry when this drops. Shared across the tasks of one batch as
+/// an `Arc`, so a concurrent phase can report a single "N of M" line.
+///
+/// [`detail`]: JobGuard::detail
+/// [`set_total`]: JobGuard::set_total
+/// [`step`]: JobGuard::step
+pub struct JobGuard {
+    reg: Arc<TransferRegistry>,
+    id: u64,
+    entry: Arc<JobEntry>,
+}
+
+impl JobGuard {
+    /// Say what the job is working on right now; empty clears it.
+    pub fn detail(&self, what: impl Into<String>) {
+        *self.entry.detail.lock().unwrap() = what.into();
+    }
+
+    /// Set how many steps the job now knows it has. Safe to raise mid-job as more
+    /// work is discovered.
+    pub fn set_total(&self, total: u64) {
+        self.entry.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Mark one more step done.
+    pub fn step(&self) {
+        self.entry.done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.reg.jobs.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// A [`Write`] that tallies bytes written to a [`TransferGuard`] (download path).
 pub struct CountingWriter<'a, W> {
     inner: W,
@@ -145,6 +243,31 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// A [`Read`] that tallies bytes read and *owns* its [`TransferGuard`], so the
+/// transfer stays registered exactly as long as the reader lives. Used by the
+/// concurrent bulk uploader, where each task hands its reader to the SDK and has
+/// nowhere separate to park the guard; the transfer deregisters when the SDK
+/// drops the reader after sealing the revision. Owning (rather than borrowing)
+/// also keeps each upload future `Send + 'static` for [`tokio::task::spawn`].
+pub struct OwnedCountingReader<R> {
+    inner: R,
+    guard: TransferGuard,
+}
+
+impl<R: Read> OwnedCountingReader<R> {
+    pub fn new(inner: R, guard: TransferGuard) -> Self {
+        Self { inner, guard }
+    }
+}
+
+impl<R: Read> Read for OwnedCountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.guard.add(n as u64);
+        Ok(n)
     }
 }
 

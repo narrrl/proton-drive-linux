@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <!-- Icons we ship ourselves because no icon theme has them. Registered as an
+       icon-theme resource path at startup, so they resolve by name (and recolour
+       with the theme) exactly like a stock symbolic icon. -->
+  <gresource prefix="/de/nils/protondrivelinux/icons">
+    <file preprocess="xml-stripblanks">scalable/actions/pdfs-folder-upload-symbolic.svg</file>
+  </gresource>
+</gresources>
