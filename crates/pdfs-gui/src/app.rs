@@ -2955,7 +2955,7 @@ fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
     let abs = mountpoint.join(&rel);
     let Some(path) = abs.to_str() else {
-        toast_error(&ui, "Couldn't play video", "The file path isn't valid UTF-8.");
+        toast_error(ui, "Couldn't play video", "The file path isn't valid UTF-8.");
         return;
     };
     toast(ui, &format!("Streaming “{}”…", entry.name));

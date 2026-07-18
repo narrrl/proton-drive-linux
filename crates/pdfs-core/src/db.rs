@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
@@ -304,7 +304,7 @@ impl Db {
     /// Run forward-only migrations from the stored `schema_version` up to
     /// [`SCHEMA_VERSION`]. Each step is wrapped in its own transaction.
     fn migrate(&self) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
 
         // `sync_state` is the key/value table holding `schema_version` and the
         // event cursor (later). Create it first so we can read the version.
@@ -378,7 +378,7 @@ impl Db {
     /// Run a closure with the locked connection. Escape hatch for callers in
     /// later phases until typed query methods are added.
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         f(&conn)
     }
 
@@ -402,7 +402,7 @@ impl Db {
         if nodes.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         for node in nodes {
             let json = serde_json::to_string(node)?;
@@ -449,7 +449,7 @@ impl Db {
     /// not cascaded here; the daemon forgets a whole subtree node-by-node.
     pub fn delete_node(&self, uid: &NodeUid) -> Result<()> {
         let uid = uid.to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM nodes WHERE uid = ?1", params![uid])?;
         tx.execute("DELETE FROM nodes_fts WHERE uid = ?1", params![uid])?;
@@ -467,7 +467,7 @@ impl Db {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let rows: Vec<(String, String)> = if query.chars().count() < TRIGRAM_MIN {
             let pat = format!("%{}%", like_escape(query));
             let mut stmt = conn.prepare(
@@ -506,7 +506,7 @@ impl Db {
     /// rehydrates its `children` map on mount even when empty; an unlisted one
     /// re-enumerates from the remote on next access.
     pub fn set_listed(&self, uid: &NodeUid, listed: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE nodes SET listed = ?2 WHERE uid = ?1",
             params![uid.to_string(), listed as i64],
@@ -516,7 +516,7 @@ impl Db {
 
     /// Load every persisted node for cold-start hydration of the `State` maps.
     pub fn load_all(&self) -> Result<Vec<StoredNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt =
             conn.prepare("SELECT node_json, listed FROM nodes WHERE node_json IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
@@ -537,7 +537,7 @@ impl Db {
     /// when the API is unreachable, so the mount can still serve the cached tree
     /// (offline.md Phase 1).
     pub fn node_by_uid(&self, uid: &str) -> Result<Option<Node>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let json: Option<String> = conn
             .query_row(
                 "SELECT node_json FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL",
@@ -555,7 +555,7 @@ impl Db {
     /// The daemon resumes from this on restart instead of reseeding to the
     /// server head, so changes made while unmounted are still applied (P2).
     pub fn get_event_cursor(&self) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let v = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'event_cursor'",
@@ -568,7 +568,7 @@ impl Db {
 
     /// Persist the incremental-sync cursor after a batch of events is applied.
     pub fn set_event_cursor(&self, cursor: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sync_state (key, value) VALUES ('event_cursor', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -579,7 +579,7 @@ impl Db {
 
     /// Read a `sync_state` value as a string.
     pub fn state_str(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let v = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",
@@ -592,7 +592,7 @@ impl Db {
 
     /// Write a `sync_state` string value.
     pub fn set_state_str(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -614,7 +614,7 @@ impl Db {
     /// nothing left to create it. (Writes to a node that is itself still queued
     /// fold into the create row instead; see [`Db::attach_blob_to_create`].)
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let superseded: Option<String> = if op_supersedes(&op.kind) {
             let blob: Option<String> = conn
                 .query_row(
@@ -664,7 +664,7 @@ impl Db {
         blob_path: &str,
         meta_json: &str,
     ) -> Result<Option<AttachedBlob>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let existing: Option<(i64, Option<String>)> = conn
             .query_row(
                 "SELECT id, blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
@@ -693,7 +693,7 @@ impl Db {
     /// which case the node has a real uid and the caller must rename it there
     /// instead (offline.md Phase 3b).
     pub fn rewrite_op_target(&self, uid: &str, parent_uid: &str, name: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE pending_op SET parent_uid = ?2, name = ?3
              WHERE uid = ?1 AND kind IN (?4, ?5)",
@@ -725,7 +725,7 @@ impl Db {
               UNION
               SELECT p.uid FROM pending_op p JOIN doomed d ON p.parent_uid = d.uid
             )";
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let blobs: Vec<String> = {
             let mut stmt = tx.prepare(&format!(
@@ -748,7 +748,7 @@ impl Db {
     /// parent has drained and has a real uid. Also moves the node rows whose
     /// parent column still names the placeholder, so listings keep resolving.
     pub fn remap_local_uid(&self, local: &str, real: &str) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
@@ -766,7 +766,7 @@ impl Db {
     /// Every queued op, oldest first. The drain worker replays them in this order
     /// so a file's writes land in the order they were made.
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
@@ -799,7 +799,7 @@ impl Db {
     /// mount owes the server, but it carries no bytes and reporting it as an
     /// upload is simply untrue.
     pub fn pending_op_counts(&self) -> Result<PendingCounts> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let uploads = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE kind IN (?1, ?2)",
             params![OP_REVISION, OP_CREATE],
@@ -815,7 +815,7 @@ impl Db {
 
     /// Drop a queued op, once its upload has actually landed.
     pub fn delete_op(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM pending_op WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -823,7 +823,7 @@ impl Db {
     /// Record a failed attempt and when to next try. Leaves the row in place —
     /// the staged bytes are still the only copy of the user's write.
     pub fn record_op_failure(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE pending_op
              SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3
@@ -836,7 +836,7 @@ impl Db {
     /// Read a `sync_state` value as an integer (the freshness stamps of the
     /// photos timeline and the trash listing are kept there).
     pub fn state_i64(&self, key: &str) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let v: Option<String> = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",
@@ -849,7 +849,7 @@ impl Db {
 
     /// Write a `sync_state` integer value.
     pub fn set_state_i64(&self, key: &str, value: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -860,7 +860,7 @@ impl Db {
 
     /// Drop a `sync_state` key, so whatever it stamped counts as never fetched.
     pub fn clear_state(&self, key: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM sync_state WHERE key = ?1", params![key])?;
         Ok(())
     }
@@ -876,7 +876,7 @@ impl Db {
         &self,
         items: &[(String, i64, Option<String>, Option<String>)],
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         // `media_type` is learned-and-kept like the ratio and thumb verdict: the
         // timeline DTO carries only the uid and capture time, so the daemon may
@@ -939,7 +939,7 @@ impl Db {
         kind: Option<crate::control::PhotoKind>,
         range: Option<(i64, i64)>,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // Built up so any combination of the optional filters is one indexed
         // query rather than a statement per case.
         let mut sql =
@@ -991,7 +991,7 @@ impl Db {
         &self,
         kind: Option<crate::control::PhotoKind>,
     ) -> Result<Vec<(i32, i32, usize)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let (filter, binds): (&str, Vec<i64>) = match kind {
             Some(k) => (" WHERE kind = ?1", vec![k.as_i64()]),
             None => ("", Vec::new()),
@@ -1014,7 +1014,7 @@ impl Db {
     /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.
     pub fn photos_counts(&self) -> Result<(usize, usize, usize)> {
         use crate::control::PhotoKind;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM photos GROUP BY kind")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         let (mut photos, mut videos, mut raw) = (0usize, 0usize, 0usize);
@@ -1036,7 +1036,7 @@ impl Db {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let placeholders = vec!["?"; uids.len()].join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM photos
@@ -1063,7 +1063,7 @@ impl Db {
     /// ([`THUMB_HAVE`] / [`THUMB_NONE`]), and its aspect ratio if the pixels were
     /// seen. A `None` ratio leaves any previously learned one alone.
     pub fn photo_set_thumb(&self, uid: &str, state: i64, ratio: Option<f64>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE photos SET thumb_state = ?2, ratio = COALESCE(?3, ratio) WHERE uid = ?1",
             params![uid, state, ratio],
@@ -1073,14 +1073,14 @@ impl Db {
 
     /// Number of photos in the persisted timeline.
     pub fn photos_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
 
     /// Replace the persisted trash listing.
     pub fn trash_replace(&self, items: &[StoredTrash]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM trash", [])?;
         {
@@ -1104,7 +1104,7 @@ impl Db {
     /// The persisted trash listing, folders first then by name — the order the
     /// Trash page shows it in.
     pub fn trash_list(&self) -> Result<Vec<StoredTrash>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT uid, name, is_dir, size, mtime FROM trash
              ORDER BY is_dir DESC, name COLLATE NOCASE",
@@ -1129,7 +1129,7 @@ impl Db {
 
     /// The registered device for this machine, if one has been created/cached.
     pub fn device_get(&self) -> Result<Option<StoredDevice>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT uid, share_id, root_uid, name, created FROM device LIMIT 1",
             [],
@@ -1149,7 +1149,7 @@ impl Db {
 
     /// Persist (or replace) this machine's device. The table holds a single row.
     pub fn device_set(&self, dev: &StoredDevice) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM device", [])?;
         conn.execute(
             "INSERT INTO device (uid, share_id, root_uid, name, created)
@@ -1166,7 +1166,7 @@ impl Db {
         remote_uid: &str,
         remote_share_id: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sync_folder (local_path, remote_uid, remote_share_id)
              VALUES (?1, ?2, ?3)",
@@ -1177,7 +1177,7 @@ impl Db {
 
     /// Every synced folder, oldest first.
     pub fn sync_folder_list(&self) -> Result<Vec<StoredSyncFolder>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
              FROM sync_folder ORDER BY id",
@@ -1203,7 +1203,7 @@ impl Db {
 
     /// Look up one synced folder by id.
     pub fn sync_folder_get(&self, id: i64) -> Result<Option<StoredSyncFolder>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
              FROM sync_folder WHERE id = ?1",
@@ -1227,7 +1227,7 @@ impl Db {
 
     /// Remove a synced folder and its per-file baseline.
     pub fn sync_folder_remove(&self, id: i64) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM sync_entry WHERE folder_id = ?1", params![id])?;
         let n = tx.execute("DELETE FROM sync_folder WHERE id = ?1", params![id])?;
@@ -1240,7 +1240,7 @@ impl Db {
     /// cleared in the same write — a `pending_mode` outliving the switch it asked
     /// for would have the engine try to apply it again on the next pass.
     pub fn sync_folder_set_mode(&self, id: i64, mode: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE sync_folder SET mode = ?2, pending_mode = NULL WHERE id = ?1",
             params![id, mode],
@@ -1251,7 +1251,7 @@ impl Db {
     /// Queue (or, with `None`, withdraw) a mode the folder should move to once it
     /// is safe to switch.
     pub fn sync_folder_set_pending_mode(&self, id: i64, mode: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE sync_folder SET pending_mode = ?2 WHERE id = ?1",
             params![id, mode],
@@ -1261,7 +1261,7 @@ impl Db {
 
     /// Update a synced folder's state and stamp `last_sync` to now.
     pub fn sync_folder_set_state(&self, id: i64, state: &str, last_sync: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE sync_folder SET state = ?2, last_sync = ?3 WHERE id = ?1",
             params![id, state, last_sync],
@@ -1271,7 +1271,7 @@ impl Db {
 
     /// The whole per-file sync baseline for a folder, keyed by relative path.
     pub fn sync_entries(&self, folder_id: i64) -> Result<HashMap<String, StoredSyncEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash
              FROM sync_entry WHERE folder_id = ?1",
@@ -1296,7 +1296,7 @@ impl Db {
 
     /// Insert or replace one baseline row.
     pub fn sync_entry_upsert(&self, folder_id: i64, e: &StoredSyncEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sync_entry
                (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash)
@@ -1322,7 +1322,7 @@ impl Db {
 
     /// Drop one baseline row (a path that left the sync set on both sides).
     pub fn sync_entry_remove(&self, folder_id: i64, rel_path: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM sync_entry WHERE folder_id = ?1 AND rel_path = ?2",
             params![folder_id, rel_path],
@@ -1337,7 +1337,7 @@ impl Db {
     /// table, so adding an [`ActivityKind`] variant needs no change here.
     pub fn activity_add(&self, entry: &ActivityEntry) -> Result<()> {
         let kind = serde_json::to_string(&entry.kind)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO activity (time, kind, target, detail, ok) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1357,7 +1357,7 @@ impl Db {
     /// whose stored `kind` no longer parses (written by an older build) are
     /// skipped rather than failing the whole read.
     pub fn activity_list(&self, limit: usize) -> Result<Vec<ActivityEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT time, kind, target, detail, ok FROM activity
              ORDER BY id DESC LIMIT ?1",
@@ -1393,7 +1393,7 @@ impl Db {
     /// next reconcile mistake "locally deleted" for "must re-download". Clearing it
     /// leaves an empty baseline + full remote = pure download (devices.md P3).
     pub fn sync_entries_clear(&self, folder_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM sync_entry WHERE folder_id = ?1",
             params![folder_id],
@@ -1405,7 +1405,7 @@ impl Db {
     /// listed folder's `children` map entry was trimmed mid-run. Returns `None`
     /// when the folder is not marked `listed` (listing unknown, must re-fetch).
     pub fn children_if_listed(&self, parent: &NodeUid) -> Result<Option<Vec<Node>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let listed: Option<i64> = conn
             .query_row(
                 "SELECT listed FROM nodes WHERE uid = ?1",
@@ -1440,7 +1440,7 @@ impl Db {
     /// Insert or refresh a cache entry: set its on-disk `size` and bump
     /// `last_accessed` to `now`. Called on every store of a blob or block.
     pub fn cache_touch(&self, key: &str, kind: &str, size: u64, now: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO cache_entries (cache_key, kind, size_bytes, last_accessed)
              VALUES (?1, ?2, ?3, ?4)
@@ -1456,7 +1456,7 @@ impl Db {
     /// Bump only `last_accessed` on a cache hit (LRU ordering). A missing row is
     /// a no-op — best effort, mirroring the old best-effort mtime touch.
     pub fn cache_accessed(&self, key: &str, now: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE cache_entries SET last_accessed = ?2 WHERE cache_key = ?1",
             params![key, now],
@@ -1466,7 +1466,7 @@ impl Db {
 
     /// Drop a single cache-entry row (one evicted blob or block).
     pub fn cache_remove(&self, key: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM cache_entries WHERE cache_key = ?1",
             params![key],
@@ -1478,7 +1478,7 @@ impl Db {
     /// uid (`<key>.b<idx>`). Called by `ContentCache::evict`, which removes the
     /// blob and all of a uid's cached blocks at once.
     pub fn cache_remove_all(&self, key: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM cache_entries WHERE cache_key = ?1 OR cache_key LIKE ?2",
             params![key, format!("{key}.b%")],
@@ -1490,7 +1490,7 @@ impl Db {
     /// `(cache_key, size_bytes)`. The budget enforcer sums the sizes and evicts
     /// from the front until the cache fits.
     pub fn cache_entries_by_kind(&self, kind: &str) -> Result<Vec<(String, u64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT cache_key, size_bytes FROM cache_entries
              WHERE kind = ?1 ORDER BY last_accessed ASC",
@@ -1518,7 +1518,7 @@ impl Db {
     /// on the open path, so a cache of thousands of blobs used to pay thousands
     /// of autocommit fsyncs before the mountpoint appeared.
     pub fn cache_rebuild(&self, entries: &[CacheEntryInput<'_>]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM cache_entries", [])?;
         {
@@ -1548,7 +1548,7 @@ impl Db {
     /// Record `uid` as pinned under display `path`. `recursive` keeps the whole
     /// subtree of a folder. Idempotent — re-pinning refreshes the path/flag.
     pub fn pin_add(&self, uid: &str, path: &str, recursive: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO pins (uid, path, recursive) VALUES (?1, ?2, ?3)
              ON CONFLICT(uid) DO UPDATE SET
@@ -1560,14 +1560,14 @@ impl Db {
 
     /// Drop `uid`'s pin row. Returns whether a row existed.
     pub fn pin_remove(&self, uid: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM pins WHERE uid = ?1", params![uid])?;
         Ok(n > 0)
     }
 
     /// Every directly-pinned entry `(uid, path, recursive)`, ordered by uid.
     pub fn pin_list(&self) -> Result<Vec<(String, String, bool)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT uid, path, recursive FROM pins ORDER BY uid")?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -1588,7 +1588,7 @@ impl Db {
     /// via a CTE; a direct pin is honoured even when the node has no `nodes` row
     /// yet (e.g. a CLI that never hydrates the node cache).
     pub fn is_pinned(&self, uid: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let direct: Option<i64> = conn
             .query_row("SELECT 1 FROM pins WHERE uid = ?1", params![uid], |r| {
                 r.get(0)
@@ -1618,7 +1618,7 @@ impl Db {
     /// every descendant of a recursively-pinned folder. Used to build the
     /// eviction-exempt set (the budget enforcer hashes these into cache keys).
     pub fn pinned_uids(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "WITH RECURSIVE sub(uid) AS (
                SELECT uid FROM pins WHERE recursive = 1
@@ -1640,7 +1640,7 @@ impl Db {
     /// Every descendant uid of `folder` (all depths), via a `parent_uid` CTE.
     /// Used to evict a recursively-pinned subtree's cached blobs on unpin.
     pub fn descendants(&self, folder: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "WITH RECURSIVE sub(uid) AS (
                SELECT uid FROM nodes WHERE parent_uid = ?1
@@ -1663,7 +1663,7 @@ impl Db {
     /// [`local_finish_scan`](Self::local_finish_scan); rows still carrying an
     /// older generation are pruned there as "no longer on disk".
     pub fn local_begin_scan(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let current: i64 = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'local_scan_gen'",
@@ -1686,7 +1686,7 @@ impl Db {
     /// FTS index is *not* touched here — it is rebuilt once in
     /// [`local_finish_scan`](Self::local_finish_scan).
     pub fn local_upsert_batch(&self, generation: i64, entries: &[LocalEntry]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -1718,7 +1718,7 @@ impl Db {
     /// (those paths are gone from disk), rebuild the FTS index over what remains,
     /// and stamp the completion time. Returns the number of indexed entries.
     pub fn local_finish_scan(&self, generation: i64, finished_at: i64) -> Result<i64> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM local_files WHERE scan_gen != ?1",
@@ -1739,7 +1739,7 @@ impl Db {
     /// has never been built. The daemon uses this to decide whether a fresh mount
     /// needs an immediate rescan or can serve the existing index.
     pub fn local_indexed_at(&self) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'local_indexed_at'",
@@ -1759,7 +1759,7 @@ impl Db {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt;
         let rows = if query.chars().count() < TRIGRAM_MIN {
             let pat = format!("%{}%", like_escape(query));
@@ -2131,7 +2131,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("pdfs-db-wal-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let db = Db::open(&path).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock();
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))

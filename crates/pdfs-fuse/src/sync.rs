@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime};
 
@@ -209,7 +209,7 @@ fn rewatch(
             return;
         }
     };
-    let mut have = watched.lock().unwrap();
+    let mut have = watched.lock();
     // Drop watches no longer wanted.
     have.retain(|(path, _)| {
         if want.iter().any(|(p, _)| p == path) {
@@ -420,7 +420,7 @@ impl Core {
         // Hold the folder's lock for the whole pass so a mode switch can't evict the
         // local tree (and mount FUSE over it) while we walk and upload it.
         let lock = self.sync_lock(folder.id);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.lock();
         // `folder` was read before the lock; a switch may have landed in between, so
         // re-read and re-check the mode rather than trusting the snapshot.
         let current = match self.db.sync_folder_get(folder.id) {

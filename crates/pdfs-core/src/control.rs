@@ -656,10 +656,10 @@ impl PhotoKind {
                 return PhotoKind::Photo;
             }
         }
-        if let Some(mt) = media_type {
-            if mt.starts_with("video/") {
-                return PhotoKind::Video;
-            }
+        if let Some(mt) = media_type
+            && mt.starts_with("video/")
+        {
+            return PhotoKind::Video;
         }
         PhotoKind::Photo
     }

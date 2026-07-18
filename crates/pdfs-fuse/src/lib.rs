@@ -39,7 +39,8 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use parking_lot::{Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::ReplyXattr;
@@ -594,12 +595,18 @@ impl Workers {
                 .spawn(move || {
                     loop {
                         // Held only to take the next job, never across it.
-                        let job = rx.lock().unwrap().recv();
+                        let job = rx.lock().recv();
                         match job {
                             // A panicking handler must not cost the pool a
                             // worker for the rest of the run. The dropped
                             // `Reply` answers EIO on its own, so the caller of
                             // the failed op is told; the next job is unaffected.
+                            //
+                            // This only holds because the shared state is behind
+                            // `parking_lot` mutexes: a `std` mutex held at the
+                            // point of the panic would come back poisoned, and
+                            // the worker we just rescued would die on its next
+                            // acquisition — as would every other thread.
                             Ok(job) => {
                                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                             }
@@ -852,13 +859,13 @@ impl Core {
         // us, so the pending map is populated; snapshot it here rather than hold
         // both locks at once.
         let pending_sizes: HashMap<NodeUid, u64> = {
-            let pending = self.pending.lock().unwrap();
+            let pending = self.pending.lock();
             pending
                 .iter()
                 .map(|(uid, pr)| (uid.clone(), pr.meta.len))
                 .collect()
         };
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
 
         // Pass 1: assign a stable inode to every uid (root is already mapped).
         for sn in &stored {
@@ -936,7 +943,7 @@ impl Core {
                 return;
             }
         };
-        let mut map = self.pending.lock().unwrap();
+        let mut map = self.pending.lock();
         let mut restored = 0usize;
         for op in ops {
             let Some(uid) = parse_node_uid(&op.uid) else {
@@ -1009,7 +1016,7 @@ impl Core {
             match self.rt.block_on(self.client.get_my_files_folder()) {
                 Ok(root) => {
                     {
-                        let mut st = self.state.lock().unwrap();
+                        let mut st = self.state.lock();
                         if let Some(e) = st.entries.get_mut(&ROOT_INO) {
                             e.node = root.clone();
                         }
@@ -1037,7 +1044,7 @@ impl Core {
     /// Lets a handler decide between answering inline and handing off to a
     /// worker, at the cost of one uncontended map lookup.
     fn children_cached(&self, ino: u64) -> bool {
-        self.state.lock().unwrap().children.contains_key(&ino)
+        self.state.lock().children.contains_key(&ino)
     }
 
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
@@ -1045,7 +1052,7 @@ impl Core {
     /// held so concurrent metadata reads aren't blocked behind a fetch.
     fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
         let folder_uid = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             if st.children.contains_key(&ino) {
                 return Ok(());
             }
@@ -1060,7 +1067,7 @@ impl Core {
         // was trimmed from the hot cache mid-run.
         match self.db.children_if_listed(&folder_uid) {
             Ok(Some(nodes)) => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
                     return Ok(());
                 }
@@ -1093,7 +1100,7 @@ impl Core {
                 Errno::EIO
             })?;
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         // Lost the race? Another thread already populated it.
         if st.children.contains_key(&ino) {
             return Ok(());
@@ -1118,7 +1125,7 @@ impl Core {
     /// the parent's listing is cached first.
     fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
         self.ensure_children(parent)?;
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock();
         st.children
             .get(&parent)
             .and_then(|kids| {
@@ -1138,7 +1145,7 @@ impl Core {
     fn resolve_path(&self, rel: &Path) -> Result<(u64, NodeUid), Errno> {
         let mut ino = ROOT_INO;
         let mut uid = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             st.entries
                 .get(&ROOT_INO)
                 .map(|e| e.uid.clone())
@@ -1217,7 +1224,7 @@ impl Core {
                 ),
             }
             let act = {
-                let mut readers = self.readers.lock().unwrap();
+                let mut readers = self.readers.lock();
                 match readers.get_mut(uid) {
                     Some(ReaderSlot::Ready(entry))
                         if entry.mtime == mtime && entry.size == fsize =>
@@ -1275,7 +1282,7 @@ impl Core {
                         }
                     };
                     {
-                        let mut readers = self.readers.lock().unwrap();
+                        let mut readers = self.readers.lock();
                         // Publish only into the slot we claimed. If it is gone
                         // or belongs to a later attempt, an eviction or a newer
                         // revision overtook us: our reader still answers the
@@ -1341,7 +1348,7 @@ impl Core {
     /// to cache what it opened, which is what we want — the eviction says that
     /// revision is no longer the truth.
     fn evict_reader(&self, uid: &NodeUid) {
-        self.readers.lock().unwrap().remove(uid);
+        self.readers.lock().remove(uid);
     }
 
     /// Serve bytes `[offset, offset + len)` of `uid`'s active revision, hitting
@@ -1361,7 +1368,7 @@ impl Core {
         // A queued write has not reached the remote yet, so the remote's current
         // revision is stale and the staged blob is the truth. Serve from it until
         // the drain worker lands the upload (offline.md Phase 3).
-        if let Some(pending) = self.pending.lock().unwrap().get(uid).cloned() {
+        if let Some(pending) = self.pending.lock().get(uid).cloned() {
             return self.read_pending(&pending, offset, len);
         }
         // A node created offline and never written has no blob and no remote: it
@@ -1439,7 +1446,6 @@ impl Core {
             .filter(|&bidx| {
                 self.stream_ring
                     .lock()
-                    .unwrap()
                     .get(uid, mtime, fsize, bidx)
                     .is_none()
             })
@@ -1467,7 +1473,7 @@ impl Core {
             while let Some(joined) = set.join_next().await {
                 let Ok((bidx, read)) = joined else { continue };
                 match read {
-                    Ok(bytes) => core.stream_ring.lock().unwrap().insert(
+                    Ok(bytes) => core.stream_ring.lock().insert(
                         &uid,
                         mtime,
                         fsize,
@@ -1523,7 +1529,6 @@ impl Core {
             } else {
                 self.stream_ring
                     .lock()
-                    .unwrap()
                     .get(uid, mtime, fsize, bidx)
             };
             match hit {
@@ -1576,7 +1581,6 @@ impl Core {
                 } else {
                     self.stream_ring
                         .lock()
-                        .unwrap()
                         .insert(uid, mtime, fsize, bidx, bytes.clone());
                 }
                 blocks[(bidx - first) as usize] = Some(bytes);
@@ -1769,7 +1773,7 @@ impl Core {
         if is_local_uid(uid) {
             return None;
         }
-        match self.pending.lock().unwrap().get(uid) {
+        match self.pending.lock().get(uid) {
             Some(p) => p.meta.based_on,
             None => Some(Baseline {
                 mtime: base_mtime,
@@ -1800,7 +1804,7 @@ impl Core {
         // refuse the write and keep the bytes recoverable (Phase 2 behaviour).
         // Only reachable offline, editing in place a file whose previous edit
         // has not drained and whose base is not cached.
-        if !meta.complete && self.pending.lock().unwrap().contains_key(uid) {
+        if !meta.complete && self.pending.lock().contains_key(uid) {
             self.stage_orphaned_write(uid, ino, src, &meta);
             return Err(Errno::EIO);
         }
@@ -1856,13 +1860,12 @@ impl Core {
         let len = meta.len;
         self.pending
             .lock()
-            .unwrap()
             .insert(uid.clone(), PendingRevision { path, meta });
         // Reflect the write in the tree straight away: `ls` must show the new
         // size and mtime even though the remote still holds the old revision.
         let now = now_secs();
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock();
             st.record_pending_write(ino, len, now);
         }
         // Cached blobs and open readers describe the superseded revision. Reads
@@ -1892,7 +1895,7 @@ impl Core {
     ///   base, so it is the drain that has to fetch it.
     fn queue_truncate(&self, ino: u64, size: u64) -> Result<(), Errno> {
         let (uid, base_mtime, base_size) = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             match st.entries.get(&ino) {
                 Some(e) if e.node.is_file() => {
                     (e.uid.clone(), e.node.modification_time, node_size(&e.node))
@@ -2017,7 +2020,6 @@ impl Core {
         })?;
         self.state
             .lock()
-            .unwrap()
             .rename_in_place(ino, new_parent_ino, new_parent_uid, new_name);
         self.wake_drain();
         debug!(%uid, %new_parent_uid, new_name, "renamed offline; queued");
@@ -2052,7 +2054,7 @@ impl Core {
             error!(%uid, error = %e, "queueing trash failed");
             Errno::EIO
         })?;
-        self.state.lock().unwrap().forget(uid);
+        self.state.lock().forget(uid);
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.wake_drain();
@@ -2070,13 +2072,13 @@ impl Core {
             }
             Err(e) => error!(%uid, error = %e, "dropping queued ops failed"),
         }
-        self.pending.lock().unwrap().remove(uid);
+        self.pending.lock().remove(uid);
     }
 
     /// Nudge the drain worker to re-examine the queue now.
     fn wake_drain(&self) {
         let (lock, cv) = &*self.drain_wake;
-        *lock.lock().unwrap() = true;
+        *lock.lock() = true;
         cv.notify_all();
     }
 
@@ -2091,7 +2093,7 @@ impl Core {
                     "cannot queue write over an undrained edit; bytes kept in staging"
                 );
                 let name = {
-                    let st = self.state.lock().unwrap();
+                    let st = self.state.lock();
                     st.entries
                         .get(&ino)
                         .map(|e| e.node.name.clone())
@@ -2163,10 +2165,9 @@ impl Core {
     /// the shortest outstanding backoff elapsing.
     fn wait_for_drain_work(&self) {
         let (lock, cv) = &*self.drain_wake;
-        let mut woken = lock.lock().unwrap();
+        let mut woken = lock.lock();
         if !*woken {
-            let (guard, _) = cv.wait_timeout(woken, DRAIN_IDLE_POLL).unwrap();
-            woken = guard;
+            cv.wait_for(&mut woken, DRAIN_IDLE_POLL);
         }
         *woken = false;
     }
@@ -2309,7 +2310,7 @@ impl Core {
     /// it away from the one the user asked for. Best effort: the event sync
     /// would correct the tree anyway, but not before the user has looked at it.
     fn adopt_drained_name(&self, uid: &NodeUid, name: &str) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         let Some(&ino) = st.by_uid.get(uid) else {
             return;
         };
@@ -2389,7 +2390,7 @@ impl Core {
         if let Some(blob) = op.blob_path.as_deref() {
             self.cache.discard_staged(Path::new(blob));
         }
-        self.pending.lock().unwrap().remove(&local);
+        self.pending.lock().remove(&local);
         self.log_activity(ActivityKind::Upload, &name, "created", true);
         info!(%local, %real, name, kind = %op.kind, "pending create landed");
         Ok(())
@@ -2472,7 +2473,7 @@ impl Core {
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if let Some(ino) = st.by_uid.remove(local) {
             st.by_uid.insert(real.clone(), ino);
             if let Some(e) = st.entries.get_mut(&ino) {
@@ -2632,12 +2633,12 @@ impl Core {
         // Dropping the pending entry hands the node back to the remote's truth:
         // reads stop coming from the staged blob, and the event sync stops
         // skipping it as "ahead of the server" (offline.md Phase 3a).
-        self.pending.lock().unwrap().remove(uid);
+        self.pending.lock().remove(uid);
         self.cache.discard_staged(blob);
         self.cache.evict(uid);
         self.evict_reader(uid);
         // The conflict copy is a node the tree has never seen.
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if let Some(&ino) = st.by_uid.get(&parent) {
             st.invalidate_listing(ino);
         }
@@ -2670,7 +2671,7 @@ impl Core {
         error!(%uid, name, reason, staged = %blob.display(),
                "cannot place a conflicted write; bytes kept in staging");
         self.db.delete_op(op.id)?;
-        self.pending.lock().unwrap().remove(uid);
+        self.pending.lock().remove(uid);
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.log_activity(
@@ -2695,7 +2696,7 @@ impl Core {
 
     /// A node's parent uid and name, as the tree currently has them.
     fn node_place(&self, uid: &NodeUid) -> Option<(NodeUid, String)> {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock();
         let ino = st.by_uid.get(uid)?;
         let entry = st.entries.get(ino)?;
         let parent = entry.node.parent_uid.clone()?;
@@ -2709,7 +2710,7 @@ impl Core {
     /// root yet, which is not where the drain runs; the drain must not panic
     /// over it regardless, since that would stop the queue for good.
     fn root_uid(&self) -> Option<NodeUid> {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock();
         st.entries.get(&ROOT_INO).map(|e| e.uid.clone())
     }
 
@@ -2752,7 +2753,7 @@ impl Core {
         }
 
         let name = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             st.by_uid
                 .get(&uid)
                 .and_then(|ino| st.entries.get(ino))
@@ -2776,7 +2777,7 @@ impl Core {
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
         self.db.delete_op(op.id)?;
-        self.pending.lock().unwrap().remove(&uid);
+        self.pending.lock().remove(&uid);
 
         // The staged blob now matches the sealed revision, so a pinned file keeps
         // it as its cached content rather than re-downloading what we just sent.
@@ -2812,7 +2813,7 @@ impl Core {
         // A write queued while this one was on the wire is ahead of the remote
         // again, and its optimistic size/mtime must win — the same reason
         // `apply_event` refuses to overwrite a node with a queued write.
-        if self.pending.lock().unwrap().contains_key(uid) {
+        if self.pending.lock().contains_key(uid) {
             return;
         }
         let node = match self.fetch_node_remote(uid) {
@@ -2827,7 +2828,7 @@ impl Core {
                 return;
             }
         };
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         let Some(parent) = st
             .by_uid
             .get(uid)
@@ -2888,7 +2889,7 @@ impl Core {
             .resolve_path(rel)
             .map_err(|e| format!("resolve path: {e:?}"))?;
         let (name, is_folder, mtime, size) = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             let e = st.entries.get(&ino).ok_or("node vanished")?;
             (
                 e.node.name.clone(),
@@ -2928,7 +2929,7 @@ impl Core {
         while let Some(dir) = stack.pop() {
             self.ensure_children(dir)
                 .map_err(|e| format!("enumerate: {e:?}"))?;
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             if let Some(kids) = st.children.get(&dir) {
                 for &k in kids {
                     if let Some(e) = st.entries.get(&k) {
@@ -2969,7 +2970,7 @@ impl Core {
     /// `Ok(None)` when the node is not a file or has no thumbnail of that type.
     fn thumbnail(&self, ino: u64, ttype: ThumbnailType) -> Result<Option<Vec<u8>>, Errno> {
         let (uid, mtime) = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             match st.entries.get(&ino) {
                 Some(e) if e.node.is_file() => (e.uid.clone(), e.node.modification_time),
                 Some(_) => return Ok(None),
@@ -3001,7 +3002,7 @@ impl Core {
             .resolve_path(rel)
             .map_err(|e| format!("resolve path: {e:?}"))?;
         let (name, is_folder) = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             st.entries
                 .get(&ino)
                 .map(|e| (e.node.name.clone(), e.node.is_folder()))
@@ -3044,7 +3045,7 @@ impl Core {
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
         let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             st.children
                 .get(&ino)
                 .map(|kids| {
@@ -3260,7 +3261,7 @@ impl Core {
             }
         }
 
-        let pending = self.thumb_gen.lock().unwrap();
+        let pending = self.thumb_gen.lock();
         uids.iter()
             .map(|uid| PhotoThumb {
                 uid: uid.to_string(),
@@ -3279,7 +3280,7 @@ impl Core {
     /// the reply this call is about to send already reports them as pending.
     fn spawn_generate_thumbs(&self, uids: Vec<NodeUid>, tags: &HashMap<String, i64>) {
         let fresh: Vec<NodeUid> = {
-            let mut inflight = self.thumb_gen.lock().unwrap();
+            let mut inflight = self.thumb_gen.lock();
             uids.into_iter()
                 .filter(|uid| inflight.insert(uid.clone()))
                 .collect()
@@ -3294,7 +3295,7 @@ impl Core {
         // blocking pool rather than on an async worker.
         self.rt.spawn_blocking(move || {
             core.generate_thumbs(&fresh, &tags);
-            let mut inflight = core.thumb_gen.lock().unwrap();
+            let mut inflight = core.thumb_gen.lock();
             for uid in &fresh {
                 inflight.remove(uid);
             }
@@ -3490,7 +3491,7 @@ impl Core {
             .resolve_path(rel)
             .map_err(|e| format!("resolve path: {e:?}"))?;
         let (name, mtime, size) = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             let e = st.entries.get(&ino).ok_or("node vanished")?;
             if !e.node.is_file() {
                 return Err("not a regular file".into());
@@ -3520,7 +3521,7 @@ impl Core {
     fn invalidate_parent_listing(&self, rel: &Path) {
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         if let Ok((pino, _)) = self.resolve_path(parent) {
-            self.state.lock().unwrap().invalidate_listing(pino);
+            self.state.lock().invalidate_listing(pino);
         }
     }
 
@@ -3538,7 +3539,7 @@ impl Core {
         self.rt
             .block_on(self.client.rename_node(&uid, new_name, None))
             .map_err(|e| format!("rename: {e}"))?;
-        self.state.lock().unwrap().forget(&uid);
+        self.state.lock().forget(&uid);
         self.invalidate_parent_listing(rel);
         Ok(new_name.to_string())
     }
@@ -3559,12 +3560,11 @@ impl Core {
         let name = self
             .state
             .lock()
-            .unwrap()
             .forget(&uid)
             .map(|(_, n)| n)
             .unwrap_or_default();
         self.invalidate_parent_listing(rel);
-        self.state.lock().unwrap().invalidate_listing(pino);
+        self.state.lock().invalidate_listing(pino);
         Ok(name)
     }
 
@@ -3580,7 +3580,6 @@ impl Core {
         let name = self
             .state
             .lock()
-            .unwrap()
             .forget(&uid)
             .map(|(_, n)| n)
             .unwrap_or_default();
@@ -3703,7 +3702,7 @@ impl Core {
         self.db
             .set_listed(&uid, false)
             .map_err(|e| format!("db: {e:?}"))?;
-        self.state.lock().unwrap().children.remove(&ino);
+        self.state.lock().children.remove(&ino);
         Ok(())
     }
 
@@ -3735,7 +3734,7 @@ impl Core {
             .block_on(self.client.restore_nodes(&parsed))
             .map_err(|e| format!("restore: {e}"))?;
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock();
             for parent in parents {
                 if let Some(&ino) = st.by_uid.get(&parent) {
                     st.invalidate_listing(ino);
@@ -3777,7 +3776,7 @@ impl Core {
     /// Forget every trace of nodes that no longer exist anywhere: their inode and
     /// DB row, and their cached content.
     fn drop_local(&self, uids: &[NodeUid]) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         for uid in uids {
             st.forget(uid);
         }
@@ -3809,7 +3808,7 @@ impl Core {
         let node = self
             .fetch_node(&new_uid)
             .map_err(|e| format!("fetch node: {e:?}"))?;
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
             && !kids.contains(&ino)
@@ -3851,7 +3850,7 @@ impl Core {
         let node = self
             .fetch_node(&new_uid)
             .map_err(|e| format!("fetch node: {e:?}"))?;
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
             && !kids.contains(&ino)
@@ -3928,7 +3927,7 @@ impl Core {
                     stats.bytes += size;
                     match self.fetch_node(&uid) {
                         Ok(node) => {
-                            let mut st = self.state.lock().unwrap();
+                            let mut st = self.state.lock();
                             let ino = st.intern(parent_ino, node);
                             if let Some(kids) = st.children.get_mut(&parent_ino)
                                 && !kids.contains(&ino)
@@ -3971,7 +3970,7 @@ impl Core {
         self.ensure_children(pino)
             .map_err(|e| format!("enumerate: {e:?}"))?;
         {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock();
             if let Some(kids) = st.children.get(&pino) {
                 for &ino in kids {
                     if let Some(e) = st.entries.get(&ino)
@@ -3993,7 +3992,7 @@ impl Core {
         let node = self
             .fetch_node(&new_uid)
             .map_err(|e| format!("fetch node: {e:?}"))?;
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
             && !kids.contains(&ino)
@@ -4268,7 +4267,7 @@ impl Core {
     /// List this device's synced folders for the front-ends, each carrying the
     /// live progress of its pass when one is running.
     fn list_sync_folders(&self) -> Result<Vec<SyncFolderInfo>, String> {
-        let progress = self.sync_progress.lock().unwrap();
+        let progress = self.sync_progress.lock();
         Ok(self
             .db
             .sync_folder_list()
@@ -4295,7 +4294,6 @@ impl Core {
         let mut passes: Vec<(i64, SyncProgress)> = self
             .sync_progress
             .lock()
-            .unwrap()
             .iter()
             .map(|(id, p)| (*id, p.clone()))
             .collect();
@@ -4349,7 +4347,6 @@ impl Core {
     pub(crate) fn sync_lock(&self, id: i64) -> Arc<Mutex<()>> {
         self.sync_locks
             .lock()
-            .unwrap()
             .entry(id)
             .or_default()
             .clone()
@@ -4368,7 +4365,7 @@ impl Core {
         // folder the daemon no longer tracks, and nothing would ever unmount it.
         // Tear it down first — including before trashing the remote tree it
         // serves, which would otherwise leave it answering for deleted nodes.
-        if let Some(session) = self.mounts.lock().unwrap().remove(&id) {
+        if let Some(session) = self.mounts.lock().remove(&id) {
             if let Err(e) = session.umount_and_join() {
                 warn!(id, error = %e, "unmount on-demand folder failed");
             } else {
@@ -4537,7 +4534,7 @@ impl Core {
         // the `state` column is still `idle` in the window between `add_sync_folder`
         // inserting the row and the engine picking it up.
         let lock = self.sync_lock(id);
-        let Ok(_guard) = lock.try_lock() else {
+        let Some(_guard) = lock.try_lock() else {
             return Err(SwitchBlocked::NotNow);
         };
         // Re-read under the lock: a pass that finished while we waited may have
@@ -4580,7 +4577,7 @@ impl Core {
                 let session = self
                     .spawn_ondemand_mount(&local, root)
                     .map_err(SwitchBlocked::Failed)?;
-                self.mounts.lock().unwrap().insert(id, session);
+                self.mounts.lock().insert(id, session);
                 // Persist the mode only now that the mount is actually up. Writing it
                 // first would strand the folder on any failure below: the engine skips
                 // non-mirror folders, so an `ondemand` row with no mount is a folder
@@ -4597,7 +4594,7 @@ impl Core {
             }
             _ => {
                 // ondemand→mirror: tear down the secondary mount first.
-                if let Some(session) = self.mounts.lock().unwrap().remove(&id)
+                if let Some(session) = self.mounts.lock().remove(&id)
                     && let Err(e) = session.umount_and_join()
                 {
                     warn!(id, error = %e, "unmount on-demand folder failed");
@@ -4718,7 +4715,7 @@ impl Core {
             };
             match self.spawn_ondemand_mount(&local, root) {
                 Ok(session) => {
-                    self.mounts.lock().unwrap().insert(folder.id, session);
+                    self.mounts.lock().insert(folder.id, session);
                     let _ = self.db.sync_folder_set_state(folder.id, "idle", now_secs());
                     info!(id = folder.id, path = %local.display(), "remounted on-demand folder");
                 }
@@ -5111,7 +5108,7 @@ impl Core {
     /// been seen through the mount (e.g. shared but not browsed to this session) —
     /// the caller then leaves the path empty.
     fn rel_path_for_uid(&self, uid: &NodeUid) -> Option<String> {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock();
         let mut ino = *st.by_uid.get(uid)?;
         let mut parts = Vec::new();
         while ino != ROOT_INO {
@@ -5163,7 +5160,7 @@ impl Core {
 
     /// Start tracking a reconcile pass over `folder_id`, in [`SyncPhase::Scanning`].
     pub(crate) fn progress_begin(&self, folder_id: i64) {
-        self.sync_progress.lock().unwrap().insert(
+        self.sync_progress.lock().insert(
             folder_id,
             SyncProgress {
                 phase: SyncPhase::Scanning,
@@ -5176,7 +5173,7 @@ impl Core {
 
     /// Apply `f` to a folder's live progress, if a pass is running for it.
     fn progress_update(&self, folder_id: i64, f: impl FnOnce(&mut SyncProgress)) {
-        if let Some(p) = self.sync_progress.lock().unwrap().get_mut(&folder_id) {
+        if let Some(p) = self.sync_progress.lock().get_mut(&folder_id) {
             f(p);
         }
     }
@@ -5230,7 +5227,7 @@ impl Core {
     /// Stop tracking a pass — no progress is reported for the folder until the
     /// next [`progress_begin`](Self::progress_begin).
     pub(crate) fn progress_end(&self, folder_id: i64) {
-        self.sync_progress.lock().unwrap().remove(&folder_id);
+        self.sync_progress.lock().remove(&folder_id);
     }
 }
 
@@ -5298,7 +5295,7 @@ impl ProtonFs {
     /// Build the filesystem rooted at `root` (the user's My Files folder).
     fn new(core: Core, root: Node) -> Self {
         {
-            let mut st = core.state.lock().unwrap();
+            let mut st = core.state.lock();
             if let Err(e) = st.db.upsert_node(&root) {
                 warn!(uid = %root.uid, error = %e, "db upsert root failed");
             }
@@ -5323,7 +5320,7 @@ impl ProtonFs {
             reply.error(e);
             return;
         }
-        let st = self.core.state.lock().unwrap();
+        let st = self.core.state.lock();
         let hit = st.children.get(&parent).and_then(|kids| {
             kids.iter().copied().find_map(|ino| {
                 st.entries
@@ -5347,7 +5344,7 @@ impl ProtonFs {
             reply.error(e);
             return;
         }
-        let st = self.core.state.lock().unwrap();
+        let st = self.core.state.lock();
         let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
 
         // "." and ".." occupy offsets 0 and 1; real children follow.
@@ -5421,7 +5418,7 @@ impl ProtonFs {
         // offline, which the remote path below cannot (offline.md Phase 3b).
         if is_local_uid(&uid) {
             self.core.discard_queued_ops(&uid);
-            self.core.state.lock().unwrap().forget(&uid);
+            self.core.state.lock().forget(&uid);
             debug!(%uid, name, "deleted a node that had not been created remotely yet");
             reply.ok();
             return;
@@ -5446,7 +5443,7 @@ impl ProtonFs {
             return;
         }
         self.core.discard_queued_ops(&uid);
-        self.core.state.lock().unwrap().forget(&uid);
+        self.core.state.lock().forget(&uid);
         self.core.cache.evict(&uid);
         self.core.evict_reader(&uid);
         self.core.invalidate_trash();
@@ -5796,7 +5793,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let st = self.core.state.lock().unwrap();
+        let st = self.core.state.lock();
         match st.entries.get(&ino.0) {
             Some(e) => {
                 let attr = self.attr(ino.0, &e.node);
@@ -5829,7 +5826,7 @@ impl Filesystem for ProtonFs {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let (uid, base_mtime, base_size) = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     (e.uid.clone(), e.node.modification_time, node_size(&e.node))
@@ -5860,7 +5857,7 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let mut st = self.core.state.lock().unwrap();
+        let mut st = self.core.state.lock();
         let fh = st.next_fh;
         st.next_fh += 1;
         st.handles.insert(
@@ -5902,7 +5899,7 @@ impl Filesystem for ProtonFs {
         // has always had between a write and a read of the same handle; a mostly
         // local read is not worth reasoning about that for.
         let handle = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             st.handles.values().find(|h| h.ino == ino.0).map(|h| {
                 (
                     h.file.clone(),
@@ -5931,7 +5928,7 @@ impl Filesystem for ProtonFs {
             return;
         }
         let (uid, mtime, fsize, is_video) = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     let media_type = match &e.node.kind {
@@ -5992,7 +5989,7 @@ impl Filesystem for ProtonFs {
         }
         let name = name.to_string_lossy().into_owned();
         let parent_uid = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -6057,7 +6054,7 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let mut st = self.core.state.lock().unwrap();
+        let mut st = self.core.state.lock();
         let ino = st.intern(parent, node);
         if let Some(kids) = st.children.get_mut(&parent)
             && !kids.contains(&ino)
@@ -6107,7 +6104,7 @@ impl Filesystem for ProtonFs {
         // Stage the bytes straight into the scratch file (no base download): only
         // the untouched remainder is pulled from the remote, and only at commit.
         let file = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.handles.get(&fh) {
                 Some(h) => h.file.clone(),
                 None => {
@@ -6122,7 +6119,7 @@ impl Filesystem for ProtonFs {
             return;
         }
         let new_len = {
-            let mut st = self.core.state.lock().unwrap();
+            let mut st = self.core.state.lock();
             let Some(h) = st.handles.get_mut(&fh) else {
                 reply.error(Errno::EBADF);
                 return;
@@ -6170,7 +6167,7 @@ impl Filesystem for ProtonFs {
         if let Some(size) = size {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
             let handled = {
-                let mut st = self.core.state.lock().unwrap();
+                let mut st = self.core.state.lock();
                 // The kernel does not put `O_TRUNC` in the `open` flags unless
                 // the mount enables `atomic_o_trunc`; it opens, then truncates
                 // with a *separate* `setattr` carrying no file handle. So an fh
@@ -6218,10 +6215,10 @@ impl Filesystem for ProtonFs {
                     return;
                 }
             } else {
-                self.core.state.lock().unwrap().set_size(ino.0, size);
+                self.core.state.lock().set_size(ino.0, size);
             }
         }
-        let st = self.core.state.lock().unwrap();
+        let st = self.core.state.lock();
         match st.entries.get(&ino.0) {
             Some(e) => {
                 let attr = self.attr(ino.0, &e.node);
@@ -6261,7 +6258,6 @@ impl Filesystem for ProtonFs {
             .core
             .state
             .lock()
-            .unwrap()
             .handles
             .get(&fh.0)
             .map(|h| h.file.clone());
@@ -6287,7 +6283,7 @@ impl Filesystem for ProtonFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let handle = self.core.state.lock().unwrap().handles.remove(&fh.0);
+        let handle = self.core.state.lock().handles.remove(&fh.0);
         // Hand the bytes to the queue rather than uploading them here: the
         // scratch file is the only copy of what was just written, and blocking
         // the caller on the network is what made a copy into the mount run at
@@ -6325,7 +6321,7 @@ impl Filesystem for ProtonFs {
         }
         let name = name.to_string_lossy().into_owned();
         let parent_uid = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -6371,7 +6367,7 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
-        let mut st = self.core.state.lock().unwrap();
+        let mut st = self.core.state.lock();
         let local = is_local_uid(&node.uid);
         let uid = node.uid.clone();
         let ino = st.intern(parent, node);
@@ -6424,7 +6420,7 @@ impl Filesystem for ProtonFs {
             return;
         }
         let new_parent_uid = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.entries.get(&newparent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -6444,7 +6440,7 @@ impl Filesystem for ProtonFs {
                 &newname,
             ) {
                 Ok(true) => {
-                    self.core.state.lock().unwrap().rename_in_place(
+                    self.core.state.lock().rename_in_place(
                         ino,
                         newparent,
                         &new_parent_uid,
@@ -6504,7 +6500,7 @@ impl Filesystem for ProtonFs {
         }
         // Forget the node so it re-interns under its new parent, and drop the
         // destination listing so it re-enumerates on next access.
-        let mut st = self.core.state.lock().unwrap();
+        let mut st = self.core.state.lock();
         st.forget(&uid);
         st.children.remove(&newparent);
         reply.ok();
@@ -6551,7 +6547,7 @@ impl Filesystem for ProtonFs {
     /// file lacks returns `ENODATA`.
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let is_file = {
-            let st = self.core.state.lock().unwrap();
+            let st = self.core.state.lock();
             match st.entries.get(&ino.0) {
                 Some(e) => e.node.is_file(),
                 None => {
@@ -6599,7 +6595,7 @@ fn apply_event(
             is_trashed,
             ..
         } => {
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock();
             if *is_trashed {
                 // Trashing makes a node vanish from its parent listing.
                 let child = st.by_uid.get(node_uid).copied();
@@ -6615,7 +6611,7 @@ fn apply_event(
                         }
                     }
                 }
-            } else if pending.lock().unwrap().contains_key(node_uid) {
+            } else if pending.lock().contains_key(node_uid) {
                 // A node we owe an upload for is *ahead* of the remote, not
                 // behind it: this event is almost always the echo of our own
                 // empty-file create, and re-fetching would replace the size and
@@ -6641,7 +6637,7 @@ fn apply_event(
             }
         }
         DriveEvent::NodeDeleted { node_uid, .. } => {
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock();
             // Capture the inode before `forget` clears the uid mapping.
             let child = st.by_uid.get(node_uid).copied();
             content.evict(node_uid);
@@ -6661,7 +6657,7 @@ fn apply_event(
         // metadata. Inodes stay stable; dirs simply re-enumerate on next access.
         DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
             warn!("event continuity lost; dropping all cached listings, resyncing lazily");
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock();
             let dirs: Vec<u64> = st.children.keys().copied().collect();
             for &ino in &dirs {
                 st.invalidate_listing(ino);
@@ -7823,7 +7819,7 @@ pub fn mount(
 
     // Unmount every on-demand sync folder too, or the kernel mounts linger as
     // stale and the next start fails with EBUSY (devices.md Phase 3).
-    let secondaries: Vec<_> = core.mounts.lock().unwrap().drain().collect();
+    let secondaries: Vec<_> = core.mounts.lock().drain().collect();
     for (id, session) in secondaries {
         if let Err(e) = session.umount_and_join() {
             warn!(id, error = %e, "unmount on-demand folder failed");

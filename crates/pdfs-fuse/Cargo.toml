@@ -17,3 +17,4 @@ libc.workspace = true
 serde_json.workspace = true
 image.workspace = true
 notify = "8"
+parking_lot.workspace = true

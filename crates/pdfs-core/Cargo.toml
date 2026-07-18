@@ -20,3 +20,4 @@ ignore.workspace = true
 sha2.workspace = true
 rusqlite.workspace = true
 keyring.workspace = true
+parking_lot.workspace = true
