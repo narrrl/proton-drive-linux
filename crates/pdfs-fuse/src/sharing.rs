@@ -8,12 +8,12 @@
 
 use std::path::Path;
 
-use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::control::{
     BookmarkInfo, DirEntry, InvitationInfo, PublicLinkInfo, ShareEntry, ShareEntryKind, SharedItem,
 };
-use proton_drive_rs::{MemberRole, NodeKind};
+use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
+use proton_drive_rs::{MemberRole, NodeKind};
 
 use super::{Core, ROOT_INO, parse_uid, public_link_info, role_from_str, role_to_str};
 
@@ -35,18 +35,21 @@ impl Core {
             emails.iter().map(|e| (e.clone(), role)).collect();
         self.rt
             .block_on(self.client.invite_users(&uid, &invitees, message))
-            .map_err(|e| CoreError::remote(format!("share: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "share"))
     }
 
     /// List the members, pending invitations and public link of the node at `rel`.
-    pub(crate) fn list_share(&self, rel: &Path) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
+    pub(crate) fn list_share(
+        &self,
+        rel: &Path,
+    ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
         let (_ino, uid) = self.resolve(rel)?;
 
         let mut entries = Vec::new();
         for m in self
             .rt
             .block_on(self.client.list_share_members(&uid))
-            .map_err(|e| CoreError::remote(format!("list members: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "list members"))?
         {
             entries.push(ShareEntry {
                 id: m.membership_id.to_string(),
@@ -58,7 +61,7 @@ impl Core {
         for inv in self
             .rt
             .block_on(self.client.list_share_invitations(&uid))
-            .map_err(|e| CoreError::remote(format!("list invitations: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "list invitations"))?
         {
             entries.push(ShareEntry {
                 id: inv.invitation_id,
@@ -70,7 +73,7 @@ impl Core {
         for ext in self
             .rt
             .block_on(self.client.list_external_invitations(&uid))
-            .map_err(|e| CoreError::remote(format!("list external invitations: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "list external invitations"))?
         {
             entries.push(ShareEntry {
                 id: ext.invitation_id,
@@ -83,7 +86,7 @@ impl Core {
         let link = self
             .rt
             .block_on(self.client.get_public_link(&uid))
-            .map_err(|e| CoreError::remote(format!("get public link: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "get public link"))?
             .map(public_link_info);
 
         Ok((entries, link))
@@ -105,72 +108,77 @@ impl Core {
                 let member = self
                     .rt
                     .block_on(self.client.list_share_members(&uid))
-                    .map_err(|e| CoreError::remote(format!("list members: {e}")))?
+                    .map_err(|e| CoreError::from_api(&e, "list members"))?
                     .into_iter()
                     .find(|m| m.membership_id.to_string() == id)
                     .ok_or_else(|| CoreError::not_found("member not found"))?;
                 self.rt
                     .block_on(self.client.update_member_role(&member, role))
-                    .map_err(|e| CoreError::remote(format!("update role: {e}")))
+                    .map_err(|e| CoreError::from_api(&e, "update role"))
             }
             ShareEntryKind::ProtonInvite => {
                 let inv = self
                     .rt
                     .block_on(self.client.list_share_invitations(&uid))
-                    .map_err(|e| CoreError::remote(format!("list invitations: {e}")))?
+                    .map_err(|e| CoreError::from_api(&e, "list invitations"))?
                     .into_iter()
                     .find(|i| i.invitation_id == id)
                     .ok_or_else(|| CoreError::not_found("invitation not found"))?;
                 self.rt
                     .block_on(self.client.update_invitation_role(&inv, role))
-                    .map_err(|e| CoreError::remote(format!("update role: {e}")))
+                    .map_err(|e| CoreError::from_api(&e, "update role"))
             }
-            ShareEntryKind::ExternalInvite => {
-                Err(CoreError::invalid("an external invitation's role cannot be changed"))
-            }
+            ShareEntryKind::ExternalInvite => Err(CoreError::invalid(
+                "an external invitation's role cannot be changed",
+            )),
         }
     }
 
     /// Remove a member, pending Proton invite, or external invite from the node
     /// at `rel`.
-    pub(crate) fn remove_share_entry(&self, rel: &Path, id: &str, kind: ShareEntryKind) -> CoreResult<()> {
+    pub(crate) fn remove_share_entry(
+        &self,
+        rel: &Path,
+        id: &str,
+        kind: ShareEntryKind,
+    ) -> CoreResult<()> {
         let (_ino, uid) = self.resolve(rel)?;
         match kind {
             ShareEntryKind::Member => {
                 let member = self
                     .rt
                     .block_on(self.client.list_share_members(&uid))
-                    .map_err(|e| CoreError::remote(format!("list members: {e}")))?
+                    .map_err(|e| CoreError::from_api(&e, "list members"))?
                     .into_iter()
                     .find(|m| m.membership_id.to_string() == id)
                     .ok_or_else(|| CoreError::not_found("member not found"))?;
                 self.rt
                     .block_on(self.client.remove_member(&member))
-                    .map_err(|e| CoreError::remote(format!("remove member: {e}")))
+                    .map_err(|e| CoreError::from_api(&e, "remove member"))
             }
             ShareEntryKind::ProtonInvite => {
                 let inv = self
                     .rt
                     .block_on(self.client.list_share_invitations(&uid))
-                    .map_err(|e| CoreError::remote(format!("list invitations: {e}")))?
+                    .map_err(|e| CoreError::from_api(&e, "list invitations"))?
                     .into_iter()
                     .find(|i| i.invitation_id == id)
                     .ok_or_else(|| CoreError::not_found("invitation not found"))?;
                 self.rt
                     .block_on(self.client.delete_invitation(&inv))
-                    .map_err(|e| CoreError::remote(format!("revoke invitation: {e}")))
+                    .map_err(|e| CoreError::from_api(&e, "revoke invitation"))
             }
             ShareEntryKind::ExternalInvite => {
                 let ext = self
                     .rt
                     .block_on(self.client.list_external_invitations(&uid))
-                    .map_err(|e| CoreError::remote(format!("list external invitations: {e}")))?
+                    .map_err(|e| CoreError::from_api(&e, "list external invitations"))?
                     .into_iter()
                     .find(|i| i.invitation_id == id)
                     .ok_or_else(|| CoreError::not_found("external invitation not found"))?;
                 self.rt
                     .block_on(self.client.delete_external_invitation(&ext))
-                    .map_err(|e| CoreError::remote(format!("revoke external invitation: {e}")))
+                    .map_err(|e| CoreError::from_api(&e, "revoke external invitation"))
             }
         }
     }
@@ -191,7 +199,7 @@ impl Core {
                 self.client
                     .create_public_link(&uid, role, password, expires),
             )
-            .map_err(|e| CoreError::remote(format!("create public link: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "create public link"))?;
         Ok(public_link_info(link))
     }
 
@@ -201,12 +209,12 @@ impl Core {
         let link = self
             .rt
             .block_on(self.client.get_public_link(&uid))
-            .map_err(|e| CoreError::remote(format!("get public link: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "get public link"))?
             .filter(|l| l.public_link_id == id)
             .ok_or_else(|| CoreError::not_found("public link not found"))?;
         self.rt
             .block_on(self.client.remove_public_link(&link))
-            .map_err(|e| CoreError::remote(format!("remove public link: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "remove public link"))
     }
 
     // ---- shared with me ---------------------------------------------------
@@ -216,14 +224,14 @@ impl Core {
         let uids = self
             .rt
             .block_on(self.client.enumerate_shared_with_me_node_uids())
-            .map_err(|e| CoreError::remote(format!("enumerate shared: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "enumerate shared"))?;
         if uids.is_empty() {
             return Ok(Vec::new());
         }
         let nodes = self
             .rt
             .block_on(self.client.enumerate_nodes(&uids))
-            .map_err(|e| CoreError::remote(format!("enumerate nodes: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
         Ok(nodes
             .into_iter()
             .map(|n| {
@@ -252,10 +260,11 @@ impl Core {
 
     /// Leave a shared node by its uid.
     pub(crate) fn leave_shared(&self, uid: &str) -> CoreResult<()> {
-        let uid = parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
+        let uid =
+            parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
         self.rt
             .block_on(self.client.leave_shared_node(&uid))
-            .map_err(|e| CoreError::remote(format!("leave shared: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "leave shared"))
     }
 
     // ---- incoming invitations ---------------------------------------------
@@ -265,7 +274,7 @@ impl Core {
         let invitations = self
             .rt
             .block_on(self.client.list_incoming_invitations())
-            .map_err(|e| CoreError::remote(format!("list invitations: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "list invitations"))?;
         Ok(invitations
             .into_iter()
             .map(|i| InvitationInfo {
@@ -281,14 +290,14 @@ impl Core {
     pub(crate) fn accept_invitation(&self, id: &str) -> CoreResult<()> {
         self.rt
             .block_on(self.client.accept_invitation(id))
-            .map_err(|e| CoreError::remote(format!("accept invitation: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "accept invitation"))
     }
 
     /// Reject an invitation addressed to me by its id.
     pub(crate) fn reject_invitation(&self, id: &str) -> CoreResult<()> {
         self.rt
             .block_on(self.client.reject_invitation(id))
-            .map_err(|e| CoreError::remote(format!("reject invitation: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "reject invitation"))
     }
 
     // ---- bookmarks --------------------------------------------------------
@@ -298,7 +307,7 @@ impl Core {
         let bookmarks = self
             .rt
             .block_on(self.client.list_bookmarks())
-            .map_err(|e| CoreError::remote(format!("list bookmarks: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "list bookmarks"))?;
         Ok(bookmarks
             .into_iter()
             .map(|b| BookmarkInfo {
@@ -314,14 +323,14 @@ impl Core {
     pub(crate) fn create_bookmark(&self, url: &str, password: Option<&str>) -> CoreResult<()> {
         self.rt
             .block_on(self.client.create_bookmark(url, password))
-            .map_err(|e| CoreError::remote(format!("create bookmark: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "create bookmark"))
     }
 
     /// Remove a saved bookmark by its token.
     pub(crate) fn delete_bookmark(&self, token: &str) -> CoreResult<()> {
         self.rt
             .block_on(self.client.delete_bookmark(token))
-            .map_err(|e| CoreError::remote(format!("delete bookmark: {e}")))
+            .map_err(|e| CoreError::from_api(&e, "delete bookmark"))
     }
 
     // ---- shared by me -----------------------------------------------------
@@ -335,14 +344,14 @@ impl Core {
         let uids = self
             .rt
             .block_on(self.client.enumerate_shared_by_me_node_uids())
-            .map_err(|e| CoreError::remote(format!("enumerate shared-by-me: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "enumerate shared-by-me"))?;
         if uids.is_empty() {
             return Ok(Vec::new());
         }
         let nodes = self
             .rt
             .block_on(self.client.enumerate_nodes(&uids))
-            .map_err(|e| CoreError::remote(format!("enumerate nodes: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
         let mut items = Vec::with_capacity(nodes.len());
         for n in nodes {
             let uid = n.uid.clone();

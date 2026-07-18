@@ -356,8 +356,18 @@ pub(crate) fn month_range(year: i32, month: i32) -> Option<(i64, i64)> {
 
 /// English month names, indexed 1..=12.
 pub(crate) const MONTH_NAMES: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 
 /// Rebuild the date-jump dropdown for the active kind: ask the daemon which
@@ -380,7 +390,10 @@ pub(crate) fn refresh_photo_months(ui: &Rc<Ui>) {
         let mut labels = vec!["All dates".to_string()];
         let mut ranges: Vec<Option<(i64, i64)>> = vec![None];
         for m in months {
-            let name = MONTH_NAMES.get((m.month - 1) as usize).copied().unwrap_or("?");
+            let name = MONTH_NAMES
+                .get((m.month - 1) as usize)
+                .copied()
+                .unwrap_or("?");
             labels.push(format!("{name} {} ({})", m.year, m.count));
             ranges.push(month_range(m.year, m.month));
         }
@@ -389,7 +402,8 @@ pub(crate) fn refresh_photo_months(ui: &Rc<Ui>) {
         // Repopulating resets the selection to 0, which would otherwise fire the
         // handler and reload; suppress that — the caller is already reloading.
         ui.gallery.date_suppress.set(true);
-        ui.gallery.dates
+        ui.gallery
+            .dates
             .set_model(Some(&gtk4::StringList::new(&label_refs)));
         ui.gallery.dates.set_selected(0);
         *ui.gallery.date_ranges.borrow_mut() = ranges;
@@ -444,7 +458,8 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
         // re-justify it in place, without rebuilding the ListStore (which would
         // yank the scroll position back to the top).
         ui_bind
-            .gallery.bound
+            .gallery
+            .bound
             .borrow_mut()
             .insert(item.position(), section);
     });
@@ -456,7 +471,8 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
     factory.connect_unbind(move |_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
         ui_unbind
-            .gallery.bound
+            .gallery
+            .bound
             .borrow_mut()
             .remove(&item.position());
         if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
@@ -562,7 +578,8 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
             return;
         }
         let range = ui_dates
-            .gallery.date_ranges
+            .gallery
+            .date_ranges
             .borrow()
             .get(dd.selected() as usize)
             .copied()
@@ -742,7 +759,12 @@ pub(crate) fn plan_rows(ratios: &[f64], target: f64, width: f64) -> Vec<Vec<(i32
 /// Size one row's tiles at `height`. A `justified` row is nudged so its widths
 /// plus gaps hit `avail` exactly — rounding each width independently leaves a
 /// few px of ragged right edge, so the last tile absorbs the remainder.
-pub(crate) fn size_row(ratios: &[f64], height: f64, avail: f64, justified: bool) -> Vec<(i32, i32)> {
+pub(crate) fn size_row(
+    ratios: &[f64],
+    height: f64,
+    avail: f64,
+    justified: bool,
+) -> Vec<(i32, i32)> {
     let height = height.round().max(1.0);
     let mut sizes: Vec<(i32, i32)> = ratios
         .iter()
@@ -896,13 +918,15 @@ pub(crate) fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture
         return;
     }
 
-    ui.gallery.thumb_wanted
+    ui.gallery
+        .thumb_wanted
         .borrow_mut()
         .insert(photo.uid.clone(), picture.clone());
 
     match photo.thumb_path.as_deref() {
         Some(path) => {
-            ui.gallery.decode_queue
+            ui.gallery
+                .decode_queue
                 .borrow_mut()
                 .push_back((photo.uid.clone(), path.to_string()));
             schedule_decode(ui);
@@ -1082,7 +1106,8 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
 /// ListView binds them.
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
     let bound: Vec<(u32, gtk4::Box)> = ui
-        .gallery.bound
+        .gallery
+        .bound
         .borrow()
         .iter()
         .map(|(pos, section)| (*pos, section.clone()))
@@ -1444,9 +1469,11 @@ pub(crate) fn play_video(ui: &Rc<Ui>, uid: String) {
                 "Couldn't open this video",
                 "Unexpected reply from the mount service.",
             ),
-            Ok(Err(_)) | Err(_) => {
-                toast_error(&ui, "Couldn't open this video", "Couldn't reach Proton Drive.")
-            }
+            Ok(Err(_)) | Err(_) => toast_error(
+                &ui,
+                "Couldn't open this video",
+                "Couldn't reach Proton Drive.",
+            ),
         }
     });
 }

@@ -472,7 +472,12 @@ pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
 }
 
 /// Run a mutation raised from the Shared page and reload the page on success.
-pub(crate) fn run_shared_mutation(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'static str) {
+pub(crate) fn run_shared_mutation(
+    ui: &Rc<Ui>,
+    req: Request,
+    done: &'static str,
+    failed: &'static str,
+) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();

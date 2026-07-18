@@ -840,9 +840,7 @@ impl Ui {
         // so it lands on the final list, not a half-populated one.
         if self.open_pending.get() && self.pending.get() == 0 {
             self.open_pending.set(false);
-            if let (Some(index), Some(window)) =
-                (self.cursor.get(), self.window.borrow().clone())
-            {
+            if let (Some(index), Some(window)) = (self.cursor.get(), self.window.borrow().clone()) {
                 self.open(index, &window);
             }
         }

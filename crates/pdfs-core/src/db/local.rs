@@ -160,4 +160,3 @@ pub(super) fn local_hit(row: &rusqlite::Row) -> rusqlite::Result<LocalFileHit> {
         mtime: row.get(4)?,
     })
 }
-

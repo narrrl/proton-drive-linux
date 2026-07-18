@@ -609,7 +609,11 @@ pub(crate) fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
     let abs = mountpoint.join(&rel);
     let Some(path) = abs.to_str() else {
-        toast_error(ui, "Couldn't play video", "The file path isn't valid UTF-8.");
+        toast_error(
+            ui,
+            "Couldn't play video",
+            "The file path isn't valid UTF-8.",
+        );
         return;
     };
     toast(ui, &format!("Streaming “{}”…", entry.name));
@@ -744,7 +748,8 @@ pub(crate) fn repaint_crumb(ui: &Rc<Ui>, path: &str) {
     } else {
         path.split('/').collect()
     };
-    ui.browser.crumb
+    ui.browser
+        .crumb
         .append(&crumb_node(ui, "Proton Drive", "", segments.is_empty()));
     let mut acc = String::new();
     for (i, seg) in segments.iter().enumerate() {
@@ -1071,7 +1076,9 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
                 };
                 toast(&ui, &what);
             }
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, "Couldn't upload", &message, kind),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't upload", &message, kind)
+            }
             _ => toast_error(&ui, "Couldn't upload", "The mount service didn't respond."),
         }
     });
@@ -1237,7 +1244,11 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
         match result {
             Ok(Ok(Response::Entries { entries })) => repaint_browser(&ui, &entries),
             Ok(Ok(Response::Error { message, kind })) => browser_failed(&ui, &message, kind),
-            Ok(Ok(_)) => browser_failed(&ui, "Unexpected reply from the mount service.", ErrorKind::Internal),
+            Ok(Ok(_)) => browser_failed(
+                &ui,
+                "Unexpected reply from the mount service.",
+                ErrorKind::Internal,
+            ),
             Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
         }
     });
@@ -1374,7 +1385,11 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
         match result {
             Ok(Ok(Response::SearchResults { hits })) => repaint_search(&ui, &hits),
             Ok(Ok(Response::Error { message, kind })) => browser_failed(&ui, &message, kind),
-            Ok(Ok(_)) => browser_failed(&ui, "Unexpected reply from the mount service.", ErrorKind::Internal),
+            Ok(Ok(_)) => browser_failed(
+                &ui,
+                "Unexpected reply from the mount service.",
+                ErrorKind::Internal,
+            ),
             Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
         }
     });

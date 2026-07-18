@@ -96,7 +96,13 @@ pub(crate) fn wire_activity(ui: &Rc<Ui>, retry: &gtk4::Button) {
 }
 
 /// Show a status page in place of the Activity list.
-pub(crate) fn activity_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+pub(crate) fn activity_status(
+    ui: &Rc<Ui>,
+    icon: &str,
+    title: &str,
+    description: &str,
+    retry: bool,
+) {
     ui.activity.status.set_icon_name(Some(icon));
     ui.activity.status.set_title(title);
     ui.activity.status.set_description(Some(description));

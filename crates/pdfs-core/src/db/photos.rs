@@ -47,8 +47,7 @@ impl Db {
         // any previously learned value so the Photos/Videos/Raw split survives a
         // refresh instead of collapsing back to name-extension guesses.
         let learned: HashMap<String, (Option<f64>, i64, Option<String>)> = {
-            let mut stmt =
-                tx.prepare("SELECT uid, ratio, thumb_state, media_type FROM photos")?;
+            let mut stmt = tx.prepare("SELECT uid, ratio, thumb_state, media_type FROM photos")?;
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
             })?;
@@ -63,18 +62,17 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for (seq, (uid, capture_time, name, media_type)) in items.iter().enumerate() {
-                let (ratio, thumb_state, learned_media) = learned
-                    .get(uid)
-                    .cloned()
-                    .unwrap_or((None, THUMB_UNKNOWN, None));
+                let (ratio, thumb_state, learned_media) =
+                    learned
+                        .get(uid)
+                        .cloned()
+                        .unwrap_or((None, THUMB_UNKNOWN, None));
                 let media_type = media_type.clone().or(learned_media);
                 // The tab this photo lands in is derived here, once, so a page or
                 // count query is a plain indexed `WHERE kind = ?` rather than a
                 // reclassification of every row.
-                let kind = crate::control::PhotoKind::classify(
-                    name.as_deref(),
-                    media_type.as_deref(),
-                );
+                let kind =
+                    crate::control::PhotoKind::classify(name.as_deref(), media_type.as_deref());
                 stmt.execute(params![
                     uid,
                     capture_time,
@@ -127,7 +125,9 @@ impl Db {
         let limit_pos = binds.len();
         binds.push(offset as i64);
         let offset_pos = binds.len();
-        sql.push_str(&format!(" ORDER BY seq LIMIT ?{limit_pos} OFFSET ?{offset_pos}"));
+        sql.push_str(&format!(
+            " ORDER BY seq LIMIT ?{limit_pos} OFFSET ?{offset_pos}"
+        ));
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -168,7 +168,11 @@ impl Db {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds), |r| {
-                Ok((r.get::<_, i32>(0)?, r.get::<_, i32>(1)?, r.get::<_, i64>(2)? as usize))
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    r.get::<_, i32>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
@@ -240,5 +244,4 @@ impl Db {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
-
 }

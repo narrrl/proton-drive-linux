@@ -12,11 +12,11 @@
 //! action, so a file just uploaded or downloaded reads as "unchanged" on the
 //! next pass and never ping-pongs.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime};
 

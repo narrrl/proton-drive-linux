@@ -94,5 +94,4 @@ impl Db {
         conn.execute("DELETE FROM sync_state WHERE key = ?1", params![key])?;
         Ok(())
     }
-
 }

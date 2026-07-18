@@ -927,6 +927,10 @@ pub enum ErrorKind {
     /// The API was reached and refused, or the transfer broke. The one class
     /// where an unchanged retry can legitimately succeed.
     Remote,
+    /// The account is out of storage. Distinct from [`Denied`](Self::Denied)
+    /// because the user *can* fix it, and distinct from [`Remote`](Self::Remote)
+    /// because retrying an upload that did not fit will not make it fit.
+    Quota,
     /// Something on this machine failed: the database, the content cache, the
     /// filesystem. Not the user's doing and not theirs to fix.
     #[default]

@@ -5,7 +5,6 @@
 //! is already on disk somewhere, so a change here would silently diverge from
 //! what an existing install actually has. Add a new one instead.
 
-
 use super::Db;
 use crate::Result;
 
@@ -84,7 +83,6 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
-
 }
 
 /// Schema v1: nodes + FTS5 trigram index + cache LRU. `sync_state` is created
@@ -329,4 +327,3 @@ const MIGRATION_V13: &str = "
 ALTER TABLE photos ADD COLUMN media_type TEXT;
 ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
 ";
-

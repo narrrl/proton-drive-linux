@@ -122,5 +122,4 @@ impl Db {
     // keyed by uid display string. `recursive` marks a folder pin: its whole
     // subtree counts as pinned, resolved against `nodes` via a CTE so a new
     // descendant is covered the moment it lands in the node cache.
-
 }

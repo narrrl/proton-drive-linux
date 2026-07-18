@@ -9,11 +9,9 @@ use std::sync::Arc;
 
 use pdfs_core::cache::StagedWrite;
 use pdfs_core::db::Db;
-use proton_drive_rs::{Node, NodeKind};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
+use proton_drive_rs::{Node, NodeKind};
 use tracing::warn;
-
-
 
 /// A node known to the filesystem, addressed by its kernel inode.
 pub(crate) struct Entry {
@@ -222,7 +220,13 @@ impl State {
     /// server did. A queued rename cannot: re-enumerating needs the network, and
     /// the server has not been told yet in any case — so this *is* the tree's
     /// new truth until the op drains (offline.md Phase 3b).
-    pub(crate) fn rename_in_place(&mut self, ino: u64, new_parent: u64, new_parent_uid: &NodeUid, name: &str) {
+    pub(crate) fn rename_in_place(
+        &mut self,
+        ino: u64,
+        new_parent: u64,
+        new_parent_uid: &NodeUid,
+        name: &str,
+    ) {
         let Some(entry) = self.entries.get_mut(&ino) else {
             return;
         };

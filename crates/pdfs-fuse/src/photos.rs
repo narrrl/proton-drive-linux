@@ -8,13 +8,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::control::{PhotoItem, PhotoKind, PhotoThumb};
 use pdfs_core::db::{self, StoredPhoto};
+use pdfs_core::{CoreError, CoreResult};
 use std::sync::atomic::Ordering;
 
-use proton_drive_rs::{NodeKind, ThumbnailType};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
+use proton_drive_rs::{NodeKind, ThumbnailType};
 use tracing::{info, warn};
 
 use super::{
@@ -275,7 +275,7 @@ impl Core {
         if photos
             .get_photos_root()
             .await
-            .map_err(|e| CoreError::remote(format!("photos root: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "photos root"))?
             .is_none()
         {
             let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 0);
@@ -285,7 +285,7 @@ impl Core {
         let items = photos
             .enumerate_timeline()
             .await
-            .map_err(|e| CoreError::remote(format!("timeline: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "timeline"))?;
 
         // The timeline DTO carries only a uid and capture time, but the Photos
         // page has to split into Photos / Videos / Raw — which needs each photo's
@@ -346,7 +346,7 @@ impl Core {
         let node = self
             .rt
             .block_on(photos.get_node(uid))
-            .map_err(|e| CoreError::remote(format!("photo node: {e}")))?
+            .map_err(|e| CoreError::from_api(&e, "photo node"))?
             .ok_or_else(|| CoreError::not_found("photo not found"))?;
         let (mtime, size) = (node.modification_time, node_size(&node));
         if let Some(p) = self.cache.cached_content_path(uid, mtime, size) {
@@ -354,11 +354,10 @@ impl Core {
         }
         let bytes = self
             .download_photo_tracked(&photos, uid, &node.name, size)
-            .map_err(|e| CoreError::remote(format!("download photo: {e}")))?;
+            .map_err(|e| CoreError::from_api(&e, "download photo"))?;
         self.cache
             .store(uid, mtime, size, &bytes)
             .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
         Ok(self.cache.content_path(uid))
     }
-
 }

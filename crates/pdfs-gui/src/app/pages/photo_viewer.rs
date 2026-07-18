@@ -322,7 +322,10 @@ pub(crate) fn navigate_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, delta: i32) {
     let renderable = |idx: u32| -> Option<PhotoItem> {
         model
             .item(idx)
-            .and_then(|obj| obj.downcast_ref::<BoxedAnyObject>().map(|b| b.borrow::<PhotoItem>().clone()))
+            .and_then(|obj| {
+                obj.downcast_ref::<BoxedAnyObject>()
+                    .map(|b| b.borrow::<PhotoItem>().clone())
+            })
             .filter(|photo| photo.kind != PhotoKind::Video)
     };
     let scan = |from: i32, step: i32| -> Option<(u32, PhotoItem)> {
@@ -564,7 +567,8 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let n = ui.gallery.model.n_items();
     let initial_idx = find_photo_index(&ui.gallery.model, &initial_uid).unwrap_or(0);
     let capture_time = ui
-        .gallery.model
+        .gallery
+        .model
         .item(initial_idx)
         .and_downcast::<BoxedAnyObject>()
         .map_or(0, |boxed| boxed.borrow::<PhotoItem>().capture_time);

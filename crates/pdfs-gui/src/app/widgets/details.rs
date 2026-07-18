@@ -147,7 +147,10 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
 /// wire its buttons back onto the entry it's showing.
 pub(crate) fn wire_details(ui: &Rc<Ui>) {
     // Both views share one model but have their own selection, so watch both.
-    for selection in [ui.details.grid_selection.clone(), ui.details.list_selection.clone()] {
+    for selection in [
+        ui.details.grid_selection.clone(),
+        ui.details.list_selection.clone(),
+    ] {
         let ui_sel = ui.clone();
         selection.connect_selection_changed(move |sel, _, _| {
             match entry_at(sel.model().as_ref(), sel.selected()) {
@@ -160,10 +163,12 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
     let ui_close = ui.clone();
     ui.details.details.close_button.connect_clicked(move |_| {
         ui_close
-            .details.grid_selection
+            .details
+            .grid_selection
             .set_selected(gtk4::INVALID_LIST_POSITION);
         ui_close
-            .details.list_selection
+            .details
+            .list_selection
             .set_selected(gtk4::INVALID_LIST_POSITION);
         hide_details(&ui_close);
     });
@@ -193,19 +198,22 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
         }
     });
     let ui_pin = ui.clone();
-    ui.details.details.pin_row.connect_active_notify(move |row| {
-        if ui_pin.details.details_suppress.get() {
-            return;
-        }
-        let Some(entry) = ui_pin.details.details_entry.borrow().clone() else {
-            return;
-        };
-        // The switch reads the *desired* state; `toggle_pin` derives the request
-        // from the entry's current one, so only act when they actually differ.
-        if row.is_active() != entry.pinned {
-            toggle_pin(&ui_pin, &entry);
-        }
-    });
+    ui.details
+        .details
+        .pin_row
+        .connect_active_notify(move |row| {
+            if ui_pin.details.details_suppress.get() {
+                return;
+            }
+            let Some(entry) = ui_pin.details.details_entry.borrow().clone() else {
+                return;
+            };
+            // The switch reads the *desired* state; `toggle_pin` derives the request
+            // from the entry's current one, so only act when they actually differ.
+            if row.is_active() != entry.pinned {
+                toggle_pin(&ui_pin, &entry);
+            }
+        });
 }
 
 /// Reveal the details pane and paint it from `entry`.

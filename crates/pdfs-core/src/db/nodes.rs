@@ -223,9 +223,7 @@ impl Db {
     // separate. `last_accessed` (unix seconds) is the LRU key. The daemon owns
     // the on-disk cache and rebuilds this index from disk on open, then keeps it
     // in sync on every store/read/evict, so it is authoritative for eviction.
-
 }
-
 
 /// Effective plaintext size of a node for the indexed `size` column: the
 /// claimed size when known, else the on-storage size; folders are 0.

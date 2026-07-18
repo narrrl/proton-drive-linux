@@ -39,11 +39,10 @@ use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 
 use pdfs_core::control::{
-    ErrorKind,
-    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
-    PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, SearchHit, ShareEntry,
-    ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection,
-    TransferItem, pending_summary, send,
+    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind, InvitationInfo,
+    JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, SearchHit,
+    ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress,
+    TransferDirection, TransferItem, pending_summary, send,
 };
 
 use pdfs_core::service;
@@ -134,7 +133,8 @@ impl Ui {
     /// The aspect ratio (w/h) to lay `uid`'s tile out at: the real one once its
     /// thumbnail has been seen, otherwise [`RATIO_UNKNOWN`].
     fn ratio(&self, uid: &str) -> f64 {
-        self.gallery.photo_ratio
+        self.gallery
+            .photo_ratio
             .borrow()
             .get(uid)
             .copied()
@@ -809,6 +809,7 @@ fn error_headline(kind: ErrorKind, fallback: &str) -> &str {
         ErrorKind::NotFound => "That's not there any more",
         ErrorKind::Denied => "You don't have access to that",
         ErrorKind::Conflict => "Something changed this first",
+        ErrorKind::Quota => "Your Proton Drive is full",
         ErrorKind::Invalid | ErrorKind::Remote | ErrorKind::Internal => fallback,
     }
 }

@@ -11,9 +11,8 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ErrorKind,
-    RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
-    pending_summary,
+    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind,
+    SyncPhase, pending_summary,
 };
 use pdfs_core::db::Db;
 
@@ -361,6 +360,9 @@ enum BookmarkCmd {
 fn cli_error(kind: ErrorKind, message: &str) -> String {
     match kind {
         ErrorKind::Offline => "offline: the Proton Drive API is unreachable".to_string(),
+        // The daemon's wording names the failed call ("upload x: ..."), which
+        // does not say the thing the user has to act on.
+        ErrorKind::Quota => format!("out of storage: {message}"),
         _ => message.to_string(),
     }
 }

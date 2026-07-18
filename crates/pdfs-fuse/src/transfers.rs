@@ -15,11 +15,11 @@
 //!
 //! [`Request::GetQueueStatus`]: pdfs_core::control::Request::GetQueueStatus
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use pdfs_core::control::{JobItem, TransferDirection, TransferItem};

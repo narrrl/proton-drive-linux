@@ -24,7 +24,6 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use pdfs_core::CoreError;
 use pdfs_core::cache::StagedWrite;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp};
@@ -253,7 +252,10 @@ impl Core {
 
     /// Make a node that so far exists only on this machine real, and adopt the
     /// uid the server gives it (offline.md Phase 3b).
-    pub(crate) fn drain_local_node(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn drain_local_node(
+        &self,
+        op: &PendingOp,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let local = parse_node_uid(&op.uid).ok_or("pending op has an unparseable uid")?;
         let parent_str = op.parent_uid.as_deref().ok_or("create op has no parent")?;
         // `run_pending_drain` will not offer an op whose parent is still a
@@ -395,7 +397,9 @@ impl Core {
         local: &NodeUid,
         real: &NodeUid,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let node = self.fetch_node(real).map_err(|e| CoreError::remote(format!("{e:?}")))?;
+        let node = self
+            .fetch_node(real)
+            .map_err(|e| self.errno_error(e, "fetch node"))?;
         // Repoints queued children and node rows, and drops the placeholder row.
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
@@ -676,7 +680,7 @@ impl Core {
                 meta.base_size,
                 &written,
             )
-            .map_err(|e| CoreError::remote(format!("gap-fill from base failed: {e:?}")))?;
+            .map_err(|e| self.errno_error(e, "gap-fill from base failed"))?;
         }
 
         let name = {
@@ -766,5 +770,4 @@ impl Core {
         };
         st.intern(parent, node);
     }
-
 }

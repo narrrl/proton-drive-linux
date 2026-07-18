@@ -400,7 +400,11 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
 
 /// Create a public link, then reload the dialog so the copy/remove controls
 /// replace the create form (and the freshly minted URL is shown).
-pub(crate) fn share_dialog_create_link(state: &Rc<ShareDialog>, role: String, password: Option<String>) {
+pub(crate) fn share_dialog_create_link(
+    state: &Rc<ShareDialog>,
+    role: String,
+    password: Option<String>,
+) {
     let rx = spawn_request(
         state.ui.dirs.control_socket(),
         Request::CreatePublicLink {

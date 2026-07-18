@@ -317,9 +317,9 @@ impl Db {
         Ok(PendingCounts { uploads, changes })
     }
 
-/// Nothing bearing this volume may be handed to the API — it would 404. The
-/// drain replaces it with the uid the server assigns.
-pub const LOCAL_VOLUME: &str = "local";
+    /// Nothing bearing this volume may be handed to the API — it would 404. The
+    /// drain replaces it with the uid the server assigns.
+    pub const LOCAL_VOLUME: &str = "local";
 
     /// Drop a queued op, once its upload has actually landed.
     pub fn delete_op(&self, id: i64) -> Result<()> {
@@ -340,5 +340,4 @@ pub const LOCAL_VOLUME: &str = "local";
         )?;
         Ok(())
     }
-
 }

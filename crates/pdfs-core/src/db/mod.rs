@@ -40,9 +40,8 @@ pub use devices::StoredDevice;
 pub use local::LocalFileHit;
 pub use nodes::{SearchHit, StoredNode};
 pub use ops::{
-    LOCAL_VOLUME,
-    AttachedBlob, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingCounts,
-    PendingOp, op_supersedes,
+    AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH,
+    PendingCounts, PendingOp, op_supersedes,
 };
 pub use photos::{StoredPhoto, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN};
 pub use sync::{StoredSyncEntry, StoredSyncFolder};

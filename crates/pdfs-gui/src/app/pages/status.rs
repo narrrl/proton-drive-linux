@@ -259,14 +259,20 @@ pub(crate) const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// read once from config / systemd here (the refresh loop owns only the live
 /// mount + cache-usage read-out), with [`Ui::settings_suppress`] set around the
 /// programmatic populate so the change handlers don't fire on it.
-pub(crate) fn wire_settings(ui: &Rc<Ui>, purge_button: &gtk4::Button, mountpoint_button: &gtk4::Button) {
+pub(crate) fn wire_settings(
+    ui: &Rc<Ui>,
+    purge_button: &gtk4::Button,
+    mountpoint_button: &gtk4::Button,
+) {
     let config = ui.dirs.load_config();
 
     // Populate from persisted config + the systemd unit state, suppressed.
     ui.status.settings_suppress.set(true);
-    ui.status.budget_row
+    ui.status
+        .budget_row
         .set_value(config.resolved_cache_budget() as f64 / GIB);
-    ui.status.mountpoint_row
+    ui.status
+        .mountpoint_row
         .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
     ui.status.autostart_row.set_active(service::is_enabled());
     ui.status.settings_suppress.set(false);
@@ -337,7 +343,12 @@ pub(crate) fn wire_settings(ui: &Rc<Ui>, purge_button: &gtk4::Button, mountpoint
 /// confirming with `done` or reporting the daemon's error under `failed`. Unlike
 /// [`run_mutation`] there's no browser reload; the next refresh tick repaints the
 /// cache read-out.
-pub(crate) fn settings_request(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'static str) {
+pub(crate) fn settings_request(
+    ui: &Rc<Ui>,
+    req: Request,
+    done: &'static str,
+    failed: &'static str,
+) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();
@@ -586,7 +597,8 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
                 .child(&row_box)
                 .build();
             ui.status.transfers_group.add(&row);
-            ui.status.transfer_rows
+            ui.status
+                .transfer_rows
                 .borrow_mut()
                 .push(TransferRow { row, label, bar });
         }
@@ -742,7 +754,10 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             .subtitle("Right-click a file in the mount to keep it offline.")
             .build();
         ui.status.pins_group.add(&row);
-        ui.status.pin_rows.borrow_mut().push(PinRow { row, unpin: None });
+        ui.status
+            .pin_rows
+            .borrow_mut()
+            .push(PinRow { row, unpin: None });
         return;
     }
 

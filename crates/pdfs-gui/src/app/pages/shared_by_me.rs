@@ -94,7 +94,13 @@ pub(crate) fn wire_shared_by_me(ui: &Rc<Ui>, retry: &gtk4::Button) {
 }
 
 /// Show a status page in place of the Shared (by-me) list.
-pub(crate) fn shared_by_me_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
+pub(crate) fn shared_by_me_status(
+    ui: &Rc<Ui>,
+    icon: &str,
+    title: &str,
+    description: &str,
+    retry: bool,
+) {
     ui.shared_by_me.status.set_icon_name(Some(icon));
     ui.shared_by_me.status.set_title(title);
     ui.shared_by_me.status.set_description(Some(description));

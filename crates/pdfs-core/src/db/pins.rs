@@ -6,8 +6,6 @@ use rusqlite::{OptionalExtension, params};
 use super::Db;
 use crate::Result;
 
-
-
 impl Db {
     pub fn pin_add(&self, uid: &str, path: &str, recursive: bool) -> Result<()> {
         let conn = self.conn.lock();
@@ -120,5 +118,4 @@ impl Db {
     }
 
     // ---- local (non-Drive) file index (schema v6) ----
-
 }

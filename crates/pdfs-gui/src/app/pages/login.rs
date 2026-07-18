@@ -82,10 +82,12 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
     // Pressing Enter in either field submits the form, so signing in never needs
     // a reach for the mouse. Both fields route to the same button.
     let btn = ui.login.login_button.clone();
-    ui.login.email
+    ui.login
+        .email
         .connect_entry_activated(move |_| btn.emit_clicked());
     let btn = ui.login.login_button.clone();
-    ui.login.password
+    ui.login
+        .password
         .connect_entry_activated(move |_| btn.emit_clicked());
 
     let ui = ui.clone();
@@ -94,7 +96,9 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
         let username = ui.login.email.text().to_string();
         let password = ui.login.password.text().to_string();
         if username.is_empty() || password.is_empty() {
-            ui.login.login_status.set_text("Enter your email and password.");
+            ui.login
+                .login_status
+                .set_text("Enter your email and password.");
             return;
         }
 
@@ -129,7 +133,10 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     service::enable_start();
                     refresh(&ui);
                 }
-                Err(e) => ui.login.login_status.set_text(&format!("Sign-in failed: {e}")),
+                Err(e) => ui
+                    .login
+                    .login_status
+                    .set_text(&format!("Sign-in failed: {e}")),
             }
         });
     });

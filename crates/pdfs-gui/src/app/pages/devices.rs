@@ -699,7 +699,12 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 }
 
 /// Run a mutation raised from the Devices page and reload the page on success.
-pub(crate) fn run_devices_mutation(ui: &Rc<Ui>, req: Request, done: &'static str, failed: &'static str) {
+pub(crate) fn run_devices_mutation(
+    ui: &Rc<Ui>,
+    req: Request,
+    done: &'static str,
+    failed: &'static str,
+) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();

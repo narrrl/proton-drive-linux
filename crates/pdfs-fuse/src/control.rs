@@ -10,17 +10,17 @@
 //! would stall the GUI`s 2s status poll behind it.
 
 use std::io::{BufRead, BufReader, Write as _};
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
-use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityKind, PhotoMonth, RefreshScope, Request as CtlRequest, Response as CtlResponse,
     TransferDirection,
 };
+use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{info, warn};
 
@@ -125,30 +125,24 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             limit,
             kind,
             range,
-        }) => {
-            match core.photos_timeline(offset, limit, kind, range) {
-                Ok(Some(items)) => CtlResponse::Photos {
-                    available: true,
-                    items,
-                    counts: core.db.photos_counts().ok(),
-                },
-                Ok(None) => CtlResponse::Photos {
-                    available: false,
-                    items: Vec::new(),
-                    counts: None,
-                },
-                Err(e) => CtlResponse::error(e),
-            }
-        }
+        }) => match core.photos_timeline(offset, limit, kind, range) {
+            Ok(Some(items)) => CtlResponse::Photos {
+                available: true,
+                items,
+                counts: core.db.photos_counts().ok(),
+            },
+            Ok(None) => CtlResponse::Photos {
+                available: false,
+                items: Vec::new(),
+                counts: None,
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::PhotoMonths { kind }) => match core.db.photos_months(kind) {
             Ok(months) => CtlResponse::PhotoMonths {
                 months: months
                     .into_iter()
-                    .map(|(year, month, count)| PhotoMonth {
-                        year,
-                        month,
-                        count,
-                    })
+                    .map(|(year, month, count)| PhotoMonth { year, month, count })
                     .collect(),
             },
             Err(e) => CtlResponse::error(e.into()),
@@ -207,7 +201,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         message: format!("uploaded photo with uid {uid}"),
                     }
                 }
-                Err(e) => CtlResponse::error(CoreError::remote(format!("upload photo failed: {e}"))),
+                Err(e) => CtlResponse::error(CoreError::from_api(&e, "upload photo failed")),
             }
         }
         Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
@@ -688,7 +682,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
 /// stall every other caller behind it — the GUI's 2s status poll, and the
 /// thumbnail batches the gallery needs to paint. [`Core`] is a bundle of handles
 /// (`Arc`/`Clone`), so each connection gets its own copy of it.
-pub(crate) fn run_control_socket(core: Core, username: String, mountpoint: PathBuf, listener: UnixListener) {
+pub(crate) fn run_control_socket(
+    core: Core,
+    username: String,
+    mountpoint: PathBuf,
+    listener: UnixListener,
+) {
     info!("control socket listening");
     for conn in listener.incoming() {
         match conn {
