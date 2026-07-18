@@ -1056,7 +1056,12 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
 }
 
 fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
-    match control_request(CtlRequest::PhotosTimeline { offset, limit })? {
+    match control_request(CtlRequest::PhotosTimeline {
+        offset,
+        limit,
+        kind: None,
+        range: None,
+    })? {
         CtlResponse::Photos {
             available: false, ..
         } => {

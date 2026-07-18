@@ -31,7 +31,7 @@
 //! set, so a multi-GiB write never buffers in RAM and only the untouched
 //! remainder of the file is pulled from the remote — lazily, at commit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as _};
@@ -53,7 +53,8 @@ use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
-    LocalHit, PhotoItem, PhotoThumb, PublicLinkInfo, RefreshScope, Request as CtlRequest,
+    LocalHit, PhotoItem, PhotoKind, PhotoMonth, PhotoThumb, PublicLinkInfo, RefreshScope,
+    Request as CtlRequest,
     Response as CtlResponse, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo,
     SyncPhase, SyncProgress, TransferDirection,
 };
@@ -104,6 +105,12 @@ const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
 /// in the DB and every page is sliced from there; a stale one is still served
 /// immediately and refreshed in the background.
 const TIMELINE_TTL: Duration = Duration::from_secs(5 * 60);
+/// How many photo nodes are resolved per [`ProtonPhotosClient::enumerate_nodes`]
+/// call when enriching a refreshed timeline with names and media types (for the
+/// Photos / Videos / Raw split). Batched so a large library is a handful of
+/// round-trips rather than one request per photo, and bounded so a single call
+/// never asks the server to decrypt the whole library at once.
+const TIMELINE_ENRICH_CHUNK: usize = 200;
 /// The same, for the persisted trash listing. Shorter, because the trash is the
 /// one listing a user changes and then immediately looks at — though our own
 /// mutations also invalidate it outright, so this only covers other clients.
@@ -126,6 +133,27 @@ const THUMB_QUALITY: u8 = 82;
 /// thumbnails. Bounded: a screenful of 20 MB digicam JPEGs would otherwise
 /// saturate the link and starve the rest of the daemon.
 const THUMB_GEN_CONCURRENCY: usize = 4;
+
+/// A read of an unpinned video at least this large streams *without* persisting
+/// its blocks to the on-disk cache. Playing a 2 GB film would otherwise pour it
+/// through the block LRU and evict everything else the user actually wants kept —
+/// and it re-streams cheaply enough on a rewatch that keeping it was never worth
+/// that. Pinned videos (kept offline on purpose) and anything smaller cache as
+/// usual.
+const STREAM_BYPASS_MIN: u64 = 256 * 1024 * 1024;
+
+/// How many bytes of streamed blocks the in-memory ring keeps. Bypassing the
+/// on-disk cache must not mean re-fetching: the kernel asks for a streamed file
+/// in reads far smaller than [`BLOCK_SIZE`], so without a ring every 128 KiB the
+/// player consumes would download and decrypt a whole 4 MiB block again. Sized
+/// for a handful of blocks per concurrently-streamed file.
+const STREAM_RING_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Blocks fetched *past* the one a sequential streaming read needed, warmed into
+/// the ring in the background so the player's next read is already in memory
+/// instead of waiting a round-trip. Kept small so it cannot crowd out the
+/// in-flight block governor.
+const STREAM_READAHEAD: u64 = 4;
 
 /// How stale the local-file index may get before the background scanner rebuilds
 /// it. A rescan is a full walk of `$HOME`, so this trades index freshness against
@@ -645,6 +673,72 @@ static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(0);
 ///
 /// Cheaply cloneable (every field is a handle/`Arc`), so the control-socket task
 /// gets its own copy while the FUSE session keeps another.
+/// In-memory LRU of blocks belonging to a file streaming past the on-disk cache
+/// (see [`STREAM_BYPASS_MIN`]). Bypassing the disk stops one film evicting the
+/// block LRU; it must not also mean the same 4 MiB block is downloaded once per
+/// 128 KiB the player reads out of it.
+///
+/// Validated by the same `(mtime, size)` pair the on-disk caches use: a node
+/// whose tag no longer matches has its blocks dropped rather than served, so a
+/// new revision can never be stitched together from the old one.
+#[derive(Default)]
+struct StreamRing {
+    blocks: HashMap<(NodeUid, u64), Arc<Vec<u8>>>,
+    /// Keys oldest-first, for eviction.
+    order: VecDeque<(NodeUid, u64)>,
+    /// Per-node validity tag, `(mtime, size)`.
+    tags: HashMap<NodeUid, (i64, u64)>,
+    bytes: u64,
+}
+
+impl StreamRing {
+    fn get(&mut self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> Option<Arc<Vec<u8>>> {
+        if self.tags.get(uid) != Some(&(mtime, size)) {
+            return None;
+        }
+        self.blocks.get(&(uid.clone(), idx)).cloned()
+    }
+
+    fn insert(&mut self, uid: &NodeUid, mtime: i64, size: u64, idx: u64, bytes: Arc<Vec<u8>>) {
+        if self.tags.get(uid) != Some(&(mtime, size)) {
+            // Revision changed under us (or first sight): anything held for this
+            // node describes the old one.
+            self.drop_node(uid);
+            self.tags.insert(uid.clone(), (mtime, size));
+        }
+        let key = (uid.clone(), idx);
+        if self.blocks.contains_key(&key) {
+            return;
+        }
+        self.bytes += bytes.len() as u64;
+        self.blocks.insert(key.clone(), bytes);
+        self.order.push_back(key);
+        while self.bytes > STREAM_RING_BYTES {
+            let Some(victim) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(dropped) = self.blocks.remove(&victim) {
+                self.bytes -= dropped.len() as u64;
+            }
+        }
+    }
+
+    fn drop_node(&mut self, uid: &NodeUid) {
+        self.order.retain(|(u, _)| u != uid);
+        let mut freed = 0u64;
+        self.blocks.retain(|(u, _), bytes| {
+            if u == uid {
+                freed += bytes.len() as u64;
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes -= freed;
+        self.tags.remove(uid);
+    }
+}
+
 #[derive(Clone)]
 struct Core {
     client: ProtonDriveClient,
@@ -656,6 +750,10 @@ struct Core {
     /// Validated by `(mtime, size)` exactly like the content cache, and bounded
     /// by [`MAX_OPEN_READERS`].
     readers: Arc<Mutex<HashMap<NodeUid, ReaderSlot>>>,
+    /// Blocks of files streaming past the on-disk cache, held in memory so a
+    /// player's small sequential reads are served from the last few 4 MiB blocks
+    /// instead of re-downloading each one. See [`StreamRing`].
+    stream_ring: Arc<Mutex<StreamRing>>,
     /// Threads that serve the FUSE handlers which touch the network, so the
     /// session's dispatch loop stays free to answer cheap metadata calls while a
     /// cold read is on the wire. See [`Workers`].
@@ -1258,6 +1356,7 @@ impl Core {
         fsize: u64,
         offset: u64,
         len: u64,
+        cache_blocks: bool,
     ) -> Result<Vec<u8>, Errno> {
         // A queued write has not reached the remote yet, so the remote's current
         // revision is stale and the staged blob is the truth. Serve from it until
@@ -1271,7 +1370,7 @@ impl Core {
         if is_local_uid(uid) {
             return Ok(Vec::new());
         }
-        self.read_range_remote(uid, mtime, fsize, offset, len)
+        self.read_range_remote(uid, mtime, fsize, offset, len, cache_blocks)
     }
 
     /// Serve a read from a staged blob, falling back to the remote base for any
@@ -1319,12 +1418,66 @@ impl Core {
                     m.base_size,
                     s,
                     bend - s,
+                    true,
                 )?);
             }
             // Past the base: a hole the write extended over.
             out.resize(out.len() + e.saturating_sub(s.max(m.base_size)) as usize, 0);
         }
         Ok(out)
+    }
+
+    /// Warm the [`STREAM_READAHEAD`] blocks after `last` into the ring, in the
+    /// background, so a player reading forward finds its next block already in
+    /// memory rather than paying a fetch + decrypt round-trip at each boundary.
+    ///
+    /// Fire-and-forget: a failure here is not an error, it only means the read
+    /// that needs those bytes will fetch them itself.
+    fn stream_readahead(&self, uid: &NodeUid, mtime: i64, fsize: u64, last: u64) {
+        let last_block = (fsize.saturating_sub(1)) / BLOCK_SIZE;
+        let wanted: Vec<u64> = ((last + 1)..=(last + STREAM_READAHEAD).min(last_block))
+            .filter(|&bidx| {
+                self.stream_ring
+                    .lock()
+                    .unwrap()
+                    .get(uid, mtime, fsize, bidx)
+                    .is_none()
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let core = self.clone();
+        let uid = uid.clone();
+        self.rt.spawn(async move {
+            let Ok(reader) = core.revision_reader(&uid, mtime, fsize).await else {
+                return;
+            };
+            // Concurrently, for the same reason the demand path fetches its
+            // misses concurrently: serially awaited blocks cost the sum of their
+            // round-trips, and the player catches up with the readahead before it
+            // finishes. The SDK's in-flight block governor bounds the fan-out.
+            let mut set = tokio::task::JoinSet::new();
+            for bidx in wanted {
+                let reader = reader.clone();
+                let bstart = bidx * BLOCK_SIZE;
+                let blen = BLOCK_SIZE.min(fsize - bstart);
+                set.spawn(async move { (bidx, reader.read_at(bstart, blen).await) });
+            }
+            while let Some(joined) = set.join_next().await {
+                let Ok((bidx, read)) = joined else { continue };
+                match read {
+                    Ok(bytes) => core.stream_ring.lock().unwrap().insert(
+                        &uid,
+                        mtime,
+                        fsize,
+                        bidx,
+                        Arc::new(bytes),
+                    ),
+                    Err(e) => debug!(%uid, bidx, error = %e, "stream readahead failed"),
+                }
+            }
+        });
     }
 
     /// Read from the content cache, else the remote. The base-content path, with
@@ -1339,6 +1492,7 @@ impl Core {
         fsize: u64,
         offset: u64,
         len: u64,
+        cache_blocks: bool,
     ) -> Result<Vec<u8>, Errno> {
         if let Some(bytes) = self.cache.read_range(uid, mtime, fsize, offset, len) {
             return Ok(bytes);
@@ -1357,10 +1511,22 @@ impl Core {
         // would otherwise stall on each block round-trip in turn; downloading the
         // misses in parallel saturates the connection and bounds latency at the
         // slowest single block instead of their sum.
-        let mut blocks: Vec<Option<Vec<u8>>> = Vec::with_capacity((last - first + 1) as usize);
+        let mut blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity((last - first + 1) as usize);
         let mut misses: Vec<u64> = Vec::new();
         for bidx in first..=last {
-            match self.cache.cached_block(uid, mtime, fsize, bidx) {
+            // A streaming read keeps its blocks only in memory, so the ring is
+            // the only cache it has — check it before the disk (which will not
+            // hold them) and before the network (which would refetch the same
+            // 4 MiB block for every 128 KiB the player consumes).
+            let hit = if cache_blocks {
+                self.cache.cached_block(uid, mtime, fsize, bidx).map(Arc::new)
+            } else {
+                self.stream_ring
+                    .lock()
+                    .unwrap()
+                    .get(uid, mtime, fsize, bidx)
+            };
+            match hit {
                 Some(b) => blocks.push(Some(b)),
                 None => {
                     blocks.push(None);
@@ -1401,8 +1567,22 @@ impl Core {
                 Ok::<_, Errno>(out)
             })?;
             for (bidx, bytes) in fetched {
-                let _ = self.cache.store_block(uid, mtime, fsize, bidx, &bytes);
+                // A streaming read (large unpinned video) skips the on-disk cache
+                // so it can't evict the rest of it; it keeps the block in the
+                // in-memory ring instead, which is bounded and dies with the read.
+                let bytes = Arc::new(bytes);
+                if cache_blocks {
+                    let _ = self.cache.store_block(uid, mtime, fsize, bidx, &bytes);
+                } else {
+                    self.stream_ring
+                        .lock()
+                        .unwrap()
+                        .insert(uid, mtime, fsize, bidx, bytes.clone());
+                }
                 blocks[(bidx - first) as usize] = Some(bytes);
+            }
+            if !cache_blocks {
+                self.stream_readahead(uid, mtime, fsize, last);
             }
         }
 
@@ -1457,6 +1637,7 @@ impl Core {
                         base_size,
                         s,
                         bend - s,
+                        true,
                     )?);
                 }
                 // Anything past the base is a hole: zero-fill.
@@ -1496,7 +1677,7 @@ impl Core {
             if s >= bend {
                 continue; // wholly past the base: already zero-filled on disk
             }
-            let bytes = self.read_range_remote(uid, base_mtime, base_size, s, bend - s)?;
+            let bytes = self.read_range_remote(uid, base_mtime, base_size, s, bend - s, true)?;
             file.write_all_at(&bytes, s).map_err(|err| {
                 error!(%uid, error = %err, "scratch gap-fill write failed");
                 Errno::EIO
@@ -2957,6 +3138,8 @@ impl Core {
         &self,
         offset: usize,
         limit: usize,
+        kind: Option<PhotoKind>,
+        range: Option<(i64, i64)>,
     ) -> Result<Option<Vec<PhotoItem>>, String> {
         let count = self.db.photos_count().map_err(|e| e.to_string())?;
         if count == 0 {
@@ -2976,7 +3159,7 @@ impl Core {
 
         let page = self
             .db
-            .photos_page(offset, limit)
+            .photos_page(offset, limit, kind, range)
             .map_err(|e| e.to_string())?;
         Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }
@@ -2998,6 +3181,7 @@ impl Core {
             name: photo.name,
             ratio: photo.ratio,
             no_thumb: photo.thumb_state == db::THUMB_NONE,
+            kind: photo.kind,
         }
     }
 
@@ -3222,9 +3406,37 @@ impl Core {
             .enumerate_timeline()
             .await
             .map_err(|e| format!("timeline: {e}"))?;
-        let rows: Vec<(String, i64, Option<String>)> = items
+
+        // The timeline DTO carries only a uid and capture time, but the Photos
+        // page has to split into Photos / Videos / Raw — which needs each photo's
+        // name and media type. Resolve those in batches off the request path.
+        // Best-effort: a photo whose node we fail to resolve keeps whatever was
+        // learned before (or classifies from nothing, i.e. a still photo), so a
+        // partial resolve never blanks the timeline.
+        let uids: Vec<NodeUid> = items.iter().map(|it| it.uid.clone()).collect();
+        let mut meta: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
+            match photos.enumerate_nodes(chunk).await {
+                Ok(nodes) => {
+                    for node in nodes {
+                        let media_type = match &node.kind {
+                            NodeKind::File { media_type, .. } => Some(media_type.clone()),
+                            NodeKind::Folder => None,
+                        };
+                        meta.insert(node.uid.to_string(), (Some(node.name), media_type));
+                    }
+                }
+                Err(e) => warn!(error = %e, "resolving photo metadata for a timeline chunk failed"),
+            }
+        }
+
+        let rows: Vec<(String, i64, Option<String>, Option<String>)> = items
             .iter()
-            .map(|it| (it.uid.to_string(), it.capture_time, None))
+            .map(|it| {
+                let key = it.uid.to_string();
+                let (name, media_type) = meta.get(&key).cloned().unwrap_or((None, None));
+                (key, it.capture_time, name, media_type)
+            })
             .collect();
         self.db.photos_replace(&rows).map_err(|e| e.to_string())?;
         let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 1);
@@ -5718,11 +5930,22 @@ impl Filesystem for ProtonFs {
             }
             return;
         }
-        let (uid, mtime, fsize) = {
+        let (uid, mtime, fsize, is_video) = {
             let st = self.core.state.lock().unwrap();
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => {
-                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
+                    let media_type = match &e.node.kind {
+                        NodeKind::File { media_type, .. } => Some(media_type.as_str()),
+                        NodeKind::Folder => None,
+                    };
+                    let is_video =
+                        PhotoKind::classify(Some(&e.node.name), media_type) == PhotoKind::Video;
+                    (
+                        e.uid.clone(),
+                        e.node.modification_time,
+                        node_size(&e.node),
+                        is_video,
+                    )
                 }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
@@ -5734,6 +5957,10 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
+        // A large unpinned video streams without polluting the block cache (see
+        // [`STREAM_BYPASS_MIN`]); everything else caches its blocks as usual.
+        let cache_blocks =
+            !(is_video && fsize >= STREAM_BYPASS_MIN && !self.core.cache.is_pinned(&uid));
         // Off the dispatch loop: this is the one handler that routinely goes to
         // the network (block fetch + decrypt, hundreds of ms on a cold file),
         // and until it returns the kernel's next request for this mount is not
@@ -5741,7 +5968,7 @@ impl Filesystem for ProtonFs {
         // races with nothing. FUSE does not require replies in request order.
         let core = self.core.clone();
         self.core.workers.run(move || {
-            match core.read_range(&uid, mtime, fsize, offset, size as u64) {
+            match core.read_range(&uid, mtime, fsize, offset, size as u64, cache_blocks) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(e),
             }
@@ -6710,19 +6937,41 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::Error { message: e },
             }
         }
-        Ok(CtlRequest::PhotosTimeline { offset, limit }) => {
-            match core.photos_timeline(offset, limit) {
+        Ok(CtlRequest::PhotosTimeline {
+            offset,
+            limit,
+            kind,
+            range,
+        }) => {
+            match core.photos_timeline(offset, limit, kind, range) {
                 Ok(Some(items)) => CtlResponse::Photos {
                     available: true,
                     items,
+                    counts: core.db.photos_counts().ok(),
                 },
                 Ok(None) => CtlResponse::Photos {
                     available: false,
                     items: Vec::new(),
+                    counts: None,
                 },
                 Err(e) => CtlResponse::Error { message: e },
             }
         }
+        Ok(CtlRequest::PhotoMonths { kind }) => match core.db.photos_months(kind) {
+            Ok(months) => CtlResponse::PhotoMonths {
+                months: months
+                    .into_iter()
+                    .map(|(year, month, count)| PhotoMonth {
+                        year,
+                        month,
+                        count,
+                    })
+                    .collect(),
+            },
+            Err(e) => CtlResponse::Error {
+                message: e.to_string(),
+            },
+        },
         Ok(CtlRequest::PhotoThumbs { uids }) => {
             let parsed: Vec<NodeUid> = uids.iter().filter_map(|u| parse_uid(u)).collect();
             CtlResponse::Thumbs {
@@ -7406,6 +7655,7 @@ pub fn mount(
         })),
         cache: Arc::new(cache),
         readers: Arc::new(Mutex::new(HashMap::new())),
+        stream_ring: Arc::new(Mutex::new(StreamRing::default())),
         workers: Arc::new(Workers::new(FUSE_WORKERS)?),
         db,
         online: Arc::new(AtomicBool::new(online)),

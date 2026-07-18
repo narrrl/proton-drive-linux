@@ -224,6 +224,13 @@ struct Ui {
     /// further input is ignored.
     opening: Cell<bool>,
     indexing: Cell<bool>,
+    /// Set when Enter arrives before the in-flight query has rendered (typing
+    /// then hitting Enter faster than the search debounce). The open is honoured
+    /// against the selected row once the fresh results settle, rather than being
+    /// dropped — so a plain "type, Enter" always opens something.
+    open_pending: Cell<bool>,
+    /// The window, so a deferred open (above) can reach it from `render`.
+    window: RefCell<Option<adw::ApplicationWindow>>,
 }
 
 /// A titled group of rows: header (hidden when empty) plus its list.
@@ -438,7 +445,10 @@ fn build_window(app: &adw::Application) {
         pending: Cell::new(0),
         opening: Cell::new(false),
         indexing: Cell::new(false),
+        open_pending: Cell::new(false),
+        window: RefCell::new(None),
     });
+    *ui.window.borrow_mut() = Some(window.clone());
 
     for (filter, label) in FILTERS {
         let chip = gtk4::ToggleButton::builder()
@@ -506,9 +516,9 @@ fn build_window(app: &adw::Application) {
                 glib::Propagation::Stop
             }
             gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
-                if let Some(index) = ui_key.cursor.get() {
-                    ui_key.open(index, &window_key);
-                }
+                // Fall back to the top row when nothing is explicitly selected
+                // (e.g. results haven't rendered yet); `open` guards the rest.
+                ui_key.open(ui_key.cursor.get().unwrap_or(0), &window_key);
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
@@ -521,6 +531,9 @@ fn build_window(app: &adw::Application) {
     let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let ui_changed = ui.clone();
     entry.connect_changed(move |entry| {
+        // A fresh keystroke supersedes any Enter that was waiting on results:
+        // the user is still refining the query, not asking to open yet.
+        ui_changed.open_pending.set(false);
         if let Some(source) = debounce.borrow_mut().take() {
             source.remove();
         }
@@ -821,6 +834,18 @@ impl Ui {
         }
 
         self.hint.set_label(&self.status_text(total, searching));
+
+        // Honour an Enter that arrived before this query rendered, now that the
+        // results (and the cursor) are settled. Only once both searches are in,
+        // so it lands on the final list, not a half-populated one.
+        if self.open_pending.get() && self.pending.get() == 0 {
+            self.open_pending.set(false);
+            if let (Some(index), Some(window)) =
+                (self.cursor.get(), self.window.borrow().clone())
+            {
+                self.open(index, &window);
+            }
+        }
     }
 
     fn status_text(&self, total: usize, searching: bool) -> String {
@@ -906,9 +931,11 @@ impl Ui {
             return;
         }
         // The rows on screen may belong to an older query whose reply is still
-        // settling. Refuse to act until the visible list matches what's typed,
-        // so Enter can never launch a file the user has already typed past.
+        // settling. Don't act on them — Enter must never launch a file the user
+        // has typed past. But don't drop the intent either: remember it and open
+        // the right row once the fresh results land (see `render`).
         if self.entry.text().trim() != *self.rendered_query.borrow() {
+            self.open_pending.set(true);
             return;
         }
         let Some(hit) = self.visible.borrow().get(index).cloned() else {

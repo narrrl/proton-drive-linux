@@ -48,7 +48,28 @@ pub enum Request {
     /// a thumbnail path comes back only for photos already in the cache, so the
     /// reply never waits on the network. Front-ends ask for the thumbnails they
     /// actually display with [`Request::PhotoThumbs`].
-    PhotosTimeline { offset: usize, limit: usize },
+    PhotosTimeline {
+        offset: usize,
+        limit: usize,
+        /// Restrict the page to one kind (Photos / Videos / Raw). `None` (the
+        /// default, and what older front-ends send) returns everything. The
+        /// offset is relative to the filtered timeline, so paging a single tab
+        /// doesn't have to walk past the other kinds.
+        #[serde(default)]
+        kind: Option<PhotoKind>,
+        /// Restrict the page to a `[from, to)` capture-time window (epoch
+        /// seconds) — the date scrubber's jump to a month. `None` spans the whole
+        /// timeline. Like `kind`, the offset is relative to the filtered set.
+        #[serde(default)]
+        range: Option<(i64, i64)>,
+    },
+    /// The months the timeline spans (newest first, with per-month counts) so a
+    /// front-end can build a date scrubber without paging the whole library.
+    /// `kind` scopes the counts to one tab when set.
+    PhotoMonths {
+        #[serde(default)]
+        kind: Option<PhotoKind>,
+    },
     /// Fetch thumbnails for the given photo uids, downloading the ones not
     /// already cached (one batched round-trip) and replying with their on-disk
     /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
@@ -578,6 +599,104 @@ pub struct LocalHit {
     pub modified: i64,
 }
 
+/// What kind of media a timeline entry is, so the Photos page can split into
+/// Photos / Videos / Raw tabs. Derived from a photo's media type when the daemon
+/// has resolved it, falling back to its file-name extension (see
+/// [`PhotoKind::classify`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhotoKind {
+    /// A normal, directly viewable still image (JPEG, PNG, HEIC, …).
+    Photo,
+    /// A video clip (mp4, mkv, mov, …).
+    Video,
+    /// A camera raw file (CR2, NEF, ARW, DNG, …) — an image, but one that needs
+    /// developing and is worth separating from ready-to-view photos.
+    Raw,
+}
+
+/// File-name extensions that denote a video, matched case-insensitively.
+const VIDEO_EXTS: &[&str] = &[
+    "mkv", "mp4", "mov", "avi", "webm", "m4v", "flv", "wmv", "mpg", "mpeg", "ts", "3gp", "m2ts",
+    "mts", "ogv",
+];
+
+/// File-name extensions that denote a camera raw. The server media type for
+/// these is frequently a generic `application/octet-stream`, so the extension is
+/// the authoritative signal.
+const RAW_EXTS: &[&str] = &[
+    "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "srw", "pef",
+    "raw", "rwl", "iiq", "3fr", "dcr", "kdc", "mrw", "x3f",
+];
+
+/// File-name extensions that denote a ready-to-view still photo. Listed so a
+/// known image name classifies as a photo outright, without deferring to a media
+/// type that might disagree.
+const PHOTO_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif", "bmp", "tif", "tiff",
+];
+
+impl PhotoKind {
+    /// Classify a photo from what the daemon knows about it. A recognised
+    /// file-name extension is authoritative — it is reliable even before the
+    /// node's media type is resolved, and for raw files the media type is often a
+    /// useless generic — so the media type is only consulted for names that carry
+    /// no extension we know. Anything still unresolved is a still photo.
+    pub fn classify(name: Option<&str>, media_type: Option<&str>) -> PhotoKind {
+        if let Some(ext) = name
+            .and_then(|n| n.rsplit_once('.'))
+            .map(|(_, e)| e.to_ascii_lowercase())
+        {
+            if RAW_EXTS.contains(&ext.as_str()) {
+                return PhotoKind::Raw;
+            }
+            if VIDEO_EXTS.contains(&ext.as_str()) {
+                return PhotoKind::Video;
+            }
+            if PHOTO_EXTS.contains(&ext.as_str()) {
+                return PhotoKind::Photo;
+            }
+        }
+        if let Some(mt) = media_type {
+            if mt.starts_with("video/") {
+                return PhotoKind::Video;
+            }
+        }
+        PhotoKind::Photo
+    }
+
+    /// The stable integer this kind is persisted as (see the `kind` column of the
+    /// `photos` table). Chosen once and never reordered.
+    pub fn as_i64(self) -> i64 {
+        match self {
+            PhotoKind::Photo => 0,
+            PhotoKind::Video => 1,
+            PhotoKind::Raw => 2,
+        }
+    }
+
+    /// Inverse of [`PhotoKind::as_i64`]; any unrecognised value reads as a still
+    /// photo, the safe default for a tab that would otherwise show nothing.
+    pub fn from_i64(v: i64) -> PhotoKind {
+        match v {
+            1 => PhotoKind::Video,
+            2 => PhotoKind::Raw,
+            _ => PhotoKind::Photo,
+        }
+    }
+}
+
+/// One month the timeline spans, with how many photos it holds — a tick on the
+/// date scrubber (reply to [`Request::PhotoMonths`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhotoMonth {
+    /// Local-time calendar year, e.g. `2026`.
+    pub year: i32,
+    /// Local-time month, `1..=12`.
+    pub month: i32,
+    /// Photos captured in that month (within the requested kind, if any).
+    pub count: usize,
+}
+
 /// One photo in a [`Request::PhotosTimeline`] page.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoItem {
@@ -599,6 +718,16 @@ pub struct PhotoItem {
     /// and its bytes could not be decoded locally. The tile shows a placeholder
     /// rather than waiting for an image that will never come.
     pub no_thumb: bool,
+    /// Which Photos-page tab this entry belongs to. Older daemons that predate
+    /// the split omit it; a front-end then treats everything as a still photo.
+    #[serde(default = "default_photo_kind")]
+    pub kind: PhotoKind,
+}
+
+/// A daemon too old to classify a timeline entry is assumed to have served a
+/// still photo — that was the only kind the Photos page showed before the split.
+fn default_photo_kind() -> PhotoKind {
+    PhotoKind::Photo
 }
 
 /// One thumbnail in a [`Response::Thumbs`] batch.
@@ -694,7 +823,16 @@ pub enum Response {
     Photos {
         available: bool,
         items: Vec<PhotoItem>,
+        /// Whole-timeline tab counts `(photos, videos, raw)`, so a front-end can
+        /// label its Photos / Videos / Raw filter without paging the library.
+        /// The counts describe the *whole* timeline regardless of the page's own
+        /// `kind` filter. Older daemons omit it; a front-end then shows no counts.
+        #[serde(default)]
+        counts: Option<(usize, usize, usize)>,
     },
+    /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
+    /// newest first.
+    PhotoMonths { months: Vec<PhotoMonth> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
@@ -761,6 +899,38 @@ pub fn send(socket: &Path, req: &Request) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn photo_kind_classifies_by_extension_then_mime() {
+        use PhotoKind::*;
+        // Raw is extension-driven: the server media type is often generic.
+        assert_eq!(PhotoKind::classify(Some("IMG_1.CR2"), None), Raw);
+        assert_eq!(
+            PhotoKind::classify(Some("shot.dng"), Some("application/octet-stream")),
+            Raw
+        );
+        // Video by extension or by mime when the name has no useful extension.
+        assert_eq!(PhotoKind::classify(Some("anime.mkv"), None), Video);
+        assert_eq!(PhotoKind::classify(Some("clip.MP4"), None), Video);
+        assert_eq!(PhotoKind::classify(None, Some("video/quicktime")), Video);
+        // Everything else is a still photo, including a mismatched raw mime whose
+        // name says it is a normal JPEG.
+        assert_eq!(PhotoKind::classify(Some("pic.jpg"), None), Photo);
+        assert_eq!(PhotoKind::classify(Some("pic.heic"), None), Photo);
+        assert_eq!(PhotoKind::classify(None, None), Photo);
+        // Extension wins over mime: a name ending .jpg is a photo even if the mime
+        // is nonsense.
+        assert_eq!(PhotoKind::classify(Some("x.jpg"), Some("video/mp4")), Photo);
+    }
+
+    #[test]
+    fn photo_kind_i64_round_trips() {
+        for k in [PhotoKind::Photo, PhotoKind::Video, PhotoKind::Raw] {
+            assert_eq!(PhotoKind::from_i64(k.as_i64()), k);
+        }
+        // An unknown persisted value degrades to a still photo.
+        assert_eq!(PhotoKind::from_i64(99), PhotoKind::Photo);
+    }
 
     /// The whole point of the split counts: a queued `mkdir` is work, but it is
     /// not an upload and must never be reported as one.

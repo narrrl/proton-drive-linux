@@ -23,7 +23,7 @@ use crate::control::{ActivityEntry, ActivityKind};
 use crate::localindex::LocalEntry;
 
 /// Current schema version. Bump on every forward migration added below.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// How many activity rows to keep. Older rows are pruned on insert, so the feed
 /// stays a bounded "recent history" rather than growing without limit.
@@ -196,6 +196,9 @@ pub struct StoredPhoto {
     pub ratio: Option<f64>,
     /// One of [`THUMB_UNKNOWN`] / [`THUMB_HAVE`] / [`THUMB_NONE`].
     pub thumb_state: i64,
+    /// Which Photos-page tab this entry belongs to, derived from its name and
+    /// media type when the timeline was last replaced.
+    pub kind: crate::control::PhotoKind,
 }
 
 /// One trashed node, as persisted for the Trash page. Trashed nodes live outside
@@ -359,6 +362,9 @@ impl Db {
         }
         if current < 12 {
             tx.execute_batch(MIGRATION_V12)?;
+        }
+        if current < 13 {
+            tx.execute_batch(MIGRATION_V13)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -866,32 +872,55 @@ impl Db {
     ///
     /// Photos no longer in the timeline are dropped, so a deletion on another
     /// client doesn't leave a ghost tile behind.
-    pub fn photos_replace(&self, items: &[(String, i64, Option<String>)]) -> Result<()> {
+    pub fn photos_replace(
+        &self,
+        items: &[(String, i64, Option<String>, Option<String>)],
+    ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let learned: HashMap<String, (Option<f64>, i64)> = {
-            let mut stmt = tx.prepare("SELECT uid, ratio, thumb_state FROM photos")?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?;
+        // `media_type` is learned-and-kept like the ratio and thumb verdict: the
+        // timeline DTO carries only the uid and capture time, so the daemon may
+        // not know a photo's media type yet when it replaces the timeline. Keep
+        // any previously learned value so the Photos/Videos/Raw split survives a
+        // refresh instead of collapsing back to name-extension guesses.
+        let learned: HashMap<String, (Option<f64>, i64, Option<String>)> = {
+            let mut stmt =
+                tx.prepare("SELECT uid, ratio, thumb_state, media_type FROM photos")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
 
         tx.execute("DELETE FROM photos", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO photos (uid, capture_time, name, ratio, thumb_state, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO photos
+                   (uid, capture_time, name, ratio, thumb_state, seq, media_type, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
-            for (seq, (uid, capture_time, name)) in items.iter().enumerate() {
-                let (ratio, thumb_state) =
-                    learned.get(uid).copied().unwrap_or((None, THUMB_UNKNOWN));
+            for (seq, (uid, capture_time, name, media_type)) in items.iter().enumerate() {
+                let (ratio, thumb_state, learned_media) = learned
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or((None, THUMB_UNKNOWN, None));
+                let media_type = media_type.clone().or(learned_media);
+                // The tab this photo lands in is derived here, once, so a page or
+                // count query is a plain indexed `WHERE kind = ?` rather than a
+                // reclassification of every row.
+                let kind = crate::control::PhotoKind::classify(
+                    name.as_deref(),
+                    media_type.as_deref(),
+                );
                 stmt.execute(params![
                     uid,
                     capture_time,
                     name,
                     ratio,
                     thumb_state,
-                    seq as i64
+                    seq as i64,
+                    media_type,
+                    kind.as_i64(),
                 ])?;
             }
         }
@@ -899,27 +928,105 @@ impl Db {
         Ok(())
     }
 
-    /// One page of the persisted timeline, newest first.
-    pub fn photos_page(&self, offset: usize, limit: usize) -> Result<Vec<StoredPhoto>> {
+    /// One page of the persisted timeline, newest first. `kind`, when set,
+    /// restricts the page to one tab (Photos / Videos / Raw); `range`, when set,
+    /// restricts it to a `[from, to)` capture-time window (epoch seconds) — the
+    /// date scrubber's jump. `offset` is relative to whatever the filters leave.
+    pub fn photos_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        kind: Option<crate::control::PhotoKind>,
+        range: Option<(i64, i64)>,
+    ) -> Result<Vec<StoredPhoto>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT uid, capture_time, name, ratio, thumb_state FROM photos
-             ORDER BY seq LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = stmt.query_map(params![limit as i64, offset as i64], |r| {
-            Ok(StoredPhoto {
-                uid: r.get(0)?,
-                capture_time: r.get(1)?,
-                name: r.get(2)?,
-                ratio: r.get(3)?,
-                thumb_state: r.get(4)?,
-            })
-        })?;
-        let mut photos = Vec::new();
-        for row in rows {
-            photos.push(row?);
+        // Built up so any combination of the optional filters is one indexed
+        // query rather than a statement per case.
+        let mut sql =
+            String::from("SELECT uid, capture_time, name, ratio, thumb_state, kind FROM photos");
+        let mut binds: Vec<i64> = Vec::new();
+        let mut conds: Vec<String> = Vec::new();
+        if let Some(k) = kind {
+            binds.push(k.as_i64());
+            conds.push(format!("kind = ?{}", binds.len()));
         }
-        Ok(photos)
+        if let Some((from, to)) = range {
+            binds.push(from);
+            conds.push(format!("capture_time >= ?{}", binds.len()));
+            binds.push(to);
+            conds.push(format!("capture_time < ?{}", binds.len()));
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        binds.push(limit as i64);
+        let limit_pos = binds.len();
+        binds.push(offset as i64);
+        let offset_pos = binds.len();
+        sql.push_str(&format!(" ORDER BY seq LIMIT ?{limit_pos} OFFSET ?{offset_pos}"));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |r| {
+                Ok(StoredPhoto {
+                    uid: r.get(0)?,
+                    capture_time: r.get(1)?,
+                    name: r.get(2)?,
+                    ratio: r.get(3)?,
+                    thumb_state: r.get(4)?,
+                    kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The months the timeline spans, newest first, each with how many photos it
+    /// holds — the data behind the date scrubber. Buckets are local-time
+    /// `(year, month)` so they line up with the day headings the gallery draws
+    /// and with the boundaries a front-end computes when it jumps to one. `kind`
+    /// scopes the counts to one tab when set.
+    pub fn photos_months(
+        &self,
+        kind: Option<crate::control::PhotoKind>,
+    ) -> Result<Vec<(i32, i32, usize)>> {
+        let conn = self.conn.lock().unwrap();
+        let (filter, binds): (&str, Vec<i64>) = match kind {
+            Some(k) => (" WHERE kind = ?1", vec![k.as_i64()]),
+            None => ("", Vec::new()),
+        };
+        let sql = format!(
+            "SELECT CAST(strftime('%Y', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS y, \
+                    CAST(strftime('%m', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS m, \
+                    COUNT(*) \
+             FROM photos{filter} GROUP BY y, m ORDER BY y DESC, m DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |r| {
+                Ok((r.get::<_, i32>(0)?, r.get::<_, i32>(1)?, r.get::<_, i64>(2)? as usize))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.
+    pub fn photos_counts(&self) -> Result<(usize, usize, usize)> {
+        use crate::control::PhotoKind;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM photos GROUP BY kind")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let (mut photos, mut videos, mut raw) = (0usize, 0usize, 0usize);
+        for row in rows {
+            let (kind, n) = row?;
+            match PhotoKind::from_i64(kind) {
+                PhotoKind::Photo => photos = n as usize,
+                PhotoKind::Video => videos = n as usize,
+                PhotoKind::Raw => raw = n as usize,
+            }
+        }
+        Ok((photos, videos, raw))
     }
 
     /// The stored photos for `uids`, in no particular order. Used by the thumbnail
@@ -932,7 +1039,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let placeholders = vec!["?"; uids.len()].join(",");
         let mut stmt = conn.prepare(&format!(
-            "SELECT uid, capture_time, name, ratio, thumb_state FROM photos
+            "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM photos
              WHERE uid IN ({placeholders})"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(uids), |r| {
@@ -942,6 +1049,7 @@ impl Db {
                 name: r.get(2)?,
                 ratio: r.get(3)?,
                 thumb_state: r.get(4)?,
+                kind: crate::control::PhotoKind::from_i64(r.get(5)?),
             })
         })?;
         let mut photos = Vec::new();
@@ -2001,6 +2109,17 @@ ALTER TABLE pending_op ADD COLUMN name TEXT;
 CREATE INDEX pending_op_parent ON pending_op(parent_uid);
 ";
 
+/// Schema v13: photos record their media type and a derived `kind` so the
+/// timeline can be split into Photos / Videos / Raw tabs. `media_type` is
+/// nullable — it is filled once the daemon resolves a photo's node — while
+/// `kind` (see [`crate::control::PhotoKind`]) defaults to `0` (still photo), the
+/// classification anything unresolved falls back to. Existing rows are
+/// reclassified for free on the next timeline refresh, so no backfill is needed.
+const MIGRATION_V13: &str = "
+ALTER TABLE photos ADD COLUMN media_type TEXT;
+ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2060,9 +2179,9 @@ mod tests {
     fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
         let db = Db::open_in_memory().unwrap();
         db.photos_replace(&[
-            ("p1".into(), 300, None),
-            ("p2".into(), 200, None),
-            ("p3".into(), 100, None),
+            ("p1".into(), 300, None, Some("video/mp4".into())),
+            ("p2".into(), 200, None, None),
+            ("p3".into(), 100, None, None),
         ])
         .unwrap();
 
@@ -2071,14 +2190,15 @@ mod tests {
         db.photo_set_thumb("p2", THUMB_NONE, None).unwrap();
 
         // The next refresh brings a new photo, keeps p1 and p2, and loses p3.
+        // p1's media type arrives as `None` this time and must not be forgotten.
         db.photos_replace(&[
-            ("p0".into(), 400, Some("new.jpg".into())),
-            ("p1".into(), 300, None),
-            ("p2".into(), 200, None),
+            ("p0".into(), 400, Some("new.jpg".into()), None),
+            ("p1".into(), 300, None, None),
+            ("p2".into(), 200, None, None),
         ])
         .unwrap();
 
-        let page = db.photos_page(0, 10).unwrap();
+        let page = db.photos_page(0, 10, None, None).unwrap();
         assert_eq!(
             page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
             ["p0", "p1", "p2"],
@@ -2092,27 +2212,59 @@ mod tests {
         // A photo we know nothing about yet starts blank.
         assert_eq!(page[0].ratio, None);
         assert_eq!(page[0].thumb_state, THUMB_UNKNOWN);
+        // Media type is learned-and-kept like the ratio: p1 keeps the video type
+        // it was first seen with even though the later refresh carried `None`, so
+        // it stays classified as a video.
+        assert_eq!(page[1].kind, crate::control::PhotoKind::Video);
 
         assert_eq!(db.photos_count().unwrap(), 3);
+        // The counts break down by tab, and a filtered page returns only its tab.
+        assert_eq!(db.photos_counts().unwrap(), (2, 1, 0));
+        let videos = db
+            .photos_page(0, 10, Some(crate::control::PhotoKind::Video), None)
+            .unwrap();
+        assert_eq!(
+            videos.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+            ["p1"]
+        );
         let by_uid = db.photos_by_uid(&["p2".into()]).unwrap();
         assert_eq!(by_uid.len(), 1);
         assert_eq!(by_uid[0].capture_time, 200);
+
+        // A date-range page keeps only the window's photos: [150, 350) is p1+p2,
+        // not p0 at 400. Combined with a kind filter both conditions apply.
+        let ranged = db.photos_page(0, 10, None, Some((150, 350))).unwrap();
+        assert_eq!(
+            ranged.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+            ["p1", "p2"]
+        );
+        let ranged_video = db
+            .photos_page(0, 10, Some(crate::control::PhotoKind::Video), Some((150, 350)))
+            .unwrap();
+        assert_eq!(
+            ranged_video.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+            ["p1"]
+        );
+        // All three surviving photos sit in the same (1970-01) local month.
+        let months = db.photos_months(None).unwrap();
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0].2, 3);
     }
 
     #[test]
     fn photos_page_slices_the_timeline_in_order() {
         let db = Db::open_in_memory().unwrap();
         let items: Vec<_> = (0..5)
-            .map(|i| (format!("p{i}"), 500 - i as i64, None))
+            .map(|i| (format!("p{i}"), 500 - i as i64, None, None::<String>))
             .collect();
         db.photos_replace(&items).unwrap();
 
-        let page = db.photos_page(2, 2).unwrap();
+        let page = db.photos_page(2, 2, None, None).unwrap();
         assert_eq!(
             page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
             ["p2", "p3"]
         );
-        assert!(db.photos_page(9, 2).unwrap().is_empty());
+        assert!(db.photos_page(9, 2, None, None).unwrap().is_empty());
     }
 
     #[test]

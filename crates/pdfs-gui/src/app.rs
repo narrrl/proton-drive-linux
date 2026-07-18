@@ -34,7 +34,7 @@ use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, InvitationInfo, JobItem,
-    PhotoItem, PublicLinkInfo, RefreshScope, Request, Response, SearchHit, ShareEntry,
+    PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, SearchHit, ShareEntry,
     ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection,
     TransferItem, pending_summary, send,
 };
@@ -276,6 +276,23 @@ struct Ui {
     gallery_upload: gtk4::Button,
     /// "1,204 photos" under the page title.
     gallery_subtitle: gtk4::Label,
+    /// Which tab (Photos / Videos / Raw) the timeline is filtered to, or `None`
+    /// for All. Read by [`load_gallery`] and set by the filter toggles.
+    gallery_kind: Cell<Option<PhotoKind>>,
+    /// The filter toggles, index-aligned with [`kind_for_tab`], kept so their
+    /// labels can carry live per-kind counts.
+    gallery_tabs: [gtk4::ToggleButton; 4],
+    /// The date-jump dropdown ("All dates" then a month per timeline entry), and
+    /// the `[from, to)` window each of its rows selects (index-aligned; `None` is
+    /// "All dates"). Selecting a row loads that month via [`load_gallery`].
+    gallery_dates: gtk4::DropDown,
+    gallery_date_ranges: RefCell<Vec<Option<(i64, i64)>>>,
+    /// The capture-time window the timeline is currently filtered to, or `None`
+    /// for the whole span. Read by [`load_gallery`], set by the date dropdown.
+    gallery_range: Cell<Option<(i64, i64)>>,
+    /// Set while the date dropdown is being repopulated, so resetting its model
+    /// doesn't fire the selection handler and kick off a spurious reload.
+    gallery_date_suppress: Cell<bool>,
     /// True while a timeline page is in flight, so the scroll-to-the-end paging
     /// can't fire a second request for the page already coming.
     gallery_loading: Cell<bool>,
@@ -543,6 +560,8 @@ fn load_proton_theme() {
          .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
          .photo-placeholder {{ color: alpha(currentColor, 0.35); background: alpha(currentColor, 0.07); }}\n\
          .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 160ms ease; }}\n\
+         .photo-video-badge {{ color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }}\n\
+         .photo-tile:hover .photo-video-badge {{ background: alpha({PROTON_PURPLE}, 0.85); }}\n\
          .photo-tile:hover .photo-caption {{ opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }}\n\
          .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
          .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n\
@@ -693,6 +712,12 @@ fn build_window(app: &adw::Application) {
         gallery_more: gallery_widgets.more.clone(),
         gallery_upload: gallery_widgets.upload.clone(),
         gallery_subtitle: gallery_widgets.subtitle.clone(),
+        gallery_kind: Cell::new(None),
+        gallery_tabs: gallery_widgets.tabs.clone(),
+        gallery_dates: gallery_widgets.dates.clone(),
+        gallery_date_ranges: RefCell::new(vec![None]),
+        gallery_range: Cell::new(None),
+        gallery_date_suppress: Cell::new(false),
         gallery_loading: Cell::new(false),
         gallery_width: Cell::new(0),
         photo_tex: RefCell::new(HashMap::new()),
@@ -2795,13 +2820,33 @@ fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Box, x: f64, 
     popover.set_parent(anchor);
     popover.connect_closed(|p| p.unparent());
 
+    // Videos lead with Play (stream from the mount, no download); the plain Open
+    // below still downloads a local copy for anyone who wants one.
+    if is_video_entry(entry) {
+        let play = menu_item("Play (stream)", "media-playback-start-symbolic");
+        let ui_play = ui.clone();
+        let entry_play = entry.clone();
+        let pop = popover.clone();
+        play.connect_clicked(move |_| {
+            pop.popdown();
+            stream_entry(&ui_play, &entry_play);
+        });
+        menu.append(&play);
+    }
+
     let open = menu_item("Open", "document-open-symbolic");
     let ui_open = ui.clone();
     let entry_open = entry.clone();
     let pop = popover.clone();
     open.connect_clicked(move |_| {
         pop.popdown();
-        activate_entry(&ui_open, &entry_open);
+        // Open always means "download a local copy and hand off", even for a
+        // video — `activate_entry` would otherwise stream it.
+        if is_video_entry(&entry_open) {
+            download_and_open(&ui_open, &entry_open);
+        } else {
+            activate_entry(&ui_open, &entry_open);
+        }
     });
     menu.append(&open);
 
@@ -2892,7 +2937,33 @@ fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Option<DirEnt
     Some(entry)
 }
 
-/// Open an entry the Nautilus way: folders descend, files download-and-open.
+/// Whether an entry's name marks it as a video, reusing the same classifier the
+/// Photos page splits on — so the file browser and the gallery agree on what a
+/// video is.
+fn is_video_entry(entry: &DirEntry) -> bool {
+    !entry.is_dir && PhotoKind::classify(Some(&entry.name), None) == PhotoKind::Video
+}
+
+/// Stream a video straight from the mount, no download. Drive folders *are* part
+/// of the FUSE mount, so a player pointed at `<mountpoint>/<rel>` reads the file
+/// through [`Core::read_range_remote`] — 4 MB blocks fetched on demand as it
+/// seeks and buffers — instead of waiting for the whole file to land like
+/// [`Request::OpenFile`] does. This is the point of the feature: a 2 GB HEVC
+/// `.mkv` starts playing in seconds.
+fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
+    let rel = entry_rel(ui, entry);
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    let abs = mountpoint.join(&rel);
+    let Some(path) = abs.to_str() else {
+        toast_error(&ui, "Couldn't play video", "The file path isn't valid UTF-8.");
+        return;
+    };
+    toast(ui, &format!("Streaming “{}”…", entry.name));
+    play_external(path);
+}
+
+/// Open an entry the Nautilus way: folders descend, videos stream from the mount,
+/// other files download-and-open.
 fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
     if entry.is_dir {
@@ -2903,35 +2974,48 @@ fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
         }
         *ui.browser_path.borrow_mut() = rel;
         load_browser(ui);
+    } else if is_video_entry(entry) {
+        // A video streams rather than downloads: that is exactly the "play it,
+        // don't fetch the whole thing" behaviour this is for.
+        stream_entry(ui, entry);
     } else {
-        // Ignore a repeat activation of a file already downloading, so an
-        // impatient double-click doesn't kick off a second round-trip.
-        if !ui.opening.borrow_mut().insert(rel.clone()) {
-            return;
-        }
-        ui.busy_begin();
-        let rx = spawn_request(
-            ui.dirs.control_socket(),
-            Request::OpenFile { path: rel.clone() },
-        );
-        let ui = ui.clone();
-        glib::spawn_future_local(async move {
-            let result = rx.recv().await;
-            ui.busy_end();
-            ui.opening.borrow_mut().remove(&rel);
-            match result {
-                Ok(Ok(Response::FilePath { path })) => open_path(&path),
-                Ok(Ok(Response::Error { message })) => {
-                    toast_error(&ui, "Couldn't open file", &message)
-                }
-                _ => toast_error(
-                    &ui,
-                    "Couldn't open file",
-                    "The mount service didn't respond.",
-                ),
-            }
-        });
+        download_and_open(ui, entry);
     }
+}
+
+/// Download a file's full content into the cache and hand it to the user's
+/// default application. The download-and-open path behind both a plain
+/// double-click and the context menu's "Open" (including for a video, when the
+/// user explicitly wants a local copy rather than to stream it).
+fn download_and_open(ui: &Rc<Ui>, entry: &DirEntry) {
+    let rel = entry_rel(ui, entry);
+    // Ignore a repeat activation of a file already downloading, so an impatient
+    // double-click doesn't kick off a second round-trip.
+    if !ui.opening.borrow_mut().insert(rel.clone()) {
+        return;
+    }
+    ui.busy_begin();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::OpenFile { path: rel.clone() },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        ui.opening.borrow_mut().remove(&rel);
+        match result {
+            Ok(Ok(Response::FilePath { path })) => open_path(&path),
+            Ok(Ok(Response::Error { message })) => {
+                toast_error(&ui, "Couldn't open file", &message)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't open file",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
 }
 
 /// Pin or unpin an entry through the daemon, then reload to reflect the new
@@ -6336,6 +6420,11 @@ struct GalleryWidgets {
     retry: gtk4::Button,
     upload: gtk4::Button,
     refresh: gtk4::Button,
+    /// The All / Photos / Videos / Raw filter toggles, in that order (index maps
+    /// to [`kind_for_tab`]).
+    tabs: [gtk4::ToggleButton; 4],
+    /// The date-jump dropdown, populated with the timeline's months.
+    dates: gtk4::DropDown,
 }
 
 /// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over
@@ -6425,6 +6514,43 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     header_box.append(&refresh);
     header_box.append(&upload);
 
+    // All / Photos / Videos / Raw filter. Linked toggles acting as one segmented
+    // control: exactly one is active, and flipping it reloads the timeline
+    // filtered to that kind (wired in [`wire_gallery`]). Labels gain live counts
+    // once a page lands.
+    let tab_labels = ["All", "Photos", "Videos", "Raw"];
+    let tabs: [gtk4::ToggleButton; 4] = std::array::from_fn(|i| {
+        gtk4::ToggleButton::builder()
+            .label(tab_labels[i])
+            .active(i == 0)
+            .build()
+    });
+    // Group the toggles so they behave as a radio set: chaining each to the first
+    // is what GTK turns into mutual exclusion.
+    for btn in &tabs[1..] {
+        btn.set_group(Some(&tabs[0]));
+    }
+    let tab_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    tab_group.add_css_class("linked");
+    for btn in &tabs {
+        btn.add_css_class("pill");
+        tab_group.append(btn);
+    }
+
+    // Date jump: "All dates" plus a row per month, filled in once the timeline's
+    // months are known (see [`refresh_photo_months`]). Pushed to the far end of
+    // the filter row, opposite the kind toggles.
+    let dates = gtk4::DropDown::from_strings(&["All dates"]);
+    dates.add_css_class("pill");
+    dates.set_tooltip_text(Some("Jump to a month"));
+
+    let filter_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    filter_bar.append(&tab_group);
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    filter_bar.append(&spacer);
+    filter_bar.append(&dates);
+
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&scroll);
@@ -6442,6 +6568,7 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header_box);
+    inner.append(&filter_bar);
     inner.append(&content);
 
     (
@@ -6458,8 +6585,88 @@ fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             retry,
             upload,
             refresh,
+            tabs,
+            dates,
         },
     )
+}
+
+/// The [`PhotoKind`] filter a gallery tab index selects: index 0 is All (no
+/// filter), then Photos / Videos / Raw. Index-aligned with the toggle array.
+fn kind_for_tab(index: usize) -> Option<PhotoKind> {
+    match index {
+        1 => Some(PhotoKind::Photo),
+        2 => Some(PhotoKind::Video),
+        3 => Some(PhotoKind::Raw),
+        _ => None,
+    }
+}
+
+/// The `[from, to)` epoch-second window of a local calendar month, or `None` if
+/// the date is somehow unrepresentable. Computed with glib so month rollover and
+/// the local timezone (matching the daemon's month buckets) are handled for us.
+fn month_range(year: i32, month: i32) -> Option<(i64, i64)> {
+    let start = glib::DateTime::from_local(year, month, 1, 0, 0, 0.0).ok()?;
+    let end = start.add_months(1).ok()?;
+    Some((start.to_unix(), end.to_unix()))
+}
+
+/// English month names, indexed 1..=12.
+const MONTH_NAMES: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September",
+    "October", "November", "December",
+];
+
+/// Rebuild the date-jump dropdown for the active kind: ask the daemon which
+/// months the timeline spans and turn them into "Month YYYY (count)" rows, each
+/// remembering the window it jumps to. Resets the selection to "All dates" — the
+/// caller pairs this with a fresh timeline load. Off the UI thread; a failure
+/// just leaves the dropdown as it was.
+fn refresh_photo_months(ui: &Rc<Ui>) {
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::PhotoMonths {
+            kind: ui.gallery_kind.get(),
+        },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let Ok(Ok(Response::PhotoMonths { months })) = rx.recv().await else {
+            return;
+        };
+        let mut labels = vec!["All dates".to_string()];
+        let mut ranges: Vec<Option<(i64, i64)>> = vec![None];
+        for m in months {
+            let name = MONTH_NAMES.get((m.month - 1) as usize).copied().unwrap_or("?");
+            labels.push(format!("{name} {} ({})", m.year, m.count));
+            ranges.push(month_range(m.year, m.month));
+        }
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+
+        // Repopulating resets the selection to 0, which would otherwise fire the
+        // handler and reload; suppress that — the caller is already reloading.
+        ui.gallery_date_suppress.set(true);
+        ui.gallery_dates
+            .set_model(Some(&gtk4::StringList::new(&label_refs)));
+        ui.gallery_dates.set_selected(0);
+        *ui.gallery_date_ranges.borrow_mut() = ranges;
+        ui.gallery_date_suppress.set(false);
+    });
+}
+
+/// Label the filter toggles with the whole-timeline `(photos, videos, raw)`
+/// counts, so a glance shows how much sits behind each tab. A tab with nothing
+/// behind it is disabled — you can't filter to an empty set — but the currently
+/// selected one stays clickable so you can always switch back off it.
+fn update_gallery_tabs(ui: &Rc<Ui>, counts: (usize, usize, usize)) {
+    let (photos, videos, raw) = counts;
+    let totals = [photos + videos + raw, photos, videos, raw];
+    for (index, tab) in ui.gallery_tabs.iter().enumerate() {
+        let name = ["All", "Photos", "Videos", "Raw"][index];
+        let n = totals[index];
+        tab.set_label(&format!("{name} {n}"));
+        tab.set_sensitive(n > 0 || tab.is_active());
+    }
 }
 
 /// Wire the gallery: install the section factory, the zoom gestures, the pager
@@ -6580,6 +6787,48 @@ fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindo
     let ui_more = ui.clone();
     ui.gallery_more.clone().connect_clicked(move |_| {
         load_gallery(&ui_more, true);
+    });
+
+    // Filter toggles: flipping to a tab reloads the timeline filtered to that
+    // kind. Only the button being switched *on* acts — the group also fires a
+    // `toggled` for the one switching off, which this skips — and a redundant
+    // toggle to the already-current kind is a no-op.
+    for (index, tab) in ui.gallery_tabs.iter().enumerate() {
+        let ui_tab = ui.clone();
+        tab.connect_toggled(move |btn| {
+            if !btn.is_active() {
+                return;
+            }
+            let kind = kind_for_tab(index);
+            if ui_tab.gallery_kind.get() == kind {
+                return;
+            }
+            ui_tab.gallery_kind.set(kind);
+            // A different kind has a different set of months; clearing the active
+            // window makes the reload rebuild the date jump for the new kind.
+            ui_tab.gallery_range.set(None);
+            load_gallery(&ui_tab, false);
+        });
+    }
+
+    // Date jump: selecting a month loads that window; "All dates" (row 0) clears
+    // it. Skipped while the model is being repopulated (see `gallery_date_suppress`).
+    let ui_dates = ui.clone();
+    ui.gallery_dates.connect_selected_notify(move |dd| {
+        if ui_dates.gallery_date_suppress.get() {
+            return;
+        }
+        let range = ui_dates
+            .gallery_date_ranges
+            .borrow()
+            .get(dd.selected() as usize)
+            .copied()
+            .flatten();
+        if ui_dates.gallery_range.get() == range {
+            return;
+        }
+        ui_dates.gallery_range.set(range);
+        load_gallery(&ui_dates, false);
     });
 
     let ui_upload = ui.clone();
@@ -6845,6 +7094,20 @@ fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     overlay.add_overlay(&picture);
     overlay.add_overlay(&caption);
 
+    // A video reads as a video at a glance: a play glyph centred over the poster
+    // thumbnail. Kept above the caption scrim so it stays legible on hover.
+    let is_video = tile.photo.kind == PhotoKind::Video;
+    if is_video {
+        let badge = gtk4::Image::builder()
+            .icon_name("media-playback-start-symbolic")
+            .pixel_size(28)
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .build();
+        badge.add_css_class("photo-video-badge");
+        overlay.add_overlay(&badge);
+    }
+
     let button = gtk4::Button::builder()
         .child(&overlay)
         .width_request(tile.width)
@@ -6858,9 +7121,17 @@ fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
 
     want_thumb(ui, &tile.photo, &picture);
 
+    // A still opens in the in-app lightbox; a video can't render there, so it
+    // downloads and hands off to an external player instead.
     let ui_open = ui.clone();
     let uid = tile.photo.uid.clone();
-    button.connect_clicked(move |_| open_photo_viewer(&ui_open, uid.clone()));
+    button.connect_clicked(move |_| {
+        if is_video {
+            play_video(&ui_open, uid.clone());
+        } else {
+            open_photo_viewer(&ui_open, uid.clone());
+        }
+    });
     button
 }
 
@@ -7142,9 +7413,15 @@ fn repaint_gallery(ui: &Rc<Ui>) {
 
     let count = ui.gallery_model.n_items();
     ui.gallery_subtitle.set_visible(count > 0);
+    // The noun tracks the active filter, so a Videos tab doesn't count "photos".
+    let (one, many) = match ui.gallery_kind.get() {
+        Some(PhotoKind::Video) => ("video", "videos"),
+        Some(PhotoKind::Raw) => ("raw photo", "raw photos"),
+        _ => ("photo", "photos"),
+    };
     ui.gallery_subtitle.set_label(&match count {
-        1 => "1 photo".to_string(),
-        n => format!("{n} photos"),
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
     });
 }
 
@@ -7341,6 +7618,11 @@ fn prefetch_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, delta: i32) {
     else {
         return;
     };
+    // Never prefetch a video: the lightbox skips over it, and warming it would
+    // mean downloading a whole clip the user won't watch from here.
+    if photo.kind == PhotoKind::Video {
+        return;
+    }
     let rx = spawn_request(
         ui.dirs.control_socket(),
         Request::OpenPhoto { uid: photo.uid },
@@ -7529,15 +7811,41 @@ fn navigate_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, delta: i32) {
     }
     let uid_val = viewer.uid.borrow().clone();
     let current_idx = find_photo_index(model, &uid_val).unwrap_or(0);
-    let next_idx = (current_idx as i32 + delta).clamp(0, n as i32 - 1) as u32;
 
-    let Some(obj) = model.item(next_idx) else {
+    // Where the raw step lands (prev/next are ±1; Home/End are huge deltas that
+    // clamp to the ends), and which way it was travelling.
+    let start = (current_idx as i32 + delta).clamp(0, n as i32 - 1);
+    let dir = if delta < 0 { -1 } else { 1 };
+
+    // The lightbox renders stills only — a video plays in an external player, so
+    // it has no frame here. Land on the nearest renderable item, preferring the
+    // travel direction and falling back to scanning inward from a boundary (so
+    // Home/End still reach the first/last still even when videos sit at the end).
+    let renderable = |idx: u32| -> Option<PhotoItem> {
+        model
+            .item(idx)
+            .and_then(|obj| obj.downcast_ref::<BoxedAnyObject>().map(|b| b.borrow::<PhotoItem>().clone()))
+            .filter(|photo| photo.kind != PhotoKind::Video)
+    };
+    let scan = |from: i32, step: i32| -> Option<(u32, PhotoItem)> {
+        let mut probe = from;
+        while (0..n as i32).contains(&probe) {
+            if let Some(photo) = renderable(probe as u32) {
+                return Some((probe as u32, photo));
+            }
+            probe += step;
+        }
+        None
+    };
+    // Scan the travel direction first. Only fall back to scanning inward when the
+    // step landed on a boundary — that is the Home/End case (jump to first/last,
+    // then step inward past any videos there); a mid-list prev/next with only
+    // videos ahead should simply stay put rather than reverse.
+    let at_boundary = start == 0 || start == n as i32 - 1;
+    let landing = scan(start, dir).or_else(|| at_boundary.then(|| scan(start, -dir)).flatten());
+    let Some((next_idx, photo)) = landing else {
         return;
     };
-    let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() else {
-        return;
-    };
-    let photo = boxed.borrow::<PhotoItem>().clone();
 
     *viewer.uid.borrow_mut() = photo.uid.clone();
     show_photo_position(viewer, next_idx, n, photo.capture_time);
@@ -7903,6 +8211,12 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
             "Reading your Proton Drive timeline.",
             false,
         );
+        // Rebuild the date jump for the current kind, but only for a full-span
+        // load — a jump *to* a month sets a range and reloads, and refreshing the
+        // dropdown then would fight the selection the user just made.
+        if ui.gallery_range.get().is_none() {
+            refresh_photo_months(ui);
+        }
     }
     let offset = ui.gallery_model.n_items() as usize;
     ui.gallery_loading.set(true);
@@ -7914,6 +8228,8 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
         Request::PhotosTimeline {
             offset,
             limit: PHOTOS_PAGE,
+            kind: ui.gallery_kind.get(),
+            range: ui.gallery_range.get(),
         },
     );
     let ui = ui.clone();
@@ -7923,7 +8239,11 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
         ui.gallery_loading.set(false);
         ui.gallery_more.set_sensitive(true);
         match result {
-            Ok(Ok(Response::Photos { available, items })) => {
+            Ok(Ok(Response::Photos {
+                available,
+                items,
+                counts,
+            })) => {
                 if !available {
                     gallery_status(
                         &ui,
@@ -7933,6 +8253,10 @@ fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         false,
                     );
                     return;
+                }
+                // Label the filter tabs with live per-kind counts.
+                if let Some(counts) = counts {
+                    update_gallery_tabs(&ui, counts);
                 }
                 // Take the daemon's word on ratios and thumbnail verdicts before
                 // anything is laid out: it persists both, so the very first frame
@@ -8041,6 +8365,47 @@ fn open_path(path: &str) {
     if let Err(e) = Command::new("xdg-open").arg(path).spawn() {
         tracing::error!("xdg-open {path} failed: {e}");
     }
+}
+
+/// Play a video with an external player. Prefers `mpv` — it sniffs the container
+/// from the bytes, so the cache's extensionless blob plays fine, and it is the
+/// right tool for the HEVC `.mkv`s this is aimed at — and falls back to the
+/// user's default handler when mpv isn't installed.
+fn play_external(path: &str) {
+    if Command::new("mpv").arg(path).spawn().is_ok() {
+        return;
+    }
+    open_path(path);
+}
+
+/// Download a Photos-library video, then hand it to an external player. Unlike a
+/// still photo — which the in-app lightbox can render — a video needs a real
+/// player, and the photos volume isn't part of the FUSE mount, so there is no
+/// path to stream it from: [`Request::OpenPhoto`] fetches the whole file into the
+/// cache (served straight from there on a repeat) and we launch the player on it.
+///
+/// For large videos kept in an on-demand *drive* folder, streaming through the
+/// mount is the better route — that is the file-browser "Play" action, not this.
+fn play_video(ui: &Rc<Ui>, uid: String) {
+    toast(ui, "Preparing video…");
+    let rx = spawn_request(ui.dirs.control_socket(), Request::OpenPhoto { uid });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::FilePath { path })) => play_external(&path),
+            Ok(Ok(Response::Error { message })) => {
+                toast_error(&ui, "Couldn't open this video", &message)
+            }
+            Ok(Ok(_)) => toast_error(
+                &ui,
+                "Couldn't open this video",
+                "Unexpected reply from the mount service.",
+            ),
+            Ok(Err(_)) | Err(_) => {
+                toast_error(&ui, "Couldn't open this video", "Couldn't reach Proton Drive.")
+            }
+        }
+    });
 }
 
 /// Format a byte count as a short binary-unit string (e.g. `1.2 GiB`).
