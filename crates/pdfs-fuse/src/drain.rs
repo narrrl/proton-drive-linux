@@ -24,6 +24,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use pdfs_core::CoreError;
 use pdfs_core::cache::StagedWrite;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp};
@@ -394,7 +395,7 @@ impl Core {
         local: &NodeUid,
         real: &NodeUid,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let node = self.fetch_node(real).map_err(|e| format!("{e:?}"))?;
+        let node = self.fetch_node(real).map_err(|e| CoreError::remote(format!("{e:?}")))?;
         // Repoints queued children and node rows, and drops the placeholder row.
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
@@ -675,7 +676,7 @@ impl Core {
                 meta.base_size,
                 &written,
             )
-            .map_err(|e| format!("gap-fill from base failed: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("gap-fill from base failed: {e:?}")))?;
         }
 
         let name = {

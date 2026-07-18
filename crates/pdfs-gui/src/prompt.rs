@@ -977,7 +977,7 @@ impl Ui {
                             xdg_open(Path::new(&path));
                             window.close();
                         }
-                        Ok(Ok(Response::Error { message })) => {
+                        Ok(Ok(Response::Error { message, .. })) => {
                             ui.hint.set_label(&format!("Could not open: {message}"));
                         }
                         _ => ui.hint.set_label("Could not reach the daemon"),

@@ -12,7 +12,7 @@ pub mod localindex;
 pub mod service;
 pub mod shell;
 
-pub use error::{Error, Result};
+pub use error::{CoreError, CoreResult, Error, Result};
 
 // Re-export the SDK surface downstream crates need, so they depend on
 // `pdfs-core` rather than pinning the SDK directly.

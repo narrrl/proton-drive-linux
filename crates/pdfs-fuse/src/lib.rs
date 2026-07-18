@@ -49,6 +49,7 @@ use fuser::{
     RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
+use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
@@ -817,6 +818,33 @@ impl Core {
             }
         }
         Ok((ino, uid))
+    }
+
+    /// [`resolve_path`](Self::resolve_path) for the request-serving side.
+    ///
+    /// The kernel-facing resolver answers in `Errno` because that is what the
+    /// FUSE reply needs. A front-end needs the opposite: `{:?}` of a libc
+    /// constant is not something to show a user, and "does not exist" and "the
+    /// API is down" want different copy and different buttons. This is the one
+    /// place that knows enough to tell them apart, so it is the place that does.
+    fn resolve(&self, rel: &Path) -> CoreResult<(u64, NodeUid)> {
+        self.resolve_path(rel).map_err(|e| {
+            let what = rel.display();
+            // `Errno` is neither `PartialEq` nor structural-match, so this
+            // compares the raw codes rather than the constants.
+            match e.code() {
+                libc::ENOENT => CoreError::not_found(format!("no such file or folder: {what}")),
+                libc::EACCES | libc::EPERM => {
+                    CoreError::denied(format!("not allowed to read {what}"))
+                }
+                // The resolver walks the tree lazily, so a cold path needs the
+                // API. Offline that surfaces as EIO, which on its own would read
+                // to the user as a broken file rather than a missing network.
+                libc::EIO if !self.online.load(Ordering::Relaxed) => CoreError::offline(),
+                libc::EINVAL => CoreError::invalid(format!("not a usable path: {what}")),
+                _ => CoreError::remote(format!("could not resolve {what}: {e:?}")),
+            }
+        })
     }
 
     /// Fetch a single node's current metadata from the remote.
@@ -1811,13 +1839,11 @@ impl Core {
     /// Pin the node at mountpoint-relative `rel`. A file downloads its full
     /// plaintext into the content cache; a folder records a recursive pin and
     /// downloads every descendant file (selective sync). Returns a human message.
-    fn pin(&self, rel: &Path) -> Result<String, String> {
-        let (ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn pin(&self, rel: &Path) -> CoreResult<String> {
+        let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder, mtime, size) = {
             let st = self.state.lock();
-            let e = st.entries.get(&ino).ok_or("node vanished")?;
+            let e = st.entries.get(&ino).ok_or_else(|| CoreError::not_found("node vanished"))?;
             (
                 e.node.name.clone(),
                 e.node.is_folder(),
@@ -1830,19 +1856,19 @@ impl Core {
             // exempt before we start filling the cache with the subtree.
             self.cache
                 .add_pin(&uid, rel, true)
-                .map_err(|e| format!("pin: {e}"))?;
+                .map_err(|e| CoreError::remote(format!("pin: {e}")))?;
             let n = self.pin_subtree(ino)?;
             return Ok(format!("{name} ({n} files)"));
         }
         let bytes = self
             .download_file_tracked(&uid, &name, size)
-            .map_err(|e| format!("download: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("download: {e}")))?;
         self.cache
             .store(&uid, mtime, size, &bytes)
-            .map_err(|e| format!("cache store: {e}"))?;
+            .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
         self.cache
             .add_pin(&uid, rel, false)
-            .map_err(|e| format!("pin: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("pin: {e}")))?;
         Ok(name)
     }
 
@@ -1850,12 +1876,12 @@ impl Core {
     /// returning the count cached (already-fresh blobs counted, not re-fetched).
     /// Walks the tree depth-first, enumerating each folder so a cold subtree is
     /// fully discovered; the lock is dropped before each network download.
-    fn pin_subtree(&self, ino: u64) -> Result<usize, String> {
+    fn pin_subtree(&self, ino: u64) -> CoreResult<usize> {
         let mut files: Vec<(NodeUid, String, i64, u64)> = Vec::new();
         let mut stack = vec![ino];
         while let Some(dir) = stack.pop() {
             self.ensure_children(dir)
-                .map_err(|e| format!("enumerate: {e:?}"))?;
+                .map_err(|e| CoreError::remote(format!("enumerate: {e:?}")))?;
             let st = self.state.lock();
             if let Some(kids) = st.children.get(&dir) {
                 for &k in kids {
@@ -1924,10 +1950,8 @@ impl Core {
 
     /// Unpin the node at `rel`, evicting its cached content. For a folder, also
     /// evicts every descendant's cached blob (the subtree is no longer kept).
-    fn unpin(&self, rel: &Path) -> Result<String, String> {
-        let (ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn unpin(&self, rel: &Path) -> CoreResult<String> {
+        let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder) = {
             let st = self.state.lock();
             st.entries
@@ -1937,7 +1961,7 @@ impl Core {
         };
         self.cache
             .remove_pin(&uid)
-            .map_err(|e| format!("unpin: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("unpin: {e}")))?;
         // A recursively-pinned folder's descendants were eviction-exempt; now
         // that the pin is gone, reclaim their blobs eagerly instead of waiting
         // for budget pressure. Descendants come from the DB node tree.
@@ -1963,12 +1987,10 @@ impl Core {
     /// List the directory at mountpoint-relative `rel` for the in-app browser:
     /// the same lazy remote enumeration `readdir` uses, projected into
     /// serializable [`DirEntry`]s (with per-file pin state).
-    fn list_dir(&self, rel: &Path) -> Result<Vec<DirEntry>, String> {
-        let (ino, _uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn list_dir(&self, rel: &Path) -> CoreResult<Vec<DirEntry>> {
+        let (ino, _uid) = self.resolve(rel)?;
         self.ensure_children(ino)
-            .map_err(|e| format!("enumerate: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate: {e:?}")))?;
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
         let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
@@ -2011,11 +2033,11 @@ impl Core {
     /// Full-text search node names against the local SQLite index, mapping each
     /// DB hit to the wire [`SearchHit`] (resolving live pin state from the cache,
     /// which the DB doesn't track). Pure local lookup — never hits the network.
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+    fn search(&self, query: &str, limit: usize) -> CoreResult<Vec<SearchHit>> {
         let hits = self
             .db
             .search(query, limit)
-            .map_err(|e| format!("search: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("search: {e}")))?;
         Ok(hits
             .into_iter()
             .map(|h| SearchHit {
@@ -2033,11 +2055,11 @@ impl Core {
     /// Search the index of files on this machine (outside Drive), built by the
     /// background scanner in [`run_local_index`]. Pure local lookup, never hits
     /// the network — and never touches the FUSE mount, which the scanner excludes.
-    fn search_local(&self, query: &str, limit: usize) -> Result<Vec<LocalHit>, String> {
+    fn search_local(&self, query: &str, limit: usize) -> CoreResult<Vec<LocalHit>> {
         let hits = self
             .db
             .search_local(query, limit)
-            .map_err(|e| format!("local search: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("local search: {e}")))?;
         Ok(hits
             .into_iter()
             .map(|h| LocalHit {
@@ -2075,15 +2097,13 @@ impl Core {
     /// into the content cache, returning its on-disk path (served from cache
     /// when a fresh blob already exists). Lets a front-end open the file with
     /// the user's default application without pinning it.
-    fn open_file(&self, rel: &Path) -> Result<PathBuf, String> {
-        let (ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn open_file(&self, rel: &Path) -> CoreResult<PathBuf> {
+        let (ino, uid) = self.resolve(rel)?;
         let (name, mtime, size) = {
             let st = self.state.lock();
-            let e = st.entries.get(&ino).ok_or("node vanished")?;
+            let e = st.entries.get(&ino).ok_or_else(|| CoreError::not_found("node vanished"))?;
             if !e.node.is_file() {
-                return Err("not a regular file".into());
+                return Err(CoreError::invalid("not a regular file"));
             }
             (
                 e.node.name.clone(),
@@ -2096,10 +2116,10 @@ impl Core {
         }
         let bytes = self
             .download_file_tracked(&uid, &name, size)
-            .map_err(|e| format!("download: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("download: {e}")))?;
         self.cache
             .store(&uid, mtime, size, &bytes)
-            .map_err(|e| format!("cache store: {e}"))?;
+            .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
         Ok(self.cache.content_path(&uid))
     }
 
@@ -2118,16 +2138,14 @@ impl Core {
     /// Mirrors the FUSE `rename` write path: rename on the remote, forget the
     /// node so it re-interns under its new name, and drop the parent listing so
     /// the next `ListDir` re-enumerates.
-    fn rename(&self, rel: &Path, new_name: &str) -> Result<String, String> {
+    fn rename(&self, rel: &Path, new_name: &str) -> CoreResult<String> {
         if new_name.is_empty() || new_name.contains('/') {
-            return Err(format!("invalid name: {new_name:?}"));
+            return Err(CoreError::invalid(format!("invalid name: {new_name:?}")));
         }
-        let (_ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let (_ino, uid) = self.resolve(rel)?;
         self.rt
             .block_on(self.client.rename_node(&uid, new_name, None))
-            .map_err(|e| format!("rename: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("rename: {e}")))?;
         self.state.lock().forget(&uid);
         self.invalidate_parent_listing(rel);
         Ok(new_name.to_string())
@@ -2136,16 +2154,14 @@ impl Core {
     /// Move a file or folder into the folder at `new_parent_rel`. Both paths are
     /// mountpoint-relative. Forgets the node and invalidates both the source and
     /// destination listings so each re-enumerates on next access.
-    fn move_to(&self, rel: &Path, new_parent_rel: &Path) -> Result<String, String> {
-        let (_ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn move_to(&self, rel: &Path, new_parent_rel: &Path) -> CoreResult<String> {
+        let (_ino, uid) = self.resolve(rel)?;
         let (pino, new_parent_uid) = self
             .resolve_path(new_parent_rel)
-            .map_err(|e| format!("resolve new parent: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("resolve new parent: {e:?}")))?;
         self.rt
             .block_on(self.client.move_node(&uid, &new_parent_uid))
-            .map_err(|e| format!("move: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("move: {e}")))?;
         let name = self
             .state
             .lock()
@@ -2159,13 +2175,11 @@ impl Core {
 
     /// Trash a file or folder. `rel` is mountpoint-relative. Forgets the node,
     /// evicts any cached content, and invalidates the parent listing.
-    fn delete(&self, rel: &Path) -> Result<String, String> {
-        let (_ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn delete(&self, rel: &Path) -> CoreResult<String> {
+        let (_ino, uid) = self.resolve(rel)?;
         self.rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
-            .map_err(|e| format!("trash: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("trash: {e}")))?;
         let name = self
             .state
             .lock()
@@ -2189,7 +2203,7 @@ impl Core {
     /// back at DB speed and is refreshed in the background past [`TRASH_TTL`].
     /// Our own trash mutations invalidate it outright (see
     /// [`Core::invalidate_trash`]), so the TTL only covers changes made elsewhere.
-    fn list_trash(&self) -> Result<Vec<DirEntry>, String> {
+    fn list_trash(&self) -> CoreResult<Vec<DirEntry>> {
         let stale = self.listing_stale(TRASH_SYNCED_MS, TRASH_TTL);
         // Never fetched: this request has to wait for it.
         if self.db.state_i64(TRASH_SYNCED_MS).ok().flatten().is_none() {
@@ -2201,7 +2215,7 @@ impl Core {
         Ok(self
             .db
             .trash_list()
-            .map_err(|e| e.to_string())?
+            .map_err(CoreError::from)?
             .into_iter()
             .map(|item| DirEntry {
                 name: item.name,
@@ -2219,19 +2233,19 @@ impl Core {
     }
 
     /// Re-fetch the trash listing from the server and persist it.
-    async fn refresh_trash(&self) -> Result<(), String> {
+    async fn refresh_trash(&self) -> CoreResult<()> {
         let uids = self
             .client
             .enumerate_trash_node_uids()
             .await
-            .map_err(|e| format!("enumerate trash: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate trash: {e}")))?;
         let nodes = if uids.is_empty() {
             Vec::new()
         } else {
             self.client
                 .enumerate_nodes(&uids)
                 .await
-                .map_err(|e| format!("enumerate nodes: {e}"))?
+                .map_err(|e| CoreError::remote(format!("enumerate nodes: {e}")))?
         };
         let items: Vec<StoredTrash> = nodes
             .into_iter()
@@ -2243,7 +2257,7 @@ impl Core {
                 mtime: node.modification_time,
             })
             .collect();
-        self.db.trash_replace(&items).map_err(|e| e.to_string())?;
+        self.db.trash_replace(&items).map_err(CoreError::from)?;
         let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
         Ok(())
     }
@@ -2279,10 +2293,8 @@ impl Core {
     /// Drop one folder's cached child listing (`rel` is mountpoint-relative), so
     /// the next `ListDir`/`readdir` re-enumerates it from the server. Backs
     /// [`CtlRequest::Refresh`] with a [`RefreshScope::Dir`] scope.
-    fn refresh_dir(&self, rel: &Path) -> Result<(), String> {
-        let (ino, uid) = self
-            .resolve_path(rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn refresh_dir(&self, rel: &Path) -> CoreResult<()> {
+        let (ino, uid) = self.resolve(rel)?;
         // Clear the DB flag directly rather than through
         // `State::invalidate_listing`, which no-ops when the folder has no
         // in-memory listing to drop — exactly the case for a folder hydrated
@@ -2290,19 +2302,19 @@ impl Core {
         // listing worth refreshing.
         self.db
             .set_listed(&uid, false)
-            .map_err(|e| format!("db: {e:?}"))?;
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
         self.state.lock().children.remove(&ino);
         Ok(())
     }
 
     /// Parse wire uids (`volume~link`) into [`NodeUid`]s, rejecting the whole
     /// batch if any is malformed — a partial trash mutation is worse than none.
-    fn parse_uids(uids: &[String]) -> Result<Vec<NodeUid>, String> {
+    fn parse_uids(uids: &[String]) -> CoreResult<Vec<NodeUid>> {
         if uids.is_empty() {
-            return Err("no nodes given".to_string());
+            return Err(CoreError::invalid("no nodes given"));
         }
         uids.iter()
-            .map(|u| parse_uid(u).ok_or_else(|| format!("invalid uid: {u}")))
+            .map(|u| parse_uid(u).ok_or_else(|| CoreError::invalid(format!("invalid uid: {u}"))))
             .collect()
     }
 
@@ -2310,18 +2322,18 @@ impl Core {
     /// are read *before* the restore — a restored node reappears in a listing the
     /// daemon may already have cached, so each destination folder is invalidated
     /// and re-enumerated on next access.
-    fn restore(&self, uids: &[String]) -> Result<usize, String> {
+    fn restore(&self, uids: &[String]) -> CoreResult<usize> {
         let parsed = Self::parse_uids(uids)?;
         let parents: Vec<NodeUid> = self
             .rt
             .block_on(self.client.enumerate_nodes(&parsed))
-            .map_err(|e| format!("enumerate nodes: {e}"))?
+            .map_err(|e| CoreError::remote(format!("enumerate nodes: {e}")))?
             .into_iter()
             .filter_map(|n| n.parent_uid)
             .collect();
         self.rt
             .block_on(self.client.restore_nodes(&parsed))
-            .map_err(|e| format!("restore: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("restore: {e}")))?;
         {
             let mut st = self.state.lock();
             for parent in parents {
@@ -2336,11 +2348,11 @@ impl Core {
 
     /// Permanently delete trashed nodes. Irreversible on the server; locally it
     /// drops any metadata and cached content the node still owns.
-    fn delete_forever(&self, uids: &[String]) -> Result<usize, String> {
+    fn delete_forever(&self, uids: &[String]) -> CoreResult<usize> {
         let parsed = Self::parse_uids(uids)?;
         self.rt
             .block_on(self.client.delete_nodes(&parsed))
-            .map_err(|e| format!("delete: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("delete: {e}")))?;
         self.drop_local(&parsed);
         self.invalidate_trash();
         Ok(parsed.len())
@@ -2349,14 +2361,14 @@ impl Core {
     /// Permanently delete everything in the trash. The uids are listed first so
     /// the blobs of items trashed by *another* client — which this daemon may
     /// still hold in its cache — are reclaimed too, not just the ones it trashed.
-    fn empty_trash(&self) -> Result<usize, String> {
+    fn empty_trash(&self) -> CoreResult<usize> {
         let uids = self
             .rt
             .block_on(self.client.enumerate_trash_node_uids())
-            .map_err(|e| format!("enumerate trash: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate trash: {e}")))?;
         self.rt
             .block_on(self.client.empty_trash())
-            .map_err(|e| format!("empty trash: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("empty trash: {e}")))?;
         self.drop_local(&uids);
         self.invalidate_trash();
         Ok(uids.len())
@@ -2378,25 +2390,23 @@ impl Core {
 
     /// Create a folder named `name` under the mountpoint-relative `parent_rel`.
     /// Interns the new node directly so it shows up without a re-enumeration.
-    fn create_folder(&self, parent_rel: &Path, name: &str) -> Result<String, String> {
+    fn create_folder(&self, parent_rel: &Path, name: &str) -> CoreResult<String> {
         if name.is_empty() || name.contains('/') {
-            return Err(format!("invalid name: {name:?}"));
+            return Err(CoreError::invalid(format!("invalid name: {name:?}")));
         }
-        let (pino, parent_uid) = self
-            .resolve_path(parent_rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let (pino, parent_uid) = self.resolve(parent_rel)?;
         self.ensure_children(pino)
-            .map_err(|e| format!("enumerate: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate: {e:?}")))?;
         let new_uid = self
             .rt
             .block_on(
                 self.client
                     .create_folder(&parent_uid, name, Some(now_secs())),
             )
-            .map_err(|e| format!("create folder: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("create folder: {e}")))?;
         let node = self
             .fetch_node(&new_uid)
-            .map_err(|e| format!("fetch node: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("fetch node: {e:?}")))?;
         let mut st = self.state.lock();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
@@ -2409,15 +2419,13 @@ impl Core {
 
     /// Upload a file named `name` with content `bytes` into the
     /// mountpoint-relative `parent_rel` folder. Interns the new node directly.
-    fn upload(&self, parent_rel: &Path, name: &str, bytes: &[u8]) -> Result<String, String> {
+    fn upload(&self, parent_rel: &Path, name: &str, bytes: &[u8]) -> CoreResult<String> {
         if name.is_empty() || name.contains('/') {
-            return Err(format!("invalid name: {name:?}"));
+            return Err(CoreError::invalid(format!("invalid name: {name:?}")));
         }
-        let (pino, parent_uid) = self
-            .resolve_path(parent_rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+        let (pino, parent_uid) = self.resolve(parent_rel)?;
         self.ensure_children(pino)
-            .map_err(|e| format!("enumerate: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate: {e:?}")))?;
         let guard = self
             .transfers
             .begin(name, "", TransferDirection::Upload, bytes.len() as u64);
@@ -2434,11 +2442,11 @@ impl Core {
                 None,
                 false,
             ))
-            .map_err(|e| format!("upload: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("upload: {e}")))?;
         drop(guard);
         let node = self
             .fetch_node(&new_uid)
-            .map_err(|e| format!("fetch node: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("fetch node: {e:?}")))?;
         let mut st = self.state.lock();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
@@ -2457,12 +2465,10 @@ impl Core {
     /// thread — a large tree far outlasts the control socket's read timeout — so
     /// it reports only a summary for the log. Individual failures are counted and
     /// logged rather than aborting the whole batch.
-    fn upload_paths(&self, parent_rel: &Path, sources: &[PathBuf]) -> Result<UploadStats, String> {
-        let (pino, parent_uid) = self
-            .resolve_path(parent_rel)
-            .map_err(|e| format!("resolve path: {e:?}"))?;
+    fn upload_paths(&self, parent_rel: &Path, sources: &[PathBuf]) -> CoreResult<UploadStats> {
+        let (pino, parent_uid) = self.resolve(parent_rel)?;
         self.ensure_children(pino)
-            .map_err(|e| format!("enumerate: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate: {e:?}")))?;
 
         // Phase 1 (sequential): build the remote folder skeleton and collect the
         // flat list of files to upload. Folders must exist before their children,
@@ -2552,12 +2558,12 @@ impl Core {
         pino: u64,
         parent_uid: &NodeUid,
         name: &str,
-    ) -> Result<(u64, NodeUid), String> {
+    ) -> CoreResult<(u64, NodeUid)> {
         if name.is_empty() || name.contains('/') {
-            return Err(format!("invalid folder name: {name:?}"));
+            return Err(CoreError::invalid(format!("invalid folder name: {name:?}")));
         }
         self.ensure_children(pino)
-            .map_err(|e| format!("enumerate: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate: {e:?}")))?;
         {
             let st = self.state.lock();
             if let Some(kids) = st.children.get(&pino) {
@@ -2577,10 +2583,10 @@ impl Core {
                 self.client
                     .create_folder(parent_uid, name, Some(now_secs())),
             )
-            .map_err(|e| format!("create folder {name}: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("create folder {name}: {e}")))?;
         let node = self
             .fetch_node(&new_uid)
-            .map_err(|e| format!("fetch node: {e:?}"))?;
+            .map_err(|e| CoreError::remote(format!("fetch node: {e:?}")))?;
         let mut st = self.state.lock();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
@@ -2605,13 +2611,13 @@ impl Core {
         tasks: &mut Vec<UploadTask>,
         folders: &mut usize,
         job: &JobGuard,
-    ) -> Result<(), String> {
+    ) -> CoreResult<()> {
         let meta =
-            std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+            std::fs::symlink_metadata(src).map_err(|e| CoreError::internal(format!("stat {}: {e}", src.display())))?;
         let name = src
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| format!("unusable name: {}", src.display()))?
+            .ok_or_else(|| CoreError::invalid(format!("unusable name: {}", src.display())))?
             .to_string();
 
         if meta.is_dir() {
@@ -2619,7 +2625,7 @@ impl Core {
             let (child_ino, child_uid) = self.ensure_remote_folder(pino, parent_uid, &name)?;
             *folders += 1;
             let mut entries: Vec<PathBuf> = std::fs::read_dir(src)
-                .map_err(|e| format!("read dir {}: {e}", src.display()))?
+                .map_err(|e| CoreError::internal(format!("read dir {}: {e}", src.display())))?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .collect();
@@ -2636,7 +2642,7 @@ impl Core {
             job.detail(&name);
         } else if meta.is_file() {
             if name.contains('/') {
-                return Err(format!("invalid file name: {name:?}"));
+                return Err(CoreError::invalid(format!("invalid file name: {name:?}")));
             }
             tasks.push(UploadTask {
                 parent_ino: pino,
@@ -2660,14 +2666,16 @@ impl Core {
         &self,
         kind: ActivityKind,
         target: impl Into<String>,
-        detail: impl Into<String>,
+        // `Display` rather than `Into<String>` so a classified `CoreError` can be
+        // logged as-is, without the caller flattening it first.
+        detail: impl std::fmt::Display,
         ok: bool,
     ) {
         let entry = ActivityEntry {
             time: now_secs(),
             kind,
             target: target.into(),
-            detail: detail.into(),
+            detail: detail.to_string(),
             ok,
         };
         if let Err(e) = self.db.activity_add(&entry) {
@@ -2773,12 +2781,12 @@ fn role_to_str(role: MemberRole) -> &'static str {
 
 /// Parse a wire role string into a [`MemberRole`]. "inherited" is read-only and
 /// rejected here, since it cannot be sent when inviting or updating.
-fn role_from_str(role: &str) -> Result<MemberRole, String> {
+fn role_from_str(role: &str) -> CoreResult<MemberRole> {
     match role.to_lowercase().as_str() {
         "viewer" => Ok(MemberRole::Viewer),
         "editor" => Ok(MemberRole::Editor),
         "admin" => Ok(MemberRole::Admin),
-        other => Err(format!("invalid role: {other}")),
+        other => Err(CoreError::invalid(format!("invalid role: {other}"))),
     }
 }
 

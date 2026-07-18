@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::control::{PhotoItem, PhotoKind, PhotoThumb};
 use pdfs_core::db::{self, StoredPhoto};
 use std::sync::atomic::Ordering;
@@ -28,8 +29,8 @@ impl Core {
         limit: usize,
         kind: Option<PhotoKind>,
         range: Option<(i64, i64)>,
-    ) -> Result<Option<Vec<PhotoItem>>, String> {
-        let count = self.db.photos_count().map_err(|e| e.to_string())?;
+    ) -> CoreResult<Option<Vec<PhotoItem>>> {
+        let count = self.db.photos_count().map_err(CoreError::from)?;
         if count == 0 {
             // Nothing to serve, so this one request has to wait for the fetch —
             // unless we already know the account has no photos volume and the
@@ -48,7 +49,7 @@ impl Core {
         let page = self
             .db
             .photos_page(offset, limit, kind, range)
-            .map_err(|e| e.to_string())?;
+            .map_err(CoreError::from)?;
         Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }
 
@@ -269,12 +270,12 @@ impl Core {
 
     /// Whether the listing stamped under `key` is older than `ttl` (or was never
     /// fetched).
-    pub(crate) async fn refresh_timeline(&self) -> Result<bool, String> {
+    pub(crate) async fn refresh_timeline(&self) -> CoreResult<bool> {
         let photos = self.photos();
         if photos
             .get_photos_root()
             .await
-            .map_err(|e| format!("photos root: {e}"))?
+            .map_err(|e| CoreError::remote(format!("photos root: {e}")))?
             .is_none()
         {
             let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 0);
@@ -284,7 +285,7 @@ impl Core {
         let items = photos
             .enumerate_timeline()
             .await
-            .map_err(|e| format!("timeline: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("timeline: {e}")))?;
 
         // The timeline DTO carries only a uid and capture time, but the Photos
         // page has to split into Photos / Videos / Raw — which needs each photo's
@@ -317,7 +318,7 @@ impl Core {
                 (key, it.capture_time, name, media_type)
             })
             .collect();
-        self.db.photos_replace(&rows).map_err(|e| e.to_string())?;
+        self.db.photos_replace(&rows).map_err(CoreError::from)?;
         let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 1);
         let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
         Ok(true)
@@ -340,23 +341,23 @@ impl Core {
 
     /// Download a photo's full content into the content cache, returning its
     /// on-disk path (served from cache when a fresh blob already exists).
-    pub(crate) fn open_photo(&self, uid: &NodeUid) -> Result<PathBuf, String> {
+    pub(crate) fn open_photo(&self, uid: &NodeUid) -> CoreResult<PathBuf> {
         let photos = self.photos();
         let node = self
             .rt
             .block_on(photos.get_node(uid))
-            .map_err(|e| format!("photo node: {e}"))?
-            .ok_or("photo not found")?;
+            .map_err(|e| CoreError::remote(format!("photo node: {e}")))?
+            .ok_or_else(|| CoreError::not_found("photo not found"))?;
         let (mtime, size) = (node.modification_time, node_size(&node));
         if let Some(p) = self.cache.cached_content_path(uid, mtime, size) {
             return Ok(p);
         }
         let bytes = self
             .download_photo_tracked(&photos, uid, &node.name, size)
-            .map_err(|e| format!("download photo: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("download photo: {e}")))?;
         self.cache
             .store(uid, mtime, size, &bytes)
-            .map_err(|e| format!("cache store: {e}"))?;
+            .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
         Ok(self.cache.content_path(uid))
     }
 

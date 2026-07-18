@@ -874,8 +874,74 @@ pub enum Response {
     /// The daemon's recent activity, newest first (reply to
     /// [`Request::ListActivity`]).
     Activity { items: Vec<ActivityEntry> },
-    /// The request failed.
-    Error { message: String },
+    /// The request failed. `message` is for the user; `kind` is for the code —
+    /// a front-end decides its copy and whether to offer a retry from `kind`,
+    /// never by matching on the text.
+    Error {
+        message: String,
+        #[serde(default)]
+        kind: ErrorKind,
+    },
+}
+
+impl Response {
+    /// Build a failure reply from a classified error, so the `kind` a
+    /// request-serving method decided survives the trip to the front-end.
+    pub fn error(e: crate::error::CoreError) -> Self {
+        Response::Error {
+            message: e.message,
+            kind: e.kind,
+        }
+    }
+}
+
+/// What class of thing went wrong, as opposed to what it read like.
+///
+/// The daemon answers most calls with prose assembled from whatever layer
+/// failed (`"resolve path: ENOENT"`), which is fine to show and useless to
+/// branch on. This is the branchable half: enough to pick the right copy, to
+/// know whether retrying is meaningful, and to tell a caller's mistake apart
+/// from an outage.
+///
+/// Deliberately coarse. A variant earns its place by changing what a front-end
+/// *does*, not by naming a distinct cause — anything finer belongs in `message`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// The API is unreachable and the request needed it. The cached tree is
+    /// still being served, so this is a "not right now", not a failure of the
+    /// thing the user asked for.
+    Offline,
+    /// No node at that path or uid. Usually means the front-end's listing is
+    /// stale, so the useful response is to reload it rather than to retry.
+    NotFound,
+    /// The account may not do that to that node — a viewer trying to write, a
+    /// share whose role was downgraded. Retrying changes nothing.
+    Denied,
+    /// The remote moved underneath the request: a name already taken, a
+    /// revision superseded. The caller has to decide, so never auto-retried.
+    Conflict,
+    /// The request itself was malformed — an empty name, a path with a `/` in
+    /// it, an unparseable uid. A bug in the caller, not a condition to retry.
+    Invalid,
+    /// The API was reached and refused, or the transfer broke. The one class
+    /// where an unchanged retry can legitimately succeed.
+    Remote,
+    /// Something on this machine failed: the database, the content cache, the
+    /// filesystem. Not the user's doing and not theirs to fix.
+    #[default]
+    Internal,
+}
+
+impl ErrorKind {
+    /// Whether repeating the identical request could plausibly succeed.
+    ///
+    /// Drives whether a front-end offers "Try again" at all: offering it for a
+    /// [`NotFound`](Self::NotFound) or an [`Invalid`](Self::Invalid) teaches the
+    /// user that the button does nothing.
+    pub fn retryable(self) -> bool {
+        matches!(self, ErrorKind::Offline | ErrorKind::Remote)
+    }
 }
 
 /// Send one [`Request`] to the daemon listening on `socket` and read its
@@ -1099,6 +1165,74 @@ mod tests {
             assert!(!line.contains('\n'), "wire form must be a single line");
             let back: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(line, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    /// A daemon built before `kind` existed sends `Error` without the field.
+    /// It must still parse, and land on the class that promises the least.
+    #[test]
+    fn an_error_without_a_kind_reads_as_internal() {
+        let wire = r#"{"Error":{"message":"something broke"}}"#;
+        let back: Response = serde_json::from_str(wire).unwrap();
+        match back {
+            Response::Error { message, kind } => {
+                assert_eq!(message, "something broke");
+                assert_eq!(kind, ErrorKind::Internal);
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_kind_survives_the_wire() {
+        for kind in [
+            ErrorKind::Offline,
+            ErrorKind::NotFound,
+            ErrorKind::Denied,
+            ErrorKind::Conflict,
+            ErrorKind::Invalid,
+            ErrorKind::Remote,
+            ErrorKind::Internal,
+        ] {
+            let line = serde_json::to_string(&Response::Error {
+                message: "x".into(),
+                kind,
+            })
+            .unwrap();
+            let back: Response = serde_json::from_str(&line).unwrap();
+            match back {
+                Response::Error { kind: got, .. } => assert_eq!(got, kind),
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Retry is offered to the user off the back of this, so it has to mean
+    /// "an identical request could work", not "this looks recoverable".
+    #[test]
+    fn only_offline_and_remote_are_worth_retrying() {
+        assert!(ErrorKind::Offline.retryable());
+        assert!(ErrorKind::Remote.retryable());
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::Denied,
+            ErrorKind::Conflict,
+            ErrorKind::Invalid,
+            ErrorKind::Internal,
+        ] {
+            assert!(!kind.retryable(), "{kind:?} must not offer a retry");
+        }
+    }
+
+    #[test]
+    fn response_error_carries_a_core_errors_classification() {
+        let r = Response::error(crate::error::CoreError::not_found("no such file"));
+        match r {
+            Response::Error { message, kind } => {
+                assert_eq!(message, "no such file");
+                assert_eq!(kind, ErrorKind::NotFound);
+            }
+            other => panic!("expected an error, got {other:?}"),
         }
     }
 }

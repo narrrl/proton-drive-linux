@@ -11,6 +11,7 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
+    ErrorKind,
     RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
     pending_summary,
 };
@@ -351,6 +352,19 @@ enum BookmarkCmd {
     Rm { token: String },
 }
 
+/// Render a daemon failure for a terminal.
+///
+/// Offline is the one class worth rewording: the daemon's prose names whichever
+/// call happened to hit the network, which tells someone at a shell nothing they
+/// can act on. Every other class already says something specific, so it is
+/// printed as sent.
+fn cli_error(kind: ErrorKind, message: &str) -> String {
+    match kind {
+        ErrorKind::Offline => "offline: the Proton Drive API is unreachable".to_string(),
+        _ => message.to_string(),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -429,7 +443,7 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
                     );
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         DeviceCmd::Rename { uid, name } => {
@@ -489,7 +503,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                     }
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         SyncCmd::Rm { id, delete_remote } => {
@@ -545,7 +559,7 @@ fn cmd_members(path: PathBuf) -> Result<()> {
                 None => println!("public link: none"),
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -584,7 +598,7 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
             CtlResponse::PublicLink { link } => {
                 println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         PublicLinkCmd::Remove { path, id } => {
@@ -626,7 +640,7 @@ fn cmd_shared() -> Result<()> {
                 println!("{kind} {}{tags}  [{}]", it.name, it.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -643,7 +657,7 @@ fn cmd_shared_with_me() -> Result<()> {
                 println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -665,7 +679,7 @@ fn cmd_activity(limit: usize) -> Result<()> {
                 println!("{mark} {when}  {verb:<8} {}{detail}", a.target);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -729,7 +743,7 @@ fn cmd_invitations(action: InvitationCmd) -> Result<()> {
                     println!("{} shared {kind} \"{name}\"  [{}]", i.inviter_email, i.id);
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         InvitationCmd::Accept { id } => {
@@ -752,7 +766,7 @@ fn cmd_bookmarks(action: BookmarkCmd) -> Result<()> {
                     println!("{name}  {}  [{}]", b.url, b.token);
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         BookmarkCmd::Add { url, password } => {
@@ -773,7 +787,7 @@ fn cmd_bookmarks(action: BookmarkCmd) -> Result<()> {
 fn ok_or_bail(resp: CtlResponse) -> Result<()> {
     match resp {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -956,7 +970,7 @@ fn cmd_pin(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -967,7 +981,7 @@ fn cmd_unpin(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1015,7 +1029,7 @@ fn cmd_transfers() -> Result<()> {
                 );
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1029,7 +1043,7 @@ fn cmd_pins() -> Result<()> {
                 println!("{}", p.path);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1049,7 +1063,7 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
                 println!("{kind}{pin} {:>12}  {}  [{}]", e.size, e.name, e.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1088,7 +1102,7 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
                 println!("{}  {}  {thumb}", p.capture_time, p.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1097,7 +1111,7 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
 fn cmd_open_photo(uid: String) -> Result<()> {
     match control_request(CtlRequest::OpenPhoto { uid })? {
         CtlResponse::FilePath { path } => println!("{path}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1113,7 +1127,7 @@ fn cmd_search(query: String, limit: usize) -> Result<()> {
                 println!("{kind}{pin} {:>12}  {}", h.size, h.path);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1125,7 +1139,7 @@ fn cmd_rename(path: PathBuf, new_name: String) -> Result<()> {
         new_name,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1137,7 +1151,7 @@ fn cmd_move(path: PathBuf, new_parent: PathBuf) -> Result<()> {
         new_parent: path_arg(&new_parent)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1148,7 +1162,7 @@ fn cmd_rm(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1163,7 +1177,7 @@ fn cmd_trash() -> Result<()> {
                 println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1172,7 +1186,7 @@ fn cmd_trash() -> Result<()> {
 fn cmd_restore(uids: Vec<String>) -> Result<()> {
     match control_request(CtlRequest::Restore { uids })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1185,7 +1199,7 @@ fn cmd_delete_forever(uids: Vec<String>) -> Result<()> {
     ))?;
     match control_request(CtlRequest::DeleteForever { uids })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1195,7 +1209,7 @@ fn cmd_empty_trash() -> Result<()> {
     confirm("Permanently delete everything in the trash? This cannot be undone.")?;
     match control_request(CtlRequest::EmptyTrash)? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1214,7 +1228,7 @@ fn cmd_refresh(target: Option<String>) -> Result<()> {
     };
     match control_request(CtlRequest::Refresh { scope })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1240,7 +1254,7 @@ fn cmd_mkdir(parent: PathBuf, name: String) -> Result<()> {
         name,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1263,7 +1277,7 @@ fn cmd_upload(sources: Vec<PathBuf>, parent: PathBuf) -> Result<()> {
         sources: abs,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())

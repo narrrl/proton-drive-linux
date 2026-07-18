@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::control::{ActivityKind, DeviceInfo, JobItem, SyncFolderInfo, SyncPhase, SyncProgress};
 use pdfs_core::db::{StoredDevice, StoredSyncFolder};
 use fuser::{Config, MountOption, Session};
@@ -31,11 +32,11 @@ impl Core {
     /// List the account's registered devices, flagging the one *this* machine
     /// syncs to so a front-end can treat it as more than another computer in the
     /// list — deleting it takes this machine's synced folders down with it.
-    pub(crate) fn list_devices(&self) -> Result<Vec<DeviceInfo>, String> {
+    pub(crate) fn list_devices(&self) -> CoreResult<Vec<DeviceInfo>> {
         let devices = self
             .rt
             .block_on(self.client.enumerate_devices())
-            .map_err(|e| format!("list devices: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("list devices: {e}")))?;
         // No cached device row yet means this machine syncs nothing, so none of
         // the listed devices is ours.
         let this_uid = self.db.device_get().ok().flatten().map(|d| d.uid);
@@ -55,23 +56,23 @@ impl Core {
     }
 
     /// Rename a device by its uid.
-    pub(crate) fn rename_device(&self, uid: &str, name: &str) -> Result<(), String> {
+    pub(crate) fn rename_device(&self, uid: &str, name: &str) -> CoreResult<()> {
         if name.is_empty() {
-            return Err("device name must not be empty".to_string());
+            return Err(CoreError::invalid("device name must not be empty"));
         }
         let device_uid = DeviceUid::from(uid);
         self.rt
             .block_on(self.client.rename_device(&device_uid, name))
-            .map_err(|e| format!("rename device: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("rename device: {e}")))?;
         Ok(())
     }
 
     /// Delete (deregister) a device by its uid.
-    pub(crate) fn delete_device(&self, uid: &str) -> Result<(), String> {
+    pub(crate) fn delete_device(&self, uid: &str) -> CoreResult<()> {
         let device_uid = DeviceUid::from(uid);
         self.rt
             .block_on(self.client.delete_device(&device_uid))
-            .map_err(|e| format!("delete device: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("delete device: {e}")))?;
         Ok(())
     }
 
@@ -81,20 +82,20 @@ impl Core {
     /// it so restarts reuse the same device. Recovery matches an existing remote
     /// Linux device by name before creating a new one, so a lost local record
     /// doesn't orphan the device's root folder.
-    pub(crate) fn ensure_device(&self) -> Result<StoredDevice, String> {
+    pub(crate) fn ensure_device(&self) -> CoreResult<StoredDevice> {
         let name = this_hostname();
         // Enumerate the remote devices once: used both to validate any cached
         // record and to recover an existing device by name.
         let remote = self
             .rt
             .block_on(self.client.enumerate_devices())
-            .map_err(|e| format!("enumerate devices: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("enumerate devices: {e}")))?;
 
         // A cached device is only trustworthy if it still exists remotely. A
         // device deleted from another client (or the web UI) leaves a stale row
         // whose root folder is gone, so creating folders under it fails with
         // "parent node is not a folder". Re-register in that case.
-        if let Some(dev) = self.db.device_get().map_err(|e| format!("db: {e:?}"))? {
+        if let Some(dev) = self.db.device_get().map_err(|e| CoreError::internal(format!("db: {e:?}")))? {
             if remote.iter().any(|d| d.uid.to_string() == dev.uid) {
                 return Ok(dev);
             }
@@ -117,7 +118,7 @@ impl Core {
                 let d = self
                     .rt
                     .block_on(self.client.create_device(&name, DeviceType::Linux))
-                    .map_err(|e| format!("create device: {e}"))?;
+                    .map_err(|e| CoreError::remote(format!("create device: {e}")))?;
                 StoredDevice {
                     uid: d.uid.to_string(),
                     share_id: d.share_id.to_string(),
@@ -127,7 +128,7 @@ impl Core {
                 }
             }
         };
-        self.db.device_set(&dev).map_err(|e| format!("db: {e:?}"))?;
+        self.db.device_set(&dev).map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
         Ok(dev)
     }
 
@@ -137,18 +138,18 @@ impl Core {
         &self,
         root_uid: &NodeUid,
         name: &str,
-    ) -> Result<Option<NodeUid>, String> {
+    ) -> CoreResult<Option<NodeUid>> {
         let uids = self
             .rt
             .block_on(self.client.enumerate_folder_children_node_uids(root_uid))
-            .map_err(|e| format!("list device root: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("list device root: {e}")))?;
         if uids.is_empty() {
             return Ok(None);
         }
         let nodes = self
             .rt
             .block_on(self.client.enumerate_nodes(&uids))
-            .map_err(|e| format!("resolve device root children: {e}"))?;
+            .map_err(|e| CoreError::remote(format!("resolve device root children: {e}")))?;
         Ok(nodes
             .into_iter()
             .find(|n| n.is_folder() && !n.trashed && n.name == name)
@@ -159,37 +160,37 @@ impl Core {
     /// needed, create a matching folder under the device root, upload the local
     /// tree into it once, and record the mapping. Phase 1 is a one-shot upload —
     /// the two-way engine (Phase 2) reconciles later changes.
-    pub(crate) fn add_sync_folder(&self, local: &Path) -> Result<StoredSyncFolder, String> {
+    pub(crate) fn add_sync_folder(&self, local: &Path) -> CoreResult<StoredSyncFolder> {
         let meta =
-            std::fs::metadata(local).map_err(|e| format!("stat {}: {e}", local.display()))?;
+            std::fs::metadata(local).map_err(|e| CoreError::internal(format!("stat {}: {e}", local.display())))?;
         if !meta.is_dir() {
-            return Err(format!("{} is not a directory", local.display()));
+            return Err(CoreError::invalid(format!("{} is not a directory", local.display())));
         }
         let local = local
             .canonicalize()
-            .map_err(|e| format!("canonicalize {}: {e}", local.display()))?;
+            .map_err(|e| CoreError::internal(format!("canonicalize {}: {e}", local.display())))?;
         let local_str = local.to_string_lossy().to_string();
 
         // Reject duplicates up front for a clear error (UNIQUE would also catch it).
         if self
             .db
             .sync_folder_list()
-            .map_err(|e| format!("db: {e:?}"))?
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
             .iter()
             .any(|f| f.local_path == local_str)
         {
-            return Err(format!("{} is already synced", local.display()));
+            return Err(CoreError::invalid(format!("{} is already synced", local.display())));
         }
 
         let name = local
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| format!("unusable folder name: {}", local.display()))?
+            .ok_or_else(|| CoreError::invalid(format!("unusable folder name: {}", local.display())))?
             .to_string();
 
         let device = self.ensure_device()?;
         let root_uid = parse_uid(&device.root_uid)
-            .ok_or_else(|| format!("bad device root uid: {}", device.root_uid))?;
+            .ok_or_else(|| CoreError::internal(format!("bad device root uid: {}", device.root_uid)))?;
 
         // The synced folder's remote root: the folder under the device root named
         // after the local basename. Reuse an existing one rather than creating a
@@ -209,13 +210,13 @@ impl Core {
                     self.client
                         .create_folder(&root_uid, &name, Some(now_secs())),
                 )
-                .map_err(|e| format!("create device folder {name}: {e}"))?,
+                .map_err(|e| CoreError::remote(format!("create device folder {name}: {e}")))?,
         };
 
         let id = self
             .db
             .sync_folder_add(&local_str, &remote_root.to_string(), &device.share_id)
-            .map_err(|e| format!("db: {e:?}"))?;
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
 
         // Hand the initial upload to the sync engine: an empty baseline against a
         // full local tree reconciles as "upload everything", and the folder is
@@ -226,18 +227,18 @@ impl Core {
         info!(local = %local.display(), id, "added sync folder");
         self.db
             .sync_folder_get(id)
-            .map_err(|e| format!("db: {e:?}"))?
-            .ok_or_else(|| "sync folder vanished after insert".to_string())
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
+            .ok_or_else(|| CoreError::not_found("sync folder vanished after insert"))
     }
 
     /// List this device's synced folders for the front-ends, each carrying the
     /// live progress of its pass when one is running.
-    pub(crate) fn list_sync_folders(&self) -> Result<Vec<SyncFolderInfo>, String> {
+    pub(crate) fn list_sync_folders(&self) -> CoreResult<Vec<SyncFolderInfo>> {
         let progress = self.sync_progress.lock();
         Ok(self
             .db
             .sync_folder_list()
-            .map_err(|e| format!("db: {e:?}"))?
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
             .into_iter()
             .map(|f| {
                 let live = progress.get(&f.id).cloned();
@@ -320,12 +321,12 @@ impl Core {
 
     /// Remove a synced folder from the sync set. `delete_remote` also deletes its
     /// folder under the device root; otherwise the cloud copy is left in place.
-    pub(crate) fn remove_sync_folder(&self, id: i64, delete_remote: bool) -> Result<(), String> {
+    pub(crate) fn remove_sync_folder(&self, id: i64, delete_remote: bool) -> CoreResult<()> {
         let folder = self
             .db
             .sync_folder_get(id)
-            .map_err(|e| format!("db: {e:?}"))?
-            .ok_or_else(|| format!("no synced folder with id {id}"))?;
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
+            .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
         // An `ondemand` folder *is* a FUSE mount over its local path, so dropping
         // only the row would strand the mount: the path would keep serving a
         // folder the daemon no longer tracks, and nothing would ever unmount it.
@@ -347,9 +348,9 @@ impl Core {
         if !self
             .db
             .sync_folder_remove(id)
-            .map_err(|e| format!("db: {e:?}"))?
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
         {
-            return Err(format!("no synced folder with id {id}"));
+            return Err(CoreError::invalid(format!("no synced folder with id {id}")));
         }
         // Stop watching the folder we just dropped.
         let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
@@ -394,22 +395,22 @@ impl Core {
     /// intent is recorded and the engine applies it at the end of the pass already
     /// running — which, seeing a queued `ondemand`, also stops pulling down files
     /// it is about to evict ([`Core::push_pass`]).
-    pub(crate) fn request_sync_folder_mode(&self, id: i64, mode: &str) -> Result<String, String> {
+    pub(crate) fn request_sync_folder_mode(&self, id: i64, mode: &str) -> CoreResult<String> {
         if mode != "mirror" && mode != "ondemand" {
-            return Err(format!("unknown mode {mode:?} (want mirror|ondemand)"));
+            return Err(CoreError::invalid(format!("unknown mode {mode:?} (want mirror|ondemand)")));
         }
         let folder = self
             .db
             .sync_folder_get(id)
-            .map_err(|e| format!("db: {e:?}"))?
-            .ok_or_else(|| format!("no synced folder with id {id}"))?;
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
+            .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
         if folder.mode == mode {
             // Already there. A queued switch the other way is the user changing
             // their mind back before it landed, so withdraw it.
             if folder.pending_mode.is_some() {
                 self.db
                     .sync_folder_set_pending_mode(id, None)
-                    .map_err(|e| format!("db: {e:?}"))?;
+                    .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
                 let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
                 return Ok(format!("staying {mode}"));
             }
@@ -423,7 +424,7 @@ impl Core {
             Err(SwitchBlocked::NotNow) => {
                 self.db
                     .sync_folder_set_pending_mode(id, Some(mode))
-                    .map_err(|e| format!("db: {e:?}"))?;
+                    .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
                 let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
                 Ok(match mode {
                     "ondemand" => format!(
@@ -436,7 +437,7 @@ impl Core {
                     ),
                 })
             }
-            Err(SwitchBlocked::Failed(e)) => Err(e),
+            Err(SwitchBlocked::Failed(e)) => Err(CoreError::internal(e)),
         }
     }
 
@@ -542,7 +543,7 @@ impl Core {
 
                 let session = self
                     .spawn_ondemand_mount(&local, root)
-                    .map_err(SwitchBlocked::Failed)?;
+                    .map_err(|e| SwitchBlocked::Failed(e.to_string()))?;
                 self.mounts.lock().insert(id, session);
                 // Persist the mode only now that the mount is actually up. Writing it
                 // first would strand the folder on any failure below: the engine skips
@@ -587,7 +588,7 @@ impl Core {
     /// Spawn a secondary FUSE session rooted at `root` over `local` on a forked
     /// inode space. Clears any stale kernel mount first (a crashed run can leave
     /// one, which would fail the fresh mount with EBUSY).
-    pub(crate) fn spawn_ondemand_mount(&self, local: &Path, root: Node) -> Result<BackgroundSession, String> {
+    pub(crate) fn spawn_ondemand_mount(&self, local: &Path, root: Node) -> CoreResult<BackgroundSession> {
         clear_stale_mount(local);
         let mut config = Config::default();
         config.mount_options = vec![
@@ -598,7 +599,7 @@ impl Core {
         let fs = ProtonFs::new(self.fork_state(), root);
         Session::new(fs, local, &config)
             .and_then(|s| s.spawn())
-            .map_err(|e| format!("mount {}: {e}", local.display()))
+            .map_err(|e| CoreError::internal(format!("mount {}: {e}", local.display())))
     }
 
     /// Re-establish FUSE mounts for folders left in `ondemand` mode across a daemon

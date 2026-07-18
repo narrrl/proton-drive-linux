@@ -15,6 +15,7 @@ use std::time::Instant;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use pdfs_core::{CoreError, CoreResult};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityKind, PhotoMonth, RefreshScope, Request as CtlRequest, Response as CtlResponse,
@@ -29,12 +30,12 @@ use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
 /// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
 /// must live under `mountpoint`; a relative path is taken as already relative to
 /// the mount root.
-fn rel_to_mount(mountpoint: &Path, path: &str) -> Result<PathBuf, String> {
+fn rel_to_mount(mountpoint: &Path, path: &str) -> CoreResult<PathBuf> {
     let p = Path::new(path);
     if p.is_absolute() {
         p.strip_prefix(mountpoint)
             .map(Path::to_path_buf)
-            .map_err(|_| format!("{path} is not under the mountpoint"))
+            .map_err(|_| CoreError::invalid(format!("{path} is not under the mountpoint")))
     } else {
         Ok(p.to_path_buf())
     }
@@ -75,18 +76,18 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Ok(name) => CtlResponse::Ok {
                     message: format!("pinned {name}"),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Unpin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.unpin(&rel) {
                 Ok(name) => CtlResponse::Ok {
                     message: format!("unpinned {name}"),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListPins) => CtlResponse::Pins {
             pins: core.cache.list_pins(),
@@ -94,9 +95,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::ListDir { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.list_dir(&rel) {
                 Ok(entries) => CtlResponse::Entries { entries },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Refresh { scope }) => {
             let result = match &scope {
@@ -116,7 +117,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Ok(()) => CtlResponse::Ok {
                     message: "refreshed".to_string(),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::PhotosTimeline {
@@ -136,7 +137,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     items: Vec::new(),
                     counts: None,
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::PhotoMonths { kind }) => match core.db.photos_months(kind) {
@@ -150,9 +151,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     })
                     .collect(),
             },
-            Err(e) => CtlResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => CtlResponse::error(e.into()),
         },
         Ok(CtlRequest::PhotoThumbs { uids }) => {
             let parsed: Vec<NodeUid> = uids.iter().filter_map(|u| parse_uid(u)).collect();
@@ -165,11 +164,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Ok(p) => CtlResponse::FilePath {
                     path: p.display().to_string(),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            None => CtlResponse::Error {
-                message: format!("bad uid: {uid}"),
-            },
+            None => CtlResponse::error(CoreError::invalid(format!("bad uid: {uid}"))),
         },
         Ok(CtlRequest::UploadPhoto {
             name,
@@ -210,9 +207,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         message: format!("uploaded photo with uid {uid}"),
                     }
                 }
-                Err(e) => CtlResponse::Error {
-                    message: format!("upload photo failed: {e}"),
-                },
+                Err(e) => CtlResponse::error(CoreError::remote(format!("upload photo failed: {e}"))),
             }
         }
         Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
@@ -220,20 +215,20 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Ok(p) => CtlResponse::FilePath {
                     path: p.display().to_string(),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Search { query, limit }) => match core.search(&query, limit) {
             Ok(hits) => CtlResponse::SearchResults { hits },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::SearchLocal { query, limit }) => match core.search_local(&query, limit) {
             Ok(hits) => CtlResponse::LocalResults {
                 hits,
                 indexing: core.indexing.load(Ordering::Relaxed),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Rename { path, new_name }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.rename(&rel, &new_name) {
@@ -245,10 +240,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::Rename, &path, &e, false);
-                    CtlResponse::Error { message: e }
+                    CtlResponse::error(e)
                 }
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Move { path, new_parent }) => {
             match (
@@ -269,10 +264,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     }
                     Err(e) => {
                         core.log_activity(ActivityKind::Move, &path, &e, false);
-                        CtlResponse::Error { message: e }
+                        CtlResponse::error(e)
                     }
                 },
-                (Err(e), _) | (_, Err(e)) => CtlResponse::Error { message: e },
+                (Err(e), _) | (_, Err(e)) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::Delete { path }) => match rel_to_mount(mountpoint, &path) {
@@ -285,10 +280,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::Trash, &path, &e, false);
-                    CtlResponse::Error { message: e }
+                    CtlResponse::error(e)
                 }
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::CreateFolder { parent, name }) => match rel_to_mount(mountpoint, &parent) {
             Ok(parent_rel) => match core.create_folder(&parent_rel, &name) {
@@ -300,10 +295,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::CreateFolder, &name, &e, false);
-                    CtlResponse::Error { message: e }
+                    CtlResponse::error(e)
                 }
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::UploadFile {
             parent,
@@ -319,10 +314,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::Upload, &name, &e, false);
-                    CtlResponse::Error { message: e }
+                    CtlResponse::error(e)
                 }
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::UploadPaths { parent, sources }) => {
             match rel_to_mount(mountpoint, &parent) {
@@ -375,12 +370,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         message: format!("uploading {n} item(s)"),
                     }
                 }
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::ListTrash) => match core.list_trash() {
             Ok(entries) => CtlResponse::Entries { entries },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Restore { uids }) => match core.restore(&uids) {
             Ok(n) => {
@@ -389,7 +384,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     message: format!("restored {n} item(s)"),
                 }
             }
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::DeleteForever { uids }) => match core.delete_forever(&uids) {
             Ok(n) => {
@@ -403,7 +398,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     message: format!("permanently deleted {n} item(s)"),
                 }
             }
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::EmptyTrash) => match core.empty_trash() {
             Ok(n) => {
@@ -412,7 +407,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     message: format!("emptied trash ({n} item(s))"),
                 }
             }
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::PurgeCache) => {
             let freed = core.cache.clear_unpinned();
@@ -439,29 +434,29 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Ok(Ok(())) => CtlResponse::Ok {
                     message: format!("cache budget set to {bytes} bytes"),
                 },
-                Ok(Err(e)) => CtlResponse::Error {
-                    message: format!("budget applied but config write failed: {e}"),
-                },
-                Err(e) => CtlResponse::Error {
-                    message: format!("budget applied but config unavailable: {e}"),
-                },
+                Ok(Err(e)) => CtlResponse::error(CoreError::internal(format!(
+                    "budget applied but config write failed: {e}"
+                ))),
+                Err(e) => CtlResponse::error(CoreError::internal(format!(
+                    "budget applied but config unavailable: {e}"
+                ))),
             }
         }
         Ok(CtlRequest::ListDevices) => match core.list_devices() {
             Ok(items) => CtlResponse::Devices { items },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::RenameDevice { uid, name }) => match core.rename_device(&uid, &name) {
             Ok(()) => CtlResponse::Ok {
                 message: format!("renamed device to {name}"),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::DeleteDevice { uid }) => match core.delete_device(&uid) {
             Ok(()) => CtlResponse::Ok {
                 message: "device deleted".to_string(),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::AddSyncFolder { local_path }) => {
             // Registering the device and uploading a folder tree far outlasts the
@@ -498,14 +493,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         }
         Ok(CtlRequest::ListSyncFolders) => match core.list_sync_folders() {
             Ok(items) => CtlResponse::SyncFolders { items },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::RemoveSyncFolder { id, delete_remote }) => {
             match core.remove_sync_folder(id, delete_remote) {
                 Ok(()) => CtlResponse::Ok {
                     message: "removed synced folder".to_string(),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::SetSyncFolderMode { id, mode }) => {
@@ -514,7 +509,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     core.log_activity(ActivityKind::Upload, &message, "", true);
                     CtlResponse::Ok { message }
                 }
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::SyncNow { id }) => {
@@ -546,17 +541,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::Share, &path, &e, false);
-                    CtlResponse::Error { message: e }
+                    CtlResponse::error(e)
                 }
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListShare { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.list_share(&rel) {
                 Ok((entries, link)) => CtlResponse::Share { entries, link },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::UpdateShareRole {
             path,
@@ -568,9 +563,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Ok(()) => CtlResponse::Ok {
                     message: format!("role updated to {role}"),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::RemoveShareEntry { path, id, kind }) => {
             match rel_to_mount(mountpoint, &path) {
@@ -581,9 +576,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                             message: "removed".to_string(),
                         }
                     }
-                    Err(e) => CtlResponse::Error { message: e },
+                    Err(e) => CtlResponse::error(e),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::CreatePublicLink {
@@ -599,10 +594,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::PublicLink, &path, &e, false);
-                    CtlResponse::Error { message: e }
+                    CtlResponse::error(e)
                 }
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::RemovePublicLink { path, id }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.remove_public_link(&rel, &id) {
@@ -612,13 +607,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         message: "public link removed".to_string(),
                     }
                 }
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListSharedWithMe) => match core.list_shared_with_me() {
             Ok(entries) => CtlResponse::Entries { entries },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::LeaveShared { uid }) => match core.leave_shared(&uid) {
             Ok(()) => {
@@ -627,52 +622,51 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     message: "left shared item".to_string(),
                 }
             }
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListInvitations) => match core.list_invitations() {
             Ok(items) => CtlResponse::Invitations { items },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::AcceptInvitation { id }) => match core.accept_invitation(&id) {
             Ok(()) => CtlResponse::Ok {
                 message: "invitation accepted".to_string(),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::RejectInvitation { id }) => match core.reject_invitation(&id) {
             Ok(()) => CtlResponse::Ok {
                 message: "invitation rejected".to_string(),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListBookmarks) => match core.list_bookmarks() {
             Ok(items) => CtlResponse::Bookmarks { items },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::CreateBookmark { url, password }) => {
             match core.create_bookmark(&url, password.as_deref()) {
                 Ok(()) => CtlResponse::Ok {
                     message: "bookmark saved".to_string(),
                 },
-                Err(e) => CtlResponse::Error { message: e },
+                Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::DeleteBookmark { token }) => match core.delete_bookmark(&token) {
             Ok(()) => CtlResponse::Ok {
                 message: "bookmark removed".to_string(),
             },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListSharedByMe) => match core.list_shared_by_me() {
             Ok(items) => CtlResponse::SharedByMe { items },
-            Err(e) => CtlResponse::Error { message: e },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListActivity { limit }) => CtlResponse::Activity {
             items: core.list_activity(limit),
         },
-        Err(e) => CtlResponse::Error {
-            message: format!("bad request: {e}"),
-        },
+        // The request did not parse: the caller sent something malformed.
+        Err(e) => CtlResponse::error(CoreError::invalid(format!("bad request: {e}"))),
     };
     let mut out = match serde_json::to_vec(&response) {
         Ok(v) => v,
