@@ -254,10 +254,13 @@ impl State {
 
     /// Drop a directory's cached child listing and mark it unlisted in the DB,
     /// so the next access re-enumerates instead of trusting a stale listing.
+    ///
+    /// The DB flag is cleared whether or not the listing was resident. A folder
+    /// trimmed from the hot cache but still `listed` in the DB is exactly the
+    /// case that needs invalidating — returning early there would leave
+    /// `ensure_children` free to rebuild the stale listing from disk.
     pub(crate) fn invalidate_listing(&mut self, ino: u64) {
-        if self.children.remove(&ino).is_none() {
-            return;
-        }
+        self.children.remove(&ino);
         if let Some(e) = self.entries.get(&ino) {
             let uid = e.uid.clone();
             if let Err(err) = self.db.set_listed(&uid, false) {

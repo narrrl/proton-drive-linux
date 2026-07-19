@@ -2308,16 +2308,8 @@ impl Core {
     /// the next `ListDir`/`readdir` re-enumerates it from the server. Backs
     /// [`CtlRequest::Refresh`] with a [`RefreshScope::Dir`] scope.
     fn refresh_dir(&self, rel: &Path) -> CoreResult<()> {
-        let (ino, uid) = self.resolve(rel)?;
-        // Clear the DB flag directly rather than through
-        // `State::invalidate_listing`, which no-ops when the folder has no
-        // in-memory listing to drop — exactly the case for a folder hydrated
-        // from the DB but not read yet this run, which is precisely the stale
-        // listing worth refreshing.
-        self.db
-            .set_listed(&uid, false)
-            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
-        self.state.lock().children.remove(&ino);
+        let (ino, _uid) = self.resolve(rel)?;
+        self.state.lock().invalidate_listing(ino);
         Ok(())
     }
 
@@ -2990,6 +2982,8 @@ impl ProtonFs {
             .block_on(self.core.client.trash_nodes(std::slice::from_ref(&uid)))
         {
             error!(%uid, error = %e, "trash failed");
+            self.core
+                .log_activity(ActivityKind::Trash, name, e.to_string(), false);
             reply.error(Errno::EIO);
             return;
         }
@@ -2998,6 +2992,11 @@ impl ProtonFs {
         self.core.cache.evict(&uid);
         self.core.evict_reader(&uid);
         self.core.invalidate_trash();
+        // Every other trash site records itself; this one did not, which made a
+        // file found in the trash impossible to attribute after the fact — the
+        // activity log was the only record and it showed nothing (bugs.md B2).
+        self.core
+            .log_activity(ActivityKind::Trash, name, "trashed from the mount", true);
         reply.ok();
     }
 }
@@ -4040,9 +4039,15 @@ impl Filesystem for ProtonFs {
         }
         // Forget the node so it re-interns under its new parent, and drop the
         // destination listing so it re-enumerates on next access.
+        //
+        // The drop has to go through `invalidate_listing`, not `children.remove`:
+        // `forget` deletes the node's DB row, so a destination still marked
+        // `listed` would be rebuilt from the DB by `ensure_children` — without the
+        // node we just moved into it. The file would be gone from the source and
+        // absent from the destination, with the rename having reported success.
         let mut st = self.core.state.lock();
         st.forget(&uid);
-        st.children.remove(&newparent);
+        st.invalidate_listing(newparent);
         reply.ok();
     }
 

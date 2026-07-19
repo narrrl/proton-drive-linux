@@ -364,6 +364,36 @@ fn children_if_listed_gated_on_flag() {
     assert_eq!(kids.len(), 2);
 }
 
+/// The shape of the `mv`-loses-the-file bug (bugs.md B1): a rename deletes the
+/// moved node's row, so a destination left marked `listed` is rebuilt from the DB
+/// without it — the file is gone from the source and absent from the destination,
+/// with `rename(2)` having reported success. Clearing the flag is what forces the
+/// re-enumeration that finds it again.
+#[test]
+fn a_deleted_child_leaves_a_listed_parent_serving_a_stale_listing() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("dst", Some("root"), "dest")).unwrap();
+    db.upsert_node(&file("f1", "root", "a.txt", 1)).unwrap();
+    db.set_listed(&uid("dst"), true).unwrap();
+
+    // The rename moved a.txt into `dst` server-side, then forgot the node.
+    db.delete_node(&uid("f1")).unwrap();
+
+    // `dst` is still flagged listed, so the DB fast path answers — and the file
+    // it was just moved into is nowhere in the result.
+    assert!(
+        db.children_if_listed(&uid("dst"))
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Clearing the flag is the only thing that sends the next read to the server.
+    db.set_listed(&uid("dst"), false).unwrap();
+    assert!(db.children_if_listed(&uid("dst")).unwrap().is_none());
+}
+
 #[test]
 fn children_if_listed_excludes_trashed() {
     let db = Db::open_in_memory().unwrap();
