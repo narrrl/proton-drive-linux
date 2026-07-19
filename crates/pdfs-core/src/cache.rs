@@ -27,13 +27,34 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::db::Db;
+use crate::db::{CacheEntryInput, Db};
 use crate::error::Result;
 
 /// `cache_entries.kind` tag for whole-file content blobs.
 const KIND_BLOB: &str = "blob";
 /// `cache_entries.kind` tag for on-demand block-cache chunks.
 const KIND_BLOCK: &str = "block";
+/// `cache_entries.kind` tag for cached thumbnails.
+const KIND_THUMB: &str = "thumb";
+
+/// How the configured budget is divided between the three pools, in percent.
+///
+/// The alternative — one shared cap across all kinds — was rejected: the pools
+/// have genuinely different lifetimes, and sharing lets one starve another. A
+/// single streaming read is millions of block bytes and would evict the whole
+/// blob cache behind it; a gallery scroll would do the same with thumbnails.
+///
+/// Whole-file blobs get the bulk: they are what "available offline" means, and
+/// they are the only pool a user explicitly asks for (by pinning). Blocks are
+/// transient partial reads, cheaply re-fetched. Thumbnails are tiny
+/// individually — a few percent buys tens of thousands of them — but there is
+/// one per photo, so the pool needs a ceiling, which is what C6 was about.
+///
+/// Must sum to 100; asserted at compile time below.
+const SPLIT_BLOB: u64 = 70;
+const SPLIT_BLOCK: u64 = 25;
+const SPLIT_THUMB: u64 = 5;
+const _: () = assert!(SPLIT_BLOB + SPLIT_BLOCK + SPLIT_THUMB == 100);
 
 /// Current wall-clock time in unix *milliseconds*, for the LRU `last_accessed`
 /// column. Milliseconds (not seconds) so two cache events in the same second
@@ -50,6 +71,12 @@ fn now_millis() -> i64 {
 /// (`DEFAULT_BLOCK_SIZE`, 4 MiB) so each cached block maps to exactly one
 /// `download_range` fetch with no straddling.
 pub const BLOCK_SIZE: u64 = 1 << 22;
+
+/// How many eviction candidates to pull per batch when a pool is over budget.
+/// Large enough that a normal overshoot (a store or two past the cap) is settled
+/// in one query, small enough that a badly-over-budget cache does not read its
+/// whole index to drop the oldest few.
+const EVICT_BATCH: usize = 64;
 
 /// Validity tag stored alongside a cached blob. A blob is fresh only if both
 /// fields still match the node's current metadata.
@@ -82,6 +109,56 @@ struct PinFile {
     pins: BTreeMap<String, Pin>,
 }
 
+/// What a staged file actually contains, written beside it as `<name>.json`
+/// (offline.md Phase 2).
+///
+/// A staged file is **not** necessarily valid whole-file content, and that is
+/// the whole reason this exists. A partial overwrite commits by filling the
+/// untouched regions from the remote base — which is exactly what fails when the
+/// network is down, so what lands in staging is the authored bytes with *zeros*
+/// in the gaps. Uploading that as-is would silently corrupt the file.
+/// `authored` says which ranges are real; `complete` says whether the file can
+/// be uploaded as it stands.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StagedWrite {
+    /// Node the write targeted, in `volume~link` display form.
+    pub uid: String,
+    /// Length of the intended new content.
+    pub len: u64,
+    /// Size and mtime of the revision the file's *untouched* ranges came from,
+    /// i.e. what a gap-fill reads. Meaningless once `complete` is true.
+    pub base_size: u64,
+    pub base_mtime: i64,
+    /// Locally authored `[start, end)` ranges. Everything else in the file is a
+    /// zero-filled hole, not content.
+    pub authored: Vec<(u64, u64)>,
+    /// True when `authored` covers the whole file, i.e. the staged bytes are the
+    /// complete new content and can be uploaded directly.
+    pub complete: bool,
+    /// The remote revision this change was made against, if it is known.
+    ///
+    /// Distinct from `base_size`/`base_mtime`, which describe wherever the
+    /// untouched bytes are to be read from — for a write that supersedes an
+    /// earlier queued one, that is the *previous staged blob*, not the remote.
+    /// This instead always names the server's revision, carried across
+    /// supersedes, so the drain can tell whether the remote moved on under a
+    /// queued change and keep a conflict copy rather than clobber it.
+    ///
+    /// `None` on a sidecar written before this field existed, and for a node
+    /// that has never existed remotely; both mean "do not conflict-check".
+    #[serde(default)]
+    pub based_on: Option<Baseline>,
+}
+
+/// The identity of a remote revision, as far as we can observe it: a file whose
+/// size and mtime both still match the ones a queued change was made against has
+/// not been rewritten by anyone else in the meantime.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Baseline {
+    pub mtime: i64,
+    pub size: u64,
+}
+
 /// Content cache rooted at a directory, with a sibling pin-registry file.
 pub struct ContentCache {
     /// Directory holding `<key>` blobs and `<key>.meta` tags.
@@ -96,6 +173,18 @@ pub struct ContentCache {
     /// Subdirectory for write-handle scratch files (disk-backed write buffers).
     /// Emptied on open so a crashed run leaves no orphans.
     scratch_dir: PathBuf,
+    /// Subdirectory holding the bytes of writes that have not been uploaded yet
+    /// (offline.md Phase 2/3) — every released write passes through here, since
+    /// the upload is a queued op performed later. Unlike `scratch_dir` this is
+    /// **never** emptied on open: these are the only copy of content the user
+    /// authored, and the whole point is that they outlive the daemon.
+    staging_dir: PathBuf,
+    /// Subdirectory holding scratch files rescued from an unclean shutdown —
+    /// writes an application had `fsync`ed but not yet closed. Populated only at
+    /// open, drained by the daemon into `staging_dir` once it can address the
+    /// nodes they belong to. Like `staging_dir` and unlike `scratch_dir`, it is
+    /// never emptied blindly.
+    recovery_dir: PathBuf,
     /// JSON pin registry path.
     pins_path: PathBuf,
     /// Soft cap on total blob bytes. Exceeded only transiently: a `store`
@@ -105,6 +194,20 @@ pub struct ContentCache {
     /// (a Settings-page change) via [`set_budget`](Self::set_budget) without
     /// taking a lock on every cache read.
     max_bytes: AtomicU64,
+    /// Running byte totals for the two budgeted pools, so the overwhelmingly
+    /// common "still under budget" answer costs an atomic load instead of a
+    /// database query.
+    ///
+    /// These are a *fast path*, not the source of truth — the `cache_entries`
+    /// index is. They are seeded from it at open (right after `reconcile`, so
+    /// they describe what is actually on disk), advanced on each store, and
+    /// **re-seeded from the index after every eviction pass**, which is what
+    /// keeps a long-running daemon from drifting: the only operations that
+    /// change a total without going through here are external file deletions,
+    /// and the next open reconciles those.
+    blob_bytes: AtomicU64,
+    block_bytes: AtomicU64,
+    thumb_bytes: AtomicU64,
     /// Unified metadata DB. Its `cache_entries` table is the LRU index: every
     /// store/read/evict updates it, and the budget enforcers query it instead of
     /// scanning the cache directories (plan.md P4).
@@ -128,11 +231,19 @@ impl ContentCache {
         std::fs::create_dir_all(&thumb_dir)?;
         let block_dir = content_dir.join("blocks");
         std::fs::create_dir_all(&block_dir)?;
-        // Scratch holds disk-backed write buffers; a previous run's leftovers are
-        // worthless, so start clean.
+        // Scratch holds disk-backed write buffers. A previous run's leftovers are
+        // worthless *except* where the application asked for durability: a handle
+        // that was `fsync`ed but never closed left a sidecar behind, and POSIX
+        // says those bytes are on stable storage. Rescue those, discard the rest.
         let scratch_dir = content_dir.join("scratch");
+        let recovery_dir = content_dir.join("recovery");
+        std::fs::create_dir_all(&recovery_dir)?;
+        Self::rescue_scratch(&scratch_dir, &recovery_dir);
         let _ = std::fs::remove_dir_all(&scratch_dir);
         std::fs::create_dir_all(&scratch_dir)?;
+        // Staging, by contrast, is deliberately preserved across runs.
+        let staging_dir = content_dir.join("staging");
+        std::fs::create_dir_all(&staging_dir)?;
         if let Some(parent) = pins_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -141,11 +252,19 @@ impl ContentCache {
             thumb_dir,
             block_dir,
             scratch_dir,
+            staging_dir,
+            recovery_dir,
             pins_path,
             max_bytes: AtomicU64::new(max_bytes),
+            blob_bytes: AtomicU64::new(0),
+            block_bytes: AtomicU64::new(0),
+            thumb_bytes: AtomicU64::new(0),
             db,
         };
         cache.reconcile()?;
+        // After reconcile, so the totals describe the index that now describes
+        // the disk.
+        cache.reseed_totals();
         cache.import_legacy_pins()?;
         Ok(cache)
     }
@@ -173,10 +292,15 @@ impl ContentCache {
     /// crash or an external file deletion, and picks up caches written by builds
     /// predating the index. In-run accesses then refine the ordering.
     fn reconcile(&self) -> Result<()> {
-        self.db.cache_clear()?;
+        // Both directories are walked before anything is written: the index is
+        // replaced in a single transaction (see [`Db::cache_rebuild`]), so the
+        // rows have to be in hand first. Names are owned for the same reason —
+        // `DirEntry::file_name` does not outlive the iteration.
+        let mut names: Vec<(String, &str, u64, i64)> = Vec::new();
         for (dir, kind) in [
             (&self.content_dir, KIND_BLOB),
             (&self.block_dir, KIND_BLOCK),
+            (&self.thumb_dir, KIND_THUMB),
         ] {
             let Ok(rd) = std::fs::read_dir(dir) else {
                 continue;
@@ -184,7 +308,15 @@ impl ContentCache {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.ends_with(".meta") || name.ends_with(".tmp") {
+                if name.ends_with(".meta") {
+                    continue;
+                }
+                // A `.tmp` is a staging file from a store that never completed
+                // its rename — a crashed or killed run. Nothing will ever claim
+                // it, and no pass other than this one looks in these
+                // directories, so it would sit there forever. Sweep it.
+                if name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(entry.path());
                     continue;
                 }
                 let Ok(meta) = entry.metadata() else { continue };
@@ -197,9 +329,19 @@ impl ContentCache {
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                self.db.cache_touch(name, kind, meta.len(), at)?;
+                names.push((name.to_string(), kind, meta.len(), at));
             }
         }
+        let entries: Vec<CacheEntryInput<'_>> = names
+            .iter()
+            .map(|(key, kind, size, at)| CacheEntryInput {
+                key,
+                kind,
+                size: *size,
+                last_accessed: *at,
+            })
+            .collect();
+        self.db.cache_rebuild(&entries)?;
         Ok(())
     }
 
@@ -285,6 +427,9 @@ impl ContentCache {
     /// crash mid-store fails validation rather than serving truncated data.
     pub fn store(&self, uid: &NodeUid, mtime: i64, size: u64, bytes: &[u8]) -> Result<()> {
         let blob = self.blob_path(uid);
+        // `with_extension` is safe *here* only because a blob path is a bare
+        // 64-char hex key with no `.`, so this appends rather than replaces.
+        // `store_thumbnail` cannot use the same idiom — see the note there.
         let tmp = blob.with_extension("tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &blob)?;
@@ -294,6 +439,38 @@ impl ContentCache {
         // newest entry is weighed (and ordered most-recent) like any other.
         self.db
             .cache_touch(&Self::key(uid), KIND_BLOB, bytes.len() as u64, now_millis())?;
+        self.blob_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.enforce_budget();
+        Ok(())
+    }
+
+    /// Adopt an existing on-disk file as `uid`'s cached content, without reading
+    /// it into memory.
+    ///
+    /// [`Self::store`] takes the bytes as a slice, which means a caller holding a
+    /// file has to load all of it first — fine for a thumbnail, an OOM for a
+    /// pinned video. This takes the path instead and hardlinks it into place,
+    /// falling back to a copy when `src` lives on another filesystem.
+    ///
+    /// The link makes the cache blob a second name for the same inode, so `src`
+    /// must not be rewritten in place afterwards — unlinking it (the staging
+    /// case, which is what this exists for) is fine and leaves the blob intact.
+    pub fn store_file(&self, uid: &NodeUid, mtime: i64, size: u64, src: &Path) -> Result<()> {
+        let blob = self.blob_path(uid);
+        let tmp = blob.with_extension("tmp");
+        // A stale tmp from an interrupted run would fail the link with EEXIST.
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::hard_link(src, &tmp).is_err() {
+            std::fs::copy(src, &tmp)?;
+        }
+        let bytes = std::fs::metadata(&tmp)?.len();
+        std::fs::rename(&tmp, &blob)?;
+        let meta = serde_json::to_vec(&Meta { mtime, size })?;
+        std::fs::write(self.meta_path(uid), meta)?;
+        self.db
+            .cache_touch(&Self::key(uid), KIND_BLOB, bytes, now_millis())?;
+        self.blob_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.enforce_budget();
         Ok(())
     }
@@ -361,38 +538,115 @@ impl ContentCache {
             bytes.len() as u64,
             now_millis(),
         )?;
+        self.block_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.enforce_block_budget();
         Ok(())
+    }
+
+    /// Re-read every pool total from the cache index, which is authoritative.
+    fn reseed_totals(&self) {
+        for kind in [KIND_BLOB, KIND_BLOCK, KIND_THUMB] {
+            if let Ok(n) = self.db.cache_total_bytes(kind) {
+                self.pool(kind).store(n, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The running total for a pool.
+    fn pool(&self, kind: &str) -> &AtomicU64 {
+        match kind {
+            KIND_BLOCK => &self.block_bytes,
+            KIND_THUMB => &self.thumb_bytes,
+            _ => &self.blob_bytes,
+        }
+    }
+
+    /// This pool's share of the configured budget (`0` = unlimited, as for the
+    /// whole cache). See [`SPLIT_BLOB`] for why the budget is divided rather
+    /// than shared.
+    fn pool_cap(&self, kind: &str) -> u64 {
+        let cap = self.cap();
+        if cap == 0 {
+            return 0;
+        }
+        let share = match kind {
+            KIND_BLOCK => SPLIT_BLOCK,
+            KIND_THUMB => SPLIT_THUMB,
+            _ => SPLIT_BLOB,
+        };
+        // Multiply before dividing: `cap / 100 * share` truncates a small budget
+        // to zero, which `pool_cap`'s callers would read as "unlimited" — the
+        // opposite of what a small budget asks for.
+        //
+        // At least one byte, for the same reason.
+        (cap.saturating_mul(share) / 100).max(1)
     }
 
     /// Evict least-recently-used block-cache files until the block dir fits
     /// `max_bytes`. No-op when the cap is disabled (`0`). All blocks are
     /// evictable — pinned files are served from whole-file blobs, never blocks.
     fn enforce_block_budget(&self) {
-        let cap = self.cap();
+        self.enforce_pool(KIND_BLOCK, &self.block_dir, None);
+    }
+
+    /// Evict least-recently-used entries of one pool until it fits the cap.
+    ///
+    /// Runs on every store, so the under-budget case is the one that matters:
+    /// it is an atomic load and nothing else. Only once the running total says
+    /// we are over does this touch the database, and then it works in bounded
+    /// batches rather than reading the whole index — a cache that is 10 GB over
+    /// budget should not materialize every row to drop the oldest few.
+    ///
+    /// `exempt` names keys that count toward the total but are never victims
+    /// (pinned blobs). A pass that can find no eligible victim stops rather than
+    /// looping: a cache held entirely by pins legitimately stays over budget.
+    fn enforce_pool(&self, kind: &str, dir: &Path, exempt: Option<&HashSet<String>>) {
+        let cap = self.pool_cap(kind);
         if cap == 0 {
             return;
         }
-        // LRU-ordered (oldest first) block entries straight from the index — no
-        // directory scan. All blocks are evictable; pinned files are served from
-        // whole-file blobs, never blocks.
-        let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOCK) else {
-            return;
+        let total = self.pool(kind);
+        if total.load(Ordering::Relaxed) <= cap {
+            return; // the common case: one atomic load, no query
+        }
+
+        // Over budget by the running count — now do the accurate work.
+        let mut running = match self.db.cache_total_bytes(kind) {
+            Ok(n) => n,
+            Err(_) => return,
         };
-        let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
-        if total <= cap {
-            return;
-        }
-        for (key, size) in entries {
-            if total <= cap {
+        let mut skipped = 0usize;
+        while running > cap {
+            // Fetch a batch past whatever we have already skipped as exempt.
+            let want = skipped + EVICT_BATCH;
+            let Ok(batch) = self.db.cache_eviction_candidates(kind, want) else {
                 break;
+            };
+            if batch.len() <= skipped {
+                break; // nothing new to consider
             }
-            // `key` is the block file's name (and its `.meta` sibling's stem).
-            let _ = std::fs::remove_file(self.block_dir.join(&key));
-            let _ = std::fs::remove_file(self.block_dir.join(format!("{key}.meta")));
-            let _ = self.db.cache_remove(&key);
-            total = total.saturating_sub(size);
+            let mut evicted_any = false;
+            for (key, size) in batch.into_iter().skip(skipped) {
+                if running <= cap {
+                    break;
+                }
+                if exempt.is_some_and(|set| set.contains(&key)) {
+                    skipped += 1; // counts toward the total, never a victim
+                    continue;
+                }
+                let _ = std::fs::remove_file(dir.join(&key));
+                let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+                let _ = self.db.cache_remove(&key);
+                running = running.saturating_sub(size);
+                evicted_any = true;
+            }
+            if !evicted_any {
+                break; // every remaining candidate is exempt
+            }
         }
+        // The index is the truth; realign the fast path with it.
+        self.reseed_totals();
     }
 
     /// Create a fresh, empty read-write scratch file for a disk-backed write
@@ -412,6 +666,174 @@ impl ContentCache {
             .write(true)
             .open(&path)?;
         Ok((file, path))
+    }
+
+    /// The sidecar path for a scratch file, holding the [`StagedWrite`] that
+    /// describes it. Written by `fsync` and removed when the write is released;
+    /// its presence at open is what marks a scratch file as durable rather than
+    /// as a crashed run's rubbish.
+    ///
+    /// Safe as `with_extension` only because scratch names are dot-free (see
+    /// [`Self::create_scratch`]), so this appends rather than replaces.
+    pub fn scratch_sidecar(scratch: &Path) -> PathBuf {
+        scratch.with_extension("json")
+    }
+
+    /// Record that the write buffered in `scratch` is durable, so a crash before
+    /// `close(2)` does not lose it.
+    ///
+    /// Called from `fsync(2)`, whose contract is that the bytes survive a crash.
+    /// The scratch file itself does survive — it is a real file — but nothing
+    /// else knows it holds anything worth keeping, and open() clears the scratch
+    /// directory. The sidecar is that knowledge: uid, logical length, and which
+    /// ranges are authored rather than holes, which is exactly what recovery
+    /// needs to hand the blob to the drain.
+    ///
+    /// Written whole to a temp name and renamed, so a crash mid-write leaves the
+    /// previous sidecar rather than a truncated one. The caller is expected to
+    /// have synced `scratch` first: a sidecar promising bytes that never reached
+    /// the disk is worse than no sidecar.
+    pub fn mark_scratch_durable(&self, scratch: &Path, meta: &StagedWrite) -> Result<()> {
+        let side = Self::scratch_sidecar(scratch);
+        let tmp = side.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(meta)?)?;
+        std::fs::rename(&tmp, &side)?;
+        // The rename is what publishes the sidecar; fsync the directory so the
+        // rename itself survives, not just the bytes it points at.
+        if let Some(dir) = side.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Drop a scratch file's durability sidecar, once the write it described has
+    /// been staged (or turned out not to be dirty at all). Best effort: a
+    /// leftover sidecar whose blob is gone is ignored by recovery anyway.
+    pub fn clear_scratch_durable(&self, scratch: &Path) {
+        let _ = std::fs::remove_file(Self::scratch_sidecar(scratch));
+    }
+
+    /// Move every scratch file that carries a readable sidecar into `recovery`,
+    /// before the caller empties the scratch directory.
+    ///
+    /// Blob first, then sidecar: a blob in recovery without its sidecar is
+    /// dropped on the next open (indistinguishable from rubbish), whereas a
+    /// sidecar whose blob never arrived would describe nothing. Neither order is
+    /// lossless if we crash mid-rescue, but this one fails toward "unrecovered
+    /// bytes on disk" rather than "op queued against missing content".
+    fn rescue_scratch(scratch_dir: &Path, recovery_dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(scratch_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let blob = entry.path();
+            if blob.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            let side = Self::scratch_sidecar(&blob);
+            // Parsed, not merely present: an unreadable sidecar cannot drive a
+            // recovery, so the blob is rubbish like any other leftover.
+            if std::fs::read(&side)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
+                .is_none()
+            {
+                continue;
+            }
+            let Some(name) = blob.file_name() else {
+                continue;
+            };
+            if std::fs::rename(&blob, recovery_dir.join(name)).is_err() {
+                continue;
+            }
+            let Some(side_name) = side.file_name() else {
+                continue;
+            };
+            let _ = std::fs::rename(&side, recovery_dir.join(side_name));
+        }
+    }
+
+    /// Writes rescued from an unclean shutdown, as `(blob, meta)` pairs for the
+    /// daemon to hand to the upload queue. A blob whose sidecar did not survive
+    /// the rescue is deleted here — nothing can address it.
+    pub fn recovered_writes(&self) -> Vec<(PathBuf, StagedWrite)> {
+        let Ok(entries) = std::fs::read_dir(&self.recovery_dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let blob = entry.path();
+            if blob.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            match std::fs::read(Self::scratch_sidecar(&blob))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
+            {
+                Some(meta) => out.push((blob, meta)),
+                None => {
+                    let _ = std::fs::remove_file(&blob);
+                }
+            }
+        }
+        out
+    }
+
+    /// Retire a recovered write. `stage_write` has already moved the blob out,
+    /// so this is the sidecar left behind — and the blob too if the caller could
+    /// not use it and said so by leaving it in place.
+    pub fn discard_recovered(&self, blob: &Path) {
+        let _ = std::fs::remove_file(Self::scratch_sidecar(blob));
+        let _ = std::fs::remove_file(blob);
+    }
+
+    /// Move a released scratch file into the staging directory with a
+    /// [`StagedWrite`] sidecar, and return where it landed.
+    ///
+    /// This is what makes a write survive its upload: the caller is releasing a
+    /// write handle and would otherwise delete the file, so until the bytes are
+    /// on the remote, staging holds the only copy. Every dirty handle goes
+    /// through here — the upload is a queued op performed later (offline.md
+    /// Phase 3), and a staged file is also what a human can recover from if the
+    /// queue never drains.
+    ///
+    /// Falls back to a copy when the rename crosses a filesystem boundary; a
+    /// failure here means we could not save the bytes at all, so it is reported
+    /// rather than swallowed.
+    pub fn stage_write(&self, meta: &StagedWrite, scratch: &Path) -> Result<PathBuf> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        // The uid goes in the name so a staged file can be tied back to its node
+        // without a database; `/` in a uid would otherwise open a path.
+        let safe_uid = meta.uid.replace(['/', '\\'], "_");
+        let path = self.staging_dir.join(format!(
+            "{}-{}-{}",
+            safe_uid,
+            now_millis(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        if let Err(e) = std::fs::rename(scratch, &path) {
+            // Cross-device: rename cannot move it, so copy and drop the original.
+            let _ = e;
+            std::fs::copy(scratch, &path)?;
+            let _ = std::fs::remove_file(scratch);
+        }
+        // Sidecar last: a staged file without one is still recoverable bytes,
+        // while a sidecar without a file would describe nothing.
+        std::fs::write(
+            path.with_extension("json"),
+            serde_json::to_vec_pretty(meta)?,
+        )?;
+        Ok(path)
+    }
+
+    /// Drop a staged blob and its sidecar, once its bytes are safely on the
+    /// remote (or the op that owned them has been superseded). Best effort:
+    /// leftovers cost disk, while failing here would strand a drained op.
+    pub fn discard_staged(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("json"));
     }
 
     /// Remove any cached blob + meta for `uid`, including its thumbnails (best
@@ -442,10 +864,18 @@ impl ContentCache {
         }
         // Forget the blob and all of this uid's block rows in the LRU index.
         let _ = self.db.cache_remove_all(&Self::key(uid));
+        // Rows just left the index; the running totals must follow.
+        self.reseed_totals();
+    }
+
+    /// Cache-index key for the `ttype` thumbnail of `uid` — the thumbnail file's
+    /// name, so eviction can remove the file by joining it onto `thumb_dir`.
+    fn thumb_key(&self, uid: &NodeUid, ttype: i32) -> String {
+        format!("{}.t{ttype}", Self::key(uid))
     }
 
     fn thumb_blob(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
-        self.thumb_dir.join(format!("{}.t{ttype}", Self::key(uid)))
+        self.thumb_dir.join(self.thumb_key(uid, ttype))
     }
 
     fn thumb_meta(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
@@ -463,7 +893,14 @@ impl ContentCache {
         if recorded != mtime {
             return None;
         }
-        std::fs::read(self.thumb_blob(uid, ttype)).ok()
+        let bytes = std::fs::read(self.thumb_blob(uid, ttype)).ok()?;
+        // Record the access for LRU, as the blob and block readers do. Without
+        // it the pool evicts in insertion order, so scrolling back up a gallery
+        // would drop exactly the tiles being looked at.
+        let _ = self
+            .db
+            .cache_accessed(&self.thumb_key(uid, ttype), now_millis());
+        Some(bytes)
     }
 
     /// On-disk path of the cached content blob for `uid`, validated against
@@ -490,7 +927,13 @@ impl ContentCache {
             return None;
         }
         let blob = self.thumb_blob(uid, ttype);
-        blob.exists().then_some(blob)
+        if !blob.exists() {
+            return None;
+        }
+        let _ = self
+            .db
+            .cache_accessed(&self.thumb_key(uid, ttype), now_millis());
+        Some(blob)
     }
 
     /// On-disk path where `uid`'s `ttype` thumbnail lives once stored.
@@ -501,6 +944,14 @@ impl ContentCache {
     /// Cache `bytes` as the `ttype` thumbnail for `uid`, tagged with `mtime`.
     /// Blob written to a temp file then renamed; the meta tag is written last so
     /// a crash mid-store fails validation rather than serving a torn thumbnail.
+    ///
+    /// The temp name carries `ttype`, and must. `Path::with_extension` would
+    /// *replace* the `.t{ttype}` suffix rather than append to it, giving every
+    /// thumbnail type of one node the same staging file — so a type-1 and a
+    /// type-2 store racing (the gallery caches type 1 from a control-socket
+    /// thread while `getxattr` caches type 2 on the FUSE dispatch loop) would
+    /// publish one type's bytes under the other's name. See
+    /// `concurrent_thumbnail_types_do_not_share_a_temp_file`.
     pub fn store_thumbnail(
         &self,
         uid: &NodeUid,
@@ -509,11 +960,31 @@ impl ContentCache {
         bytes: &[u8],
     ) -> Result<()> {
         let blob = self.thumb_blob(uid, ttype);
-        let tmp = blob.with_extension("tmp");
+        let tmp = self
+            .thumb_dir
+            .join(format!("{}.t{ttype}.tmp", Self::key(uid)));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(self.thumb_meta(uid, ttype), serde_json::to_vec(&mtime)?)?;
+        self.db.cache_touch(
+            &self.thumb_key(uid, ttype),
+            KIND_THUMB,
+            bytes.len() as u64,
+            now_millis(),
+        )?;
+        self.thumb_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.enforce_thumb_budget();
         Ok(())
+    }
+
+    /// Evict least-recently-used thumbnails until the pool fits its share of the
+    /// budget. Every thumbnail is evictable, including those of pinned nodes: a
+    /// thumbnail is derived data that the gallery re-fetches or regenerates, and
+    /// exempting them would mean a large pinned library could hold the pool
+    /// permanently over its ceiling — the exact unbounded growth C6 was about.
+    fn enforce_thumb_budget(&self) {
+        self.enforce_pool(KIND_THUMB, &self.thumb_dir, None);
     }
 
     /// Evict least-recently-used *unpinned* blobs until total blob bytes fit the
@@ -521,8 +992,11 @@ impl ContentCache {
     /// cache already fits. Pinned blobs are skipped, so a cache held entirely by
     /// pins can legitimately stay over budget.
     fn enforce_budget(&self) {
-        let cap = self.cap();
-        if cap == 0 {
+        let cap = self.pool_cap(KIND_BLOB);
+        if cap == 0 || self.blob_bytes.load(Ordering::Relaxed) <= cap {
+            // The common case, settled without a query — and in particular
+            // without the recursive pin CTE below, which used to run on every
+            // single store.
             return;
         }
         // Pinned blobs (by cache key) are exempt from eviction. Resolves direct
@@ -535,30 +1009,8 @@ impl ContentCache {
             .iter()
             .map(|uid| Self::key_str(uid))
             .collect();
-
-        // LRU-ordered (oldest first) blob entries from the index — no directory
-        // scan. Pinned blobs still count toward the total (so pins alone can hold
-        // the cache over budget) but are never chosen as victims.
-        let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOB) else {
-            return;
-        };
-        let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
-        if total <= cap {
-            return;
-        }
-        for (key, size) in entries {
-            if total <= cap {
-                break;
-            }
-            if pinned.contains(&key) {
-                continue; // counts toward total but is never a victim
-            }
-            // `key` is the blob file's name (and its `.meta` sibling's stem).
-            let _ = std::fs::remove_file(self.content_dir.join(&key));
-            let _ = std::fs::remove_file(self.content_dir.join(format!("{key}.meta")));
-            let _ = self.db.cache_remove(&key);
-            total = total.saturating_sub(size);
-        }
+        let content_dir = self.content_dir.clone();
+        self.enforce_pool(KIND_BLOB, &content_dir, Some(&pinned));
     }
 
     /// Whether `uid` is pinned — directly, or because an ancestor folder is
@@ -601,33 +1053,31 @@ impl ContentCache {
             .collect()
     }
 
-    /// Total bytes of cached content blobs (pinned + unpinned), matching what
-    /// [`enforce_budget`](Self::enforce_budget) weighs against the cap.
-    /// Thumbnails live in a sibling dir and are not counted. Cheap directory
-    /// scan, safe to call from a front-end for a usage read-out.
+    /// Total bytes the cache holds on disk — blobs, blocks and thumbnails
+    /// together — which is what the configured budget caps and therefore the
+    /// only honest thing to show next to it.
+    ///
+    /// This used to scan `content_dir` alone, which excluded both the block dir
+    /// and the thumb dir: the Settings page could report a few hundred megabytes
+    /// while the cache held several gigabytes. Now it reads the same running
+    /// totals the budget enforcers use, so the displayed number and the enforced
+    /// number cannot disagree — and it costs three atomic loads instead of a
+    /// directory scan.
+    ///
+    /// Excludes the `.meta` sidecars (a few dozen bytes each) and the scratch
+    /// and staging dirs, which hold unuploaded user writes rather than cache and
+    /// are deliberately not evictable.
     pub fn usage(&self) -> u64 {
-        let Ok(rd) = std::fs::read_dir(&self.content_dir) else {
-            return 0;
-        };
-        let mut total = 0u64;
-        for entry in rd.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name.ends_with(".meta") || name.ends_with(".tmp") {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata()
-                && meta.is_file()
-            {
-                total += meta.len();
-            }
-        }
-        total
+        [KIND_BLOB, KIND_BLOCK, KIND_THUMB]
+            .iter()
+            .map(|k| self.pool(k).load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Configured soft byte cap (`0` = unlimited), for display alongside
-    /// [`usage`](Self::usage).
+    /// [`usage`](Self::usage). This is the whole-cache figure; internally it is
+    /// divided between the pools (see [`SPLIT_BLOB`]), but the user set one
+    /// number and gets that number.
     pub fn budget(&self) -> u64 {
         self.cap()
     }
@@ -646,6 +1096,7 @@ impl ContentCache {
         self.max_bytes.store(bytes, Ordering::Relaxed);
         self.enforce_budget();
         self.enforce_block_budget();
+        self.enforce_thumb_budget();
     }
 
     /// Delete every *unpinned* cached blob plus all on-demand block chunks,
@@ -674,15 +1125,22 @@ impl ContentCache {
                 freed = freed.saturating_add(size);
             }
         }
-        // Every on-demand block (transient partial reads, re-fetched on demand).
-        if let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOCK) {
-            for (key, size) in entries {
-                let _ = std::fs::remove_file(self.block_dir.join(&key));
-                let _ = std::fs::remove_file(self.block_dir.join(format!("{key}.meta")));
-                let _ = self.db.cache_remove(&key);
-                freed = freed.saturating_add(size);
+        // Every on-demand block (transient partial reads, re-fetched on demand)
+        // and every thumbnail (derived, re-fetched or regenerated on demand).
+        // Both pools are dropped wholesale rather than filtered by pin: neither
+        // is what "keep this available offline" means, and leaving them behind
+        // would make "clear cache" free visibly less than it reported.
+        for (kind, dir) in [(KIND_BLOCK, &self.block_dir), (KIND_THUMB, &self.thumb_dir)] {
+            if let Ok(entries) = self.db.cache_entries_by_kind(kind) {
+                for (key, size) in entries {
+                    let _ = std::fs::remove_file(dir.join(&key));
+                    let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+                    let _ = self.db.cache_remove(&key);
+                    freed = freed.saturating_add(size);
+                }
             }
         }
+        self.reseed_totals();
         freed
     }
 }
@@ -724,6 +1182,28 @@ mod tests {
         cache_capped(0)
     }
 
+    /// A cache whose `kind` pool holds exactly `bytes`.
+    ///
+    /// The configured budget is a whole-cache figure divided between the pools
+    /// (C7), while a test that exercises eviction cares about one pool at a
+    /// time. So the test states the pool size it means and this inverts the
+    /// split, rather than every such test hard-coding a number that silently
+    /// changes meaning if the split is ever retuned.
+    fn cache_with_pool_cap(kind: &str, bytes: u64) -> (ContentCache, TempDir) {
+        let share = match kind {
+            KIND_BLOCK => SPLIT_BLOCK,
+            KIND_THUMB => SPLIT_THUMB,
+            _ => SPLIT_BLOB,
+        };
+        // Round up, so the pool holds at least `bytes` rather than one short.
+        let (c, d) = cache_capped((bytes * 100).div_ceil(share));
+        assert!(
+            c.pool_cap(kind) >= bytes,
+            "helper must give the {kind} pool at least {bytes} bytes"
+        );
+        (c, d)
+    }
+
     fn cache_capped(max_bytes: u64) -> (ContentCache, TempDir) {
         let dir = TempDir::new();
         let db = Arc::new(Db::open_in_memory().unwrap());
@@ -753,6 +1233,47 @@ mod tests {
             c.read_range(&u, 100, data.len() as u64, 100, 5).unwrap(),
             b""
         );
+    }
+
+    /// The drain promotes a staged upload into the cache by path and then
+    /// unlinks the staging name. The cached copy has to survive that, and the
+    /// promote has to charge the LRU index like [`ContentCache::store`] does.
+    #[test]
+    fn store_file_adopts_blob_and_survives_source_unlink() {
+        let (c, d) = cache();
+        let u = uid("a");
+        let data = b"staged contents";
+        let src = d.path().join("staged-blob");
+        std::fs::write(&src, data).unwrap();
+
+        c.store_file(&u, 100, data.len() as u64, &src).unwrap();
+        std::fs::remove_file(&src).unwrap();
+
+        assert!(c.is_cached(&u, 100, data.len() as u64));
+        assert_eq!(
+            c.read_range(&u, 100, data.len() as u64, 7, 8).unwrap(),
+            b"contents"
+        );
+        assert_eq!(c.usage(), data.len() as u64);
+    }
+
+    /// A cross-filesystem staging dir cannot be hardlinked from; the copy
+    /// blob and its metadata must both be replaced wholesale — a stale `.meta`
+    /// left beside new content would validate a read of the wrong bytes. The
+    /// link goes to a temp name and is renamed over the blob for exactly this,
+    /// so re-storing over an existing entry is the case worth pinning.
+    #[test]
+    fn store_file_replaces_an_existing_blob() {
+        let (c, d) = cache();
+        let u = uid("a");
+        c.store(&u, 100, 3, b"old").unwrap();
+
+        let src = d.path().join("new-blob");
+        std::fs::write(&src, b"newer").unwrap();
+        c.store_file(&u, 200, 5, &src).unwrap();
+
+        assert!(!c.is_cached(&u, 100, 3), "stale meta must not validate");
+        assert_eq!(c.read_range(&u, 200, 5, 0, 5).unwrap(), b"newer");
     }
 
     #[test]
@@ -842,10 +1363,75 @@ mod tests {
         assert!(!c.is_cached(&u, 100, 3));
     }
 
+    /// The under-budget path — which is every store until the cache fills — must
+    /// not touch the database at all. It is on the cold-read hot path: one call
+    /// per cached 4 MiB block, under the connection lock every FUSE metadata
+    /// call also needs.
+    #[test]
+    fn budget_check_is_free_when_under_budget() {
+        use std::time::Instant;
+
+        // Cap far above what we store, so every store stays under budget.
+        let (c, _d) = cache_capped(1 << 30);
+        let payload = vec![0u8; 4096];
+
+        // Cost of a store against a near-empty index...
+        let t = Instant::now();
+        for i in 0..500u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+        let empty = t.elapsed() / 500;
+
+        // ...and against one with a few thousand entries in it.
+        for i in 500..2500u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+        let t = Instant::now();
+        for i in 2500..3000u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+        let full = t.elapsed() / 500;
+
+        println!("B4: store_block under budget — {empty:?} at ~0 entries, {full:?} at 2500");
+        // A ratio, not a wall-clock bound: the claim is that the under-budget
+        // path does not grow with the index, and only a ratio tests that. An
+        // absolute threshold measures the machine's load instead, and this test
+        // runs alongside the rest of the suite.
+        assert!(
+            full < empty * 3,
+            "under-budget store should not scale with the index: \
+             {empty:?} at ~0 entries vs {full:?} at 2500"
+        );
+    }
+
+    /// The running totals are a fast path, not a second source of truth: after
+    /// an eviction pass they are realigned with the index, so repeated
+    /// over-budget stores cannot drift them.
+    #[test]
+    fn running_totals_stay_aligned_with_the_index() {
+        let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
+        for i in 0..12u64 {
+            c.store_block(&uid("a"), 1, 100, i, b"aaaa").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let indexed: u64 =
+            c.db.cache_entries_by_kind("block")
+                .unwrap()
+                .iter()
+                .map(|(_, s)| s)
+                .sum();
+        assert_eq!(
+            c.block_bytes.load(Ordering::Relaxed),
+            indexed,
+            "running total matches the index after repeated eviction"
+        );
+        assert!(indexed <= 8, "and the cap is actually held: {indexed}");
+    }
+
     #[test]
     fn budget_evicts_lru_unpinned() {
-        // Cap fits two 4-byte blobs but not three.
-        let (c, _d) = cache_capped(8);
+        // Blob pool fits two 4-byte blobs but not three.
+        let (c, _d) = cache_with_pool_cap(KIND_BLOB, 8);
         let (a, b, d) = (uid("a"), uid("b"), uid("d"));
 
         c.store(&a, 1, 4, b"aaaa").unwrap();
@@ -866,7 +1452,7 @@ mod tests {
 
     #[test]
     fn budget_never_evicts_pinned() {
-        let (c, _d) = cache_capped(8);
+        let (c, _d) = cache_with_pool_cap(KIND_BLOB, 8);
         let (a, b, d) = (uid("a"), uid("b"), uid("d"));
 
         c.store(&a, 1, 4, b"aaaa").unwrap();
@@ -909,13 +1495,69 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         c.store(&d, 1, 4, b"dddd").unwrap();
 
-        // Tightening to 8 bytes evicts the LRU unpinned blob(s) now, not on the
-        // next store.
-        c.set_budget(8);
+        // Tightening to a budget whose blob share is 8 bytes evicts the LRU
+        // unpinned blob(s) now, not on the next store.
+        c.set_budget((8 * 100u64).div_ceil(SPLIT_BLOB));
         assert!(!c.is_cached(&a, 1, 4), "oldest blob evicted on tighten");
         assert!(c.is_cached(&b, 1, 4));
         assert!(c.is_cached(&d, 1, 4));
-        assert_eq!(c.budget(), 8);
+        // `budget()` reports the whole-cache figure that was set, not one
+        // pool's share of it.
+        assert_eq!(c.budget(), (8 * 100u64).div_ceil(SPLIT_BLOB));
+    }
+
+    /// **The A2 reproduce.** Thumbnail types 1 and 2 of one node must not share
+    /// a staging file. They are stored from different subsystems — the Photos
+    /// gallery caches type 1 from a control-socket thread while `getxattr`
+    /// caches type 2 on the FUSE dispatch loop — so the two genuinely overlap.
+    ///
+    /// The failure is silent: the loser's rename either publishes the *other*
+    /// type's bytes under this type's name, or vanishes with ENOENT. Both are
+    /// reported here, because a fix that only removed the error would leave the
+    /// corruption.
+    #[test]
+    fn concurrent_thumbnail_types_do_not_share_a_temp_file() {
+        use std::sync::Arc as StdArc;
+
+        let (c, _d) = cache();
+        let c = StdArc::new(c);
+        let u = uid("a");
+        // Big enough that the write is not a single atomic-looking syscall, and
+        // distinguishable by content and length.
+        let one = vec![0xA1u8; 96 * 1024];
+        let two = vec![0xB2u8; 64 * 1024];
+
+        let mut handles = Vec::new();
+        for (ttype, payload) in [(1i32, one.clone()), (2i32, two.clone())] {
+            let c = c.clone();
+            let u = u.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut errors = 0usize;
+                for _ in 0..400 {
+                    if c.store_thumbnail(&u, ttype, 100, &payload).is_err() {
+                        errors += 1;
+                    }
+                }
+                errors
+            }));
+        }
+
+        let mut store_errors = 0usize;
+        for h in handles {
+            store_errors += h.join().expect("store thread panicked");
+        }
+
+        // Whatever is on disk for each type must be that type's bytes.
+        if let Some(got) = c.read_thumbnail(&u, 1, 100) {
+            assert_eq!(got, one, "type 1 served type 2's bytes");
+        }
+        if let Some(got) = c.read_thumbnail(&u, 2, 100) {
+            assert_eq!(got, two, "type 2 served type 1's bytes");
+        }
+        assert_eq!(
+            store_errors, 0,
+            "a store lost its staging file to the other type"
+        );
     }
 
     #[test]
@@ -932,6 +1574,107 @@ mod tests {
         c.evict(&u);
         assert!(c.read_thumbnail(&u, 1, 100).is_none());
         assert!(c.read_thumbnail(&u, 2, 100).is_none());
+    }
+
+    /// Total bytes of every real file under `root`, recursively — what `du`
+    /// would report, and what `usage()` claims to be reporting.
+    fn bytes_on_disk(root: &Path) -> u64 {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                total += bytes_on_disk(&entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
+    /// C6/C7. Two claims the cache makes and does not keep.
+    ///
+    /// The configured budget is the whole promise of the Settings page: it is
+    /// the only thing standing between an on-demand filesystem and a full disk.
+    /// A thumbnail per photo, on a library of tens of thousands, is not a
+    /// rounding error.
+    #[test]
+    fn every_pool_is_budgeted_and_visible() {
+        const CAP: u64 = 256 * 1024;
+        let (c, dir) = cache_capped(CAP);
+        let payload = vec![0u8; 8 * 1024];
+
+        // A gallery scroll: one thumbnail per photo, far past the cap.
+        for i in 0..200u64 {
+            c.store_thumbnail(&uid(&format!("photo{i}")), 1, 1, &payload)
+                .unwrap();
+        }
+        // Plus enough blob and block traffic to fill both other pools.
+        for i in 0..100u64 {
+            c.store(&uid(&format!("file{i}")), 1, payload.len() as u64, &payload)
+                .unwrap();
+            c.store_block(&uid("streamed"), 1, 1 << 30, i, &payload)
+                .unwrap();
+        }
+
+        let on_disk = bytes_on_disk(dir.path());
+        let reported = c.usage();
+
+        // 1. The cap is a cap on the cache, not on one pool of it.
+        assert!(
+            on_disk <= CAP + CAP / 8,
+            "cache holds {on_disk} bytes against a {CAP}-byte budget"
+        );
+        // 2. And the number shown to the user is the number on disk. Meta
+        //    sidecars are small and untracked, hence the tolerance.
+        let drift = on_disk.abs_diff(reported);
+        assert!(
+            drift <= on_disk / 8,
+            "usage() reports {reported} against {on_disk} on disk"
+        );
+    }
+
+    /// The thumbnail pool must evict by *use*, not by insertion order. A gallery
+    /// scrolled down and back up re-reads the tiles it already has; under FIFO
+    /// those are exactly the ones dropped, so every scroll back would re-fetch.
+    #[test]
+    fn thumbnails_evict_least_recently_used() {
+        // Pool fits two 4-byte thumbnails but not three.
+        let (c, _d) = cache_with_pool_cap(KIND_THUMB, 8);
+        let (a, b, d) = (uid("a"), uid("b"), uid("d"));
+
+        c.store_thumbnail(&a, 1, 1, b"aaaa").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        c.store_thumbnail(&b, 1, 1, b"bbbb").unwrap();
+        // Look at `a` again, making `b` the least-recently-used.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(c.read_thumbnail(&a, 1, 1).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        c.store_thumbnail(&d, 1, 1, b"dddd").unwrap();
+        assert!(c.read_thumbnail(&a, 1, 1).is_some(), "recently read, kept");
+        assert!(c.read_thumbnail(&b, 1, 1).is_none(), "least recently used");
+        assert!(c.read_thumbnail(&d, 1, 1).is_some(), "just stored");
+    }
+
+    /// Evicting a node drops its thumbnails from the index as well as from disk.
+    /// A row left behind would keep counting bytes that are gone, and the
+    /// running total would drift above the truth until the next restart.
+    #[test]
+    fn evicting_a_node_clears_its_thumbnail_accounting() {
+        let (c, _d) = cache();
+        let u = uid("a");
+        c.store(&u, 1, 4, b"aaaa").unwrap();
+        c.store_thumbnail(&u, 1, 1, b"thumb1").unwrap();
+        c.store_thumbnail(&u, 2, 1, b"preview2").unwrap();
+        assert!(c.thumb_bytes.load(Ordering::Relaxed) > 0);
+
+        c.evict(&u);
+        assert_eq!(c.thumb_bytes.load(Ordering::Relaxed), 0);
+        assert!(c.db.cache_entries_by_kind(KIND_THUMB).unwrap().is_empty());
+        assert_eq!(c.usage(), 0, "nothing cached, nothing reported");
     }
 
     #[test]
@@ -969,8 +1712,8 @@ mod tests {
 
     #[test]
     fn block_budget_evicts_lru() {
-        // Cap fits two 4-byte blocks but not three.
-        let (c, _d) = cache_capped(8);
+        // Block pool fits two 4-byte blocks but not three.
+        let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
         let u = uid("a");
         c.store_block(&u, 1, 12, 0, b"aaaa").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -986,6 +1729,141 @@ mod tests {
         );
         assert!(c.cached_block(&u, 1, 12, 1).is_none(), "LRU block evicted");
         assert!(c.cached_block(&u, 1, 12, 2).is_some(), "newest survives");
+    }
+
+    /// A failed upload must never cost the user their bytes (offline.md Phase 2):
+    /// the scratch file moves to staging intact, and staging survives a reopen
+    /// the way scratch deliberately does not.
+    #[test]
+    fn failed_write_is_staged_and_survives_reopen() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let c = ContentCache::open(content.clone(), dir.path().join("pins.json"), 0, db.clone())
+            .unwrap();
+
+        let (mut f, scratch) = c.create_scratch().unwrap();
+        f.write_all(b"unsent work").unwrap();
+        drop(f);
+
+        // A partial overwrite: only the first 11 bytes are real, so the staged
+        // file must not be mistaken for uploadable whole-file content.
+        let meta = StagedWrite {
+            uid: uid("a").to_string(),
+            len: 40,
+            base_size: 40,
+            base_mtime: 100,
+            authored: vec![(0, 11)],
+            complete: false,
+            based_on: Some(Baseline {
+                mtime: 100,
+                size: 40,
+            }),
+        };
+        let staged = c.stage_write(&meta, &scratch).unwrap();
+        assert!(!scratch.exists(), "scratch is moved, not copied");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"unsent work");
+
+        let sidecar: StagedWrite =
+            serde_json::from_slice(&std::fs::read(staged.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(sidecar.authored, vec![(0, 11)]);
+        assert!(
+            !sidecar.complete,
+            "gaps are zeros, not content: uploading this as-is would corrupt the file"
+        );
+
+        // Reopening wipes scratch (worthless leftovers) but must keep staging.
+        drop(c);
+        let _c2 = ContentCache::open(content, dir.path().join("pins.json"), 0, db).unwrap();
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"unsent work",
+            "staged bytes outlive the daemon that failed to upload them"
+        );
+    }
+
+    /// A2: `fsync(2)` promises the bytes survive a crash, but queueing happens
+    /// at `release`. A scratch file marked durable must therefore outlive the
+    /// open that clears the scratch directory — and an unmarked one must not,
+    /// since that is a crashed run's rubbish.
+    #[test]
+    fn fsynced_scratch_survives_reopen_and_unmarked_scratch_does_not() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut synced, synced_path) = c.create_scratch().unwrap();
+        synced.write_all(b"fsynced bytes").unwrap();
+        synced.sync_all().unwrap();
+        let meta = StagedWrite {
+            uid: uid("a").to_string(),
+            len: 13,
+            base_size: 0,
+            base_mtime: 100,
+            authored: vec![(0, 13)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&synced_path, &meta).unwrap();
+
+        // A second handle that was written but never fsynced: no promise was
+        // made about it, and it is indistinguishable from a torn buffer.
+        let (mut loose, loose_path) = c.create_scratch().unwrap();
+        loose.write_all(b"never fsynced").unwrap();
+
+        // Crash: no release, no staging, just a restart.
+        drop(c);
+        let c2 = ContentCache::open(content, pins, 0, db).unwrap();
+
+        assert!(!synced_path.exists(), "scratch dir is still cleared");
+        assert!(!loose_path.exists());
+
+        let recovered = c2.recovered_writes();
+        assert_eq!(recovered.len(), 1, "only the fsynced write is recoverable");
+        let (blob, got) = &recovered[0];
+        assert_eq!(std::fs::read(blob).unwrap(), b"fsynced bytes");
+        assert_eq!(got.uid, uid("a").to_string());
+        assert_eq!(got.authored, vec![(0, 13)]);
+
+        // Staging it is what a restart does with it; the sidecar goes after.
+        let staged = c2.stage_write(got, blob).unwrap();
+        c2.discard_recovered(blob);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"fsynced bytes");
+        assert!(c2.recovered_writes().is_empty(), "recovery does not repeat");
+    }
+
+    /// Releasing a write hands the bytes to staging, so the sidecar an earlier
+    /// `fsync` left must not offer recovery a second, stale copy of it.
+    #[test]
+    fn cleared_durability_marker_stops_recovery() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut f, path) = c.create_scratch().unwrap();
+        f.write_all(b"released").unwrap();
+        let meta = StagedWrite {
+            uid: uid("a").to_string(),
+            len: 8,
+            base_size: 0,
+            base_mtime: 100,
+            authored: vec![(0, 8)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&path, &meta).unwrap();
+        c.clear_scratch_durable(&path);
+
+        drop(c);
+        let c2 = ContentCache::open(content, pins, 0, db).unwrap();
+        assert!(c2.recovered_writes().is_empty());
     }
 
     #[test]

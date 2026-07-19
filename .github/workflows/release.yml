@@ -28,7 +28,8 @@ jobs:
             libadwaita-1-dev \
             libsecret-1-dev \
             libdbus-1-dev \
-            desktop-file-utils
+            desktop-file-utils \
+            rpm
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -109,6 +110,26 @@ jobs:
           # Build Debian package
           dpkg-deb --build deb proton-drive-linux_${{ env.VERSION }}_amd64.deb
 
+      - name: Package Fedora package (.rpm)
+        run: |
+          # Sanitize version (replace hyphens with dots for RPM compatibility)
+          RPM_VERSION=$(echo "${{ env.VERSION }}" | tr '-' '.')
+          
+          # Create RPM build directories
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT,db}
+          
+          # Build RPM package
+          rpmbuild -bb \
+            --define "_topdir $PWD/rpmbuild" \
+            --define "_sourcedir $PWD" \
+            --define "version ${RPM_VERSION}" \
+            --define "_dbpath $PWD/rpmbuild/db" \
+            packaging/proton-drive-linux.spec
+            
+          # Copy built RPM to root directory
+          cp rpmbuild/RPMS/x86_64/*.rpm .
+
+
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -116,6 +137,7 @@ jobs:
           path: |
             *.deb
             *.tar.gz
+            *.rpm
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -125,6 +147,7 @@ jobs:
           files: |
             *.deb
             *.tar.gz
+            *.rpm
           draft: false
           prerelease: false
         env:

@@ -93,7 +93,7 @@ pub fn scan(
             !matches!(entry.file_name().to_str(), Some(name) if SKIP_DIRS.contains(&name))
         });
 
-    let state = std::sync::Mutex::new(SinkState {
+    let state = parking_lot::Mutex::new(SinkState {
         buf: Vec::with_capacity(BATCH),
         total: 0,
         sink,
@@ -112,7 +112,7 @@ pub fn scan(
                 return WalkState::Continue;
             };
 
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock();
             state.push(local);
             if state.total >= MAX_ENTRIES {
                 return WalkState::Quit;
@@ -121,7 +121,7 @@ pub fn scan(
         })
     });
 
-    let mut state = state.into_inner().unwrap();
+    let mut state = state.into_inner();
     state.flush();
     state.total
 }

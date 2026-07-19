@@ -15,10 +15,11 @@
 //!
 //! [`Request::GetQueueStatus`]: pdfs_core::control::Request::GetQueueStatus
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use pdfs_core::control::{JobItem, TransferDirection, TransferItem};
@@ -76,7 +77,7 @@ impl TransferRegistry {
             done: AtomicU64::new(0),
             started: Instant::now(),
         });
-        self.inner.lock().unwrap().insert(id, entry.clone());
+        self.inner.lock().insert(id, entry.clone());
         TransferGuard {
             reg: self.clone(),
             id,
@@ -95,7 +96,7 @@ impl TransferRegistry {
             done: AtomicU64::new(0),
             total: AtomicU64::new(0),
         });
-        self.jobs.lock().unwrap().insert(id, entry.clone());
+        self.jobs.lock().insert(id, entry.clone());
         JobGuard {
             reg: self.clone(),
             id,
@@ -108,7 +109,7 @@ impl TransferRegistry {
     ///
     /// [`Response::Transfers`]: pdfs_core::control::Response::Transfers
     pub fn jobs_snapshot(&self) -> Vec<JobItem> {
-        let map = self.jobs.lock().unwrap();
+        let map = self.jobs.lock();
         let mut ids: Vec<_> = map.keys().copied().collect();
         ids.sort_unstable();
         ids.iter()
@@ -116,7 +117,7 @@ impl TransferRegistry {
                 let e = &map[id];
                 JobItem {
                     title: e.title.clone(),
-                    detail: e.detail.lock().unwrap().clone(),
+                    detail: e.detail.lock().clone(),
                     done: e.done.load(Ordering::Relaxed),
                     total: e.total.load(Ordering::Relaxed),
                 }
@@ -131,7 +132,7 @@ impl TransferRegistry {
     ///
     /// [`Response::Transfers`]: pdfs_core::control::Response::Transfers
     pub fn snapshot(&self) -> Vec<TransferItem> {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock();
         let mut ids: Vec<_> = map.keys().copied().collect();
         ids.sort_unstable();
         ids.iter()
@@ -176,7 +177,7 @@ impl TransferGuard {
 
 impl Drop for TransferGuard {
     fn drop(&mut self) {
-        self.reg.inner.lock().unwrap().remove(&self.id);
+        self.reg.inner.lock().remove(&self.id);
     }
 }
 
@@ -197,7 +198,7 @@ pub struct JobGuard {
 impl JobGuard {
     /// Say what the job is working on right now; empty clears it.
     pub fn detail(&self, what: impl Into<String>) {
-        *self.entry.detail.lock().unwrap() = what.into();
+        *self.entry.detail.lock() = what.into();
     }
 
     /// Set how many steps the job now knows it has. Safe to raise mid-job as more
@@ -214,7 +215,7 @@ impl JobGuard {
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        self.reg.jobs.lock().unwrap().remove(&self.id);
+        self.reg.jobs.lock().remove(&self.id);
     }
 }
 

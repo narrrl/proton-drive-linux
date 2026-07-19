@@ -11,7 +11,8 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    Request as CtlRequest, Response as CtlResponse, ShareEntryKind, SyncPhase,
+    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind,
+    SyncPhase, pending_summary,
 };
 use pdfs_core::db::Db;
 
@@ -145,6 +146,15 @@ enum Command {
     },
     /// Permanently delete everything in the trash. This cannot be undone.
     EmptyTrash,
+
+    /// Drop a cached listing so the next read re-fetches it from the server.
+    /// Use it when another client changed something and the daemon hasn't
+    /// noticed yet.
+    Refresh {
+        /// What to refresh: a folder path (inside the mountpoint or relative to
+        /// it), `trash`, or `photos`. The mount root if omitted.
+        target: Option<String>,
+    },
 
     /// Manage the account's registered devices.
     Devices {
@@ -341,6 +351,22 @@ enum BookmarkCmd {
     Rm { token: String },
 }
 
+/// Render a daemon failure for a terminal.
+///
+/// Offline is the one class worth rewording: the daemon's prose names whichever
+/// call happened to hit the network, which tells someone at a shell nothing they
+/// can act on. Every other class already says something specific, so it is
+/// printed as sent.
+fn cli_error(kind: ErrorKind, message: &str) -> String {
+    match kind {
+        ErrorKind::Offline => "offline: the Proton Drive API is unreachable".to_string(),
+        // The daemon's wording names the failed call ("upload x: ..."), which
+        // does not say the thing the user has to act on.
+        ErrorKind::Quota => format!("out of storage: {message}"),
+        _ => message.to_string(),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -376,6 +402,7 @@ fn main() -> Result<()> {
         Command::Restore { uids } => cmd_restore(uids),
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
         Command::EmptyTrash => cmd_empty_trash(),
+        Command::Refresh { target } => cmd_refresh(target),
         Command::Devices { action } => cmd_devices(action),
         Command::Sync { action } => cmd_sync(action),
         Command::Share {
@@ -418,7 +445,7 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
                     );
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         DeviceCmd::Rename { uid, name } => {
@@ -451,14 +478,23 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                     } else {
                         f.last_sync.to_string()
                     };
+                    // A queued switch is reported as the mode the folder is moving
+                    // to, so `sync list` never reads as if the request was dropped.
+                    let mode = match &f.pending_mode {
+                        Some(pending) => format!("{} → {pending}", f.mode),
+                        None => f.mode.clone(),
+                    };
                     println!(
-                        "[{}]  {}  ({}, {}, synced: {sync})",
-                        f.id, f.local_path, f.mode, f.state
+                        "[{}]  {}  ({mode}, {}, synced: {sync})",
+                        f.id, f.local_path, f.state
                     );
                     // A pass in flight says what it is doing, indented under it.
                     if let Some(p) = &f.progress {
                         match p.phase {
-                            SyncPhase::Scanning => println!("      scanning…"),
+                            SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
+                            SyncPhase::Scanning => {
+                                println!("      scanning: {} of {}", p.done, p.total.max(p.done))
+                            }
                             SyncPhase::Applying => println!(
                                 "      {} of {}  {}",
                                 p.done + 1,
@@ -469,7 +505,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                     }
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         SyncCmd::Rm { id, delete_remote } => {
@@ -525,7 +561,7 @@ fn cmd_members(path: PathBuf) -> Result<()> {
                 None => println!("public link: none"),
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -564,7 +600,7 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
             CtlResponse::PublicLink { link } => {
                 println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         PublicLinkCmd::Remove { path, id } => {
@@ -606,7 +642,7 @@ fn cmd_shared() -> Result<()> {
                 println!("{kind} {}{tags}  [{}]", it.name, it.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -623,7 +659,7 @@ fn cmd_shared_with_me() -> Result<()> {
                 println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -645,7 +681,7 @@ fn cmd_activity(limit: usize) -> Result<()> {
                 println!("{mark} {when}  {verb:<8} {}{detail}", a.target);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -709,7 +745,7 @@ fn cmd_invitations(action: InvitationCmd) -> Result<()> {
                     println!("{} shared {kind} \"{name}\"  [{}]", i.inviter_email, i.id);
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         InvitationCmd::Accept { id } => {
@@ -732,7 +768,7 @@ fn cmd_bookmarks(action: BookmarkCmd) -> Result<()> {
                     println!("{name}  {}  [{}]", b.url, b.token);
                 }
             }
-            CtlResponse::Error { message } => bail!("{message}"),
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
         BookmarkCmd::Add { url, password } => {
@@ -753,7 +789,7 @@ fn cmd_bookmarks(action: BookmarkCmd) -> Result<()> {
 fn ok_or_bail(resp: CtlResponse) -> Result<()> {
     match resp {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -809,9 +845,19 @@ fn cmd_status() -> Result<()> {
     // If a mount daemon is running, report live status from its control socket.
     match control_request(CtlRequest::Status) {
         Ok(CtlResponse::Status {
-            mountpoint, pinned, ..
+            mountpoint,
+            pinned,
+            online,
+            pending_uploads,
+            pending_changes,
+            ..
         }) => {
-            println!("Mounted at {mountpoint} ({pinned} pinned)");
+            let state = if online { "" } else { ", offline" };
+            let queued = match pending_summary(pending_uploads, pending_changes) {
+                Some(s) => format!(", {s}"),
+                None => String::new(),
+            };
+            println!("Mounted at {mountpoint} ({pinned} pinned{state}{queued})");
         }
         Ok(other) => println!("Mount: unexpected response {other:?}"),
         Err(_) => println!("Mount: not running."),
@@ -926,7 +972,7 @@ fn cmd_pin(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -937,7 +983,7 @@ fn cmd_unpin(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -985,7 +1031,7 @@ fn cmd_transfers() -> Result<()> {
                 );
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -999,7 +1045,7 @@ fn cmd_pins() -> Result<()> {
                 println!("{}", p.path);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1019,14 +1065,19 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
                 println!("{kind}{pin} {:>12}  {}  [{}]", e.size, e.name, e.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
 }
 
 fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
-    match control_request(CtlRequest::PhotosTimeline { offset, limit })? {
+    match control_request(CtlRequest::PhotosTimeline {
+        offset,
+        limit,
+        kind: None,
+        range: None,
+    })? {
         CtlResponse::Photos {
             available: false, ..
         } => {
@@ -1053,7 +1104,7 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
                 println!("{}  {}  {thumb}", p.capture_time, p.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1062,7 +1113,7 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
 fn cmd_open_photo(uid: String) -> Result<()> {
     match control_request(CtlRequest::OpenPhoto { uid })? {
         CtlResponse::FilePath { path } => println!("{path}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1078,7 +1129,7 @@ fn cmd_search(query: String, limit: usize) -> Result<()> {
                 println!("{kind}{pin} {:>12}  {}", h.size, h.path);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1090,7 +1141,7 @@ fn cmd_rename(path: PathBuf, new_name: String) -> Result<()> {
         new_name,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1102,7 +1153,7 @@ fn cmd_move(path: PathBuf, new_parent: PathBuf) -> Result<()> {
         new_parent: path_arg(&new_parent)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1113,7 +1164,7 @@ fn cmd_rm(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1128,7 +1179,7 @@ fn cmd_trash() -> Result<()> {
                 println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
             }
         }
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1137,7 +1188,7 @@ fn cmd_trash() -> Result<()> {
 fn cmd_restore(uids: Vec<String>) -> Result<()> {
     match control_request(CtlRequest::Restore { uids })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1150,7 +1201,7 @@ fn cmd_delete_forever(uids: Vec<String>) -> Result<()> {
     ))?;
     match control_request(CtlRequest::DeleteForever { uids })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1160,7 +1211,26 @@ fn cmd_empty_trash() -> Result<()> {
     confirm("Permanently delete everything in the trash? This cannot be undone.")?;
     match control_request(CtlRequest::EmptyTrash)? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Drop a cached listing. `trash` and `photos` name those two listings; anything
+/// else is read as a folder path, so a folder actually called "trash" is still
+/// reachable as `./trash`.
+fn cmd_refresh(target: Option<String>) -> Result<()> {
+    let scope = match target.as_deref() {
+        Some("trash") => RefreshScope::Trash,
+        Some("photos") => RefreshScope::Photos,
+        path => RefreshScope::Dir {
+            path: path.unwrap_or("").to_string(),
+        },
+    };
+    match control_request(CtlRequest::Refresh { scope })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1186,7 +1256,7 @@ fn cmd_mkdir(parent: PathBuf, name: String) -> Result<()> {
         name,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
@@ -1209,7 +1279,7 @@ fn cmd_upload(sources: Vec<PathBuf>, parent: PathBuf) -> Result<()> {
         sources: abs,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message } => bail!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
