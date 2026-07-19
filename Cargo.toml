@@ -10,8 +10,8 @@ authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
 
 [workspace.dependencies]
-proton-sdk = { version = "0.1", path = "../proton-sdk-rs/crates/proton-sdk" }
-proton-drive-rs = { version = "0.1", path = "../proton-sdk-rs/crates/proton-drive-rs" }
+proton-sdk = { version = "0.1.10" }
+proton-drive-rs = { version = "0.1.10" }
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }
