@@ -128,6 +128,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -268,6 +274,18 @@ dependencies = [
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "async-compression"
+version = "0.4.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -922,6 +940,23 @@ dependencies = [
  "bytes",
  "memchr",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
 name = "concurrent-queue"
@@ -1657,6 +1692,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2176,6 +2217,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
 ]
 
 [[package]]
@@ -2926,6 +2978,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3434,7 +3495,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pdfs-cli"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -3449,11 +3510,12 @@ dependencies = [
 
 [[package]]
 name = "pdfs-core"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "directories",
  "ignore",
  "keyring",
+ "parking_lot",
  "proton-drive-rs",
  "proton-sdk",
  "rusqlite",
@@ -3467,12 +3529,13 @@ dependencies = [
 
 [[package]]
 name = "pdfs-fuse"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "fuser",
  "image",
  "libc",
  "notify",
+ "parking_lot",
  "pdfs-core",
  "proton-drive-rs",
  "serde_json",
@@ -3482,7 +3545,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-gui"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3742,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -3751,6 +3814,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
+ "lru",
  "pgp",
  "proton-sdk",
  "reqwest",
@@ -3766,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "aes-gcm 0.11.0",
  "async-trait",
@@ -3779,6 +3843,7 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "lru",
  "num-bigint 0.5.1",
  "num-traits",
  "pgp",
@@ -3882,7 +3947,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5043,12 +5108,17 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags 2.13.0",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

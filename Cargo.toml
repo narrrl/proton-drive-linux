@@ -3,15 +3,15 @@ resolver = "2"
 members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
 
 [workspace.dependencies]
-proton-sdk = "0.1.6"
-proton-drive-rs = "0.1.6"
+proton-sdk = { version = "0.1", path = "../proton-sdk-rs/crates/proton-sdk" }
+proton-drive-rs = { version = "0.1", path = "../proton-sdk-rs/crates/proton-drive-rs" }
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }
@@ -22,6 +22,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
+# Non-poisoning mutexes. A handler that panics while holding a lock must not
+# wedge every later acquisition of it: `Workers` catches the unwind to keep the
+# pool alive, and `std::sync::Mutex` would defeat that by poisoning the state
+# the recovered worker needs.
+parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
@@ -37,9 +42,3 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 fuser = "0.17"
 libc = "0.2"
-
-# Development override: build against the local SDK checkout until 0.1.6 is
-# published to crates.io. Remove this block to consume the released crate.
-[patch.crates-io]
-proton-sdk = { path = "../proton-sdk-rs/crates/proton-sdk" }
-proton-drive-rs = { path = "../proton-sdk-rs/crates/proton-drive-rs" }

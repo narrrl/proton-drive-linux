@@ -18,7 +18,9 @@ use ksni::menu::StandardItem;
 use ksni::{MenuItem, Tray, TrayService};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{JobItem, Request, Response, TransferDirection, TransferItem, send};
+use pdfs_core::control::{
+    JobItem, Request, Response, TransferDirection, TransferItem, pending_summary, send,
+};
 use pdfs_core::service;
 
 /// How often the tray re-polls the daemon to refresh its menu.
@@ -86,9 +88,19 @@ struct DriveTray {
 fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
     match send(socket, &Request::Status) {
         Ok(Response::Status {
-            mountpoint, pinned, ..
+            mountpoint,
+            pinned,
+            online,
+            pending_uploads,
+            pending_changes,
+            ..
         }) => DriveState {
-            line: format!("Mounted at {mountpoint} ({pinned} pinned)"),
+            line: match (online, pending_summary(pending_uploads, pending_changes)) {
+                (true, None) => format!("Mounted at {mountpoint} ({pinned} pinned)"),
+                (true, Some(q)) => format!("Syncing — {q} ({pinned} pinned)"),
+                (false, None) => format!("Offline — cached files only ({pinned} pinned)"),
+                (false, Some(q)) => format!("Offline — {q}"),
+            },
             mounted: true,
             mountpoint: PathBuf::from(mountpoint),
             // Same daemon is up, so a cheap follow-up poll gives the sync line.
@@ -258,6 +270,12 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(&tray_sock);
     let _lock_socket = std::os::unix::net::UnixListener::bind(&tray_sock)
         .context("failed to bind tray single-instance socket")?;
+    // Owner-only like the control socket (B6). This one only guards single
+    // instancing, so a failure is logged rather than fatal — but there is no
+    // reason to leave it reachable by other local users either.
+    if let Err(e) = pdfs_core::config::restrict_socket(&tray_sock) {
+        tracing::warn!(error = %e, "could not restrict tray socket permissions");
+    }
 
     let socket = dirs.control_socket();
     let default_mountpoint = dirs.default_mountpoint();

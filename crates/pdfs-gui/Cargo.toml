@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "pdfs-app"
-path = "src/app.rs"
+path = "src/app/main.rs"
 
 [[bin]]
 name = "pdfs-prompt"

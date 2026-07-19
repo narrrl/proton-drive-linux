@@ -1,6 +1,6 @@
 //! Static client identity and per-user filesystem paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -165,18 +165,104 @@ impl AppDirs {
             .unwrap_or_else(|| self.default_mountpoint())
     }
 
-    /// Create state + cache dirs if missing.
+    /// Create state + cache dirs if missing, owner-only.
+    ///
+    /// The mode is set explicitly rather than left to the umask. These
+    /// directories hold decrypted file content, a plaintext index of every node
+    /// name in the Drive, and the control socket — and `create_dir_all` under a
+    /// typical umask makes them `0755`. Until this was fixed, the only thing
+    /// keeping another local user out was `~/.cache` and `~/.local/state`
+    /// happening to be `0700`, which is a convention of the user's system and
+    /// not something this client established (bugs.md B6).
+    ///
+    /// Applied on every start, not just at creation: a directory that already
+    /// exists with a permissive mode — restored from a backup that flattened
+    /// modes, or created by an older build — is tightened here.
     pub fn ensure(&self) -> Result<()> {
-        std::fs::create_dir_all(self.state_dir())?;
-        std::fs::create_dir_all(self.cache_dir())?;
-        let _ = std::fs::create_dir_all(self.dirs.config_dir());
+        for dir in [self.state_dir(), self.cache_dir()] {
+            std::fs::create_dir_all(&dir)?;
+            restrict_dir(&dir);
+        }
+        let config_dir = self.dirs.config_dir().to_path_buf();
+        if std::fs::create_dir_all(&config_dir).is_ok() {
+            restrict_dir(&config_dir);
+        }
         Ok(())
     }
+}
+
+/// Make `dir` owner-only (`0700`). Best effort: a mode we cannot set (an
+/// exotic filesystem, a directory we do not own) is not worth refusing to
+/// start over, and the caller has no better answer than continuing.
+fn restrict_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        tracing::warn!(path = %dir.display(), error = %e, "could not restrict directory to 0700");
+    }
+}
+
+/// Make a just-bound Unix socket owner-only (`0600`).
+///
+/// Connecting to the control socket drives the daemon with its authenticated
+/// session — enumerate, read, upload, trash, share — without presenting any
+/// credential, since the daemon already holds one. It is an authority boundary,
+/// not merely private data, and `UnixListener::bind` applies the umask like any
+/// other file (bugs.md B6).
+///
+/// There is a window between `bind` and this call during which the socket
+/// carries the umask's mode. It is closed in practice by the containing
+/// directory: [`Dirs::ensure`] has already made the state directory `0700`, so
+/// nothing else can reach the socket to exploit the window.
+pub fn restrict_socket(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// bugs.md B6. A permissive mode here is not a cosmetic problem: these
+    /// directories hold decrypted content, a plaintext index of every node name,
+    /// and the control socket that commands the daemon's session.
+    #[test]
+    fn restrict_dir_makes_a_directory_owner_only() {
+        let dir = std::env::temp_dir().join(format!("pdfs-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Start deliberately world-readable, as `create_dir_all` under a typical
+        // umask would leave it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict_dir(&dir);
+
+        assert_eq!(mode_of(&dir), 0o700, "group and other must have no access");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Connecting to the control socket confers the daemon's authenticated
+    /// session with no credential, so it is an authority boundary rather than
+    /// merely private data.
+    #[test]
+    fn restrict_socket_makes_a_socket_owner_only() {
+        let dir = std::env::temp_dir().join(format!("pdfs-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        restrict_socket(&sock).unwrap();
+
+        assert_eq!(mode_of(&sock), 0o600, "no other local user may connect");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_app_config_serialization() {
