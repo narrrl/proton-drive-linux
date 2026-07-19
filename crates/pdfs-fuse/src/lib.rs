@@ -184,6 +184,11 @@ const XATTR_THUMBNAIL: &str = "user.proton.thumbnail";
 /// Extended attribute exposing the larger server-side preview image of a file.
 const XATTR_PREVIEW: &str = "user.proton.preview";
 
+/// How many "this file has no thumbnail" answers [`Core::thumbnail`] remembers
+/// before dropping the lot and re-learning them. Sized to cover a large browsing
+/// session; each entry is a uid, a type tag and an mtime.
+const MAX_THUMBNAIL_MISSES: usize = 8192;
+
 /// How many files the bulk uploader ships at once. Overlaps the per-file network
 /// round-trips without letting an unbounded number of block buffers pile up.
 const UPLOAD_CONCURRENCY: usize = 4;
@@ -449,6 +454,16 @@ struct Core {
     /// those downloads is a full-size photo — so an in-flight uid is never started
     /// twice.
     thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
+    /// Nodes the remote has told us have *no* thumbnail of a given type, keyed by
+    /// `(uid, thumbnail type)` and holding the mtime the answer was learned at.
+    ///
+    /// Absence has to be cached or it costs a round trip every time it is asked
+    /// for, and it is asked for constantly: an `ls -l` from an xattr-aware lister
+    /// issues a `getxattr` per advertised name per entry, so a 65-file directory
+    /// of videos re-probed 130 times per listing at ~186 ms each (B5). The mtime
+    /// is the validity tag — a new revision may well have a thumbnail — matching
+    /// how [`ContentCache::read_thumbnail`] validates the positive side.
+    no_thumbnail: Arc<Mutex<HashMap<(NodeUid, i32), i64>>>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
@@ -2010,6 +2025,12 @@ impl Core {
         if let Some(bytes) = self.cache.read_thumbnail(&uid, ttype.as_i32(), mtime) {
             return Ok(Some(bytes));
         }
+        // "This file has no thumbnail" is an answer worth remembering: without
+        // it every listing pays a round trip per file to be told nothing (B5).
+        let key = (uid.clone(), ttype.as_i32());
+        if self.no_thumbnail.lock().get(&key) == Some(&mtime) {
+            return Ok(None);
+        }
         let bytes = self
             .rt
             .block_on(self.client.download_thumbnail(&uid, ttype))
@@ -2017,10 +2038,23 @@ impl Core {
                 warn!(%uid, error = %e, "download thumbnail failed");
                 Errno::EIO
             })?;
-        if let Some(bytes) = &bytes {
-            let _ = self
-                .cache
-                .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
+        match &bytes {
+            Some(bytes) => {
+                let _ = self
+                    .cache
+                    .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
+            }
+            None => {
+                let mut misses = self.no_thumbnail.lock();
+                // Bounded by clearing rather than by LRU: the entries are two
+                // words each, the cap is far above any plausible working set,
+                // and re-learning a miss costs one round trip. Not worth a
+                // second data structure to order them.
+                if misses.len() >= MAX_THUMBNAIL_MISSES {
+                    misses.clear();
+                }
+                misses.insert(key, mtime);
+            }
         }
         Ok(bytes)
     }
@@ -4118,6 +4152,25 @@ impl Filesystem for ProtonFs {
     /// a previewing client can fetch it without downloading the whole file. The
     /// bytes are fetched on demand and cached; absence yields `ENODATA`.
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        // Always off the dispatch loop: a miss goes to the wire, and a lister
+        // that stats a directory issues one of these per file per advertised
+        // name — inline, that serialized the whole mount behind ~186 ms of
+        // network per call (B5).
+        let fs = self.clone();
+        let name = name.to_os_string();
+        self.core.workers.run(Lane::Meta, move || {
+            fs.serve_getxattr(ino, &name, size, reply)
+        });
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        self.serve_listxattr(ino, size, reply);
+    }
+}
+
+impl ProtonFs {
+    /// The body of [`Filesystem::getxattr`], on a worker thread.
+    fn serve_getxattr(&self, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let ttype = match name.to_str() {
             Some(XATTR_THUMBNAIL) => ThumbnailType::Thumbnail,
             Some(XATTR_PREVIEW) => ThumbnailType::Preview,
@@ -4150,14 +4203,25 @@ impl Filesystem for ProtonFs {
         }
     }
 
-    /// Advertise the thumbnail/preview attribute names for regular files. The
-    /// names are listed unconditionally for files; a `getxattr` for one a given
-    /// file lacks returns `ENODATA`.
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let is_file = {
+    /// Advertise the thumbnail/preview attribute names, but only for files whose
+    /// media type can actually carry one.
+    ///
+    /// Listing them for every file is what made `ls -l` expensive: an xattr-aware
+    /// lister asks for each advertised name, and each ask that misses is a network
+    /// round trip (B5). Proton only ever generates thumbnails for images and
+    /// videos, so advertising them on a `.mkv` or a `.pdf` is an invitation to do
+    /// work that can only end in `ENODATA`. `getxattr` still serves an explicit
+    /// request for an unadvertised name, so nothing becomes unreachable.
+    fn serve_listxattr(&self, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let thumbnailable = {
             let st = self.core.state.lock();
             match st.entries.get(&ino.0) {
-                Some(e) => e.node.is_file(),
+                Some(e) => match &e.node.kind {
+                    NodeKind::File { media_type, .. } => {
+                        media_type.starts_with("image/") || media_type.starts_with("video/")
+                    }
+                    NodeKind::Folder => false,
+                },
                 None => {
                     reply.error(Errno::ENOENT);
                     return;
@@ -4166,7 +4230,7 @@ impl Filesystem for ProtonFs {
         };
         // xattr names are returned as a NUL-terminated, concatenated list.
         let mut buf = Vec::new();
-        if is_file {
+        if thumbnailable {
             for name in [XATTR_THUMBNAIL, XATTR_PREVIEW] {
                 buf.extend_from_slice(name.as_bytes());
                 buf.push(0);
@@ -4578,6 +4642,7 @@ pub fn mount(
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
+        no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
         transfers: TransferRegistry::new(),
         indexing: Arc::new(AtomicBool::new(false)),
         sync_progress: Arc::new(Mutex::new(HashMap::new())),
