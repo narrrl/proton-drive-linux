@@ -63,6 +63,22 @@ sudo apt-get install -y \
 sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus
 ```
 
+### Fedora (44+)
+```bash
+sudo dnf install -y \
+  pkgconf-pkg-config fuse3-devel gtk4-devel libadwaita-devel \
+  libsecret-devel dbus-devel glib2-devel cargo rust
+```
+
+Runtime extras (pick your desktop):
+```bash
+# GNOME — keyring + tray (AppIndicator)
+sudo dnf install -y gnome-keyring gnome-shell-extension-appindicator xdg-utils
+
+# KDE Plasma — KWallet (Secret Service); tray works via built-in SNI
+sudo dnf install -y kwallet xdg-utils
+```
+
 ---
 
 ## Building from Source
@@ -99,6 +115,20 @@ sudo apt install ./proton-drive-linux_*.deb
 A local `PKGBUILD` is available under the `packaging/` directory. You can build and install it using:
 ```bash
 cd packaging && makepkg -fi
+```
+
+### 3. Fedora (local RPM)
+A local `.spec` is available under `packaging/`. From the repository root:
+```bash
+sudo dnf install -y rpm-build
+rpmbuild -bb packaging/proton-drive-linux.spec \
+  --define "git_dir $PWD" \
+  --define "_rpmdir $PWD/packaging/out" \
+  --define "_builddir $PWD/packaging/build" \
+  --define "_sourcedir $PWD" \
+  --define "_specdir $PWD/packaging" \
+  --define "_srcrpmdir $PWD/packaging/out"
+sudo dnf install packaging/out/x86_64/proton-drive-linux-*.rpm
 ```
 
 ---
