@@ -8,6 +8,7 @@
 
 use keyring::Entry;
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
+use proton_sdk::api::{HumanVerification, HumanVerificationCredential};
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use serde::{Deserialize, Serialize};
@@ -84,14 +85,68 @@ fn keyring_entry() -> Result<Entry> {
 /// Run an interactive SRP + (optional) 2FA login and persist the session.
 ///
 /// `get_totp` is only invoked when the account requires a second factor, so
-/// callers can defer prompting until it is actually needed.
+/// callers can defer prompting until it is actually needed. It may be called
+/// more than once — [`login_interactive`] re-runs the whole login after human
+/// verification, and a 2FA account needs a fresh code on that second attempt.
+///
+/// A gated login fails with [`Error::HumanVerificationRequired`]; a front-end
+/// that can present the challenge should use [`login_interactive`] instead.
 pub async fn login(
     username: &str,
     password: &str,
-    get_totp: impl FnOnce() -> Result<String>,
+    get_totp: impl Fn() -> Result<String>,
 ) -> Result<()> {
-    let mut session =
-        ProtonApiSession::begin(client_config(), username, password.as_bytes()).await?;
+    login_verified(username, password, None, get_totp).await
+}
+
+/// [`login`], able to answer a human-verification gate rather than fail on it.
+///
+/// `get_hv` is invoked only when the API actually gates the login, mirroring how
+/// `get_totp` is only invoked for accounts with a second factor: neither costs a
+/// prompt the user did not need. It receives the challenge and returns the token
+/// the user earned by solving it.
+///
+/// The retry lives here rather than in the front-ends because the recovery is
+/// not a UI concern: the gated attempt burned its SRP handshake, so the login
+/// has to start over with the credential attached, and every front-end would
+/// otherwise have to know that. Gating the *retry* is not handled — a second
+/// challenge in a row means the token was rejected, and looping on it would trap
+/// the user in a CAPTCHA that never clears.
+pub async fn login_interactive(
+    username: &str,
+    password: &str,
+    get_totp: impl Fn() -> Result<String>,
+    get_hv: impl FnOnce(HumanVerification) -> Result<HumanVerificationCredential>,
+) -> Result<()> {
+    match login_verified(username, password, None, &get_totp).await {
+        Err(Error::HumanVerificationRequired(hv)) => {
+            let credential = get_hv(*hv)?;
+            login_verified(username, password, Some(&credential), &get_totp).await
+        }
+        other => other,
+    }
+}
+
+/// [`login`], replaying a human-verification token the user has already earned.
+///
+/// A gated login fails with [`Error::HumanVerificationRequired`] carrying the
+/// challenge. The front-end presents it, collects the solved token, and calls
+/// this. The login starts over from the SRP handshake rather than resuming: the
+/// gated attempt never got a session, and its `srp_session` is spent.
+pub async fn login_verified(
+    username: &str,
+    password: &str,
+    verification: Option<&HumanVerificationCredential>,
+    get_totp: impl Fn() -> Result<String>,
+) -> Result<()> {
+    let mut session = ProtonApiSession::begin_verified(
+        client_config(),
+        username,
+        password.as_bytes(),
+        verification,
+    )
+    .await
+    .map_err(classify_verification_gate)?;
 
     if session.is_waiting_for_second_factor() {
         let code = get_totp()?;
@@ -108,6 +163,23 @@ pub async fn login(
 
     save(&session, password, key_salts).await?;
     Ok(())
+}
+
+/// Lift a human-verification gate out of the generic API error into the typed
+/// variant a front-end can act on.
+///
+/// Only a gate that names a solvable method is converted. A `9001` with no
+/// `Details`, or one offering only `email`/`sms`, stays a plain API error:
+/// promoting it would send the UI to open a verification page it cannot
+/// complete, which reads to the user as a hang rather than a refusal.
+fn classify_verification_gate(e: proton_sdk::error::ProtonError) -> Error {
+    let proton_sdk::error::ProtonError::Api(api) = &e else {
+        return e.into();
+    };
+    match api.human_verification() {
+        Some(hv) if hv.supports_captcha() => Error::HumanVerificationRequired(Box::new(hv)),
+        _ => e.into(),
+    }
 }
 
 /// Persist the session's current tokens, mailbox password and key salts.

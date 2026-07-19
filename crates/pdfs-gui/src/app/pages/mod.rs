@@ -8,3 +8,4 @@ pub(crate) mod shared;
 pub(crate) mod shared_by_me;
 pub(crate) mod status;
 pub(crate) mod trash;
+pub(crate) mod verify;

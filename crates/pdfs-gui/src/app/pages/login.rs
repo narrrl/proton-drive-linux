@@ -1,4 +1,5 @@
 use crate::*;
+use pdfs_core::proton_sdk::api::HumanVerificationCredential;
 
 pub(crate) struct LoginState {
     // Login page.
@@ -104,15 +105,32 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
 
         ui.login.login_button.set_sensitive(false);
         ui.login.login_status.set_text("Signing in…");
-        let (rx, totp_req_rx) = spawn_login(username, password);
+        let (rx, totp_req_rx, hv_req_rx) = spawn_login(username, password);
 
         // Surface the 2FA dialog only if the SDK actually asks for a code (i.e.
         // the account has 2FA enabled). The worker blocks until the dialog feeds
         // back a code (or is cancelled, dropping the sender).
+        //
+        // Loops rather than awaiting once: a login gated behind a CAPTCHA is
+        // restarted after verification, so a 2FA account is asked for a second,
+        // unexpired code on the retry.
         let ui_2fa = ui.clone();
         glib::spawn_future_local(async move {
-            if let Ok(code_tx) = totp_req_rx.recv().await {
+            while let Ok(code_tx) = totp_req_rx.recv().await {
                 prompt_2fa(&ui_2fa, code_tx);
+            }
+        });
+
+        // Same shape for human verification: only fires when the API gates the
+        // sign-in, and the worker is blocked on the token until it does.
+        let ui_hv = ui.clone();
+        glib::spawn_future_local(async move {
+            if let Ok((url, token_tx)) = hv_req_rx.recv().await {
+                ui_hv
+                    .login
+                    .login_status
+                    .set_text("Complete the verification to continue…");
+                prompt_human_verification(&ui_hv, &url, token_tx);
             }
         });
 
@@ -155,9 +173,13 @@ pub(crate) fn spawn_login(
 ) -> (
     async_channel::Receiver<Result<(), String>>,
     async_channel::Receiver<std::sync::mpsc::Sender<String>>,
+    async_channel::Receiver<(String, std::sync::mpsc::Sender<String>)>,
 ) {
     let (tx, rx) = async_channel::bounded(1);
-    let (totp_req_tx, totp_req_rx) = async_channel::bounded(1);
+    // Two, not one: a CAPTCHA-gated login restarts, so a 2FA account is asked
+    // for a code on each attempt and a single slot would deadlock the worker.
+    let (totp_req_tx, totp_req_rx) = async_channel::bounded(2);
+    let (hv_req_tx, hv_req_rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -170,24 +192,42 @@ pub(crate) fn spawn_login(
             }
         };
         let result = rt.block_on(async move {
-            auth::login(&username, &password, || {
-                // 2FA required: hand a one-shot sender to the UI and block until
-                // the dialog supplies the code. A dropped sender (cancelled
-                // dialog) surfaces as a cancelled login.
-                let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
-                totp_req_tx
-                    .send_blocking(code_tx)
-                    .map_err(|_| pdfs_core::Error::Other("two-factor prompt closed".into()))?;
-                code_rx
-                    .recv()
-                    .map_err(|_| pdfs_core::Error::Other("two-factor entry cancelled".into()))
-            })
+            auth::login_interactive(
+                &username,
+                &password,
+                || {
+                    // 2FA required: hand a one-shot sender to the UI and block
+                    // until the dialog supplies the code. A dropped sender
+                    // (cancelled dialog) surfaces as a cancelled login.
+                    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+                    totp_req_tx
+                        .send_blocking(code_tx)
+                        .map_err(|_| pdfs_core::Error::Other("two-factor prompt closed".into()))?;
+                    code_rx
+                        .recv()
+                        .map_err(|_| pdfs_core::Error::Other("two-factor entry cancelled".into()))
+                },
+                |hv| {
+                    // Gated: hand the UI the page to show, block on the token the
+                    // user earns by solving it.
+                    let (token_tx, token_rx) = std::sync::mpsc::channel::<String>();
+                    hv_req_tx
+                        .send_blocking((hv.verification_url(), token_tx))
+                        .map_err(|_| {
+                            pdfs_core::Error::Other("verification prompt closed".into())
+                        })?;
+                    let token = token_rx
+                        .recv()
+                        .map_err(|_| pdfs_core::Error::Other("verification cancelled".into()))?;
+                    Ok(HumanVerificationCredential::captcha(token))
+                },
+            )
             .await
             .map_err(|e| e.to_string())
         });
         let _ = tx.send_blocking(result);
     });
-    (rx, totp_req_rx)
+    (rx, totp_req_rx, hv_req_rx)
 }
 
 /// Show the lazy two-factor dialog and feed the entered code back to the waiting

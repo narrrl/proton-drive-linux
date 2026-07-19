@@ -1,5 +1,6 @@
 //! Crate-wide error type.
 
+use proton_sdk::api::HumanVerification;
 use thiserror::Error;
 
 use crate::control::ErrorKind;
@@ -30,6 +31,15 @@ pub enum Error {
     /// does not have. Only a fresh password login restores it.
     #[error("saved session can no longer unlock your keys — run `pdfs login` again")]
     ReloginRequired,
+
+    /// The login was gated behind human verification. Not a failure the user can
+    /// fix by retrying: the challenge has to be solved and the login restarted
+    /// with the resulting token (see [`auth::login_verified`](crate::auth::login_verified)).
+    ///
+    /// Carries the challenge rather than just a message so a front-end can
+    /// present it; a front-end that cannot (no webview) still has prose to show.
+    #[error("sign-in needs human verification — complete the CAPTCHA to continue")]
+    HumanVerificationRequired(Box<HumanVerification>),
 
     #[error("{0}")]
     Other(String),
@@ -154,7 +164,9 @@ impl From<serde_json::Error> for CoreError {
 impl From<Error> for CoreError {
     fn from(e: Error) -> Self {
         let kind = match &e {
-            Error::NotLoggedIn | Error::ReloginRequired => ErrorKind::Denied,
+            Error::NotLoggedIn | Error::ReloginRequired | Error::HumanVerificationRequired(_) => {
+                ErrorKind::Denied
+            }
             Error::Proton(proton_sdk::ProtonError::Api(api)) => api_kind(api.code),
             // A `ProtonError` that never reached the API is a transport failure.
             Error::Proton(_) => ErrorKind::Offline,
