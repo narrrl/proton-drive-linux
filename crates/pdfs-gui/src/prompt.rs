@@ -515,18 +515,32 @@ fn build_window(app: &adw::Application) {
                 ui_key.cycle_filter(back);
                 glib::Propagation::Stop
             }
-            gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
-                // Fall back to the top row when nothing is explicitly selected
-                // (e.g. results haven't rendered yet); `open` guards the rest.
-                ui_key.open(ui_key.cursor.get().unwrap_or(0), &window_key);
-                glib::Propagation::Stop
-            }
+            // Return is deliberately absent: `GtkText` binds it to `activate`
+            // and consumes it, so a bubble-phase controller on the window never
+            // sees it while the entry has focus (which is always, here). It is
+            // handled on the entry's `activate` signal instead — see below.
             _ => glib::Propagation::Proceed,
         }
     });
     // On the window, not the entry: arrow keys must steer the list even when the
     // pointer has moved focus into it.
     window.add_controller(keys);
+
+    // Enter opens the row under the cursor. This lives on the entry rather than
+    // with the other keys on the window because `GtkText` claims Return for its
+    // own `activate` binding, so a bubble-phase controller upstream of the
+    // focused entry is never reached. Enter with focus in the list is covered by
+    // `row_activated` above.
+    let ui_activate = ui.clone();
+    let window_activate = window.clone();
+    entry.connect_activate(move |_| {
+        if ui_activate.opening.get() {
+            return;
+        }
+        // Fall back to the top row when nothing is explicitly selected (e.g.
+        // results haven't rendered yet); `open` guards the rest.
+        ui_activate.open(ui_activate.cursor.get().unwrap_or(0), &window_activate);
+    });
 
     let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let ui_changed = ui.clone();
