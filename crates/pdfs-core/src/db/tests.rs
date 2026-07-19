@@ -373,7 +373,8 @@ fn children_if_listed_gated_on_flag() {
 fn a_deleted_child_leaves_a_listed_parent_serving_a_stale_listing() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("root", None, "My Files")).unwrap();
-    db.upsert_node(&folder("dst", Some("root"), "dest")).unwrap();
+    db.upsert_node(&folder("dst", Some("root"), "dest"))
+        .unwrap();
     db.upsert_node(&file("f1", "root", "a.txt", 1)).unwrap();
     db.set_listed(&uid("dst"), true).unwrap();
 
@@ -1302,7 +1303,10 @@ fn next_due_op_respects_backoff() {
     let id = db.enqueue_op(&bulk_op(1, &root)).unwrap().0;
     db.record_op_failure(id, "boom", 5_000).unwrap();
 
-    assert!(db.next_due_op(4_999).unwrap().is_none(), "still backing off");
+    assert!(
+        db.next_due_op(4_999).unwrap().is_none(),
+        "still backing off"
+    );
     assert!(db.next_due_op(5_000).unwrap().is_some(), "due now");
 }
 
@@ -1362,7 +1366,9 @@ fn cache_total_bytes_agrees_with_summing_the_rows() {
     // query. The claim that matters — that the *common* path does not touch the
     // database at all — is pinned by `budget_check_is_free_when_under_budget`,
     // which compares against itself and so is load-independent.
-    println!("B4: {rounds} budget checks over {N} entries — scan {scan:?}, aggregate {aggregate:?}");
+    println!(
+        "B4: {rounds} budget checks over {N} entries — scan {scan:?}, aggregate {aggregate:?}"
+    );
 }
 
 /// Victims still come out least-recently-accessed first, now in bounded batches

@@ -90,7 +90,11 @@ impl Db {
     /// pass over a large cache does not read every row to drop a few, and so the
     /// `(kind, last_accessed)` index can answer it as a range scan with an early
     /// stop.
-    pub fn cache_eviction_candidates(&self, kind: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+    pub fn cache_eviction_candidates(
+        &self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT cache_key, size_bytes FROM cache_entries

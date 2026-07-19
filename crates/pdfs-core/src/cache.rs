@@ -179,6 +179,12 @@ pub struct ContentCache {
     /// **never** emptied on open: these are the only copy of content the user
     /// authored, and the whole point is that they outlive the daemon.
     staging_dir: PathBuf,
+    /// Subdirectory holding scratch files rescued from an unclean shutdown —
+    /// writes an application had `fsync`ed but not yet closed. Populated only at
+    /// open, drained by the daemon into `staging_dir` once it can address the
+    /// nodes they belong to. Like `staging_dir` and unlike `scratch_dir`, it is
+    /// never emptied blindly.
+    recovery_dir: PathBuf,
     /// JSON pin registry path.
     pins_path: PathBuf,
     /// Soft cap on total blob bytes. Exceeded only transiently: a `store`
@@ -225,9 +231,14 @@ impl ContentCache {
         std::fs::create_dir_all(&thumb_dir)?;
         let block_dir = content_dir.join("blocks");
         std::fs::create_dir_all(&block_dir)?;
-        // Scratch holds disk-backed write buffers; a previous run's leftovers are
-        // worthless, so start clean.
+        // Scratch holds disk-backed write buffers. A previous run's leftovers are
+        // worthless *except* where the application asked for durability: a handle
+        // that was `fsync`ed but never closed left a sidecar behind, and POSIX
+        // says those bytes are on stable storage. Rescue those, discard the rest.
         let scratch_dir = content_dir.join("scratch");
+        let recovery_dir = content_dir.join("recovery");
+        std::fs::create_dir_all(&recovery_dir)?;
+        Self::rescue_scratch(&scratch_dir, &recovery_dir);
         let _ = std::fs::remove_dir_all(&scratch_dir);
         std::fs::create_dir_all(&scratch_dir)?;
         // Staging, by contrast, is deliberately preserved across runs.
@@ -242,6 +253,7 @@ impl ContentCache {
             block_dir,
             scratch_dir,
             staging_dir,
+            recovery_dir,
             pins_path,
             max_bytes: AtomicU64::new(max_bytes),
             blob_bytes: AtomicU64::new(0),
@@ -429,6 +441,36 @@ impl ContentCache {
             .cache_touch(&Self::key(uid), KIND_BLOB, bytes.len() as u64, now_millis())?;
         self.blob_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.enforce_budget();
+        Ok(())
+    }
+
+    /// Adopt an existing on-disk file as `uid`'s cached content, without reading
+    /// it into memory.
+    ///
+    /// [`Self::store`] takes the bytes as a slice, which means a caller holding a
+    /// file has to load all of it first — fine for a thumbnail, an OOM for a
+    /// pinned video. This takes the path instead and hardlinks it into place,
+    /// falling back to a copy when `src` lives on another filesystem.
+    ///
+    /// The link makes the cache blob a second name for the same inode, so `src`
+    /// must not be rewritten in place afterwards — unlinking it (the staging
+    /// case, which is what this exists for) is fine and leaves the blob intact.
+    pub fn store_file(&self, uid: &NodeUid, mtime: i64, size: u64, src: &Path) -> Result<()> {
+        let blob = self.blob_path(uid);
+        let tmp = blob.with_extension("tmp");
+        // A stale tmp from an interrupted run would fail the link with EEXIST.
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::hard_link(src, &tmp).is_err() {
+            std::fs::copy(src, &tmp)?;
+        }
+        let bytes = std::fs::metadata(&tmp)?.len();
+        std::fs::rename(&tmp, &blob)?;
+        let meta = serde_json::to_vec(&Meta { mtime, size })?;
+        std::fs::write(self.meta_path(uid), meta)?;
+        self.db
+            .cache_touch(&Self::key(uid), KIND_BLOB, bytes, now_millis())?;
+        self.blob_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.enforce_budget();
         Ok(())
     }
@@ -624,6 +666,127 @@ impl ContentCache {
             .write(true)
             .open(&path)?;
         Ok((file, path))
+    }
+
+    /// The sidecar path for a scratch file, holding the [`StagedWrite`] that
+    /// describes it. Written by `fsync` and removed when the write is released;
+    /// its presence at open is what marks a scratch file as durable rather than
+    /// as a crashed run's rubbish.
+    ///
+    /// Safe as `with_extension` only because scratch names are dot-free (see
+    /// [`Self::create_scratch`]), so this appends rather than replaces.
+    pub fn scratch_sidecar(scratch: &Path) -> PathBuf {
+        scratch.with_extension("json")
+    }
+
+    /// Record that the write buffered in `scratch` is durable, so a crash before
+    /// `close(2)` does not lose it.
+    ///
+    /// Called from `fsync(2)`, whose contract is that the bytes survive a crash.
+    /// The scratch file itself does survive — it is a real file — but nothing
+    /// else knows it holds anything worth keeping, and open() clears the scratch
+    /// directory. The sidecar is that knowledge: uid, logical length, and which
+    /// ranges are authored rather than holes, which is exactly what recovery
+    /// needs to hand the blob to the drain.
+    ///
+    /// Written whole to a temp name and renamed, so a crash mid-write leaves the
+    /// previous sidecar rather than a truncated one. The caller is expected to
+    /// have synced `scratch` first: a sidecar promising bytes that never reached
+    /// the disk is worse than no sidecar.
+    pub fn mark_scratch_durable(&self, scratch: &Path, meta: &StagedWrite) -> Result<()> {
+        let side = Self::scratch_sidecar(scratch);
+        let tmp = side.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(meta)?)?;
+        std::fs::rename(&tmp, &side)?;
+        // The rename is what publishes the sidecar; fsync the directory so the
+        // rename itself survives, not just the bytes it points at.
+        if let Some(dir) = side.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Drop a scratch file's durability sidecar, once the write it described has
+    /// been staged (or turned out not to be dirty at all). Best effort: a
+    /// leftover sidecar whose blob is gone is ignored by recovery anyway.
+    pub fn clear_scratch_durable(&self, scratch: &Path) {
+        let _ = std::fs::remove_file(Self::scratch_sidecar(scratch));
+    }
+
+    /// Move every scratch file that carries a readable sidecar into `recovery`,
+    /// before the caller empties the scratch directory.
+    ///
+    /// Blob first, then sidecar: a blob in recovery without its sidecar is
+    /// dropped on the next open (indistinguishable from rubbish), whereas a
+    /// sidecar whose blob never arrived would describe nothing. Neither order is
+    /// lossless if we crash mid-rescue, but this one fails toward "unrecovered
+    /// bytes on disk" rather than "op queued against missing content".
+    fn rescue_scratch(scratch_dir: &Path, recovery_dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(scratch_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let blob = entry.path();
+            if blob.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            let side = Self::scratch_sidecar(&blob);
+            // Parsed, not merely present: an unreadable sidecar cannot drive a
+            // recovery, so the blob is rubbish like any other leftover.
+            if std::fs::read(&side)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
+                .is_none()
+            {
+                continue;
+            }
+            let Some(name) = blob.file_name() else {
+                continue;
+            };
+            if std::fs::rename(&blob, recovery_dir.join(name)).is_err() {
+                continue;
+            }
+            let Some(side_name) = side.file_name() else {
+                continue;
+            };
+            let _ = std::fs::rename(&side, recovery_dir.join(side_name));
+        }
+    }
+
+    /// Writes rescued from an unclean shutdown, as `(blob, meta)` pairs for the
+    /// daemon to hand to the upload queue. A blob whose sidecar did not survive
+    /// the rescue is deleted here — nothing can address it.
+    pub fn recovered_writes(&self) -> Vec<(PathBuf, StagedWrite)> {
+        let Ok(entries) = std::fs::read_dir(&self.recovery_dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let blob = entry.path();
+            if blob.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            match std::fs::read(Self::scratch_sidecar(&blob))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
+            {
+                Some(meta) => out.push((blob, meta)),
+                None => {
+                    let _ = std::fs::remove_file(&blob);
+                }
+            }
+        }
+        out
+    }
+
+    /// Retire a recovered write. `stage_write` has already moved the blob out,
+    /// so this is the sidecar left behind — and the blob too if the caller could
+    /// not use it and said so by leaving it in place.
+    pub fn discard_recovered(&self, blob: &Path) {
+        let _ = std::fs::remove_file(Self::scratch_sidecar(blob));
+        let _ = std::fs::remove_file(blob);
     }
 
     /// Move a released scratch file into the staging directory with a
@@ -1072,6 +1235,47 @@ mod tests {
         );
     }
 
+    /// The drain promotes a staged upload into the cache by path and then
+    /// unlinks the staging name. The cached copy has to survive that, and the
+    /// promote has to charge the LRU index like [`ContentCache::store`] does.
+    #[test]
+    fn store_file_adopts_blob_and_survives_source_unlink() {
+        let (c, d) = cache();
+        let u = uid("a");
+        let data = b"staged contents";
+        let src = d.path().join("staged-blob");
+        std::fs::write(&src, data).unwrap();
+
+        c.store_file(&u, 100, data.len() as u64, &src).unwrap();
+        std::fs::remove_file(&src).unwrap();
+
+        assert!(c.is_cached(&u, 100, data.len() as u64));
+        assert_eq!(
+            c.read_range(&u, 100, data.len() as u64, 7, 8).unwrap(),
+            b"contents"
+        );
+        assert_eq!(c.usage(), data.len() as u64);
+    }
+
+    /// A cross-filesystem staging dir cannot be hardlinked from; the copy
+    /// blob and its metadata must both be replaced wholesale — a stale `.meta`
+    /// left beside new content would validate a read of the wrong bytes. The
+    /// link goes to a temp name and is renamed over the blob for exactly this,
+    /// so re-storing over an existing entry is the case worth pinning.
+    #[test]
+    fn store_file_replaces_an_existing_blob() {
+        let (c, d) = cache();
+        let u = uid("a");
+        c.store(&u, 100, 3, b"old").unwrap();
+
+        let src = d.path().join("new-blob");
+        std::fs::write(&src, b"newer").unwrap();
+        c.store_file(&u, 200, 5, &src).unwrap();
+
+        assert!(!c.is_cached(&u, 100, 3), "stale meta must not validate");
+        assert_eq!(c.read_range(&u, 200, 5, 0, 5).unwrap(), b"newer");
+    }
+
     #[test]
     fn reconcile_rebuilds_index_from_disk() {
         let dir = TempDir::new();
@@ -1210,13 +1414,12 @@ mod tests {
             c.store_block(&uid("a"), 1, 100, i, b"aaaa").unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let indexed: u64 = c
-            .db
-            .cache_entries_by_kind("block")
-            .unwrap()
-            .iter()
-            .map(|(_, s)| s)
-            .sum();
+        let indexed: u64 =
+            c.db.cache_entries_by_kind("block")
+                .unwrap()
+                .iter()
+                .map(|(_, s)| s)
+                .sum();
         assert_eq!(
             c.block_bytes.load(Ordering::Relaxed),
             indexed,
@@ -1351,7 +1554,10 @@ mod tests {
         if let Some(got) = c.read_thumbnail(&u, 2, 100) {
             assert_eq!(got, two, "type 2 served type 1's bytes");
         }
-        assert_eq!(store_errors, 0, "a store lost its staging file to the other type");
+        assert_eq!(
+            store_errors, 0,
+            "a store lost its staging file to the other type"
+        );
     }
 
     #[test]
@@ -1575,6 +1781,89 @@ mod tests {
             b"unsent work",
             "staged bytes outlive the daemon that failed to upload them"
         );
+    }
+
+    /// A2: `fsync(2)` promises the bytes survive a crash, but queueing happens
+    /// at `release`. A scratch file marked durable must therefore outlive the
+    /// open that clears the scratch directory — and an unmarked one must not,
+    /// since that is a crashed run's rubbish.
+    #[test]
+    fn fsynced_scratch_survives_reopen_and_unmarked_scratch_does_not() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut synced, synced_path) = c.create_scratch().unwrap();
+        synced.write_all(b"fsynced bytes").unwrap();
+        synced.sync_all().unwrap();
+        let meta = StagedWrite {
+            uid: uid("a").to_string(),
+            len: 13,
+            base_size: 0,
+            base_mtime: 100,
+            authored: vec![(0, 13)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&synced_path, &meta).unwrap();
+
+        // A second handle that was written but never fsynced: no promise was
+        // made about it, and it is indistinguishable from a torn buffer.
+        let (mut loose, loose_path) = c.create_scratch().unwrap();
+        loose.write_all(b"never fsynced").unwrap();
+
+        // Crash: no release, no staging, just a restart.
+        drop(c);
+        let c2 = ContentCache::open(content, pins, 0, db).unwrap();
+
+        assert!(!synced_path.exists(), "scratch dir is still cleared");
+        assert!(!loose_path.exists());
+
+        let recovered = c2.recovered_writes();
+        assert_eq!(recovered.len(), 1, "only the fsynced write is recoverable");
+        let (blob, got) = &recovered[0];
+        assert_eq!(std::fs::read(blob).unwrap(), b"fsynced bytes");
+        assert_eq!(got.uid, uid("a").to_string());
+        assert_eq!(got.authored, vec![(0, 13)]);
+
+        // Staging it is what a restart does with it; the sidecar goes after.
+        let staged = c2.stage_write(got, blob).unwrap();
+        c2.discard_recovered(blob);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"fsynced bytes");
+        assert!(c2.recovered_writes().is_empty(), "recovery does not repeat");
+    }
+
+    /// Releasing a write hands the bytes to staging, so the sidecar an earlier
+    /// `fsync` left must not offer recovery a second, stale copy of it.
+    #[test]
+    fn cleared_durability_marker_stops_recovery() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut f, path) = c.create_scratch().unwrap();
+        f.write_all(b"released").unwrap();
+        let meta = StagedWrite {
+            uid: uid("a").to_string(),
+            len: 8,
+            base_size: 0,
+            base_mtime: 100,
+            authored: vec![(0, 8)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&path, &meta).unwrap();
+        c.clear_scratch_durable(&path);
+
+        drop(c);
+        let c2 = ContentCache::open(content, pins, 0, db).unwrap();
+        assert!(c2.recovered_writes().is_empty());
     }
 
     #[test]

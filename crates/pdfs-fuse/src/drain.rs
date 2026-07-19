@@ -731,10 +731,11 @@ impl Core {
 
         // The staged blob now matches the sealed revision, so a pinned file keeps
         // it as its cached content rather than re-downloading what we just sent.
-        if self.cache.is_pinned(&uid)
-            && let Ok(bytes) = std::fs::read(&blob)
-        {
-            let _ = self.cache.store(&uid, now_secs(), meta.len, &bytes);
+        // Adopted by link, not by value: the blob is the whole file, and a pinned
+        // video read into a `Vec` here is an OOM. `discard_staged` below drops the
+        // staging name only — the cache keeps the inode.
+        if self.cache.is_pinned(&uid) {
+            let _ = self.cache.store_file(&uid, now_secs(), meta.len, &blob);
         }
         self.cache.discard_staged(&blob);
         self.evict_reader(&uid);

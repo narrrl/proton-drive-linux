@@ -555,24 +555,44 @@ impl Core {
                     .next()
                     .ok_or_else(|| SwitchBlocked::Failed("remote folder not found".to_string()))?;
 
-                // Reclaim the disk: empty the local dir (keep it as the mountpoint).
-                evict_dir_contents(&local).map_err(|e| {
-                    SwitchBlocked::Failed(format!("evict {}: {e}", local.display()))
-                })?;
-
-                let session = self
-                    .spawn_ondemand_mount(&local, root)
-                    .map_err(|e| SwitchBlocked::Failed(e.to_string()))?;
-                self.mounts.lock().insert(id, session);
-                // Persist the mode only now that the mount is actually up. Writing it
-                // first would strand the folder on any failure below: the engine skips
-                // non-mirror folders, so an `ondemand` row with no mount is a folder
-                // that is neither mirrored nor browsable, and nothing retries it.
-                // Failing before this point leaves it `mirror`, and the next pass
-                // re-downloads whatever eviction removed.
+                // Persist the mode *before* touching the local tree, and never roll it
+                // back on failure.
+                //
+                // The eviction below deletes every local file in the folder. While the
+                // row still says `mirror`, that empty directory is a valid input to the
+                // sync engine, which reads it as "the user deleted all of this" and
+                // trashes the whole folder on Drive. So the window between the evict and
+                // the mode write is a window in which any failure — a busy mountpoint, a
+                // missing fuse module, a dead DB — destroys the folder. Writing the mode
+                // first closes it: the engine skips non-mirror folders, so the worst a
+                // failure can now leave behind is an `ondemand` row with no mount, which
+                // is inert. Inert and marked `error` is recoverable; trashed is not.
+                //
+                // The same reasoning forbids reverting to `mirror` when a step below
+                // fails, since eviction may already have deleted part of the tree.
+                // Recovery is the user's explicit switch back to `mirror`, whose arm
+                // clears the baseline and re-downloads.
                 self.db
                     .sync_folder_set_mode(id, "ondemand")
                     .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
+
+                // Reclaim the disk: empty the local dir (keep it as the mountpoint).
+                if let Err(e) = evict_dir_contents(&local) {
+                    let _ = self.db.sync_folder_set_state(id, "error", now_secs());
+                    return Err(SwitchBlocked::Failed(format!(
+                        "evict {}: {e}",
+                        local.display()
+                    )));
+                }
+
+                let session = match self.spawn_ondemand_mount(&local, root) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        let _ = self.db.sync_folder_set_state(id, "error", now_secs());
+                        return Err(SwitchBlocked::Failed(e.to_string()));
+                    }
+                };
+                self.mounts.lock().insert(id, session);
                 let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
                 self.db.sync_folder_set_state(id, "idle", now_secs()).ok();
                 info!(id, path = %local.display(), "mounted sync folder on-demand");

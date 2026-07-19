@@ -81,8 +81,8 @@ mod transfers;
 mod workers;
 use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
 use tracing::{debug, error, info, warn};
-use transfers::{CountingReader, CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
-use workers::{FUSE_WORKERS, Workers};
+use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
+use workers::{FUSE_WORKERS, Lane, Workers};
 
 /// Attribute/entry cache lifetime handed back to the kernel. Long because the
 /// Phase 2 event poller actively invalidates changed inodes; without a remote
@@ -634,6 +634,67 @@ impl Core {
         }
         if restored > 0 {
             info!(count = restored, "restored pending ops");
+        }
+    }
+
+    /// Queue the writes that an unclean shutdown caught between `fsync(2)` and
+    /// `close(2)`.
+    ///
+    /// `fsync` promises the bytes survive a crash, but the queueing that makes a
+    /// write outlive the daemon happens at `release`. A crash in between used to
+    /// lose the data outright, because the scratch directory is cleared at open.
+    /// Now `fsync` leaves a sidecar, `ContentCache::open` moves those blobs to
+    /// `recovery/`, and this walks them into the same staging + queued-op path a
+    /// normal release takes.
+    ///
+    /// Runs after [`hydrate_pending`](Self::hydrate_pending), which is what makes
+    /// the incomplete-blob check in [`enqueue_staged_write`](Self::enqueue_staged_write)
+    /// meaningful: a recovered partial write whose earlier write is still queued
+    /// must not gap-fill from a remote revision that no longer describes the
+    /// file. With `pending` already loaded, that case is detected and the bytes
+    /// are parked rather than mis-filled.
+    ///
+    /// Failure is per-write and never fatal: a node that no longer exists, or an
+    /// op that cannot be queued, leaves its blob in `recovery/` for the next run
+    /// (and for a human) instead of taking the mount down.
+    fn recover_fsynced_writes(&self) {
+        let recovered = self.cache.recovered_writes();
+        if recovered.is_empty() {
+            return;
+        }
+        let mut queued = 0usize;
+        for (blob, meta) in recovered {
+            let Some(uid) = parse_node_uid(&meta.uid) else {
+                error!(uid = %meta.uid, "recovered write has an unparseable uid; keeping bytes");
+                continue;
+            };
+            // The inode is only used to stamp the in-memory tree with the new
+            // size, and nothing is interned this early — `hydrate` reads the
+            // size back off `pending` when the node is first looked up, so 0
+            // (no such inode) is correct rather than merely tolerable.
+            match self.enqueue_staged_write(&uid, 0, &blob, meta) {
+                Ok(()) => {
+                    self.cache.discard_recovered(&blob);
+                    queued += 1;
+                }
+                Err(e) => {
+                    error!(%uid, blob = %blob.display(), error = ?e,
+                           "cannot queue a recovered write; bytes kept for the next run");
+                    // Some failures (a partial write parked by
+                    // `stage_orphaned_write`) still consume the blob. Its sidecar
+                    // would then describe nothing, so retire it — the bytes are
+                    // in staging, which is where a human looks for them.
+                    if !blob.exists() {
+                        self.cache.discard_recovered(&blob);
+                    }
+                }
+            }
+        }
+        if queued > 0 {
+            info!(
+                count = queued,
+                "recovered fsynced writes from an unclean shutdown"
+            );
         }
     }
 
@@ -1392,6 +1453,11 @@ impl Core {
     /// The scratch file is *moved* into staging, never copied: it is the only
     /// copy of what the user wrote.
     fn queue_revision(&self, h: &WriteHandle) -> Result<(), Errno> {
+        // The handle is being retired either way, so any durability sidecar an
+        // `fsync` left has done its job: from here the bytes are tracked as a
+        // staged write and a queued op, and a sidecar outliving them would offer
+        // recovery a second, stale copy of the same write.
+        self.cache.clear_scratch_durable(&h.path);
         if !h.dirty {
             let _ = std::fs::remove_file(&h.path);
             return Ok(());
@@ -2423,46 +2489,6 @@ impl Core {
         Ok(name.to_string())
     }
 
-    /// Upload a file named `name` with content `bytes` into the
-    /// mountpoint-relative `parent_rel` folder. Interns the new node directly.
-    fn upload(&self, parent_rel: &Path, name: &str, bytes: &[u8]) -> CoreResult<String> {
-        if name.is_empty() || name.contains('/') {
-            return Err(CoreError::invalid(format!("invalid name: {name:?}")));
-        }
-        let (pino, parent_uid) = self.resolve(parent_rel)?;
-        self.ensure_children(pino)
-            .map_err(|e| self.errno_error(e, "enumerate"))?;
-        let guard = self
-            .transfers
-            .begin(name, "", TransferDirection::Upload, bytes.len() as u64);
-        let reader = CountingReader::new(std::io::Cursor::new(bytes), &guard);
-        let new_uid = self
-            .rt
-            .block_on(self.client.upload_file_from(
-                &parent_uid,
-                name,
-                media_type_for(name),
-                reader,
-                bytes.len() as i64,
-                Vec::new(),
-                None,
-                false,
-            ))
-            .map_err(|e| CoreError::from_api(&e, "upload"))?;
-        drop(guard);
-        let node = self
-            .fetch_node(&new_uid)
-            .map_err(|e| self.errno_error(e, "fetch node"))?;
-        let mut st = self.state.lock();
-        let ino = st.intern(pino, node);
-        if let Some(kids) = st.children.get_mut(&pino)
-            && !kids.contains(&ino)
-        {
-            kids.push(ino);
-        }
-        Ok(name.to_string())
-    }
-
     /// Bulk-upload local files and directory trees under `sources` into the
     /// mountpoint-relative `parent_rel` folder. Directories are recreated (or
     /// merged into an existing same-named folder) and walked; the resulting flat
@@ -3328,7 +3354,7 @@ impl Filesystem for ProtonFs {
         let fs = self.clone();
         self.core
             .workers
-            .run(move || fs.serve_lookup(parent, &name, reply));
+            .run(Lane::Meta, move || fs.serve_lookup(parent, &name, reply));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -3360,7 +3386,7 @@ impl Filesystem for ProtonFs {
         let fs = self.clone();
         self.core
             .workers
-            .run(move || fs.serve_readdir(ino, offset, reply));
+            .run(Lane::Meta, move || fs.serve_readdir(ino, offset, reply));
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -3503,7 +3529,7 @@ impl Filesystem for ProtonFs {
         // even read off the FUSE device. It only reads `state`, so moving it
         // races with nothing. FUSE does not require replies in request order.
         let core = self.core.clone();
-        self.core.workers.run(move || {
+        self.core.workers.run(Lane::Transfer, move || {
             match core.read_range(&uid, mtime, fsize, offset, size as u64, cache_blocks) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(e),
@@ -3793,23 +3819,67 @@ impl Filesystem for ProtonFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let file = self
-            .core
-            .state
-            .lock()
-            .handles
-            .get(&fh.0)
-            .map(|h| h.file.clone());
-        match file {
-            Some(f) => match f.sync_all() {
-                Ok(()) => reply.ok(),
-                Err(e) => {
-                    error!(fh = fh.0, error = %e, "fsync of scratch file failed");
-                    reply.error(Errno::EIO);
-                }
-            },
-            None => reply.error(Errno::EBADF),
+        // Everything the durability sidecar needs, copied out so no lock is held
+        // across the sync.
+        let handle = self.core.state.lock().handles.get(&fh.0).map(|h| {
+            (
+                h.file.clone(),
+                h.path.clone(),
+                h.uid.clone(),
+                h.dirty,
+                h.written.clone(),
+                h.len,
+                h.base_size,
+                h.base_mtime,
+            )
+        });
+        let Some((f, path, uid, dirty, written, len, base_size, base_mtime)) = handle else {
+            reply.error(Errno::EBADF);
+            return;
+        };
+        if let Err(e) = f.sync_all() {
+            error!(fh = fh.0, error = %e, "fsync of scratch file failed");
+            reply.error(Errno::EIO);
+            return;
         }
+        // A clean handle has nothing on it that the remote does not already
+        // hold, so there is nothing for a crash to lose.
+        if !dirty {
+            reply.ok();
+            return;
+        }
+        // The bytes are on stable storage, but only the scratch file knows that,
+        // and the scratch directory is cleared at open. Record what the blob is
+        // so a restart can hand it to the upload queue instead of deleting it.
+        //
+        // Deliberately *not* the full release path: staging the blob here would
+        // move the file out from under a handle the application still has open,
+        // and queueing an upload per `fsync` would push a revision for every
+        // barrier in a write loop. This only makes the existing file findable.
+        let authored: Vec<(u64, u64)> = written
+            .segments(0, len)
+            .into_iter()
+            .filter(|&(_, _, authored)| authored)
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        let meta = StagedWrite {
+            uid: uid.to_string(),
+            len,
+            base_size,
+            base_mtime,
+            complete: authored == [(0, len)],
+            authored,
+            based_on: self.core.remote_baseline(&uid, base_mtime, base_size),
+        };
+        // A failed sidecar means the write is not durable, and `fsync` promising
+        // otherwise is the defect this exists to fix — so it is an error, not a
+        // warning.
+        if let Err(e) = self.core.cache.mark_scratch_durable(&path, &meta) {
+            error!(%uid, error = %e, "recording fsync durability failed");
+            reply.error(Errno::EIO);
+            return;
+        }
+        reply.ok();
     }
 
     fn release(
@@ -4037,17 +4107,10 @@ impl Filesystem for ProtonFs {
             reply.error(Errno::EIO);
             return;
         }
-        // Forget the node so it re-interns under its new parent, and drop the
-        // destination listing so it re-enumerates on next access.
-        //
-        // The drop has to go through `invalidate_listing`, not `children.remove`:
-        // `forget` deletes the node's DB row, so a destination still marked
-        // `listed` would be rebuilt from the DB by `ensure_children` — without the
-        // node we just moved into it. The file would be gone from the source and
-        // absent from the destination, with the rename having reported success.
-        let mut st = self.core.state.lock();
-        st.forget(&uid);
-        st.invalidate_listing(newparent);
+        self.core
+            .state
+            .lock()
+            .relocate(ino, parent, newparent, &new_parent_uid, &newname);
         reply.ok();
     }
 
@@ -4526,6 +4589,10 @@ pub fn mount(
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.
     core.hydrate_pending();
+    // Then the writes that were fsynced but never closed, which the cache moved
+    // aside at open. After `hydrate_pending`, so a recovered partial write can
+    // see an already-queued write to the same node.
+    core.recover_fsynced_writes();
     {
         let core = core.clone();
         std::thread::Builder::new()
@@ -4584,6 +4651,15 @@ pub fn mount(
     // stale socket file from a previous run would block the bind, so clear it.
     let _ = std::fs::remove_file(control_socket);
     let listener = UnixListener::bind(control_socket)?;
+    // Owner-only before anything can connect: a peer on this socket commands the
+    // daemon's authenticated session without a credential of its own (B6).
+    if let Err(e) = pdfs_core::config::restrict_socket(control_socket) {
+        error!(error = %e, "cannot restrict control socket permissions; refusing to serve");
+        let _ = std::fs::remove_file(control_socket);
+        return Err(std::io::Error::other(format!(
+            "control socket permissions: {e}"
+        )));
+    }
     {
         let core = core.clone();
         let username = username.clone();

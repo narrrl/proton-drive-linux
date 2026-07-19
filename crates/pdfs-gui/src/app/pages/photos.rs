@@ -615,13 +615,6 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
                     .and_then(|n| n.to_str())
                     .unwrap_or("photo.jpg")
                     .to_string();
-                let bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!("Failed to read photo: {e}");
-                        return;
-                    }
-                };
                 let ext = path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -643,10 +636,13 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
                 ui.busy_begin();
                 let rx = spawn_request(
                     ui.dirs.control_socket(),
+                    // The daemon opens the file itself: it runs on this machine,
+                    // and a photo's bytes through line-delimited JSON is an OOM
+                    // of both processes (see `Request::UploadPhoto`).
                     Request::UploadPhoto {
                         name,
                         media_type: media_type.to_string(),
-                        bytes,
+                        source_path: path.display().to_string(),
                         capture_time,
                     },
                 );

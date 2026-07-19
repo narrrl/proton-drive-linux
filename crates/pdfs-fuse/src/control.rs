@@ -165,43 +165,54 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::UploadPhoto {
             name,
             media_type,
-            bytes,
+            source_path,
             capture_time,
         }) => {
-            let photos = core.photos();
-            let metadata = proton_drive_rs::PhotoUploadMetadata {
-                capture_time,
-                ..Default::default()
-            };
-            let guard = core.transfers.begin(
-                name.clone(),
-                "",
-                TransferDirection::Upload,
-                bytes.len() as u64,
-            );
-            let reader = CountingReader::new(std::io::Cursor::new(&bytes), &guard);
-            match core.rt.block_on(photos.upload_photo_from(
-                &name,
-                &media_type,
-                reader,
-                bytes.len() as i64,
-                Vec::new(),
-                metadata,
-                false,
-            )) {
-                Ok(uid) => {
-                    // The photo we just uploaded belongs at the head of the
-                    // timeline, and the GUI reloads the gallery the moment this
-                    // reply lands — so refresh now rather than leaving it to a
-                    // background pass that would land just after that reload.
-                    if let Err(e) = core.rt.block_on(core.refresh_timeline()) {
-                        warn!(error = %e, "timeline refresh after upload failed");
-                    }
-                    CtlResponse::Ok {
-                        message: format!("uploaded photo with uid {uid}"),
+            // Streamed off disk rather than carried over the socket: see the note
+            // on `Request::UploadPhoto`. The length comes from the same handle the
+            // bytes do, so a file changing size under us cannot make the two
+            // disagree.
+            match std::fs::File::open(&source_path).and_then(|f| f.metadata().map(|m| (f, m.len())))
+            {
+                Err(e) => CtlResponse::error(CoreError::invalid(format!(
+                    "cannot read {source_path}: {e}"
+                ))),
+                Ok((file, len)) => {
+                    let photos = core.photos();
+                    let metadata = proton_drive_rs::PhotoUploadMetadata {
+                        capture_time,
+                        ..Default::default()
+                    };
+                    let guard =
+                        core.transfers
+                            .begin(name.clone(), "", TransferDirection::Upload, len);
+                    let reader = CountingReader::new(std::io::BufReader::new(file), &guard);
+                    match core.rt.block_on(photos.upload_photo_from(
+                        &name,
+                        &media_type,
+                        reader,
+                        len as i64,
+                        Vec::new(),
+                        metadata,
+                        false,
+                    )) {
+                        Ok(uid) => {
+                            // The photo we just uploaded belongs at the head of the
+                            // timeline, and the GUI reloads the gallery the moment this
+                            // reply lands — so refresh now rather than leaving it to a
+                            // background pass that would land just after that reload.
+                            if let Err(e) = core.rt.block_on(core.refresh_timeline()) {
+                                warn!(error = %e, "timeline refresh after upload failed");
+                            }
+                            CtlResponse::Ok {
+                                message: format!("uploaded photo with uid {uid}"),
+                            }
+                        }
+                        Err(e) => {
+                            CtlResponse::error(CoreError::from_api(&e, "upload photo failed"))
+                        }
                     }
                 }
-                Err(e) => CtlResponse::error(CoreError::from_api(&e, "upload photo failed")),
             }
         }
         Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
@@ -289,25 +300,6 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => {
                     core.log_activity(ActivityKind::CreateFolder, &name, &e, false);
-                    CtlResponse::error(e)
-                }
-            },
-            Err(e) => CtlResponse::error(e),
-        },
-        Ok(CtlRequest::UploadFile {
-            parent,
-            name,
-            bytes,
-        }) => match rel_to_mount(mountpoint, &parent) {
-            Ok(parent_rel) => match core.upload(&parent_rel, &name, &bytes) {
-                Ok(name) => {
-                    core.log_activity(ActivityKind::Upload, &name, "", true);
-                    CtlResponse::Ok {
-                        message: format!("uploaded {name}"),
-                    }
-                }
-                Err(e) => {
-                    core.log_activity(ActivityKind::Upload, &name, &e, false);
                     CtlResponse::error(e)
                 }
             },

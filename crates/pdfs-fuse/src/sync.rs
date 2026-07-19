@@ -17,8 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
-use std::time::{Duration, SystemTime};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime};
 
 use notify::{RecursiveMode, Watcher};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -30,8 +30,20 @@ use crate::{Core, now_secs, parse_uid};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
 
-/// Coalesce a burst of filesystem events into a single reconcile per folder.
+/// How long the watcher must go quiet before a burst counts as finished.
+///
+/// Measured from the *last* event, not the first: applications do not write a
+/// file once. An editor saves by writing a temp file and renaming it over the
+/// target; an export or a database dump writes continuously for as long as it
+/// takes. Settling a fixed interval after the first event walks the tree while
+/// the file is still growing, and uploads a torn snapshot as a real revision —
+/// corrected on the next pass, but only after spending the encrypt-and-upload
+/// on a file that was never in that state.
 const DEBOUNCE: Duration = Duration::from_secs(2);
+/// Ceiling on the settle wait, so a directory under sustained change still
+/// syncs. Without it, copying a large tree in — events arriving forever —
+/// would postpone the reconcile for as long as the copy ran.
+const MAX_SETTLE: Duration = Duration::from_secs(30);
 /// How often to re-walk remotes so changes made on other clients are pulled in.
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
 /// How many uploads/downloads/folder-creations a reconcile runs at once. The
@@ -111,11 +123,7 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
         let mut all = false;
         let mut do_rewatch = false;
         classify(msg, &mut ids, &mut all, &mut do_rewatch);
-        // Debounce: let a burst settle, then drain everything queued behind it.
-        std::thread::sleep(DEBOUNCE);
-        while let Ok(m) = rx.try_recv() {
-            classify(m, &mut ids, &mut all, &mut do_rewatch);
-        }
+        settle(&rx, &mut ids, &mut all, &mut do_rewatch);
 
         if do_rewatch {
             rewatch(&core, &mut watcher, &watched);
@@ -151,10 +159,7 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
         let mut all = false;
         let mut do_rewatch = false;
         classify(msg, &mut ids, &mut all, &mut do_rewatch);
-        std::thread::sleep(DEBOUNCE);
-        while let Ok(m) = rx.try_recv() {
-            classify(m, &mut ids, &mut all, &mut do_rewatch);
-        }
+        settle(&rx, &mut ids, &mut all, &mut do_rewatch);
         if all {
             reconcile_all(core);
         } else {
@@ -165,6 +170,46 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
             }
         }
     }
+}
+
+/// Absorb the rest of an event burst, returning once the watcher has been quiet
+/// for `quiet` or `cap` has elapsed since the first event — whichever comes
+/// first. The caller has already classified the event that opened the burst.
+///
+/// Split out with its timings as parameters so the settling behaviour can be
+/// tested in milliseconds rather than in the tens of seconds the real constants
+/// describe.
+fn settle_with(
+    rx: &Receiver<SyncMsg>,
+    ids: &mut HashSet<i64>,
+    all: &mut bool,
+    do_rewatch: &mut bool,
+    quiet: Duration,
+    cap: Duration,
+) {
+    let deadline = Instant::now() + cap;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        // Never wait past the cap, however quiet the watcher goes.
+        let wait = quiet.min(deadline - now);
+        match rx.recv_timeout(wait) {
+            // Another event: the burst is still going, so the quiet window
+            // starts again from here.
+            Ok(m) => classify(m, ids, all, do_rewatch),
+            // Quiet for a full window: whatever was being written has stopped.
+            Err(RecvTimeoutError::Timeout) => break,
+            // Every sender is gone; the caller's loop is about to end anyway.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// [`settle_with`] at the real timings.
+fn settle(rx: &Receiver<SyncMsg>, ids: &mut HashSet<i64>, all: &mut bool, do_rewatch: &mut bool) {
+    settle_with(rx, ids, all, do_rewatch, DEBOUNCE, MAX_SETTLE);
 }
 
 fn classify(msg: SyncMsg, ids: &mut HashSet<i64>, all: &mut bool, rewatch: &mut bool) {
@@ -386,6 +431,37 @@ impl From<String> for PassAbort {
     }
 }
 
+/// Refuse to run a pass whose local side has vanished in its entirety.
+///
+/// A path in the baseline with no local copy is classified as "the user deleted
+/// this", and the pass answers by trashing it on Drive. That is right for one
+/// file and right for a handful. When it is true of *every* path the baseline
+/// knows, the likely cause is not a user: it is an unmounted external disk, a
+/// mountpoint whose FUSE mount died, a home directory that was not yet decrypted
+/// when the daemon started, or a bug in this client — and the answer to all of
+/// those is to trash the folder's entire contents on Drive.
+///
+/// So this pass abort exists to cap the blast radius rather than to catch a
+/// specific defect. Losing a pass to it costs a retry; the failure it prevents
+/// costs the folder. A user who really did empty the folder can express that by
+/// removing it from sync and re-adding it — the baseline goes with it.
+///
+/// One surviving path is enough to clear the guard, since the classification is
+/// only ever wrong about all of them at once.
+fn guard_local_wipe<B, L>(
+    baseline: &HashMap<String, B>,
+    local: &HashMap<String, L>,
+) -> Result<(), String> {
+    if baseline.len() >= 2 && baseline.keys().all(|rel| !local.contains_key(rel)) {
+        return Err(format!(
+            "every one of the {} synced paths is missing locally; refusing to trash \
+             them on Drive. Check that the folder is mounted and readable.",
+            baseline.len()
+        ));
+    }
+    Ok(())
+}
+
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
 enum Applied {
@@ -592,6 +668,7 @@ impl Core {
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
         self.walk_local(folder_id, local_root, local_root, &mut local)?;
+        guard_local_wipe(&baseline, &local)?;
 
         // The remote folder uids come from the baseline instead of a walk: every
         // directory this device has synced recorded its uid there when it was
@@ -846,6 +923,7 @@ impl Core {
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
         self.walk_local(folder_id, local_root, local_root, &mut local)?;
+        guard_local_wipe(&baseline, &local)?;
 
         let mut remote: HashMap<String, RemoteItem> = HashMap::new();
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
@@ -1740,6 +1818,113 @@ fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed `n` `Reconcile` events `gap` apart on another thread, starting
+    /// immediately. Returns the sender's join handle so the test can keep it
+    /// alive (dropping the sender early would look like a disconnect).
+    fn drip(n: usize, gap: Duration) -> (Receiver<SyncMsg>, std::thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            for i in 0..n {
+                if tx.send(SyncMsg::Reconcile(i as i64)).is_err() {
+                    return;
+                }
+                std::thread::sleep(gap);
+            }
+        });
+        (rx, h)
+    }
+
+    fn collect(rx: &Receiver<SyncMsg>, quiet: Duration, cap: Duration) -> (HashSet<i64>, Duration) {
+        let mut ids = HashSet::new();
+        let (mut all, mut rewatch) = (false, false);
+        // The caller of `settle` has always classified the opening event first.
+        let first = rx.recv().unwrap();
+        classify(first, &mut ids, &mut all, &mut rewatch);
+        let started = Instant::now();
+        settle_with(rx, &mut ids, &mut all, &mut rewatch, quiet, cap);
+        (ids, started.elapsed())
+    }
+
+    /// The bug this replaced a fixed sleep for: a save that keeps writing past
+    /// the debounce used to be walked mid-write, uploading a torn snapshot as a
+    /// real revision. The window has to restart on every event, so settling
+    /// waits for the writer to actually stop.
+    #[test]
+    fn settling_waits_for_the_last_event_not_the_first() {
+        // Eight events 20ms apart — a burst lasting ~160ms, far longer than the
+        // 60ms quiet window a fixed sleep would have used.
+        let (rx, h) = drip(8, Duration::from_millis(20));
+        let (ids, elapsed) = collect(&rx, Duration::from_millis(60), Duration::from_secs(30));
+        h.join().unwrap();
+
+        assert_eq!(ids.len(), 8, "every event in the burst is absorbed");
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "settling returned after {elapsed:?}: it stopped waiting while events \
+             were still arriving, which is the torn-revision bug"
+        );
+    }
+
+    /// A burst that ends is not waited on any longer than the quiet window.
+    #[test]
+    fn settling_returns_once_the_burst_stops() {
+        let (rx, h) = drip(3, Duration::from_millis(5));
+        let (ids, elapsed) = collect(&rx, Duration::from_millis(50), Duration::from_secs(30));
+        h.join().unwrap();
+
+        assert_eq!(ids.len(), 3);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a finished burst must settle on the quiet window, not the cap"
+        );
+    }
+
+    /// Sustained change — copying a large tree in — must not postpone the
+    /// reconcile for as long as the copy runs. The cap ends the wait.
+    #[test]
+    fn settling_is_capped_under_continuous_change() {
+        // Events every 10ms for far longer than the 150ms cap allows.
+        let (rx, h) = drip(200, Duration::from_millis(10));
+        let (_ids, elapsed) = collect(&rx, Duration::from_millis(100), Duration::from_millis(150));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "settled after {elapsed:?}; the cap should have ended the wait near 150ms"
+        );
+        drop(rx);
+        h.join().unwrap();
+    }
+
+    /// The guard that keeps a vanished local tree (dead mount, unplugged disk)
+    /// from being read as "the user deleted everything" and trashing the folder
+    /// on Drive.
+    #[test]
+    fn guard_local_wipe_blocks_only_a_total_disappearance() {
+        let base: HashMap<String, ()> = ["a.txt", "b.txt", "d/c.txt"]
+            .iter()
+            .map(|r| ((*r).to_string(), ()))
+            .collect();
+        let none: HashMap<String, ()> = HashMap::new();
+        let one: HashMap<String, ()> = [("b.txt".to_string(), ())].into_iter().collect();
+
+        assert!(
+            guard_local_wipe(&base, &none).is_err(),
+            "wholesale loss aborts"
+        );
+        assert!(
+            guard_local_wipe(&base, &one).is_ok(),
+            "one survivor means the tree is readable; the rest are real deletions"
+        );
+        // A one-entry baseline is a genuine single delete, not a wipe to detect.
+        let single: HashMap<String, ()> = [("a.txt".to_string(), ())].into_iter().collect();
+        assert!(guard_local_wipe(&single, &none).is_ok());
+        // Nothing synced yet: a first pass over an empty folder is not a wipe.
+        assert!(guard_local_wipe(&none, &none).is_ok());
+        // Local paths that are not in the baseline are new uploads, and do not
+        // count as survivors.
+        let fresh: HashMap<String, ()> = [("new.txt".to_string(), ())].into_iter().collect();
+        assert!(guard_local_wipe(&base, &fresh).is_err());
+    }
 
     #[test]
     fn parent_and_base_split_relative_paths() {

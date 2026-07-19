@@ -269,6 +269,43 @@ impl State {
         }
     }
 
+    /// Settle the local state after a node has been moved (and possibly renamed)
+    /// on the remote: rewrite it in place, and drop **both** directories'
+    /// listings so each re-enumerates.
+    ///
+    /// Both, because each is stale for its own reason. The destination has
+    /// gained a child it does not know about; the source has lost one. The
+    /// source is the subtler half, and was audit A5: pruning the moved node from
+    /// the source's in-memory children looks sufficient while that entry stays
+    /// resident, but the source's DB row is left `listed = 1`. Once it is
+    /// evicted from the hot cache, or the daemon restarts, `ensure_children`
+    /// rebuilds the listing from the DB and declares it complete, so anything
+    /// else that changed remotely under the source since is never seen.
+    ///
+    /// What this must *not* do is `forget` the node. Forgetting drops its
+    /// `by_uid` mapping, so the re-enumeration hands it a fresh inode — while
+    /// the kernel has already carried the renamed dentry over to the *old* one.
+    /// Every lookup through that dentry then resolves to an inode `entries` no
+    /// longer holds and fails `ENOENT`, so the renamed directory reads as
+    /// missing (`ls` on it errors while `ls` of its parent lists it) until the
+    /// entry TTL expires. Keeping the inode keeps the kernel's dentry valid.
+    ///
+    /// A pure rename (`from == to`) invalidates that one directory once.
+    pub(crate) fn relocate(
+        &mut self,
+        ino: u64,
+        from_parent: u64,
+        to_parent: u64,
+        to_parent_uid: &NodeUid,
+        name: &str,
+    ) {
+        self.rename_in_place(ino, to_parent, to_parent_uid, name);
+        self.invalidate_listing(to_parent);
+        if from_parent != to_parent {
+            self.invalidate_listing(from_parent);
+        }
+    }
+
     /// Update a file entry's recorded plaintext size so `getattr` reflects an
     /// in-progress write before the new revision is sealed.
     pub(crate) fn set_size(&mut self, ino: u64, size: u64) {
@@ -303,5 +340,156 @@ impl State {
         {
             warn!(uid = %e.uid, error = %err, "db upsert_node failed for a queued write");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+
+    fn uid(link: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    fn node(link: &str, parent: &str, name: &str, is_dir: bool) -> Node {
+        Node {
+            uid: uid(link),
+            parent_uid: Some(uid(parent)),
+            kind: if is_dir {
+                NodeKind::Folder
+            } else {
+                NodeKind::File {
+                    media_type: "text/plain".into(),
+                    total_size_on_storage: 0,
+                    active_revision_state: None,
+                    claimed_size: Some(0),
+                    claimed_modification_time: None,
+                }
+            },
+            name: name.into(),
+            creation_time: 100,
+            modification_time: 100,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            verification: Default::default(),
+        }
+    }
+
+    /// A unique temp directory removed on drop; avoids a dev-dependency.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "pdfs-state-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `Db::open_in_memory` is `#[cfg(test)]` inside `pdfs-core`, so it does not
+    /// exist for this crate's tests — a temp file is the equivalent here. The
+    /// directory outlives the state because the state holds the open database.
+    fn state() -> (State, TempDir) {
+        let dir = TempDir::new();
+        let db = Db::open(&dir.0.join("cache.db")).unwrap();
+        let st = State {
+            entries: HashMap::new(),
+            by_uid: HashMap::new(),
+            children: HashMap::new(),
+            next_ino: 1,
+            handles: HashMap::new(),
+            next_fh: 1,
+            db: Arc::new(db),
+        };
+        (st, dir)
+    }
+
+    /// Two folders, each holding one file, both listed — the state a move
+    /// starts from. Returns `(state, src_ino, dst_ino)`.
+    fn two_folders() -> (State, TempDir, u64, u64) {
+        let (mut st, dir) = state();
+        let src = st.intern(0, node("src", "root", "src", true));
+        let dst = st.intern(0, node("dst", "root", "dst", true));
+        let f = st.intern(src, node("f", "src", "f.txt", false));
+        st.children.insert(src, vec![f]);
+        st.children.insert(dst, vec![]);
+        st.db.set_listed(&uid("src"), true).unwrap();
+        st.db.set_listed(&uid("dst"), true).unwrap();
+        (st, dir, src, dst)
+    }
+
+    /// Audit A5. Moving a file out of a folder leaves that folder's DB row
+    /// claiming a complete listing, so once the hot cache drops it, remote
+    /// changes under it stop being seen. `relocate` has to clear both sides.
+    #[test]
+    fn relocate_invalidates_the_source_as_well_as_the_destination() {
+        let (mut st, _dir, src, dst) = two_folders();
+        let f = st.by_uid[&uid("f")];
+        st.relocate(f, src, dst, &uid("dst"), "f.txt");
+
+        assert!(
+            st.db.children_if_listed(&uid("dst")).unwrap().is_none(),
+            "destination re-enumerates: it gained a child whose row was just deleted"
+        );
+        assert!(
+            st.db.children_if_listed(&uid("src")).unwrap().is_none(),
+            "source re-enumerates: its listing predates the move, and a stale \
+             `listed` flag would hide every later remote change under it"
+        );
+        assert!(!st.children.contains_key(&src));
+        assert!(!st.children.contains_key(&dst));
+        assert_eq!(
+            st.by_uid.get(&uid("f")),
+            Some(&f),
+            "the inode survives the move: the kernel has already pointed the \
+             renamed dentry at it, so re-interning under a fresh one would make \
+             every lookup through that dentry ENOENT"
+        );
+        assert_eq!(st.entries[&f].parent, dst);
+    }
+
+    /// A pure rename never leaves the directory, so there is one listing to
+    /// drop, not two — and dropping it must not depend on the parents differing.
+    #[test]
+    fn relocate_within_one_directory_still_invalidates_it() {
+        let (mut st, _dir, src, _dst) = two_folders();
+        let f = st.by_uid[&uid("f")];
+        st.relocate(f, src, src, &uid("src"), "renamed.txt");
+        assert!(st.db.children_if_listed(&uid("src")).unwrap().is_none());
+        assert!(!st.children.contains_key(&src));
+        assert_eq!(st.by_uid.get(&uid("f")), Some(&f), "the inode is stable");
+        assert_eq!(st.entries[&f].node.name, "renamed.txt");
+    }
+
+    /// The failure mode the fix exists for, stated directly: forgetting the node
+    /// prunes it from the resident listing but leaves the DB claiming the source
+    /// is fully enumerated. This pins *why* `relocate` cannot just call `forget`.
+    #[test]
+    fn forget_alone_leaves_the_source_claiming_a_complete_listing() {
+        let (mut st, _dir, _src, _dst) = two_folders();
+        st.forget(&uid("f"));
+        let listed = st.db.children_if_listed(&uid("src")).unwrap();
+        assert!(
+            listed.is_some(),
+            "forget does not clear the flag — which is exactly why relocate must"
+        );
+        assert!(
+            listed.unwrap().is_empty(),
+            "and the listing it would serve is the moved file's absence, \
+             with no way to notice anything else changed"
+        );
     }
 }

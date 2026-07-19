@@ -76,11 +76,18 @@ pub enum Request {
     PhotoThumbs { uids: Vec<String> },
     /// Download a photo's full content into the cache; replies with its path.
     OpenPhoto { uid: String },
-    /// Upload a photo with the given name, media type, and content bytes.
+    /// Upload the photo at `source_path` under the given name and media type.
+    ///
+    /// A path, not the bytes: this protocol is line-delimited JSON, and
+    /// `serde_json` writes a `Vec<u8>` as an array of decimal integers — a ~5-6x
+    /// inflation that both peers then hold in memory at once, which turned a
+    /// large photo or a video into an OOM of the GUI, the daemon, or both. The
+    /// daemon shares a filesystem with every front-end it serves (the socket is
+    /// a Unix socket), so it opens and streams the file itself.
     UploadPhoto {
         name: String,
         media_type: String,
-        bytes: Vec<u8>,
+        source_path: String,
         capture_time: Option<i64>,
     },
     /// Download a Drive file's full content into the cache; replies with the
@@ -106,13 +113,10 @@ pub enum Request {
     /// Create a new folder named `name` under the mountpoint-relative `parent`.
     /// Replies with [`Response::Ok`].
     CreateFolder { parent: String, name: String },
-    /// Upload a file named `name` with content `bytes` into the
-    /// mountpoint-relative `parent` folder. Replies with [`Response::Ok`].
-    UploadFile {
-        parent: String,
-        name: String,
-        bytes: Vec<u8>,
-    },
+    // There is deliberately no bytes-carrying single-file upload: it was
+    // `UploadFile { parent, name, bytes }`, and it OOMed on anything large for
+    // the reason described on `UploadPhoto`. `UploadPaths` covers the same case
+    // by path, including the one-file batch.
     /// Bulk-upload local files and/or directory trees into the mountpoint-relative
     /// `parent` folder. `sources` are absolute paths on the daemon's own
     /// filesystem (the daemon is local): each file is uploaded, each directory is
@@ -1036,10 +1040,11 @@ mod tests {
                 parent: "a".into(),
                 name: "new".into(),
             },
-            Request::UploadFile {
-                parent: "a".into(),
-                name: "f.bin".into(),
-                bytes: vec![0, 1, 2, 255],
+            Request::UploadPhoto {
+                name: "p.jpg".into(),
+                media_type: "image/jpeg".into(),
+                source_path: "/home/u/p.jpg".into(),
+                capture_time: Some(1_700_000_000),
             },
             Request::UploadPaths {
                 parent: "a".into(),
