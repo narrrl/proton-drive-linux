@@ -188,6 +188,29 @@ impl Db {
         Ok(Some(AttachedBlob { id, superseded }))
     }
 
+    /// Replace the sidecar of a queued op, for a baseline that has moved under
+    /// it.
+    ///
+    /// Exists for one caller: when *our own* upload seals a new revision while a
+    /// further write to the same node is already queued, that queued write's
+    /// [`StagedWrite::based_on`](crate::cache::StagedWrite::based_on) still
+    /// names the revision we just replaced. Left alone it would read as "another
+    /// device changed this file" and divert the write into a conflict copy over
+    /// nothing — a self-conflict. Restamping it is what keeps a chain of writes
+    /// to one file a chain rather than a pile of copies.
+    ///
+    /// Deliberately narrow: only the sidecar changes, so the blob, the attempt
+    /// count and the backoff all survive. Returns false when no such op is
+    /// queued, which is the ordinary case.
+    pub fn update_op_meta(&self, uid: &str, kind: &str, meta_json: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE pending_op SET meta_json = ?3 WHERE uid = ?1 AND kind = ?2",
+            params![uid, kind, meta_json],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Point a queued create at a new parent and name, for a node renamed or
     /// moved before it ever reached the server.
     ///

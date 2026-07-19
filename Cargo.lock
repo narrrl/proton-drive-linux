@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aes-gcm 0.11.0",
  "async-trait",
@@ -3843,6 +3843,7 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "lru",
  "num-bigint 0.5.1",
  "num-traits",
  "pgp",

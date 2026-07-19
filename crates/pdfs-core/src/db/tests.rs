@@ -26,7 +26,57 @@ fn open_bounds_the_wal_size() {
         .unwrap();
     assert_eq!(limit, WAL_SIZE_LIMIT);
 
+    // Without a busy timeout the default is 0: a lock held by anyone else fails
+    // the statement instantly instead of waiting for it to clear.
+    let busy: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(busy, BUSY_TIMEOUT.as_millis() as i64);
+
     drop(conn);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A second connection to the same file — a hand-started `pdfs mount` alongside
+/// the systemd service, a backup tool, a stray `sqlite3` session — holds a write
+/// lock briefly. Our write must wait for it rather than failing on the spot.
+///
+/// **This passed before the busy timeout was set explicitly**, because rusqlite
+/// already applies one. It is kept as a characterisation test, not as evidence
+/// of a fix: it states the behaviour the daemon relies on, so that losing it
+/// (dropping the pragma, or a dependency changing its default) fails here rather
+/// than in front of a user.
+#[test]
+fn a_write_waits_for_a_competing_writer() {
+    use std::time::Duration;
+
+    let path = std::env::temp_dir().join(format!("pdfs-db-busy-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+
+    // A second process's connection takes an exclusive write lock and holds it
+    // for a moment, as any real transaction would.
+    let holder = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let other = rusqlite::Connection::open(&path).unwrap();
+            other.busy_timeout(Duration::from_secs(5)).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        })
+    };
+    // Let the holder actually acquire the lock before we contend for it.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // This is the assertion: it blocks until the holder commits, rather than
+    // returning SQLITE_BUSY.
+    db.set_state_i64("busy_probe", 7).unwrap();
+
+    holder.join().unwrap();
+    assert_eq!(db.state_i64("busy_probe").unwrap(), Some(7));
+
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
@@ -539,6 +589,56 @@ fn opens_and_migrates() {
         })
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION.to_string());
+}
+
+/// A queued write whose baseline is restamped must keep everything else.
+///
+/// The restamp happens after our *own* upload seals a new revision under a
+/// still-queued write. If it took the blob or the retry state with it, the fix
+/// for a spurious conflict copy would cost the bytes that conflict copy was
+/// there to protect.
+#[test]
+fn restamping_a_baseline_leaves_the_blob_and_retry_state_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let op = PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/blob".to_string()),
+        meta_json: Some(r#"{"based_on":"old"}"#.to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+    db.record_op_failure(db.pending_ops().unwrap()[0].id, "offline", 999)
+        .unwrap();
+
+    let updated = db
+        .update_op_meta(&uid("a").to_string(), OP_REVISION, r#"{"based_on":"new"}"#)
+        .unwrap();
+    assert!(updated, "the queued write is there to restamp");
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].meta_json.as_deref(), Some(r#"{"based_on":"new"}"#));
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/blob"),
+        "the only copy of the user's bytes"
+    );
+    assert_eq!(ops[0].attempts, 1, "backoff survives a restamp");
+    assert_eq!(ops[0].next_attempt_at, 999);
+
+    // No queued write for that node is the ordinary case, not an error: most
+    // uploads are the last one for their file.
+    assert!(
+        !db.update_op_meta(&uid("b").to_string(), OP_REVISION, "{}")
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1182,9 +1282,11 @@ fn next_due_op_respects_backoff() {
 /// under budget" — under the shared connection lock, so it also stalled FUSE
 /// metadata calls.
 ///
-/// Asserts the shape: the under-budget check must not scale with cache size.
+/// Asserts correctness — the aggregate must agree with summing the rows, and
+/// must count the kinds apart — and *reports* the timing without asserting on
+/// it. See the note at the measurement for why.
 #[test]
-fn cache_total_bytes_does_not_scale_with_cache_size() {
+fn cache_total_bytes_agrees_with_summing_the_rows() {
     use std::time::Instant;
 
     let db = Db::open_in_memory().unwrap();
@@ -1223,17 +1325,14 @@ fn cache_total_bytes_does_not_scale_with_cache_size() {
     }
     let aggregate = t1.elapsed();
 
+    // Reported, not asserted. The SUM is cheaper than reading every row — no
+    // materialization, no allocation, no sort — but it is still O(rows), so this
+    // is a constant factor, and an assertion on a constant factor measured
+    // alongside the rest of the suite tests the machine's load as much as the
+    // query. The claim that matters — that the *common* path does not touch the
+    // database at all — is pinned by `budget_check_is_free_when_under_budget`,
+    // which compares against itself and so is load-independent.
     println!("B4: {rounds} budget checks over {N} entries — scan {scan:?}, aggregate {aggregate:?}");
-    // The SUM is much cheaper — no row materialization, no allocation, no sort —
-    // but it is still O(rows): summing N values reads N index entries. That is
-    // why `ContentCache` keeps a running total on top of this and only falls
-    // back to the query when it has to evict. See
-    // `budget_check_is_free_when_under_budget`.
-    assert!(
-        aggregate * 2 < scan,
-        "expected the SUM to be materially cheaper than reading every row; \
-         scan={scan:?} aggregate={aggregate:?}"
-    );
 }
 
 /// Victims still come out least-recently-accessed first, now in bounded batches

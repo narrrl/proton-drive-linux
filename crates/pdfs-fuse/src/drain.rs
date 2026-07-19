@@ -24,9 +24,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use pdfs_core::cache::StagedWrite;
+use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp};
+use proton_drive_rs::Node;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{debug, error, info, warn};
 
@@ -511,7 +512,7 @@ impl Core {
         let name = place
             .as_ref()
             .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| meta.uid.clone());
+            .unwrap_or_else(|| self.node_name(uid));
         // A node the tree has forgotten still has bytes worth keeping, so the
         // copy falls back to the root rather than being abandoned.
         let Some(parent) = place.map(|(p, _)| p).or_else(|| self.root_uid()) else {
@@ -625,11 +626,38 @@ impl Core {
 
     /// A node's parent uid and name, as the tree currently has them.
     pub(crate) fn node_place(&self, uid: &NodeUid) -> Option<(NodeUid, String)> {
-        let st = self.state.lock();
-        let ino = st.by_uid.get(uid)?;
-        let entry = st.entries.get(ino)?;
-        let parent = entry.node.parent_uid.clone()?;
-        Some((parent, entry.node.name.clone()))
+        {
+            let st = self.state.lock();
+            if let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))
+                && let Some(parent) = entry.node.parent_uid.clone()
+            {
+                return Some((parent, entry.node.name.clone()));
+            }
+        }
+        // The in-memory tree only holds what has been walked to since the daemon
+        // started, and the drain routinely runs before anything has walked to
+        // this file — after a restart, or for a write that arrived by path. The
+        // DB knows it anyway. Without this fallback a conflict copy was named
+        // after the node's *uid* and dumped in the root, which is how a file
+        // called `G88km…==~c2do…== (sync-conflict 1784429627)` appears at the
+        // top of someone's Drive.
+        let node = self.db.node_by_uid(&uid.to_string()).ok().flatten()?;
+        Some((node.parent_uid.clone()?, node.name.clone()))
+    }
+
+    /// The name to show a user for `uid`, for a transfer entry or an activity
+    /// log line.
+    ///
+    /// Falls back to something short and human rather than to the uid: a uid is
+    /// 130 characters of base64 that identifies the file to us and to nobody
+    /// else, and it has ended up in both the activity log and on real files in
+    /// the Drive root. The link prefix keeps it traceable without pretending to
+    /// be a name.
+    pub(crate) fn node_name(&self, uid: &NodeUid) -> String {
+        self.node_place(uid).map(|(_, n)| n).unwrap_or_else(|| {
+            let short: String = uid.link_id.to_string().chars().take(8).collect();
+            format!("recovered-{short}")
+        })
     }
 
     /// The uid of the My Files root, which every node in the mount descends
@@ -681,14 +709,7 @@ impl Core {
             .map_err(|e| self.errno_error(e, "gap-fill from base failed"))?;
         }
 
-        let name = {
-            let st = self.state.lock();
-            st.by_uid
-                .get(&uid)
-                .and_then(|ino| st.entries.get(ino))
-                .map(|e| e.node.name.clone())
-                .unwrap_or_else(|| meta.uid.clone())
-        };
+        let name = self.node_name(&uid);
         let guard =
             self.transfers
                 .begin(&name, meta.uid.clone(), TransferDirection::Upload, meta.len);
@@ -736,15 +757,16 @@ impl Core {
     /// makes the *next* write to this file look like another device changed it
     /// underneath us, and diverts it into a conflict copy over nothing.
     ///
+    /// A write queued while this upload was on the wire is handled instead by
+    /// [`Core::rebaseline_pending`]: its optimistic size/mtime must stay on the
+    /// node (the same reason `apply_event` refuses to overwrite a node with a
+    /// queued write), but its *baseline* still has to learn about the revision
+    /// we just sealed. Skipping both, as this used to, is what produced a file
+    /// that conflicted with itself and left a full-size duplicate behind.
+    ///
     /// Best effort: a failure here costs a spurious conflict copy on the next
     /// write, not this upload, which has already landed.
     pub(crate) fn refresh_after_upload(&self, uid: &NodeUid) {
-        // A write queued while this one was on the wire is ahead of the remote
-        // again, and its optimistic size/mtime must win — the same reason
-        // `apply_event` refuses to overwrite a node with a queued write.
-        if self.pending.lock().contains_key(uid) {
-            return;
-        }
         let node = match self.fetch_node_remote(uid) {
             Ok(Some(node)) => node,
             // Trashed or deleted under us: the tree will hear it from the event
@@ -757,6 +779,12 @@ impl Core {
                 return;
             }
         };
+        // Ordered so that a write queued *during* the fetch above is still
+        // caught: it took its baseline from the node's optimistic stamp, and
+        // this overwrites it with the revision the server actually holds.
+        if self.rebaseline_pending(uid, &node) {
+            return;
+        }
         let mut st = self.state.lock();
         let Some(parent) = st
             .by_uid
@@ -767,5 +795,46 @@ impl Core {
             return;
         };
         st.intern(parent, node);
+    }
+
+    /// Point a still-queued write at the revision this upload just sealed, and
+    /// report whether there was one.
+    ///
+    /// The revision we sent *is* the base the queued write will be applied over,
+    /// but nothing else says so. [`Core::remote_baseline`] carries a baseline
+    /// across a supersede because the op it inherits from "is the last one that
+    /// actually observed the remote" — true only until that op drains. Once it
+    /// has, the inherited baseline names a revision we replaced ourselves, and
+    /// [`Core::revision_conflict`] reads that as another device having moved the
+    /// file. It is a self-conflict, and it is expensive: the whole staged blob
+    /// is re-uploaded as a second file.
+    ///
+    /// Both copies of the sidecar are updated — the in-memory one the next
+    /// `release` inherits from, and the persisted one the drain reloads after a
+    /// restart. Best effort on the DB half; the in-memory half is what the
+    /// immediate next write reads.
+    fn rebaseline_pending(&self, uid: &NodeUid, sealed: &Node) -> bool {
+        let base = Baseline {
+            mtime: sealed.modification_time,
+            size: node_size(sealed),
+        };
+        let mut pending = self.pending.lock();
+        let Some(p) = pending.get_mut(uid) else {
+            return false;
+        };
+        p.meta.based_on = Some(base);
+        match serde_json::to_string(&p.meta) {
+            Ok(json) => {
+                if let Err(e) = self.db.update_op_meta(&uid.to_string(), OP_REVISION, &json) {
+                    warn!(%uid, error = %e,
+                          "restamping a queued write's baseline failed; \
+                           it may land as a conflict copy of itself");
+                }
+            }
+            Err(e) => warn!(%uid, error = %e, "serializing a restamped sidecar failed"),
+        }
+        debug!(%uid, mtime = base.mtime, size = base.size,
+               "queued write rebaselined onto the revision just uploaded");
+        true
     }
 }

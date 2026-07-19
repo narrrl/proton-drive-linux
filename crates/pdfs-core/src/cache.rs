@@ -34,6 +34,27 @@ use crate::error::Result;
 const KIND_BLOB: &str = "blob";
 /// `cache_entries.kind` tag for on-demand block-cache chunks.
 const KIND_BLOCK: &str = "block";
+/// `cache_entries.kind` tag for cached thumbnails.
+const KIND_THUMB: &str = "thumb";
+
+/// How the configured budget is divided between the three pools, in percent.
+///
+/// The alternative — one shared cap across all kinds — was rejected: the pools
+/// have genuinely different lifetimes, and sharing lets one starve another. A
+/// single streaming read is millions of block bytes and would evict the whole
+/// blob cache behind it; a gallery scroll would do the same with thumbnails.
+///
+/// Whole-file blobs get the bulk: they are what "available offline" means, and
+/// they are the only pool a user explicitly asks for (by pinning). Blocks are
+/// transient partial reads, cheaply re-fetched. Thumbnails are tiny
+/// individually — a few percent buys tens of thousands of them — but there is
+/// one per photo, so the pool needs a ceiling, which is what C6 was about.
+///
+/// Must sum to 100; asserted at compile time below.
+const SPLIT_BLOB: u64 = 70;
+const SPLIT_BLOCK: u64 = 25;
+const SPLIT_THUMB: u64 = 5;
+const _: () = assert!(SPLIT_BLOB + SPLIT_BLOCK + SPLIT_THUMB == 100);
 
 /// Current wall-clock time in unix *milliseconds*, for the LRU `last_accessed`
 /// column. Milliseconds (not seconds) so two cache events in the same second
@@ -180,6 +201,7 @@ pub struct ContentCache {
     /// and the next open reconciles those.
     blob_bytes: AtomicU64,
     block_bytes: AtomicU64,
+    thumb_bytes: AtomicU64,
     /// Unified metadata DB. Its `cache_entries` table is the LRU index: every
     /// store/read/evict updates it, and the budget enforcers query it instead of
     /// scanning the cache directories (plan.md P4).
@@ -224,6 +246,7 @@ impl ContentCache {
             max_bytes: AtomicU64::new(max_bytes),
             blob_bytes: AtomicU64::new(0),
             block_bytes: AtomicU64::new(0),
+            thumb_bytes: AtomicU64::new(0),
             db,
         };
         cache.reconcile()?;
@@ -265,6 +288,7 @@ impl ContentCache {
         for (dir, kind) in [
             (&self.content_dir, KIND_BLOB),
             (&self.block_dir, KIND_BLOCK),
+            (&self.thumb_dir, KIND_THUMB),
         ] {
             let Ok(rd) = std::fs::read_dir(dir) else {
                 continue;
@@ -272,7 +296,15 @@ impl ContentCache {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.ends_with(".meta") || name.ends_with(".tmp") {
+                if name.ends_with(".meta") {
+                    continue;
+                }
+                // A `.tmp` is a staging file from a store that never completed
+                // its rename — a crashed or killed run. Nothing will ever claim
+                // it, and no pass other than this one looks in these
+                // directories, so it would sit there forever. Sweep it.
+                if name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(entry.path());
                     continue;
                 }
                 let Ok(meta) = entry.metadata() else { continue };
@@ -470,23 +502,43 @@ impl ContentCache {
         Ok(())
     }
 
-    /// Re-read both pool totals from the cache index, which is authoritative.
+    /// Re-read every pool total from the cache index, which is authoritative.
     fn reseed_totals(&self) {
-        if let Ok(n) = self.db.cache_total_bytes(KIND_BLOB) {
-            self.blob_bytes.store(n, Ordering::Relaxed);
-        }
-        if let Ok(n) = self.db.cache_total_bytes(KIND_BLOCK) {
-            self.block_bytes.store(n, Ordering::Relaxed);
+        for kind in [KIND_BLOB, KIND_BLOCK, KIND_THUMB] {
+            if let Ok(n) = self.db.cache_total_bytes(kind) {
+                self.pool(kind).store(n, Ordering::Relaxed);
+            }
         }
     }
 
     /// The running total for a pool.
     fn pool(&self, kind: &str) -> &AtomicU64 {
-        if kind == KIND_BLOCK {
-            &self.block_bytes
-        } else {
-            &self.blob_bytes
+        match kind {
+            KIND_BLOCK => &self.block_bytes,
+            KIND_THUMB => &self.thumb_bytes,
+            _ => &self.blob_bytes,
         }
+    }
+
+    /// This pool's share of the configured budget (`0` = unlimited, as for the
+    /// whole cache). See [`SPLIT_BLOB`] for why the budget is divided rather
+    /// than shared.
+    fn pool_cap(&self, kind: &str) -> u64 {
+        let cap = self.cap();
+        if cap == 0 {
+            return 0;
+        }
+        let share = match kind {
+            KIND_BLOCK => SPLIT_BLOCK,
+            KIND_THUMB => SPLIT_THUMB,
+            _ => SPLIT_BLOB,
+        };
+        // Multiply before dividing: `cap / 100 * share` truncates a small budget
+        // to zero, which `pool_cap`'s callers would read as "unlimited" — the
+        // opposite of what a small budget asks for.
+        //
+        // At least one byte, for the same reason.
+        (cap.saturating_mul(share) / 100).max(1)
     }
 
     /// Evict least-recently-used block-cache files until the block dir fits
@@ -508,7 +560,7 @@ impl ContentCache {
     /// (pinned blobs). A pass that can find no eligible victim stops rather than
     /// looping: a cache held entirely by pins legitimately stays over budget.
     fn enforce_pool(&self, kind: &str, dir: &Path, exempt: Option<&HashSet<String>>) {
-        let cap = self.cap();
+        let cap = self.pool_cap(kind);
         if cap == 0 {
             return;
         }
@@ -653,8 +705,14 @@ impl ContentCache {
         self.reseed_totals();
     }
 
+    /// Cache-index key for the `ttype` thumbnail of `uid` — the thumbnail file's
+    /// name, so eviction can remove the file by joining it onto `thumb_dir`.
+    fn thumb_key(&self, uid: &NodeUid, ttype: i32) -> String {
+        format!("{}.t{ttype}", Self::key(uid))
+    }
+
     fn thumb_blob(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
-        self.thumb_dir.join(format!("{}.t{ttype}", Self::key(uid)))
+        self.thumb_dir.join(self.thumb_key(uid, ttype))
     }
 
     fn thumb_meta(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
@@ -672,7 +730,14 @@ impl ContentCache {
         if recorded != mtime {
             return None;
         }
-        std::fs::read(self.thumb_blob(uid, ttype)).ok()
+        let bytes = std::fs::read(self.thumb_blob(uid, ttype)).ok()?;
+        // Record the access for LRU, as the blob and block readers do. Without
+        // it the pool evicts in insertion order, so scrolling back up a gallery
+        // would drop exactly the tiles being looked at.
+        let _ = self
+            .db
+            .cache_accessed(&self.thumb_key(uid, ttype), now_millis());
+        Some(bytes)
     }
 
     /// On-disk path of the cached content blob for `uid`, validated against
@@ -699,7 +764,13 @@ impl ContentCache {
             return None;
         }
         let blob = self.thumb_blob(uid, ttype);
-        blob.exists().then_some(blob)
+        if !blob.exists() {
+            return None;
+        }
+        let _ = self
+            .db
+            .cache_accessed(&self.thumb_key(uid, ttype), now_millis());
+        Some(blob)
     }
 
     /// On-disk path where `uid`'s `ttype` thumbnail lives once stored.
@@ -732,7 +803,25 @@ impl ContentCache {
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(self.thumb_meta(uid, ttype), serde_json::to_vec(&mtime)?)?;
+        self.db.cache_touch(
+            &self.thumb_key(uid, ttype),
+            KIND_THUMB,
+            bytes.len() as u64,
+            now_millis(),
+        )?;
+        self.thumb_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.enforce_thumb_budget();
         Ok(())
+    }
+
+    /// Evict least-recently-used thumbnails until the pool fits its share of the
+    /// budget. Every thumbnail is evictable, including those of pinned nodes: a
+    /// thumbnail is derived data that the gallery re-fetches or regenerates, and
+    /// exempting them would mean a large pinned library could hold the pool
+    /// permanently over its ceiling — the exact unbounded growth C6 was about.
+    fn enforce_thumb_budget(&self) {
+        self.enforce_pool(KIND_THUMB, &self.thumb_dir, None);
     }
 
     /// Evict least-recently-used *unpinned* blobs until total blob bytes fit the
@@ -740,7 +829,7 @@ impl ContentCache {
     /// cache already fits. Pinned blobs are skipped, so a cache held entirely by
     /// pins can legitimately stay over budget.
     fn enforce_budget(&self) {
-        let cap = self.cap();
+        let cap = self.pool_cap(KIND_BLOB);
         if cap == 0 || self.blob_bytes.load(Ordering::Relaxed) <= cap {
             // The common case, settled without a query — and in particular
             // without the recursive pin CTE below, which used to run on every
@@ -801,33 +890,31 @@ impl ContentCache {
             .collect()
     }
 
-    /// Total bytes of cached content blobs (pinned + unpinned), matching what
-    /// [`enforce_budget`](Self::enforce_budget) weighs against the cap.
-    /// Thumbnails live in a sibling dir and are not counted. Cheap directory
-    /// scan, safe to call from a front-end for a usage read-out.
+    /// Total bytes the cache holds on disk — blobs, blocks and thumbnails
+    /// together — which is what the configured budget caps and therefore the
+    /// only honest thing to show next to it.
+    ///
+    /// This used to scan `content_dir` alone, which excluded both the block dir
+    /// and the thumb dir: the Settings page could report a few hundred megabytes
+    /// while the cache held several gigabytes. Now it reads the same running
+    /// totals the budget enforcers use, so the displayed number and the enforced
+    /// number cannot disagree — and it costs three atomic loads instead of a
+    /// directory scan.
+    ///
+    /// Excludes the `.meta` sidecars (a few dozen bytes each) and the scratch
+    /// and staging dirs, which hold unuploaded user writes rather than cache and
+    /// are deliberately not evictable.
     pub fn usage(&self) -> u64 {
-        let Ok(rd) = std::fs::read_dir(&self.content_dir) else {
-            return 0;
-        };
-        let mut total = 0u64;
-        for entry in rd.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name.ends_with(".meta") || name.ends_with(".tmp") {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata()
-                && meta.is_file()
-            {
-                total += meta.len();
-            }
-        }
-        total
+        [KIND_BLOB, KIND_BLOCK, KIND_THUMB]
+            .iter()
+            .map(|k| self.pool(k).load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Configured soft byte cap (`0` = unlimited), for display alongside
-    /// [`usage`](Self::usage).
+    /// [`usage`](Self::usage). This is the whole-cache figure; internally it is
+    /// divided between the pools (see [`SPLIT_BLOB`]), but the user set one
+    /// number and gets that number.
     pub fn budget(&self) -> u64 {
         self.cap()
     }
@@ -846,6 +933,7 @@ impl ContentCache {
         self.max_bytes.store(bytes, Ordering::Relaxed);
         self.enforce_budget();
         self.enforce_block_budget();
+        self.enforce_thumb_budget();
     }
 
     /// Delete every *unpinned* cached blob plus all on-demand block chunks,
@@ -874,13 +962,19 @@ impl ContentCache {
                 freed = freed.saturating_add(size);
             }
         }
-        // Every on-demand block (transient partial reads, re-fetched on demand).
-        if let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOCK) {
-            for (key, size) in entries {
-                let _ = std::fs::remove_file(self.block_dir.join(&key));
-                let _ = std::fs::remove_file(self.block_dir.join(format!("{key}.meta")));
-                let _ = self.db.cache_remove(&key);
-                freed = freed.saturating_add(size);
+        // Every on-demand block (transient partial reads, re-fetched on demand)
+        // and every thumbnail (derived, re-fetched or regenerated on demand).
+        // Both pools are dropped wholesale rather than filtered by pin: neither
+        // is what "keep this available offline" means, and leaving them behind
+        // would make "clear cache" free visibly less than it reported.
+        for (kind, dir) in [(KIND_BLOCK, &self.block_dir), (KIND_THUMB, &self.thumb_dir)] {
+            if let Ok(entries) = self.db.cache_entries_by_kind(kind) {
+                for (key, size) in entries {
+                    let _ = std::fs::remove_file(dir.join(&key));
+                    let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+                    let _ = self.db.cache_remove(&key);
+                    freed = freed.saturating_add(size);
+                }
             }
         }
         self.reseed_totals();
@@ -923,6 +1017,28 @@ mod tests {
 
     fn cache() -> (ContentCache, TempDir) {
         cache_capped(0)
+    }
+
+    /// A cache whose `kind` pool holds exactly `bytes`.
+    ///
+    /// The configured budget is a whole-cache figure divided between the pools
+    /// (C7), while a test that exercises eviction cares about one pool at a
+    /// time. So the test states the pool size it means and this inverts the
+    /// split, rather than every such test hard-coding a number that silently
+    /// changes meaning if the split is ever retuned.
+    fn cache_with_pool_cap(kind: &str, bytes: u64) -> (ContentCache, TempDir) {
+        let share = match kind {
+            KIND_BLOCK => SPLIT_BLOCK,
+            KIND_THUMB => SPLIT_THUMB,
+            _ => SPLIT_BLOB,
+        };
+        // Round up, so the pool holds at least `bytes` rather than one short.
+        let (c, d) = cache_capped((bytes * 100).div_ceil(share));
+        assert!(
+            c.pool_cap(kind) >= bytes,
+            "helper must give the {kind} pool at least {bytes} bytes"
+        );
+        (c, d)
     }
 
     fn cache_capped(max_bytes: u64) -> (ContentCache, TempDir) {
@@ -1054,23 +1170,33 @@ mod tests {
         // Cap far above what we store, so every store stays under budget.
         let (c, _d) = cache_capped(1 << 30);
         let payload = vec![0u8; 4096];
-        // Populate enough entries that a full scan would be visibly slower.
-        for i in 0..2000u64 {
-            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
-        }
 
+        // Cost of a store against a near-empty index...
         let t = Instant::now();
-        for i in 2000..2500u64 {
+        for i in 0..500u64 {
             c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
         }
-        let per_store = t.elapsed() / 500;
+        let empty = t.elapsed() / 500;
 
-        println!("B4: store_block while under budget — {per_store:?} each");
-        // Generous bound: the point is that it does not grow with the 2000
-        // existing entries, not that any particular microsecond count holds.
+        // ...and against one with a few thousand entries in it.
+        for i in 500..2500u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+        let t = Instant::now();
+        for i in 2500..3000u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+        let full = t.elapsed() / 500;
+
+        println!("B4: store_block under budget — {empty:?} at ~0 entries, {full:?} at 2500");
+        // A ratio, not a wall-clock bound: the claim is that the under-budget
+        // path does not grow with the index, and only a ratio tests that. An
+        // absolute threshold measures the machine's load instead, and this test
+        // runs alongside the rest of the suite.
         assert!(
-            per_store < std::time::Duration::from_millis(1),
-            "under-budget store should not scan the index; took {per_store:?}"
+            full < empty * 3,
+            "under-budget store should not scale with the index: \
+             {empty:?} at ~0 entries vs {full:?} at 2500"
         );
     }
 
@@ -1079,7 +1205,7 @@ mod tests {
     /// over-budget stores cannot drift them.
     #[test]
     fn running_totals_stay_aligned_with_the_index() {
-        let (c, _d) = cache_capped(8);
+        let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
         for i in 0..12u64 {
             c.store_block(&uid("a"), 1, 100, i, b"aaaa").unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1101,8 +1227,8 @@ mod tests {
 
     #[test]
     fn budget_evicts_lru_unpinned() {
-        // Cap fits two 4-byte blobs but not three.
-        let (c, _d) = cache_capped(8);
+        // Blob pool fits two 4-byte blobs but not three.
+        let (c, _d) = cache_with_pool_cap(KIND_BLOB, 8);
         let (a, b, d) = (uid("a"), uid("b"), uid("d"));
 
         c.store(&a, 1, 4, b"aaaa").unwrap();
@@ -1123,7 +1249,7 @@ mod tests {
 
     #[test]
     fn budget_never_evicts_pinned() {
-        let (c, _d) = cache_capped(8);
+        let (c, _d) = cache_with_pool_cap(KIND_BLOB, 8);
         let (a, b, d) = (uid("a"), uid("b"), uid("d"));
 
         c.store(&a, 1, 4, b"aaaa").unwrap();
@@ -1166,13 +1292,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         c.store(&d, 1, 4, b"dddd").unwrap();
 
-        // Tightening to 8 bytes evicts the LRU unpinned blob(s) now, not on the
-        // next store.
-        c.set_budget(8);
+        // Tightening to a budget whose blob share is 8 bytes evicts the LRU
+        // unpinned blob(s) now, not on the next store.
+        c.set_budget((8 * 100u64).div_ceil(SPLIT_BLOB));
         assert!(!c.is_cached(&a, 1, 4), "oldest blob evicted on tighten");
         assert!(c.is_cached(&b, 1, 4));
         assert!(c.is_cached(&d, 1, 4));
-        assert_eq!(c.budget(), 8);
+        // `budget()` reports the whole-cache figure that was set, not one
+        // pool's share of it.
+        assert_eq!(c.budget(), (8 * 100u64).div_ceil(SPLIT_BLOB));
     }
 
     /// **The A2 reproduce.** Thumbnail types 1 and 2 of one node must not share
@@ -1242,6 +1370,107 @@ mod tests {
         assert!(c.read_thumbnail(&u, 2, 100).is_none());
     }
 
+    /// Total bytes of every real file under `root`, recursively — what `du`
+    /// would report, and what `usage()` claims to be reporting.
+    fn bytes_on_disk(root: &Path) -> u64 {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                total += bytes_on_disk(&entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
+    /// C6/C7. Two claims the cache makes and does not keep.
+    ///
+    /// The configured budget is the whole promise of the Settings page: it is
+    /// the only thing standing between an on-demand filesystem and a full disk.
+    /// A thumbnail per photo, on a library of tens of thousands, is not a
+    /// rounding error.
+    #[test]
+    fn every_pool_is_budgeted_and_visible() {
+        const CAP: u64 = 256 * 1024;
+        let (c, dir) = cache_capped(CAP);
+        let payload = vec![0u8; 8 * 1024];
+
+        // A gallery scroll: one thumbnail per photo, far past the cap.
+        for i in 0..200u64 {
+            c.store_thumbnail(&uid(&format!("photo{i}")), 1, 1, &payload)
+                .unwrap();
+        }
+        // Plus enough blob and block traffic to fill both other pools.
+        for i in 0..100u64 {
+            c.store(&uid(&format!("file{i}")), 1, payload.len() as u64, &payload)
+                .unwrap();
+            c.store_block(&uid("streamed"), 1, 1 << 30, i, &payload)
+                .unwrap();
+        }
+
+        let on_disk = bytes_on_disk(dir.path());
+        let reported = c.usage();
+
+        // 1. The cap is a cap on the cache, not on one pool of it.
+        assert!(
+            on_disk <= CAP + CAP / 8,
+            "cache holds {on_disk} bytes against a {CAP}-byte budget"
+        );
+        // 2. And the number shown to the user is the number on disk. Meta
+        //    sidecars are small and untracked, hence the tolerance.
+        let drift = on_disk.abs_diff(reported);
+        assert!(
+            drift <= on_disk / 8,
+            "usage() reports {reported} against {on_disk} on disk"
+        );
+    }
+
+    /// The thumbnail pool must evict by *use*, not by insertion order. A gallery
+    /// scrolled down and back up re-reads the tiles it already has; under FIFO
+    /// those are exactly the ones dropped, so every scroll back would re-fetch.
+    #[test]
+    fn thumbnails_evict_least_recently_used() {
+        // Pool fits two 4-byte thumbnails but not three.
+        let (c, _d) = cache_with_pool_cap(KIND_THUMB, 8);
+        let (a, b, d) = (uid("a"), uid("b"), uid("d"));
+
+        c.store_thumbnail(&a, 1, 1, b"aaaa").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        c.store_thumbnail(&b, 1, 1, b"bbbb").unwrap();
+        // Look at `a` again, making `b` the least-recently-used.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(c.read_thumbnail(&a, 1, 1).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        c.store_thumbnail(&d, 1, 1, b"dddd").unwrap();
+        assert!(c.read_thumbnail(&a, 1, 1).is_some(), "recently read, kept");
+        assert!(c.read_thumbnail(&b, 1, 1).is_none(), "least recently used");
+        assert!(c.read_thumbnail(&d, 1, 1).is_some(), "just stored");
+    }
+
+    /// Evicting a node drops its thumbnails from the index as well as from disk.
+    /// A row left behind would keep counting bytes that are gone, and the
+    /// running total would drift above the truth until the next restart.
+    #[test]
+    fn evicting_a_node_clears_its_thumbnail_accounting() {
+        let (c, _d) = cache();
+        let u = uid("a");
+        c.store(&u, 1, 4, b"aaaa").unwrap();
+        c.store_thumbnail(&u, 1, 1, b"thumb1").unwrap();
+        c.store_thumbnail(&u, 2, 1, b"preview2").unwrap();
+        assert!(c.thumb_bytes.load(Ordering::Relaxed) > 0);
+
+        c.evict(&u);
+        assert_eq!(c.thumb_bytes.load(Ordering::Relaxed), 0);
+        assert!(c.db.cache_entries_by_kind(KIND_THUMB).unwrap().is_empty());
+        assert_eq!(c.usage(), 0, "nothing cached, nothing reported");
+    }
+
     #[test]
     fn evict_removes_blob() {
         let (c, _d) = cache();
@@ -1277,8 +1506,8 @@ mod tests {
 
     #[test]
     fn block_budget_evicts_lru() {
-        // Cap fits two 4-byte blocks but not three.
-        let (c, _d) = cache_capped(8);
+        // Block pool fits two 4-byte blocks but not three.
+        let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
         let u = uid("a");
         c.store_block(&u, 1, 12, 0, b"aaaa").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));

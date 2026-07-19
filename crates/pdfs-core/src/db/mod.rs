@@ -52,6 +52,13 @@ pub use trash::StoredTrash;
 /// outliers rather than fighting the normal write path for disk.
 const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
+/// How long a statement waits for a database lock before giving up.
+///
+/// Long enough to outlast any transaction this daemon writes (the largest, a
+/// full-index FTS rebuild, is well under a second), short enough that a
+/// genuinely stuck holder surfaces as an error rather than an apparent hang.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Handle to the unified metadata database.
 ///
 /// Cheap to wrap in an `Arc`; clone the `Arc`, not this. All access goes through
@@ -77,6 +84,17 @@ impl Db {
         // forever — a multi-GB file next to a database two orders of magnitude
         // smaller. Checkpointing is unaffected; only the file is truncated back.
         conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
+        // Wait for a lock rather than failing instantly on SQLITE_BUSY.
+        //
+        // This is deliberately explicit and deliberately redundant: rusqlite
+        // already applies a five-second busy timeout of its own, so this changes
+        // nothing today. It is here so the value is *ours* — a behaviour the
+        // daemon depends on should not be an inherited default that a dependency
+        // bump can silently change. `open_bounds_the_wal_size` pins it.
+        //
+        // (Bare SQLite does default to 0, which is where the belief that this
+        // was unset came from. That default is not what we get.)
+        conn.busy_timeout(BUSY_TIMEOUT)?;
 
         let db = Self {
             conn: Mutex::new(conn),

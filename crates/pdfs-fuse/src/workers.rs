@@ -49,11 +49,26 @@ impl Workers {
                             // `Reply` answers EIO on its own, so the caller of
                             // the failed op is told; the next job is unaffected.
                             //
-                            // This only holds because the shared state is behind
-                            // `parking_lot` mutexes: a `std` mutex held at the
-                            // point of the panic would come back poisoned, and
-                            // the worker we just rescued would die on its next
-                            // acquisition — as would every other thread.
+                            // This only holds while no shared state a job
+                            // touches sits behind a *poisoning* lock. A
+                            // `std::sync::Mutex` held at the point of the panic
+                            // comes back poisoned, and the worker we just
+                            // rescued dies on its next acquisition — as does
+                            // every other thread. The rescue would then convert
+                            // one recoverable EIO into a permanently broken
+                            // daemon: strictly worse than not catching at all.
+                            //
+                            // This crate's state is behind `parking_lot`, which
+                            // does not poison. **The requirement crosses the
+                            // crate boundary**, though: a job runs deep into
+                            // `proton-sdk`, whose entity cache is a `std`
+                            // mutex. It recovers the guard rather than
+                            // unwrapping (see `InMemoryCacheRepository::state`);
+                            // its session and HTTP state are
+                            // `tokio::sync::Mutex`, which has no poisoning at
+                            // all. Anything new reached from a job owes the same
+                            // check — an SDK-side `.lock().unwrap()` silently
+                            // invalidates this comment.
                             Ok(job) => {
                                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                             }

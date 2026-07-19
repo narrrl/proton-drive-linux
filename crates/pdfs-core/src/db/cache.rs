@@ -52,14 +52,17 @@ impl Db {
         Ok(())
     }
 
-    /// Drop the whole-file blob row for `key` plus every block row for the same
-    /// uid (`<key>.b<idx>`). Called by `ContentCache::evict`, which removes the
-    /// blob and all of a uid's cached blocks at once.
+    /// Drop the whole-file blob row for `key` plus every derived row for the
+    /// same uid — blocks (`<key>.b<idx>`) and thumbnails (`<key>.t<type>`).
+    /// Called by `ContentCache::evict`, which removes the blob, all of a uid's
+    /// cached blocks and all of its thumbnails at once; a row left behind here
+    /// would keep counting bytes that are no longer on disk.
     pub fn cache_remove_all(&self, key: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "DELETE FROM cache_entries WHERE cache_key = ?1 OR cache_key LIKE ?2",
-            params![key, format!("{key}.b%")],
+            "DELETE FROM cache_entries
+             WHERE cache_key = ?1 OR cache_key LIKE ?2 OR cache_key LIKE ?3",
+            params![key, format!("{key}.b%"), format!("{key}.t%")],
         )?;
         Ok(())
     }
