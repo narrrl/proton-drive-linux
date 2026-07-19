@@ -320,12 +320,20 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
             let overlay = gtk4::Overlay::new();
             overlay.set_child(Some(&icon));
             overlay.add_overlay(&badge);
+            // `WordChar` rather than the default `Word`: a name with no spaces
+            // offers no word-break opportunity, so word wrapping cannot break it
+            // at all and the label asks for its full natural width instead —
+            // one tile stretches to the width of the window and the grid
+            // collapses to a single column. Allowing a mid-word break is what
+            // keeps the two-line-then-ellipsis budget below enforceable for
+            // *every* name rather than only the ones that happen to have spaces.
             let label = gtk4::Label::builder()
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
                 .justify(gtk4::Justification::Center)
                 .max_width_chars(13)
                 .width_chars(13)
                 .wrap(true)
+                .wrap_mode(gtk4::pango::WrapMode::WordChar)
                 .lines(2)
                 .build();
             let tile = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
@@ -349,6 +357,9 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
         let entry = obj.borrow::<DirEntry>();
         icon.set_icon_name(Some(icon_base_for(&entry)));
         label.set_label(&entry.name);
+        // The tile shows at most two lines of it, so the full name has to be
+        // reachable somehow.
+        label.set_tooltip_text(Some(&entry.name));
         apply_badge(&badge, &entry);
     });
     grid.set_factory(Some(&factory));
@@ -388,7 +399,14 @@ pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
         move |_, item| {
             let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
             let icon = gtk4::Image::builder().pixel_size(16).build();
-            let label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+            // Ellipsized so the Name column can be *narrower* than its longest
+            // name. Without it the label's minimum width is the whole string,
+            // the column inherits that minimum, and one long name pushes Size
+            // and Modified off the right edge of the window for every row.
+            let label = gtk4::Label::builder()
+                .halign(gtk4::Align::Start)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build();
             let badge = gtk4::Image::builder().pixel_size(14).build();
             badge.add_css_class("file-badge");
             let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -411,6 +429,7 @@ pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
         let entry = obj.borrow::<DirEntry>();
         icon.set_icon_name(Some(&format!("{}-symbolic", icon_base_for(&entry))));
         label.set_label(&entry.name);
+        label.set_tooltip_text(Some(&entry.name));
         apply_badge(&badge, &entry);
     });
     let column = gtk4::ColumnViewColumn::new(Some("Name"), Some(factory));
