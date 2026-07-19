@@ -10,8 +10,8 @@ authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
 
 [workspace.dependencies]
-proton-sdk = "0.1.6"
-proton-drive-rs = "0.1.6"
+proton-sdk = "0.1.8"
+proton-drive-rs = "0.1.8"
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }
@@ -37,9 +37,3 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 fuser = "0.17"
 libc = "0.2"
-
-# Development override: build against the local SDK checkout until 0.1.6 is
-# published to crates.io. Remove this block to consume the released crate.
-[patch.crates-io]
-proton-sdk = { path = "../proton-sdk-rs/crates/proton-sdk" }
-proton-drive-rs = { path = "../proton-sdk-rs/crates/proton-drive-rs" }
