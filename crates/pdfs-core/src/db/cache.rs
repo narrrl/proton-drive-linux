@@ -64,9 +64,49 @@ impl Db {
         Ok(())
     }
 
+    /// Total bytes held by entries of `kind`.
+    ///
+    /// The budget enforcers' first question, and almost always their last: the
+    /// common case is "under budget, evict nothing". Answering it with a `SUM`
+    /// costs one index range rather than materializing every row, which matters
+    /// because `enforce_block_budget` runs on every cached block — once per
+    /// 4 MiB of every cold read — while holding the shared connection.
+    pub fn cache_total_bytes(&self, kind: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM cache_entries WHERE kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )?;
+        Ok(total.max(0) as u64)
+    }
+
+    /// The `limit` least-recently-accessed entries of `kind`, oldest first.
+    ///
+    /// Eviction wants a handful of victims, not the whole table. Bounded so a
+    /// pass over a large cache does not read every row to drop a few, and so the
+    /// `(kind, last_accessed)` index can answer it as a range scan with an early
+    /// stop.
+    pub fn cache_eviction_candidates(&self, kind: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT cache_key, size_bytes FROM cache_entries
+             WHERE kind = ?1 ORDER BY last_accessed ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![kind, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Every cache entry of `kind`, ordered least-recently-accessed first, as
-    /// `(cache_key, size_bytes)`. The budget enforcer sums the sizes and evicts
-    /// from the front until the cache fits.
+    /// `(cache_key, size_bytes)`. Used by the whole-cache passes
+    /// (`clear_unpinned`); incremental eviction wants
+    /// [`cache_eviction_candidates`](Self::cache_eviction_candidates).
     pub fn cache_entries_by_kind(&self, kind: &str) -> Result<Vec<(String, u64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(

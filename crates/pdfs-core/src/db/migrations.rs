@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 13;
+pub(super) const SCHEMA_VERSION: i64 = 14;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -74,6 +74,9 @@ impl Db {
         }
         if current < 13 {
             tx.execute_batch(MIGRATION_V13)?;
+        }
+        if current < 14 {
+            tx.execute_batch(MIGRATION_V14)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -326,4 +329,14 @@ CREATE INDEX pending_op_parent ON pending_op(parent_uid);
 const MIGRATION_V13: &str = "
 ALTER TABLE photos ADD COLUMN media_type TEXT;
 ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Schema v14: index the content-cache LRU. `cache_entries` carried only its
+/// `cache_key` primary key, so every budget check and every eviction pass was a
+/// full scan plus a sort — on a path that runs once per cached 4 MiB block,
+/// under the connection lock every FUSE metadata call also needs. `(kind,
+/// last_accessed)` turns both into a range scan: the `SUM` reads one kind's
+/// slice, and eviction reads its front and stops.
+const MIGRATION_V14: &str = "
+CREATE INDEX cache_entries_lru ON cache_entries(kind, last_accessed);
 ";

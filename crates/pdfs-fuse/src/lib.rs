@@ -3097,17 +3097,6 @@ fn conflict_name(name: &str, stamp: i64) -> String {
     }
 }
 
-/// Whether an op can be attempted now, as opposed to waiting on another op.
-///
-/// A node created inside a folder that was itself created offline cannot be sent
-/// anywhere until that folder is real — the API has never heard of `local~…`.
-/// Ops replay in queue order, so the parent normally drains first and rewrites
-/// this one; the check matters when the parent is instead backing off after a
-/// failure, where the child must wait rather than burn its own retries.
-fn op_is_ready(op: &PendingOp) -> bool {
-    !op.parent_uid.as_deref().is_some_and(is_local_uid_str)
-}
-
 /// Fabricate the node the server would have returned, for a `create`/`mkdir`
 /// that could not reach it. Everything the kernel asks about a fresh node —
 /// name, kind, size, times — is knowable locally; the uid is the only invention,
@@ -4782,28 +4771,6 @@ mod local_uid_tests {
         assert!(!is_local_uid_str("local"));
         // The sentinel is the *volume*; a link that merely says "local" is real.
         assert!(!is_local_uid_str("vol1~local"));
-    }
-
-    #[test]
-    fn an_op_waits_for_a_parent_that_is_still_a_placeholder() {
-        let op = |parent: Option<&str>| PendingOp {
-            id: 0,
-            kind: OP_CREATE.to_string(),
-            uid: "local~child".to_string(),
-            parent_uid: parent.map(str::to_string),
-            name: Some("f.txt".to_string()),
-            blob_path: None,
-            meta_json: None,
-            created_at: 0,
-            attempts: 0,
-            last_error: None,
-            next_attempt_at: 0,
-        };
-        // Sending this to the API would 404: the folder does not exist yet.
-        assert!(!op_is_ready(&op(Some("local~dir"))));
-        assert!(op_is_ready(&op(Some("vol1~dir"))));
-        // A revision op names no parent and is always ready.
-        assert!(op_is_ready(&op(None)));
     }
 
     #[test]

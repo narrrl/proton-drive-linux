@@ -51,6 +51,12 @@ fn now_millis() -> i64 {
 /// `download_range` fetch with no straddling.
 pub const BLOCK_SIZE: u64 = 1 << 22;
 
+/// How many eviction candidates to pull per batch when a pool is over budget.
+/// Large enough that a normal overshoot (a store or two past the cap) is settled
+/// in one query, small enough that a badly-over-budget cache does not read its
+/// whole index to drop the oldest few.
+const EVICT_BATCH: usize = 64;
+
 /// Validity tag stored alongside a cached blob. A blob is fresh only if both
 /// fields still match the node's current metadata.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +167,19 @@ pub struct ContentCache {
     /// (a Settings-page change) via [`set_budget`](Self::set_budget) without
     /// taking a lock on every cache read.
     max_bytes: AtomicU64,
+    /// Running byte totals for the two budgeted pools, so the overwhelmingly
+    /// common "still under budget" answer costs an atomic load instead of a
+    /// database query.
+    ///
+    /// These are a *fast path*, not the source of truth — the `cache_entries`
+    /// index is. They are seeded from it at open (right after `reconcile`, so
+    /// they describe what is actually on disk), advanced on each store, and
+    /// **re-seeded from the index after every eviction pass**, which is what
+    /// keeps a long-running daemon from drifting: the only operations that
+    /// change a total without going through here are external file deletions,
+    /// and the next open reconciles those.
+    blob_bytes: AtomicU64,
+    block_bytes: AtomicU64,
     /// Unified metadata DB. Its `cache_entries` table is the LRU index: every
     /// store/read/evict updates it, and the budget enforcers query it instead of
     /// scanning the cache directories (plan.md P4).
@@ -203,9 +222,14 @@ impl ContentCache {
             staging_dir,
             pins_path,
             max_bytes: AtomicU64::new(max_bytes),
+            blob_bytes: AtomicU64::new(0),
+            block_bytes: AtomicU64::new(0),
             db,
         };
         cache.reconcile()?;
+        // After reconcile, so the totals describe the index that now describes
+        // the disk.
+        cache.reseed_totals();
         cache.import_legacy_pins()?;
         Ok(cache)
     }
@@ -359,6 +383,9 @@ impl ContentCache {
     /// crash mid-store fails validation rather than serving truncated data.
     pub fn store(&self, uid: &NodeUid, mtime: i64, size: u64, bytes: &[u8]) -> Result<()> {
         let blob = self.blob_path(uid);
+        // `with_extension` is safe *here* only because a blob path is a bare
+        // 64-char hex key with no `.`, so this appends rather than replaces.
+        // `store_thumbnail` cannot use the same idiom — see the note there.
         let tmp = blob.with_extension("tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &blob)?;
@@ -368,6 +395,8 @@ impl ContentCache {
         // newest entry is weighed (and ordered most-recent) like any other.
         self.db
             .cache_touch(&Self::key(uid), KIND_BLOB, bytes.len() as u64, now_millis())?;
+        self.blob_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.enforce_budget();
         Ok(())
     }
@@ -435,38 +464,95 @@ impl ContentCache {
             bytes.len() as u64,
             now_millis(),
         )?;
+        self.block_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.enforce_block_budget();
         Ok(())
+    }
+
+    /// Re-read both pool totals from the cache index, which is authoritative.
+    fn reseed_totals(&self) {
+        if let Ok(n) = self.db.cache_total_bytes(KIND_BLOB) {
+            self.blob_bytes.store(n, Ordering::Relaxed);
+        }
+        if let Ok(n) = self.db.cache_total_bytes(KIND_BLOCK) {
+            self.block_bytes.store(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The running total for a pool.
+    fn pool(&self, kind: &str) -> &AtomicU64 {
+        if kind == KIND_BLOCK {
+            &self.block_bytes
+        } else {
+            &self.blob_bytes
+        }
     }
 
     /// Evict least-recently-used block-cache files until the block dir fits
     /// `max_bytes`. No-op when the cap is disabled (`0`). All blocks are
     /// evictable — pinned files are served from whole-file blobs, never blocks.
     fn enforce_block_budget(&self) {
+        self.enforce_pool(KIND_BLOCK, &self.block_dir, None);
+    }
+
+    /// Evict least-recently-used entries of one pool until it fits the cap.
+    ///
+    /// Runs on every store, so the under-budget case is the one that matters:
+    /// it is an atomic load and nothing else. Only once the running total says
+    /// we are over does this touch the database, and then it works in bounded
+    /// batches rather than reading the whole index — a cache that is 10 GB over
+    /// budget should not materialize every row to drop the oldest few.
+    ///
+    /// `exempt` names keys that count toward the total but are never victims
+    /// (pinned blobs). A pass that can find no eligible victim stops rather than
+    /// looping: a cache held entirely by pins legitimately stays over budget.
+    fn enforce_pool(&self, kind: &str, dir: &Path, exempt: Option<&HashSet<String>>) {
         let cap = self.cap();
         if cap == 0 {
             return;
         }
-        // LRU-ordered (oldest first) block entries straight from the index — no
-        // directory scan. All blocks are evictable; pinned files are served from
-        // whole-file blobs, never blocks.
-        let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOCK) else {
-            return;
+        let total = self.pool(kind);
+        if total.load(Ordering::Relaxed) <= cap {
+            return; // the common case: one atomic load, no query
+        }
+
+        // Over budget by the running count — now do the accurate work.
+        let mut running = match self.db.cache_total_bytes(kind) {
+            Ok(n) => n,
+            Err(_) => return,
         };
-        let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
-        if total <= cap {
-            return;
-        }
-        for (key, size) in entries {
-            if total <= cap {
+        let mut skipped = 0usize;
+        while running > cap {
+            // Fetch a batch past whatever we have already skipped as exempt.
+            let want = skipped + EVICT_BATCH;
+            let Ok(batch) = self.db.cache_eviction_candidates(kind, want) else {
                 break;
+            };
+            if batch.len() <= skipped {
+                break; // nothing new to consider
             }
-            // `key` is the block file's name (and its `.meta` sibling's stem).
-            let _ = std::fs::remove_file(self.block_dir.join(&key));
-            let _ = std::fs::remove_file(self.block_dir.join(format!("{key}.meta")));
-            let _ = self.db.cache_remove(&key);
-            total = total.saturating_sub(size);
+            let mut evicted_any = false;
+            for (key, size) in batch.into_iter().skip(skipped) {
+                if running <= cap {
+                    break;
+                }
+                if exempt.is_some_and(|set| set.contains(&key)) {
+                    skipped += 1; // counts toward the total, never a victim
+                    continue;
+                }
+                let _ = std::fs::remove_file(dir.join(&key));
+                let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+                let _ = self.db.cache_remove(&key);
+                running = running.saturating_sub(size);
+                evicted_any = true;
+            }
+            if !evicted_any {
+                break; // every remaining candidate is exempt
+            }
         }
+        // The index is the truth; realign the fast path with it.
+        self.reseed_totals();
     }
 
     /// Create a fresh, empty read-write scratch file for a disk-backed write
@@ -563,6 +649,8 @@ impl ContentCache {
         }
         // Forget the blob and all of this uid's block rows in the LRU index.
         let _ = self.db.cache_remove_all(&Self::key(uid));
+        // Rows just left the index; the running totals must follow.
+        self.reseed_totals();
     }
 
     fn thumb_blob(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
@@ -622,6 +710,14 @@ impl ContentCache {
     /// Cache `bytes` as the `ttype` thumbnail for `uid`, tagged with `mtime`.
     /// Blob written to a temp file then renamed; the meta tag is written last so
     /// a crash mid-store fails validation rather than serving a torn thumbnail.
+    ///
+    /// The temp name carries `ttype`, and must. `Path::with_extension` would
+    /// *replace* the `.t{ttype}` suffix rather than append to it, giving every
+    /// thumbnail type of one node the same staging file — so a type-1 and a
+    /// type-2 store racing (the gallery caches type 1 from a control-socket
+    /// thread while `getxattr` caches type 2 on the FUSE dispatch loop) would
+    /// publish one type's bytes under the other's name. See
+    /// `concurrent_thumbnail_types_do_not_share_a_temp_file`.
     pub fn store_thumbnail(
         &self,
         uid: &NodeUid,
@@ -630,7 +726,9 @@ impl ContentCache {
         bytes: &[u8],
     ) -> Result<()> {
         let blob = self.thumb_blob(uid, ttype);
-        let tmp = blob.with_extension("tmp");
+        let tmp = self
+            .thumb_dir
+            .join(format!("{}.t{ttype}.tmp", Self::key(uid)));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(self.thumb_meta(uid, ttype), serde_json::to_vec(&mtime)?)?;
@@ -643,7 +741,10 @@ impl ContentCache {
     /// pins can legitimately stay over budget.
     fn enforce_budget(&self) {
         let cap = self.cap();
-        if cap == 0 {
+        if cap == 0 || self.blob_bytes.load(Ordering::Relaxed) <= cap {
+            // The common case, settled without a query — and in particular
+            // without the recursive pin CTE below, which used to run on every
+            // single store.
             return;
         }
         // Pinned blobs (by cache key) are exempt from eviction. Resolves direct
@@ -656,30 +757,8 @@ impl ContentCache {
             .iter()
             .map(|uid| Self::key_str(uid))
             .collect();
-
-        // LRU-ordered (oldest first) blob entries from the index — no directory
-        // scan. Pinned blobs still count toward the total (so pins alone can hold
-        // the cache over budget) but are never chosen as victims.
-        let Ok(entries) = self.db.cache_entries_by_kind(KIND_BLOB) else {
-            return;
-        };
-        let mut total: u64 = entries.iter().map(|(_, size)| *size).sum();
-        if total <= cap {
-            return;
-        }
-        for (key, size) in entries {
-            if total <= cap {
-                break;
-            }
-            if pinned.contains(&key) {
-                continue; // counts toward total but is never a victim
-            }
-            // `key` is the blob file's name (and its `.meta` sibling's stem).
-            let _ = std::fs::remove_file(self.content_dir.join(&key));
-            let _ = std::fs::remove_file(self.content_dir.join(format!("{key}.meta")));
-            let _ = self.db.cache_remove(&key);
-            total = total.saturating_sub(size);
-        }
+        let content_dir = self.content_dir.clone();
+        self.enforce_pool(KIND_BLOB, &content_dir, Some(&pinned));
     }
 
     /// Whether `uid` is pinned — directly, or because an ancestor folder is
@@ -804,6 +883,7 @@ impl ContentCache {
                 freed = freed.saturating_add(size);
             }
         }
+        self.reseed_totals();
         freed
     }
 }
@@ -963,6 +1043,62 @@ mod tests {
         assert!(!c.is_cached(&u, 100, 3));
     }
 
+    /// The under-budget path — which is every store until the cache fills — must
+    /// not touch the database at all. It is on the cold-read hot path: one call
+    /// per cached 4 MiB block, under the connection lock every FUSE metadata
+    /// call also needs.
+    #[test]
+    fn budget_check_is_free_when_under_budget() {
+        use std::time::Instant;
+
+        // Cap far above what we store, so every store stays under budget.
+        let (c, _d) = cache_capped(1 << 30);
+        let payload = vec![0u8; 4096];
+        // Populate enough entries that a full scan would be visibly slower.
+        for i in 0..2000u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+
+        let t = Instant::now();
+        for i in 2000..2500u64 {
+            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+        }
+        let per_store = t.elapsed() / 500;
+
+        println!("B4: store_block while under budget — {per_store:?} each");
+        // Generous bound: the point is that it does not grow with the 2000
+        // existing entries, not that any particular microsecond count holds.
+        assert!(
+            per_store < std::time::Duration::from_millis(1),
+            "under-budget store should not scan the index; took {per_store:?}"
+        );
+    }
+
+    /// The running totals are a fast path, not a second source of truth: after
+    /// an eviction pass they are realigned with the index, so repeated
+    /// over-budget stores cannot drift them.
+    #[test]
+    fn running_totals_stay_aligned_with_the_index() {
+        let (c, _d) = cache_capped(8);
+        for i in 0..12u64 {
+            c.store_block(&uid("a"), 1, 100, i, b"aaaa").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let indexed: u64 = c
+            .db
+            .cache_entries_by_kind("block")
+            .unwrap()
+            .iter()
+            .map(|(_, s)| s)
+            .sum();
+        assert_eq!(
+            c.block_bytes.load(Ordering::Relaxed),
+            indexed,
+            "running total matches the index after repeated eviction"
+        );
+        assert!(indexed <= 8, "and the cap is actually held: {indexed}");
+    }
+
     #[test]
     fn budget_evicts_lru_unpinned() {
         // Cap fits two 4-byte blobs but not three.
@@ -1037,6 +1173,57 @@ mod tests {
         assert!(c.is_cached(&b, 1, 4));
         assert!(c.is_cached(&d, 1, 4));
         assert_eq!(c.budget(), 8);
+    }
+
+    /// **The A2 reproduce.** Thumbnail types 1 and 2 of one node must not share
+    /// a staging file. They are stored from different subsystems — the Photos
+    /// gallery caches type 1 from a control-socket thread while `getxattr`
+    /// caches type 2 on the FUSE dispatch loop — so the two genuinely overlap.
+    ///
+    /// The failure is silent: the loser's rename either publishes the *other*
+    /// type's bytes under this type's name, or vanishes with ENOENT. Both are
+    /// reported here, because a fix that only removed the error would leave the
+    /// corruption.
+    #[test]
+    fn concurrent_thumbnail_types_do_not_share_a_temp_file() {
+        use std::sync::Arc as StdArc;
+
+        let (c, _d) = cache();
+        let c = StdArc::new(c);
+        let u = uid("a");
+        // Big enough that the write is not a single atomic-looking syscall, and
+        // distinguishable by content and length.
+        let one = vec![0xA1u8; 96 * 1024];
+        let two = vec![0xB2u8; 64 * 1024];
+
+        let mut handles = Vec::new();
+        for (ttype, payload) in [(1i32, one.clone()), (2i32, two.clone())] {
+            let c = c.clone();
+            let u = u.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut errors = 0usize;
+                for _ in 0..400 {
+                    if c.store_thumbnail(&u, ttype, 100, &payload).is_err() {
+                        errors += 1;
+                    }
+                }
+                errors
+            }));
+        }
+
+        let mut store_errors = 0usize;
+        for h in handles {
+            store_errors += h.join().expect("store thread panicked");
+        }
+
+        // Whatever is on disk for each type must be that type's bytes.
+        if let Some(got) = c.read_thumbnail(&u, 1, 100) {
+            assert_eq!(got, one, "type 1 served type 2's bytes");
+        }
+        if let Some(got) = c.read_thumbnail(&u, 2, 100) {
+            assert_eq!(got, two, "type 2 served type 1's bytes");
+        }
+        assert_eq!(store_errors, 0, "a store lost its staging file to the other type");
     }
 
     #[test]

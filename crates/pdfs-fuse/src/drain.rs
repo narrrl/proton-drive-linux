@@ -35,7 +35,7 @@ use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, ROOT_INO, conflict_name,
     is_already_exists, is_gone, is_local_uid_str, media_type_for, node_size, now_millis, now_secs,
-    op_is_ready, parse_node_uid,
+    parse_node_uid,
 };
 
 impl Core {
@@ -55,12 +55,10 @@ impl Core {
     pub(crate) fn run_pending_drain(&self) {
         loop {
             let now = now_millis();
-            let due = self
-                .db
-                .pending_ops()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|op| op.next_attempt_at <= now && op_is_ready(op));
+            // One row, chosen by the database. Reading the whole queue to pick
+            // one op made a long queue quadratic to drain, and held the shared
+            // connection — and so every FUSE metadata call — for the duration.
+            let due = self.db.next_due_op(now).unwrap_or_default();
 
             let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
                 self.wait_for_drain_work();

@@ -269,6 +269,63 @@ impl Db {
 
     /// Every queued op, oldest first. The drain worker replays them in this order
     /// so a file's writes land in the order they were made.
+    /// The oldest queued op that is due and not blocked, or `None`.
+    ///
+    /// This is the drain loop's per-iteration query, and it is deliberately not
+    /// `pending_ops().find(...)`. That variant read every row — including each
+    /// op's full `meta_json` — sorted them, and threw all but one away, once per
+    /// drained op *and* once per retry, while holding the single connection
+    /// mutex that every FUSE `lookup` also needs. A queue of a few thousand ops
+    /// (an ordinary offline `cp -r`) made draining quadratic in the queue length.
+    ///
+    /// Both filters are in SQL so the row is decided by the database rather than
+    /// materialized and rejected in Rust:
+    ///
+    /// * `next_attempt_at <= now` — the backoff.
+    /// * a `local~` parent is skipped. A node created inside a folder that was
+    ///   itself created offline cannot be sent anywhere until that folder is
+    ///   real. Ops replay in queue order so the parent normally drains first;
+    ///   this matters when the parent is backing off, where the child must wait
+    ///   rather than burn its own retries.
+    ///
+    /// `id` is `INTEGER PRIMARY KEY`, i.e. the rowid, so `ORDER BY id LIMIT 1`
+    /// walks the table in insertion order and stops at the first match — no
+    /// sort, and no separate index to maintain. The common case (something is
+    /// due) exits on the first row.
+    pub fn next_due_op(&self, now: i64) -> Result<Option<PendingOp>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                    attempts, last_error, next_attempt_at
+             FROM pending_op
+             WHERE next_attempt_at <= ?1
+               AND (parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~')
+             ORDER BY id LIMIT 1",
+            v = LOCAL_VOLUME,
+            n = LOCAL_VOLUME.len() + 1,
+        ))?;
+        let op = stmt
+            .query_row(params![now], |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    uid: r.get(2)?,
+                    parent_uid: r.get(3)?,
+                    name: r.get(4)?,
+                    blob_path: r.get(5)?,
+                    meta_json: r.get(6)?,
+                    created_at: r.get(7)?,
+                    attempts: r.get(8)?,
+                    last_error: r.get(9)?,
+                    next_attempt_at: r.get(10)?,
+                })
+            })
+            .optional()?;
+        Ok(op)
+    }
+
+    /// Every queued op, oldest first. For status read-outs and the CLI — the
+    /// drain wants [`next_due_op`](Self::next_due_op) instead.
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(

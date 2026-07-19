@@ -1061,3 +1061,257 @@ fn schema_objects_exist() {
         .unwrap();
     assert_eq!(count, 3);
 }
+
+/// A queued op carrying a realistically-sized `meta_json`, which is what made
+/// the old scan expensive: the drain read and parsed every op's sidecar to pick
+/// one.
+fn bulk_op(i: usize, parent: &str) -> PendingOp {
+    PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: format!("vol~link{i}"),
+        parent_uid: Some(parent.to_string()),
+        name: Some(format!("file-{i}.bin")),
+        blob_path: Some(format!("/staging/vol~link{i}-{i}")),
+        // A StagedWrite sidecar, roughly the shape and size of a real one.
+        meta_json: Some(format!(
+            r#"{{"uid":"vol~link{i}","len":8388608,"base_size":8388608,
+                 "base_mtime":1700000000,"authored":[[0,8388608]],"complete":true,
+                 "based_on":{{"mtime":1700000000,"size":8388608}}}}"#
+        )),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    }
+}
+
+/// **The B3 measurement.** The drain picks one op per iteration. Doing that by
+/// reading the whole queue is quadratic in queue length; doing it in SQL with
+/// `LIMIT 1` is flat. Asserts the shape of the difference, not a wall-clock
+/// number — the point is that one grows with the queue and the other does not.
+#[test]
+fn next_due_op_does_not_scale_with_queue_length() {
+    use std::time::Instant;
+
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    const N: usize = 2000;
+    for i in 0..N {
+        db.enqueue_op(&bulk_op(i, &root)).unwrap();
+    }
+
+    // Both must agree on which op is next.
+    let scanned = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.next_attempt_at <= 10);
+    let queried = db.next_due_op(10).unwrap();
+    assert_eq!(
+        scanned.as_ref().map(|o| o.id),
+        queried.as_ref().map(|o| o.id),
+        "the new query must pick the op the old scan picked"
+    );
+    assert_eq!(scanned.map(|o| o.uid), queried.map(|o| o.uid));
+
+    // Simulate a drain pass: pick the next op, retire it, repeat.
+    let rounds = 200;
+
+    let t0 = Instant::now();
+    for _ in 0..rounds {
+        let _ = db
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.next_attempt_at <= 10);
+    }
+    let scan = t0.elapsed();
+
+    let t1 = Instant::now();
+    for _ in 0..rounds {
+        let _ = db.next_due_op(10).unwrap();
+    }
+    let query = t1.elapsed();
+
+    println!("B3: {rounds} picks over a {N}-op queue — scan {scan:?}, query {query:?}");
+    assert!(
+        query * 20 < scan,
+        "expected the LIMIT 1 query to be far cheaper than a full scan; \
+         scan={scan:?} query={query:?}"
+    );
+}
+
+/// The readiness filter moved into SQL, so it needs its own coverage there: an
+/// op whose parent was itself created offline is not yet sendable and must be
+/// skipped in favour of a later one that is.
+#[test]
+fn next_due_op_skips_ops_blocked_on_a_local_parent() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+
+    db.enqueue_op(&bulk_op(1, "local~dir")).unwrap();
+    db.enqueue_op(&bulk_op(2, &root)).unwrap();
+
+    let next = db.next_due_op(10).unwrap().expect("an op is due");
+    assert_eq!(next.uid, "vol~link2", "skipped the local-parent op");
+
+    // A NULL parent is not blocked.
+    let mut orphan = bulk_op(3, &root);
+    orphan.parent_uid = None;
+    db.enqueue_op(&orphan).unwrap();
+    db.delete_op(next.id).unwrap();
+    assert_eq!(db.next_due_op(10).unwrap().unwrap().uid, "vol~link3");
+}
+
+/// Backoff still gates: nothing is returned before an op is due.
+#[test]
+fn next_due_op_respects_backoff() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    let id = db.enqueue_op(&bulk_op(1, &root)).unwrap().0;
+    db.record_op_failure(id, "boom", 5_000).unwrap();
+
+    assert!(db.next_due_op(4_999).unwrap().is_none(), "still backing off");
+    assert!(db.next_due_op(5_000).unwrap().is_some(), "due now");
+}
+
+/// **The B4 measurement.** `enforce_block_budget` runs on *every* `store_block`,
+/// i.e. once per 4 MiB of every cold read. The old path read and sorted every
+/// row of the cache index to answer a question that is almost always "no, we are
+/// under budget" — under the shared connection lock, so it also stalled FUSE
+/// metadata calls.
+///
+/// Asserts the shape: the under-budget check must not scale with cache size.
+#[test]
+fn cache_total_bytes_does_not_scale_with_cache_size() {
+    use std::time::Instant;
+
+    let db = Db::open_in_memory().unwrap();
+    // A 20 GB block cache at 4 MiB a block is ~5000 rows.
+    const N: usize = 5000;
+    const BLOCK: u64 = 4 << 20;
+    for i in 0..N {
+        db.cache_touch(&format!("k{i}.b0"), "block", BLOCK, i as i64)
+            .unwrap();
+    }
+
+    // The aggregate must agree with summing the rows.
+    let summed: u64 = db
+        .cache_entries_by_kind("block")
+        .unwrap()
+        .iter()
+        .map(|(_, s)| s)
+        .sum();
+    assert_eq!(db.cache_total_bytes("block").unwrap(), summed);
+    assert_eq!(summed, N as u64 * BLOCK);
+    // Kinds are counted apart.
+    assert_eq!(db.cache_total_bytes("blob").unwrap(), 0);
+
+    let rounds = 500;
+
+    let t0 = Instant::now();
+    for _ in 0..rounds {
+        let entries = db.cache_entries_by_kind("block").unwrap();
+        let _: u64 = entries.iter().map(|(_, s)| *s).sum();
+    }
+    let scan = t0.elapsed();
+
+    let t1 = Instant::now();
+    for _ in 0..rounds {
+        let _ = db.cache_total_bytes("block").unwrap();
+    }
+    let aggregate = t1.elapsed();
+
+    println!("B4: {rounds} budget checks over {N} entries — scan {scan:?}, aggregate {aggregate:?}");
+    // The SUM is much cheaper — no row materialization, no allocation, no sort —
+    // but it is still O(rows): summing N values reads N index entries. That is
+    // why `ContentCache` keeps a running total on top of this and only falls
+    // back to the query when it has to evict. See
+    // `budget_check_is_free_when_under_budget`.
+    assert!(
+        aggregate * 2 < scan,
+        "expected the SUM to be materially cheaper than reading every row; \
+         scan={scan:?} aggregate={aggregate:?}"
+    );
+}
+
+/// Victims still come out least-recently-accessed first, now in bounded batches
+/// rather than one unbounded read of the table.
+#[test]
+fn cache_eviction_candidates_are_lru_ordered_and_limited() {
+    let db = Db::open_in_memory().unwrap();
+    for i in 0..10u64 {
+        // Insert newest-first so insertion order cannot be mistaken for LRU order.
+        db.cache_touch(&format!("k{i}"), "blob", 100, (10 - i) as i64)
+            .unwrap();
+    }
+    db.cache_touch("other", "block", 100, 0).unwrap();
+
+    let batch = db.cache_eviction_candidates("blob", 3).unwrap();
+    assert_eq!(batch.len(), 3, "honours the limit");
+    let keys: Vec<&str> = batch.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["k9", "k8", "k7"], "least-recently-accessed first");
+    assert!(
+        batch.iter().all(|(k, _)| k != "other"),
+        "a different kind is never a candidate"
+    );
+}
+
+/// **The B5 checkpoint.** `improvements.md` P2.3 proposes concurrent SQLite
+/// reads, on the premise that the single `Mutex<Connection>` serializes the FUSE
+/// workers. This measures what the connection is actually asked to do now that
+/// B3 and B4 have landed, so the proposal is decided on evidence.
+///
+/// Note what is *not* here: `lookup`/`getattr`/`readdir` do not read this
+/// database in the steady state — they serve from `State::entries` in memory and
+/// only write through on a cold fill. The per-read DB operation is
+/// `cache_accessed`, one `UPDATE` per cache hit, which is what this drives.
+#[test]
+fn db_contention_under_fuse_worker_load() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    for i in 0..5000u64 {
+        db.cache_touch(&format!("k{i}.b0"), "block", 4 << 20, i as i64)
+            .unwrap();
+    }
+
+    // Eight workers, matching FUSE_WORKERS, each doing what a served block read
+    // does to the database: one LRU touch.
+    const WORKERS: usize = 8;
+    const PER_WORKER: usize = 2000;
+
+    let t = Instant::now();
+    let mut handles = Vec::new();
+    for w in 0..WORKERS {
+        let db = db.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..PER_WORKER {
+                db.cache_accessed(&format!("k{}.b0", (w * PER_WORKER + i) % 5000), i as i64)
+                    .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let concurrent = t.elapsed();
+
+    // The same work on one thread, for the serialization baseline.
+    let t = Instant::now();
+    for i in 0..(WORKERS * PER_WORKER) {
+        db.cache_accessed(&format!("k{}.b0", i % 5000), i as i64)
+            .unwrap();
+    }
+    let serial = t.elapsed();
+
+    let total = WORKERS * PER_WORKER;
+    println!(
+        "B5: {total} LRU touches — {WORKERS} threads {concurrent:?}, 1 thread {serial:?} \
+         (per-op {:?} vs {:?})",
+        concurrent / total as u32,
+        serial / total as u32
+    );
+}
