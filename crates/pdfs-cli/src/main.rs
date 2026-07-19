@@ -817,8 +817,19 @@ fn cmd_login(username: Option<String>) -> Result<()> {
     };
 
     let rt = tokio::runtime::Runtime::new()?;
+    // Solving a CAPTCHA needs a browser engine, which the CLI has no business
+    // carrying. Point at the app that does rather than failing with the raw API
+    // message, which reads as "your login is broken".
     rt.block_on(auth::login(&username, &password, get_totp))
-        .context("login failed")?;
+        .map_err(|e| match e {
+            pdfs_core::Error::HumanVerificationRequired(_) => anyhow::anyhow!(
+                "Proton is asking for a CAPTCHA before it will accept this sign-in.\n\
+                 Run `pdfs-app` and sign in there — it can show the verification page.\n\
+                 (This is usually triggered by a VPN or an unfamiliar IP; signing in from \
+                 your usual network often avoids it.)"
+            ),
+            other => anyhow::Error::new(other).context("login failed"),
+        })?;
 
     println!("Logged in as {username}. Session stored in the system keyring.");
     Ok(())

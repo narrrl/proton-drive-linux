@@ -11,6 +11,7 @@ use pages::shared::*;
 use pages::shared_by_me::*;
 use pages::status::*;
 use pages::trash::*;
+use pages::verify::*;
 use widgets::details::*;
 use widgets::share_dialog::*;
 
