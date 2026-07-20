@@ -20,7 +20,6 @@ use pdfs_core::db::{StoredDevice, StoredSyncFolder};
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, NodeUid};
 use proton_drive_rs::{DeviceType, Node};
-use std::collections::HashSet;
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
@@ -401,7 +400,7 @@ impl Core {
         // notified about them. Filled in by `spawn_ondemand_mount`.
         fork.notifier = Arc::new(OnceLock::new());
         // Size upgrades are keyed by inode, which is per-fork too.
-        fork.size_upgrades = Arc::new(Mutex::new(HashSet::new()));
+        fork.size_upgrades = Arc::new(Mutex::new(HashMap::new()));
         fork
     }
 
