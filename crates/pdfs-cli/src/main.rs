@@ -23,8 +23,72 @@ use pdfs_core::db::Db;
     about = "Proton Drive for Linux (Files On-Demand)"
 )]
 struct Cli {
+    /// Emit machine-readable JSON instead of formatted text.
+    ///
+    /// Applies to the query commands (`status`, `ls`, `pins`, `sync list`,
+    /// `devices list`, `transfers`, `activity`, `cache inspect`). Commands that
+    /// perform an action keep their human output — a script that needs to know
+    /// whether one succeeded has the exit code.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Whether `--json` was passed. A global rather than a threaded parameter
+/// because it is read at the leaves — one line per query command — and
+/// threading a display flag through every command signature would cost more
+/// than it explains.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn json_enabled() -> bool {
+    JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The daemon's reply as JSON, with the response-variant tag stripped.
+///
+/// Serializing [`CtlResponse`] directly yields serde's externally tagged form,
+/// `{"SyncFolders": {"items": […]}}`, which makes every script write
+/// `jq '.SyncFolders.items[]'` and couples it to the name of an internal enum
+/// variant. The payload is what the caller asked for, so that is what is
+/// emitted: `{"items": […]}`.
+///
+/// The reply is still serialized from the daemon's own type rather than
+/// rebuilt by hand, so new fields appear in the JSON without anyone
+/// remembering to add them here.
+fn response_payload(response: &CtlResponse) -> Result<serde_json::Value> {
+    let value = serde_json::to_value(response)?;
+    // Every variant serializes as a one-key object keyed by the variant name;
+    // anything else is left alone rather than guessed at.
+    if let serde_json::Value::Object(map) = &value
+        && map.len() == 1
+        && let Some((_, payload)) = map.iter().next()
+    {
+        return Ok(payload.clone());
+    }
+    Ok(value)
+}
+
+/// Print the daemon's reply as JSON if `--json` is in effect, reporting whether
+/// it did so — a `true` means the caller should skip its human formatting.
+///
+/// A daemon-side error still prints its payload, so a script can read the
+/// `kind`, but then fails the command. Emitting the error and exiting `0` would
+/// make every `--json` caller inspect the body to find out whether it worked,
+/// when the exit code is the thing they already check.
+fn emit_json(response: &CtlResponse) -> Result<bool> {
+    if !json_enabled() {
+        return Ok(false);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response_payload(response)?)?
+    );
+    if let CtlResponse::Error { message, kind } = response {
+        bail!("{}", cli_error(*kind, message));
+    }
+    Ok(true)
 }
 
 #[derive(Subcommand)]
@@ -407,6 +471,7 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     match cli.command {
         Command::Login { username } => cmd_login(username),
         Command::Logout => cmd_logout(),
@@ -461,23 +526,29 @@ fn main() -> Result<()> {
 
 fn cmd_devices(action: DeviceCmd) -> Result<()> {
     match action {
-        DeviceCmd::List => match control_request(CtlRequest::ListDevices)? {
-            CtlResponse::Devices { items } if items.is_empty() => println!("No devices."),
-            CtlResponse::Devices { items } => {
-                for d in items {
-                    let sync = d
-                        .last_sync
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "never".to_string());
-                    println!(
-                        "{}  {}  (synced: {sync})  [{}]",
-                        d.device_type, d.name, d.uid
-                    );
-                }
+        DeviceCmd::List => {
+            let response = control_request(CtlRequest::ListDevices)?;
+            if emit_json(&response)? {
+                return Ok(());
             }
-            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
-            other => bail!("unexpected response: {other:?}"),
-        },
+            match response {
+                CtlResponse::Devices { items } if items.is_empty() => println!("No devices."),
+                CtlResponse::Devices { items } => {
+                    for d in items {
+                        let sync = d
+                            .last_sync
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "never".to_string());
+                        println!(
+                            "{}  {}  (synced: {sync})  [{}]",
+                            d.device_type, d.name, d.uid
+                        );
+                    }
+                }
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         DeviceCmd::Rename { uid, name } => {
             ok_or_bail(control_request(CtlRequest::RenameDevice { uid, name })?)?
         }
@@ -497,7 +568,12 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                 .to_string();
             ok_or_bail(control_request(CtlRequest::AddSyncFolder { local_path })?)?
         }
-        SyncCmd::List => match control_request(CtlRequest::ListSyncFolders)? {
+        SyncCmd::List => {
+            let response = control_request(CtlRequest::ListSyncFolders)?;
+            if emit_json(&response)? {
+                return Ok(());
+            }
+            match response {
             CtlResponse::SyncFolders { items } if items.is_empty() => {
                 println!("No synced folders.")
             }
@@ -537,7 +613,8 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
-        },
+            }
+        }
         SyncCmd::Rm { id, delete_remote } => {
             ok_or_bail(control_request(CtlRequest::RemoveSyncFolder {
                 id,
@@ -696,7 +773,11 @@ fn cmd_shared_with_me() -> Result<()> {
 }
 
 fn cmd_activity(limit: usize) -> Result<()> {
-    match control_request(CtlRequest::ListActivity { limit })? {
+    let response = control_request(CtlRequest::ListActivity { limit })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Activity { items } if items.is_empty() => println!("No recent activity."),
         CtlResponse::Activity { items } => {
             for a in items {
@@ -872,6 +953,32 @@ fn cmd_logout() -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
+    // `status` is the one query that merges two sources — the local keyring and
+    // the daemon — so its JSON is composed here rather than being a daemon reply
+    // passed through. A script asking for status wants both halves in one
+    // object, including the "logged in but no daemon" case that has no reply at
+    // all.
+    if json_enabled() {
+        let session = match auth::load() {
+            Ok(s) => Some(s),
+            Err(pdfs_core::Error::NotLoggedIn) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let mount = match control_request(CtlRequest::Status) {
+            Ok(r @ CtlResponse::Status { .. }) => response_payload(&r)?,
+            _ => serde_json::Value::Null,
+        };
+        let out = serde_json::json!({
+            "logged_in": session.is_some(),
+            "username": session.as_ref().map(|s| s.username.clone()),
+            "user_id": session.as_ref().map(|s| s.user_id.clone()),
+            "scopes": session.as_ref().map(|s| s.scopes.clone()),
+            "mount": mount,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
     match auth::load() {
         Ok(s) => {
             println!("Logged in as {} (user {})", s.username, s.user_id);
@@ -1032,7 +1139,11 @@ fn cmd_unpin(path: PathBuf) -> Result<()> {
 
 fn cmd_transfers() -> Result<()> {
     use pdfs_core::control::TransferDirection;
-    match control_request(CtlRequest::GetQueueStatus)? {
+    let response = control_request(CtlRequest::GetQueueStatus)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Transfers { items, jobs } if items.is_empty() && jobs.is_empty() => {
             println!("Nothing in progress.")
         }
@@ -1079,7 +1190,11 @@ fn cmd_transfers() -> Result<()> {
 }
 
 fn cmd_pins() -> Result<()> {
-    match control_request(CtlRequest::ListPins)? {
+    let response = control_request(CtlRequest::ListPins)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Pins { pins } if pins.is_empty() => println!("No pinned files."),
         CtlResponse::Pins { pins } => {
             for p in pins {
@@ -1097,7 +1212,11 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
         Some(p) => path_arg(&p)?,
         None => String::new(),
     };
-    match control_request(CtlRequest::ListDir { path })? {
+    let response = control_request(CtlRequest::ListDir { path })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Entries { entries } if entries.is_empty() => println!("(empty)"),
         CtlResponse::Entries { entries } => {
             for e in entries {
@@ -1380,7 +1499,11 @@ fn cmd_cache(action: CacheCmd) -> Result<()> {
 }
 
 fn cmd_cache_inspect(deep: bool) -> Result<()> {
-    match control_request(CtlRequest::CacheInspect { deep })? {
+    let response = control_request(CtlRequest::CacheInspect { deep })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::CacheReport {
             schema_version,
             db_bytes,

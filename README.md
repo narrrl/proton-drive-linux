@@ -92,6 +92,30 @@ For the local metadata database and content cache:
 the database while it runs, so it is a deliberate operation rather than
 something the daemon does on a timer.
 
+## Scripting (`--json`)
+
+Query commands accept a global `--json` flag and emit machine-readable output:
+
+```console
+$ pdfs --json sync list | jq '.items[] | select(.state != "idle") | .local_path'
+$ pdfs --json cache inspect | jq '.db_reclaimable_bytes'
+$ pdfs --json status | jq -r '.mount.mountpoint'
+```
+
+Supported on `status`, `ls`, `pins`, `sync list`, `devices list`, `transfers`,
+`activity`, and `cache inspect`. Commands that perform an action keep their
+human output — a script that needs to know whether one worked has the exit code.
+
+Two things worth relying on:
+
+- **The payload is unwrapped.** Output is `{"items": […]}`, not the daemon's
+  internal `{"SyncFolders": {"items": […]}}`, so scripts never name an internal
+  variant.
+- **Errors still fail.** A daemon-side error prints its JSON body (with a
+  machine-readable `kind`) on stdout *and* exits non-zero, so `set -e` and
+  `if pdfs …` behave as expected rather than treating a failed lookup as
+  success.
+
 ## Performance & Caching
 
 The client includes several optimizations designed for high efficiency, a low memory footprint, and a responsive user experience:
