@@ -39,6 +39,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -183,6 +184,18 @@ const ORPHAN_INO: u64 = 0;
 const XATTR_THUMBNAIL: &str = "user.proton.thumbnail";
 /// Extended attribute exposing the larger server-side preview image of a file.
 const XATTR_PREVIEW: &str = "user.proton.preview";
+
+/// How many "this file has no thumbnail" answers [`Core::thumbnail`] remembers
+/// before dropping the lot and re-learning them. Sized to cover a large browsing
+/// session; each entry is a uid, a type tag and an mtime.
+const MAX_THUMBNAIL_MISSES: usize = 8192;
+
+/// How many nodes one size-upgrade request covers.
+///
+/// Matches the SDK's own `MAX_BATCH_COUNT`, so a chunk is exactly one request:
+/// chunking smaller would add round trips, larger would be split anyway and
+/// delay the waiters this chunking exists to release (bugs.md B14).
+const SIZE_UPGRADE_CHUNK: usize = 150;
 
 /// How many files the bulk uploader ships at once. Overlaps the per-file network
 /// round-trips without letting an unbounded number of block buffers pile up.
@@ -449,6 +462,33 @@ struct Core {
     /// those downloads is a full-size photo — so an in-flight uid is never started
     /// twice.
     thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
+    /// Nodes the remote has told us have *no* thumbnail of a given type, keyed by
+    /// `(uid, thumbnail type)` and holding the mtime the answer was learned at.
+    ///
+    /// Absence has to be cached or it costs a round trip every time it is asked
+    /// for, and it is asked for constantly: an `ls -l` from an xattr-aware lister
+    /// issues a `getxattr` per advertised name per entry, so a 65-file directory
+    /// of videos re-probed 130 times per listing at ~186 ms each (B5). The mtime
+    /// is the validity tag — a new revision may well have a thumbnail — matching
+    /// how [`ContentCache::read_thumbnail`] validates the positive side.
+    no_thumbnail: Arc<Mutex<HashMap<(NodeUid, i32), i64>>>,
+    /// Folders whose listing was enumerated cheaply and is having its file sizes
+    /// filled in right now, so a burst of `stat`s over a fresh listing starts one
+    /// upgrade rather than one per entry. See [`Core::spawn_size_upgrade`].
+    /// Size upgrades currently running, per folder inode. A `getattr` that
+    /// needs a real size waits on the entry rather than issuing its own fetch —
+    /// `ls -l` of a folder is one `getattr` per file, and they must collapse
+    /// onto a single batch (bugs.md B14).
+    size_upgrades: Arc<Mutex<HashMap<u64, Arc<SizeUpgrade>>>>,
+    /// This mount's kernel notification channel, for telling the kernel to drop
+    /// metadata it has cached. Set once the session exists — which is *after*
+    /// the `Core` it is built from, hence the cell.
+    ///
+    /// Per mount, not per daemon: each on-demand fork runs its own session over
+    /// its own inode space, so notifying through the primary mount's channel
+    /// would name inodes that session has never heard of. [`Core::fork_state`]
+    /// gives each fork an empty cell of its own.
+    notifier: Arc<OnceLock<Notifier>>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
@@ -762,6 +802,38 @@ impl Core {
         self.state.lock().children.contains_key(&ino)
     }
 
+    /// Re-apply the optimistic size of any queued write to `nodes`.
+    ///
+    /// A node that arrives from the remote (or from its DB row) carries the size
+    /// of the revision the *server* holds, which for a file with a write still
+    /// queued is the pre-write size — often 0 for a file created moments ago.
+    /// Interning it as-is silently reverts the optimistic size that
+    /// `record_pending_write` stamped, and a file that stats as 0 bytes is a file
+    /// the kernel will not issue a single `read` for: `cat` prints nothing and
+    /// the staged blob that `read_range` would have served is never asked for.
+    /// That reads as data loss even though nothing is lost (B11).
+    ///
+    /// [`Core::hydrate`] does the same thing for the restart case. This covers
+    /// every *live* re-enumeration — which is what a rename or move triggers,
+    /// since both invalidate the listings they touch.
+    ///
+    /// Snapshots the pending map and returns before any caller takes the state
+    /// lock: no site in the daemon holds `pending` and `state` at once, and this
+    /// is not the place to become the first.
+    fn stamp_pending_sizes(&self, nodes: &mut [Node]) {
+        let sizes: HashMap<NodeUid, u64> = {
+            let pending = self.pending.lock();
+            if pending.is_empty() {
+                return;
+            }
+            pending
+                .iter()
+                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
+                .collect()
+        };
+        apply_pending_sizes(nodes, &sizes);
+    }
+
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
@@ -781,19 +853,36 @@ impl Core {
         // can be rebuilt from disk without hitting the API, even if its listing
         // was trimmed from the hot cache mid-run.
         match self.db.children_if_listed(&folder_uid) {
-            Ok(Some(nodes)) => {
+            Ok(Some(mut nodes)) => {
+                // Before the lock: a DB row carries the size the server last
+                // sealed, which a queued write is ahead of (B11).
+                self.stamp_pending_sizes(&mut nodes);
                 let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
                     return Ok(());
                 }
                 let mut child_inos = Vec::with_capacity(nodes.len());
+                let mut needs_size = Vec::new();
                 for node in nodes {
                     if node.trashed || node.uid == folder_uid {
                         continue;
                     }
+                    if matches!(
+                        &node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    ) {
+                        needs_size.push(node.uid.clone());
+                    }
                     child_inos.push(st.intern_from_db(ino, node));
                 }
                 st.children.insert(ino, child_inos);
+                drop(st);
+                // Rows persisted from a cheap enumeration whose upgrade never
+                // ran (a restart in between, say) still owe their real sizes.
+                self.spawn_size_upgrade(ino, needs_size);
                 return Ok(());
             }
             Ok(None) => {}
@@ -807,13 +896,25 @@ impl Core {
                 error!(%folder_uid, error = %e, "enumerate folder children failed");
                 Errno::EIO
             })?;
-        let nodes = self
+        // Cheap enumeration: `Light` skips unlocking each *file's* node key,
+        // which is an S2K derivation per file and was ~74% of the cost of a cold
+        // listing (B12 — measured with `perf`, 64% of cycles in SHA-256 alone).
+        // Folders are unlocked either way; their keys are what the children are
+        // decrypted with, so the walk cannot proceed without them.
+        //
+        // The price is that files come back without a `claimed_size`, so
+        // `node_size` falls back to the *ciphertext* size until
+        // `spawn_size_upgrade` below fills the real one in.
+        let mut nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(self.client.enumerate_nodes_light(&uids))
             .map_err(|e| {
                 error!(%folder_uid, error = %e, "enumerate nodes failed");
                 Errno::EIO
             })?;
+        // Same as the DB path above: the remote's size for a file with a write
+        // still queued is the pre-write one (B11).
+        self.stamp_pending_sizes(&mut nodes);
 
         let mut st = self.state.lock();
         // Lost the race? Another thread already populated it.
@@ -825,6 +926,21 @@ impl Core {
             .into_iter()
             .filter(|node| !node.trashed && node.uid != folder_uid)
             .collect();
+        // Files whose real size the cheap enumeration could not read. Collected
+        // before interning so the upgrade below has the uids without re-walking.
+        let needs_size: Vec<NodeUid> = filtered_nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    &n.kind,
+                    NodeKind::File {
+                        claimed_size: None,
+                        ..
+                    }
+                )
+            })
+            .map(|n| n.uid.clone())
+            .collect();
         let inos = st.intern_batch(ino, filtered_nodes);
         child_inos.extend(inos);
         st.children.insert(ino, child_inos);
@@ -833,7 +949,220 @@ impl Core {
         if let Err(e) = self.db.set_listed(&folder_uid, true) {
             warn!(%folder_uid, error = %e, "db set_listed(true) failed");
         }
+        drop(st);
+        self.spawn_size_upgrade(ino, needs_size);
         Ok(())
+    }
+
+    /// Resolve the real size of every file in `parent`'s listing still carrying
+    /// a provisional one, returning when they are in `state`.
+    ///
+    /// Called when a `stat` lands on such a file. That covers the paths
+    /// [`Core::ensure_children`] cannot: a listing rebuilt from the DB, or one
+    /// restored by [`Core::hydrate`] on mount, whose rows were persisted before
+    /// an earlier upgrade had a chance to run. Gathers the whole folder rather
+    /// than the one file asked for, because a `stat` of one entry in a listing
+    /// almost always means a `stat` of all of them.
+    fn upgrade_sizes_for_parent(&self, ino: u64, uid: &NodeUid, parent: u64) {
+        let provisional = |e: &Entry| {
+            matches!(
+                &e.node.kind,
+                NodeKind::File {
+                    claimed_size: None,
+                    ..
+                }
+            )
+        };
+        let (key, mut missing): (u64, Vec<NodeUid>) = {
+            let st = self.state.lock();
+            match st.children.get(&parent) {
+                // The listing is resident: batch the whole folder under its
+                // inode, so the rest of an `ls -l` rides along on this fetch.
+                Some(kids) => (
+                    parent,
+                    kids.iter()
+                        .filter_map(|k| st.entries.get(k))
+                        .filter(|e| provisional(e))
+                        .map(|e| e.uid.clone())
+                        .collect(),
+                ),
+                // It is not, and returning here is what let a provisional size
+                // reach the caller anyway: a rename invalidates its parents'
+                // listings, so a freshly renamed file always landed in this
+                // branch. Resolve the single node instead, keyed by its own
+                // inode — folder and file inodes share one space, so the two
+                // single-flight keys cannot collide. (Same shape as B4: an
+                // early return that assumed the hot cache was authoritative.)
+                None => (ino, Vec::new()),
+            }
+        };
+        // The node that was actually asked about is never optional, whichever
+        // branch produced the batch.
+        if !missing.iter().any(|u| u == uid) {
+            missing.push(uid.clone());
+        }
+        // Blocking, not spawning: the caller is a `getattr` that must not answer
+        // with a provisional size (bugs.md B14).
+        self.upgrade_sizes(key, missing, Some(ino));
+    }
+
+    /// Fill in the true sizes of files a `Light` enumeration returned without
+    /// one, on a worker, after the listing has already been served.
+    ///
+    /// This is the other half of the split in [`Core::ensure_children`]. The
+    /// listing itself needs only names and parentage, so it is served from the
+    /// cheap enumeration immediately; the S2K-per-file work that produces
+    /// `claimed_size` happens here, off the path the user is waiting on.
+    ///
+    /// **Sizes are provisional until this lands.** `node_size` falls back to
+    /// `total_size_on_storage`, the *ciphertext* size, which is slightly larger
+    /// than the real one. Reads are unaffected — the revision reader carries its
+    /// own authoritative size — so this is a cosmetic discrepancy in `stat` that
+    /// closes within a round trip, not a repeat of B11 (which reported **0** and
+    /// so suppressed reads entirely).
+    ///
+    /// Single-flight per folder: a `stat` of every entry in a fresh listing is
+    /// the normal case, and each one must not start its own upgrade.
+    fn spawn_size_upgrade(&self, folder_ino: u64, uids: Vec<NodeUid>) {
+        self.upgrade_sizes(folder_ino, uids, None);
+    }
+
+    /// Start (or join) the size upgrade for `key`, and — when `waiting_for` names
+    /// an inode — block until that node's real size has landed.
+    ///
+    /// Single-flight per `key`. The fetch runs on its own thread rather than on
+    /// the [`Workers`] pool: callers wait on `Lane::Meta`, so a batch queued onto
+    /// that lane could have a wide enough `ls -l` fill it with threads waiting
+    /// for a job that can never be scheduled. `Lane::Transfer` would swap that
+    /// for starvation behind bulk reads. One short-lived thread per folder,
+    /// bounded by the single-flight, avoids both.
+    fn upgrade_sizes(&self, key: u64, uids: Vec<NodeUid>, waiting_for: Option<u64>) {
+        if uids.is_empty() {
+            return;
+        }
+        let slot = {
+            let mut in_flight = self.size_upgrades.lock();
+            match in_flight.get(&key) {
+                // Someone else is already fetching this folder; their batch
+                // covers us, so just wait on it.
+                Some(existing) => existing.clone(),
+                None => {
+                    let slot = Arc::new(SizeUpgrade::default());
+                    in_flight.insert(key, slot.clone());
+                    let core = self.clone();
+                    let worker = slot.clone();
+                    std::thread::spawn(move || {
+                        core.run_size_upgrade(key, uids, &worker);
+                    });
+                    slot
+                }
+            }
+        };
+        let Some(ino) = waiting_for else {
+            return;
+        };
+        slot.wait_for(|| self.size_is_real(ino));
+    }
+
+    /// Fetch `uids` in chunks, applying and announcing each one as it lands.
+    ///
+    /// Chunked so a waiter is released as soon as *its* file is resolved. A
+    /// single 793-node batch took ~80 s, which outran [`SizeUpgrade::WAIT`] and
+    /// put provisional sizes back in front of callers — the bug this was
+    /// supposed to fix (bugs.md B14).
+    fn run_size_upgrade(&self, key: u64, uids: Vec<NodeUid>, slot: &SizeUpgrade) {
+        for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
+            let result = self.rt.block_on(self.client.enumerate_nodes(chunk));
+            self.apply_size_upgrade(key, result);
+            slot.chunk_done();
+        }
+        // Both of these must happen however the loop ended: a folder whose
+        // upgrade failed has to be retryable, and its waiters released.
+        self.size_upgrades.lock().remove(&key);
+        slot.finish();
+    }
+
+    /// Whether `ino` has a real size — the condition a waiter is waiting on.
+    /// A node that vanished counts as resolved; there is nothing left to wait
+    /// for, and its caller will find the `ENOENT` for itself.
+    fn size_is_real(&self, ino: u64) -> bool {
+        let st = self.state.lock();
+        st.entries.get(&ino).is_none_or(|e| {
+            !matches!(
+                &e.node.kind,
+                NodeKind::File {
+                    claimed_size: None,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Adopt the sizes a completed upgrade fetched. Split from
+    /// [`Core::upgrade_sizes`] so the single-flight bookkeeping there has one
+    /// exit path rather than one per early return.
+    fn apply_size_upgrade(&self, folder_ino: u64, result: Result<Vec<Node>, ProtonError>) {
+        let core = self;
+        {
+            let mut nodes = match result {
+                Ok(nodes) => nodes,
+                Err(e) => {
+                    // Not fatal: the listing stands, sizes just stay provisional
+                    // until something invalidates and re-enumerates it.
+                    warn!(folder_ino, error = %e, "size upgrade failed; sizes stay provisional");
+                    return;
+                }
+            };
+            // A queued write is ahead of anything the server can report, so its
+            // optimistic size must survive this just as it survives a re-listing
+            // (B11).
+            core.stamp_pending_sizes(&mut nodes);
+            let mut changed: Vec<u64> = Vec::new();
+            let mut st = core.state.lock();
+            for node in nodes {
+                // Only adopt the size. Re-interning wholesale would also adopt a
+                // name or parent that a rename/move may have changed locally
+                // while this was in flight, undoing it.
+                let Some(&ino) = st.by_uid.get(&node.uid) else {
+                    continue;
+                };
+                changed.push(ino);
+                let NodeKind::File { claimed_size, .. } = &node.kind else {
+                    continue;
+                };
+                let (Some(size), Some(entry)) = (*claimed_size, st.entries.get_mut(&ino)) else {
+                    continue;
+                };
+                if let NodeKind::File { claimed_size, .. } = &mut entry.node.kind {
+                    *claimed_size = Some(size);
+                }
+            }
+            let updated: Vec<Node> = st
+                .children
+                .get(&folder_ino)
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|k| st.entries.get(k).map(|e| e.node.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            drop(st);
+            if let Err(e) = core.db.upsert_nodes(&updated) {
+                warn!(folder_ino, error = %e, "persisting upgraded sizes failed");
+            }
+            // Without this the corrected size is invisible for the length of the
+            // attr TTL: the kernel answers `stat` from the provisional attrs it
+            // cached while the listing was being served, so `ls -l` reports the
+            // ciphertext size for up to 30 s even though the daemon has had the
+            // real one all along. Notify *after* the DB write, so a re-`getattr`
+            // provoked by the invalidation cannot race the persistence.
+            if let Some(notifier) = core.notifier.get() {
+                for ino in changed {
+                    let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+                }
+            }
+            debug!(folder_ino, files = updated.len(), "filled in listing sizes");
+        }
     }
 
     /// Resolve a child `name` within `parent` to its `(inode, uid)`, ensuring
@@ -2010,6 +2339,12 @@ impl Core {
         if let Some(bytes) = self.cache.read_thumbnail(&uid, ttype.as_i32(), mtime) {
             return Ok(Some(bytes));
         }
+        // "This file has no thumbnail" is an answer worth remembering: without
+        // it every listing pays a round trip per file to be told nothing (B5).
+        let key = (uid.clone(), ttype.as_i32());
+        if self.no_thumbnail.lock().get(&key) == Some(&mtime) {
+            return Ok(None);
+        }
         let bytes = self
             .rt
             .block_on(self.client.download_thumbnail(&uid, ttype))
@@ -2017,10 +2352,23 @@ impl Core {
                 warn!(%uid, error = %e, "download thumbnail failed");
                 Errno::EIO
             })?;
-        if let Some(bytes) = &bytes {
-            let _ = self
-                .cache
-                .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
+        match &bytes {
+            Some(bytes) => {
+                let _ = self
+                    .cache
+                    .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
+            }
+            None => {
+                let mut misses = self.no_thumbnail.lock();
+                // Bounded by clearing rather than by LRU: the entries are two
+                // words each, the cap is far above any plausible working set,
+                // and re-learning a miss costs one round trip. Not worth a
+                // second data structure to order them.
+                if misses.len() >= MAX_THUMBNAIL_MISSES {
+                    misses.clear();
+                }
+                misses.insert(key, mtime);
+            }
         }
         Ok(bytes)
     }
@@ -2271,6 +2619,79 @@ impl Core {
         self.invalidate_parent_listing(rel);
         self.invalidate_trash();
         Ok(name)
+    }
+
+    /// Remove the node a `rename` is about to replace, so the new name is free
+    /// for the API call that follows.
+    ///
+    /// `rename(2)` promises to replace an existing destination atomically. Proton
+    /// offers no such primitive — `rename_node` refuses a name that is already
+    /// taken — so this is the first half of an emulation that is *not* atomic:
+    /// see [`Core::restore_replaced`] for the other half (bugs.md B13).
+    ///
+    /// A node whose own creation is still queued has never reached the server, so
+    /// dropping its queued ops is the whole removal; nothing goes to the wire and
+    /// it works offline.
+    fn remove_replaced(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
+        if is_local_uid(uid) {
+            self.discard_queued_ops(uid);
+            self.state.lock().forget(uid);
+            debug!(%uid, name, "replaced a node whose create was still queued");
+            return Ok(());
+        }
+        if let Err(e) = self
+            .rt
+            .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
+        {
+            error!(%uid, name, error = %e, "trashing the node a rename replaces failed");
+            self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
+            return Err(Errno::EIO);
+        }
+        self.discard_queued_ops(uid);
+        self.state.lock().forget(uid);
+        self.cache.evict(uid);
+        self.evict_reader(uid);
+        self.invalidate_trash();
+        // The node is recoverable from the trash, but only if the user knows it
+        // went there — a rename is not an operation anyone expects to trash
+        // something, so this is the only record that it happened.
+        self.log_activity(
+            ActivityKind::Trash,
+            name,
+            "replaced by a rename from the mount",
+            true,
+        );
+        Ok(())
+    }
+
+    /// Put back the node [`Core::remove_replaced`] trashed, after the rename it
+    /// was clearing the way for failed anyway.
+    ///
+    /// Best-effort by construction: if the restore also fails there is nothing
+    /// further to try, and the node is still in the trash where `pdfs restore`
+    /// can reach it. Says so loudly in that case, because the alternative is a
+    /// file the user believes was only renamed quietly sitting in the trash.
+    fn restore_replaced(&self, victim: Option<&(u64, NodeUid)>, name: &str) {
+        let Some((_, uid)) = victim else { return };
+        if is_local_uid(uid) {
+            // Its queued create was discarded and cannot be reconstructed from
+            // here; the caller's error is what the user acts on.
+            warn!(%uid, name, "a rename failed after discarding a queued node it replaced");
+            return;
+        }
+        match self
+            .rt
+            .block_on(self.client.restore_nodes(std::slice::from_ref(uid)))
+        {
+            Ok(()) => {
+                self.invalidate_trash();
+                debug!(%uid, name, "restored the node a failed rename had replaced");
+            }
+            Err(e) => {
+                error!(%uid, name, error = %e, "restoring a replaced node failed; it stays in the trash");
+                self.log_activity(ActivityKind::Restore, name, e.to_string(), false);
+            }
+        }
     }
 
     /// List the account's trash, from the DB. Trashed nodes are outside the
@@ -2884,27 +3305,67 @@ impl ProtonFs {
     }
 
     /// The body of [`Filesystem::lookup`], on whichever thread ends up serving it.
-    fn serve_lookup(&self, parent: u64, name: &str, reply: ReplyEntry) {
+    /// `off_loop` says whether the caller is already on a worker, and so whether
+    /// this may block. `lookup` answers a cached parent on the dispatch loop,
+    /// where it may not.
+    fn serve_lookup(&self, parent: u64, name: &str, reply: ReplyEntry, off_loop: bool) {
         if let Err(e) = self.core.ensure_children(parent) {
             reply.error(e);
             return;
         }
-        let st = self.core.state.lock();
-        let hit = st.children.get(&parent).and_then(|kids| {
-            kids.iter().copied().find_map(|ino| {
-                st.entries
-                    .get(&ino)
-                    .filter(|e| e.node.name == name)
-                    .map(|e| (ino, &e.node))
+        let hit = {
+            let st = self.core.state.lock();
+            st.children.get(&parent).and_then(|kids| {
+                kids.iter().copied().find_map(|ino| {
+                    st.entries.get(&ino).filter(|e| e.node.name == name).map(|e| {
+                        // A `lookup` reply carries attrs with the same TTL a
+                        // `getattr` would, so `ls -l` — which is one `lookup`
+                        // per entry and no `getattr` at all — takes its sizes
+                        // from here. Resolving only in `getattr` left the whole
+                        // listing provisional (bugs.md B14).
+                        let provisional = matches!(
+                            &e.node.kind,
+                            NodeKind::File {
+                                claimed_size: None,
+                                ..
+                            }
+                        )
+                        .then(|| (e.parent, e.uid.clone()));
+                        (ino, self.attr(ino, &e.node), provisional)
+                    })
+                })
             })
-        });
-        match hit {
-            Some((ino, node)) => {
-                let attr = self.attr(ino, node);
-                reply.entry(&TTL, &attr, Generation(0));
-            }
-            None => reply.error(Errno::ENOENT),
+        };
+        let Some((ino, attr, provisional)) = hit else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some((grandparent, uid)) = provisional else {
+            reply.entry(&TTL, &attr, Generation(0));
+            return;
+        };
+        // Resolving goes to the network. On the dispatch loop that is not
+        // allowed (the B5 lesson), so hand off — but only from the loop: doing
+        // it while already on a worker would queue a job onto the lane this
+        // thread occupies.
+        if !off_loop {
+            let fs = self.clone();
+            let name = name.to_string();
+            self.core
+                .workers
+                .run(Lane::Meta, move || fs.serve_lookup(parent, &name, reply, true));
+            return;
         }
+        self.core.upgrade_sizes_for_parent(ino, &uid, grandparent);
+        // Re-read: on timeout or failure this is the provisional attr again,
+        // which is no worse than what this path used to always send.
+        let attr = {
+            let st = self.core.state.lock();
+            st.entries
+                .get(&ino)
+                .map_or(attr, |e| self.attr(ino, &e.node))
+        };
+        reply.entry(&TTL, &attr, Generation(0));
     }
 
     /// The body of [`Filesystem::readdir`], on whichever thread ends up serving it.
@@ -3217,6 +3678,125 @@ fn media_type_for(name: &str) -> &'static str {
 }
 
 /// The plaintext size, in bytes, that a node reports.
+/// Overwrite each file node's `claimed_size` with the optimistic size of its
+/// queued write, where it has one. Folders and nodes with nothing queued are
+/// left alone. See [`Core::stamp_pending_sizes`] for why this exists.
+fn apply_pending_sizes(nodes: &mut [Node], sizes: &HashMap<NodeUid, u64>) {
+    for node in nodes {
+        if let Some(&len) = sizes.get(&node.uid)
+            && let NodeKind::File { claimed_size, .. } = &mut node.kind
+        {
+            *claimed_size = Some(len as i64);
+        }
+    }
+}
+
+/// A size upgrade in flight for one folder, so the `getattr`s that need its
+/// result wait for the one batch instead of each fetching its own node.
+///
+/// A plain `Condvar` rather than a channel: the waiters do not want a value,
+/// only the edge, and there may be hundreds of them for one folder.
+#[derive(Default)]
+struct Progress {
+    /// The whole batch has been applied (or failed). Nothing more is coming.
+    done: bool,
+    /// Bumped every time a chunk lands, so a waiter can tell "no progress since
+    /// I last looked" from "progress happened while I was looking".
+    generation: u64,
+}
+
+/// A size upgrade in flight for one folder, so the `getattr`s and `lookup`s that
+/// need its result wait for the one batch instead of each fetching its own node.
+///
+/// Waiters are released **per chunk**, not once at the end: a waiter only cares
+/// about its own file, and waiting for the other 792 is what let a large folder
+/// outrun the timeout (bugs.md B14).
+#[derive(Default)]
+struct SizeUpgrade {
+    inner: Mutex<Progress>,
+    ready: Condvar,
+}
+
+impl SizeUpgrade {
+    /// How long a caller will wait for a real size before answering with the
+    /// provisional one.
+    ///
+    /// A `stat` that never returns is far worse than one that is briefly wrong:
+    /// on timeout the caller falls back to the pre-fix behaviour rather than
+    /// wedging whatever is listing the directory.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Block until `resolved` reports the caller's own node has a real size, the
+    /// batch finishes without producing one, or [`SizeUpgrade::WAIT`] elapses.
+    ///
+    /// `resolved` is called with **no lock of ours held**. It reaches into
+    /// `state`, and the thread applying a chunk holds `state` before it signals
+    /// here — taking them in the other order would close the cycle.
+    fn wait_for(&self, resolved: impl Fn() -> bool) {
+        let deadline = Instant::now() + Self::WAIT;
+        loop {
+            let seen = {
+                let progress = self.inner.lock();
+                if progress.done {
+                    return;
+                }
+                progress.generation
+            };
+            if resolved() {
+                return;
+            }
+            let mut progress = self.inner.lock();
+            if progress.done {
+                return;
+            }
+            // A chunk landed while we were checking, so re-check rather than
+            // sleeping through the answer we were waiting for.
+            if progress.generation == seen
+                && self.ready.wait_until(&mut progress, deadline).timed_out()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Announce that a chunk has been applied. Every waiter re-checks its own
+    /// node; the ones it resolved return, the rest go back to sleep.
+    fn chunk_done(&self) {
+        self.inner.lock().generation += 1;
+        self.ready.notify_all();
+    }
+
+    /// Release every waiter for good. The worker must reach this on all paths.
+    fn finish(&self) {
+        let mut progress = self.inner.lock();
+        progress.done = true;
+        progress.generation += 1;
+        drop(progress);
+        self.ready.notify_all();
+    }
+}
+
+/// Whether a `rename` may replace an existing destination, per POSIX.
+///
+/// Split out from the handler because it is the part that is pure and the part
+/// that is dangerous: every `Err` here is a refusal that happens *before*
+/// anything is trashed, and getting one wrong turns a refusal into the
+/// destruction of the destination (bugs.md B13).
+///
+/// `dst_empty` is only meaningful when `dst_dir`; pass `true` otherwise.
+fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<(), Errno> {
+    match (src_dir, dst_dir) {
+        // A non-directory may not replace a directory, or vice versa.
+        (false, true) => Err(Errno::EISDIR),
+        (true, false) => Err(Errno::ENOTDIR),
+        // Proton trashes a folder with its whole subtree, so replacing a
+        // non-empty one would silently take its contents with it. POSIX says
+        // ENOTEMPTY, which is also the safe answer.
+        (true, true) if !dst_empty => Err(Errno::ENOTEMPTY),
+        _ => Ok(()),
+    }
+}
+
 fn node_size(node: &Node) -> u64 {
     match &node.kind {
         NodeKind::Folder => 0,
@@ -3348,24 +3928,70 @@ impl Filesystem for ProtonFs {
         // listed folder — the common case — is a map hit, and answering it
         // inline costs less than the handoff would.
         if self.core.children_cached(parent) {
-            self.serve_lookup(parent, &name, reply);
+            self.serve_lookup(parent, &name, reply, false);
             return;
         }
         let fs = self.clone();
         self.core
             .workers
-            .run(Lane::Meta, move || fs.serve_lookup(parent, &name, reply));
+            .run(Lane::Meta, move || fs.serve_lookup(parent, &name, reply, true));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let st = self.core.state.lock();
-        match st.entries.get(&ino.0) {
-            Some(e) => {
-                let attr = self.attr(ino.0, &e.node);
-                reply.attr(&TTL, &attr);
+        let (attr, provisional_in) = {
+            let st = self.core.state.lock();
+            match st.entries.get(&ino.0) {
+                Some(e) => {
+                    // A file still carrying the cheap enumeration's placeholder
+                    // size (B12).
+                    let provisional = matches!(
+                        &e.node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    )
+                    .then(|| (e.parent, e.uid.clone()));
+                    (self.attr(ino.0, &e.node), provisional)
+                }
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
             }
-            None => reply.error(Errno::ENOENT),
-        }
+        };
+        // The common case: the size is real, answer from the lock we just held.
+        let Some((parent, uid)) = provisional_in else {
+            reply.attr(&TTL, &attr);
+            return;
+        };
+        // A provisional size is the *ciphertext* size, which is larger than the
+        // file. Publishing it makes every reader that trusts `st_size` — rsync,
+        // mmap, sendfile, a sized read loop — run off the end of the file and
+        // fail. So resolve it before answering rather than after (bugs.md B14).
+        //
+        // The cost is one batched round trip for the whole folder, not one per
+        // file: `ls -l` is one `getattr` per entry and they collapse onto a
+        // single upgrade. This is why B12's split is still worth having — the
+        // plain listing never comes here at all.
+        //
+        // Off the dispatch loop, because it goes to the network: blocking there
+        // would stall every other operation on the mount (the B5 lesson).
+        let fs = self.clone();
+        self.core.workers.run(Lane::Meta, move || {
+            fs.core.upgrade_sizes_for_parent(ino.0, &uid, parent);
+            // Re-read: the upgrade writes through `state`, and on timeout or
+            // failure this is simply the provisional attr we already had.
+            let attr = {
+                let st = fs.core.state.lock();
+                match st.entries.get(&ino.0) {
+                    Some(e) => fs.attr(ino.0, &e.node),
+                    // Forgotten while we waited.
+                    None => attr,
+                }
+            };
+            reply.attr(&TTL, &attr);
+        });
     }
 
     fn readdir(
@@ -4005,7 +4631,7 @@ impl Filesystem for ProtonFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let parent = parent.0;
@@ -4038,6 +4664,78 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
+        // `rename(2)` replaces an existing destination; Proton has no replacing
+        // rename, so the victim has to be removed first and the operation stops
+        // being atomic. Without this the 422 surfaced as a blanket EIO and every
+        // write-to-temp-then-rename tool — rsync, atomic editor saves — failed
+        // at the very end of its transfer (bugs.md B13).
+        //
+        // `RENAME_EXCHANGE` has no Proton primitive and cannot be emulated
+        // without a window in which one of the two names does not exist.
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let victim = match self.core.lookup_child(newparent, &newname) {
+            // Renaming a node onto its own name is a no-op, never a self-replace.
+            Ok((_, vuid)) if vuid == uid => None,
+            Ok(x) => Some(x),
+            // Nothing to replace: the overwhelmingly common case.
+            Err(e) if e.code() == libc::ENOENT => None,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        if let Some((victim_ino, victim_uid)) = &victim {
+            if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            // POSIX requires both ends to agree on being a directory, and the
+            // check has to happen before anything is trashed: getting it wrong
+            // turns a refusal into the destruction of the destination.
+            let (src_dir, dst_dir) = {
+                let st = self.core.state.lock();
+                let is_dir = |i: &u64| {
+                    st.entries
+                        .get(i)
+                        .map(|e| matches!(e.node.kind, NodeKind::Folder))
+                };
+                match (is_dir(&ino), is_dir(victim_ino)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
+                }
+            };
+            // Replacing a directory means trashing it, and Proton trashes a
+            // folder with its whole subtree — so the destination's emptiness has
+            // to be known before the decision is made.
+            let dst_empty = if dst_dir {
+                if let Err(e) = self.core.ensure_children(*victim_ino) {
+                    reply.error(e);
+                    return;
+                }
+                self.core
+                    .state
+                    .lock()
+                    .children
+                    .get(victim_ino)
+                    .is_none_or(|kids| kids.is_empty())
+            } else {
+                true
+            };
+            if let Err(e) = check_replaceable(src_dir, dst_dir, dst_empty) {
+                reply.error(e);
+                return;
+            }
+            if let Err(e) = self.core.remove_replaced(victim_uid, &newname) {
+                reply.error(e);
+                return;
+            }
+        }
         // A node whose own creation is still queued has no server-side identity
         // to rename: the queued op *is* the node, so rewriting its target is the
         // whole rename. Nothing reaches the API, which is why this works offline
@@ -4062,10 +4760,12 @@ impl Filesystem for ProtonFs {
                 // now and this handle's is stale. A retry resolves it.
                 Ok(false) => {
                     warn!(%uid, name, newname, "queued create vanished under a rename");
+                    self.core.restore_replaced(victim.as_ref(), &newname);
                     reply.error(Errno::EBUSY);
                 }
                 Err(e) => {
                     error!(%uid, error = %e, "rewriting a queued create's target failed");
+                    self.core.restore_replaced(victim.as_ref(), &newname);
                     reply.error(Errno::EIO);
                 }
             }
@@ -4082,11 +4782,17 @@ impl Filesystem for ProtonFs {
                 .queue_rename(ino, &uid, newparent, &new_parent_uid, &newname)
             {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
+                Err(e) => {
+                    self.core.restore_replaced(victim.as_ref(), &newname);
+                    reply.error(e);
+                }
             }
             return;
         }
         // Move first if the parent changed, then rename if the name changed.
+        // A failure past this point has already trashed any node the rename was
+        // replacing, so put it back rather than leaving the caller with neither
+        // the source moved nor the destination intact.
         if newparent != parent
             && let Err(e) = self
                 .core
@@ -4094,6 +4800,7 @@ impl Filesystem for ProtonFs {
                 .block_on(self.core.client.move_node(&uid, &new_parent_uid))
         {
             error!(%uid, error = %e, "move failed");
+            self.core.restore_replaced(victim.as_ref(), &newname);
             reply.error(Errno::EIO);
             return;
         }
@@ -4104,6 +4811,7 @@ impl Filesystem for ProtonFs {
                 .block_on(self.core.client.rename_node(&uid, &newname, None))
         {
             error!(%uid, error = %e, "rename failed");
+            self.core.restore_replaced(victim.as_ref(), &newname);
             reply.error(Errno::EIO);
             return;
         }
@@ -4118,6 +4826,25 @@ impl Filesystem for ProtonFs {
     /// a previewing client can fetch it without downloading the whole file. The
     /// bytes are fetched on demand and cached; absence yields `ENODATA`.
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        // Always off the dispatch loop: a miss goes to the wire, and a lister
+        // that stats a directory issues one of these per file per advertised
+        // name — inline, that serialized the whole mount behind ~186 ms of
+        // network per call (B5).
+        let fs = self.clone();
+        let name = name.to_os_string();
+        self.core.workers.run(Lane::Meta, move || {
+            fs.serve_getxattr(ino, &name, size, reply)
+        });
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        self.serve_listxattr(ino, size, reply);
+    }
+}
+
+impl ProtonFs {
+    /// The body of [`Filesystem::getxattr`], on a worker thread.
+    fn serve_getxattr(&self, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let ttype = match name.to_str() {
             Some(XATTR_THUMBNAIL) => ThumbnailType::Thumbnail,
             Some(XATTR_PREVIEW) => ThumbnailType::Preview,
@@ -4150,14 +4877,25 @@ impl Filesystem for ProtonFs {
         }
     }
 
-    /// Advertise the thumbnail/preview attribute names for regular files. The
-    /// names are listed unconditionally for files; a `getxattr` for one a given
-    /// file lacks returns `ENODATA`.
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let is_file = {
+    /// Advertise the thumbnail/preview attribute names, but only for files whose
+    /// media type can actually carry one.
+    ///
+    /// Listing them for every file is what made `ls -l` expensive: an xattr-aware
+    /// lister asks for each advertised name, and each ask that misses is a network
+    /// round trip (B5). Proton only ever generates thumbnails for images and
+    /// videos, so advertising them on a `.mkv` or a `.pdf` is an invitation to do
+    /// work that can only end in `ENODATA`. `getxattr` still serves an explicit
+    /// request for an unadvertised name, so nothing becomes unreachable.
+    fn serve_listxattr(&self, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let thumbnailable = {
             let st = self.core.state.lock();
             match st.entries.get(&ino.0) {
-                Some(e) => e.node.is_file(),
+                Some(e) => match &e.node.kind {
+                    NodeKind::File { media_type, .. } => {
+                        media_type.starts_with("image/") || media_type.starts_with("video/")
+                    }
+                    NodeKind::Folder => false,
+                },
                 None => {
                     reply.error(Errno::ENOENT);
                     return;
@@ -4166,7 +4904,7 @@ impl Filesystem for ProtonFs {
         };
         // xattr names are returned as a NUL-terminated, concatenated list.
         let mut buf = Vec::new();
-        if is_file {
+        if thumbnailable {
             for name in [XATTR_THUMBNAIL, XATTR_PREVIEW] {
                 buf.extend_from_slice(name.as_bytes());
                 buf.push(0);
@@ -4578,6 +5316,9 @@ pub fn mount(
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
+        no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
+        size_upgrades: Arc::new(Mutex::new(HashMap::new())),
+        notifier: Arc::new(OnceLock::new()),
         transfers: TransferRegistry::new(),
         indexing: Arc::new(AtomicBool::new(false)),
         sync_progress: Arc::new(Mutex::new(HashMap::new())),
@@ -4679,6 +5420,9 @@ pub fn mount(
     // thread; we then wait here for either a stop signal or the mount ending.
     let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
     let notifier = bg.notifier();
+    // Same channel, kept on the `Core` so background work (a size upgrade, say)
+    // can invalidate kernel-cached metadata without threading a handle through.
+    let _ = core.notifier.set(notifier.clone());
     rt.spawn(run_event_sync(
         client,
         scope,
@@ -4759,6 +5503,173 @@ pub fn mount(
 
     let _ = std::fs::remove_file(control_socket);
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod size_upgrade_tests {
+    use super::SizeUpgrade;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The point of the per-chunk design: a waiter returns as soon as *its own*
+    /// file is resolved, without waiting for the rest of the folder. A single
+    /// batch over 793 nodes took ~80 s, which outran the timeout and handed back
+    /// the provisional size this is all meant to prevent.
+    #[test]
+    fn a_waiter_returns_on_the_chunk_that_resolves_it() {
+        let slot = Arc::new(SizeUpgrade::default());
+        let mine = Arc::new(AtomicBool::new(false));
+        let worker = slot.clone();
+        let flag = mine.clone();
+        let t = std::thread::spawn(move || {
+            // Our node lands in the first chunk; two more follow.
+            std::thread::sleep(Duration::from_millis(30));
+            flag.store(true, Ordering::SeqCst);
+            worker.chunk_done();
+            std::thread::sleep(Duration::from_millis(200));
+            worker.chunk_done();
+            worker.finish();
+        });
+        let started = Instant::now();
+        slot.wait_for(|| mine.load(Ordering::SeqCst));
+        // Released by the first chunk, not the last.
+        assert!(started.elapsed() < Duration::from_millis(150));
+        t.join().unwrap();
+    }
+
+    /// A chunk that does not resolve this waiter must not wake it for good.
+    #[test]
+    fn an_unrelated_chunk_does_not_release_a_waiter() {
+        let slot = Arc::new(SizeUpgrade::default());
+        let worker = slot.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            worker.chunk_done();
+            std::thread::sleep(Duration::from_millis(60));
+            worker.finish();
+        });
+        let started = Instant::now();
+        // Never resolved: only `finish` can end this wait.
+        slot.wait_for(|| false);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        t.join().unwrap();
+    }
+
+    /// A batch that ends without resolving the node — a failed fetch — still
+    /// releases its waiters, who fall back to the provisional size.
+    #[test]
+    fn finish_releases_a_waiter_that_was_never_resolved() {
+        let slot = Arc::new(SizeUpgrade::default());
+        let worker = slot.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            worker.finish();
+        });
+        let started = Instant::now();
+        slot.wait_for(|| false);
+        assert!(started.elapsed() < SizeUpgrade::WAIT);
+        t.join().unwrap();
+    }
+
+    /// Already resolved before waiting: must not block at all. This is the
+    /// follower that arrives after the chunk it needed has landed.
+    #[test]
+    fn an_already_resolved_waiter_does_not_block() {
+        let slot = SizeUpgrade::default();
+        let started = Instant::now();
+        slot.wait_for(|| true);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// Finishing before anyone waits must not strand the late arrival — the
+    /// flag is what is checked, not the notification, which it would miss.
+    #[test]
+    fn waiting_after_finish_returns_at_once() {
+        let slot = SizeUpgrade::default();
+        slot.finish();
+        let started = Instant::now();
+        slot.wait_for(|| false);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// Every waiter is released, not just the first: one `ls -l` puts one
+    /// waiter per file on the same folder.
+    #[test]
+    fn all_waiters_are_released() {
+        let slot = Arc::new(SizeUpgrade::default());
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let slot = slot.clone();
+                std::thread::spawn(move || slot.wait_for(|| false))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(20));
+        slot.finish();
+        for w in waiters {
+            w.join().expect("every waiter returns");
+        }
+    }
+
+    /// The timeout is the backstop: a batch that never finishes must not wedge
+    /// the caller's `stat` forever.
+    #[test]
+    fn a_waiter_gives_up_at_the_timeout() {
+        let slot = SizeUpgrade::default();
+        let started = Instant::now();
+        // Nothing will ever resolve or finish this.
+        slot.wait_for(|| false);
+        assert!(started.elapsed() >= SizeUpgrade::WAIT);
+    }
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::check_replaceable;
+
+    /// The case that motivated all of this: rsync renaming its temp file over
+    /// the real one. Two plain files, and it has to be allowed — refusing is
+    /// what made every rsync transfer fail at the last step (bugs.md B13).
+    #[test]
+    fn a_file_may_replace_a_file() {
+        assert!(check_replaceable(false, false, true).is_ok());
+    }
+
+    #[test]
+    fn an_empty_directory_may_be_replaced_by_a_directory() {
+        assert!(check_replaceable(true, true, true).is_ok());
+    }
+
+    /// Proton trashes a folder with its whole subtree, so allowing this would
+    /// discard every file under the destination without ever naming them.
+    #[test]
+    fn a_non_empty_directory_is_never_replaced() {
+        let e = check_replaceable(true, true, false).expect_err("must refuse");
+        assert_eq!(e.code(), libc::ENOTEMPTY);
+    }
+
+    #[test]
+    fn the_two_ends_must_agree_on_being_a_directory() {
+        assert_eq!(
+            check_replaceable(false, true, true)
+                .expect_err("a file may not replace a directory")
+                .code(),
+            libc::EISDIR
+        );
+        assert_eq!(
+            check_replaceable(true, false, true)
+                .expect_err("a directory may not replace a file")
+                .code(),
+            libc::ENOTDIR
+        );
+    }
+
+    /// `dst_empty` describes a directory; it must not leak into the file case,
+    /// where callers pass `true` by convention.
+    #[test]
+    fn emptiness_is_ignored_when_the_destination_is_a_file() {
+        assert!(check_replaceable(false, false, false).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -4883,6 +5794,87 @@ mod local_uid_tests {
         let parent = NodeUid::new(VolumeId::from("vol1"), LinkId::from("root"));
         let node = local_node(mint_local_uid(), parent, "photos".into(), true);
         assert!(node.is_folder());
+    }
+}
+
+#[cfg(test)]
+mod pending_size_tests {
+    use super::{Node, NodeKind, NodeUid, apply_pending_sizes, node_size};
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    use std::collections::HashMap;
+
+    fn uid(link: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    fn file(link: &str, claimed: i64) -> Node {
+        Node {
+            uid: uid(link),
+            parent_uid: Some(uid("parent")),
+            kind: NodeKind::File {
+                media_type: "text/plain".into(),
+                total_size_on_storage: 0,
+                active_revision_state: None,
+                claimed_size: Some(claimed),
+                claimed_modification_time: None,
+            },
+            name: link.into(),
+            creation_time: 100,
+            modification_time: 100,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            verification: Default::default(),
+        }
+    }
+
+    fn folder(link: &str) -> Node {
+        Node {
+            kind: NodeKind::Folder,
+            ..file(link, 0)
+        }
+    }
+
+    /// B11: a re-enumeration mid-write must not revert the size to the
+    /// server's. A file that stats as 0 gets no `read` from the kernel at all,
+    /// so the staged blob is never served and the file reads as empty.
+    #[test]
+    fn a_queued_write_keeps_its_optimistic_size_through_a_re_enumeration() {
+        let mut nodes = vec![file("queued", 0), file("settled", 4096)];
+        let sizes = HashMap::from([(uid("queued"), 3)]);
+
+        apply_pending_sizes(&mut nodes, &sizes);
+
+        assert_eq!(
+            node_size(&nodes[0]),
+            3,
+            "the remote's pre-write size must not win over the queued write's"
+        );
+        assert_eq!(
+            node_size(&nodes[1]),
+            4096,
+            "a file with nothing queued keeps the size the server reported"
+        );
+    }
+
+    /// The map is keyed by uid and says nothing about kind; a folder that
+    /// somehow collides must not grow a `claimed_size`.
+    #[test]
+    fn folders_are_left_alone() {
+        let mut nodes = vec![folder("dir")];
+        apply_pending_sizes(&mut nodes, &HashMap::from([(uid("dir"), 999)]));
+        assert!(matches!(nodes[0].kind, NodeKind::Folder));
+        assert_eq!(node_size(&nodes[0]), 0);
+    }
+
+    /// The common case: nothing queued, nothing touched.
+    #[test]
+    fn an_empty_pending_map_changes_nothing() {
+        let mut nodes = vec![file("a", 10), file("b", 20)];
+        apply_pending_sizes(&mut nodes, &HashMap::new());
+        assert_eq!(node_size(&nodes[0]), 10);
+        assert_eq!(node_size(&nodes[1]), 20);
     }
 }
 

@@ -70,11 +70,22 @@ impl Db {
             // FTS5 has no UPSERT, so refresh the row by delete-then-insert.
             // Trashed nodes are kept out of the index entirely so they never
             // surface in search results.
-            tx.execute("DELETE FROM nodes_fts WHERE uid = ?1", params![uid])?;
+            //
+            // Keyed by the node's rowid, never by its uid: the uid is not an
+            // indexed FTS column, so deleting by it scans the entire index once
+            // per node written (B12). The rowid is stable across the upsert
+            // above — `ON CONFLICT DO UPDATE` keeps the existing row — so it is
+            // the same key before and after.
+            let rowid: i64 = tx.query_row(
+                "SELECT rowid FROM nodes WHERE uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )?;
+            tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
             if !node.trashed {
                 tx.execute(
-                    "INSERT INTO nodes_fts (uid, name) VALUES (?1, ?2)",
-                    params![uid, node.name],
+                    "INSERT INTO nodes_fts (rowid, name) VALUES (?1, ?2)",
+                    params![rowid, node.name],
                 )?;
             }
         }
@@ -88,8 +99,21 @@ impl Db {
         let uid = uid.to_string();
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+        // Read the rowid before dropping the node: it is the search index's key
+        // (B12), and it is gone once the row is. A node with no row leaves
+        // nothing to unindex — the index is keyed off `nodes`, so it cannot
+        // hold an entry the table never had.
+        let rowid: Option<i64> = tx
+            .query_row(
+                "SELECT rowid FROM nodes WHERE uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?;
         tx.execute("DELETE FROM nodes WHERE uid = ?1", params![uid])?;
-        tx.execute("DELETE FROM nodes_fts WHERE uid = ?1", params![uid])?;
+        if let Some(rowid) = rowid {
+            tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -123,7 +147,7 @@ impl Db {
                 .join(" AND ");
             let mut stmt = conn.prepare(
                 "SELECT n.node_json, n.uid
-                 FROM nodes_fts f JOIN nodes n ON n.uid = f.uid
+                 FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
                  WHERE f.name MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
                  ORDER BY f.rank LIMIT ?2",
             )?;

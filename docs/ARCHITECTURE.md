@@ -284,3 +284,63 @@ See [RECOVERY.md](RECOVERY.md) for what a lost machine means for the plaintext d
 - Treat the cache and state directories as being as sensitive as the Drive contents themselves.
 - Multi-user machines warrant checking `~/.cache` and `~/.local/state` are `0700` until §8.5 is addressed.
 - Purging the cache (`pdfs` settings, or `PurgeCache` over IPC) removes content but **not** `cache.db`, and deliberately never removes undrained `staging/` or `recovery/` blobs.
+
+---
+
+## 9. Human Verification (CAPTCHA) Flow
+
+When logging in from an unfamiliar IP address or VPN, the Proton API may gate the sign-in with a human verification challenge (CAPTCHA). This client handles this asynchronously and interactively.
+
+### 9.1 Sequence of Verification and Re-Authentication
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User (GUI)
+    participant Core as pdfs-core (Auth)
+    participant UI as pdfs-gui (Login Page)
+    participant Web as WebKitWebView Dialog
+    participant API as Proton API Server
+
+    User->>UI: Enter credentials & click Sign In
+    UI->>Core: login_interactive()
+    Core->>API: auth/v4 (Initial SRP Handshake)
+    API-->>Core: HTTP 422 (Error 9001: CAPTCHA Challenge URL)
+    Core->>UI: Error::HumanVerificationRequired(hv)
+    UI->>UI: Block login thread, dispatch to GTK main loop
+    UI->>Web: Create dialog & load verification URL
+    Note over User, Web: User completes CAPTCHA in embedded WebView
+    Web->>UI: window.postMessage(HUMAN_VERIFICATION_SUCCESS)
+    UI->>UI: Extract token (with double-serialization safety)
+    UI->>UI: Close dialog & send token to blocked login thread
+    UI->>Core: login_verified(with verification token)
+    Core->>API: auth/v4 (SRP retry with x-pm-human-verification-token)
+    API-->>Core: Returns session tokens
+    Core-->>UI: Login Successful
+```
+
+### 9.2 Key Technical Design Decisions
+
+1. **Weak Reference UI Binding:** To prevent memory leaks and strong reference cycles between the parent dialog, the child `WebKitWebView`, the script message manager, and the connection callback, the dialog is downgraded to a `WeakRef` inside the callback:
+   ```rust
+   let dlg_weak = dialog.downgrade();
+   content.connect_script_message_received(Some("hv"), move |_, value| {
+       // ...
+       if let Some(dlg) = dlg_weak.upgrade() {
+           dlg.close();
+       }
+   });
+   ```
+2. **Double-Serialization Tolerance:** The JavaScript message listener forwards event data as a JSON string to the native handler. Since the underlying page may post either JS objects or pre-serialized JSON strings, the Rust side performs dual-phase parsing:
+   ```rust
+   let mut value = serde_json::from_str(raw).ok()?;
+   if let Some(inner) = value.as_str() {
+       if let Ok(parsed) = serde_json::from_str(inner) {
+           value = parsed;
+       }
+   }
+   ```
+   This ensures compatibility with all versions of Proton's client verification scripts.
+3. **SRP Handshake Reset:** Because a gated login burns the SRP handshake on the API side, the client cannot simply resume the previous request. Instead, `auth::login_interactive` restarts the SRP process from scratch with the verification credentials attached, keeping the complex handshake details isolated from the front-end.
+4. **CLI Fallback:** Since the CLI has no native web browser engine, hitting the CAPTCHA gate fails immediately with a user-friendly message directing the user to sign in once via the GUI (`pdfs-app`) to persist the authenticated session keys to the system keyring.
+

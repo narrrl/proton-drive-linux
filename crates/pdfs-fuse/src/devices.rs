@@ -20,6 +20,7 @@ use pdfs_core::db::{StoredDevice, StoredSyncFolder};
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, NodeUid};
 use proton_drive_rs::{DeviceType, Node};
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
 use super::sync::{self, base_name};
@@ -394,6 +395,12 @@ impl Core {
             next_fh: 1,
             db: self.db.clone(),
         }));
+        // A fresh inode space needs a fresh notification channel: this fork's
+        // session is the only one that knows these inodes, so it must be the one
+        // notified about them. Filled in by `spawn_ondemand_mount`.
+        fork.notifier = Arc::new(OnceLock::new());
+        // Size upgrades are keyed by inode, which is per-fork too.
+        fork.size_upgrades = Arc::new(Mutex::new(HashMap::new()));
         fork
     }
 
@@ -639,10 +646,15 @@ impl Core {
             MountOption::Subtype("protondrive".to_string()),
             MountOption::DefaultPermissions,
         ];
-        let fs = ProtonFs::new(self.fork_state(), root);
-        Session::new(fs, local, &config)
+        let core = self.fork_state();
+        let fs = ProtonFs::new(core.clone(), root);
+        let session = Session::new(fs, local, &config)
             .and_then(|s| s.spawn())
-            .map_err(|e| CoreError::internal(format!("mount {}: {e}", local.display())))
+            .map_err(|e| CoreError::internal(format!("mount {}: {e}", local.display())))?;
+        // Hand this fork its own session's notification channel, so a background
+        // size upgrade can drop the kernel's cached attrs for these inodes.
+        let _ = core.notifier.set(session.notifier());
+        Ok(session)
     }
 
     /// Re-establish FUSE mounts for folders left in `ondemand` mode across a daemon

@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 14;
+pub(super) const SCHEMA_VERSION: i64 = 15;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -77,6 +77,9 @@ impl Db {
         }
         if current < 14 {
             tx.execute_batch(MIGRATION_V14)?;
+        }
+        if current < 15 {
+            tx.execute_batch(MIGRATION_V15)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -339,4 +342,30 @@ ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
 /// slice, and eviction reads its front and stops.
 const MIGRATION_V14: &str = "
 CREATE INDEX cache_entries_lru ON cache_entries(kind, last_accessed);
+";
+
+/// Schema v15: key the search index by rowid so a row can be replaced without
+/// scanning the whole index (B12).
+///
+/// v3 built `nodes_fts` with the node's `uid` as an `UNINDEXED` column and
+/// `upsert_nodes` refreshed a row with `DELETE FROM nodes_fts WHERE uid = ?`.
+/// `UNINDEXED` means exactly what it says — the column is retrievable but not
+/// searchable — so that predicate could only ever be a full scan of the index
+/// (`EXPLAIN QUERY PLAN`: `SCAN nodes_fts VIRTUAL TABLE`). Every node written
+/// scanned every node indexed: measured at 6.5 ms per node against a 17k-node
+/// index, about half the cost of a cold listing, and *growing with the size of
+/// the account* rather than the size of the listing.
+///
+/// FTS5 deletes by `rowid` efficiently, and `nodes` is an ordinary rowid table
+/// (`uid` is its `TEXT PRIMARY KEY`, not `WITHOUT ROWID`), so its rowid is a
+/// stable per-node key that `ON CONFLICT DO UPDATE` preserves. Rebuild the index
+/// keyed by it and drop the `uid` column: searches now join on `rowid`, which is
+/// also a cheaper join than the old one on a TEXT uid.
+const MIGRATION_V15: &str = "
+DROP TABLE IF EXISTS nodes_fts;
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+  name, tokenize='trigram'
+);
+INSERT INTO nodes_fts (rowid, name)
+  SELECT rowid, name FROM nodes WHERE trashed = 0;
 ";
