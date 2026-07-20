@@ -307,6 +307,11 @@ pub enum Request {
     /// Remove a saved bookmark by its `token`. Replies with [`Response::Ok`].
     DeleteBookmark { token: String },
 
+    // ---- account ----------------------------------------------------------
+    /// Total account storage usage (used/total, all Proton products, not just
+    /// Drive). Replies with [`Response::AccountQuota`].
+    AccountQuota,
+
     // ---- activity ---------------------------------------------------------
     /// Fetch the daemon's recent activity log, newest first, capped at `limit`
     /// entries. Replies with [`Response::Activity`]. The log is persisted, so it
@@ -970,6 +975,11 @@ pub enum Response {
     Invitations { items: Vec<InvitationInfo> },
     /// Saved public links (reply to [`Request::ListBookmarks`]).
     Bookmarks { items: Vec<BookmarkInfo> },
+    /// Account storage usage in bytes (reply to [`Request::AccountQuota`]).
+    /// `max_space` is the total; `used_space` what is consumed. `max_space == 0`
+    /// means the total is unknown, which a front-end shows as a plain used figure
+    /// rather than a full bar.
+    AccountQuota { max_space: i64, used_space: i64 },
     /// Nodes I have shared with others (reply to [`Request::ListSharedByMe`]).
     SharedByMe { items: Vec<SharedItem> },
     /// The daemon's recent activity, newest first (reply to
@@ -1283,6 +1293,7 @@ mod tests {
             Request::DeleteBookmark {
                 token: "tok".into(),
             },
+            Request::AccountQuota,
         ];
         for req in reqs {
             let line = serde_json::to_string(&req).unwrap();

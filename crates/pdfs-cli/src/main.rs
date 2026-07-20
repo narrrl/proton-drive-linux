@@ -310,6 +310,8 @@ enum Command {
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
     },
+    /// Show account storage usage (used of total, across all Proton products).
+    Quota,
     /// Inspect and maintain the local metadata database and content cache.
     Cache {
         #[command(subcommand)]
@@ -547,6 +549,7 @@ fn main() -> Result<()> {
         Command::Invitations { action } => cmd_invitations(action),
         Command::Bookmarks { action } => cmd_bookmarks(action),
         Command::Activity { limit } => cmd_activity(limit),
+        Command::Quota => cmd_quota(),
         Command::Cache { action } => cmd_cache(action),
         Command::Diagnose => cmd_diagnose(),
     }
@@ -921,6 +924,35 @@ fn cmd_shared_get(uid: String, dest: Option<PathBuf>) -> Result<()> {
             println!("{}", dest.display());
         }
         None => println!("{}", path.display()),
+    }
+    Ok(())
+}
+
+fn cmd_quota() -> Result<()> {
+    let response = control_request(CtlRequest::AccountQuota)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::AccountQuota {
+            max_space,
+            used_space,
+        } => {
+            let used = used_space.max(0) as u64;
+            if max_space > 0 {
+                let total = max_space as u64;
+                let pct = (used as f64 / total as f64 * 100.0).round() as u64;
+                println!(
+                    "{} of {} used ({pct}%)",
+                    human_bytes(used),
+                    human_bytes(total)
+                );
+            } else {
+                println!("{} used", human_bytes(used));
+            }
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
 }

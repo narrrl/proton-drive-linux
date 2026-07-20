@@ -10,6 +10,13 @@ pub(crate) struct DevicesState {
     pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
     pub(crate) sync_group: adw::PreferencesGroup,
     pub(crate) sync_rows: RefCell<Vec<gtk4::Widget>>,
+    /// "Rename" action in the "This computer" header. Insensitive until the
+    /// device list identifies this machine's own device.
+    pub(crate) rename_this: gtk4::Button,
+    /// This machine's own device `(uid, name)`, from the last device list. The
+    /// current device is filtered out of the "Other computers" rows, so this is
+    /// where its rename target lives. `None` until identified.
+    pub(crate) this_device: RefCell<Option<(String, String)>>,
     pub(crate) inflight: Cell<bool>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
 }
@@ -20,6 +27,8 @@ pub(crate) struct DevicesWidgets {
     pub(crate) status: adw::StatusPage,
     /// "This computer" — the local folders synced to this machine's device.
     pub(crate) sync_group: adw::PreferencesGroup,
+    /// "Rename" in the "This computer" header — renames this machine's device.
+    pub(crate) rename_this: gtk4::Button,
     /// "Other computers" — the account's *other* registered devices. This
     /// machine's own device is deliberately not among them; see
     /// [`repaint_devices`].
@@ -75,6 +84,17 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
              them as you open them.",
         )
         .build();
+    // Rename control for *this* machine's device, in the section header. The
+    // current device is filtered out of "Other computers", so this is the only
+    // place it can be renamed; insensitive until the device list identifies it.
+    let rename_this = gtk4::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Rename this computer")
+        .valign(gtk4::Align::Center)
+        .sensitive(false)
+        .build();
+    rename_this.add_css_class("flat");
+    sync_group.set_header_suffix(Some(&rename_this));
     let group = adw::PreferencesGroup::builder()
         .title("Other computers")
         .description("Other devices backing up to this account.")
@@ -123,6 +143,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
             content,
             status,
             sync_group,
+            rename_this,
             group,
             add_folder,
             restore,
@@ -148,6 +169,12 @@ pub(crate) fn wire_devices(
     add_folder.connect_clicked(move |_| prompt_add_sync_folder(&ui_add));
     let ui_restore = ui.clone();
     restore.connect_clicked(move |_| prompt_restore_folders(&ui_restore));
+    let ui_ren = ui.clone();
+    ui.devices.rename_this.connect_clicked(move |_| {
+        if let Some((uid, name)) = ui_ren.devices.this_device.borrow().clone() {
+            prompt_rename_device(&ui_ren, &uid, &name);
+        }
+    });
 }
 
 /// Show a status page in place of the Devices list.
@@ -281,6 +308,22 @@ pub(crate) fn devices_unreachable(ui: &Rc<Ui>) {
 pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
     for row in ui.devices.rows.borrow_mut().drain(..) {
         ui.devices.group.remove(&row);
+    }
+    // Identify this machine's own device so the "This computer" header's Rename
+    // action has a target. It never appears in the rows below, so this is the
+    // only place its name/uid is captured.
+    match devices.iter().find(|d| d.this_device) {
+        Some(me) => {
+            *ui.devices.this_device.borrow_mut() = Some((me.uid.clone(), me.name.clone()));
+            ui.devices.rename_this.set_sensitive(true);
+            ui.devices
+                .rename_this
+                .set_tooltip_text(Some(&format!("Rename this computer ({})", me.name)));
+        }
+        None => {
+            *ui.devices.this_device.borrow_mut() = None;
+            ui.devices.rename_this.set_sensitive(false);
+        }
     }
     let others: Vec<&DeviceInfo> = devices.iter().filter(|d| !d.this_device).collect();
     if others.is_empty() {

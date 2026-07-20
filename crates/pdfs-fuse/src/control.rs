@@ -680,6 +680,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::AccountQuota) => match core.account_quota() {
+            Ok((max_space, used_space)) => CtlResponse::AccountQuota {
+                max_space,
+                used_space,
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::ListSharedFolder { uid }) => match core.list_shared_folder(&uid) {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),

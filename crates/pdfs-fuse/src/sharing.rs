@@ -392,6 +392,19 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "delete bookmark"))
     }
 
+    // ---- account ----------------------------------------------------------
+
+    /// Total account storage usage `(max_space, used_space)` in bytes, across all
+    /// Proton products (not Drive-only). A remote round-trip; nothing here is
+    /// cached.
+    pub(crate) fn account_quota(&self) -> CoreResult<(i64, i64)> {
+        let q = self
+            .rt
+            .block_on(self.client.quota())
+            .map_err(|e| CoreError::from_api(&e, "account quota"))?;
+        Ok((q.max_space, q.used_space))
+    }
+
     // ---- shared by me -----------------------------------------------------
 
     /// List the nodes I have shared with others, each with a summary of its share
