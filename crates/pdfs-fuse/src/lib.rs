@@ -75,6 +75,7 @@ use control::run_control_socket;
 mod devices;
 mod drain;
 mod photos;
+mod profile;
 mod sharing;
 mod state;
 mod sync;
@@ -506,8 +507,10 @@ struct Core {
     /// id (devices.md Phase 3). Each is a `ProtonFs` rooted at the folder's remote
     /// node, mounted over its local path, sharing this Core's client/cache/db but
     /// with its own inode space (`fork_state`). Held so we can unmount on toggle
-    /// back to `mirror` and on daemon shutdown.
-    mounts: Arc<Mutex<HashMap<i64, BackgroundSession>>>,
+    /// back to `mirror` and on daemon shutdown. The `u32` is the FUSE connection
+    /// id (see [`fuse_connection_id`]), captured at mount time so teardown can
+    /// abort a mid-transfer connection instead of blocking on it.
+    mounts: Arc<Mutex<HashMap<i64, SecondaryMount>>>,
     /// Per-sync-folder locks, held for a whole reconcile pass and for a whole
     /// mode switch. A `mirror→ondemand` flip evicts the local tree and mounts
     /// FUSE over it, so it must never overlap a pass that is walking and
@@ -3317,22 +3320,25 @@ impl ProtonFs {
             let st = self.core.state.lock();
             st.children.get(&parent).and_then(|kids| {
                 kids.iter().copied().find_map(|ino| {
-                    st.entries.get(&ino).filter(|e| e.node.name == name).map(|e| {
-                        // A `lookup` reply carries attrs with the same TTL a
-                        // `getattr` would, so `ls -l` — which is one `lookup`
-                        // per entry and no `getattr` at all — takes its sizes
-                        // from here. Resolving only in `getattr` left the whole
-                        // listing provisional (bugs.md B14).
-                        let provisional = matches!(
-                            &e.node.kind,
-                            NodeKind::File {
-                                claimed_size: None,
-                                ..
-                            }
-                        )
-                        .then(|| (e.parent, e.uid.clone()));
-                        (ino, self.attr(ino, &e.node), provisional)
-                    })
+                    st.entries
+                        .get(&ino)
+                        .filter(|e| e.node.name == name)
+                        .map(|e| {
+                            // A `lookup` reply carries attrs with the same TTL a
+                            // `getattr` would, so `ls -l` — which is one `lookup`
+                            // per entry and no `getattr` at all — takes its sizes
+                            // from here. Resolving only in `getattr` left the whole
+                            // listing provisional (bugs.md B14).
+                            let provisional = matches!(
+                                &e.node.kind,
+                                NodeKind::File {
+                                    claimed_size: None,
+                                    ..
+                                }
+                            )
+                            .then(|| (e.parent, e.uid.clone()));
+                            (ino, self.attr(ino, &e.node), provisional)
+                        })
                 })
             })
         };
@@ -3351,9 +3357,9 @@ impl ProtonFs {
         if !off_loop {
             let fs = self.clone();
             let name = name.to_string();
-            self.core
-                .workers
-                .run(Lane::Meta, move || fs.serve_lookup(parent, &name, reply, true));
+            self.core.workers.run(Lane::Meta, move || {
+                fs.serve_lookup(parent, &name, reply, true)
+            });
             return;
         }
         self.core.upgrade_sizes_for_parent(ino, &uid, grandparent);
@@ -3932,9 +3938,9 @@ impl Filesystem for ProtonFs {
             return;
         }
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Meta, move || fs.serve_lookup(parent, &name, reply, true));
+        self.core.workers.run(Lane::Meta, move || {
+            fs.serve_lookup(parent, &name, reply, true)
+        });
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -5198,6 +5204,66 @@ pub enum MountOutcome {
     Unmounted,
 }
 
+/// Whether `path` is a mountpoint whose FUSE connection is dead — the state a
+/// daemon killed before it could unmount leaves behind.
+///
+/// The kernel answers every operation on such a path with `ENOTCONN`, which the
+/// ordinary existence checks (`is_dir`, `exists`) report as plain `false`: the
+/// path looks *absent* rather than broken. Callers that would otherwise treat
+/// that as "nothing to mount here" use this to tell the two apart.
+pub(crate) fn is_stale_mount(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path).map_err(|e| e.raw_os_error()),
+        Err(Some(libc::ENOTCONN))
+    )
+}
+
+/// A secondary (on-demand sync folder) FUSE session, paired with its FUSE
+/// connection id so teardown can abort a mid-transfer connection rather than
+/// block on it. See [`Core::mounts`] and [`umount_session_unblocked`].
+type SecondaryMount = (BackgroundSession, Option<u32>);
+
+/// The kernel's id for the FUSE connection backing the mount at `mountpoint` —
+/// the directory name under `/sys/fs/fuse/connections`, which is the minor
+/// number of the mountpoint's device. Must be read *while still mounted*; after
+/// unmount the path resolves to the underlying directory on another device.
+/// `None` when the path can't be stat'd.
+fn fuse_connection_id(mountpoint: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(mountpoint).ok()?.dev();
+    Some(libc::minor(dev))
+}
+
+/// Force the kernel to abort FUSE connection `id`, erroring every in-flight
+/// request.
+///
+/// On a stop signal we unmount lazily (`MNT_DETACH`) so the call succeeds even
+/// mid-transfer — but detach only removes the mountpoint; it does *not* end the
+/// connection while a request is still in flight. fuser's session loop then
+/// blocks on `/dev/fuse` waiting for a next request that never comes, so `join`
+/// hangs — long enough during a transfer that systemd's stop timeout SIGKILLs
+/// the daemon mid-unmount, stranding the on-demand mounts as dead endpoints.
+/// Writing the connection's `abort` file makes the pending reads fail with
+/// `ENODEV`, so the loop returns and `join` completes at once. Best-effort:
+/// there is nothing more to do on the shutdown path if it fails.
+fn abort_fuse_connection(id: u32) {
+    let path = format!("/sys/fs/fuse/connections/{id}/abort");
+    if std::fs::write(&path, b"1").is_ok() {
+        info!(id, "aborted FUSE connection to unblock unmount");
+    }
+}
+
+/// Unmount a background session that may be mid-transfer without wedging: abort
+/// its connection first (so the session loop exits promptly), then lazily
+/// unmount and join. `conn` is the id captured at mount time; `None` skips the
+/// abort and just unmounts (a healthy idle mount joins on its own `Destroy`).
+fn umount_session_unblocked(session: BackgroundSession, conn: Option<u32>) -> std::io::Result<()> {
+    if let Some(id) = conn {
+        abort_fuse_connection(id);
+    }
+    session.umount_and_join()
+}
+
 /// Best-effort teardown of a stale mount left behind by a crashed daemon. A
 /// previous run that died without unmounting leaves the kernel mount in place,
 /// so the fresh `Session::new` below would fail with EBUSY ("Device or resource
@@ -5419,6 +5485,9 @@ pub fn mount(
     // for the event task. `spawn` runs the session loop on its own background
     // thread; we then wait here for either a stop signal or the mount ending.
     let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
+    // The connection id, captured now while the mount is live, so a stop signal
+    // mid-transfer can abort it rather than block `join` (see `abort_fuse_connection`).
+    let main_conn = fuse_connection_id(mountpoint);
     let notifier = bg.notifier();
     // Same channel, kept on the `Core` so background work (a size upgrade, say)
     // can invalidate kernel-cached metadata without threading a handle through.
@@ -5470,7 +5539,7 @@ pub fn mount(
         match sig_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(()) => {
                 info!("stop requested; unmounting");
-                if let Err(e) = bg.umount_and_join() {
+                if let Err(e) = umount_session_unblocked(bg, main_conn) {
                     warn!(error = %e, "umount_and_join failed");
                 }
                 break MountOutcome::Shutdown;
@@ -5495,8 +5564,8 @@ pub fn mount(
     // Unmount every on-demand sync folder too, or the kernel mounts linger as
     // stale and the next start fails with EBUSY (devices.md Phase 3).
     let secondaries: Vec<_> = core.mounts.lock().drain().collect();
-    for (id, session) in secondaries {
-        if let Err(e) = session.umount_and_join() {
+    for (id, (session, conn)) in secondaries {
+        if let Err(e) = umount_session_unblocked(session, conn) {
             warn!(id, error = %e, "unmount on-demand folder failed");
         }
     }
@@ -5880,7 +5949,20 @@ mod pending_size_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Intervals, conflict_name};
+    use super::{Intervals, conflict_name, is_stale_mount};
+
+    /// The predicate must answer *only* for a dead FUSE connection. A healthy
+    /// directory and an absent path are both "not stale" — widening it to any
+    /// `metadata` error would make the on-demand restore lazily unmount paths
+    /// that are simply missing.
+    #[test]
+    fn is_stale_mount_is_narrow() {
+        let dir = std::env::temp_dir().join(format!("pdfs-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_stale_mount(&dir));
+        assert!(!is_stale_mount(&dir.join("no-such-entry")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Flatten `segments` into a readable form for assertions.
     fn segs(iv: &Intervals, start: u64, end: u64) -> Vec<(u64, u64, bool)> {

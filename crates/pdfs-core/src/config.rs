@@ -41,6 +41,13 @@ pub struct AppConfig {
     /// defaults. Defaulted for configs predating the field.
     #[serde(default)]
     pub ignore_patterns: Option<Vec<String>>,
+    /// Device uid this machine has been *adopted* into, overriding the hostname
+    /// heuristic in `ensure_device`. Lives here rather than in `cache.db` so it
+    /// survives a fresh install — on a new machine the DB is empty by
+    /// definition, which is exactly when the pin matters. `None` means "resolve
+    /// by hostname". Defaulted for configs predating the field.
+    #[serde(default)]
+    pub device_uid: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -51,6 +58,7 @@ impl Default for AppConfig {
             cache_budget: None,
             mountpoint: None,
             ignore_patterns: None,
+            device_uid: None,
         }
     }
 }
@@ -294,6 +302,7 @@ mod tests {
             cache_budget: Some(1234),
             mountpoint: Some("/tmp/x".to_string()),
             ignore_patterns: Some(vec!["build/".to_string()]),
+            device_uid: Some("dev-uid".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();

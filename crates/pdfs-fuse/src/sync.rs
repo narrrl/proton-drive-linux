@@ -2094,7 +2094,8 @@ mod tests {
         let remote: HashMap<String, RemoteItem> = HashMap::new();
         let baseline: HashMap<String, StoredSyncEntry> = HashMap::new();
 
-        let order = classification_order(&local, &remote, &baseline, &rules_for(&["node_modules/"]));
+        let order =
+            classification_order(&local, &remote, &baseline, &rules_for(&["node_modules/"]));
 
         assert_eq!(
             order,
@@ -2179,6 +2180,16 @@ mod tests {
         // count as survivors.
         let fresh: HashMap<String, ()> = [("new.txt".to_string(), ())].into_iter().collect();
         assert!(guard_local_wipe(&base, &fresh).is_err());
+    }
+
+    /// A restored folder (features.md 5.2) starts with an empty baseline against
+    /// an empty local directory and a full remote. That must reconcile as
+    /// "download everything" rather than tripping the wipe guard — otherwise
+    /// every restore would wedge its folder on the first pass.
+    #[test]
+    fn guard_local_wipe_is_inert_for_a_restored_folder() {
+        let empty: HashMap<String, ()> = HashMap::new();
+        assert!(guard_local_wipe(&empty, &empty).is_ok());
     }
 
     #[test]

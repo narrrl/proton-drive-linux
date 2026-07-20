@@ -137,9 +137,10 @@ impl Db {
             if exists.is_none() {
                 continue;
             }
-            let count: i64 = conn.query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |r| {
-                r.get(0)
-            })?;
+            let count: i64 =
+                conn.query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |r| {
+                    r.get(0)
+                })?;
             tables.push(((*name).to_string(), count));
         }
 
@@ -203,7 +204,6 @@ impl Db {
         let frames: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(2))?;
         Ok(frames.max(0))
     }
-
 }
 
 #[cfg(test)]
@@ -314,7 +314,8 @@ mod tests {
         let db = Db::open(&path).unwrap();
 
         for i in 0..2000 {
-            db.set_state_str(&format!("k{i}"), &"v".repeat(256)).unwrap();
+            db.set_state_str(&format!("k{i}"), &"v".repeat(256))
+                .unwrap();
         }
         let full = db.stats().unwrap().total_bytes();
         for i in 0..2000 {

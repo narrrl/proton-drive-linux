@@ -10,6 +10,10 @@ pub(crate) struct SharedState {
     pub(crate) with_me_group: adw::PreferencesGroup,
     pub(crate) invitations_group: adw::PreferencesGroup,
     pub(crate) bookmarks_group: adw::PreferencesGroup,
+    /// Where in a shared folder the page currently is, as `(uid, name)` from the
+    /// top level down. Empty = the top level. Shared subtrees have no path in the
+    /// mount, so descending is uid-addressed and the stack *is* the breadcrumb.
+    pub(crate) nav: RefCell<Vec<(String, String)>>,
     pub(crate) rows: RefCell<Vec<(adw::PreferencesGroup, gtk4::Widget)>>,
     /// Guards the Shared page's load so overlapping navigations don't stack.
     pub(crate) inflight: Cell<bool>,
@@ -139,8 +143,17 @@ pub(crate) fn shared_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &
 
 /// Fetch the three Shared sections (shared-with-me, invitations, bookmarks) in
 /// parallel and repaint the page once all three land.
+///
+/// Inside a shared folder ([`SharedState::nav`] non-empty) only that folder's
+/// children are fetched: invitations and bookmarks belong to the top level, and
+/// carrying them down a subtree would read as if they lived there.
 pub(crate) fn load_shared(ui: &Rc<Ui>) {
     if ui.shared.inflight.get() {
+        return;
+    }
+    let current = ui.shared.nav.borrow().last().cloned();
+    if let Some((uid, _)) = current {
+        load_shared_folder(ui, uid);
         return;
     }
     ui.shared.inflight.set(true);
@@ -192,6 +205,163 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
     });
 }
 
+/// List one shared folder's children and repaint the page as that folder's view.
+/// The uid comes from the row that was activated (or from the nav stack on a
+/// reload) — a shared subtree is reachable no other way.
+fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
+    ui.shared.inflight.set(true);
+    shared_status(
+        ui,
+        "folder-symbolic",
+        "Loading…",
+        "Reading this shared folder.",
+        false,
+    );
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListSharedFolder { uid });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        ui.shared.inflight.set(false);
+        match result {
+            Ok(Ok(Response::Entries { entries })) => {
+                repaint_shared_folder(&ui, &entries);
+                ui.shared.loaded_at.set(Some(Instant::now()));
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                // The folder is gone or access was revoked: fall back to the top
+                // level rather than stranding the page on a dead uid.
+                ui.shared.nav.borrow_mut().pop();
+                toast_failure(&ui, "Couldn't open shared folder", &message, kind);
+                load_shared(&ui);
+            }
+            _ => {
+                ui.shared.loaded_at.set(None);
+                shared_unreachable(&ui);
+            }
+        }
+    });
+}
+
+/// Paint the contents of the shared folder at the top of the nav stack: a row to
+/// go back up, then the children. Invitations and bookmarks are hidden here —
+/// they are top-level things, not contents of this folder.
+fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
+    for (group, row) in ui.shared.rows.borrow_mut().drain(..) {
+        group.remove(&row);
+    }
+    ui.shared.content.set_visible_child_name("list");
+    ui.shared.invitations_group.set_visible(false);
+    ui.shared.bookmarks_group.set_visible(false);
+
+    let nav = ui.shared.nav.borrow().clone();
+    let title = nav
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    ui.shared.with_me_group.set_title(&title);
+
+    let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
+    let up = adw::ActionRow::builder()
+        .title("Back")
+        .activatable(true)
+        .build();
+    up.add_prefix(&gtk4::Image::from_icon_name("go-up-symbolic"));
+    let ui_up = ui.clone();
+    up.connect_activated(move |_| {
+        ui_up.shared.nav.borrow_mut().pop();
+        load_shared(&ui_up);
+    });
+    ui.shared.with_me_group.add(&up);
+    rows.push((ui.shared.with_me_group.clone(), up.upcast()));
+
+    if entries.is_empty() {
+        let row = dim_row("This folder is empty.");
+        ui.shared.with_me_group.add(&row);
+        rows.push((ui.shared.with_me_group.clone(), row.upcast()));
+    } else {
+        for entry in entries {
+            let row = shared_entry_row(ui, entry);
+            ui.shared.with_me_group.add(&row);
+            rows.push((ui.shared.with_me_group.clone(), row.upcast()));
+        }
+    }
+    *ui.shared.rows.borrow_mut() = rows;
+}
+
+/// A row for one node shared with me: folders descend into, files download and
+/// open with the user's default application.
+fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&entry.name)
+        .activatable(true)
+        .build();
+    if !entry.is_dir {
+        row.set_subtitle(&human_bytes(entry.size));
+    }
+    row.add_prefix(&gtk4::Image::from_icon_name(if entry.is_dir {
+        "folder-symbolic"
+    } else {
+        "text-x-generic-symbolic"
+    }));
+    let ui_act = ui.clone();
+    let uid = entry.uid.clone();
+    let name = entry.name.clone();
+    let is_dir = entry.is_dir;
+    row.connect_activated(move |_| {
+        if is_dir {
+            ui_act
+                .shared
+                .nav
+                .borrow_mut()
+                .push((uid.clone(), name.clone()));
+            load_shared(&ui_act);
+        } else {
+            open_shared_file(&ui_act, &uid, &name);
+        }
+    });
+    row
+}
+
+/// Download a file shared with me into the daemon's cache and hand it to the
+/// user's default application — the shared-item twin of the browser's
+/// download-and-open, addressed by uid because the file lives outside the mount.
+fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
+    // Ignore a repeat activation of a file already downloading, so an impatient
+    // double-click doesn't kick off a second round-trip.
+    if !ui.opening.borrow_mut().insert(uid.to_string()) {
+        return;
+    }
+    ui.busy_begin();
+    toast(ui, &format!("Downloading “{name}”…"));
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::OpenSharedFile {
+            uid: uid.to_string(),
+        },
+    );
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        ui.opening.borrow_mut().remove(&uid);
+        match result {
+            Ok(Ok(Response::FilePath { path })) => open_path(&path),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't open file", &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't open file",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
 /// The daemon didn't answer the Shared page. Same still-starting vs. down split
 /// as the other pages.
 pub(crate) fn shared_unreachable(ui: &Rc<Ui>) {
@@ -233,6 +403,9 @@ pub(crate) fn repaint_shared(
         group.remove(&row);
     }
     ui.shared.content.set_visible_child_name("list");
+    ui.shared.invitations_group.set_visible(true);
+    ui.shared.bookmarks_group.set_visible(true);
+    ui.shared.with_me_group.set_title("Shared with me");
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
 
     // Shared with me: name + Leave.
@@ -242,12 +415,7 @@ pub(crate) fn repaint_shared(
         rows.push((ui.shared.with_me_group.clone(), row.upcast()));
     } else {
         for entry in shared {
-            let row = adw::ActionRow::builder().title(&entry.name).build();
-            row.add_prefix(&gtk4::Image::from_icon_name(if entry.is_dir {
-                "folder-symbolic"
-            } else {
-                "text-x-generic-symbolic"
-            }));
+            let row = shared_entry_row(ui, entry);
             let leave = gtk4::Button::builder()
                 .label("Leave")
                 .valign(gtk4::Align::Center)

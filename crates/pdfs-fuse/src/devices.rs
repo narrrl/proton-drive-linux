@@ -26,8 +26,33 @@ use tracing::{info, warn};
 use super::sync::{self, base_name};
 use super::{
     BackgroundSession, Core, ProtonFs, State, SwitchBlocked, clear_stale_mount, device_type_str,
-    dir_is_empty, evict_dir_contents, now_secs, parse_uid, sync_folder_info, this_hostname,
+    dir_is_empty, evict_dir_contents, fuse_connection_id, is_stale_mount, now_secs, parse_uid,
+    sync_folder_info, this_hostname, umount_session_unblocked,
 };
+
+/// The device uid this machine has been adopted into, from `config.json`.
+///
+/// Read fresh each time rather than cached on [`Core`]: adoption rewrites the
+/// config from the control socket, and the next `ensure_device` must see it
+/// without a daemon restart.
+pub(crate) fn adopted_device_uid() -> Option<String> {
+    let uid = pdfs_core::config::AppDirs::new()
+        .ok()?
+        .load_config()
+        .device_uid?;
+    let uid = uid.trim().to_string();
+    (!uid.is_empty()).then_some(uid)
+}
+
+/// Pin (or, with `None`, unpin) the adopted device uid in `config.json`.
+pub(crate) fn set_adopted_device_uid(uid: Option<&str>) -> CoreResult<()> {
+    let dirs = pdfs_core::config::AppDirs::new()
+        .map_err(|e| CoreError::internal(format!("config dirs: {e}")))?;
+    let mut cfg = dirs.load_config();
+    cfg.device_uid = uid.map(|u| u.to_string());
+    dirs.save_config(&cfg)
+        .map_err(|e| CoreError::internal(format!("write config: {e}")))
+}
 
 impl Core {
     // ---- devices ----------------------------------------------------------
@@ -43,12 +68,14 @@ impl Core {
         // No cached device row yet means this machine syncs nothing, so none of
         // the listed devices is ours.
         let this_uid = self.db.device_get().ok().flatten().map(|d| d.uid);
+        let pinned = adopted_device_uid();
         Ok(devices
             .into_iter()
             .map(|d| {
                 let uid = d.uid.to_string();
                 DeviceInfo {
                     this_device: this_uid.as_deref() == Some(uid.as_str()),
+                    adopted: pinned.as_deref() == Some(uid.as_str()),
                     uid,
                     name: d.name.unwrap_or_else(|_| "(unnamed device)".to_string()),
                     device_type: device_type_str(d.device_type).to_string(),
@@ -79,20 +106,96 @@ impl Core {
         Ok(())
     }
 
+    /// Adopt an existing device as *this* machine's, pinning it in `config.json`
+    /// so hostname changes and reinstalls stop registering duplicates
+    /// (features.md 5.1). `None` clears the pin and returns to hostname matching.
+    ///
+    /// Refuses a uid that is not in the account: the whole point of the pin is
+    /// that it is authoritative, so accepting a bad one would defer the failure
+    /// to the next `ensure_device` with no obvious cause.
+    pub(crate) fn adopt_device(&self, uid: Option<&str>) -> CoreResult<String> {
+        let Some(uid) = uid else {
+            set_adopted_device_uid(None)?;
+            return Ok("adoption cleared; device now resolved by hostname".to_string());
+        };
+        let remote = self
+            .rt
+            .block_on(self.client.enumerate_devices())
+            .map_err(|e| CoreError::from_api(&e, "enumerate devices"))?;
+        let dev = remote
+            .into_iter()
+            .find(|d| d.uid.to_string() == uid)
+            .ok_or_else(|| CoreError::not_found(format!("no device {uid} in this account")))?;
+
+        let name = dev
+            .name
+            .as_deref()
+            .ok()
+            .map(|n| n.to_string())
+            .unwrap_or_else(this_hostname);
+        set_adopted_device_uid(Some(uid))?;
+        // Write the row through too, so callers that read the cached device
+        // (and `ListSyncFolders`' "this device" flag) agree immediately rather
+        // than after the next `ensure_device`.
+        self.db
+            .device_set(&StoredDevice {
+                uid: uid.to_string(),
+                share_id: dev.share_id.to_string(),
+                root_uid: dev.root_folder_uid.to_string(),
+                name: name.clone(),
+                created: dev.creation_time,
+            })
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+        info!(uid, name, "adopted device");
+        Ok(format!("adopted device {name}"))
+    }
+
     // ---- device folder sync (devices.md, Phase 1) -------------------------
 
     /// Auto-register (or recover) this machine as a Proton Drive Device, caching
     /// it so restarts reuse the same device. Recovery matches an existing remote
     /// Linux device by name before creating a new one, so a lost local record
     /// doesn't orphan the device's root folder.
+    ///
+    /// Resolution order: the *adopted* uid pinned in `config.json`, then the
+    /// cached DB row (validated remotely), then a hostname match, then create.
+    /// The pin exists because the hostname heuristic silently registers a second
+    /// device after a rename or reinstall, orphaning the first one's folders
+    /// (features.md 5.1).
     pub(crate) fn ensure_device(&self) -> CoreResult<StoredDevice> {
         let name = this_hostname();
-        // Enumerate the remote devices once: used both to validate any cached
-        // record and to recover an existing device by name.
+        // Enumerate the remote devices once: used to validate the pin, validate
+        // any cached record, and recover an existing device by name.
         let remote = self
             .rt
             .block_on(self.client.enumerate_devices())
             .map_err(|e| CoreError::from_api(&e, "enumerate devices"))?;
+
+        // An adopted uid is an explicit instruction, so it outranks everything
+        // and it fails loudly: falling back to the heuristic here would create
+        // the duplicate device the user adopted specifically to avoid.
+        if let Some(pin) = adopted_device_uid() {
+            let d = remote
+                .iter()
+                .find(|d| d.uid.to_string() == pin)
+                .ok_or_else(|| {
+                    CoreError::not_found(format!(
+                        "adopted device {pin} not found in this account; \
+                         run `pdfs devices adopt --clear` to return to hostname matching"
+                    ))
+                })?;
+            let dev = StoredDevice {
+                uid: d.uid.to_string(),
+                share_id: d.share_id.to_string(),
+                root_uid: d.root_folder_uid.to_string(),
+                name: d.name.as_deref().ok().unwrap_or(&name).to_string(),
+                created: d.creation_time,
+            };
+            self.db
+                .device_set(&dev)
+                .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+            return Ok(dev);
+        }
 
         // A cached device is only trustworthy if it still exists remotely. A
         // device deleted from another client (or the web UI) leaves a stale row
@@ -346,8 +449,8 @@ impl Core {
         // folder the daemon no longer tracks, and nothing would ever unmount it.
         // Tear it down first — including before trashing the remote tree it
         // serves, which would otherwise leave it answering for deleted nodes.
-        if let Some(session) = self.mounts.lock().remove(&id) {
-            if let Err(e) = session.umount_and_join() {
+        if let Some((session, conn)) = self.mounts.lock().remove(&id) {
+            if let Err(e) = umount_session_unblocked(session, conn) {
                 warn!(id, error = %e, "unmount on-demand folder failed");
             } else {
                 info!(id, path = %folder.local_path, "unmounted on-demand folder");
@@ -599,7 +702,9 @@ impl Core {
                         return Err(SwitchBlocked::Failed(e.to_string()));
                     }
                 };
-                self.mounts.lock().insert(id, session);
+                self.mounts
+                    .lock()
+                    .insert(id, (session, fuse_connection_id(&local)));
                 let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
                 self.db.sync_folder_set_state(id, "idle", now_secs()).ok();
                 info!(id, path = %local.display(), "mounted sync folder on-demand");
@@ -607,8 +712,8 @@ impl Core {
             }
             _ => {
                 // ondemand→mirror: tear down the secondary mount first.
-                if let Some(session) = self.mounts.lock().remove(&id)
-                    && let Err(e) = session.umount_and_join()
+                if let Some((session, conn)) = self.mounts.lock().remove(&id)
+                    && let Err(e) = umount_session_unblocked(session, conn)
                 {
                     warn!(id, error = %e, "unmount on-demand folder failed");
                 }
@@ -676,6 +781,17 @@ impl Core {
                 continue;
             }
             let local = PathBuf::from(&folder.local_path);
+            // A daemon killed before it could unmount (systemd's stop timeout,
+            // say) leaves this path attached to a dead FUSE connection: it still
+            // exists, but every stat on it fails with ENOTCONN — so `is_dir()`
+            // reads it as *missing* and the folder gets parked in `error` on
+            // every subsequent start, with no way back but a manual
+            // `fusermount -u`. Detach the corpse first; the directory
+            // underneath then restores normally.
+            if is_stale_mount(&local) {
+                warn!(id = folder.id, path = %local.display(), "restore on-demand: clearing stale mount");
+                clear_stale_mount(&local);
+            }
             if !local.is_dir() {
                 warn!(id = folder.id, path = %local.display(), "restore on-demand: local path missing");
                 let _ = self
@@ -737,7 +853,9 @@ impl Core {
             };
             match self.spawn_ondemand_mount(&local, root) {
                 Ok(session) => {
-                    self.mounts.lock().insert(folder.id, session);
+                    self.mounts
+                        .lock()
+                        .insert(folder.id, (session, fuse_connection_id(&local)));
                     let _ = self.db.sync_folder_set_state(folder.id, "idle", now_secs());
                     info!(id = folder.id, path = %local.display(), "remounted on-demand folder");
                 }

@@ -41,9 +41,10 @@ use pdfs_core::config::AppDirs;
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind, InvitationInfo,
-    JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, SearchHit,
-    ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress,
-    TransferDirection, TransferItem, pending_summary, send,
+    JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response,
+    RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
+    SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, pending_summary,
+    send,
 };
 
 use pdfs_core::service;
@@ -478,6 +479,7 @@ fn build_window(app: &adw::Application) {
             with_me_group: shared_widgets.shared_with_me.clone(),
             invitations_group: shared_widgets.invitations.clone(),
             bookmarks_group: shared_widgets.bookmarks.clone(),
+            nav: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
             inflight: Cell::new(false),
             loaded_at: Cell::new(None),
@@ -535,7 +537,12 @@ fn build_window(app: &adw::Application) {
     wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
-    wire_devices(&ui, &devices_widgets.retry, &devices_widgets.add_folder);
+    wire_devices(
+        &ui,
+        &devices_widgets.retry,
+        &devices_widgets.add_folder,
+        &devices_widgets.restore,
+    );
     wire_activity(&ui, &activity_widgets.retry);
     wire_refresh(
         &ui,

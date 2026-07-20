@@ -11,8 +11,8 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind,
-    SyncPhase, pending_summary,
+    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse,
+    RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase, pending_summary,
 };
 use pdfs_core::db::Db;
 
@@ -276,8 +276,19 @@ enum Command {
     },
     /// List the items I have shared with others (members, invites or a link).
     Shared,
-    /// List nodes shared with me that I have accepted.
-    SharedWithMe,
+    /// List nodes shared with me that I have accepted, or the children of one.
+    SharedWithMe {
+        /// Folder uid to list into, in `volume~link` form (from a previous run).
+        /// Omit for the top level.
+        uid: Option<String>,
+    },
+    /// Download a file shared with me by its uid (from `pdfs shared-with-me`).
+    SharedGet {
+        /// Node uid in `volume~link` form.
+        uid: String,
+        /// Where to write it. Omit to leave it in the cache and print the path.
+        dest: Option<PathBuf>,
+    },
     /// Leave a shared node by its uid (from `pdfs shared-with-me`).
     Leave {
         /// Node uid in `volume~link` form.
@@ -358,6 +369,15 @@ enum DeviceCmd {
     Rename { uid: String, name: String },
     /// Delete (deregister) a device by uid.
     Rm { uid: String },
+    /// Adopt an existing device as this machine's, so a hostname change or a
+    /// reinstall re-attaches to it instead of registering a duplicate.
+    Adopt {
+        /// Device uid (from `devices list`). Omit with `--clear`.
+        uid: Option<String>,
+        /// Drop the adoption and go back to matching by hostname.
+        #[arg(long, conflicts_with = "uid")]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -389,6 +409,13 @@ enum SyncCmd {
         /// `mirror` (full local copy) or `ondemand` (FUSE mount, reclaims disk).
         #[arg(value_parser = ["mirror", "ondemand"])]
         mode: String,
+    },
+    /// Re-attach this machine's device folders to local directories, then sync
+    /// them down. Use after adopting a device on a new machine.
+    Restore {
+        /// Accept every proposed local path without asking.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -514,7 +541,8 @@ fn main() -> Result<()> {
         Command::Unshare { path, id, kind } => cmd_unshare(path, id, kind),
         Command::PublicLink { action } => cmd_public_link(action),
         Command::Shared => cmd_shared(),
-        Command::SharedWithMe => cmd_shared_with_me(),
+        Command::SharedWithMe { uid } => cmd_shared_with_me(uid),
+        Command::SharedGet { uid, dest } => cmd_shared_get(uid, dest),
         Command::Leave { uid } => cmd_leave(uid),
         Command::Invitations { action } => cmd_invitations(action),
         Command::Bookmarks { action } => cmd_bookmarks(action),
@@ -539,8 +567,13 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
                             .last_sync
                             .map(|t| t.to_string())
                             .unwrap_or_else(|| "never".to_string());
+                        let tag = match (d.adopted, d.this_device) {
+                            (true, _) => "  *adopted*",
+                            (false, true) => "  *this machine*",
+                            _ => "",
+                        };
                         println!(
-                            "{}  {}  (synced: {sync})  [{}]",
+                            "{}  {}  (synced: {sync})  [{}]{tag}",
                             d.device_type, d.name, d.uid
                         );
                     }
@@ -553,6 +586,13 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
             ok_or_bail(control_request(CtlRequest::RenameDevice { uid, name })?)?
         }
         DeviceCmd::Rm { uid } => ok_or_bail(control_request(CtlRequest::DeleteDevice { uid })?)?,
+        DeviceCmd::Adopt { uid, clear } => {
+            if uid.is_none() && !clear {
+                bail!("give a device uid (see `pdfs devices list`), or --clear");
+            }
+            let uid = if clear { None } else { uid };
+            ok_or_bail(control_request(CtlRequest::AdoptDevice { uid })?)?
+        }
     }
     Ok(())
 }
@@ -574,45 +614,49 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                 return Ok(());
             }
             match response {
-            CtlResponse::SyncFolders { items } if items.is_empty() => {
-                println!("No synced folders.")
-            }
-            CtlResponse::SyncFolders { items } => {
-                for f in items {
-                    let sync = if f.last_sync == 0 {
-                        "never".to_string()
-                    } else {
-                        f.last_sync.to_string()
-                    };
-                    // A queued switch is reported as the mode the folder is moving
-                    // to, so `sync list` never reads as if the request was dropped.
-                    let mode = match &f.pending_mode {
-                        Some(pending) => format!("{} → {pending}", f.mode),
-                        None => f.mode.clone(),
-                    };
-                    println!(
-                        "[{}]  {}  ({mode}, {}, synced: {sync})",
-                        f.id, f.local_path, f.state
-                    );
-                    // A pass in flight says what it is doing, indented under it.
-                    if let Some(p) = &f.progress {
-                        match p.phase {
-                            SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
-                            SyncPhase::Scanning => {
-                                println!("      scanning: {} of {}", p.done, p.total.max(p.done))
+                CtlResponse::SyncFolders { items } if items.is_empty() => {
+                    println!("No synced folders.")
+                }
+                CtlResponse::SyncFolders { items } => {
+                    for f in items {
+                        let sync = if f.last_sync == 0 {
+                            "never".to_string()
+                        } else {
+                            f.last_sync.to_string()
+                        };
+                        // A queued switch is reported as the mode the folder is moving
+                        // to, so `sync list` never reads as if the request was dropped.
+                        let mode = match &f.pending_mode {
+                            Some(pending) => format!("{} → {pending}", f.mode),
+                            None => f.mode.clone(),
+                        };
+                        println!(
+                            "[{}]  {}  ({mode}, {}, synced: {sync})",
+                            f.id, f.local_path, f.state
+                        );
+                        // A pass in flight says what it is doing, indented under it.
+                        if let Some(p) = &f.progress {
+                            match p.phase {
+                                SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
+                                SyncPhase::Scanning => {
+                                    println!(
+                                        "      scanning: {} of {}",
+                                        p.done,
+                                        p.total.max(p.done)
+                                    )
+                                }
+                                SyncPhase::Applying => println!(
+                                    "      {} of {}  {}",
+                                    p.done + 1,
+                                    p.total.max(p.done + 1),
+                                    p.current
+                                ),
                             }
-                            SyncPhase::Applying => println!(
-                                "      {} of {}  {}",
-                                p.done + 1,
-                                p.total.max(p.done + 1),
-                                p.current
-                            ),
                         }
                     }
                 }
-            }
-            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
-            other => bail!("unexpected response: {other:?}"),
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
             }
         }
         SyncCmd::Rm { id, delete_remote } => {
@@ -625,8 +669,86 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         SyncCmd::Mode { id, mode } => {
             ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
         }
+        SyncCmd::Restore { yes } => return cmd_sync_restore(yes),
     }
     Ok(())
+}
+
+/// `pdfs sync restore`: list what this machine's device holds, confirm where
+/// each folder should land, then hand the mapping to the daemon.
+///
+/// The daemon only ever *proposes* local paths — a path recorded by another
+/// machine may name a home directory that does not exist here — so the default
+/// flow is propose-and-confirm. `--yes` accepts the proposals for scripting.
+fn cmd_sync_restore(yes: bool) -> Result<()> {
+    let response = control_request(CtlRequest::ListRestorableFolders)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    let items = match response {
+        CtlResponse::RestorableFolders { items } => items,
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let candidates: Vec<_> = items.into_iter().filter(|f| !f.already_synced).collect();
+    if candidates.is_empty() {
+        println!("Nothing to restore: this device has no folders that aren't already synced here.");
+        return Ok(());
+    }
+
+    let mut chosen: Vec<CtlRestoreItem> = Vec::new();
+    for f in candidates {
+        if yes {
+            println!("{}  ->  {}  [{}]", f.name, f.local_path, f.mode);
+            chosen.push(CtlRestoreItem {
+                remote_uid: f.remote_uid,
+                local_path: f.local_path,
+                mode: f.mode,
+            });
+            continue;
+        }
+        // Empty answer takes the proposal, `n` skips, anything else is read as
+        // the path to use instead — the three things a user wants here.
+        let answer = prompt_line(&format!(
+            "{} [{}] -> {} (Enter to accept, 'n' to skip, or a path)",
+            f.name, f.mode, f.local_path
+        ))?;
+        match answer.as_str() {
+            "n" | "N" => continue,
+            "" => chosen.push(CtlRestoreItem {
+                remote_uid: f.remote_uid,
+                local_path: f.local_path,
+                mode: f.mode,
+            }),
+            path => chosen.push(CtlRestoreItem {
+                remote_uid: f.remote_uid,
+                local_path: expand_tilde(path),
+                mode: f.mode,
+            }),
+        }
+    }
+    if chosen.is_empty() {
+        println!("Nothing selected.");
+        return Ok(());
+    }
+    ok_or_bail(control_request(CtlRequest::RestoreSyncFolders {
+        items: chosen,
+    })?)
+}
+
+/// Expand a leading `~` in a hand-typed path. The daemon requires an absolute
+/// path, and a shell is not always the one doing the typing here.
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home)
+                .join(rest)
+                .to_string_lossy()
+                .into_owned(),
+            None => path.to_string(),
+        },
+        None => path.to_string(),
+    }
 }
 
 fn cmd_share(
@@ -755,8 +877,20 @@ fn cmd_shared() -> Result<()> {
     Ok(())
 }
 
-fn cmd_shared_with_me() -> Result<()> {
-    match control_request(CtlRequest::ListSharedWithMe)? {
+/// List what is shared with me, or — given a folder uid — that folder's
+/// children. Shared items have no path in the mount, so a uid is the only handle
+/// there is: every row prints one, and it is what the next level down (or
+/// `shared-get`) is addressed with.
+fn cmd_shared_with_me(uid: Option<String>) -> Result<()> {
+    let request = match uid {
+        Some(uid) => CtlRequest::ListSharedFolder { uid },
+        None => CtlRequest::ListSharedWithMe,
+    };
+    let response = control_request(request)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Entries { entries } if entries.is_empty() => {
             println!("Nothing shared with you.")
         }
@@ -768,6 +902,25 @@ fn cmd_shared_with_me() -> Result<()> {
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Download a file shared with me. The daemon puts the plaintext in its content
+/// cache and replies with that path; with a `dest` we copy it out, so the caller
+/// gets a file it owns rather than one the cache may later evict.
+fn cmd_shared_get(uid: String, dest: Option<PathBuf>) -> Result<()> {
+    let path = match control_request(CtlRequest::OpenSharedFile { uid })? {
+        CtlResponse::FilePath { path } => PathBuf::from(path),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    match dest {
+        Some(dest) => {
+            std::fs::copy(&path, &dest).with_context(|| format!("writing {}", dest.display()))?;
+            println!("{}", dest.display());
+        }
+        None => println!("{}", path.display()),
     }
     Ok(())
 }
@@ -1514,7 +1667,10 @@ fn cmd_cache_inspect(deep: bool) -> Result<()> {
             integrity_problems,
             integrity_checked,
         } => {
-            println!("Database   schema v{schema_version}, {}", human_bytes(db_bytes));
+            println!(
+                "Database   schema v{schema_version}, {}",
+                human_bytes(db_bytes)
+            );
             if db_reclaimable_bytes > 0 {
                 println!(
                     "           {} reclaimable — run `pdfs cache vacuum`",
@@ -1649,7 +1805,11 @@ fn cmd_diagnose() -> Result<()> {
             );
         }
         Ok(other) => {
-            all_ok &= check("  daemon responding", false, format!("unexpected: {other:?}"));
+            all_ok &= check(
+                "  daemon responding",
+                false,
+                format!("unexpected: {other:?}"),
+            );
         }
         Err(e) => {
             // Not a failure of the installation: a stopped daemon is a normal
