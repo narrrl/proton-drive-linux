@@ -121,8 +121,10 @@ jobs:
           
           # Build RPM package
           rpmbuild -bb \
+            --nodeps \
             --define "_topdir $PWD/rpmbuild" \
             --define "_sourcedir $PWD" \
+            --define "git_dir $PWD" \
             --define "version ${RPM_VERSION}" \
             --define "_dbpath $PWD/rpmbuild/db" \
             packaging/proton-drive-linux.spec

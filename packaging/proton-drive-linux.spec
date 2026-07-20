@@ -7,8 +7,10 @@
 # Match Arch PKGBUILD `!lto` — LTO has broken some GTK/Rust links in practice.
 %global _lto_cflags %{nil}
 
+%{!?version: %global version 0.4.0}
+
 Name:           proton-drive-linux
-Version:        0.4.0
+Version:        %{version}
 Release:        1%{?dist}
 Summary:        Proton Drive client for Linux (FUSE, CLI, GTK4 app + tray)
 License:        MIT
