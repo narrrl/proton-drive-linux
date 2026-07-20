@@ -70,7 +70,7 @@ pub(crate) fn prompt_human_verification(
     let token_tx = Rc::new(RefCell::new(Some(token_tx)));
 
     let tx = token_tx.clone();
-    let dlg = dialog.clone();
+    let dlg_weak = dialog.downgrade();
     content.connect_script_message_received(Some("hv"), move |_, value| {
         let Some(token) = extract_token(&value.to_str()) else {
             // Every `postMessage` on the page reaches here, most of them the
@@ -81,7 +81,9 @@ pub(crate) fn prompt_human_verification(
         if let Some(tx) = tx.borrow_mut().take() {
             let _ = tx.send(token);
         }
-        dlg.close();
+        if let Some(dlg) = dlg_weak.upgrade() {
+            dlg.close();
+        }
     });
 
     // Covers the close button, Escape, and the user giving up.
@@ -104,7 +106,14 @@ pub(crate) fn prompt_human_verification(
 /// unrecognised shape as success would hand the API an empty token and fail the
 /// login with a confusing error.
 fn extract_token(raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    // If the message was stringified twice (e.g. raw is a double-quoted JSON string),
+    // parse the inner string.
+    if let Some(inner) = value.as_str() {
+        if let Ok(parsed) = serde_json::from_str(inner) {
+            value = parsed;
+        }
+    }
     // The payload is nested under `payload` and the message names itself in
     // `type`; both spellings of the success type have shipped.
     let kind = value.get("type")?.as_str()?;
@@ -130,6 +139,12 @@ mod tests {
     fn a_completion_message_yields_its_token() {
         let raw =
             r#"{"type":"HUMAN_VERIFICATION_SUCCESS","payload":{"token":"tok-1","type":"captcha"}}"#;
+        assert_eq!(extract_token(raw).as_deref(), Some("tok-1"));
+    }
+
+    #[test]
+    fn a_double_serialized_completion_message_yields_its_token() {
+        let raw = r#""{\"type\":\"HUMAN_VERIFICATION_SUCCESS\",\"payload\":{\"token\":\"tok-1\",\"type\":\"captcha\"}}""#;
         assert_eq!(extract_token(raw).as_deref(), Some("tok-1"));
     }
 

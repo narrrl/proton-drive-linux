@@ -39,6 +39,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -464,6 +465,19 @@ struct Core {
     /// is the validity tag — a new revision may well have a thumbnail — matching
     /// how [`ContentCache::read_thumbnail`] validates the positive side.
     no_thumbnail: Arc<Mutex<HashMap<(NodeUid, i32), i64>>>,
+    /// Folders whose listing was enumerated cheaply and is having its file sizes
+    /// filled in right now, so a burst of `stat`s over a fresh listing starts one
+    /// upgrade rather than one per entry. See [`Core::spawn_size_upgrade`].
+    size_upgrades: Arc<Mutex<HashSet<u64>>>,
+    /// This mount's kernel notification channel, for telling the kernel to drop
+    /// metadata it has cached. Set once the session exists — which is *after*
+    /// the `Core` it is built from, hence the cell.
+    ///
+    /// Per mount, not per daemon: each on-demand fork runs its own session over
+    /// its own inode space, so notifying through the primary mount's channel
+    /// would name inodes that session has never heard of. [`Core::fork_state`]
+    /// gives each fork an empty cell of its own.
+    notifier: Arc<OnceLock<Notifier>>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
@@ -777,6 +791,38 @@ impl Core {
         self.state.lock().children.contains_key(&ino)
     }
 
+    /// Re-apply the optimistic size of any queued write to `nodes`.
+    ///
+    /// A node that arrives from the remote (or from its DB row) carries the size
+    /// of the revision the *server* holds, which for a file with a write still
+    /// queued is the pre-write size — often 0 for a file created moments ago.
+    /// Interning it as-is silently reverts the optimistic size that
+    /// `record_pending_write` stamped, and a file that stats as 0 bytes is a file
+    /// the kernel will not issue a single `read` for: `cat` prints nothing and
+    /// the staged blob that `read_range` would have served is never asked for.
+    /// That reads as data loss even though nothing is lost (B11).
+    ///
+    /// [`Core::hydrate`] does the same thing for the restart case. This covers
+    /// every *live* re-enumeration — which is what a rename or move triggers,
+    /// since both invalidate the listings they touch.
+    ///
+    /// Snapshots the pending map and returns before any caller takes the state
+    /// lock: no site in the daemon holds `pending` and `state` at once, and this
+    /// is not the place to become the first.
+    fn stamp_pending_sizes(&self, nodes: &mut [Node]) {
+        let sizes: HashMap<NodeUid, u64> = {
+            let pending = self.pending.lock();
+            if pending.is_empty() {
+                return;
+            }
+            pending
+                .iter()
+                .map(|(uid, pr)| (uid.clone(), pr.meta.len))
+                .collect()
+        };
+        apply_pending_sizes(nodes, &sizes);
+    }
+
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
@@ -796,19 +842,36 @@ impl Core {
         // can be rebuilt from disk without hitting the API, even if its listing
         // was trimmed from the hot cache mid-run.
         match self.db.children_if_listed(&folder_uid) {
-            Ok(Some(nodes)) => {
+            Ok(Some(mut nodes)) => {
+                // Before the lock: a DB row carries the size the server last
+                // sealed, which a queued write is ahead of (B11).
+                self.stamp_pending_sizes(&mut nodes);
                 let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
                     return Ok(());
                 }
                 let mut child_inos = Vec::with_capacity(nodes.len());
+                let mut needs_size = Vec::new();
                 for node in nodes {
                     if node.trashed || node.uid == folder_uid {
                         continue;
                     }
+                    if matches!(
+                        &node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    ) {
+                        needs_size.push(node.uid.clone());
+                    }
                     child_inos.push(st.intern_from_db(ino, node));
                 }
                 st.children.insert(ino, child_inos);
+                drop(st);
+                // Rows persisted from a cheap enumeration whose upgrade never
+                // ran (a restart in between, say) still owe their real sizes.
+                self.spawn_size_upgrade(ino, needs_size);
                 return Ok(());
             }
             Ok(None) => {}
@@ -822,13 +885,25 @@ impl Core {
                 error!(%folder_uid, error = %e, "enumerate folder children failed");
                 Errno::EIO
             })?;
-        let nodes = self
+        // Cheap enumeration: `Light` skips unlocking each *file's* node key,
+        // which is an S2K derivation per file and was ~74% of the cost of a cold
+        // listing (B12 — measured with `perf`, 64% of cycles in SHA-256 alone).
+        // Folders are unlocked either way; their keys are what the children are
+        // decrypted with, so the walk cannot proceed without them.
+        //
+        // The price is that files come back without a `claimed_size`, so
+        // `node_size` falls back to the *ciphertext* size until
+        // `spawn_size_upgrade` below fills the real one in.
+        let mut nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(self.client.enumerate_nodes_light(&uids))
             .map_err(|e| {
                 error!(%folder_uid, error = %e, "enumerate nodes failed");
                 Errno::EIO
             })?;
+        // Same as the DB path above: the remote's size for a file with a write
+        // still queued is the pre-write one (B11).
+        self.stamp_pending_sizes(&mut nodes);
 
         let mut st = self.state.lock();
         // Lost the race? Another thread already populated it.
@@ -840,6 +915,21 @@ impl Core {
             .into_iter()
             .filter(|node| !node.trashed && node.uid != folder_uid)
             .collect();
+        // Files whose real size the cheap enumeration could not read. Collected
+        // before interning so the upgrade below has the uids without re-walking.
+        let needs_size: Vec<NodeUid> = filtered_nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    &n.kind,
+                    NodeKind::File {
+                        claimed_size: None,
+                        ..
+                    }
+                )
+            })
+            .map(|n| n.uid.clone())
+            .collect();
         let inos = st.intern_batch(ino, filtered_nodes);
         child_inos.extend(inos);
         st.children.insert(ino, child_inos);
@@ -848,7 +938,130 @@ impl Core {
         if let Err(e) = self.db.set_listed(&folder_uid, true) {
             warn!(%folder_uid, error = %e, "db set_listed(true) failed");
         }
+        drop(st);
+        self.spawn_size_upgrade(ino, needs_size);
         Ok(())
+    }
+
+    /// Kick a size upgrade for every file in `parent`'s listing still carrying a
+    /// provisional size.
+    ///
+    /// Called when a `stat` lands on such a file. That covers the paths
+    /// [`Core::ensure_children`] cannot: a listing rebuilt from the DB, or one
+    /// restored by [`Core::hydrate`] on mount, whose rows were persisted before
+    /// an earlier upgrade had a chance to run. Gathers the whole folder rather
+    /// than the one file asked for, because a `stat` of one entry in a listing
+    /// almost always means a `stat` of all of them.
+    fn upgrade_sizes_for_parent(&self, parent: u64) {
+        let missing: Vec<NodeUid> = {
+            let st = self.state.lock();
+            let Some(kids) = st.children.get(&parent) else {
+                return;
+            };
+            kids.iter()
+                .filter_map(|k| st.entries.get(k))
+                .filter(|e| {
+                    matches!(
+                        &e.node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    )
+                })
+                .map(|e| e.uid.clone())
+                .collect()
+        };
+        self.spawn_size_upgrade(parent, missing);
+    }
+
+    /// Fill in the true sizes of files a `Light` enumeration returned without
+    /// one, on a worker, after the listing has already been served.
+    ///
+    /// This is the other half of the split in [`Core::ensure_children`]. The
+    /// listing itself needs only names and parentage, so it is served from the
+    /// cheap enumeration immediately; the S2K-per-file work that produces
+    /// `claimed_size` happens here, off the path the user is waiting on.
+    ///
+    /// **Sizes are provisional until this lands.** `node_size` falls back to
+    /// `total_size_on_storage`, the *ciphertext* size, which is slightly larger
+    /// than the real one. Reads are unaffected — the revision reader carries its
+    /// own authoritative size — so this is a cosmetic discrepancy in `stat` that
+    /// closes within a round trip, not a repeat of B11 (which reported **0** and
+    /// so suppressed reads entirely).
+    ///
+    /// Single-flight per folder: a `stat` of every entry in a fresh listing is
+    /// the normal case, and each one must not start its own upgrade.
+    fn spawn_size_upgrade(&self, folder_ino: u64, uids: Vec<NodeUid>) {
+        if uids.is_empty() {
+            return;
+        }
+        if !self.size_upgrades.lock().insert(folder_ino) {
+            return;
+        }
+        let core = self.clone();
+        self.workers.run(Lane::Meta, move || {
+            let result = core.rt.block_on(core.client.enumerate_nodes(&uids));
+            core.size_upgrades.lock().remove(&folder_ino);
+            let mut nodes = match result {
+                Ok(nodes) => nodes,
+                Err(e) => {
+                    // Not fatal: the listing stands, sizes just stay provisional
+                    // until something invalidates and re-enumerates it.
+                    warn!(folder_ino, error = %e, "size upgrade failed; sizes stay provisional");
+                    return;
+                }
+            };
+            // A queued write is ahead of anything the server can report, so its
+            // optimistic size must survive this just as it survives a re-listing
+            // (B11).
+            core.stamp_pending_sizes(&mut nodes);
+            let mut changed: Vec<u64> = Vec::new();
+            let mut st = core.state.lock();
+            for node in nodes {
+                // Only adopt the size. Re-interning wholesale would also adopt a
+                // name or parent that a rename/move may have changed locally
+                // while this was in flight, undoing it.
+                let Some(&ino) = st.by_uid.get(&node.uid) else {
+                    continue;
+                };
+                changed.push(ino);
+                let NodeKind::File { claimed_size, .. } = &node.kind else {
+                    continue;
+                };
+                let (Some(size), Some(entry)) = (*claimed_size, st.entries.get_mut(&ino)) else {
+                    continue;
+                };
+                if let NodeKind::File { claimed_size, .. } = &mut entry.node.kind {
+                    *claimed_size = Some(size);
+                }
+            }
+            let updated: Vec<Node> = st
+                .children
+                .get(&folder_ino)
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|k| st.entries.get(k).map(|e| e.node.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            drop(st);
+            if let Err(e) = core.db.upsert_nodes(&updated) {
+                warn!(folder_ino, error = %e, "persisting upgraded sizes failed");
+            }
+            // Without this the corrected size is invisible for the length of the
+            // attr TTL: the kernel answers `stat` from the provisional attrs it
+            // cached while the listing was being served, so `ls -l` reports the
+            // ciphertext size for up to 30 s even though the daemon has had the
+            // real one all along. Notify *after* the DB write, so a re-`getattr`
+            // provoked by the invalidation cannot race the persistence.
+            if let Some(notifier) = core.notifier.get() {
+                for ino in changed {
+                    let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+                }
+            }
+            debug!(folder_ino, files = updated.len(), "filled in listing sizes");
+        });
     }
 
     /// Resolve a child `name` within `parent` to its `(inode, uid)`, ensuring
@@ -3251,6 +3464,19 @@ fn media_type_for(name: &str) -> &'static str {
 }
 
 /// The plaintext size, in bytes, that a node reports.
+/// Overwrite each file node's `claimed_size` with the optimistic size of its
+/// queued write, where it has one. Folders and nodes with nothing queued are
+/// left alone. See [`Core::stamp_pending_sizes`] for why this exists.
+fn apply_pending_sizes(nodes: &mut [Node], sizes: &HashMap<NodeUid, u64>) {
+    for node in nodes {
+        if let Some(&len) = sizes.get(&node.uid)
+            && let NodeKind::File { claimed_size, .. } = &mut node.kind
+        {
+            *claimed_size = Some(len as i64);
+        }
+    }
+}
+
 fn node_size(node: &Node) -> u64 {
     match &node.kind {
         NodeKind::Folder => 0,
@@ -3392,13 +3618,32 @@ impl Filesystem for ProtonFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let st = self.core.state.lock();
-        match st.entries.get(&ino.0) {
-            Some(e) => {
-                let attr = self.attr(ino.0, &e.node);
-                reply.attr(&TTL, &attr);
+        let (attr, provisional_in) = {
+            let st = self.core.state.lock();
+            match st.entries.get(&ino.0) {
+                Some(e) => {
+                    // A file still carrying the cheap enumeration's placeholder
+                    // size: answer now with what we have and have the real size
+                    // fetched in the background (B12).
+                    let provisional = matches!(
+                        &e.node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    )
+                    .then_some(e.parent);
+                    (self.attr(ino.0, &e.node), provisional)
+                }
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
             }
-            None => reply.error(Errno::ENOENT),
+        };
+        reply.attr(&TTL, &attr);
+        if let Some(parent) = provisional_in {
+            self.core.upgrade_sizes_for_parent(parent);
         }
     }
 
@@ -4643,6 +4888,8 @@ pub fn mount(
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
+        size_upgrades: Arc::new(Mutex::new(HashSet::new())),
+        notifier: Arc::new(OnceLock::new()),
         transfers: TransferRegistry::new(),
         indexing: Arc::new(AtomicBool::new(false)),
         sync_progress: Arc::new(Mutex::new(HashMap::new())),
@@ -4744,6 +4991,9 @@ pub fn mount(
     // thread; we then wait here for either a stop signal or the mount ending.
     let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
     let notifier = bg.notifier();
+    // Same channel, kept on the `Core` so background work (a size upgrade, say)
+    // can invalidate kernel-cached metadata without threading a handle through.
+    let _ = core.notifier.set(notifier.clone());
     rt.spawn(run_event_sync(
         client,
         scope,
@@ -4948,6 +5198,87 @@ mod local_uid_tests {
         let parent = NodeUid::new(VolumeId::from("vol1"), LinkId::from("root"));
         let node = local_node(mint_local_uid(), parent, "photos".into(), true);
         assert!(node.is_folder());
+    }
+}
+
+#[cfg(test)]
+mod pending_size_tests {
+    use super::{Node, NodeKind, NodeUid, apply_pending_sizes, node_size};
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    use std::collections::HashMap;
+
+    fn uid(link: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    fn file(link: &str, claimed: i64) -> Node {
+        Node {
+            uid: uid(link),
+            parent_uid: Some(uid("parent")),
+            kind: NodeKind::File {
+                media_type: "text/plain".into(),
+                total_size_on_storage: 0,
+                active_revision_state: None,
+                claimed_size: Some(claimed),
+                claimed_modification_time: None,
+            },
+            name: link.into(),
+            creation_time: 100,
+            modification_time: 100,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            verification: Default::default(),
+        }
+    }
+
+    fn folder(link: &str) -> Node {
+        Node {
+            kind: NodeKind::Folder,
+            ..file(link, 0)
+        }
+    }
+
+    /// B11: a re-enumeration mid-write must not revert the size to the
+    /// server's. A file that stats as 0 gets no `read` from the kernel at all,
+    /// so the staged blob is never served and the file reads as empty.
+    #[test]
+    fn a_queued_write_keeps_its_optimistic_size_through_a_re_enumeration() {
+        let mut nodes = vec![file("queued", 0), file("settled", 4096)];
+        let sizes = HashMap::from([(uid("queued"), 3)]);
+
+        apply_pending_sizes(&mut nodes, &sizes);
+
+        assert_eq!(
+            node_size(&nodes[0]),
+            3,
+            "the remote's pre-write size must not win over the queued write's"
+        );
+        assert_eq!(
+            node_size(&nodes[1]),
+            4096,
+            "a file with nothing queued keeps the size the server reported"
+        );
+    }
+
+    /// The map is keyed by uid and says nothing about kind; a folder that
+    /// somehow collides must not grow a `claimed_size`.
+    #[test]
+    fn folders_are_left_alone() {
+        let mut nodes = vec![folder("dir")];
+        apply_pending_sizes(&mut nodes, &HashMap::from([(uid("dir"), 999)]));
+        assert!(matches!(nodes[0].kind, NodeKind::Folder));
+        assert_eq!(node_size(&nodes[0]), 0);
+    }
+
+    /// The common case: nothing queued, nothing touched.
+    #[test]
+    fn an_empty_pending_map_changes_nothing() {
+        let mut nodes = vec![file("a", 10), file("b", 20)];
+        apply_pending_sizes(&mut nodes, &HashMap::new());
+        assert_eq!(node_size(&nodes[0]), 10);
+        assert_eq!(node_size(&nodes[1]), 20);
     }
 }
 

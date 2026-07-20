@@ -564,6 +564,78 @@ fn search_drops_fts_row_on_delete_and_trash() {
     assert_eq!(db.search("unique", 10).unwrap().len(), 0);
 }
 
+/// Renaming re-indexes the node, which is the case delete-by-rowid has to get
+/// right: the *old* name must leave the index. A stale row here would be
+/// invisible in every other test — the new name is findable either way.
+#[test]
+fn renaming_a_node_replaces_the_name_in_the_search_index() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "beforename.txt", 1))
+        .unwrap();
+    assert_eq!(db.search("beforename", 10).unwrap().len(), 1);
+
+    db.upsert_node(&file("f1", "root", "aftername.txt", 1))
+        .unwrap();
+
+    assert_eq!(
+        db.search("aftername", 10).unwrap().len(),
+        1,
+        "the new name must be searchable"
+    );
+    assert_eq!(
+        db.search("beforename", 10).unwrap().len(),
+        0,
+        "the old name must have left the index, not merely been added alongside"
+    );
+}
+
+/// B12: the cost of writing a listing must not scale with how much is already
+/// indexed. The old `DELETE FROM nodes_fts WHERE uid = ?` scanned the whole
+/// index once per node written, so a large account paid more to write the *same*
+/// folder — measured at 6.5 ms per node against a 17k-node index on the live DB.
+///
+/// Written as a ratio between two index sizes rather than an absolute time, so
+/// it fails on the scaling regression and not on a slow machine.
+#[test]
+fn writing_nodes_does_not_scale_with_the_size_of_the_index() {
+    use std::time::Instant;
+
+    /// Fill `db` with `n` indexed nodes, then time re-writing a fixed batch.
+    fn cost_against_index_of(n: usize) -> std::time::Duration {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        let filler: Vec<_> = (0..n)
+            .map(|i| file(&format!("bg{i}"), "root", &format!("background{i}.txt"), 1))
+            .collect();
+        db.upsert_nodes(&filler).unwrap();
+
+        // The batch under test is identical in both runs; only the amount of
+        // already-indexed data around it differs.
+        let batch: Vec<_> = (0..200)
+            .map(|i| file(&format!("m{i}"), "root", &format!("measured{i}.txt"), 1))
+            .collect();
+        db.upsert_nodes(&batch).unwrap();
+
+        let t = Instant::now();
+        db.upsert_nodes(&batch).unwrap();
+        t.elapsed()
+    }
+
+    let small = cost_against_index_of(200);
+    let large = cost_against_index_of(5000);
+
+    // Calibration, measured while writing this: over the same 25× growth in
+    // index size, the old full-scan path cost 6.4× more (46 ms → 294 ms) while
+    // the rowid path costs 1.04× (39 ms → 41 ms). 3× sits well clear of both.
+    println!("B12: 200-node write — against 200 indexed {small:?}, against 5000 {large:?}");
+    assert!(
+        large < small * 3,
+        "writing a listing got dramatically more expensive as the index grew, \
+         which is the B12 full-scan regression; small={small:?} large={large:?}"
+    );
+}
+
 fn activity(target: &str, kind: ActivityKind, ok: bool) -> ActivityEntry {
     ActivityEntry {
         time: 1700,
