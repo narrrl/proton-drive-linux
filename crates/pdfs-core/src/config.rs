@@ -6,6 +6,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::syncignore::DEFAULT_IGNORE_PATTERNS;
 
 /// Proton requires `external-drive-{name}@{semver}-{channel}` (channel ∈
 /// stable/beta/alpha); a malformed value trips the 422 anti-abuse path.
@@ -34,6 +35,12 @@ pub struct AppConfig {
     /// path here. Defaulted for configs predating the field.
     #[serde(default)]
     pub mountpoint: Option<String>,
+    /// Ignore patterns (gitignore syntax) applied to every mirror sync folder,
+    /// on top of each folder's own `.pdfsignore`. `None` means "use
+    /// [`DEFAULT_IGNORE_PATTERNS`]"; an explicit empty list disables the
+    /// defaults. Defaulted for configs predating the field.
+    #[serde(default)]
+    pub ignore_patterns: Option<Vec<String>>,
 }
 
 impl Default for AppConfig {
@@ -43,6 +50,7 @@ impl Default for AppConfig {
             user_agent: USER_AGENT.to_string(),
             cache_budget: None,
             mountpoint: None,
+            ignore_patterns: None,
         }
     }
 }
@@ -52,6 +60,20 @@ impl AppConfig {
     /// [`DEFAULT_CACHE_BUDGET_BYTES`] when unset.
     pub fn resolved_cache_budget(&self) -> u64 {
         self.cache_budget.unwrap_or(DEFAULT_CACHE_BUDGET_BYTES)
+    }
+
+    /// The effective global sync ignore patterns: the user's explicit list, or
+    /// [`DEFAULT_IGNORE_PATTERNS`] when unset. An explicit empty list is
+    /// honoured as "no global patterns", which is why this is not a
+    /// `unwrap_or_default`.
+    pub fn resolved_ignore_patterns(&self) -> Vec<String> {
+        match &self.ignore_patterns {
+            Some(patterns) => patterns.clone(),
+            None => DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
     }
 }
 
@@ -271,6 +293,7 @@ mod tests {
             user_agent: "test-agent/1.0".to_string(),
             cache_budget: Some(1234),
             mountpoint: Some("/tmp/x".to_string()),
+            ignore_patterns: Some(vec!["build/".to_string()]),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
@@ -283,5 +306,31 @@ mod tests {
         let default_config = AppConfig::default();
         assert_eq!(default_config.app_version, APP_VERSION);
         assert_eq!(default_config.user_agent, USER_AGENT);
+    }
+
+    #[test]
+    fn a_config_predating_ignore_patterns_still_loads() {
+        // Every installed config on disk looks like this; the field must not be
+        // required or the daemon would fall back to a default config on upgrade.
+        let json = r#"{"app_version":"v","user_agent":"u"}"#;
+        let decoded: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(decoded.ignore_patterns.is_none());
+        assert_eq!(
+            decoded.resolved_ignore_patterns().len(),
+            DEFAULT_IGNORE_PATTERNS.len(),
+            "an absent list means the defaults apply"
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_ignore_list_disables_the_defaults() {
+        let config = AppConfig {
+            ignore_patterns: Some(Vec::new()),
+            ..AppConfig::default()
+        };
+        assert!(
+            config.resolved_ignore_patterns().is_empty(),
+            "opting out must be expressible, so this cannot be unwrap_or_default"
+        );
     }
 }

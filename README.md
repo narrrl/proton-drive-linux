@@ -12,6 +12,47 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
 - **Human Verification (CAPTCHA) Recovery**: Detects sign-in gates (VPN/new IP challenges) and launches an embedded `WebKitWebView` dialog to safely complete the challenge, transparently retrying authentication with the earned token.
+- **Selective Sync (`.pdfsignore`)**: Keep build trees, dependency directories, and editor leftovers out of synced folders using gitignore-style rules.
+
+## Selective Sync (`.pdfsignore`)
+
+Two-way synced folders skip paths matched by ignore rules, so syncing a project
+directory does not upload `node_modules/`, `target/`, or `.git/`.
+
+Rules come from two places, and both apply:
+
+1. **Per folder** — a `.pdfsignore` file at the root of the synced folder
+   (`.protonignore` also works). Gitignore syntax, including negation:
+
+   ```gitignore
+   # everything build-related
+   build/
+   *.log
+
+   # ...except this one
+   !important.log
+   ```
+
+2. **Globally** — an `ignore_patterns` list in `config.json`, applied to every
+   synced folder. When unset, sensible defaults apply: `.git/`, `.hg/`, `.svn/`,
+   `node_modules/`, `target/`, `.venv/`, `__pycache__/`, `*~`, `*.swp`, `*.tmp`,
+   `.DS_Store`, and `Thumbs.db`.
+
+   ```json
+   {
+     "ignore_patterns": ["node_modules/", "target/", "*.iso"]
+   }
+   ```
+
+   Set it to `[]` to opt out of the defaults entirely.
+
+Rules are re-read at the start of every sync pass, so edits take effect on the
+next pass without restarting the daemon.
+
+**Ignoring is never destructive.** If a rule starts matching a file that was
+already synced, its copy on Drive is left untouched — the file simply stops
+being tracked. Removing the rule later picks the existing remote file back up
+rather than re-uploading it.
 
 ## Performance & Caching
 
