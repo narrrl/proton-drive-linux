@@ -55,20 +55,21 @@ sudo apt-get install -y \
   libfuse3-dev \
   libgtk-4-dev \
   libadwaita-1-dev \
+  libwebkitgtk-6.0-dev \
   libsecret-1-dev \
   libdbus-1-dev
 ```
 
 ### Arch Linux
 ```bash
-sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus
+sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus webkitgtk-6.0
 ```
 
 ### Fedora (44+)
 ```bash
 sudo dnf install -y \
   pkgconf-pkg-config fuse3-devel gtk4-devel libadwaita-devel \
-  libsecret-devel dbus-devel glib2-devel cargo rust
+  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel cargo rust
 ```
 
 Runtime extras (pick your desktop):

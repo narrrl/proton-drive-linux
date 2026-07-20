@@ -24,11 +24,13 @@ BuildRequires:  libadwaita-devel
 BuildRequires:  libsecret-devel
 BuildRequires:  dbus-devel
 BuildRequires:  glib2-devel
+BuildRequires:  webkitgtk6.0-devel
 
 Requires:       fuse3
 Requires:       gtk4
 Requires:       libadwaita
 Requires:       libsecret
+Requires:       webkitgtk6.0
 Requires:       xdg-utils
 
 # DE-specific; do not Require a single desktop environment.

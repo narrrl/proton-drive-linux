@@ -26,6 +26,7 @@ jobs:
             libfuse3-dev \
             libgtk-4-dev \
             libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
             libsecret-1-dev \
             libdbus-1-dev \
             desktop-file-utils \
@@ -98,7 +99,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: Nils Pukropp <contact@narl.io>
-          Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0
+          Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4
           Installed-Size: ${INSTALLED_SIZE}
           Description: Proton Drive client for Linux
            Proton Drive client for Linux featuring:
