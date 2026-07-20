@@ -42,6 +42,8 @@ pub(crate) fn build_login_page() -> (
     let login_status = gtk4::Label::builder()
         .wrap(true)
         .justify(gtk4::Justification::Center)
+        // Errors (e.g. CAPTCHA / API) must be copyable for bug reports.
+        .selectable(true)
         .build();
     login_status.add_css_class("dim-label");
 
