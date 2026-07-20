@@ -25,6 +25,7 @@ mod activity;
 mod cache;
 mod devices;
 mod local;
+mod maintenance;
 mod migrations;
 mod nodes;
 mod ops;
@@ -38,6 +39,7 @@ mod utils;
 pub use cache::CacheEntryInput;
 pub use devices::StoredDevice;
 pub use local::LocalFileHit;
+pub use maintenance::{DbStats, VacuumOutcome};
 pub use nodes::{SearchHit, StoredNode};
 pub use ops::{
     AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH,

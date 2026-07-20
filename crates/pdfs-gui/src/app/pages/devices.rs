@@ -10,6 +10,13 @@ pub(crate) struct DevicesState {
     pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
     pub(crate) sync_group: adw::PreferencesGroup,
     pub(crate) sync_rows: RefCell<Vec<gtk4::Widget>>,
+    /// "Rename" action in the "This computer" header. Insensitive until the
+    /// device list identifies this machine's own device.
+    pub(crate) rename_this: gtk4::Button,
+    /// This machine's own device `(uid, name)`, from the last device list. The
+    /// current device is filtered out of the "Other computers" rows, so this is
+    /// where its rename target lives. `None` until identified.
+    pub(crate) this_device: RefCell<Option<(String, String)>>,
     pub(crate) inflight: Cell<bool>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
 }
@@ -20,11 +27,16 @@ pub(crate) struct DevicesWidgets {
     pub(crate) status: adw::StatusPage,
     /// "This computer" — the local folders synced to this machine's device.
     pub(crate) sync_group: adw::PreferencesGroup,
+    /// "Rename" in the "This computer" header — renames this machine's device.
+    pub(crate) rename_this: gtk4::Button,
     /// "Other computers" — the account's *other* registered devices. This
     /// machine's own device is deliberately not among them; see
     /// [`repaint_devices`].
     pub(crate) group: adw::PreferencesGroup,
     pub(crate) add_folder: gtk4::Button,
+    /// "Restore Folders" — re-attach this device's remote folders to local
+    /// directories after adopting it on a new machine.
+    pub(crate) restore: gtk4::Button,
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
 }
@@ -47,11 +59,18 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     add_folder.add_css_class("flat");
+    let restore = gtk4::Button::builder()
+        .label("Restore Folders")
+        .tooltip_text("Sync this computer's Drive folders back to local directories")
+        .valign(gtk4::Align::Center)
+        .build();
+    restore.add_css_class("flat");
     let refresh = refresh_button();
 
     let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header.append(&titles);
     header.append(&refresh);
+    header.append(&restore);
     header.append(&add_folder);
 
     // The description spells out what the per-row On-demand switch does to the
@@ -65,6 +84,17 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
              them as you open them.",
         )
         .build();
+    // Rename control for *this* machine's device, in the section header. The
+    // current device is filtered out of "Other computers", so this is the only
+    // place it can be renamed; insensitive until the device list identifies it.
+    let rename_this = gtk4::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Rename this computer")
+        .valign(gtk4::Align::Center)
+        .sensitive(false)
+        .build();
+    rename_this.add_css_class("flat");
+    sync_group.set_header_suffix(Some(&rename_this));
     let group = adw::PreferencesGroup::builder()
         .title("Other computers")
         .description("Other devices backing up to this account.")
@@ -113,8 +143,10 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
             content,
             status,
             sync_group,
+            rename_this,
             group,
             add_folder,
+            restore,
             retry,
             refresh,
         },
@@ -122,7 +154,12 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
 }
 
 /// Install the Devices page's retry button and the "Add Folder" action.
-pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk4::Button) {
+pub(crate) fn wire_devices(
+    ui: &Rc<Ui>,
+    retry: &gtk4::Button,
+    add_folder: &gtk4::Button,
+    restore: &gtk4::Button,
+) {
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
         service::restart();
@@ -130,6 +167,14 @@ pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk4:
     });
     let ui_add = ui.clone();
     add_folder.connect_clicked(move |_| prompt_add_sync_folder(&ui_add));
+    let ui_restore = ui.clone();
+    restore.connect_clicked(move |_| prompt_restore_folders(&ui_restore));
+    let ui_ren = ui.clone();
+    ui.devices.rename_this.connect_clicked(move |_| {
+        if let Some((uid, name)) = ui_ren.devices.this_device.borrow().clone() {
+            prompt_rename_device(&ui_ren, &uid, &name);
+        }
+    });
 }
 
 /// Show a status page in place of the Devices list.
@@ -264,6 +309,22 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
     for row in ui.devices.rows.borrow_mut().drain(..) {
         ui.devices.group.remove(&row);
     }
+    // Identify this machine's own device so the "This computer" header's Rename
+    // action has a target. It never appears in the rows below, so this is the
+    // only place its name/uid is captured.
+    match devices.iter().find(|d| d.this_device) {
+        Some(me) => {
+            *ui.devices.this_device.borrow_mut() = Some((me.uid.clone(), me.name.clone()));
+            ui.devices.rename_this.set_sensitive(true);
+            ui.devices
+                .rename_this
+                .set_tooltip_text(Some(&format!("Rename this computer ({})", me.name)));
+        }
+        None => {
+            *ui.devices.this_device.borrow_mut() = None;
+            ui.devices.rename_this.set_sensitive(false);
+        }
+    }
     let others: Vec<&DeviceInfo> = devices.iter().filter(|d| !d.this_device).collect();
     if others.is_empty() {
         let row = adw::ActionRow::builder()
@@ -294,6 +355,21 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
             .valign(gtk4::Align::Center)
             .build();
         rename.add_css_class("flat");
+        // Adoption is how a reinstalled or renamed machine re-attaches to the
+        // device it used to be, instead of registering a duplicate. It only
+        // makes sense on *another* device's row, which is the only place this
+        // loop paints.
+        let adopt = gtk4::Button::builder()
+            .icon_name("insert-object-symbolic")
+            .tooltip_text("Use this computer's identity for this machine")
+            .valign(gtk4::Align::Center)
+            .build();
+        adopt.add_css_class("flat");
+        let ui_ad = ui.clone();
+        let uid_ad = dev.uid.clone();
+        let name_ad = dev.name.clone();
+        adopt.connect_clicked(move |_| prompt_adopt_device(&ui_ad, &uid_ad, &name_ad));
+        row.add_suffix(&adopt);
         let ui_ren = ui.clone();
         let uid_ren = dev.uid.clone();
         let name_ren = dev.name.clone();
@@ -533,6 +609,110 @@ pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
     });
 }
 
+/// Ask the daemon what this machine's device holds, then show a picker mapping
+/// each remote folder onto a local directory.
+///
+/// The daemon's paths are proposals — from the device's `profile.json` when it
+/// makes sense here, else `~/<name>` — so every one of them is editable and
+/// nothing is restored without being ticked.
+pub(crate) fn prompt_restore_folders(ui: &Rc<Ui>) {
+    ui.busy_begin();
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListRestorableFolders);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::RestorableFolders { items })) => show_restore_picker(&ui, items),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't list folders to restore", &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't list folders to restore",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
+/// The restore picker itself: one editable row per restorable folder.
+fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
+    let win = ui_window(ui);
+    let candidates: Vec<RestorableFolder> =
+        items.into_iter().filter(|f| !f.already_synced).collect();
+    if candidates.is_empty() {
+        toast(
+            ui,
+            "Nothing to restore — this computer's folders are all synced here.",
+        );
+        return;
+    }
+
+    let group = adw::PreferencesGroup::builder()
+        .description(
+            "Tick the folders to sync to this machine, and adjust where each one should live.",
+        )
+        .build();
+    // Held so the response handler can read back what the user ticked and typed.
+    let mut controls: Vec<(String, String, gtk4::CheckButton, adw::EntryRow)> = Vec::new();
+    for f in candidates {
+        let check = gtk4::CheckButton::builder()
+            .active(true)
+            .valign(gtk4::Align::Center)
+            .build();
+        let row = adw::EntryRow::builder().title(&f.name).build();
+        row.set_text(&f.local_path);
+        row.add_prefix(&check);
+        group.add(&row);
+        controls.push((f.remote_uid, f.mode, check, row));
+    }
+
+    let scroll = gtk4::ScrolledWindow::builder()
+        .propagate_natural_height(true)
+        .max_content_height(420)
+        .child(&group)
+        .build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Restore folders")
+        .body("These folders are backed up under this computer in Proton Drive.")
+        .extra_child(&scroll)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("restore", "Restore");
+    dialog.set_response_appearance("restore", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("restore"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "restore" {
+            return;
+        }
+        let items: Vec<RestoreItem> = controls
+            .iter()
+            .filter(|(_, _, check, _)| check.is_active())
+            .map(|(uid, mode, _, row)| RestoreItem {
+                remote_uid: uid.clone(),
+                local_path: row.text().to_string(),
+                mode: mode.clone(),
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        // The daemon acks before the downloads finish, like AddSyncFolder — the
+        // rows appear as the periodic refresh picks them up.
+        run_devices_mutation(
+            &ui,
+            Request::RestoreSyncFolders { items },
+            "Restoring folders…",
+            "Couldn't restore folders",
+        );
+    });
+    dialog.present(win.as_ref());
+}
+
 /// Flip a synced folder between `mirror` and `ondemand`. Reloads after so the
 /// row's subtitle and switch reflect the daemon's real state (the request may be
 /// rejected, e.g. switching to on-demand while a folder is mid-sync).
@@ -692,6 +872,46 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
                 Request::DeleteDevice { uid: uid.clone() },
                 "Device removed",
                 "Couldn't remove the device",
+            );
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Confirm, then adopt another device as this machine's identity.
+///
+/// Worth a confirmation rather than a plain click: adoption re-points this
+/// machine's syncing at another computer's device folder, and the folders
+/// already synced here keep pointing at the old one until they are removed. The
+/// dialog says so, because the alternative is a user discovering it by watching
+/// their folders diverge.
+pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Use this computer's identity")
+        .body(format!(
+            "Treat this machine as “{name}”?\n\nNew synced folders are created under that \
+             computer in Proton Drive, and this machine keeps that identity even if its hostname \
+             changes. Folders already synced here are not moved.\n\nUse “Restore folders” \
+             afterwards to bring back what “{name}” was syncing."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("adopt", "Use identity");
+    dialog.set_response_appearance("adopt", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "adopt" {
+            run_devices_mutation(
+                &ui,
+                Request::AdoptDevice {
+                    uid: Some(uid.clone()),
+                },
+                "Identity adopted",
+                "Couldn't adopt that computer",
             );
         }
     });

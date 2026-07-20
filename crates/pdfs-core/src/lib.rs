@@ -9,8 +9,10 @@ pub mod control;
 pub mod db;
 pub mod error;
 pub mod localindex;
+pub mod profile;
 pub mod service;
 pub mod shell;
+pub mod syncignore;
 
 pub use error::{CoreError, CoreResult, Error, Result};
 

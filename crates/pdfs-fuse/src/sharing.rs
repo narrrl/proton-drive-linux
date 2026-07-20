@@ -15,7 +15,34 @@ use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{MemberRole, NodeKind};
 
-use super::{Core, ROOT_INO, parse_uid, public_link_info, role_from_str, role_to_str};
+use proton_drive_rs::Node;
+
+use super::{Core, ROOT_INO, node_size, parse_uid, public_link_info, role_from_str, role_to_str};
+
+/// A node from a *shared* listing as a [`DirEntry`]. Shared nodes live outside
+/// the mount, so the entry is uid-addressed: `path` is empty, and the local-state
+/// flags (`pinned`, `cached`) are false — they describe my own tree, not this one.
+fn shared_entry(n: Node) -> DirEntry {
+    let is_dir = n.is_folder();
+    let size = match &n.kind {
+        NodeKind::File {
+            claimed_size,
+            total_size_on_storage,
+            ..
+        } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+        NodeKind::Folder => 0,
+    };
+    DirEntry {
+        name: n.name,
+        is_dir,
+        size,
+        modified: n.modification_time,
+        pinned: false,
+        cached: false,
+        uid: n.uid.to_string(),
+        path: String::new(),
+    }
+}
 
 impl Core {
     // ---- sharing a node ---------------------------------------------------
@@ -232,30 +259,62 @@ impl Core {
             .rt
             .block_on(self.client.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
-        Ok(nodes
-            .into_iter()
-            .map(|n| {
-                let is_dir = n.is_folder();
-                let size = match &n.kind {
-                    NodeKind::File {
-                        claimed_size,
-                        total_size_on_storage,
-                        ..
-                    } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
-                    NodeKind::Folder => 0,
-                };
-                DirEntry {
-                    name: n.name,
-                    is_dir,
-                    size,
-                    modified: 0,
-                    pinned: false,
-                    cached: false,
-                    uid: n.uid.to_string(),
-                    path: String::new(),
-                }
-            })
-            .collect())
+        Ok(nodes.into_iter().map(shared_entry).collect())
+    }
+
+    /// List the children of a folder shared with me, addressed by uid.
+    ///
+    /// A shared subtree has no path in this account's mount — the FUSE tree only
+    /// spans my own volume — so browsing into one is uid-addressed the whole way
+    /// down, each listing handing the front-end the uids it descends with next.
+    pub(crate) fn list_shared_folder(&self, uid: &str) -> CoreResult<Vec<DirEntry>> {
+        let uid =
+            parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
+        let child_uids = self
+            .rt
+            .block_on(self.client.enumerate_folder_children_node_uids(&uid))
+            .map_err(|e| CoreError::from_api(&e, "enumerate shared children"))?;
+        if child_uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes = self
+            .rt
+            .block_on(self.client.enumerate_nodes(&child_uids))
+            .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
+        Ok(nodes.into_iter().map(shared_entry).collect())
+    }
+
+    /// Download a file shared with me into the content cache, returning its
+    /// on-disk path (served from cache when a fresh blob already exists).
+    ///
+    /// The by-uid twin of [`Core::open_file`]: same cache and same tracked
+    /// download, but the node is fetched from the server rather than resolved
+    /// through the inode tree, which does not cover other people's volumes.
+    ///
+    /// [`Core::open_file`]: super::Core::open_file
+    pub(crate) fn open_shared_file(&self, uid: &str) -> CoreResult<std::path::PathBuf> {
+        let uid =
+            parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
+        let node = self
+            .rt
+            .block_on(self.client.get_node(&uid))
+            .map_err(|e| CoreError::from_api(&e, "get shared node"))?
+            .ok_or_else(|| CoreError::not_found("shared node not found"))?;
+        if !node.is_file() {
+            return Err(CoreError::invalid("not a regular file"));
+        }
+        let size = node_size(&node);
+        let mtime = node.modification_time;
+        if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
+            return Ok(p);
+        }
+        let bytes = self
+            .download_file_tracked(&uid, &node.name, size)
+            .map_err(|e| CoreError::from_api(&e, "download"))?;
+        self.cache
+            .store(&uid, mtime, size, &bytes)
+            .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
+        Ok(self.cache.content_path(&uid))
     }
 
     /// Leave a shared node by its uid.
@@ -331,6 +390,19 @@ impl Core {
         self.rt
             .block_on(self.client.delete_bookmark(token))
             .map_err(|e| CoreError::from_api(&e, "delete bookmark"))
+    }
+
+    // ---- account ----------------------------------------------------------
+
+    /// Total account storage usage `(max_space, used_space)` in bytes, across all
+    /// Proton products (not Drive-only). A remote round-trip; nothing here is
+    /// cached.
+    pub(crate) fn account_quota(&self) -> CoreResult<(i64, i64)> {
+        let q = self
+            .rt
+            .block_on(self.client.quota())
+            .map_err(|e| CoreError::from_api(&e, "account quota"))?;
+        Ok((q.max_space, q.used_space))
     }
 
     // ---- shared by me -----------------------------------------------------

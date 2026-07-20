@@ -17,6 +17,14 @@ pub(crate) struct StatusState {
     pub(crate) mount_row: adw::ActionRow,
     pub(crate) cache_bar: gtk4::ProgressBar,
     pub(crate) cache_label: gtk4::Label,
+    /// Account-quota group + its bar/label. Hidden until the first reading.
+    pub(crate) quota_group: adw::PreferencesGroup,
+    pub(crate) quota_bar: gtk4::ProgressBar,
+    pub(crate) quota_label: gtk4::Label,
+    /// One `AccountQuota` in flight at a time, and when it last succeeded — quota
+    /// barely moves, so [`refresh_quota`] refetches on a long TTL, not every tick.
+    pub(crate) quota_inflight: Cell<bool>,
+    pub(crate) quota_checked_at: Cell<Option<Instant>>,
     /// "Start on login" toggle. [`Self::settings_suppress`] guards programmatic
     /// sets so reflecting the systemd state doesn't fire the toggle handler.
     pub(crate) autostart_row: adw::SwitchRow,
@@ -78,6 +86,10 @@ pub(crate) struct MainWidgets {
     pub(crate) mount_row: adw::ActionRow,
     /// Live upload/download progress, populated by the refresh loop.
     pub(crate) transfers_group: adw::PreferencesGroup,
+    /// Account-quota group; hidden until `refresh_quota` gets a reading.
+    pub(crate) quota_group: adw::PreferencesGroup,
+    pub(crate) quota_bar: gtk4::ProgressBar,
+    pub(crate) quota_label: gtk4::Label,
     pub(crate) cache_bar: gtk4::ProgressBar,
     pub(crate) cache_label: gtk4::Label,
     pub(crate) pins_group: adw::PreferencesGroup,
@@ -110,6 +122,29 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     logout_button.add_css_class("flat");
     account_row.add_suffix(&logout_button);
     account_group.add(&account_row);
+
+    // Account storage: the Proton account quota (used of total), distinct from
+    // the local content cache below. A progress bar + "X of Y used" line, painted
+    // by `refresh_quota`. Hidden until the first successful read so a cold start
+    // (or an account the API can't report) shows nothing rather than an empty bar.
+    let quota_group = adw::PreferencesGroup::builder()
+        .title("Account storage")
+        .description("Your Proton storage across all products.")
+        .visible(false)
+        .build();
+    let quota_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    quota_box.set_margin_top(6);
+    quota_box.set_margin_bottom(6);
+    let quota_bar = gtk4::ProgressBar::new();
+    let quota_label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+    quota_label.add_css_class("dim-label");
+    quota_box.append(&quota_bar);
+    quota_box.append(&quota_label);
+    let quota_row = adw::PreferencesRow::builder()
+        .activatable(false)
+        .child(&quota_box)
+        .build();
+    quota_group.add(&quota_row);
 
     // Mount group: a read-only status line. The mount is managed automatically
     // by the systemd user service; there is no toggle to fiddle with.
@@ -219,6 +254,7 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&account_group);
+    inner.append(&quota_group);
     inner.append(&mount_group);
     inner.append(&transfers_group);
     inner.append(&storage_group);
@@ -238,6 +274,9 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
             account_row,
             mount_row,
             transfers_group,
+            quota_group,
+            quota_bar,
+            quota_label,
             cache_bar,
             cache_label,
             pins_group,
@@ -463,10 +502,63 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     // Both of these pages show work as it happens, so they follow the tick while
     // they are on screen. Every other page loads on navigation only.
     match ui.stack.visible_child_name().as_deref() {
+        Some("main") => refresh_quota(ui),
         Some("devices") => refresh_sync_folders(ui),
         Some("activity") => refresh_activity(ui),
         _ => {}
     }
+}
+
+/// How long a quota reading stays fresh. Account storage barely moves, so the
+/// Settings tick refetches it only this often rather than every 2s.
+const QUOTA_TTL: Duration = Duration::from_secs(60);
+
+/// Fetch the account quota (if the last reading is stale) and paint the Account
+/// storage group. Runs only while Settings is on screen. The group stays hidden
+/// until a reading lands, so an account the API can't report — or a still-starting
+/// daemon — shows nothing rather than an empty bar. A failed fetch leaves the last
+/// good reading in place.
+pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
+    if ui.status.quota_inflight.get() {
+        return;
+    }
+    if let Some(at) = ui.status.quota_checked_at.get()
+        && at.elapsed() < QUOTA_TTL
+    {
+        return;
+    }
+    ui.status.quota_inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::AccountQuota);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.status.quota_inflight.set(false);
+        if let Ok(Ok(Response::AccountQuota {
+            max_space,
+            used_space,
+        })) = result
+        {
+            ui.status.quota_checked_at.set(Some(Instant::now()));
+            let used = used_space.max(0) as u64;
+            if max_space > 0 {
+                let total = max_space as u64;
+                let fraction = (used as f64 / total as f64).min(1.0);
+                ui.status.quota_bar.set_fraction(fraction);
+                let pct = (fraction * 100.0).round() as u64;
+                ui.status.quota_label.set_text(&format!(
+                    "{} of {} used ({pct}%)",
+                    human_bytes(used),
+                    human_bytes(total)
+                ));
+            } else {
+                ui.status.quota_bar.set_fraction(0.0);
+                ui.status
+                    .quota_label
+                    .set_text(&format!("{} used", human_bytes(used)));
+            }
+            ui.status.quota_group.set_visible(true);
+        }
+    });
 }
 
 /// Record the mount state seen by the last status poll: gate every control that

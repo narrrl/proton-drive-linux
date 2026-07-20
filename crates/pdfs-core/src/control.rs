@@ -136,6 +136,22 @@ pub enum Request {
     /// persist it to config so the next mount keeps it. Replies with
     /// [`Response::Ok`].
     SetCacheBudget { bytes: u64 },
+    /// Report on the health of the metadata database and content cache: sizes,
+    /// row counts, and — when `deep` — SQLite's own integrity check. Replies
+    /// with [`Response::CacheReport`].
+    ///
+    /// `deep` reads every page of the database, so it is opt-in: worth it when
+    /// diagnosing a suspected corruption, wasteful as a routine status call.
+    CacheInspect {
+        #[serde(default)]
+        deep: bool,
+    },
+    /// Checkpoint the write-ahead log and compact the database, replying with
+    /// [`Response::Ok`] reporting the bytes reclaimed.
+    ///
+    /// Takes a write lock for the duration and needs room for a second copy of
+    /// the database, which is why it is user-invoked rather than periodic.
+    CacheVacuum,
     /// Snapshot what the daemon is working on: in-flight transfers (active
     /// uploads/downloads) and the longer jobs around them (scans, folder
     /// skeletons, the local index, sync passes). Replies with
@@ -172,6 +188,11 @@ pub enum Request {
     RenameDevice { uid: String, name: String },
     /// Delete (deregister) a device by its uid. Replies with [`Response::Ok`].
     DeleteDevice { uid: String },
+    /// Adopt an existing device as this machine's, pinning its uid in
+    /// `config.json` so a hostname change or reinstall re-attaches to it instead
+    /// of registering a duplicate (features.md 5.1). `uid: None` clears the pin.
+    /// Replies with [`Response::Ok`].
+    AdoptDevice { uid: Option<String> },
 
     // ---- device folder sync (devices.md) ----------------------------------
     /// Add a local folder to this machine's device, uploading its tree and
@@ -188,6 +209,13 @@ pub enum Request {
     /// Force a reconcile pass: one folder by id, or all when `id` is `None`.
     /// Replies with [`Response::Ok`].
     SyncNow { id: Option<i64> },
+    /// List the folders under this machine's device that can be synced here,
+    /// each with a proposed local path (features.md 5.2). Replies with
+    /// [`Response::RestorableFolders`].
+    ListRestorableFolders,
+    /// Attach the given remote device folders to local paths and sync them down.
+    /// Replies with [`Response::Ok`].
+    RestoreSyncFolders { items: Vec<RestoreItem> },
 
     // ---- sharing a node ---------------------------------------------------
     /// Invite `emails` (Proton and/or external addresses, auto-detected) to the
@@ -243,6 +271,16 @@ pub enum Request {
     /// [`Response::Entries`] (each entry carries its `uid`; `path` is empty since
     /// the item lives outside the mount tree).
     ListSharedWithMe,
+    /// List the children of a folder shared with me, addressed by `uid`. Replies
+    /// with [`Response::Entries`]; like [`Request::ListSharedWithMe`] the entries
+    /// carry a `uid` and an empty `path`, since the subtree lives outside the
+    /// mount. Lets a front-end browse into a shared folder.
+    ListSharedFolder { uid: String },
+    /// Download a file shared with me into the content cache, addressed by `uid`.
+    /// Replies with [`Response::FilePath`] so the front-end can open it with the
+    /// default app. The by-uid twin of [`Request::OpenFile`], which can only
+    /// address nodes inside the mount.
+    OpenSharedFile { uid: String },
     /// Leave a shared node by its `uid`, giving up my access. Replies with
     /// [`Response::Ok`].
     LeaveShared { uid: String },
@@ -268,6 +306,11 @@ pub enum Request {
     },
     /// Remove a saved bookmark by its `token`. Replies with [`Response::Ok`].
     DeleteBookmark { token: String },
+
+    // ---- account ----------------------------------------------------------
+    /// Total account storage usage (used/total, all Proton products, not just
+    /// Drive). Replies with [`Response::AccountQuota`].
+    AccountQuota,
 
     // ---- activity ---------------------------------------------------------
     /// Fetch the daemon's recent activity log, newest first, capped at `limit`
@@ -324,6 +367,11 @@ pub struct DeviceInfo {
     /// front-end must not offer that as casually as removing another computer.
     #[serde(default)]
     pub this_device: bool,
+    /// Whether this device is the one *explicitly adopted* in `config.json`
+    /// ([`Request::AdoptDevice`]), as opposed to one matched by hostname. Only
+    /// an adopted device survives a hostname change or a reinstall.
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 /// One synced local folder on this machine's device (in [`Response::SyncFolders`]).
@@ -351,6 +399,36 @@ pub struct SyncFolderInfo {
     /// running. Live daemon state, not a stored column.
     #[serde(default)]
     pub progress: Option<SyncProgress>,
+}
+
+/// A folder under this machine's device offered for restore (in
+/// [`Response::RestorableFolders`]).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RestorableFolder {
+    /// Uid of the remote folder — the handle for [`RestoreItem`].
+    pub remote_uid: String,
+    /// Its remote name.
+    pub name: String,
+    /// Where the daemon *proposes* to put it: the path the profile recorded when
+    /// that path makes sense on this machine, else `~/<name>`. A front-end shows
+    /// this as an editable default, never applies it silently.
+    pub local_path: String,
+    /// Proposed mode, from the profile; `mirror` when unknown.
+    pub mode: String,
+    /// Already synced on this machine, so restoring it again would be a no-op.
+    /// Listed anyway so the picker shows the whole device.
+    #[serde(default)]
+    pub already_synced: bool,
+}
+
+/// One folder to restore, in [`Request::RestoreSyncFolders`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RestoreItem {
+    pub remote_uid: String,
+    /// Absolute local path to sync it to; created if missing.
+    pub local_path: String,
+    /// `mirror` or `ondemand`.
+    pub mode: String,
 }
 
 /// Which stage a running sync pass is in, in a [`SyncProgress`].
@@ -817,6 +895,28 @@ pub enum Response {
     },
     /// A human-readable success message.
     Ok { message: String },
+    /// Health report for the metadata database and content cache (reply to
+    /// [`Request::CacheInspect`]).
+    CacheReport {
+        /// Schema version the database file is at.
+        schema_version: i64,
+        /// Bytes the database file accounts for.
+        db_bytes: u64,
+        /// Bytes a vacuum could hand back.
+        db_reclaimable_bytes: u64,
+        /// Row counts per table, in display order.
+        tables: Vec<(String, i64)>,
+        /// Bytes of cached content blobs, blocks, and thumbnails.
+        cache_used: u64,
+        /// Configured soft byte cap (`0` = unlimited).
+        cache_budget: u64,
+        /// Problems SQLite reported. Empty means sound; absent when the caller
+        /// did not ask for a deep check.
+        integrity_problems: Vec<String>,
+        /// Whether the integrity check actually ran, so an empty problem list
+        /// is not mistaken for a clean bill of health it never gave.
+        integrity_checked: bool,
+    },
     /// The pin registry.
     Pins { pins: Vec<Pin> },
     /// A directory listing (reply to [`Request::ListDir`]) or a trash listing
@@ -860,6 +960,8 @@ pub enum Response {
     Devices { items: Vec<DeviceInfo> },
     /// This device's synced folders (reply to [`Request::ListSyncFolders`]).
     SyncFolders { items: Vec<SyncFolderInfo> },
+    /// Folders offered for restore (reply to [`Request::ListRestorableFolders`]).
+    RestorableFolders { items: Vec<RestorableFolder> },
     /// A node's share: members + pending invitations, and its public link if any
     /// (reply to [`Request::ListShare`]).
     Share {
@@ -873,6 +975,11 @@ pub enum Response {
     Invitations { items: Vec<InvitationInfo> },
     /// Saved public links (reply to [`Request::ListBookmarks`]).
     Bookmarks { items: Vec<BookmarkInfo> },
+    /// Account storage usage in bytes (reply to [`Request::AccountQuota`]).
+    /// `max_space` is the total; `used_space` what is consumed. `max_space == 0`
+    /// means the total is unknown, which a front-end shows as a plain used figure
+    /// rather than a full bar.
+    AccountQuota { max_space: i64, used_space: i64 },
     /// Nodes I have shared with others (reply to [`Request::ListSharedByMe`]).
     SharedByMe { items: Vec<SharedItem> },
     /// The daemon's recent activity, newest first (reply to
@@ -1123,6 +1230,18 @@ mod tests {
                 mode: "ondemand".into(),
             },
             Request::SyncNow { id: Some(3) },
+            Request::AdoptDevice {
+                uid: Some("dev-1".into()),
+            },
+            Request::AdoptDevice { uid: None },
+            Request::ListRestorableFolders,
+            Request::RestoreSyncFolders {
+                items: vec![RestoreItem {
+                    remote_uid: "vol~link".into(),
+                    local_path: "/home/me/Docs".into(),
+                    mode: "mirror".into(),
+                }],
+            },
             Request::ShareNode {
                 path: "a/b".into(),
                 emails: vec!["x@proton.me".into(), "y@example.com".into()],
@@ -1154,6 +1273,12 @@ mod tests {
             Request::ListSharedByMe,
             Request::ListActivity { limit: 100 },
             Request::ListSharedWithMe,
+            Request::ListSharedFolder {
+                uid: "vol~link".into(),
+            },
+            Request::OpenSharedFile {
+                uid: "vol~link".into(),
+            },
             Request::LeaveShared {
                 uid: "vol~link".into(),
             },
@@ -1168,6 +1293,7 @@ mod tests {
             Request::DeleteBookmark {
                 token: "tok".into(),
             },
+            Request::AccountQuota,
         ];
         for req in reqs {
             let line = serde_json::to_string(&req).unwrap();

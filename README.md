@@ -12,6 +12,109 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
 - **Human Verification (CAPTCHA) Recovery**: Detects sign-in gates (VPN/new IP challenges) and launches an embedded `WebKitWebView` dialog to safely complete the challenge, transparently retrying authentication with the earned token.
+- **Selective Sync (`.pdfsignore`)**: Keep build trees, dependency directories, and editor leftovers out of synced folders using gitignore-style rules.
+
+## Selective Sync (`.pdfsignore`)
+
+Two-way synced folders skip paths matched by ignore rules, so syncing a project
+directory does not upload `node_modules/`, `target/`, or `.git/`.
+
+Rules come from two places, and both apply:
+
+1. **Per folder** — a `.pdfsignore` file at the root of the synced folder
+   (`.protonignore` also works). Gitignore syntax, including negation:
+
+   ```gitignore
+   # everything build-related
+   build/
+   *.log
+
+   # ...except this one
+   !important.log
+   ```
+
+2. **Globally** — an `ignore_patterns` list in `config.json`, applied to every
+   synced folder. When unset, sensible defaults apply: `.git/`, `.hg/`, `.svn/`,
+   `node_modules/`, `target/`, `.venv/`, `__pycache__/`, `*~`, `*.swp`, `*.tmp`,
+   `.DS_Store`, and `Thumbs.db`.
+
+   ```json
+   {
+     "ignore_patterns": ["node_modules/", "target/", "*.iso"]
+   }
+   ```
+
+   Set it to `[]` to opt out of the defaults entirely.
+
+Rules are re-read at the start of every sync pass, so edits take effect on the
+next pass without restarting the daemon.
+
+**Ignoring is never destructive.** If a rule starts matching a file that was
+already synced, its copy on Drive is left untouched — the file simply stops
+being tracked. Removing the rule later picks the existing remote file back up
+rather than re-uploading it.
+
+## Diagnostics & Maintenance
+
+When something looks wrong, `pdfs diagnose` checks the installation and prints a
+report. It runs without a daemon on purpose — the state worth diagnosing is
+usually the state where the daemon will not start:
+
+```console
+$ pdfs diagnose
+Paths
+[ok  ]   state dir: /home/you/.local/state/proton-drive-linux
+[ok  ]   database: /home/you/.local/state/proton-drive-linux/cache.db (170.3 MiB)
+
+Account
+[ok  ]   keyring session: you@proton.me
+
+Daemon
+[ok  ]   daemon responding
+[ok  ]   mounted at: /home/you/ProtonDrive
+[ok  ]   queued writes: none
+
+No problems found.
+```
+
+It exits non-zero if any check fails, so it works in a health-check script.
+
+For the local metadata database and content cache:
+
+| Command | What it does |
+|---|---|
+| `pdfs cache inspect` | Database size, reclaimable space, per-table row counts, cache usage against budget |
+| `pdfs cache inspect --deep` | Also runs SQLite's integrity check — reads every page, so it is slow on a large database |
+| `pdfs cache vacuum` | Checkpoints the write-ahead log and compacts the database |
+| `pdfs cache clear` | Deletes cached file content, keeping pinned files |
+
+`vacuum` takes a write lock for its duration and needs room for a second copy of
+the database while it runs, so it is a deliberate operation rather than
+something the daemon does on a timer.
+
+## Scripting (`--json`)
+
+Query commands accept a global `--json` flag and emit machine-readable output:
+
+```console
+$ pdfs --json sync list | jq '.items[] | select(.state != "idle") | .local_path'
+$ pdfs --json cache inspect | jq '.db_reclaimable_bytes'
+$ pdfs --json status | jq -r '.mount.mountpoint'
+```
+
+Supported on `status`, `ls`, `pins`, `sync list`, `devices list`, `transfers`,
+`activity`, and `cache inspect`. Commands that perform an action keep their
+human output — a script that needs to know whether one worked has the exit code.
+
+Two things worth relying on:
+
+- **The payload is unwrapped.** Output is `{"items": […]}`, not the daemon's
+  internal `{"SyncFolders": {"items": […]}}`, so scripts never name an internal
+  variant.
+- **Errors still fail.** A daemon-side error prints its JSON body (with a
+  machine-readable `kind`) on stdout *and* exits non-zero, so `set -e` and
+  `if pdfs …` behave as expected rather than treating a failed lookup as
+  success.
 
 ## Performance & Caching
 

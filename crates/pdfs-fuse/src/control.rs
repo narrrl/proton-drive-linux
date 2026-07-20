@@ -73,18 +73,24 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         }
         Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.pin(&rel) {
-                Ok(name) => CtlResponse::Ok {
-                    message: format!("pinned {name}"),
-                },
+                Ok(name) => {
+                    core.touch_profile();
+                    CtlResponse::Ok {
+                        message: format!("pinned {name}"),
+                    }
+                }
                 Err(e) => CtlResponse::error(e),
             },
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::Unpin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.unpin(&rel) {
-                Ok(name) => CtlResponse::Ok {
-                    message: format!("unpinned {name}"),
-                },
+                Ok(name) => {
+                    core.touch_profile();
+                    CtlResponse::Ok {
+                        message: format!("unpinned {name}"),
+                    }
+                }
                 Err(e) => CtlResponse::error(e),
             },
             Err(e) => CtlResponse::error(e),
@@ -404,6 +410,45 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 ),
             }
         }
+        Ok(CtlRequest::CacheInspect { deep }) => match core.db.stats() {
+            Ok(stats) => {
+                // The deep check reads every page, so it runs only on request;
+                // `integrity_checked` tells the caller which answer it is
+                // holding, since "no problems found" and "never looked" are
+                // both an empty list.
+                let (integrity_problems, integrity_checked) = if deep {
+                    match core.db.integrity_check() {
+                        Ok(problems) => (problems, true),
+                        Err(e) => (vec![format!("integrity check failed: {e:?}")], true),
+                    }
+                } else {
+                    (Vec::new(), false)
+                };
+                CtlResponse::CacheReport {
+                    schema_version: stats.schema_version,
+                    db_bytes: stats.total_bytes(),
+                    db_reclaimable_bytes: stats.reclaimable_bytes(),
+                    tables: stats.tables,
+                    cache_used: core.cache.usage(),
+                    cache_budget: core.cache.budget(),
+                    integrity_problems,
+                    integrity_checked,
+                }
+            }
+            Err(e) => CtlResponse::error(CoreError::internal(format!("read db stats: {e:?}"))),
+        },
+        Ok(CtlRequest::CacheVacuum) => match core.db.vacuum() {
+            Ok(outcome) => CtlResponse::Ok {
+                message: format!(
+                    "vacuumed: {:.1} MiB freed ({:.1} MiB → {:.1} MiB), {} WAL frame(s) checkpointed",
+                    outcome.freed_bytes() as f64 / 1_048_576.0,
+                    outcome.before_bytes as f64 / 1_048_576.0,
+                    outcome.after_bytes as f64 / 1_048_576.0,
+                    outcome.wal_frames_checkpointed,
+                ),
+            },
+            Err(e) => CtlResponse::error(CoreError::internal(format!("vacuum: {e:?}"))),
+        },
         Ok(CtlRequest::GetQueueStatus) => CtlResponse::Transfers {
             items: core.transfers.snapshot(),
             jobs: core.jobs_snapshot(),
@@ -417,9 +462,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 cfg.cache_budget = Some(bytes);
                 dirs.save_config(&cfg)
             }) {
-                Ok(Ok(())) => CtlResponse::Ok {
-                    message: format!("cache budget set to {bytes} bytes"),
-                },
+                Ok(Ok(())) => {
+                    core.touch_profile();
+                    CtlResponse::Ok {
+                        message: format!("cache budget set to {bytes} bytes"),
+                    }
+                }
                 Ok(Err(e)) => CtlResponse::error(CoreError::internal(format!(
                     "budget applied but config write failed: {e}"
                 ))),
@@ -444,6 +492,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::AdoptDevice { uid }) => match core.adopt_device(uid.as_deref()) {
+            Ok(message) => CtlResponse::Ok { message },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::AddSyncFolder { local_path }) => {
             // Registering the device and uploading a folder tree far outlasts the
             // socket read timeout, so ack immediately and work on a background
@@ -455,6 +507,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 let started = Instant::now();
                 match core.add_sync_folder(&path) {
                     Ok(folder) => {
+                        core.touch_profile();
                         let name = Path::new(&folder.local_path)
                             .file_name()
                             .and_then(|n| n.to_str())
@@ -483,15 +536,19 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::RemoveSyncFolder { id, delete_remote }) => {
             match core.remove_sync_folder(id, delete_remote) {
-                Ok(()) => CtlResponse::Ok {
-                    message: "removed synced folder".to_string(),
-                },
+                Ok(()) => {
+                    core.touch_profile();
+                    CtlResponse::Ok {
+                        message: "removed synced folder".to_string(),
+                    }
+                }
                 Err(e) => CtlResponse::error(e),
             }
         }
         Ok(CtlRequest::SetSyncFolderMode { id, mode }) => {
             match core.request_sync_folder_mode(id, &mode) {
                 Ok(message) => {
+                    core.touch_profile();
                     core.log_activity(ActivityKind::Upload, &message, "", true);
                     CtlResponse::Ok { message }
                 }
@@ -505,6 +562,28 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     Some(id) => format!("reconciling folder {id}"),
                     None => "reconciling all folders".to_string(),
                 },
+            }
+        }
+        Ok(CtlRequest::ListRestorableFolders) => match core.list_restorable_folders() {
+            Ok(items) => CtlResponse::RestorableFolders { items },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::RestoreSyncFolders { items }) => {
+            // Like AddSyncFolder: each restored folder downloads a whole tree,
+            // which outlasts the socket timeout. Ack, then work.
+            let core = core.clone();
+            std::thread::spawn(move || match core.restore_sync_folders(&items) {
+                Ok(message) => {
+                    core.touch_profile();
+                    core.log_activity(ActivityKind::Download, &message, "", true);
+                }
+                Err(e) => {
+                    warn!(error = %e, "restore failed");
+                    core.log_activity(ActivityKind::Download, "restore folders", &e, false);
+                }
+            });
+            CtlResponse::Ok {
+                message: "restoring folders".to_string(),
             }
         }
         Ok(CtlRequest::ShareNode {
@@ -599,6 +678,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::ListSharedWithMe) => match core.list_shared_with_me() {
             Ok(entries) => CtlResponse::Entries { entries },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::AccountQuota) => match core.account_quota() {
+            Ok((max_space, used_space)) => CtlResponse::AccountQuota {
+                max_space,
+                used_space,
+            },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::ListSharedFolder { uid }) => match core.list_shared_folder(&uid) {
+            Ok(entries) => CtlResponse::Entries { entries },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::OpenSharedFile { uid }) => match core.open_shared_file(&uid) {
+            Ok(p) => CtlResponse::FilePath {
+                path: p.display().to_string(),
+            },
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::LeaveShared { uid }) => match core.leave_shared(&uid) {

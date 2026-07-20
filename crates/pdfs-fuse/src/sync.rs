@@ -29,6 +29,7 @@ use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
+use pdfs_core::syncignore::IgnoreRules;
 
 /// How long the watcher must go quiet before a burst counts as finished.
 ///
@@ -448,6 +449,94 @@ impl From<String> for PassAbort {
 ///
 /// One surviving path is enough to clear the guard, since the classification is
 /// only ever wrong about all of them at once.
+/// The paths a reconcile pass will classify: the union of the local, remote,
+/// and baseline states, minus anything the ignore rules exclude, shallowest
+/// first so a parent folder is created before its children are placed in it.
+///
+/// The ignore filter belongs *here*, on the union, rather than on the local walk
+/// alone — filtering the walk alone would be actively destructive. A file synced
+/// before it became ignored is absent from `local` but present in `remote` and
+/// `baseline`, which is precisely the "local deleted, remote untouched" shape
+/// `do_reconcile` responds to by trashing the remote copy. Adding a line to
+/// `.pdfsignore` must never delete anything from Drive.
+///
+/// Ignored baseline rows are deliberately left in the database rather than
+/// removed: with the row intact, un-ignoring the path later re-adopts the
+/// existing remote file instead of reading as a brand-new local one.
+fn classification_order<L, R, B>(
+    local: &HashMap<String, L>,
+    remote: &HashMap<String, R>,
+    baseline: &HashMap<String, B>,
+    rules: &IgnoreRules,
+) -> Vec<String>
+where
+    L: HasKind,
+    R: HasKind,
+{
+    let mut paths: HashSet<String> = HashSet::new();
+    paths.extend(local.keys().cloned());
+    paths.extend(remote.keys().cloned());
+    paths.extend(baseline.keys().cloned());
+    let mut order: Vec<String> = paths.into_iter().collect();
+    if !rules.is_empty() {
+        order.retain(|rel| {
+            // A baseline-only path has no kind recorded, so it is tested as
+            // both; see `filter_baseline` for why erring towards "ignored" is
+            // the safe direction here.
+            let kind = local
+                .get(rel)
+                .map(HasKind::is_dir)
+                .or_else(|| remote.get(rel).map(HasKind::is_dir));
+            match kind {
+                Some(is_dir) => !rules.is_ignored(rel, is_dir),
+                None => !rules.is_ignored(rel, false) && !rules.is_ignored(rel, true),
+            }
+        });
+    }
+    order.sort_by_key(|p| p.matches('/').count());
+    order
+}
+
+/// Lets [`classification_order`] ask either walk's item whether it is a
+/// directory without knowing which walk it came from.
+trait HasKind {
+    fn is_dir(&self) -> bool;
+}
+
+impl HasKind for LocalItem {
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+impl HasKind for RemoteItem {
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+/// The baseline minus its ignored paths, for [`guard_local_wipe`].
+///
+/// The guard asks "did every synced path vanish locally?", and an ignored path
+/// is absent from the local walk by rule rather than by loss. Left in, a rule
+/// covering the whole tree would trip the guard on every pass and wedge that
+/// folder's sync for good.
+///
+/// A baseline row does not record whether it was a file or a folder, so a path
+/// counts as ignored if it matches as either. Erring towards "ignored" only ever
+/// shrinks the set the guard checks, which weakens a safety net rather than
+/// causing a deletion — the wrong direction to be wrong in is the other one.
+fn filter_baseline<'a, B>(
+    baseline: &'a HashMap<String, B>,
+    rules: &IgnoreRules,
+) -> HashMap<String, &'a B> {
+    baseline
+        .iter()
+        .filter(|(rel, _)| !rules.is_ignored(rel, false) && !rules.is_ignored(rel, true))
+        .map(|(rel, entry)| (rel.clone(), entry))
+        .collect()
+}
+
 fn guard_local_wipe<B, L>(
     baseline: &HashMap<String, B>,
     local: &HashMap<String, L>,
@@ -529,11 +618,16 @@ impl Core {
             .db
             .sync_folder_set_state(folder.id, "syncing", folder.last_sync);
         let name = base_name(&folder.local_path);
+        // Rebuilt per pass rather than cached on `Core`, so editing `.pdfsignore`
+        // takes effect on the next reconcile instead of at the next daemon start.
+        // The cost is one small file read against a pass that is about to walk the
+        // whole tree.
+        let rules = self.ignore_rules(&local_root);
         self.progress_begin(folder.id);
         let result = if push_only {
-            self.push_pass(folder.id, &local_root, &remote_root)
+            self.push_pass(folder.id, &local_root, &remote_root, &rules)
         } else {
-            match self.do_reconcile(folder.id, &local_root, &remote_root) {
+            match self.do_reconcile(folder.id, &local_root, &remote_root, &rules) {
                 Ok(outcome) => Ok(outcome),
                 Err(PassAbort::Failed(e)) => Err(e),
                 // The user asked for on-demand while this pass was running. Rather
@@ -548,7 +642,7 @@ impl Core {
                     );
                     push_only = true;
                     self.progress_begin(folder.id);
-                    self.push_pass(folder.id, &local_root, &remote_root)
+                    self.push_pass(folder.id, &local_root, &remote_root, &rules)
                 }
             }
         };
@@ -619,6 +713,27 @@ impl Core {
         }
     }
 
+    /// Compile the ignore rules for a synced folder: the global patterns from
+    /// the config, plus any `.pdfsignore` at `local_root`.
+    ///
+    /// A config that cannot be read falls back to the built-in defaults rather
+    /// than to "ignore nothing" — the defaults exclude build and VCS trees, and
+    /// silently uploading those because a config read failed is the outcome this
+    /// feature exists to prevent.
+    fn ignore_rules(&self, local_root: &Path) -> IgnoreRules {
+        let globals = match pdfs_core::config::AppDirs::new() {
+            Ok(dirs) => dirs.load_config().resolved_ignore_patterns(),
+            Err(e) => {
+                warn!(error = %e, "sync: cannot resolve config dir; using default ignore patterns");
+                pdfs_core::syncignore::DEFAULT_IGNORE_PATTERNS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            }
+        };
+        IgnoreRules::load(local_root, &globals)
+    }
+
     /// Whether a switch to on-demand is waiting on this folder — i.e. whether a
     /// pass in flight is still doing work worth doing. Read from the db rather than
     /// held in memory because the request arrives on the control-socket thread while
@@ -658,6 +773,7 @@ impl Core {
         folder_id: i64,
         local_root: &Path,
         remote_root: &NodeUid,
+        rules: &IgnoreRules,
     ) -> Result<Outcome, String> {
         let baseline = self
             .db
@@ -667,8 +783,12 @@ impl Core {
         self.progress_scan_total(folder_id, baseline.len());
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
-        self.walk_local(folder_id, local_root, local_root, &mut local)?;
-        guard_local_wipe(&baseline, &local)?;
+        self.walk_local(folder_id, local_root, local_root, rules, &mut local)?;
+        // The guard compares against the paths this pass could still see: an
+        // ignored path is absent from `local` by rule, not by loss, and counting
+        // those as missing would trip the guard on every pass — wedging the
+        // folder's sync permanently — the moment a rule covers the whole tree.
+        guard_local_wipe(&filter_baseline(&baseline, rules), &local)?;
 
         // The remote folder uids come from the baseline instead of a walk: every
         // directory this device has synced recorded its uid there when it was
@@ -909,6 +1029,7 @@ impl Core {
         folder_id: i64,
         local_root: &Path,
         remote_root: &NodeUid,
+        rules: &IgnoreRules,
     ) -> Result<Outcome, PassAbort> {
         // Loaded before the walks: the remote one uses it to tell which files are
         // unchanged and so can skip decrypting their claimed size, and its size is
@@ -922,8 +1043,9 @@ impl Core {
         self.progress_scan_total(folder_id, baseline.len() * 2);
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
-        self.walk_local(folder_id, local_root, local_root, &mut local)?;
-        guard_local_wipe(&baseline, &local)?;
+        self.walk_local(folder_id, local_root, local_root, rules, &mut local)?;
+        // See `push_pass`: the guard must not count rule-excluded paths as lost.
+        guard_local_wipe(&filter_baseline(&baseline, rules), &local)?;
 
         let mut remote: HashMap<String, RemoteItem> = HashMap::new();
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
@@ -937,14 +1059,7 @@ impl Core {
             &baseline,
         )?;
 
-        // Union of every path across the three states, shallow paths first so a
-        // parent folder is created before its children are placed inside it.
-        let mut paths: HashSet<String> = HashSet::new();
-        paths.extend(local.keys().cloned());
-        paths.extend(remote.keys().cloned());
-        paths.extend(baseline.keys().cloned());
-        let mut order: Vec<String> = paths.into_iter().collect();
-        order.sort_by_key(|p| p.matches('/').count());
+        let order = classification_order(&local, &remote, &baseline, rules);
 
         let mut outcome = Outcome::default();
         // Folders to delete, collected here and removed deepest-first at the end
@@ -1189,6 +1304,7 @@ impl Core {
         folder_id: i64,
         root: &Path,
         dir: &Path,
+        rules: &IgnoreRules,
         out: &mut HashMap<String, LocalItem>,
     ) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
@@ -1208,6 +1324,13 @@ impl Core {
             if rel.contains(".pdfs-tmp-") {
                 continue;
             }
+            // Ignored paths are dropped here as well as from the classification
+            // union — not for correctness (the union filter is what makes this
+            // safe) but so an ignored `node_modules/` is never descended into or
+            // counted against scan progress.
+            if rules.is_ignored(rel, meta.is_dir()) {
+                continue;
+            }
             if meta.is_dir() {
                 out.insert(
                     rel.to_string(),
@@ -1218,7 +1341,7 @@ impl Core {
                     },
                 );
                 self.progress_scanned(folder_id, base_name(rel));
-                self.walk_local(folder_id, root, &path, out)?;
+                self.walk_local(folder_id, root, &path, rules, out)?;
             } else if meta.is_file() {
                 out.insert(
                     rel.to_string(),
@@ -1895,6 +2018,139 @@ mod tests {
         h.join().unwrap();
     }
 
+    fn rules_for(patterns: &[&str]) -> IgnoreRules {
+        // No folder root is needed: these patterns are all root-relative globs,
+        // and `load` only touches the filesystem to look for an ignore file.
+        let globals: Vec<String> = patterns.iter().map(|s| (*s).to_string()).collect();
+        IgnoreRules::load(Path::new("/nonexistent-sync-root"), &globals)
+    }
+
+    fn local_item(is_dir: bool) -> LocalItem {
+        LocalItem {
+            is_dir,
+            mtime: 1,
+            size: 1,
+        }
+    }
+
+    fn remote_item(is_dir: bool) -> RemoteItem {
+        RemoteItem {
+            uid: uid(),
+            is_dir,
+            mtime: 1,
+            size: 1,
+        }
+    }
+
+    /// The regression this whole feature has to not cause: a file that was
+    /// synced *before* a rule started matching it is absent locally but present
+    /// remotely and in the baseline — the exact shape `do_reconcile` answers by
+    /// trashing the remote copy. It must never reach classification.
+    #[test]
+    fn a_newly_ignored_synced_file_is_never_classified_for_deletion() {
+        let local: HashMap<String, LocalItem> = HashMap::new();
+        let remote: HashMap<String, RemoteItem> =
+            [("secrets/key.pem".to_string(), remote_item(false))]
+                .into_iter()
+                .collect();
+        let baseline = baseline_with("secrets/key.pem", 1, 1);
+
+        let order = classification_order(&local, &remote, &baseline, &rules_for(&["secrets/"]));
+
+        assert!(
+            order.is_empty(),
+            "an ignored path reached classification as {order:?}; with no local \
+             entry and a baseline row it would be trashed on Drive"
+        );
+    }
+
+    /// Filtering only the local walk is not enough, and this is why: the remote
+    /// and baseline sides carry the path too.
+    #[test]
+    fn the_filter_covers_the_remote_and_baseline_sides_not_just_local() {
+        let local: HashMap<String, LocalItem> = [("target".to_string(), local_item(true))]
+            .into_iter()
+            .collect();
+        let remote: HashMap<String, RemoteItem> = [("target".to_string(), remote_item(true))]
+            .into_iter()
+            .collect();
+        let baseline = baseline_with("target", 1, 1);
+
+        let order = classification_order(&local, &remote, &baseline, &rules_for(&["target/"]));
+
+        assert!(order.is_empty(), "got {order:?}");
+    }
+
+    #[test]
+    fn unignored_paths_still_classify_shallowest_first() {
+        let local: HashMap<String, LocalItem> = [
+            ("a/b/c.txt".to_string(), local_item(false)),
+            ("a".to_string(), local_item(true)),
+            ("a/b".to_string(), local_item(true)),
+            ("node_modules/x.js".to_string(), local_item(false)),
+        ]
+        .into_iter()
+        .collect();
+        let remote: HashMap<String, RemoteItem> = HashMap::new();
+        let baseline: HashMap<String, StoredSyncEntry> = HashMap::new();
+
+        let order =
+            classification_order(&local, &remote, &baseline, &rules_for(&["node_modules/"]));
+
+        assert_eq!(
+            order,
+            vec!["a", "a/b", "a/b/c.txt"],
+            "a parent must be created before the paths inside it"
+        );
+    }
+
+    #[test]
+    fn without_rules_every_path_is_classified() {
+        let local: HashMap<String, LocalItem> = [("node_modules".to_string(), local_item(true))]
+            .into_iter()
+            .collect();
+        let remote: HashMap<String, RemoteItem> = HashMap::new();
+        let baseline: HashMap<String, StoredSyncEntry> = HashMap::new();
+
+        let order = classification_order(&local, &remote, &baseline, &IgnoreRules::empty());
+
+        assert_eq!(order, vec!["node_modules"]);
+    }
+
+    /// A rule covering the whole tree empties the local walk. Without the
+    /// baseline being filtered to match, the wipe guard reads that as "every
+    /// synced path vanished" and aborts the pass — every pass, forever.
+    #[test]
+    fn the_wipe_guard_ignores_paths_excluded_by_rule() {
+        let mut baseline = baseline_with("build/a.o", 1, 1);
+        baseline.extend(baseline_with("build/b.o", 1, 1));
+        let local: HashMap<String, LocalItem> = HashMap::new();
+        let rules = rules_for(&["build/"]);
+
+        assert!(
+            guard_local_wipe(&baseline, &local).is_err(),
+            "unfiltered, this is the wedge: the guard fires on a rule, not a loss"
+        );
+        assert!(
+            guard_local_wipe(&filter_baseline(&baseline, &rules), &local).is_ok(),
+            "filtered, an all-ignored baseline leaves the guard nothing to check"
+        );
+    }
+
+    /// The guard must still catch a real disappearance when rules are active.
+    #[test]
+    fn the_wipe_guard_still_fires_on_a_real_loss_with_rules_active() {
+        let mut baseline = baseline_with("docs/a.md", 1, 1);
+        baseline.extend(baseline_with("docs/b.md", 1, 1));
+        let local: HashMap<String, LocalItem> = HashMap::new();
+        let rules = rules_for(&["build/"]);
+
+        assert!(
+            guard_local_wipe(&filter_baseline(&baseline, &rules), &local).is_err(),
+            "these paths are not ignored; their absence is a genuine wipe"
+        );
+    }
+
     /// The guard that keeps a vanished local tree (dead mount, unplugged disk)
     /// from being read as "the user deleted everything" and trashing the folder
     /// on Drive.
@@ -1924,6 +2180,16 @@ mod tests {
         // count as survivors.
         let fresh: HashMap<String, ()> = [("new.txt".to_string(), ())].into_iter().collect();
         assert!(guard_local_wipe(&base, &fresh).is_err());
+    }
+
+    /// A restored folder (features.md 5.2) starts with an empty baseline against
+    /// an empty local directory and a full remote. That must reconcile as
+    /// "download everything" rather than tripping the wipe guard — otherwise
+    /// every restore would wedge its folder on the first pass.
+    #[test]
+    fn guard_local_wipe_is_inert_for_a_restored_folder() {
+        let empty: HashMap<String, ()> = HashMap::new();
+        assert!(guard_local_wipe(&empty, &empty).is_ok());
     }
 
     #[test]

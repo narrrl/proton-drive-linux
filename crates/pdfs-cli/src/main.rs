@@ -11,8 +11,8 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse, ShareEntryKind,
-    SyncPhase, pending_summary,
+    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse,
+    RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase, pending_summary,
 };
 use pdfs_core::db::Db;
 
@@ -23,8 +23,72 @@ use pdfs_core::db::Db;
     about = "Proton Drive for Linux (Files On-Demand)"
 )]
 struct Cli {
+    /// Emit machine-readable JSON instead of formatted text.
+    ///
+    /// Applies to the query commands (`status`, `ls`, `pins`, `sync list`,
+    /// `devices list`, `transfers`, `activity`, `cache inspect`). Commands that
+    /// perform an action keep their human output — a script that needs to know
+    /// whether one succeeded has the exit code.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Whether `--json` was passed. A global rather than a threaded parameter
+/// because it is read at the leaves — one line per query command — and
+/// threading a display flag through every command signature would cost more
+/// than it explains.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn json_enabled() -> bool {
+    JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The daemon's reply as JSON, with the response-variant tag stripped.
+///
+/// Serializing [`CtlResponse`] directly yields serde's externally tagged form,
+/// `{"SyncFolders": {"items": […]}}`, which makes every script write
+/// `jq '.SyncFolders.items[]'` and couples it to the name of an internal enum
+/// variant. The payload is what the caller asked for, so that is what is
+/// emitted: `{"items": […]}`.
+///
+/// The reply is still serialized from the daemon's own type rather than
+/// rebuilt by hand, so new fields appear in the JSON without anyone
+/// remembering to add them here.
+fn response_payload(response: &CtlResponse) -> Result<serde_json::Value> {
+    let value = serde_json::to_value(response)?;
+    // Every variant serializes as a one-key object keyed by the variant name;
+    // anything else is left alone rather than guessed at.
+    if let serde_json::Value::Object(map) = &value
+        && map.len() == 1
+        && let Some((_, payload)) = map.iter().next()
+    {
+        return Ok(payload.clone());
+    }
+    Ok(value)
+}
+
+/// Print the daemon's reply as JSON if `--json` is in effect, reporting whether
+/// it did so — a `true` means the caller should skip its human formatting.
+///
+/// A daemon-side error still prints its payload, so a script can read the
+/// `kind`, but then fails the command. Emitting the error and exiting `0` would
+/// make every `--json` caller inspect the body to find out whether it worked,
+/// when the exit code is the thing they already check.
+fn emit_json(response: &CtlResponse) -> Result<bool> {
+    if !json_enabled() {
+        return Ok(false);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response_payload(response)?)?
+    );
+    if let CtlResponse::Error { message, kind } = response {
+        bail!("{}", cli_error(*kind, message));
+    }
+    Ok(true)
 }
 
 #[derive(Subcommand)]
@@ -212,8 +276,19 @@ enum Command {
     },
     /// List the items I have shared with others (members, invites or a link).
     Shared,
-    /// List nodes shared with me that I have accepted.
-    SharedWithMe,
+    /// List nodes shared with me that I have accepted, or the children of one.
+    SharedWithMe {
+        /// Folder uid to list into, in `volume~link` form (from a previous run).
+        /// Omit for the top level.
+        uid: Option<String>,
+    },
+    /// Download a file shared with me by its uid (from `pdfs shared-with-me`).
+    SharedGet {
+        /// Node uid in `volume~link` form.
+        uid: String,
+        /// Where to write it. Omit to leave it in the cache and print the path.
+        dest: Option<PathBuf>,
+    },
     /// Leave a shared node by its uid (from `pdfs shared-with-me`).
     Leave {
         /// Node uid in `volume~link` form.
@@ -235,6 +310,36 @@ enum Command {
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
     },
+    /// Show account storage usage (used of total, across all Proton products).
+    Quota,
+    /// Inspect and maintain the local metadata database and content cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheCmd,
+    },
+    /// Check this installation for problems and print a report.
+    ///
+    /// Runs without a daemon on purpose: the state worth diagnosing is usually
+    /// the state where the daemon will not start.
+    Diagnose,
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Report database size, row counts, and cache usage.
+    Inspect {
+        /// Also run SQLite's integrity check. Reads every page, so it is slow
+        /// on a large database — worth it when you suspect corruption.
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Checkpoint the write-ahead log and compact the database.
+    ///
+    /// Takes a write lock for the duration and needs room for a second copy of
+    /// the database while it runs.
+    Vacuum,
+    /// Delete cached file content, keeping pinned files.
+    Clear,
 }
 
 /// Which collection a share entry lives in, for `share-role` / `unshare`.
@@ -266,6 +371,15 @@ enum DeviceCmd {
     Rename { uid: String, name: String },
     /// Delete (deregister) a device by uid.
     Rm { uid: String },
+    /// Adopt an existing device as this machine's, so a hostname change or a
+    /// reinstall re-attaches to it instead of registering a duplicate.
+    Adopt {
+        /// Device uid (from `devices list`). Omit with `--clear`.
+        uid: Option<String>,
+        /// Drop the adoption and go back to matching by hostname.
+        #[arg(long, conflicts_with = "uid")]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -297,6 +411,13 @@ enum SyncCmd {
         /// `mirror` (full local copy) or `ondemand` (FUSE mount, reclaims disk).
         #[arg(value_parser = ["mirror", "ondemand"])]
         mode: String,
+    },
+    /// Re-attach this machine's device folders to local directories, then sync
+    /// them down. Use after adopting a device on a new machine.
+    Restore {
+        /// Accept every proposed local path without asking.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -379,6 +500,7 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     match cli.command {
         Command::Login { username } => cmd_login(username),
         Command::Logout => cmd_logout(),
@@ -421,37 +543,59 @@ fn main() -> Result<()> {
         Command::Unshare { path, id, kind } => cmd_unshare(path, id, kind),
         Command::PublicLink { action } => cmd_public_link(action),
         Command::Shared => cmd_shared(),
-        Command::SharedWithMe => cmd_shared_with_me(),
+        Command::SharedWithMe { uid } => cmd_shared_with_me(uid),
+        Command::SharedGet { uid, dest } => cmd_shared_get(uid, dest),
         Command::Leave { uid } => cmd_leave(uid),
         Command::Invitations { action } => cmd_invitations(action),
         Command::Bookmarks { action } => cmd_bookmarks(action),
         Command::Activity { limit } => cmd_activity(limit),
+        Command::Quota => cmd_quota(),
+        Command::Cache { action } => cmd_cache(action),
+        Command::Diagnose => cmd_diagnose(),
     }
 }
 
 fn cmd_devices(action: DeviceCmd) -> Result<()> {
     match action {
-        DeviceCmd::List => match control_request(CtlRequest::ListDevices)? {
-            CtlResponse::Devices { items } if items.is_empty() => println!("No devices."),
-            CtlResponse::Devices { items } => {
-                for d in items {
-                    let sync = d
-                        .last_sync
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "never".to_string());
-                    println!(
-                        "{}  {}  (synced: {sync})  [{}]",
-                        d.device_type, d.name, d.uid
-                    );
-                }
+        DeviceCmd::List => {
+            let response = control_request(CtlRequest::ListDevices)?;
+            if emit_json(&response)? {
+                return Ok(());
             }
-            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
-            other => bail!("unexpected response: {other:?}"),
-        },
+            match response {
+                CtlResponse::Devices { items } if items.is_empty() => println!("No devices."),
+                CtlResponse::Devices { items } => {
+                    for d in items {
+                        let sync = d
+                            .last_sync
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "never".to_string());
+                        let tag = match (d.adopted, d.this_device) {
+                            (true, _) => "  *adopted*",
+                            (false, true) => "  *this machine*",
+                            _ => "",
+                        };
+                        println!(
+                            "{}  {}  (synced: {sync})  [{}]{tag}",
+                            d.device_type, d.name, d.uid
+                        );
+                    }
+                }
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         DeviceCmd::Rename { uid, name } => {
             ok_or_bail(control_request(CtlRequest::RenameDevice { uid, name })?)?
         }
         DeviceCmd::Rm { uid } => ok_or_bail(control_request(CtlRequest::DeleteDevice { uid })?)?,
+        DeviceCmd::Adopt { uid, clear } => {
+            if uid.is_none() && !clear {
+                bail!("give a device uid (see `pdfs devices list`), or --clear");
+            }
+            let uid = if clear { None } else { uid };
+            ok_or_bail(control_request(CtlRequest::AdoptDevice { uid })?)?
+        }
     }
     Ok(())
 }
@@ -467,47 +611,57 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                 .to_string();
             ok_or_bail(control_request(CtlRequest::AddSyncFolder { local_path })?)?
         }
-        SyncCmd::List => match control_request(CtlRequest::ListSyncFolders)? {
-            CtlResponse::SyncFolders { items } if items.is_empty() => {
-                println!("No synced folders.")
+        SyncCmd::List => {
+            let response = control_request(CtlRequest::ListSyncFolders)?;
+            if emit_json(&response)? {
+                return Ok(());
             }
-            CtlResponse::SyncFolders { items } => {
-                for f in items {
-                    let sync = if f.last_sync == 0 {
-                        "never".to_string()
-                    } else {
-                        f.last_sync.to_string()
-                    };
-                    // A queued switch is reported as the mode the folder is moving
-                    // to, so `sync list` never reads as if the request was dropped.
-                    let mode = match &f.pending_mode {
-                        Some(pending) => format!("{} → {pending}", f.mode),
-                        None => f.mode.clone(),
-                    };
-                    println!(
-                        "[{}]  {}  ({mode}, {}, synced: {sync})",
-                        f.id, f.local_path, f.state
-                    );
-                    // A pass in flight says what it is doing, indented under it.
-                    if let Some(p) = &f.progress {
-                        match p.phase {
-                            SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
-                            SyncPhase::Scanning => {
-                                println!("      scanning: {} of {}", p.done, p.total.max(p.done))
+            match response {
+                CtlResponse::SyncFolders { items } if items.is_empty() => {
+                    println!("No synced folders.")
+                }
+                CtlResponse::SyncFolders { items } => {
+                    for f in items {
+                        let sync = if f.last_sync == 0 {
+                            "never".to_string()
+                        } else {
+                            f.last_sync.to_string()
+                        };
+                        // A queued switch is reported as the mode the folder is moving
+                        // to, so `sync list` never reads as if the request was dropped.
+                        let mode = match &f.pending_mode {
+                            Some(pending) => format!("{} → {pending}", f.mode),
+                            None => f.mode.clone(),
+                        };
+                        println!(
+                            "[{}]  {}  ({mode}, {}, synced: {sync})",
+                            f.id, f.local_path, f.state
+                        );
+                        // A pass in flight says what it is doing, indented under it.
+                        if let Some(p) = &f.progress {
+                            match p.phase {
+                                SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
+                                SyncPhase::Scanning => {
+                                    println!(
+                                        "      scanning: {} of {}",
+                                        p.done,
+                                        p.total.max(p.done)
+                                    )
+                                }
+                                SyncPhase::Applying => println!(
+                                    "      {} of {}  {}",
+                                    p.done + 1,
+                                    p.total.max(p.done + 1),
+                                    p.current
+                                ),
                             }
-                            SyncPhase::Applying => println!(
-                                "      {} of {}  {}",
-                                p.done + 1,
-                                p.total.max(p.done + 1),
-                                p.current
-                            ),
                         }
                     }
                 }
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
             }
-            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
-            other => bail!("unexpected response: {other:?}"),
-        },
+        }
         SyncCmd::Rm { id, delete_remote } => {
             ok_or_bail(control_request(CtlRequest::RemoveSyncFolder {
                 id,
@@ -518,8 +672,86 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         SyncCmd::Mode { id, mode } => {
             ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
         }
+        SyncCmd::Restore { yes } => return cmd_sync_restore(yes),
     }
     Ok(())
+}
+
+/// `pdfs sync restore`: list what this machine's device holds, confirm where
+/// each folder should land, then hand the mapping to the daemon.
+///
+/// The daemon only ever *proposes* local paths — a path recorded by another
+/// machine may name a home directory that does not exist here — so the default
+/// flow is propose-and-confirm. `--yes` accepts the proposals for scripting.
+fn cmd_sync_restore(yes: bool) -> Result<()> {
+    let response = control_request(CtlRequest::ListRestorableFolders)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    let items = match response {
+        CtlResponse::RestorableFolders { items } => items,
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let candidates: Vec<_> = items.into_iter().filter(|f| !f.already_synced).collect();
+    if candidates.is_empty() {
+        println!("Nothing to restore: this device has no folders that aren't already synced here.");
+        return Ok(());
+    }
+
+    let mut chosen: Vec<CtlRestoreItem> = Vec::new();
+    for f in candidates {
+        if yes {
+            println!("{}  ->  {}  [{}]", f.name, f.local_path, f.mode);
+            chosen.push(CtlRestoreItem {
+                remote_uid: f.remote_uid,
+                local_path: f.local_path,
+                mode: f.mode,
+            });
+            continue;
+        }
+        // Empty answer takes the proposal, `n` skips, anything else is read as
+        // the path to use instead — the three things a user wants here.
+        let answer = prompt_line(&format!(
+            "{} [{}] -> {} (Enter to accept, 'n' to skip, or a path)",
+            f.name, f.mode, f.local_path
+        ))?;
+        match answer.as_str() {
+            "n" | "N" => continue,
+            "" => chosen.push(CtlRestoreItem {
+                remote_uid: f.remote_uid,
+                local_path: f.local_path,
+                mode: f.mode,
+            }),
+            path => chosen.push(CtlRestoreItem {
+                remote_uid: f.remote_uid,
+                local_path: expand_tilde(path),
+                mode: f.mode,
+            }),
+        }
+    }
+    if chosen.is_empty() {
+        println!("Nothing selected.");
+        return Ok(());
+    }
+    ok_or_bail(control_request(CtlRequest::RestoreSyncFolders {
+        items: chosen,
+    })?)
+}
+
+/// Expand a leading `~` in a hand-typed path. The daemon requires an absolute
+/// path, and a shell is not always the one doing the typing here.
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home)
+                .join(rest)
+                .to_string_lossy()
+                .into_owned(),
+            None => path.to_string(),
+        },
+        None => path.to_string(),
+    }
 }
 
 fn cmd_share(
@@ -648,8 +880,20 @@ fn cmd_shared() -> Result<()> {
     Ok(())
 }
 
-fn cmd_shared_with_me() -> Result<()> {
-    match control_request(CtlRequest::ListSharedWithMe)? {
+/// List what is shared with me, or — given a folder uid — that folder's
+/// children. Shared items have no path in the mount, so a uid is the only handle
+/// there is: every row prints one, and it is what the next level down (or
+/// `shared-get`) is addressed with.
+fn cmd_shared_with_me(uid: Option<String>) -> Result<()> {
+    let request = match uid {
+        Some(uid) => CtlRequest::ListSharedFolder { uid },
+        None => CtlRequest::ListSharedWithMe,
+    };
+    let response = control_request(request)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Entries { entries } if entries.is_empty() => {
             println!("Nothing shared with you.")
         }
@@ -665,8 +909,60 @@ fn cmd_shared_with_me() -> Result<()> {
     Ok(())
 }
 
+/// Download a file shared with me. The daemon puts the plaintext in its content
+/// cache and replies with that path; with a `dest` we copy it out, so the caller
+/// gets a file it owns rather than one the cache may later evict.
+fn cmd_shared_get(uid: String, dest: Option<PathBuf>) -> Result<()> {
+    let path = match control_request(CtlRequest::OpenSharedFile { uid })? {
+        CtlResponse::FilePath { path } => PathBuf::from(path),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    match dest {
+        Some(dest) => {
+            std::fs::copy(&path, &dest).with_context(|| format!("writing {}", dest.display()))?;
+            println!("{}", dest.display());
+        }
+        None => println!("{}", path.display()),
+    }
+    Ok(())
+}
+
+fn cmd_quota() -> Result<()> {
+    let response = control_request(CtlRequest::AccountQuota)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::AccountQuota {
+            max_space,
+            used_space,
+        } => {
+            let used = used_space.max(0) as u64;
+            if max_space > 0 {
+                let total = max_space as u64;
+                let pct = (used as f64 / total as f64 * 100.0).round() as u64;
+                println!(
+                    "{} of {} used ({pct}%)",
+                    human_bytes(used),
+                    human_bytes(total)
+                );
+            } else {
+                println!("{} used", human_bytes(used));
+            }
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
 fn cmd_activity(limit: usize) -> Result<()> {
-    match control_request(CtlRequest::ListActivity { limit })? {
+    let response = control_request(CtlRequest::ListActivity { limit })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Activity { items } if items.is_empty() => println!("No recent activity."),
         CtlResponse::Activity { items } => {
             for a in items {
@@ -842,6 +1138,32 @@ fn cmd_logout() -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
+    // `status` is the one query that merges two sources — the local keyring and
+    // the daemon — so its JSON is composed here rather than being a daemon reply
+    // passed through. A script asking for status wants both halves in one
+    // object, including the "logged in but no daemon" case that has no reply at
+    // all.
+    if json_enabled() {
+        let session = match auth::load() {
+            Ok(s) => Some(s),
+            Err(pdfs_core::Error::NotLoggedIn) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let mount = match control_request(CtlRequest::Status) {
+            Ok(r @ CtlResponse::Status { .. }) => response_payload(&r)?,
+            _ => serde_json::Value::Null,
+        };
+        let out = serde_json::json!({
+            "logged_in": session.is_some(),
+            "username": session.as_ref().map(|s| s.username.clone()),
+            "user_id": session.as_ref().map(|s| s.user_id.clone()),
+            "scopes": session.as_ref().map(|s| s.scopes.clone()),
+            "mount": mount,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
     match auth::load() {
         Ok(s) => {
             println!("Logged in as {} (user {})", s.username, s.user_id);
@@ -1002,7 +1324,11 @@ fn cmd_unpin(path: PathBuf) -> Result<()> {
 
 fn cmd_transfers() -> Result<()> {
     use pdfs_core::control::TransferDirection;
-    match control_request(CtlRequest::GetQueueStatus)? {
+    let response = control_request(CtlRequest::GetQueueStatus)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Transfers { items, jobs } if items.is_empty() && jobs.is_empty() => {
             println!("Nothing in progress.")
         }
@@ -1049,7 +1375,11 @@ fn cmd_transfers() -> Result<()> {
 }
 
 fn cmd_pins() -> Result<()> {
-    match control_request(CtlRequest::ListPins)? {
+    let response = control_request(CtlRequest::ListPins)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Pins { pins } if pins.is_empty() => println!("No pinned files."),
         CtlResponse::Pins { pins } => {
             for p in pins {
@@ -1067,7 +1397,11 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
         Some(p) => path_arg(&p)?,
         None => String::new(),
     };
-    match control_request(CtlRequest::ListDir { path })? {
+    let response = control_request(CtlRequest::ListDir { path })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Entries { entries } if entries.is_empty() => println!("(empty)"),
         CtlResponse::Entries { entries } => {
             for e in entries {
@@ -1308,6 +1642,228 @@ fn path_arg(path: &Path) -> Result<String> {
     p.to_str()
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("path is not valid UTF-8"))
+}
+
+/// Format a byte count for a report line.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, f64); 4] = [
+        ("GiB", 1_073_741_824.0),
+        ("MiB", 1_048_576.0),
+        ("KiB", 1024.0),
+        ("B", 1.0),
+    ];
+    let b = bytes as f64;
+    for (unit, scale) in UNITS {
+        if b >= scale {
+            return format!("{:.1} {unit}", b / scale);
+        }
+    }
+    "0 B".to_string()
+}
+
+fn cmd_cache(action: CacheCmd) -> Result<()> {
+    match action {
+        CacheCmd::Inspect { deep } => cmd_cache_inspect(deep),
+        CacheCmd::Vacuum => match control_request(CtlRequest::CacheVacuum)? {
+            CtlResponse::Ok { message } => {
+                println!("{message}");
+                Ok(())
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        CacheCmd::Clear => match control_request(CtlRequest::PurgeCache)? {
+            CtlResponse::Ok { message } => {
+                println!("{message}");
+                Ok(())
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        },
+    }
+}
+
+fn cmd_cache_inspect(deep: bool) -> Result<()> {
+    let response = control_request(CtlRequest::CacheInspect { deep })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::CacheReport {
+            schema_version,
+            db_bytes,
+            db_reclaimable_bytes,
+            tables,
+            cache_used,
+            cache_budget,
+            integrity_problems,
+            integrity_checked,
+        } => {
+            println!(
+                "Database   schema v{schema_version}, {}",
+                human_bytes(db_bytes)
+            );
+            if db_reclaimable_bytes > 0 {
+                println!(
+                    "           {} reclaimable — run `pdfs cache vacuum`",
+                    human_bytes(db_reclaimable_bytes)
+                );
+            }
+            let budget = if cache_budget == 0 {
+                "unlimited".to_string()
+            } else {
+                human_bytes(cache_budget)
+            };
+            println!("Content    {} cached of {budget}", human_bytes(cache_used));
+
+            println!("\nRows");
+            for (name, count) in tables {
+                println!("  {name:<16} {count:>10}");
+            }
+
+            if integrity_checked {
+                if integrity_problems.is_empty() {
+                    println!("\nIntegrity  ok");
+                } else {
+                    println!("\nIntegrity  {} problem(s):", integrity_problems.len());
+                    for problem in integrity_problems {
+                        println!("  {problem}");
+                    }
+                }
+            } else {
+                println!("\nIntegrity  not checked (pass --deep)");
+            }
+            Ok(())
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// One line of the `diagnose` report.
+fn check(label: &str, ok: bool, detail: impl AsRef<str>) -> bool {
+    let mark = if ok { "ok  " } else { "FAIL" };
+    let detail = detail.as_ref();
+    if detail.is_empty() {
+        println!("[{mark}] {label}");
+    } else {
+        println!("[{mark}] {label}: {detail}");
+    }
+    ok
+}
+
+/// Self-check the installation, reporting each finding and exiting non-zero if
+/// any check failed.
+///
+/// Every check is written to work with no daemon running, because that is the
+/// situation a user runs this in. A missing daemon is reported as a finding,
+/// not an error that aborts the rest of the report.
+fn cmd_diagnose() -> Result<()> {
+    let mut all_ok = true;
+
+    let dirs = AppDirs::new().context("resolve application directories")?;
+    let config = dirs.load_config();
+
+    println!("Paths");
+    let state = dirs.state_dir();
+    all_ok &= check(
+        "  state dir",
+        state.is_dir(),
+        format!("{}", state.display()),
+    );
+    let cache_dir = dirs.cache_dir();
+    all_ok &= check(
+        "  cache dir",
+        cache_dir.is_dir(),
+        format!("{}", cache_dir.display()),
+    );
+    // Writability is checked by actually writing: permission bits do not
+    // account for a full disk, a read-only remount, or an immutable flag.
+    let probe = state.join(".pdfs-diagnose-probe");
+    let writable = std::fs::write(&probe, b"probe").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    all_ok &= check("  state dir writable", writable, "");
+
+    let db_path = dirs.db_path();
+    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    all_ok &= check(
+        "  database",
+        db_path.is_file(),
+        format!("{} ({})", db_path.display(), human_bytes(db_size)),
+    );
+
+    println!("\nAccount");
+    match pdfs_core::auth::load() {
+        Ok(session) => {
+            all_ok &= check("  keyring session", true, session.username);
+        }
+        Err(e) => {
+            // A locked keyring and an absent login look the same from here, so
+            // the detail carries the distinction rather than the verdict.
+            all_ok &= check("  keyring session", false, format!("{e}"));
+        }
+    }
+
+    println!("\nDaemon");
+    let socket = dirs.control_socket();
+    let socket_exists = socket.exists();
+    check(
+        "  control socket",
+        socket_exists,
+        format!("{}", socket.display()),
+    );
+    // A stale socket file with no listener is the common failure, so the reply
+    // is what decides this rather than the file's existence.
+    match control_request(CtlRequest::Status) {
+        Ok(CtlResponse::Status {
+            mountpoint,
+            online,
+            pending_uploads,
+            pending_changes,
+            ..
+        }) => {
+            check("  daemon responding", true, "");
+            check("  mounted at", true, mountpoint);
+            check("  network", online, if online { "" } else { "offline" });
+            let pending = pending_uploads + pending_changes;
+            check(
+                "  queued writes",
+                true,
+                if pending == 0 {
+                    "none".to_string()
+                } else {
+                    format!("{pending} waiting to upload")
+                },
+            );
+        }
+        Ok(other) => {
+            all_ok &= check(
+                "  daemon responding",
+                false,
+                format!("unexpected: {other:?}"),
+            );
+        }
+        Err(e) => {
+            // Not a failure of the installation: a stopped daemon is a normal
+            // state, and the rest of the report is still worth printing.
+            check("  daemon responding", false, format!("{e:#}"));
+            println!("         (start it with `systemctl --user start pdfs.service`)");
+        }
+    }
+
+    let mountpoint = dirs.resolved_mountpoint(&config);
+    check(
+        "  mountpoint exists",
+        mountpoint.is_dir(),
+        format!("{}", mountpoint.display()),
+    );
+
+    if all_ok {
+        println!("\nNo problems found.");
+        Ok(())
+    } else {
+        bail!("one or more checks failed; see the report above")
+    }
 }
 
 /// Send one request to the running mount daemon's control socket and read its
