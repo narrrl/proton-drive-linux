@@ -136,6 +136,22 @@ pub enum Request {
     /// persist it to config so the next mount keeps it. Replies with
     /// [`Response::Ok`].
     SetCacheBudget { bytes: u64 },
+    /// Report on the health of the metadata database and content cache: sizes,
+    /// row counts, and — when `deep` — SQLite's own integrity check. Replies
+    /// with [`Response::CacheReport`].
+    ///
+    /// `deep` reads every page of the database, so it is opt-in: worth it when
+    /// diagnosing a suspected corruption, wasteful as a routine status call.
+    CacheInspect {
+        #[serde(default)]
+        deep: bool,
+    },
+    /// Checkpoint the write-ahead log and compact the database, replying with
+    /// [`Response::Ok`] reporting the bytes reclaimed.
+    ///
+    /// Takes a write lock for the duration and needs room for a second copy of
+    /// the database, which is why it is user-invoked rather than periodic.
+    CacheVacuum,
     /// Snapshot what the daemon is working on: in-flight transfers (active
     /// uploads/downloads) and the longer jobs around them (scans, folder
     /// skeletons, the local index, sync passes). Replies with
@@ -817,6 +833,28 @@ pub enum Response {
     },
     /// A human-readable success message.
     Ok { message: String },
+    /// Health report for the metadata database and content cache (reply to
+    /// [`Request::CacheInspect`]).
+    CacheReport {
+        /// Schema version the database file is at.
+        schema_version: i64,
+        /// Bytes the database file accounts for.
+        db_bytes: u64,
+        /// Bytes a vacuum could hand back.
+        db_reclaimable_bytes: u64,
+        /// Row counts per table, in display order.
+        tables: Vec<(String, i64)>,
+        /// Bytes of cached content blobs, blocks, and thumbnails.
+        cache_used: u64,
+        /// Configured soft byte cap (`0` = unlimited).
+        cache_budget: u64,
+        /// Problems SQLite reported. Empty means sound; absent when the caller
+        /// did not ask for a deep check.
+        integrity_problems: Vec<String>,
+        /// Whether the integrity check actually ran, so an empty problem list
+        /// is not mistaken for a clean bill of health it never gave.
+        integrity_checked: bool,
+    },
     /// The pin registry.
     Pins { pins: Vec<Pin> },
     /// A directory listing (reply to [`Request::ListDir`]) or a trash listing

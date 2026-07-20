@@ -54,6 +54,44 @@ already synced, its copy on Drive is left untouched — the file simply stops
 being tracked. Removing the rule later picks the existing remote file back up
 rather than re-uploading it.
 
+## Diagnostics & Maintenance
+
+When something looks wrong, `pdfs diagnose` checks the installation and prints a
+report. It runs without a daemon on purpose — the state worth diagnosing is
+usually the state where the daemon will not start:
+
+```console
+$ pdfs diagnose
+Paths
+[ok  ]   state dir: /home/you/.local/state/proton-drive-linux
+[ok  ]   database: /home/you/.local/state/proton-drive-linux/cache.db (170.3 MiB)
+
+Account
+[ok  ]   keyring session: you@proton.me
+
+Daemon
+[ok  ]   daemon responding
+[ok  ]   mounted at: /home/you/ProtonDrive
+[ok  ]   queued writes: none
+
+No problems found.
+```
+
+It exits non-zero if any check fails, so it works in a health-check script.
+
+For the local metadata database and content cache:
+
+| Command | What it does |
+|---|---|
+| `pdfs cache inspect` | Database size, reclaimable space, per-table row counts, cache usage against budget |
+| `pdfs cache inspect --deep` | Also runs SQLite's integrity check — reads every page, so it is slow on a large database |
+| `pdfs cache vacuum` | Checkpoints the write-ahead log and compacts the database |
+| `pdfs cache clear` | Deletes cached file content, keeping pinned files |
+
+`vacuum` takes a write lock for its duration and needs room for a second copy of
+the database while it runs, so it is a deliberate operation rather than
+something the daemon does on a timer.
+
 ## Performance & Caching
 
 The client includes several optimizations designed for high efficiency, a low memory footprint, and a responsive user experience:

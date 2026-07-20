@@ -235,6 +235,34 @@ enum Command {
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
     },
+    /// Inspect and maintain the local metadata database and content cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheCmd,
+    },
+    /// Check this installation for problems and print a report.
+    ///
+    /// Runs without a daemon on purpose: the state worth diagnosing is usually
+    /// the state where the daemon will not start.
+    Diagnose,
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Report database size, row counts, and cache usage.
+    Inspect {
+        /// Also run SQLite's integrity check. Reads every page, so it is slow
+        /// on a large database — worth it when you suspect corruption.
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Checkpoint the write-ahead log and compact the database.
+    ///
+    /// Takes a write lock for the duration and needs room for a second copy of
+    /// the database while it runs.
+    Vacuum,
+    /// Delete cached file content, keeping pinned files.
+    Clear,
 }
 
 /// Which collection a share entry lives in, for `share-role` / `unshare`.
@@ -426,6 +454,8 @@ fn main() -> Result<()> {
         Command::Invitations { action } => cmd_invitations(action),
         Command::Bookmarks { action } => cmd_bookmarks(action),
         Command::Activity { limit } => cmd_activity(limit),
+        Command::Cache { action } => cmd_cache(action),
+        Command::Diagnose => cmd_diagnose(),
     }
 }
 
@@ -1308,6 +1338,217 @@ fn path_arg(path: &Path) -> Result<String> {
     p.to_str()
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("path is not valid UTF-8"))
+}
+
+/// Format a byte count for a report line.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, f64); 4] = [
+        ("GiB", 1_073_741_824.0),
+        ("MiB", 1_048_576.0),
+        ("KiB", 1024.0),
+        ("B", 1.0),
+    ];
+    let b = bytes as f64;
+    for (unit, scale) in UNITS {
+        if b >= scale {
+            return format!("{:.1} {unit}", b / scale);
+        }
+    }
+    "0 B".to_string()
+}
+
+fn cmd_cache(action: CacheCmd) -> Result<()> {
+    match action {
+        CacheCmd::Inspect { deep } => cmd_cache_inspect(deep),
+        CacheCmd::Vacuum => match control_request(CtlRequest::CacheVacuum)? {
+            CtlResponse::Ok { message } => {
+                println!("{message}");
+                Ok(())
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        CacheCmd::Clear => match control_request(CtlRequest::PurgeCache)? {
+            CtlResponse::Ok { message } => {
+                println!("{message}");
+                Ok(())
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        },
+    }
+}
+
+fn cmd_cache_inspect(deep: bool) -> Result<()> {
+    match control_request(CtlRequest::CacheInspect { deep })? {
+        CtlResponse::CacheReport {
+            schema_version,
+            db_bytes,
+            db_reclaimable_bytes,
+            tables,
+            cache_used,
+            cache_budget,
+            integrity_problems,
+            integrity_checked,
+        } => {
+            println!("Database   schema v{schema_version}, {}", human_bytes(db_bytes));
+            if db_reclaimable_bytes > 0 {
+                println!(
+                    "           {} reclaimable — run `pdfs cache vacuum`",
+                    human_bytes(db_reclaimable_bytes)
+                );
+            }
+            let budget = if cache_budget == 0 {
+                "unlimited".to_string()
+            } else {
+                human_bytes(cache_budget)
+            };
+            println!("Content    {} cached of {budget}", human_bytes(cache_used));
+
+            println!("\nRows");
+            for (name, count) in tables {
+                println!("  {name:<16} {count:>10}");
+            }
+
+            if integrity_checked {
+                if integrity_problems.is_empty() {
+                    println!("\nIntegrity  ok");
+                } else {
+                    println!("\nIntegrity  {} problem(s):", integrity_problems.len());
+                    for problem in integrity_problems {
+                        println!("  {problem}");
+                    }
+                }
+            } else {
+                println!("\nIntegrity  not checked (pass --deep)");
+            }
+            Ok(())
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// One line of the `diagnose` report.
+fn check(label: &str, ok: bool, detail: impl AsRef<str>) -> bool {
+    let mark = if ok { "ok  " } else { "FAIL" };
+    let detail = detail.as_ref();
+    if detail.is_empty() {
+        println!("[{mark}] {label}");
+    } else {
+        println!("[{mark}] {label}: {detail}");
+    }
+    ok
+}
+
+/// Self-check the installation, reporting each finding and exiting non-zero if
+/// any check failed.
+///
+/// Every check is written to work with no daemon running, because that is the
+/// situation a user runs this in. A missing daemon is reported as a finding,
+/// not an error that aborts the rest of the report.
+fn cmd_diagnose() -> Result<()> {
+    let mut all_ok = true;
+
+    let dirs = AppDirs::new().context("resolve application directories")?;
+    let config = dirs.load_config();
+
+    println!("Paths");
+    let state = dirs.state_dir();
+    all_ok &= check(
+        "  state dir",
+        state.is_dir(),
+        format!("{}", state.display()),
+    );
+    let cache_dir = dirs.cache_dir();
+    all_ok &= check(
+        "  cache dir",
+        cache_dir.is_dir(),
+        format!("{}", cache_dir.display()),
+    );
+    // Writability is checked by actually writing: permission bits do not
+    // account for a full disk, a read-only remount, or an immutable flag.
+    let probe = state.join(".pdfs-diagnose-probe");
+    let writable = std::fs::write(&probe, b"probe").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    all_ok &= check("  state dir writable", writable, "");
+
+    let db_path = dirs.db_path();
+    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    all_ok &= check(
+        "  database",
+        db_path.is_file(),
+        format!("{} ({})", db_path.display(), human_bytes(db_size)),
+    );
+
+    println!("\nAccount");
+    match pdfs_core::auth::load() {
+        Ok(session) => {
+            all_ok &= check("  keyring session", true, session.username);
+        }
+        Err(e) => {
+            // A locked keyring and an absent login look the same from here, so
+            // the detail carries the distinction rather than the verdict.
+            all_ok &= check("  keyring session", false, format!("{e}"));
+        }
+    }
+
+    println!("\nDaemon");
+    let socket = dirs.control_socket();
+    let socket_exists = socket.exists();
+    check(
+        "  control socket",
+        socket_exists,
+        format!("{}", socket.display()),
+    );
+    // A stale socket file with no listener is the common failure, so the reply
+    // is what decides this rather than the file's existence.
+    match control_request(CtlRequest::Status) {
+        Ok(CtlResponse::Status {
+            mountpoint,
+            online,
+            pending_uploads,
+            pending_changes,
+            ..
+        }) => {
+            check("  daemon responding", true, "");
+            check("  mounted at", true, mountpoint);
+            check("  network", online, if online { "" } else { "offline" });
+            let pending = pending_uploads + pending_changes;
+            check(
+                "  queued writes",
+                true,
+                if pending == 0 {
+                    "none".to_string()
+                } else {
+                    format!("{pending} waiting to upload")
+                },
+            );
+        }
+        Ok(other) => {
+            all_ok &= check("  daemon responding", false, format!("unexpected: {other:?}"));
+        }
+        Err(e) => {
+            // Not a failure of the installation: a stopped daemon is a normal
+            // state, and the rest of the report is still worth printing.
+            check("  daemon responding", false, format!("{e:#}"));
+            println!("         (start it with `systemctl --user start pdfs.service`)");
+        }
+    }
+
+    let mountpoint = dirs.resolved_mountpoint(&config);
+    check(
+        "  mountpoint exists",
+        mountpoint.is_dir(),
+        format!("{}", mountpoint.display()),
+    );
+
+    if all_ok {
+        println!("\nNo problems found.");
+        Ok(())
+    } else {
+        bail!("one or more checks failed; see the report above")
+    }
 }
 
 /// Send one request to the running mount daemon's control socket and read its

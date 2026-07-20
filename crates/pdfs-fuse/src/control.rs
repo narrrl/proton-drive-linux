@@ -404,6 +404,45 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 ),
             }
         }
+        Ok(CtlRequest::CacheInspect { deep }) => match core.db.stats() {
+            Ok(stats) => {
+                // The deep check reads every page, so it runs only on request;
+                // `integrity_checked` tells the caller which answer it is
+                // holding, since "no problems found" and "never looked" are
+                // both an empty list.
+                let (integrity_problems, integrity_checked) = if deep {
+                    match core.db.integrity_check() {
+                        Ok(problems) => (problems, true),
+                        Err(e) => (vec![format!("integrity check failed: {e:?}")], true),
+                    }
+                } else {
+                    (Vec::new(), false)
+                };
+                CtlResponse::CacheReport {
+                    schema_version: stats.schema_version,
+                    db_bytes: stats.total_bytes(),
+                    db_reclaimable_bytes: stats.reclaimable_bytes(),
+                    tables: stats.tables,
+                    cache_used: core.cache.usage(),
+                    cache_budget: core.cache.budget(),
+                    integrity_problems,
+                    integrity_checked,
+                }
+            }
+            Err(e) => CtlResponse::error(CoreError::internal(format!("read db stats: {e:?}"))),
+        },
+        Ok(CtlRequest::CacheVacuum) => match core.db.vacuum() {
+            Ok(outcome) => CtlResponse::Ok {
+                message: format!(
+                    "vacuumed: {:.1} MiB freed ({:.1} MiB → {:.1} MiB), {} WAL frame(s) checkpointed",
+                    outcome.freed_bytes() as f64 / 1_048_576.0,
+                    outcome.before_bytes as f64 / 1_048_576.0,
+                    outcome.after_bytes as f64 / 1_048_576.0,
+                    outcome.wal_frames_checkpointed,
+                ),
+            },
+            Err(e) => CtlResponse::error(CoreError::internal(format!("vacuum: {e:?}"))),
+        },
         Ok(CtlRequest::GetQueueStatus) => CtlResponse::Transfers {
             items: core.transfers.snapshot(),
             jobs: core.jobs_snapshot(),
