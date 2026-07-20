@@ -154,21 +154,34 @@ impl Db {
 
     /// Fold the WAL back into the database and compact the file.
     ///
-    /// Checkpointing first keeps the `VACUUM` from having to contend with a
-    /// large WAL.
-    ///
     /// `VACUUM` rewrites the whole database into a fresh file, so it needs room
     /// for a second copy and takes a write lock for the duration. That makes it
     /// a deliberate, user-invoked operation rather than something the daemon
     /// does on a timer.
+    ///
+    /// The checkpoint runs *after* the vacuum. Checkpointing only beforehand
+    /// folds a log that the vacuum is about to rewrite anyway, and leaves the
+    /// rewrite itself sitting in the WAL: measured on a live install, a 170 MiB
+    /// database vacuumed to 136 MiB while its WAL grew 67 MiB → 143 MiB,
+    /// erasing the reclaim in net disk terms and reporting `0 frames`
+    /// checkpointed because it ran when there was nothing to fold.
+    ///
+    /// Ordering it afterwards is strictly better but is *not* a proven fix for
+    /// that inflation. The live case inflates because the daemon's other
+    /// connections hold read transactions, and a `TRUNCATE` checkpoint waits on
+    /// readers — so under a busy daemon this can still return having moved
+    /// little. `journal_size_limit` remains the backstop that caps the file.
+    /// Confirming the fix needs a measurement against a live daemon, not a
+    /// single-connection test, which folds the WAL on its own either way.
     pub fn vacuum(&self) -> Result<VacuumOutcome> {
         let before = self.stats()?.total_bytes();
-        let wal_frames_checkpointed = self.checkpoint_wal()?;
 
         {
             let conn = self.conn.lock();
             conn.execute_batch("VACUUM")?;
         }
+
+        let wal_frames_checkpointed = self.checkpoint_wal()?;
 
         let after = self.stats()?.total_bytes();
         Ok(VacuumOutcome {
@@ -258,6 +271,64 @@ mod tests {
     fn vacuuming_a_fresh_database_leaves_it_sound() {
         let db = Db::open_in_memory().unwrap();
         db.vacuum().unwrap();
+        assert!(db.integrity_check().unwrap().is_empty());
+    }
+
+    /// A unique temp directory removed on drop; avoids a dev-dependency, as in
+    /// [`crate::cache`]'s tests. Needed here because an in-memory database has
+    /// no WAL file to measure.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "pdfs-maint-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file-backed vacuum reclaims space and leaves the file sound.
+    ///
+    /// Note what this does *not* pin: the WAL-inflation behaviour that motivated
+    /// the checkpoint ordering in [`Db::vacuum`]. Measured here, both orderings
+    /// report `frames=0` and leave a 0-byte WAL, because a single-connection
+    /// test lets SQLite fold the log itself. The live case inflated only because
+    /// the daemon holds concurrent readers that block a checkpoint, and
+    /// reproducing that needs a second connection parked in a read transaction.
+    /// An assertion on frame count or WAL size here would pass under both
+    /// orderings and so would be decoration — see the note in `vacuum`.
+    #[test]
+    fn a_file_backed_vacuum_reclaims_space_and_stays_sound() {
+        let dir = TempDir::new();
+        let path = dir.0.join("cache.db");
+        let db = Db::open(&path).unwrap();
+
+        for i in 0..2000 {
+            db.set_state_str(&format!("k{i}"), &"v".repeat(256)).unwrap();
+        }
+        let full = db.stats().unwrap().total_bytes();
+        for i in 0..2000 {
+            db.set_state_str(&format!("k{i}"), "").unwrap();
+        }
+
+        let outcome = db.vacuum().unwrap();
+
+        assert!(
+            outcome.after_bytes < full,
+            "vacuum did not reclaim: {} → {} (peak {full})",
+            outcome.before_bytes,
+            outcome.after_bytes
+        );
         assert!(db.integrity_check().unwrap().is_empty());
     }
 }
