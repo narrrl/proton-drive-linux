@@ -3518,7 +3518,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pdfs-cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "clap 4.6.2",
@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "directories",
  "ignore",
@@ -3552,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-fuse"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "fuser",
  "image",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-gui"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "async-channel",
