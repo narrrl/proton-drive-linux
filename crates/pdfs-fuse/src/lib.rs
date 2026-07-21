@@ -613,7 +613,17 @@ impl Core {
                 .and_then(|p| st.by_uid.get(p).copied())
                 .unwrap_or(ORPHAN_INO);
             let uid = node.uid.clone();
-            st.entries.insert(ino, Entry { uid, parent, node });
+            st.entries.insert(
+                ino,
+                Entry {
+                    uid,
+                    parent,
+                    node,
+                    lookup_count: 1,
+                    open_count: 0,
+                    unlinked: false,
+                },
+            );
         }
 
         // Pass 3: rebuild child listings for fully-enumerated folders. The root
@@ -3323,6 +3333,9 @@ impl ProtonFs {
                     uid: root.uid.clone(),
                     parent: ROOT_INO,
                     node: root,
+                    lookup_count: 1,
+                    open_count: 0,
+                    unlinked: false,
                 },
             );
         }
@@ -3466,19 +3479,25 @@ impl ProtonFs {
     /// local cache. Backs both `unlink` and `rmdir` (Proton trashes whole
     /// subtrees, so an `rmdir` of a non-empty dir behaves the same).
     fn trash_child(&self, parent: u64, name: &str, reply: ReplyEmpty) {
-        let (_ino, uid) = match self.core.lookup_child(parent, name) {
+        let (ino, uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,
             Err(e) => {
                 reply.error(e);
                 return;
             }
         };
+        let open_now = {
+            let mut st = self.core.state.lock();
+            st.forget_or_unlink(&uid);
+            st.entries.get(&ino).map(|e| e.open_count).unwrap_or(0) > 0
+        };
         // A node the server has never heard of cannot be trashed there; deleting
         // it just means its queued creation is no longer wanted. This works
         // offline, which the remote path below cannot (offline.md Phase 3b).
         if is_local_uid(&uid) {
-            self.core.discard_queued_ops(&uid);
-            self.core.state.lock().forget(&uid);
+            if !open_now {
+                self.core.discard_queued_ops(&uid);
+            }
             debug!(%uid, name, "deleted a node that had not been created remotely yet");
             reply.ok();
             return;
@@ -3504,10 +3523,11 @@ impl ProtonFs {
             reply.error(Errno::EIO);
             return;
         }
-        self.core.discard_queued_ops(&uid);
-        self.core.state.lock().forget(&uid);
-        self.core.cache.evict(&uid);
-        self.core.evict_reader(&uid);
+        if !open_now {
+            self.core.discard_queued_ops(&uid);
+            self.core.cache.evict(&uid);
+            self.core.evict_reader(&uid);
+        }
         self.core.invalidate_trash();
         // Every other trash site records itself; this one did not, which made a
         // file found in the trash impossible to attribute after the fact — the
@@ -3968,10 +3988,8 @@ impl Filesystem for ProtonFs {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        let st = self.core.state.lock();
-        if let Some(entry) = st.entries.get(&ino.0) {
-            debug!(ino = ino.0, uid = %entry.uid, nlookup, "kernel forget message received");
-        }
+        let mut st = self.core.state.lock();
+        st.forget_lookup(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -4054,9 +4072,10 @@ impl Filesystem for ProtonFs {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let (uid, base_mtime, base_size) = {
-            let st = self.core.state.lock();
-            match st.entries.get(&ino.0) {
+            let mut st = self.core.state.lock();
+            match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
+                    e.open_count = e.open_count.saturating_add(1);
                     (e.uid.clone(), e.node.modification_time, node_size(&e.node))
                 }
                 Some(_) => {
@@ -4167,10 +4186,17 @@ impl Filesystem for ProtonFs {
                     };
                     let is_video =
                         PhotoKind::classify(Some(&e.node.name), media_type) == PhotoKind::Video;
+                    let fsize = self
+                        .core
+                        .pending
+                        .lock()
+                        .get(&e.uid)
+                        .map(|p| p.meta.len)
+                        .unwrap_or_else(|| node_size(&e.node));
                     (
                         e.uid.clone(),
                         e.node.modification_time,
-                        node_size(&e.node),
+                        fsize,
                         is_video,
                     )
                 }
@@ -4609,10 +4635,22 @@ impl Filesystem for ProtonFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let handle = {
+        let (handle, unlinked_uid) = {
             let mut st = self.core.state.lock();
+            let unlinked_uid = if let Some(entry) = st.entries.get_mut(&_ino.0) {
+                entry.open_count = entry.open_count.saturating_sub(1);
+                if entry.open_count == 0 && entry.unlinked {
+                    let uid = entry.uid.clone();
+                    st.forget(&uid);
+                    Some(uid)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let ino = st.handles.remove(&fh.0);
-            ino.and_then(|i| {
+            let h = ino.and_then(|i| {
                 let aw = st.active_writes.get_mut(&i)?;
                 aw.open_count = aw.open_count.saturating_sub(1);
                 if aw.open_count == 0 {
@@ -4620,8 +4658,14 @@ impl Filesystem for ProtonFs {
                 } else {
                     None
                 }
-            })
+            });
+            (h, unlinked_uid)
         };
+        if let Some(uid) = unlinked_uid {
+            self.core.discard_queued_ops(&uid);
+            self.core.cache.evict(&uid);
+            self.core.evict_reader(&uid);
+        }
         // Hand the bytes to the queue rather than uploading them here: the
         // scratch file is the only copy of what was just written, and blocking
         // the caller on the network is what made a copy into the mount run at

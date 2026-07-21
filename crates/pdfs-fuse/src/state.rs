@@ -18,6 +18,9 @@ pub(crate) struct Entry {
     pub(crate) uid: NodeUid,
     pub(crate) parent: u64,
     pub(crate) node: Node,
+    pub(crate) lookup_count: u64,
+    pub(crate) open_count: u32,
+    pub(crate) unlinked: bool,
 }
 
 /// A set of non-overlapping `[start, end)` byte ranges, kept sorted and merged.
@@ -194,9 +197,24 @@ impl State {
                 uid: node.uid.clone(),
                 parent,
                 node,
+                lookup_count: 1,
+                open_count: 0,
+                unlinked: false,
             },
         );
         ino
+    }
+
+    /// Decrement lookup count for an inode and prune if lookup_count == 0 && open_count == 0 && unlinked.
+    pub(crate) fn forget_lookup(&mut self, ino: u64, nlookup: u64) -> Option<(u64, String)> {
+        if let Some(entry) = self.entries.get_mut(&ino) {
+            entry.lookup_count = entry.lookup_count.saturating_sub(nlookup);
+            if entry.lookup_count == 0 && entry.open_count == 0 && entry.unlinked {
+                let uid = entry.uid.clone();
+                return self.forget(&uid);
+            }
+        }
+        None
     }
 
     /// Allocate (or reuse) a stable inode for a node that came *from* the
@@ -251,6 +269,22 @@ impl State {
             target_ino = parent;
         }
         false
+    }
+
+    /// Forget a node or, if open handles exist (open_count > 0), mark it unlinked
+    /// and remove it from parent children so lookups fail while open reads succeed.
+    pub(crate) fn forget_or_unlink(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+        if let Some(&ino) = self.by_uid.get(uid)
+            && let Some(entry) = self.entries.get_mut(&ino)
+            && entry.open_count > 0
+        {
+            entry.unlinked = true;
+            if let Some(kids) = self.children.get_mut(&entry.parent) {
+                kids.retain(|&k| k != ino);
+            }
+            return Some((entry.parent, entry.node.name.clone()));
+        }
+        self.forget(uid)
     }
 
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
