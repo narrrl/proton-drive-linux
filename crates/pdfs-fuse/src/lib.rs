@@ -46,9 +46,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fuser::ReplyXattr;
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenAccMode, OpenFlags,
-    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
+    FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner, MountOption, Notifier, OpenAccMode,
+    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
 use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::AppDirs;
@@ -4845,6 +4845,34 @@ impl Filesystem for ProtonFs {
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         self.serve_listxattr(ino, size, reply);
+    }
+
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: IoctlFlags,
+        cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: ReplyIoctl,
+    ) {
+        // The ioctl type lives in bits 8..15 of the command number.
+        // Type 'T' (0x54) covers terminal ioctls (TCGETS, TCGETS2, …).
+        // Programs like aria2 probe every fd with TCGETS2 to detect
+        // whether they are talking to a tty.  A filesystem is never a
+        // terminal, so ENOTTY is the correct answer — and it stops
+        // fuser from logging a WARN for every call.
+        const IOC_TYPE_SHIFT: u32 = 8;
+        const IOC_TYPE_MASK: u32 = 0xFF;
+        let ioc_type = (cmd >> IOC_TYPE_SHIFT) & IOC_TYPE_MASK;
+
+        if ioc_type == b'T' as u32 {
+            reply.error(Errno::ENOTTY);
+        } else {
+            reply.error(Errno::ENOSYS);
+        }
     }
 }
 

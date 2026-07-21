@@ -11,6 +11,17 @@
 //! exposed). The baseline is refreshed from ground truth after every applied
 //! action, so a file just uploaded or downloaded reads as "unchanged" on the
 //! next pass and never ping-pongs.
+//!
+//! ## Open-for-write deferral
+//!
+//! A file still held open for writing by another process is not uploaded.
+//! Uploading mid-write produces a torn snapshot — a revision that was never a
+//! real state of the file — wasting the encrypt-and-upload cost and creating a
+//! revision the user never asked for. The FUSE mount path already defers until
+//! `close(fd)` by design; the mirror path now does the same by scanning
+//! `/proc/*/fd` once per reconcile pass and skipping any file whose fd flags
+//! include `O_WRONLY` or `O_RDWR`. Deferred files are picked up on the next
+//! pass, after the writer has closed them.
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use notify::{RecursiveMode, Watcher};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
@@ -284,6 +295,11 @@ struct LocalItem {
     is_dir: bool,
     mtime: i64,
     size: i64,
+    /// True when another process holds this file open for writing (detected via
+    /// `/proc/*/fd`). An open-for-write file is kept in the map — so it is not
+    /// misread as a deletion — but treated as unchanged for upload purposes,
+    /// deferring the upload until the writer closes the file.
+    open_for_write: bool,
 }
 
 /// One item found while walking a remote tree.
@@ -305,6 +321,8 @@ struct Outcome {
     deleted: usize,
     conflicts: usize,
     errors: usize,
+    /// Files skipped because another process held them open for writing.
+    deferred: usize,
 }
 
 impl Outcome {
@@ -327,6 +345,7 @@ impl Outcome {
             && self.deleted == 0
             && self.conflicts == 0
             && self.errors == 0
+            && self.deferred == 0
     }
 
     /// A human summary of the pass: "3 uploaded, 1 downloaded, 2 failed".
@@ -338,6 +357,7 @@ impl Outcome {
             (self.created, "folder(s) created"),
             (self.deleted, "deleted"),
             (self.conflicts, "conflicted"),
+            (self.deferred, "deferred (open for write)"),
             (self.errors, "failed"),
         ] {
             if n > 0 {
@@ -507,6 +527,84 @@ impl HasKind for LocalItem {
     fn is_dir(&self) -> bool {
         self.is_dir
     }
+}
+
+// ---- open-for-write detection ---------------------------------------------
+
+/// Scan `/proc/*/fd` once and return the set of **canonical** paths under
+/// `root` that any process currently holds open for writing (`O_WRONLY` or
+/// `O_RDWR`). The scan is best-effort: unreadable `/proc/*/fd` directories
+/// (other users' processes, or kernel threads) are silently skipped.
+///
+/// Cost: one `readdir` of `/proc`, then for every process one `readdir` of its
+/// `/proc/<pid>/fd/`, and one `readlink` + one `open` of `/proc/<pid>/fdinfo/<n>`
+/// per open fd that resolves under `root`. For a typical desktop with a few
+/// hundred processes and a handful of files inside the sync root, this
+/// completes in low single-digit milliseconds.
+fn open_for_write_set(root: &Path) -> HashSet<PathBuf> {
+    let mut result = HashSet::new();
+    let Ok(root_canonical) = std::fs::canonicalize(root) else {
+        return result;
+    };
+    let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+        return result;
+    };
+    for proc_entry in proc_entries.filter_map(|e| e.ok()) {
+        let pid_name = proc_entry.file_name();
+        // Skip non-numeric entries (kernel threads, /proc/self, etc.)
+        if !pid_name
+            .to_str()
+            .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let fd_dir = PathBuf::from("/proc").join(&pid_name).join("fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd_entry in fds.filter_map(|e| e.ok()) {
+            // readlink on /proc/<pid>/fd/<n> gives the target path.
+            let link = fd_dir.join(fd_entry.file_name());
+            let Ok(target) = std::fs::read_link(&link) else {
+                continue;
+            };
+            // Quick prefix check before the more expensive fdinfo read.
+            if !target.starts_with(&root_canonical) {
+                continue;
+            }
+            // Read the fd's flags from /proc/<pid>/fdinfo/<n> to determine
+            // the access mode. The first line is "pos:\t<offset>", the second
+            // is "flags:\t<octal>". We only need the low two bits of flags:
+            //   0 = O_RDONLY, 1 = O_WRONLY, 2 = O_RDWR
+            let fdinfo_path = PathBuf::from("/proc")
+                .join(&pid_name)
+                .join("fdinfo")
+                .join(fd_entry.file_name());
+            if let Ok(contents) = std::fs::read_to_string(&fdinfo_path)
+                && is_write_mode(&contents)
+            {
+                result.insert(target);
+            }
+        }
+    }
+    result
+}
+
+/// Parse the `flags:` line out of a `/proc/<pid>/fdinfo/<n>` file and return
+/// true if the low two bits indicate write access (`O_WRONLY = 1` or
+/// `O_RDWR = 2`).
+fn is_write_mode(fdinfo: &str) -> bool {
+    for line in fdinfo.lines() {
+        if let Some(rest) = line.strip_prefix("flags:\t") {
+            if let Ok(flags) = u32::from_str_radix(rest.trim_start_matches('0'), 8) {
+                let access = flags & 0o3; // O_ACCMODE
+                return access == 1 || access == 2; // O_WRONLY or O_RDWR
+            }
+            // An empty octal string ("0" stripped to "") means flags == 0 == O_RDONLY.
+            return false;
+        }
+    }
+    false
 }
 
 impl HasKind for RemoteItem {
@@ -783,7 +881,10 @@ impl Core {
         self.progress_scan_total(folder_id, baseline.len());
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
-        self.walk_local(folder_id, local_root, local_root, rules, &mut local)?;
+        let writing = open_for_write_set(local_root);
+        self.walk_local(
+            folder_id, local_root, local_root, rules, &writing, &mut local,
+        )?;
         // The guard compares against the paths this pass could still see: an
         // ignored path is absent from `local` by rule, not by loss, and counting
         // those as missing would trip the guard on every pass — wedging the
@@ -825,7 +926,7 @@ impl Core {
         // anything to push, and the only ones that could be a two-sided edit.
         let changed: Vec<&String> = local
             .iter()
-            .filter(|(_, item)| !item.is_dir)
+            .filter(|(_, item)| !item.is_dir && !item.open_for_write)
             .filter(|(rel, item)| {
                 baseline
                     .get(*rel)
@@ -856,7 +957,10 @@ impl Core {
         };
         let changed: HashSet<&String> = changed.into_iter().collect();
 
-        let mut outcome = Outcome::default();
+        let mut outcome = Outcome {
+            deferred: local.values().filter(|item| item.open_for_write).count(),
+            ..Default::default()
+        };
         let mut order: Vec<&String> = local.keys().collect();
         order.sort_by_key(|p| p.matches('/').count());
 
@@ -1043,7 +1147,10 @@ impl Core {
         self.progress_scan_total(folder_id, baseline.len() * 2);
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
-        self.walk_local(folder_id, local_root, local_root, rules, &mut local)?;
+        let writing = open_for_write_set(local_root);
+        self.walk_local(
+            folder_id, local_root, local_root, rules, &writing, &mut local,
+        )?;
         // See `push_pass`: the guard must not count rule-excluded paths as lost.
         guard_local_wipe(&filter_baseline(&baseline, rules), &local)?;
 
@@ -1150,6 +1257,17 @@ impl Core {
             }
 
             // File.
+            // A file still open for writing is treated as unchanged on the local
+            // side: uploading it now would capture a torn snapshot, and the next
+            // pass — after the writer has closed it — will see the final content.
+            if l.is_some_and(|l| l.open_for_write) {
+                debug!(
+                    rel,
+                    "sync: file open for write by another process; deferring upload"
+                );
+                outcome.deferred += 1;
+                continue;
+            }
             let base = baseline.get(rel);
             let local_changed = l.is_some_and(|l| {
                 base.is_none_or(|b| b.local_mtime != l.mtime || b.local_size != l.size)
@@ -1305,6 +1423,7 @@ impl Core {
         root: &Path,
         dir: &Path,
         rules: &IgnoreRules,
+        writing: &HashSet<PathBuf>,
         out: &mut HashMap<String, LocalItem>,
     ) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
@@ -1338,17 +1457,25 @@ impl Core {
                         is_dir: true,
                         mtime: 0,
                         size: 0,
+                        open_for_write: false,
                     },
                 );
                 self.progress_scanned(folder_id, base_name(rel));
-                self.walk_local(folder_id, root, &path, rules, out)?;
+                self.walk_local(folder_id, root, &path, rules, writing, out)?;
             } else if meta.is_file() {
+                // Check whether any process holds this file open for writing.
+                // The canonical path is used because /proc/*/fd links resolve
+                // to canonical targets.
+                let ofw = std::fs::canonicalize(&path)
+                    .map(|canon| writing.contains(&canon))
+                    .unwrap_or(false);
                 out.insert(
                     rel.to_string(),
                     LocalItem {
                         is_dir: false,
                         mtime: system_mtime(&meta),
                         size: meta.len() as i64,
+                        open_for_write: ofw,
                     },
                 );
                 self.progress_scanned(folder_id, base_name(rel));
@@ -2030,6 +2157,7 @@ mod tests {
             is_dir,
             mtime: 1,
             size: 1,
+            open_for_write: false,
         }
     }
 
@@ -2341,5 +2469,68 @@ mod tests {
         );
         let no_ext = conflict_path(Path::new("/home/me/README"), 42);
         assert_eq!(no_ext, PathBuf::from("/home/me/README (sync-conflict 42)"));
+    }
+
+    // ---- open-for-write detection tests -----------------------------------
+
+    #[test]
+    fn is_write_mode_detects_wronly() {
+        // O_WRONLY = 0o1 → flags octal "0100001" (O_WRONLY | O_LARGEFILE on x86_64)
+        let fdinfo = "pos:\t0\nflags:\t0100001\nmnt_id:\t29\n";
+        assert!(is_write_mode(fdinfo), "O_WRONLY must be detected as write");
+    }
+
+    #[test]
+    fn is_write_mode_detects_rdwr() {
+        // O_RDWR = 0o2 → flags octal "0100002"
+        let fdinfo = "pos:\t0\nflags:\t0100002\nmnt_id:\t29\n";
+        assert!(is_write_mode(fdinfo), "O_RDWR must be detected as write");
+    }
+
+    #[test]
+    fn is_write_mode_ignores_rdonly() {
+        // O_RDONLY = 0o0 → flags octal "0100000" (just O_LARGEFILE)
+        let fdinfo = "pos:\t0\nflags:\t0100000\nmnt_id:\t29\n";
+        assert!(
+            !is_write_mode(fdinfo),
+            "O_RDONLY must not be detected as write"
+        );
+    }
+
+    #[test]
+    fn is_write_mode_handles_bare_zero() {
+        // A plain "0" (no O_LARGEFILE, no access flags).
+        let fdinfo = "pos:\t0\nflags:\t0\nmnt_id:\t29\n";
+        assert!(!is_write_mode(fdinfo), "flags 0 is O_RDONLY");
+    }
+
+    #[test]
+    fn is_write_mode_returns_false_on_missing_flags_line() {
+        let fdinfo = "pos:\t42\nmnt_id:\t29\n";
+        assert!(!is_write_mode(fdinfo));
+    }
+
+    #[test]
+    fn is_write_mode_handles_append() {
+        // O_WRONLY | O_APPEND = 0o1 | 0o2000 = 0o2001 → with O_LARGEFILE: 0o102001
+        let fdinfo = "pos:\t0\nflags:\t0102001\nmnt_id:\t29\n";
+        assert!(is_write_mode(fdinfo), "O_WRONLY|O_APPEND is still a write");
+    }
+
+    #[test]
+    fn outcome_includes_deferred_in_summary() {
+        let mut o = Outcome::default();
+        o.uploaded = 3;
+        o.deferred = 2;
+        assert!(!o.is_empty());
+        assert_eq!(o.summary(), "3 uploaded, 2 deferred (open for write)");
+    }
+
+    #[test]
+    fn outcome_deferred_alone_is_not_empty() {
+        let mut o = Outcome::default();
+        assert!(o.is_empty());
+        o.deferred = 1;
+        assert!(!o.is_empty());
     }
 }
