@@ -807,9 +807,13 @@ impl ContentCache {
             .collect();
         let content_dir = self.content_dir.clone();
         // Force pool enforcement ignoring current cap check to free disk space immediately
-        let Ok(list) = self.db.cache_eviction_candidates(KIND_BLOB, 10) else { return; };
+        let Ok(list) = self.db.cache_eviction_candidates(KIND_BLOB, 10) else {
+            return;
+        };
         for (key, bytes) in list {
-            if pinned.contains(&key) { continue; }
+            if pinned.contains(&key) {
+                continue;
+            }
             let p = content_dir.join(&key);
             let m = content_dir.join(format!("{key}.meta"));
             let _ = std::fs::remove_file(&p);

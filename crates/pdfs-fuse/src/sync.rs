@@ -1681,14 +1681,20 @@ impl Core {
                 });
             }
             let mut out = Vec::new();
+            let mut join_errors = 0usize;
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(result) => out.push(result),
-                    Err(e) => warn!(error = %e, "sync: task panicked"),
+                    Err(e) => {
+                        join_errors += 1;
+                        warn!(error = %e, "sync: task panicked");
+                    }
                 }
             }
-            out
+            (out, join_errors)
         });
+        let (results, join_errors) = results;
+        outcome.errors += join_errors;
         for result in results {
             match result {
                 Ok(applied) => {

@@ -683,26 +683,22 @@ impl Core {
                 // fails, since eviction may already have deleted part of the tree.
                 // Recovery is the user's explicit switch back to `mirror`, whose arm
                 // clears the baseline and re-downloads.
-                // Try mounting the secondary FUSE filesystem FIRST before touching local files.
-                // If mount fails, abort safely so local files are preserved intact.
-                let session = match self.spawn_ondemand_mount(&local, root) {
-                    Ok(session) => session,
-                    Err(e) => {
-                        return Err(SwitchBlocked::Failed(format!(
-                            "mount ondemand failed; local files preserved: {e}"
-                        )));
-                    }
-                };
-
                 if let Err(e) = self.db.sync_folder_set_mode(id, "ondemand") {
-                    let _ = umount_session_unblocked(session, fuse_connection_id(&local));
                     return Err(SwitchBlocked::Failed(format!("db: {e:?}")));
                 }
 
-                // Reclaim the disk: empty the local dir now that the mount handles filesystem requests.
+                // Reclaim the disk before mounting. Once FUSE covers `local`, a
+                // directory walk addresses the remote namespace, so evicting at
+                // that point sends unlink/rmdir requests to Drive and leaves the
+                // underlying mirror hidden and untouched.
                 if let Err(e) = evict_dir_contents(&local) {
                     warn!(id, path = %local.display(), error = %e, "evict local dir contents failed");
                 }
+                let session = self.spawn_ondemand_mount(&local, root).map_err(|e| {
+                    SwitchBlocked::Failed(format!(
+                        "mount ondemand failed after local cache eviction; switch back to mirror to restore it: {e}"
+                    ))
+                })?;
                 self.mounts
                     .lock()
                     .insert(id, (session, fuse_connection_id(&local)));

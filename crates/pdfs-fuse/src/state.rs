@@ -56,27 +56,6 @@ impl Intervals {
         }
     }
 
-    /// Punch a hole in `[start, end)`, removing authored status for this range.
-    pub(crate) fn punch_hole(&mut self, start: u64, end: u64) {
-        if start >= end {
-            return;
-        }
-        let mut next = Vec::new();
-        for &(s, e) in &self.0 {
-            if e <= start || s >= end {
-                next.push((s, e));
-            } else {
-                if s < start {
-                    next.push((s, start));
-                }
-                if e > end {
-                    next.push((end, e));
-                }
-            }
-        }
-        self.0 = next;
-    }
-
     /// Split `[start, end)` into contiguous `(s, e, authored)` segments, in
     /// order. `authored == true` means the bytes live in the scratch file;
     /// `false` means they must come from the remote base (or are a hole).
@@ -241,13 +220,15 @@ impl State {
     /// Check if a directory inode has any child nodes in memory or in the database.
     pub(crate) fn has_children(&self, parent: u64) -> bool {
         if let Some(kids) = self.children.get(&parent)
-            && !kids.is_empty() {
-                return true;
-            }
+            && !kids.is_empty()
+        {
+            return true;
+        }
         if let Some(entry) = self.entries.get(&parent)
-            && let Ok(has_kids) = self.db.has_children(&entry.uid) {
-                return has_kids;
-            }
+            && let Ok(has_kids) = self.db.has_children(&entry.uid)
+        {
+            return has_kids;
+        }
         false
     }
 
@@ -584,33 +565,6 @@ mod tests {
             "and the listing it would serve is the moved file's absence, \
              with no way to notice anything else changed"
         );
-    }
-
-    #[test]
-    fn test_intervals_punch_hole_middle() {
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        iv.punch_hole(30, 50);
-        assert_eq!(iv.0, vec![(0, 30), (50, 100)]);
-    }
-
-    #[test]
-    fn test_intervals_punch_hole_edges() {
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        iv.punch_hole(0, 20);
-        assert_eq!(iv.0, vec![(20, 100)]);
-
-        iv.punch_hole(80, 100);
-        assert_eq!(iv.0, vec![(20, 80)]);
-    }
-
-    #[test]
-    fn test_intervals_punch_hole_full() {
-        let mut iv = Intervals::default();
-        iv.add(0, 100);
-        iv.punch_hole(0, 100);
-        assert!(iv.0.is_empty());
     }
 
     #[test]

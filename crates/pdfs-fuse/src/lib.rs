@@ -3486,11 +3486,13 @@ impl ProtonFs {
                 return;
             }
         };
-        let open_now = {
-            let mut st = self.core.state.lock();
-            st.forget_or_unlink(&uid);
-            st.entries.get(&ino).map(|e| e.open_count).unwrap_or(0) > 0
-        };
+        let open_now = self
+            .core
+            .state
+            .lock()
+            .entries
+            .get(&ino)
+            .is_some_and(|e| e.open_count > 0);
         // A node the server has never heard of cannot be trashed there; deleting
         // it just means its queued creation is no longer wanted. This works
         // offline, which the remote path below cannot (offline.md Phase 3b).
@@ -3498,6 +3500,7 @@ impl ProtonFs {
             if !open_now {
                 self.core.discard_queued_ops(&uid);
             }
+            self.core.state.lock().forget_or_unlink(&uid);
             debug!(%uid, name, "deleted a node that had not been created remotely yet");
             reply.ok();
             return;
@@ -3507,7 +3510,10 @@ impl ProtonFs {
         // command returns (offline.md Phase 3b).
         if !self.core.online.load(Ordering::Relaxed) {
             match self.core.queue_trash(&uid, name) {
-                Ok(()) => reply.ok(),
+                Ok(()) => {
+                    self.core.state.lock().forget_or_unlink(&uid);
+                    reply.ok();
+                }
                 Err(e) => reply.error(e),
             }
             return;
@@ -3523,6 +3529,9 @@ impl ProtonFs {
             reply.error(Errno::EIO);
             return;
         }
+        // Only remove the namespace entry after Drive accepted the mutation.
+        // Otherwise an EIO response still made the path disappear locally.
+        self.core.state.lock().forget_or_unlink(&uid);
         if !open_now {
             self.core.discard_queued_ops(&uid);
             self.core.cache.evict(&uid);
@@ -4099,6 +4108,9 @@ impl Filesystem for ProtonFs {
         let (file, path) = match self.core.cache.create_scratch() {
             Ok(x) => x,
             Err(e) => {
+                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                    entry.open_count = entry.open_count.saturating_sub(1);
+                }
                 error!(%uid, error = %e, "create scratch file failed");
                 reply.error(Errno::EIO);
                 return;
@@ -4193,12 +4205,7 @@ impl Filesystem for ProtonFs {
                         .get(&e.uid)
                         .map(|p| p.meta.len)
                         .unwrap_or_else(|| node_size(&e.node));
-                    (
-                        e.uid.clone(),
-                        e.node.modification_time,
-                        fsize,
-                        is_video,
-                    )
+                    (e.uid.clone(), e.node.modification_time, fsize, is_video)
                 }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
@@ -4312,6 +4319,9 @@ impl Filesystem for ProtonFs {
         };
         let mut st = self.core.state.lock();
         let ino = st.intern(parent, node);
+        if let Some(entry) = st.entries.get_mut(&ino) {
+            entry.open_count = entry.open_count.saturating_add(1);
+        }
         if let Some(kids) = st.children.get_mut(&parent)
             && !kids.contains(&ino)
         {
@@ -4503,7 +4513,10 @@ impl Filesystem for ProtonFs {
                     let ret = unsafe { libc::fallocate(fd, mode, offset as i64, length as i64) };
                     if ret == 0 {
                         if is_punch_hole {
-                            aw.written.punch_hole(offset, new_end);
+                            // A punched range reads as zero. Mark it authored so
+                            // queue_revision does not refill it from the remote
+                            // baseline and silently undo the hole at commit.
+                            aw.written.add(offset, new_end.min(aw.len));
                             aw.dirty = true;
                         } else if !keep_size && new_end > aw.len {
                             aw.written.add(aw.len, new_end);
@@ -4661,6 +4674,7 @@ impl Filesystem for ProtonFs {
             });
             (h, unlinked_uid)
         };
+        let was_unlinked = unlinked_uid.is_some();
         if let Some(uid) = unlinked_uid {
             self.core.discard_queued_ops(&uid);
             self.core.cache.evict(&uid);
@@ -4670,12 +4684,22 @@ impl Filesystem for ProtonFs {
         // scratch file is the only copy of what was just written, and blocking
         // the caller on the network is what made a copy into the mount run at
         // upload speed (and fail outright offline).
-        match handle {
-            Some(h) => match self.core.queue_revision(&h) {
+        match (handle, was_unlinked) {
+            (Some(h), true) => {
+                // POSIX keeps an unlinked file usable until the last close, but
+                // closing it must not resurrect those bytes as a new revision.
+                if let Err(e) = std::fs::remove_file(&h.path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
+                }
+                reply.ok();
+            }
+            (Some(h), false) => match self.core.queue_revision(&h) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
             },
-            None => reply.ok(),
+            (None, _) => reply.ok(),
         }
     }
 
@@ -4684,10 +4708,11 @@ impl Filesystem for ProtonFs {
         if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
             let st = self.core.state.lock();
             if let Some(entry) = st.entries.get(&ino)
-                && entry.node.is_folder() {
-                    reply.error(Errno::EISDIR);
-                    return;
-                }
+                && entry.node.is_folder()
+            {
+                reply.error(Errno::EISDIR);
+                return;
+            }
         }
         self.trash_child(parent.0, &name_str, reply);
     }
@@ -4695,16 +4720,27 @@ impl Filesystem for ProtonFs {
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_string_lossy();
         if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
-            let st = self.core.state.lock();
-            if let Some(entry) = st.entries.get(&ino) {
-                if !entry.node.is_folder() {
+            {
+                let st = self.core.state.lock();
+                if st
+                    .entries
+                    .get(&ino)
+                    .is_some_and(|entry| !entry.node.is_folder())
+                {
                     reply.error(Errno::ENOTDIR);
                     return;
                 }
-                if st.has_children(ino) {
-                    reply.error(Errno::ENOTEMPTY);
-                    return;
-                }
+            }
+            // A missing cached listing says "unknown", not "empty". Proton's
+            // trash call is recursive, so enumerate before applying rmdir's
+            // POSIX emptiness rule.
+            if let Err(e) = self.core.ensure_children(ino) {
+                reply.error(e);
+                return;
+            }
+            if self.core.state.lock().has_children(ino) {
+                reply.error(Errno::ENOTEMPTY);
+                return;
             }
         }
         self.trash_child(parent.0, &name_str, reply);
@@ -4819,10 +4855,12 @@ impl Filesystem for ProtonFs {
         {
             let st = self.core.state.lock();
             if let Some(entry) = st.entries.get(&ino)
-                && entry.node.is_folder() && st.is_ancestor_of(ino, newparent) {
-                    reply.error(Errno::EINVAL);
-                    return;
-                }
+                && entry.node.is_folder()
+                && st.is_ancestor_of(ino, newparent)
+            {
+                reply.error(Errno::EINVAL);
+                return;
+            }
         }
         // The destination has to be listed either way: the queued path pushes
         // the node into that listing, and the online one drops it to force a

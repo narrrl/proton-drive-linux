@@ -72,29 +72,23 @@ impl Core {
             if let Err(e) = self.drain_op(&op) {
                 let attempts = op.attempts + 1;
                 let err_str = e.to_string();
-                let is_unrecoverable = attempts >= 5 || err_str.contains("403") || err_str.contains("402") || err_str.contains("413");
-                if is_unrecoverable {
-                    warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed permanently; quarantining op");
-                    let _ = self.db.delete_ops_for_uid(&op.uid);
-                    self.log_activity(
-                        ActivityKind::Upload,
-                        &op.uid,
-                        format!("quarantined after failure: {err_str}"),
-                        false,
-                    );
-                } else {
-                    let backoff = DRAIN_BACKOFF_MIN
-                        .saturating_mul(1u32 << attempts.min(6))
-                        .min(DRAIN_BACKOFF_MAX);
-                    warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
-                    if let Err(e) = self.db.record_op_failure(
-                        op.id,
-                        &err_str,
-                        now_millis() + backoff.as_millis() as i64,
-                    ) {
-                        error!(uid = %op.uid, error = %e, "recording a drain failure failed");
-                        self.wait_for_drain_work();
-                    }
+                // Never infer that user data is disposable from an error string
+                // or an arbitrary retry count. The staged blob and this row are
+                // the only durable description of an accepted write. Even a
+                // permission/quota error can become recoverable after the user
+                // changes account state, and deleting the row here made the blob
+                // unreachable after five ordinary network failures.
+                let backoff = DRAIN_BACKOFF_MIN
+                    .saturating_mul(1u32 << attempts.min(6))
+                    .min(DRAIN_BACKOFF_MAX);
+                warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
+                if let Err(e) = self.db.record_op_failure(
+                    op.id,
+                    &err_str,
+                    now_millis() + backoff.as_millis() as i64,
+                ) {
+                    error!(uid = %op.uid, error = %e, "recording a drain failure failed");
+                    self.wait_for_drain_work();
                 }
             }
         }
