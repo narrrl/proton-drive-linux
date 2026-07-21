@@ -4075,8 +4075,7 @@ impl Filesystem for ProtonFs {
         let mut st = self.core.state.lock();
         let fh = st.next_fh;
         st.next_fh += 1;
-        st.handles.insert(
-            fh,
+        let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
             WriteHandle {
                 ino: ino.0,
                 uid,
@@ -4089,8 +4088,11 @@ impl Filesystem for ProtonFs {
                 base_size,
                 base_mtime,
                 dirty: false,
-            },
-        );
+                open_count: 0,
+            }
+        });
+        aw.open_count += 1;
+        st.handles.insert(fh, ino.0);
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
@@ -4115,7 +4117,7 @@ impl Filesystem for ProtonFs {
         // local read is not worth reasoning about that for.
         let handle = {
             let st = self.core.state.lock();
-            st.handles.values().find(|h| h.ino == ino.0).map(|h| {
+            st.active_writes.get(&ino.0).map(|h| {
                 (
                     h.file.clone(),
                     h.len,
@@ -4278,8 +4280,7 @@ impl Filesystem for ProtonFs {
         }
         let fh = st.next_fh;
         st.next_fh += 1;
-        st.handles.insert(
-            fh,
+        let aw = st.active_writes.entry(ino).or_insert_with(|| {
             // A brand-new file: empty base, everything written is authored.
             WriteHandle {
                 ino,
@@ -4291,8 +4292,11 @@ impl Filesystem for ProtonFs {
                 base_size: 0,
                 base_mtime,
                 dirty: false,
-            },
-        );
+                open_count: 0,
+            }
+        });
+        aw.open_count += 1;
+        st.handles.insert(fh, ino);
         let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
         reply.created(
             &TTL,
@@ -4320,8 +4324,8 @@ impl Filesystem for ProtonFs {
         // the untouched remainder is pulled from the remote, and only at commit.
         let file = {
             let st = self.core.state.lock();
-            match st.handles.get(&fh) {
-                Some(h) => h.file.clone(),
+            match st.handles.get(&fh).and_then(|&i| st.active_writes.get(&i)) {
+                Some(aw) => aw.file.clone(),
                 None => {
                     reply.error(Errno::EBADF);
                     return;
@@ -4335,15 +4339,20 @@ impl Filesystem for ProtonFs {
         }
         let new_len = {
             let mut st = self.core.state.lock();
-            let Some(h) = st.handles.get_mut(&fh) else {
+            let Some(aw) = st
+                .handles
+                .get(&fh)
+                .copied()
+                .and_then(|i| st.active_writes.get_mut(&i))
+            else {
                 reply.error(Errno::EBADF);
                 return;
             };
             let end = offset + data.len() as u64;
-            h.written.add(offset, end);
-            h.len = h.len.max(end);
-            h.dirty = true;
-            let len = h.len;
+            aw.written.add(offset, end);
+            aw.len = aw.len.max(end);
+            aw.dirty = true;
+            let len = aw.len;
             st.set_size(ino.0, len);
             len
         };
@@ -4383,36 +4392,19 @@ impl Filesystem for ProtonFs {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
             let handled = {
                 let mut st = self.core.state.lock();
-                // The kernel does not put `O_TRUNC` in the `open` flags unless
-                // the mount enables `atomic_o_trunc`; it opens, then truncates
-                // with a *separate* `setattr` carrying no file handle. So an fh
-                // is a hint, not a precondition — fall back to the write handle
-                // for this inode, the same lookup `read` does and for the same
-                // reason. Without it a `cp` over an existing file becomes two
-                // independent queued ops: a truncate, plus a release that still
-                // believes the file is its old length. They then conflict with
-                // each other and the write is diverted into a conflict copy.
-                let target = match fh {
-                    Some(fh) if st.handles.contains_key(&fh) => Some(fh),
-                    _ => st
-                        .handles
-                        .iter()
-                        .find(|(_, h)| h.ino == ino.0)
-                        .map(|(&fh, _)| fh),
-                };
-                match target.and_then(|fh| st.handles.get_mut(&fh)) {
-                    Some(h) => {
-                        if size < h.len {
+                match st.active_writes.get_mut(&ino.0) {
+                    Some(aw) => {
+                        if size < aw.len {
                             // Shrink: drop authored ranges past the new end.
-                            h.written.clip(size);
-                        } else if size > h.len {
+                            aw.written.clip(size);
+                        } else if size > aw.len {
                             // Grow: the new tail is defined as zeros, so claim
                             // it as authored rather than base content.
-                            h.written.add(h.len, size);
+                            aw.written.add(aw.len, size);
                         }
-                        let _ = h.file.set_len(size);
-                        h.len = size;
-                        h.dirty = true;
+                        let _ = aw.file.set_len(size);
+                        aw.len = size;
+                        aw.dirty = true;
                         true
                     }
                     None => false,
@@ -4447,7 +4439,7 @@ impl Filesystem for ProtonFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        fh: FileHandle,
+        _fh: FileHandle,
         offset: u64,
         length: u64,
         mode: i32,
@@ -4458,16 +4450,16 @@ impl Filesystem for ProtonFs {
 
         let res = {
             let mut st = self.core.state.lock();
-            match st.handles.get_mut(&fh.0) {
-                Some(h) => {
+            match st.active_writes.get_mut(&ino.0) {
+                Some(aw) => {
                     use std::os::unix::io::AsRawFd;
-                    let fd = h.file.as_raw_fd();
+                    let fd = aw.file.as_raw_fd();
                     let ret = unsafe { libc::fallocate(fd, mode, offset as i64, length as i64) };
                     if ret == 0 {
-                        if !keep_size && new_end > h.len {
-                            h.written.add(h.len, new_end);
-                            h.len = new_end;
-                            h.dirty = true;
+                        if !keep_size && new_end > aw.len {
+                            aw.written.add(aw.len, new_end);
+                            aw.len = new_end;
+                            aw.dirty = true;
                             st.set_size(ino.0, new_end);
                         }
                         Ok(())
@@ -4514,18 +4506,22 @@ impl Filesystem for ProtonFs {
     ) {
         // Everything the durability sidecar needs, copied out so no lock is held
         // across the sync.
-        let handle = self.core.state.lock().handles.get(&fh.0).map(|h| {
-            (
-                h.file.clone(),
-                h.path.clone(),
-                h.uid.clone(),
-                h.dirty,
-                h.written.clone(),
-                h.len,
-                h.base_size,
-                h.base_mtime,
-            )
-        });
+        let handle = {
+            let st = self.core.state.lock();
+            let ino = st.handles.get(&fh.0).copied();
+            ino.and_then(|i| st.active_writes.get(&i)).map(|aw| {
+                (
+                    aw.file.clone(),
+                    aw.path.clone(),
+                    aw.uid.clone(),
+                    aw.dirty,
+                    aw.written.clone(),
+                    aw.len,
+                    aw.base_size,
+                    aw.base_mtime,
+                )
+            })
+        };
         let Some((f, path, uid, dirty, written, len, base_size, base_mtime)) = handle else {
             reply.error(Errno::EBADF);
             return;
@@ -4585,7 +4581,19 @@ impl Filesystem for ProtonFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let handle = self.core.state.lock().handles.remove(&fh.0);
+        let handle = {
+            let mut st = self.core.state.lock();
+            let ino = st.handles.remove(&fh.0);
+            ino.and_then(|i| {
+                let aw = st.active_writes.get_mut(&i)?;
+                aw.open_count = aw.open_count.saturating_sub(1);
+                if aw.open_count == 0 {
+                    st.active_writes.remove(&i)
+                } else {
+                    None
+                }
+            })
+        };
         // Hand the bytes to the queue rather than uploading them here: the
         // scratch file is the only copy of what was just written, and blocking
         // the caller on the network is what made a copy into the mount run at
@@ -4914,26 +4922,15 @@ impl Filesystem for ProtonFs {
         _ino: INodeNo,
         _fh: FileHandle,
         _flags: IoctlFlags,
-        cmd: u32,
+        _cmd: u32,
         _in_data: &[u8],
         _out_size: u32,
         reply: ReplyIoctl,
     ) {
-        // The ioctl type lives in bits 8..15 of the command number.
-        // Type 'T' (0x54) covers terminal ioctls (TCGETS, TCGETS2, …).
-        // Programs like aria2 probe every fd with TCGETS2 to detect
-        // whether they are talking to a tty.  A filesystem is never a
-        // terminal, so ENOTTY is the correct answer — and it stops
-        // fuser from logging a WARN for every call.
-        const IOC_TYPE_SHIFT: u32 = 8;
-        const IOC_TYPE_MASK: u32 = 0xFF;
-        let ioc_type = (cmd >> IOC_TYPE_SHIFT) & IOC_TYPE_MASK;
-
-        if ioc_type == b'T' as u32 {
-            reply.error(Errno::ENOTTY);
-        } else {
-            reply.error(Errno::ENOSYS);
-        }
+        // Filesystems are not character devices or terminals; returning ENOTTY
+        // for unhandled ioctls is standard Linux POSIX behavior and prevents
+        // fuser warning logs when applications probe file descriptors.
+        reply.error(Errno::ENOTTY);
     }
 }
 
@@ -5456,6 +5453,7 @@ pub fn mount(
             by_uid: HashMap::new(),
             children: HashMap::new(),
             next_ino: 2,
+            active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
             db: db.clone(),

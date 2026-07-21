@@ -750,7 +750,14 @@ impl Core {
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
         self.db.delete_op(op.id)?;
-        self.pending.lock().remove(&uid);
+        {
+            let mut p = self.pending.lock();
+            if let Some(op_in_mem) = p.get(&uid)
+                && op_in_mem.path == blob
+            {
+                p.remove(&uid);
+            }
+        }
 
         // The staged blob now matches the sealed revision, so a pinned file keeps
         // it as its cached content rather than re-downloading what we just sent.
@@ -816,10 +823,10 @@ impl Core {
             let sealed_mtime = node.modification_time;
             let sealed_size = node_size(&node);
             let mut st = self.state.lock();
-            for h in st.handles.values_mut() {
-                if h.uid == *uid {
-                    h.base_mtime = sealed_mtime;
-                    h.base_size = sealed_size;
+            for aw in st.active_writes.values_mut() {
+                if aw.uid == *uid {
+                    aw.base_mtime = sealed_mtime;
+                    aw.base_size = sealed_size;
                     debug!(%uid, mtime = sealed_mtime, size = sealed_size,
                            "rebased open write handle onto the revision just uploaded");
                 }

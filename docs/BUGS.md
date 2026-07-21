@@ -1159,3 +1159,27 @@ retracted.
 
 **Verified:** Clean build and 200/200 workspace tests passing.
 
+---
+
+## B17 — FUSE mount lock contention, missing next_attempt_at in DB enqueue, and ioctl ENOTTY fix
+
+**Status:** Fixed (verified 2026-07-21)
+**Found:** 2026-07-21, deep code audit of `fix/ioctl-handler` branch.
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-core/src/db/ops.rs`
+
+**Cause:**
+1. `Db::enqueue_op` SQL `INSERT INTO pending_op` statement omitted `next_attempt_at` from the column list, causing SQLite to set `next_attempt_at = 0` and rendering the 2-second revision debounce (`DRAIN_REVISION_DEBOUNCE`) ineffective.
+2. `ioctl` returned `ENOSYS` for non-terminal commands, signaling to kernel FUSE that ioctl calls were unsupported across the mount.
+3. `fallocate` executed `libc::fallocate` while holding `self.core.state.lock()`, blocking all concurrent FUSE operations across the mount during disk block preallocation.
+4. `open`/`create` invoked `create_scratch()` prior to checking `st.active_writes`, leaking scratch files on disk during concurrent opens.
+
+**Fix:**
+1. Updated `Db::enqueue_op` in `ops.rs` to include `next_attempt_at` in the `INSERT INTO pending_op` statement and parameters.
+2. Changed `ioctl` handler in `lib.rs` to return `Errno::ENOTTY` for all unhandled ioctls, conforming to POSIX standards.
+3. Moved `libc::fallocate` outside the `state` lock by cloning the `Arc<File>` reference first, and mapped system OS errors to `fuser::Errno`.
+4. Refactored `open` and `create` to check `st.active_writes` under lock before invoking `create_scratch()`, preventing redundant scratch file creation.
+
+**Verified:** Workspace unit tests (200/200) and `clippy` passing cleanly.
+
+
+

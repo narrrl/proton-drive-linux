@@ -105,6 +105,8 @@ pub(crate) struct WriteHandle {
     pub(crate) base_mtime: i64,
     /// Whether anything diverged from the remote and needs an upload.
     pub(crate) dirty: bool,
+    /// Number of file handles currently sharing this scratch state.
+    pub(crate) open_count: usize,
 }
 
 /// A released write whose upload has not happened yet (offline.md Phase 3).
@@ -131,9 +133,11 @@ pub(crate) struct State {
     /// key means the directory has been enumerated.
     pub(crate) children: HashMap<u64, Vec<u64>>,
     pub(crate) next_ino: u64,
-    /// Open write handles keyed by file handle id. Read-only opens use fh 0 and
+    /// Shared write state keyed by inode. Concurrent writers share the scratch file.
+    pub(crate) active_writes: HashMap<u64, WriteHandle>,
+    /// Maps file handle id (fh) to inode (ino). Read-only opens use fh 0 and
     /// have no entry here.
-    pub(crate) handles: HashMap<u64, WriteHandle>,
+    pub(crate) handles: HashMap<u64, u64>,
     pub(crate) next_fh: u64,
     /// Unified SQLite metadata cache. Every map mutation below writes through to
     /// it inside the `State` lock so the DB stays the authoritative copy across
@@ -410,6 +414,7 @@ mod tests {
             by_uid: HashMap::new(),
             children: HashMap::new(),
             next_ino: 1,
+            active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
             db: Arc::new(db),

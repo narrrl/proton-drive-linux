@@ -138,8 +138,8 @@ impl Db {
         };
         conn.execute(
             "INSERT INTO pending_op
-               (kind, uid, parent_uid, name, blob_path, meta_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (kind, uid, parent_uid, name, blob_path, meta_json, created_at, next_attempt_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 op.kind,
                 op.uid,
@@ -147,7 +147,8 @@ impl Db {
                 op.name,
                 op.blob_path,
                 op.meta_json,
-                op.created_at
+                op.created_at,
+                op.next_attempt_at
             ],
         )?;
         Ok((conn.last_insert_rowid(), superseded))

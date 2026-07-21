@@ -494,6 +494,7 @@ impl Core {
             by_uid: HashMap::new(),
             children: HashMap::new(),
             next_ino: 2,
+            active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
             db: self.db.clone(),

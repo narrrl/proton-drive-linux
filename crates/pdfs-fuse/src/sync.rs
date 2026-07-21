@@ -2519,9 +2519,11 @@ mod tests {
 
     #[test]
     fn outcome_includes_deferred_in_summary() {
-        let mut o = Outcome::default();
-        o.uploaded = 3;
-        o.deferred = 2;
+        let o = Outcome {
+            uploaded: 3,
+            deferred: 2,
+            ..Default::default()
+        };
         assert!(!o.is_empty());
         assert_eq!(o.summary(), "3 uploaded, 2 deferred (open for write)");
     }
