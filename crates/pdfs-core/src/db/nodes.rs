@@ -118,6 +118,18 @@ impl Db {
         Ok(())
     }
 
+    /// Check if a folder node has any non-trashed children in the database.
+    pub fn has_children(&self, parent_uid: &NodeUid) -> Result<bool> {
+        let uid_str = parent_uid.to_string();
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE parent_uid = ?1 AND trashed = 0",
+            params![uid_str],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Full-text search over node names, newest schema's trigram index giving
     /// substring (not just prefix) matches. Returns up to `limit` non-trashed
     /// hits, each with its mountpoint-relative path resolved. Queries shorter

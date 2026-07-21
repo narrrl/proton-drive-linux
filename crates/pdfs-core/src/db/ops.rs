@@ -230,6 +230,17 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Check if a queued create or mkdir op exists for `uid`.
+    pub fn has_create_op(&self, uid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE uid = ?1 AND kind IN (?2, ?3)",
+            params![uid, OP_CREATE, OP_MKDIR],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Drop every op targeting a node **or anything queued beneath it**,
     /// returning the staged blobs they held so the caller can delete them.
     ///

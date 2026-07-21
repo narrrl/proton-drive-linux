@@ -1808,6 +1808,11 @@ impl Core {
         // staged write and a queued op, and a sidecar outliving them would offer
         // recovery a second, stale copy of the same write.
         self.cache.clear_scratch_durable(&h.path);
+        if is_local_uid(&h.uid) && !self.db.has_create_op(&h.uid.to_string()).unwrap_or(true) {
+            debug!(uid = %h.uid, "local node was unlinked before creation; dropping revision");
+            let _ = std::fs::remove_file(&h.path);
+            return Ok(());
+        }
         if !h.dirty {
             let _ = std::fs::remove_file(&h.path);
             return Ok(());
@@ -1880,10 +1885,11 @@ impl Core {
             return None;
         }
         match self.pending.lock().get(uid) {
-            Some(p) => p.meta.based_on,
+            Some(p) => p.meta.based_on.clone(),
             None => Some(Baseline {
                 mtime: base_mtime,
                 size: base_size,
+                hash: None,
             }),
         }
     }
@@ -3961,6 +3967,13 @@ impl Filesystem for ProtonFs {
         });
     }
 
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        let st = self.core.state.lock();
+        if let Some(entry) = st.entries.get(&ino.0) {
+            debug!(ino = ino.0, uid = %entry.uid, nlookup, "kernel forget message received");
+        }
+    }
+
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let (attr, provisional_in) = {
             let st = self.core.state.lock();
@@ -4448,15 +4461,25 @@ impl Filesystem for ProtonFs {
         let new_end = offset.saturating_add(length);
         let keep_size = (mode & 1) != 0; // FALLOC_FL_KEEP_SIZE
 
+        let is_punch_hole = (mode & 0x02) != 0; // FALLOC_FL_PUNCH_HOLE
+
         let res = {
             let mut st = self.core.state.lock();
-            match st.active_writes.get_mut(&ino.0) {
+            match st
+                .handles
+                .get(&_fh.0)
+                .copied()
+                .and_then(|i| st.active_writes.get_mut(&i))
+            {
                 Some(aw) => {
                     use std::os::unix::io::AsRawFd;
                     let fd = aw.file.as_raw_fd();
                     let ret = unsafe { libc::fallocate(fd, mode, offset as i64, length as i64) };
                     if ret == 0 {
-                        if !keep_size && new_end > aw.len {
+                        if is_punch_hole {
+                            aw.written.punch_hole(offset, new_end);
+                            aw.dirty = true;
+                        } else if !keep_size && new_end > aw.len {
                             aw.written.add(aw.len, new_end);
                             aw.len = new_end;
                             aw.dirty = true;
@@ -4464,11 +4487,16 @@ impl Filesystem for ProtonFs {
                         }
                         Ok(())
                     } else {
-                        // In theory we could map errno to fuser::Errno, but EIO is safe
                         Err(Errno::EIO)
                     }
                 }
-                None => Err(Errno::EBADF),
+                None => {
+                    if st.entries.contains_key(&ino.0) {
+                        Err(Errno::EBADF)
+                    } else {
+                        Err(Errno::ENOENT)
+                    }
+                }
             }
         };
 
@@ -4608,11 +4636,34 @@ impl Filesystem for ProtonFs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        self.trash_child(parent.0, &name.to_string_lossy(), reply);
+        let name_str = name.to_string_lossy();
+        if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
+            let st = self.core.state.lock();
+            if let Some(entry) = st.entries.get(&ino)
+                && entry.node.is_folder() {
+                    reply.error(Errno::EISDIR);
+                    return;
+                }
+        }
+        self.trash_child(parent.0, &name_str, reply);
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        self.trash_child(parent.0, &name.to_string_lossy(), reply);
+        let name_str = name.to_string_lossy();
+        if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
+            let st = self.core.state.lock();
+            if let Some(entry) = st.entries.get(&ino) {
+                if !entry.node.is_folder() {
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
+                if st.has_children(ino) {
+                    reply.error(Errno::ENOTEMPTY);
+                    return;
+                }
+            }
+        }
+        self.trash_child(parent.0, &name_str, reply);
     }
 
     fn mkdir(
@@ -4720,6 +4771,15 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
+        // Ancestor cycle check: moving a directory into itself or one of its descendants is forbidden by POSIX (EINVAL).
+        {
+            let st = self.core.state.lock();
+            if let Some(entry) = st.entries.get(&ino)
+                && entry.node.is_folder() && st.is_ancestor_of(ino, newparent) {
+                    reply.error(Errno::EINVAL);
+                    return;
+                }
+        }
         // The destination has to be listed either way: the queued path pushes
         // the node into that listing, and the online one drops it to force a
         // re-enumeration.
@@ -5544,7 +5604,10 @@ pub fn mount(
     // Bind the control socket before the FUSE session takes over the thread. A
     // stale socket file from a previous run would block the bind, so clear it.
     let _ = std::fs::remove_file(control_socket);
-    let listener = UnixListener::bind(control_socket)?;
+    let old_umask = unsafe { libc::umask(0o77) };
+    let listener_res = UnixListener::bind(control_socket);
+    unsafe { libc::umask(old_umask) };
+    let listener = listener_res?;
     // Owner-only before anything can connect: a peer on this socket commands the
     // daemon's authenticated session without a credential of its own (B6).
     if let Err(e) = pdfs_core::config::restrict_socket(control_socket) {
@@ -6141,5 +6204,96 @@ mod tests {
         let new_len = 30u64;
         iv.add(old_len, new_len);
         assert_eq!(segs(&iv, 0, 30), vec![(0, 30, true)]);
+    }
+
+    use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
+    use proton_drive_rs::{Node, NodeKind};
+
+    #[test]
+    fn test_posix_unlink_and_rmdir_checks() {
+        let (mut st, _dir) = state_test_helper();
+        let parent = st.intern(0, node_helper("parent_uid", "none", "parent", true));
+        let folder_child = st.intern(
+            parent,
+            node_helper("folder_child", "parent_uid", "subfolder", true),
+        );
+        let file_child = st.intern(
+            parent,
+            node_helper("file_child", "parent_uid", "file.txt", false),
+        );
+        st.children.insert(parent, vec![folder_child, file_child]);
+
+        // unlink on folder -> EISDIR check
+        let folder_entry = st.entries.get(&folder_child).unwrap();
+        assert!(folder_entry.node.is_folder(), "folder_child is a folder");
+
+        // rmdir on file -> ENOTDIR check
+        let file_entry = st.entries.get(&file_child).unwrap();
+        assert!(!file_entry.node.is_folder(), "file_child is a file");
+
+        // rmdir on non-empty parent -> ENOTEMPTY check
+        assert!(st.has_children(parent), "parent is not empty");
+    }
+
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn state_test_helper() -> (crate::state::State, TestDir) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir_path = std::env::temp_dir().join(format!(
+            "pdfs-lib-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let db = pdfs_core::db::Db::open(&dir_path.join("cache.db")).unwrap();
+        let st = crate::state::State {
+            entries: std::collections::HashMap::new(),
+            by_uid: std::collections::HashMap::new(),
+            children: std::collections::HashMap::new(),
+            next_ino: 1,
+            active_writes: std::collections::HashMap::new(),
+            handles: std::collections::HashMap::new(),
+            next_fh: 1,
+            db: std::sync::Arc::new(db),
+        };
+        (st, TestDir(dir_path))
+    }
+
+    fn node_helper(id: &str, parent: &str, name: &str, is_dir: bool) -> Node {
+        let uid = NodeUid::new(VolumeId::from("vol"), LinkId::from(id));
+        let parent_uid = if parent == "none" {
+            None
+        } else {
+            Some(NodeUid::new(VolumeId::from("vol"), LinkId::from(parent)))
+        };
+        Node {
+            uid,
+            parent_uid,
+            name: name.to_string(),
+            kind: if is_dir {
+                NodeKind::Folder
+            } else {
+                NodeKind::File {
+                    media_type: "text/plain".into(),
+                    total_size_on_storage: 0,
+                    active_revision_state: None,
+                    claimed_size: Some(0),
+                    claimed_modification_time: None,
+                }
+            },
+            creation_time: 100,
+            modification_time: 100,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            verification: Default::default(),
+        }
     }
 }

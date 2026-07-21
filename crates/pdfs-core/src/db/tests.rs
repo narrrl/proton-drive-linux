@@ -1522,3 +1522,91 @@ fn db_contention_under_fuse_worker_load() {
         serial / total as u32
     );
 }
+
+#[test]
+fn test_db_has_children_and_trashed_filtering() {
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    let db = Db::open_in_memory().unwrap();
+    let parent_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("parent"));
+    let child_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("child"));
+
+    assert!(
+        !db.has_children(&parent_uid).unwrap(),
+        "no children initially"
+    );
+
+    let parent_node = Node {
+        uid: parent_uid.clone(),
+        parent_uid: None,
+        name: "parent".into(),
+        kind: NodeKind::Folder,
+        creation_time: 100,
+        modification_time: 100,
+        trashed: false,
+        is_shared: false,
+        is_shared_publicly: false,
+        signature_email: None,
+        verification: Default::default(),
+    };
+    db.upsert_node(&parent_node).unwrap();
+
+    let mut child_node = Node {
+        uid: child_uid.clone(),
+        parent_uid: Some(parent_uid.clone()),
+        name: "child.txt".into(),
+        kind: NodeKind::File {
+            media_type: "text/plain".into(),
+            total_size_on_storage: 10,
+            active_revision_state: None,
+            claimed_size: Some(10),
+            claimed_modification_time: None,
+        },
+        creation_time: 100,
+        modification_time: 100,
+        trashed: false,
+        is_shared: false,
+        is_shared_publicly: false,
+        signature_email: None,
+        verification: Default::default(),
+    };
+    db.upsert_node(&child_node).unwrap();
+
+    assert!(db.has_children(&parent_uid).unwrap(), "child node present");
+
+    // Trashing child removes it from active children
+    child_node.trashed = true;
+    db.upsert_node(&child_node).unwrap();
+
+    assert!(
+        !db.has_children(&parent_uid).unwrap(),
+        "trashed child ignored"
+    );
+}
+
+#[test]
+fn test_db_has_create_op() {
+    let db = Db::open_in_memory().unwrap();
+    let local_uid = "local~testnode12345678901234567890";
+
+    assert!(!db.has_create_op(local_uid).unwrap(), "no op initially");
+
+    let op = ops::PendingOp {
+        id: 0,
+        kind: ops::OP_CREATE.to_string(),
+        uid: local_uid.to_string(),
+        parent_uid: Some("vol~parent".to_string()),
+        name: Some("test.txt".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1000,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+
+    assert!(db.has_create_op(local_uid).unwrap(), "create op present");
+
+    db.delete_ops_for_uid(local_uid).unwrap();
+    assert!(!db.has_create_op(local_uid).unwrap(), "op deleted");
+}

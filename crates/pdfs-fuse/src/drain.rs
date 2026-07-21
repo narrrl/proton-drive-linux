@@ -490,7 +490,7 @@ impl Core {
         uid: &NodeUid,
         meta: &StagedWrite,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let Some(base) = meta.based_on else {
+        let Some(ref base) = meta.based_on else {
             return Ok(None);
         };
         let Some(node) = self.fetch_node_remote(uid)? else {
@@ -870,12 +870,13 @@ impl Core {
         let base = Baseline {
             mtime: sealed.modification_time,
             size: node_size(sealed),
+            hash: None,
         };
         let mut pending = self.pending.lock();
         let Some(p) = pending.get_mut(uid) else {
             return false;
         };
-        p.meta.based_on = Some(base);
+        p.meta.based_on = Some(base.clone());
         match serde_json::to_string(&p.meta) {
             Ok(json) => {
                 if let Err(e) = self.db.update_op_meta(&uid.to_string(), OP_REVISION, &json) {

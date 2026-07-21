@@ -53,6 +53,27 @@ impl Intervals {
         }
     }
 
+    /// Punch a hole in `[start, end)`, removing authored status for this range.
+    pub(crate) fn punch_hole(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let mut next = Vec::new();
+        for &(s, e) in &self.0 {
+            if e <= start || s >= end {
+                next.push((s, e));
+            } else {
+                if s < start {
+                    next.push((s, start));
+                }
+                if e > end {
+                    next.push((end, e));
+                }
+            }
+        }
+        self.0 = next;
+    }
+
     /// Split `[start, end)` into contiguous `(s, e, authored)` segments, in
     /// order. `authored == true` means the bytes live in the scratch file;
     /// `false` means they must come from the remote base (or are a hole).
@@ -197,6 +218,39 @@ impl State {
             .into_iter()
             .map(|node| self.intern_mem(parent, node))
             .collect()
+    }
+
+    /// Check if a directory inode has any child nodes in memory or in the database.
+    pub(crate) fn has_children(&self, parent: u64) -> bool {
+        if let Some(kids) = self.children.get(&parent)
+            && !kids.is_empty() {
+                return true;
+            }
+        if let Some(entry) = self.entries.get(&parent)
+            && let Ok(has_kids) = self.db.has_children(&entry.uid) {
+                return has_kids;
+            }
+        false
+    }
+
+    /// Check if `ancestor_ino` is `target_ino` or an ancestor of `target_ino` (for rename cycle prevention).
+    pub(crate) fn is_ancestor_of(&self, ancestor_ino: u64, mut target_ino: u64) -> bool {
+        if ancestor_ino == target_ino {
+            return true;
+        }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(target_ino);
+        while let Some(entry) = self.entries.get(&target_ino) {
+            let parent = entry.parent;
+            if parent == ancestor_ino {
+                return true;
+            }
+            if parent == 0 || !visited.insert(parent) {
+                break;
+            }
+            target_ino = parent;
+        }
+        false
     }
 
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
@@ -496,5 +550,75 @@ mod tests {
             "and the listing it would serve is the moved file's absence, \
              with no way to notice anything else changed"
         );
+    }
+
+    #[test]
+    fn test_intervals_punch_hole_middle() {
+        let mut iv = Intervals::default();
+        iv.add(0, 100);
+        iv.punch_hole(30, 50);
+        assert_eq!(iv.0, vec![(0, 30), (50, 100)]);
+    }
+
+    #[test]
+    fn test_intervals_punch_hole_edges() {
+        let mut iv = Intervals::default();
+        iv.add(0, 100);
+        iv.punch_hole(0, 20);
+        assert_eq!(iv.0, vec![(20, 100)]);
+
+        iv.punch_hole(80, 100);
+        assert_eq!(iv.0, vec![(20, 80)]);
+    }
+
+    #[test]
+    fn test_intervals_punch_hole_full() {
+        let mut iv = Intervals::default();
+        iv.add(0, 100);
+        iv.punch_hole(0, 100);
+        assert!(iv.0.is_empty());
+    }
+
+    #[test]
+    fn test_is_ancestor_of_hierarchy() {
+        let (mut st, _dir) = state();
+        let root = st.intern(0, node("root_id", "none", "root", true));
+        let p1 = st.intern(root, node("p1_id", "root_id", "p1", true));
+        let p2 = st.intern(p1, node("p2_id", "p1_id", "p2", true));
+        let child = st.intern(p2, node("child_id", "p2_id", "child", true));
+
+        assert!(st.is_ancestor_of(root, root), "self is ancestor");
+        assert!(st.is_ancestor_of(root, p1), "root is ancestor of p1");
+        assert!(
+            st.is_ancestor_of(root, child),
+            "root is ancestor of deep child"
+        );
+        assert!(st.is_ancestor_of(p1, child), "p1 is ancestor of deep child");
+        assert!(
+            !st.is_ancestor_of(child, root),
+            "child is not ancestor of root"
+        );
+        assert!(!st.is_ancestor_of(child, p1), "child is not ancestor of p1");
+    }
+
+    #[test]
+    fn test_state_has_children_mem_and_db() {
+        let (mut st, _dir) = state();
+        let folder = st.intern_mem(0, node("dir_uid", "none", "dir", true));
+        assert!(!st.has_children(folder), "initially empty");
+
+        // Memory-only children (using intern_mem so DB is not populated yet)
+        let f1 = st.intern_mem(folder, node("file1_uid", "dir_uid", "file1.txt", false));
+        st.children.insert(folder, vec![f1]);
+        assert!(st.has_children(folder), "has child in memory");
+
+        st.children.insert(folder, vec![]);
+        assert!(!st.has_children(folder), "cleared memory children");
+
+        // DB children
+        st.db
+            .upsert_node(&node("file2_uid", "dir_uid", "file2.txt", false))
+            .unwrap();
+        assert!(st.has_children(folder), "has child in db");
     }
 }

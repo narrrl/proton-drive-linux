@@ -153,10 +153,12 @@ pub struct StagedWrite {
 /// The identity of a remote revision, as far as we can observe it: a file whose
 /// size and mtime both still match the ones a queued change was made against has
 /// not been rewritten by anyone else in the meantime.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     pub mtime: i64,
     pub size: u64,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 /// Content cache rooted at a directory, with a sibling pin-registry file.
@@ -431,7 +433,12 @@ impl ContentCache {
         // 64-char hex key with no `.`, so this appends rather than replaces.
         // `store_thumbnail` cannot use the same idiom — see the note there.
         let tmp = blob.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &blob)?;
         let meta = serde_json::to_vec(&Meta { mtime, size })?;
         std::fs::write(self.meta_path(uid), meta)?;
@@ -463,6 +470,9 @@ impl ContentCache {
         let _ = std::fs::remove_file(&tmp);
         if std::fs::hard_link(src, &tmp).is_err() {
             std::fs::copy(src, &tmp)?;
+        }
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_all();
         }
         let bytes = std::fs::metadata(&tmp)?.len();
         std::fs::rename(&tmp, &blob)?;
@@ -526,7 +536,12 @@ impl ContentCache {
         let tmp = self
             .block_dir
             .join(format!("{}.b{idx}.tmp", Self::key(uid)));
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(
             self.block_meta(uid, idx),
@@ -1759,6 +1774,7 @@ mod tests {
             based_on: Some(Baseline {
                 mtime: 100,
                 size: 40,
+                hash: None,
             }),
         };
         let staged = c.stage_write(&meta, &scratch).unwrap();
