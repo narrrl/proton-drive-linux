@@ -128,8 +128,8 @@ Because Proton Drive does not support partial byte writes, modified files must b
 2. **Close/Release (`queue_revision`):** When the application closes the file descriptor, the daemon:
    - Fetches any untouched gaps from the remote base file to compile the full file.
    - Moves the scratch file to `staging` under a `{uid}-{millis}-{counter}` name, so a staged blob can be tied back to its node without consulting the database.
-   - Queues a pending database operation (`PendingOp`).
-3. **Async Drain Thread (`run_pending_drain`):** The background drain worker picks up the database operations queue, handles revisions uploads, resolves conflicts, and cleans up staging files.
+   - Queues a pending database operation (`PendingOp`). For `OP_REVISION` ops, execution is debounced by 2 seconds (`DRAIN_REVISION_DEBOUNCE = 2s`) to give rapid follow-up writes (e.g. `aria2c` preallocation followed by writing) time to supersede the staged blob before network transmission.
+3. **Async Drain Thread (`run_pending_drain`):** The background drain worker picks up the database operations queue, handles revision uploads, resolves conflicts, and cleans up staging files. Upon landing a revision upload (`refresh_after_upload`), it rebaselines both still-queued ops (`rebaseline_pending`) and open write handles targeting the same node to prevent false self-conflict copies on subsequent writes.
 
 ```mermaid
 sequenceDiagram

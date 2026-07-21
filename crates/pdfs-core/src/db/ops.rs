@@ -347,6 +347,28 @@ impl Db {
         Ok(op)
     }
 
+    /// The earliest `next_attempt_at` among all queued ops, or `None` if the
+    /// queue is empty. Used by the drain loop to sleep exactly until the next
+    /// debounced or backed-off op becomes eligible rather than waiting the full
+    /// idle-poll interval.
+    pub fn earliest_due_at(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock();
+        let ts: Option<i64> = conn
+            .query_row(
+                &format!(
+                    "SELECT MIN(next_attempt_at) FROM pending_op \
+                     WHERE parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~'",
+                    v = LOCAL_VOLUME,
+                    n = LOCAL_VOLUME.len() + 1,
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(ts)
+    }
+
     /// Every queued op, oldest first. For status read-outs and the CLI — the
     /// drain wants [`next_due_op`](Self::next_due_op) instead.
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {

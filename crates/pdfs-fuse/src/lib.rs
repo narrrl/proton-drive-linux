@@ -106,6 +106,15 @@ const DRAIN_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// directly on a new write or a reconnect, so this only bounds how late a
 /// backoff can fire.
 const DRAIN_IDLE_POLL: Duration = Duration::from_secs(30);
+/// Grace period before a queued revision becomes eligible for draining.
+///
+/// Tools like aria2c preallocate a file (truncate to target size) and then write
+/// the real content, sometimes across separate open/close cycles. Without a
+/// grace period the first close drains immediately, uploading the preallocated
+/// (mostly-zero) content; the second close then finds its baseline stale and
+/// creates a conflict copy of itself. Holding the op for a short window gives
+/// the follow-up write time to supersede it.
+const DRAIN_REVISION_DEBOUNCE: Duration = Duration::from_secs(2);
 
 const ONLINE_PROBE_MIN: Duration = Duration::from_secs(5);
 const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
@@ -711,6 +720,15 @@ impl Core {
                 error!(uid = %meta.uid, "recovered write has an unparseable uid; keeping bytes");
                 continue;
             };
+
+            // If the write is incomplete and an earlier edit is still queued, merging it
+            // now would use the wrong remote base. enqueue_staged_write would abandon it
+            // to staging; keep it in recovery instead so the drain loop can queue it
+            // once the queue clears.
+            if !meta.complete && self.pending.lock().contains_key(&uid) {
+                continue;
+            }
+
             // The inode is only used to stamp the in-memory tree with the new
             // size, and nothing is interned this early — `hydrate` reads the
             // size back off `pending` when the node is first looked up, so 0
@@ -1934,7 +1952,7 @@ impl Core {
                 created_at: now_millis(),
                 attempts: 0,
                 last_error: None,
-                next_attempt_at: 0,
+                next_attempt_at: now_millis() + DRAIN_REVISION_DEBOUNCE.as_millis() as i64,
             };
             let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
                 error!(%uid, error = %e, "queueing upload failed");
@@ -4422,6 +4440,49 @@ impl Filesystem for ProtonFs {
                 reply.attr(&TTL, &attr);
             }
             None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let new_end = offset.saturating_add(length);
+        let keep_size = (mode & 1) != 0; // FALLOC_FL_KEEP_SIZE
+
+        let res = {
+            let mut st = self.core.state.lock();
+            match st.handles.get_mut(&fh.0) {
+                Some(h) => {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = h.file.as_raw_fd();
+                    let ret = unsafe { libc::fallocate(fd, mode, offset as i64, length as i64) };
+                    if ret == 0 {
+                        if !keep_size && new_end > h.len {
+                            h.written.add(h.len, new_end);
+                            h.len = new_end;
+                            h.dirty = true;
+                            st.set_size(ino.0, new_end);
+                        }
+                        Ok(())
+                    } else {
+                        // In theory we could map errno to fuser::Errno, but EIO is safe
+                        Err(Errno::EIO)
+                    }
+                }
+                None => Err(Errno::EBADF),
+            }
+        };
+
+        match res {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 

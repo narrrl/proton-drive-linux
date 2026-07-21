@@ -110,9 +110,10 @@ fn extract_token(raw: &str) -> Option<String> {
     // If the message was stringified twice (e.g. raw is a double-quoted JSON string),
     // parse the inner string.
     if let Some(inner) = value.as_str()
-        && let Ok(parsed) = serde_json::from_str(inner) {
-            value = parsed;
-        }
+        && let Ok(parsed) = serde_json::from_str(inner)
+    {
+        value = parsed;
+    }
     // The payload is nested under `payload` and the message names itself in
     // `type`; both spellings of the success type have shipped.
     let kind = value.get("type")?.as_str()?;

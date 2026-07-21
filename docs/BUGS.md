@@ -1138,3 +1138,24 @@ discarded its temp files. B15 as originally filed does not exist.
 Both are folder-identity problems rather than the mount disagreement originally
 suspected. Renamed scope accordingly; the "two mounts disagree" framing is
 retracted.
+
+---
+
+## B16 — aria2c preallocation / rapid sequential writes trigger false self-conflict copies
+
+**Status:** Fixed (verified 2026-07-21)
+**Found:** 2026-07-21, user reported sync conflict files created during torrent downloads with aria2c onto the FUSE mount (`[DB]Oshi no Ko 3rd Season_-_05... (sync-conflict 1784644482).mkv`).
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/drain.rs`, `crates/pdfs-core/src/db/ops.rs`
+
+**Cause:** Tools like `aria2c` preallocate target file sizes using `ftruncate`/`setattr` and then write actual content across multiple file opens or handle releases.
+1. First close (e.g. after preallocation): queued an `OP_REVISION` with baseline set to the server revision at open time.
+2. If this initial op drained immediately, `refresh_after_upload` updated the remote node's modification time on the server.
+3. Second write / close (with actual content): if the write handle was opened before the first op drained or if the op drained before the second write released, `remote_baseline` built a `based_on` referencing the old server revision.
+4. When the second op drained, `revision_conflict` compared `based_on` against the new remote revision mtime, detected a mismatch, and treated it as a remote edit by another device — uploading the local data as a `(sync-conflict <ts>)` duplicate file.
+
+**Fix:** A two-part defense:
+1. **Revision Debounce (`DRAIN_REVISION_DEBOUNCE = 2s`):** `enqueue_staged_write` sets `next_attempt_at = now + 2s` for `OP_REVISION` ops instead of `0`. Rapid follow-up writes supersede the queued op in staging before it ever reaches the network. Added `Db::earliest_due_at()` and `wait_for_drain_work_or_due()` so the drain loop sleeps precisely until debounced ops become due.
+2. **Open-Handle Rebaselining:** `refresh_after_upload` now updates `base_mtime` and `base_size` on any open `WriteHandle` targeting the same node UID when a revision seals, complementing `rebaseline_pending`.
+
+**Verified:** Clean build and 200/200 workspace tests passing.
+

@@ -23,6 +23,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
@@ -62,7 +63,10 @@ impl Core {
             let due = self.db.next_due_op(now).unwrap_or_default();
 
             let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
-                self.wait_for_drain_work();
+                self.recover_fsynced_writes();
+                // A debounced or backed-off op may be waiting: sleep only
+                // until it becomes due rather than the full idle-poll.
+                self.wait_for_drain_work_or_due();
                 continue;
             };
             if let Err(e) = self.drain_op(&op) {
@@ -93,6 +97,25 @@ impl Core {
         let mut woken = lock.lock();
         if !*woken {
             cv.wait_for(&mut woken, DRAIN_IDLE_POLL);
+        }
+        *woken = false;
+    }
+
+    /// Like [`wait_for_drain_work`](Self::wait_for_drain_work), but first
+    /// checks whether a debounced or backed-off op is due before the idle-poll
+    /// ceiling. A 2-second debounce must not sleep 30 seconds.
+    fn wait_for_drain_work_or_due(&self) {
+        let timeout = match self.db.earliest_due_at() {
+            Ok(Some(ts)) => {
+                let remaining = (ts - now_millis()).max(0) as u64;
+                Duration::from_millis(remaining).min(DRAIN_IDLE_POLL)
+            }
+            _ => DRAIN_IDLE_POLL,
+        };
+        let (lock, cv) = &*self.drain_wake;
+        let mut woken = lock.lock();
+        if !*woken {
+            cv.wait_for(&mut woken, timeout);
         }
         *woken = false;
     }
@@ -780,6 +803,28 @@ impl Core {
                 return;
             }
         };
+        // Rebase any *open* write handles targeting this node. A handle opened
+        // before this upload carries a stale base — its `base_mtime`/`base_size`
+        // name the revision we just replaced. Without this update,
+        // `remote_baseline` will build a `based_on` from those stale values, the
+        // drain will compare them against the revision we sealed, and the write
+        // will be diverted into a conflict copy of itself.
+        //
+        // This is the open-handle counterpart of `rebaseline_pending`, which
+        // covers the same gap for *queued* ops.
+        {
+            let sealed_mtime = node.modification_time;
+            let sealed_size = node_size(&node);
+            let mut st = self.state.lock();
+            for h in st.handles.values_mut() {
+                if h.uid == *uid {
+                    h.base_mtime = sealed_mtime;
+                    h.base_size = sealed_size;
+                    debug!(%uid, mtime = sealed_mtime, size = sealed_size,
+                           "rebased open write handle onto the revision just uploaded");
+                }
+            }
+        }
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
         // this overwrites it with the revision the server actually holds.
