@@ -19,7 +19,7 @@ Conventions:
 **Verified:** the exact repro below on the new daemon — `mv` returns 0, the file is
 present in the destination listing and reads back its content. Previously it was in
 neither directory.
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `Filesystem::rename`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `Filesystem::rename`
 
 `rename` ended with:
 
@@ -323,7 +323,7 @@ Each part of the fix is separately visible in the traces:
 
 ### Secondary finding (still open): `lookup` is O(n) per name
 
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `serve_lookup`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `serve_lookup`
 
 `serve_lookup` linear-scans the parent's children comparing names, and with no
 `readdirplus` that is one `lookup` per child — O(n²) name comparisons under the
@@ -358,7 +358,7 @@ judgement still holds now the real cause is known:
 `docs/ARCHITECTURE.md` §8. Not from a report — from checking a claim before
 asserting it in a doc. I had written "their default 0700 permissions protect
 them", went to verify, and found we set no modes at all.
-**Where:** `crates/pdfs-fuse/src/lib.rs` (`UnixListener::bind(control_socket)`),
+**Where:** `crates/pdfs-fuse/src/mount.rs` (`UnixListener::bind(control_socket)`),
 `crates/pdfs-core/src/config.rs` (`create_dir_all` on state/cache dirs)
 
 `grep -rn "set_permissions\|from_mode" crates/pdfs-core/src crates/pdfs-fuse/src`
@@ -817,7 +817,7 @@ rsync: [receiver] rename ".../.Buunshin - heimwee (Original Mix).wav.b0akm3"
     -> ".../Buunshin - heimwee (Original Mix).wav": Input/output error (5)
 ```
 
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `Filesystem::rename` (~4380)
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `Filesystem::rename`
 
 Daemon log, one per failed file:
 
@@ -1187,7 +1187,7 @@ retracted.
 
 **Status:** Fixed (verified 2026-07-22)  
 **Found:** 2026-07-21, multi-agent filesystem safety audit (`audit_bugs.md` CRIT-01)  
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `ProtonFs::unlink`, `ProtonFs::rmdir`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::unlink`, `ProtonFs::rmdir`
 
 **Cause:** `unlink` on directories and `rmdir` on non-empty directories bypassed POSIX checks and called `trash_child` directly, silently deleting remote subtrees.
 
@@ -1243,7 +1243,7 @@ switching back to `mirror` clears the baseline and restores the local copy.
 
 **Status:** Fixed (verified 2026-07-22)  
 **Found:** 2026-07-21, multi-agent FUSE audit (`audit_bugs.md` HIGH-01)  
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `ProtonFs::fallocate`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::fallocate`
 
 **Cause:** `FALLOC_FL_PUNCH_HOLE` zeroed scratch blocks but removed their
 `WriteHandle::written` authored status. Revision assembly therefore classified
@@ -1286,7 +1286,7 @@ silently undoing the hole at commit.
 
 **Status:** Fixed (verified 2026-07-21)  
 **Found:** 2026-07-21, multi-agent FUSE audit (`audit_bugs.md` HIGH-04)  
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `ProtonFs::rename`, `crates/pdfs-fuse/src/state.rs:L237`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::rename`, `crates/pdfs-fuse/src/state.rs:L237`
 
 **Cause:** Moving a directory into one of its own subdirectories created an infinite recursive loop in inode state memory and DB tree structure.
 
@@ -1462,7 +1462,7 @@ added later, but it must retain the row and blob.
 
 **Status:** Fixed in code (unverified on a live mount, 2026-07-22)
 **Found:** 2026-07-22, deep FUSE/POSIX audit
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `ProtonFs::trash_child`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::trash_child`
 
 **Cause:** `trash_child` called `forget_or_unlink` before the online
 `trash_nodes` request. If Drive rejected or failed the request, FUSE returned
@@ -1558,7 +1558,7 @@ retain the baseline and increment `Outcome.errors`.
 
 **Status:** Open
 **Found:** 2026-07-22, FUSE/POSIX audit
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `ProtonFs::serve_readdir`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::serve_readdir`
 
 **Cause:** `readdir` rebuilds a live vector for every call and uses its array
 index as the continuation cookie. A namespace mutation between pages can shift
@@ -1574,7 +1574,7 @@ small reply pages and mutation between calls.
 
 **Status:** Open
 **Found:** 2026-07-22, daemon lifecycle audit
-**Where:** `crates/pdfs-fuse/src/lib.rs`, mount lifecycle; drain/index/sync loops
+**Where:** `crates/pdfs-fuse/src/mount.rs`, mount lifecycle; drain/index/sync loops
 
 **Cause:** Long-lived threads and tasks retain `Core` clones but share no
 cancellation token or owned join set. Unmount removes the session/socket without
@@ -1584,5 +1584,4 @@ continue DB/client activity after teardown.
 **Required fix/test:** Add shared cancellation, interruptible waits, owned join
 handles, and ordered shutdown. Repeated mount/unmount tests should return thread
 counts to baseline and observe no post-unmount DB work.
-
 
