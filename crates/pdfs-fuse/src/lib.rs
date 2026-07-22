@@ -35,6 +35,7 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
@@ -54,13 +55,15 @@ use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
-    SearchHit, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection,
+    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
+    TransferDirection,
 };
 use pdfs_core::db::{
     Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, StoredNode,
     StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
+use pdfs_core::search::relevance_score;
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
@@ -1524,6 +1527,27 @@ impl Core {
         Ok(out.into_inner())
     }
 
+    /// Download a whole file directly into `out`, without retaining its
+    /// plaintext in memory. This is the disk-backed twin of
+    /// [`Core::download_file_tracked`], and preserves the same transfer
+    /// accounting while allowing callers that only need an on-disk file to
+    /// keep memory use independent of file size.
+    fn download_file_tracked_to<W: Write>(
+        &self,
+        uid: &NodeUid,
+        name: &str,
+        total: u64,
+        out: W,
+    ) -> std::result::Result<W, ProtonError> {
+        let guard = self
+            .transfers
+            .begin(name, uid.to_string(), TransferDirection::Download, total);
+        let mut out = CountingWriter::new(out, &guard);
+        self.rt
+            .block_on(self.client.download_file_to(uid, &mut out))?;
+        Ok(out.into_inner())
+    }
+
     /// Like [`download_file_tracked`] for a photo, streaming through the photos
     /// client's [`download_photo_to`].
     ///
@@ -1778,6 +1802,7 @@ impl Core {
                 modified: h.node.modification_time,
                 pinned: self.cache.is_pinned(&h.node.uid),
                 uid: h.node.uid.to_string(),
+                score: 0,
             })
             .collect())
     }
@@ -1798,8 +1823,93 @@ impl Core {
                 is_dir: h.is_dir,
                 size: h.size.max(0) as u64,
                 modified: h.mtime,
+                score: 0,
             })
             .collect())
+    }
+
+    /// Search both prompt sources with identical query and per-source limits.
+    /// Keeping the composition in the daemon core gives every control surface
+    /// the same semantics while preserving the legacy source-specific methods.
+    fn search_v2(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> CoreResult<(Vec<SearchHit>, Vec<LocalHit>)> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        // Candidate generation is intentionally broader than the final result
+        // cap: filtering and fuzzy rejection happen below, so limiting at the
+        // SQLite boundary to `limit` would recreate the old empty-filter bug.
+        let candidate_limit = limit.saturating_mul(10).clamp(100, 1_000);
+        let mut drive_hits = if filters.sources.contains(&SearchSource::Drive) {
+            self.db
+                .search_candidates(query, candidate_limit)
+                .map_err(|e| CoreError::from_api(&e, "search candidates"))?
+                .into_iter()
+                .filter(|hit| filters.kind.accepts(&hit.node.name, hit.node.is_folder()))
+                .filter_map(|hit| {
+                    let parent = Path::new(&hit.path)
+                        .parent()
+                        .map_or_else(String::new, |path| path.display().to_string());
+                    let pinned = self.cache.is_pinned(&hit.node.uid);
+                    let score = relevance_score(query, &hit.node.name, &parent)?
+                        + if pinned { 250 } else { 0 };
+                    Some(SearchHit {
+                        name: hit.node.name.clone(),
+                        path: hit.path,
+                        is_dir: hit.node.is_folder(),
+                        size: node_size(&hit.node),
+                        modified: hit.node.modification_time,
+                        pinned,
+                        uid: hit.node.uid.to_string(),
+                        score,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut local_hits = if filters.sources.contains(&SearchSource::Local) {
+            self.db
+                .search_local_candidates(query, candidate_limit)
+                .map_err(|e| CoreError::from_api(&e, "local search candidates"))?
+                .into_iter()
+                .filter(|hit| filters.kind.accepts(&hit.name, hit.is_dir))
+                .filter_map(|hit| {
+                    let parent = Path::new(&hit.path)
+                        .parent()
+                        .map_or_else(String::new, |path| path.display().to_string());
+                    Some(LocalHit {
+                        score: relevance_score(query, &hit.name, &parent)?,
+                        name: hit.name,
+                        path: hit.path,
+                        is_dir: hit.is_dir,
+                        size: hit.size.max(0) as u64,
+                        modified: hit.mtime,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drive_hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        local_hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        drive_hits.truncate(limit);
+        local_hits.truncate(limit);
+        Ok((drive_hits, local_hits))
     }
 
     /// A page of the photos timeline (newest first), sliced out of the DB.
@@ -1847,12 +1957,43 @@ impl Core {
         if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
             return Ok(p);
         }
-        let bytes = self
-            .download_file_tracked(&uid, &name, size)
-            .map_err(|e| CoreError::from_api(&e, "download"))?;
-        self.cache
-            .store(&uid, mtime, size, &bytes)
-            .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
+
+        // Keep the temporary file beside the final cache blob. `store_file`
+        // can then adopt it with a hard link and atomic rename, while the SDK
+        // streams decrypted blocks to disk instead of building a file-sized
+        // `Vec<u8>`. A unique name also keeps concurrent opens of the same node
+        // from sharing a partially written staging file.
+        static OPEN_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = OPEN_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.cache.content_path(&uid).with_extension(format!(
+            "open-{}-{}-{seq}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| CoreError::internal(format!("create download temp: {e}")))?;
+        let file = match self.download_file_tracked_to(&uid, &name, size, file) {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(CoreError::from_api(&e, "download"));
+            }
+        };
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::internal(format!("sync download temp: {e}")));
+        }
+        if let Err(e) = self.cache.store_file(&uid, mtime, size, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::internal(format!("cache store: {e}")));
+        }
+        let _ = std::fs::remove_file(&tmp);
         Ok(self.cache.content_path(&uid))
     }
 

@@ -101,6 +101,19 @@ pub enum Request {
     /// Independent of [`Request::Search`] so a front-end can fire both at once and
     /// render whichever lands first. Replies with [`Response::LocalResults`].
     SearchLocal { query: String, limit: usize },
+    /// Search both the Drive metadata index and the local-file index in one
+    /// round-trip. This is the preferred prompt API; the two legacy search
+    /// requests remain available for older clients. `limit` applies to each
+    /// source independently. `filters` is applied before limiting, so selecting
+    /// (for example) images cannot hide valid matches below an unfiltered top
+    /// `limit`. Older clients omit it and therefore search both sources and all
+    /// kinds. Replies with [`Response::SearchResultsV2`].
+    SearchV2 {
+        query: String,
+        limit: usize,
+        #[serde(default)]
+        filters: SearchFilters,
+    },
     /// Rename a file or folder. `path` is mountpoint-relative; `new_name` is a
     /// single path component (no separators). Replies with [`Response::Ok`].
     Rename { path: String, new_name: String },
@@ -665,6 +678,10 @@ pub struct SearchHit {
     pub pinned: bool,
     /// Node uid in `volume~link` form.
     pub uid: String,
+    /// Relevance assigned by the daemon. Higher scores sort first. Legacy
+    /// daemons omit it, in which case clients retain the daemon's result order.
+    #[serde(default)]
+    pub score: i64,
 }
 
 /// One hit in a [`Request::SearchLocal`] result: a file on this machine, outside
@@ -679,6 +696,107 @@ pub struct LocalHit {
     pub size: u64,
     /// Modification time, epoch seconds.
     pub modified: i64,
+    /// Relevance assigned by the daemon. Higher scores sort first. Legacy
+    /// daemons omit it, in which case clients retain the daemon's result order.
+    #[serde(default)]
+    pub score: i64,
+}
+
+/// A searchable corpus in [`Request::SearchV2`]. Kept explicit on the wire so
+/// future sources can be added without multiplying request variants.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchSource {
+    Drive,
+    Local,
+}
+
+/// Coarse result kind used by the prompt's facets. Classification belongs in
+/// core/the daemon and must happen before the per-source limit is applied.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchKind {
+    #[default]
+    All,
+    Folders,
+    Documents,
+    Images,
+    Media,
+}
+
+impl SearchKind {
+    /// Classify a result before the caller applies its final limit. This stays
+    /// beside the wire enum so every front end and both search corpora agree.
+    pub fn accepts(self, name: &str, is_dir: bool) -> bool {
+        if self == Self::All {
+            return true;
+        }
+        if self == Self::Folders {
+            return is_dir;
+        }
+        if is_dir {
+            return false;
+        }
+        let extension = std::path::Path::new(name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match self {
+            Self::Documents => matches!(
+                extension.as_str(),
+                "pdf"
+                    | "doc"
+                    | "docx"
+                    | "odt"
+                    | "rtf"
+                    | "txt"
+                    | "md"
+                    | "xls"
+                    | "xlsx"
+                    | "ods"
+                    | "csv"
+                    | "ppt"
+                    | "pptx"
+                    | "odp"
+                    | "epub"
+            ),
+            Self::Images => matches!(
+                extension.as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "avif" | "heic" | "tiff"
+            ),
+            Self::Media => {
+                PhotoKind::classify(Some(name), None) == PhotoKind::Video
+                    || matches!(
+                        extension.as_str(),
+                        "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac"
+                    )
+            }
+            Self::All | Self::Folders => unreachable!(),
+        }
+    }
+}
+
+/// Optional constraints for a unified search. The default deliberately means
+/// the original SearchV2 behaviour, preserving old JSON requests.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SearchFilters {
+    /// Sources to query. An explicit empty list searches neither source.
+    #[serde(default = "default_search_sources")]
+    pub sources: Vec<SearchSource>,
+    #[serde(default)]
+    pub kind: SearchKind,
+}
+
+impl Default for SearchFilters {
+    fn default() -> Self {
+        Self {
+            sources: default_search_sources(),
+            kind: SearchKind::All,
+        }
+    }
+}
+
+fn default_search_sources() -> Vec<SearchSource> {
+    vec![SearchSource::Drive, SearchSource::Local]
 }
 
 /// What kind of media a timeline entry is, so the Photos page can split into
@@ -947,6 +1065,14 @@ pub enum Response {
     /// is true while a scan of the machine is still running, so a front-end can
     /// say "still indexing" instead of "no matches" on a cold first launch.
     LocalResults { hits: Vec<LocalHit>, indexing: bool },
+    /// Drive and local-file search results returned together (reply to
+    /// [`Request::SearchV2`]). `local_indexing` distinguishes a genuinely empty
+    /// local result set from one observed while the initial scan is running.
+    SearchResultsV2 {
+        drive_hits: Vec<SearchHit>,
+        local_hits: Vec<LocalHit>,
+        local_indexing: bool,
+    },
     /// A snapshot of what the daemon is working on (reply to
     /// [`Request::GetQueueStatus`]): `items` are byte-moving transfers, `jobs`
     /// the longer non-transfer work around them (scans, folder skeletons, the
@@ -1104,6 +1230,58 @@ mod tests {
         assert_eq!(PhotoKind::classify(Some("x.jpg"), Some("video/mp4")), Photo);
     }
 
+    /// Keep every extension accepted by the shared classifier covered.  Drive
+    /// activation uses this classification before it knows whether opening a
+    /// file should stream through FUSE or materialise a complete cache entry;
+    /// silently dropping one of these formats would therefore regress large
+    /// videos back to the expensive whole-file path.
+    #[test]
+    fn photo_kind_recognises_every_supported_video_extension() {
+        for ext in VIDEO_EXTS {
+            let lower = format!("movie.{ext}");
+            let upper = format!("MOVIE.{}", ext.to_ascii_uppercase());
+            assert_eq!(
+                PhotoKind::classify(Some(&lower), None),
+                PhotoKind::Video,
+                "lower-case .{ext}"
+            );
+            assert_eq!(
+                PhotoKind::classify(Some(&upper), None),
+                PhotoKind::Video,
+                "upper-case .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn photo_kind_uses_video_mime_only_when_extension_is_not_authoritative() {
+        use PhotoKind::*;
+
+        assert_eq!(
+            PhotoKind::classify(Some("extensionless"), Some("video/mp4; codecs=avc1")),
+            Video
+        );
+        assert_eq!(
+            PhotoKind::classify(Some("clip.unknown"), Some("video/x-matroska")),
+            Video
+        );
+        // Audio is not a video and must not accidentally take the video
+        // streaming policy merely because both are time-based media.
+        assert_eq!(
+            PhotoKind::classify(Some("recording"), Some("audio/flac")),
+            Photo
+        );
+        // A known still/raw suffix remains authoritative over server metadata.
+        assert_eq!(
+            PhotoKind::classify(Some("poster.AVIF"), Some("video/mp4")),
+            Photo
+        );
+        assert_eq!(
+            PhotoKind::classify(Some("negative.NEF"), Some("video/mp4")),
+            Raw
+        );
+    }
+
     #[test]
     fn photo_kind_i64_round_trips() {
         for k in [PhotoKind::Photo, PhotoKind::Video, PhotoKind::Raw] {
@@ -1165,6 +1343,149 @@ mod tests {
             // Round-trip is lossless: re-serializing yields the same bytes.
             assert_eq!(line, serde_json::to_string(&back).unwrap());
         }
+    }
+
+    #[test]
+    fn unified_search_request_and_response_roundtrip() {
+        let request = Request::SearchV2 {
+            query: "quarterly report".into(),
+            limit: 37,
+            filters: SearchFilters::default(),
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            line,
+            r#"{"SearchV2":{"query":"quarterly report","limit":37,"filters":{"sources":["Drive","Local"],"kind":"All"}}}"#
+        );
+        let decoded: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+
+        let response = Response::SearchResultsV2 {
+            drive_hits: vec![SearchHit {
+                name: "report.pdf".into(),
+                path: "Work/report.pdf".into(),
+                is_dir: false,
+                size: 12,
+                modified: 123,
+                pinned: true,
+                uid: "vol~link".into(),
+                score: 985,
+            }],
+            local_hits: vec![LocalHit {
+                name: "notes.txt".into(),
+                path: "/home/me/notes.txt".into(),
+                is_dir: false,
+                size: 7,
+                modified: 456,
+                score: 720,
+            }],
+            local_indexing: true,
+        };
+        let line = serde_json::to_string(&response).unwrap();
+        assert!(!line.contains('\n'));
+        let decoded: Response = serde_json::from_str(&line).unwrap();
+        match decoded {
+            Response::SearchResultsV2 {
+                drive_hits,
+                local_hits,
+                local_indexing,
+            } => {
+                assert_eq!(drive_hits.len(), 1);
+                assert_eq!(drive_hits[0].uid, "vol~link");
+                assert_eq!(drive_hits[0].score, 985);
+                assert_eq!(local_hits.len(), 1);
+                assert_eq!(local_hits[0].path, "/home/me/notes.txt");
+                assert_eq!(local_hits[0].score, 720);
+                assert!(local_indexing);
+            }
+            other => panic!("expected unified search results, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_v2_legacy_wire_form_gets_compatible_defaults() {
+        let decoded: Request =
+            serde_json::from_str(r#"{"SearchV2":{"query":"old client","limit":20}}"#).unwrap();
+        match decoded {
+            Request::SearchV2 {
+                query,
+                limit,
+                filters,
+            } => {
+                assert_eq!(query, "old client");
+                assert_eq!(limit, 20);
+                assert_eq!(filters, SearchFilters::default());
+            }
+            other => panic!("expected SearchV2, got {other:?}"),
+        }
+
+        // New daemons add scores, but old-daemon replies remain readable and
+        // signal that their existing order should be retained with score 0.
+        let decoded: Response = serde_json::from_str(
+            r#"{"SearchResultsV2":{"drive_hits":[{"name":"a","path":"a","is_dir":false,"size":1,"modified":2,"pinned":false,"uid":"v~a"}],"local_hits":[{"name":"b","path":"/b","is_dir":false,"size":3,"modified":4}],"local_indexing":false}}"#,
+        )
+        .unwrap();
+        match decoded {
+            Response::SearchResultsV2 {
+                drive_hits,
+                local_hits,
+                ..
+            } => {
+                assert_eq!(drive_hits[0].score, 0);
+                assert_eq!(local_hits[0].score, 0);
+            }
+            other => panic!("expected SearchResultsV2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_v2_filters_roundtrip() {
+        let request = Request::SearchV2 {
+            query: "holiday".into(),
+            limit: 50,
+            filters: SearchFilters {
+                sources: vec![SearchSource::Drive],
+                kind: SearchKind::Images,
+            },
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        let decoded: Request = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::SearchV2 {
+                filters: SearchFilters { sources, kind: SearchKind::Images },
+                ..
+            } if sources == vec![SearchSource::Drive]
+        ));
+    }
+
+    #[test]
+    fn search_kind_classifies_before_results_are_limited() {
+        assert!(SearchKind::Folders.accepts("movie.mp4", true));
+        assert!(!SearchKind::Folders.accepts("movie.mp4", false));
+        assert!(SearchKind::Documents.accepts("REPORT.PDF", false));
+        assert!(SearchKind::Images.accepts("scan.HEIC", false));
+        assert!(SearchKind::Media.accepts("film.mkv", false));
+        assert!(SearchKind::Media.accepts("recording.flac", false));
+        assert!(!SearchKind::Media.accepts("poster.jpg", false));
+        assert!(SearchKind::All.accepts("anything", true));
+    }
+
+    #[test]
+    fn legacy_search_wire_forms_still_decode() {
+        let drive: Request =
+            serde_json::from_str(r#"{"Search":{"query":"old","limit":20}}"#).unwrap();
+        assert!(matches!(
+            drive,
+            Request::Search { query, limit } if query == "old" && limit == 20
+        ));
+
+        let local: Request =
+            serde_json::from_str(r#"{"SearchLocal":{"query":"old","limit":10}}"#).unwrap();
+        assert!(matches!(
+            local,
+            Request::SearchLocal { query, limit } if query == "old" && limit == 10
+        ));
     }
 
     /// The trash requests carry uids rather than paths; they must survive the same

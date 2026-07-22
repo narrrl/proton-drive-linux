@@ -543,6 +543,95 @@ fn search_short_query_like_fallback() {
 }
 
 #[test]
+fn fuzzy_candidates_include_typo_and_parent_path_matches() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("projects", Some("root"), "Projects"))
+        .unwrap();
+    db.upsert_node(&file("report", "projects", "quarterly-report.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("video", "projects", "video.mp4", 1))
+        .unwrap();
+
+    let typo = db.search_candidates("quartrly", 20).unwrap();
+    assert!(
+        typo.iter()
+            .any(|hit| hit.node.name == "quarterly-report.pdf")
+    );
+    assert!(
+        db.search_candidates("vedio", 20)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.node.name == "video.mp4")
+    );
+
+    let path = db.search_candidates("projects", 20).unwrap();
+    assert!(
+        path.iter()
+            .any(|hit| hit.node.name == "quarterly-report.pdf")
+    );
+}
+
+#[test]
+fn renaming_parent_refreshes_descendant_search_paths() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("folder", Some("root"), "zzbeforezz"))
+        .unwrap();
+    db.upsert_node(&file("child", "folder", "plain.txt", 1))
+        .unwrap();
+    assert!(
+        db.search_candidates("zzbeforezz", 20)
+            .unwrap()
+            .iter()
+            .any(|h| h.node.name == "plain.txt")
+    );
+
+    db.upsert_node(&folder("folder", Some("root"), "yyafteryy"))
+        .unwrap();
+    assert!(
+        !db.search_candidates("zzbeforezz", 20)
+            .unwrap()
+            .iter()
+            .any(|h| h.node.name == "plain.txt")
+    );
+    assert!(
+        db.search_candidates("yyafteryy", 20)
+            .unwrap()
+            .iter()
+            .any(|h| h.node.name == "plain.txt")
+    );
+}
+
+#[test]
+fn local_fuzzy_candidates_include_typo_and_parent_path() {
+    let db = Db::open_in_memory().unwrap();
+    let generation = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(
+        generation,
+        &[
+            local(
+                "/home/u/Projects/quarterly-report.pdf",
+                "quarterly-report.pdf",
+                false,
+            ),
+            local("/home/u/Videos/video.mp4", "video.mp4", false),
+        ],
+    )
+    .unwrap();
+    db.local_finish_scan(generation, 1).unwrap();
+
+    assert_eq!(db.search_local_candidates("quartrly", 20).unwrap().len(), 1);
+    assert_eq!(db.search_local_candidates("projects", 20).unwrap().len(), 1);
+    assert!(
+        db.search_local_candidates("vedio", 20)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.name == "video.mp4")
+    );
+}
+
+#[test]
 fn search_drops_fts_row_on_delete_and_trash() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("root", None, "My Files")).unwrap();

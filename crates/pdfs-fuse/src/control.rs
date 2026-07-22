@@ -241,6 +241,18 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::SearchV2 {
+            query,
+            limit,
+            filters,
+        }) => match core.search_v2(&query, limit, &filters) {
+            Ok((drive_hits, local_hits)) => CtlResponse::SearchResultsV2 {
+                drive_hits,
+                local_hits,
+                local_indexing: core.indexing.load(Ordering::Relaxed),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::Rename { path, new_name }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.rename(&rel, &new_name) {
                 Ok(name) => {

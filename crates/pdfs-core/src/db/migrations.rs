@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 15;
+pub(super) const SCHEMA_VERSION: i64 = 16;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -80,6 +80,9 @@ impl Db {
         }
         if current < 15 {
             tx.execute_batch(MIGRATION_V15)?;
+        }
+        if current < 16 {
+            tx.execute_batch(MIGRATION_V16)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -368,4 +371,38 @@ CREATE VIRTUAL TABLE nodes_fts USING fts5(
 );
 INSERT INTO nodes_fts (rowid, name)
   SELECT rowid, name FROM nodes WHERE trashed = 0;
+";
+
+/// Schema v16: fuzzy search needs a bounded candidate set that includes parent
+/// paths.  Keeping the path in the trigram indexes lets SQLite narrow both name
+/// and path candidates without walking either base table for every keystroke.
+/// Node paths are initially backfilled below and subsequently maintained by the
+/// node write path (including descendants after a folder move/rename).
+const MIGRATION_V16: &str = "
+DROP TABLE IF EXISTS nodes_fts;
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+  name, path, tokenize='trigram'
+);
+CREATE INDEX IF NOT EXISTS idx_nodes_name_nocase ON nodes(name COLLATE NOCASE);
+INSERT INTO nodes_fts (rowid, name, path)
+WITH RECURSIVE paths(rowid, uid, path) AS (
+  SELECT n.rowid, n.uid, '' FROM nodes n
+   WHERE n.parent_uid IS NULL
+      OR NOT EXISTS (SELECT 1 FROM nodes p WHERE p.uid = n.parent_uid)
+  UNION ALL
+  SELECT n.rowid, n.uid,
+         CASE WHEN paths.path = '' THEN n.name ELSE paths.path || '/' || n.name END
+    FROM nodes n JOIN paths ON n.parent_uid = paths.uid
+)
+SELECT n.rowid, n.name, paths.path
+  FROM nodes n JOIN paths ON paths.rowid = n.rowid
+ WHERE n.trashed = 0;
+
+DROP TABLE IF EXISTS local_fts;
+CREATE VIRTUAL TABLE local_fts USING fts5(
+  name, path, content='local_files', content_rowid='id', tokenize='trigram'
+);
+CREATE INDEX IF NOT EXISTS idx_local_files_name_nocase
+  ON local_files(name COLLATE NOCASE);
+INSERT INTO local_fts(local_fts) VALUES('rebuild');
 ";

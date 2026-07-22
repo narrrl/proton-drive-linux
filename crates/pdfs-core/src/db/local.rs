@@ -7,6 +7,7 @@ use super::Db;
 use crate::Result;
 use crate::localindex::LocalEntry;
 
+use super::nodes::candidate_trigrams;
 use super::utils::{TRIGRAM_MIN, like_escape};
 
 /// One hit from [`Db::search_local`]: an indexed file on the machine itself, not
@@ -146,6 +147,58 @@ impl Db {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Bounded candidates for the fuzzy scorer, including matches in the full
+    /// local path. ORed trigrams admit misspellings while the FTS index prevents
+    /// this from becoming an unbounded filesystem-table scan.
+    pub fn search_local_candidates(&self, query: &str, limit: usize) -> Result<Vec<LocalFileHit>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let terms = candidate_trigrams(query);
+        let lane_limit = limit.div_ceil(2);
+        let mut rows: Vec<LocalFileHit> = if terms.is_empty() {
+            let pat = format!("%{}%", like_escape(query));
+            let mut stmt = conn.prepare(
+                "SELECT path, name, is_dir, size, mtime FROM local_files
+                 WHERE name LIKE ?1 ESCAPE '\\' OR path LIKE ?1 ESCAPE '\\'
+                 ORDER BY mtime DESC LIMIT ?2",
+            )?;
+            stmt.query_map(params![pat, limit as i64], local_hit)?
+                .collect::<std::result::Result<_, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT f.path, f.name, f.is_dir, f.size, f.mtime
+                   FROM local_fts x JOIN local_files f ON f.id = x.rowid
+                  WHERE local_fts MATCH ?1
+                  ORDER BY x.rank LIMIT ?2",
+            )?;
+            stmt.query_map(params![terms.join(" OR "), lane_limit as i64], local_hit)?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        if !terms.is_empty()
+            && let Some(first) = query.chars().next()
+        {
+            let prefix = format!("{}%", like_escape(&first.to_string()));
+            let mut stmt = conn.prepare(
+                "SELECT path, name, is_dir, size, mtime FROM local_files
+                 WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
+                 ORDER BY name COLLATE NOCASE LIMIT ?2",
+            )?;
+            let fallback = stmt
+                .query_map(params![prefix, lane_limit as i64], local_hit)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for hit in fallback {
+                if !rows.iter().any(|existing| existing.path == hit.path) {
+                    rows.push(hit);
+                }
+            }
+            rows.truncate(limit);
+        }
+        Ok(rows)
     }
 }
 

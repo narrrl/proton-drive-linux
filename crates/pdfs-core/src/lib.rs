@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod localindex;
 pub mod profile;
+pub mod search;
 pub mod service;
 pub mod shell;
 pub mod syncignore;

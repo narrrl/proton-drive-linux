@@ -81,12 +81,42 @@ impl Db {
                 params![uid],
                 |row| row.get(0),
             )?;
-            tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
-            if !node.trashed {
-                tx.execute(
-                    "INSERT INTO nodes_fts (rowid, name) VALUES (?1, ?2)",
-                    params![rowid, node.name],
+            // A folder rename/move changes every descendant's searchable path.
+            // Refresh the affected subtree, while retaining efficient rowid
+            // deletes for the overwhelmingly common one-file case.
+            let mut affected = vec![rowid];
+            if node.is_folder() {
+                let mut stmt = tx.prepare(
+                    "WITH RECURSIVE descendants(rowid, uid) AS (
+                       SELECT rowid, uid FROM nodes WHERE parent_uid = ?1
+                       UNION ALL
+                       SELECT n.rowid, n.uid FROM nodes n
+                         JOIN descendants d ON n.parent_uid = d.uid
+                     ) SELECT rowid FROM descendants",
                 )?;
+                for descendant in stmt.query_map(params![uid], |row| row.get(0))? {
+                    affected.push(descendant?);
+                }
+            }
+            for affected_rowid in affected {
+                tx.execute(
+                    "DELETE FROM nodes_fts WHERE rowid = ?1",
+                    params![affected_rowid],
+                )?;
+                let indexed: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT name, uid FROM nodes WHERE rowid = ?1 AND trashed = 0",
+                        params![affected_rowid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((name, indexed_uid)) = indexed {
+                    let path = path_of(&tx, &indexed_uid)?;
+                    tx.execute(
+                        "INSERT INTO nodes_fts (rowid, name, path) VALUES (?1, ?2, ?3)",
+                        params![affected_rowid, name, path],
+                    )?;
+                }
             }
         }
         tx.commit()?;
@@ -175,6 +205,68 @@ impl Db {
         Ok(hits)
     }
 
+    /// Return a bounded, deliberately broad candidate pool for fuzzy ranking.
+    /// Unlike [`search`](Self::search), trigram terms are ORed across both the
+    /// basename and parent path, so a typo can still share enough trigrams to
+    /// enter the pool. Final relevance ordering belongs to the caller.
+    pub fn search_candidates(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let terms = candidate_trigrams(query);
+        let lane_limit = limit.div_ceil(2);
+        let mut rows: Vec<(String, String)> = if terms.is_empty() {
+            let pat = format!("%{}%", like_escape(query));
+            let mut stmt = conn.prepare(
+                "SELECT node_json, uid FROM nodes
+                 WHERE name LIKE ?1 ESCAPE '\\' AND trashed = 0 AND node_json IS NOT NULL
+                 ORDER BY name LIMIT ?2",
+            )?;
+            collect_pairs(stmt.query_map(params![pat, limit as i64], pair)?)?
+        } else {
+            let expression = terms.join(" OR ");
+            let mut stmt = conn.prepare(
+                "SELECT n.node_json, n.uid
+                   FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
+                  WHERE nodes_fts MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
+                  ORDER BY f.rank LIMIT ?2",
+            )?;
+            collect_pairs(stmt.query_map(params![expression, lane_limit as i64], pair)?)?
+        };
+        // A short substitution can destroy every trigram (`vedio` vs `video`).
+        // Feed the scorer an additional indexed same-initial lane so it can
+        // recover those candidates without scanning the full node table.
+        if !terms.is_empty()
+            && let Some(first) = query.chars().next()
+        {
+            let prefix = format!("{}%", like_escape(&first.to_string()));
+            let mut stmt = conn.prepare(
+                "SELECT node_json, uid FROM nodes
+                 WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
+                   AND trashed = 0 AND node_json IS NOT NULL
+                 ORDER BY name COLLATE NOCASE LIMIT ?2",
+            )?;
+            let fallback =
+                collect_pairs(stmt.query_map(params![prefix, lane_limit as i64], pair)?)?;
+            for row in fallback {
+                if !rows.iter().any(|(_, uid)| uid == &row.1) {
+                    rows.push(row);
+                }
+            }
+            rows.truncate(limit);
+        }
+        rows.into_iter()
+            .map(|(json, uid)| {
+                Ok(SearchHit {
+                    node: serde_json::from_str(&json)?,
+                    path: path_of(&conn, &uid)?,
+                })
+            })
+            .collect()
+    }
+
     /// Mark (or unmark) a folder's child listing as complete. A listed folder
     /// rehydrates its `children` map on mount even when empty; an unlisted one
     /// re-enumerates from the remote on next access.
@@ -259,6 +351,23 @@ impl Db {
     // separate. `last_accessed` (unix seconds) is the LRU key. The daemon owns
     // the on-disk cache and rebuilds this index from disk on open, then keeps it
     // in sync on every store/read/evict, so it is authoritative for eviction.
+}
+
+/// Unique quoted character trigrams suitable for an FTS5 OR expression.
+pub(super) fn candidate_trigrams(query: &str) -> Vec<String> {
+    let chars: Vec<char> = query.to_lowercase().chars().collect();
+    let mut terms = Vec::new();
+    for window in chars.windows(TRIGRAM_MIN) {
+        if window.iter().all(|c| c.is_whitespace()) {
+            continue;
+        }
+        let raw: String = window.iter().collect();
+        let quoted = format!("\"{}\"", raw.replace('"', "\"\""));
+        if !terms.contains(&quoted) {
+            terms.push(quoted);
+        }
+    }
+    terms
 }
 
 /// Effective plaintext size of a node for the indexed `size` column: the
