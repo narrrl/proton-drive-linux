@@ -56,8 +56,8 @@ use local_scan::open_for_write_set;
 use model::{LocalItem, Outcome, PassAbort, Pending, RemoteItem};
 pub(crate) use planner::base_name;
 use planner::{
-    classification_order, conflict_path, filter_baseline, guard_local_wipe, join_rel, parent_rel,
-    rel_to_path, remote_sig, unchanged_remote_size,
+    FilePlan, classification_order, conflict_path, filter_baseline, guard_local_wipe, join_rel,
+    parent_rel, plan_file, rel_to_path, remote_sig, unchanged_remote_size,
 };
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
@@ -666,117 +666,82 @@ impl Core {
                 continue;
             }
 
-            // File.
-            // A file still open for writing is treated as unchanged on the local
-            // side: uploading it now would capture a torn snapshot, and the next
-            // pass — after the writer has closed it — will see the final content.
-            if l.is_some_and(|l| l.open_for_write) {
-                debug!(
-                    rel,
-                    "sync: file open for write by another process; deferring upload"
-                );
-                outcome.deferred += 1;
-                continue;
-            }
-            let base = baseline.get(rel);
-            let local_changed = l.is_some_and(|l| {
-                base.is_none_or(|b| b.local_mtime != l.mtime || b.local_size != l.size)
-            });
-            let remote_changed =
-                r.is_some_and(|r| base.is_none_or(|b| remote_sig(b) != Some((r.mtime, r.size))));
-
-            match (l, r) {
-                (Some(_), Some(r)) => {
-                    // With no baseline, both sides read as "changed" and fall to the
-                    // conflict arm — the safe default for a folder re-added over
-                    // existing remote content.
-                    if !local_changed && !remote_changed {
-                        // Both untouched; baseline already matches.
-                    } else if local_changed && !remote_changed {
-                        batch.push(Pending::UploadRevision {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                        });
-                    } else if remote_changed && !local_changed {
-                        batch.push(Pending::Download {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                            mtime: r.mtime,
-                            size: r.size,
-                        });
-                    } else {
-                        batch.push(Pending::Conflict {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                            mtime: r.mtime,
-                            size: r.size,
-                        });
-                    }
+            match plan_file(l, r, baseline.get(rel)) {
+                FilePlan::Unchanged => {}
+                FilePlan::Deferred => {
+                    debug!(
+                        rel,
+                        "sync: file open for write by another process; deferring upload"
+                    );
+                    outcome.deferred += 1;
                 }
-                (Some(_), None) => {
-                    if base.is_none() || local_changed {
-                        // New local file, or remote deleted while local changed →
-                        // (re)upload it as a new remote file.
-                        match remote_dirs.get(parent_rel(rel)) {
-                            Some(parent) => batch.push(Pending::UploadNew {
-                                rel: rel.clone(),
-                                parent: parent.clone(),
-                            }),
-                            None => {
-                                warn!(rel, "sync: no remote parent for file; continuing");
-                                outcome.errors += 1;
-                            }
-                        }
-                    } else {
-                        // Remote deleted, local untouched → delete local.
-                        let _ = std::fs::remove_file(local_root.join(rel_to_path(rel)));
-                        let _ = self.db.sync_entry_remove(folder_id, rel);
+                FilePlan::UploadRevision => {
+                    let remote = r.expect("upload revision requires a remote file");
+                    batch.push(Pending::UploadRevision {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                    });
+                }
+                FilePlan::Download => {
+                    let remote = r.expect("download requires a remote file");
+                    batch.push(Pending::Download {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                        mtime: remote.mtime,
+                        size: remote.size,
+                    });
+                }
+                FilePlan::Conflict => {
+                    let remote = r.expect("conflict requires a remote file");
+                    batch.push(Pending::Conflict {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                        mtime: remote.mtime,
+                        size: remote.size,
+                    });
+                }
+                FilePlan::UploadNew => match remote_dirs.get(parent_rel(rel)) {
+                    Some(parent) => batch.push(Pending::UploadNew {
+                        rel: rel.clone(),
+                        parent: parent.clone(),
+                    }),
+                    None => {
+                        warn!(rel, "sync: no remote parent for file; continuing");
+                        outcome.errors += 1;
+                    }
+                },
+                FilePlan::DeleteLocal => {
+                    let _ = std::fs::remove_file(local_root.join(rel_to_path(rel)));
+                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    self.log_activity(ActivityKind::Trash, base_name(rel), "removed locally", true);
+                    outcome.deleted += 1;
+                }
+                FilePlan::DeleteRemote => {
+                    let remote = r.expect("remote deletion requires a remote file");
+                    if let Err(e) = self
+                        .rt
+                        .block_on(self.client.trash_nodes(std::slice::from_ref(&remote.uid)))
+                    {
+                        warn!(rel, error = %e, "sync: trash remote failed");
                         self.log_activity(
                             ActivityKind::Trash,
                             base_name(rel),
-                            "removed locally",
-                            true,
+                            e.to_string(),
+                            false,
                         );
-                        outcome.deleted += 1;
+                        outcome.errors += 1;
+                        continue;
                     }
+                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    self.log_activity(
+                        ActivityKind::Trash,
+                        base_name(rel),
+                        "removed on Drive",
+                        true,
+                    );
+                    outcome.deleted += 1;
                 }
-                (None, Some(r)) => {
-                    if base.is_none() || remote_changed {
-                        // New remote file, or local deleted while remote changed →
-                        // (re)download it.
-                        batch.push(Pending::Download {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                            mtime: r.mtime,
-                            size: r.size,
-                        });
-                    } else {
-                        // Local deleted, remote untouched → delete remote.
-                        if let Err(e) = self
-                            .rt
-                            .block_on(self.client.trash_nodes(std::slice::from_ref(&r.uid)))
-                        {
-                            warn!(rel, error = %e, "sync: trash remote failed");
-                            self.log_activity(
-                                ActivityKind::Trash,
-                                base_name(rel),
-                                e.to_string(),
-                                false,
-                            );
-                            outcome.errors += 1;
-                            continue;
-                        }
-                        let _ = self.db.sync_entry_remove(folder_id, rel);
-                        self.log_activity(
-                            ActivityKind::Trash,
-                            base_name(rel),
-                            "removed on Drive",
-                            true,
-                        );
-                        outcome.deleted += 1;
-                    }
-                }
-                (None, None) => {
+                FilePlan::ForgetBaseline => {
                     let _ = self.db.sync_entry_remove(folder_id, rel);
                 }
             }

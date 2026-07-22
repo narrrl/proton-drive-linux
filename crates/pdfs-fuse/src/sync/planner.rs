@@ -174,3 +174,180 @@ pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
         None => PathBuf::from(name),
     }
 }
+
+/// A pure decision for one file-shaped path. Transfer identities and filesystem
+/// effects are attached by the executor after this classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FilePlan {
+    Unchanged,
+    Deferred,
+    UploadNew,
+    UploadRevision,
+    Download,
+    Conflict,
+    DeleteLocal,
+    DeleteRemote,
+    ForgetBaseline,
+}
+
+pub(super) fn plan_file(
+    local: Option<&LocalItem>,
+    remote: Option<&RemoteItem>,
+    baseline: Option<&StoredSyncEntry>,
+) -> FilePlan {
+    if local.is_some_and(|item| item.open_for_write) {
+        return FilePlan::Deferred;
+    }
+
+    let local_changed = local.is_some_and(|item| {
+        baseline.is_none_or(|base| base.local_mtime != item.mtime || base.local_size != item.size)
+    });
+    let remote_changed = remote.is_some_and(|item| {
+        baseline.is_none_or(|base| remote_sig(base) != Some((item.mtime, item.size)))
+    });
+
+    match (local, remote) {
+        (Some(_), Some(_)) => match (local_changed, remote_changed) {
+            (false, false) => FilePlan::Unchanged,
+            (true, false) => FilePlan::UploadRevision,
+            (false, true) => FilePlan::Download,
+            (true, true) => FilePlan::Conflict,
+        },
+        (Some(_), None) if baseline.is_none() || local_changed => FilePlan::UploadNew,
+        (Some(_), None) => FilePlan::DeleteLocal,
+        (None, Some(_)) if baseline.is_none() || remote_changed => FilePlan::Download,
+        (None, Some(_)) => FilePlan::DeleteRemote,
+        (None, None) => FilePlan::ForgetBaseline,
+    }
+}
+
+#[cfg(test)]
+mod file_plan_tests {
+    use super::*;
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+
+    fn local(mtime: i64, size: i64) -> LocalItem {
+        LocalItem {
+            is_dir: false,
+            mtime,
+            size,
+            open_for_write: false,
+        }
+    }
+
+    fn remote(mtime: i64, size: i64) -> RemoteItem {
+        RemoteItem {
+            uid: NodeUid::new(VolumeId::from("v"), LinkId::from("l")),
+            is_dir: false,
+            mtime,
+            size,
+        }
+    }
+
+    fn baseline(
+        local_mtime: i64,
+        local_size: i64,
+        remote_mtime: i64,
+        remote_size: i64,
+    ) -> StoredSyncEntry {
+        StoredSyncEntry {
+            rel_path: "file".into(),
+            remote_uid: Some("v~l".into()),
+            local_mtime,
+            local_size,
+            remote_rev: Some(remote_mtime.to_string()),
+            remote_hash: Some(remote_size.to_string()),
+        }
+    }
+
+    #[test]
+    fn file_plan_covers_every_presence_and_change_shape() {
+        let same_local = local(10, 20);
+        let changed_local = local(11, 20);
+        let same_remote = remote(30, 40);
+        let changed_remote = remote(31, 40);
+        let base = baseline(10, 20, 30, 40);
+        let cases = [
+            (None, None, None, FilePlan::ForgetBaseline),
+            (None, None, Some(&base), FilePlan::ForgetBaseline),
+            (Some(&same_local), None, None, FilePlan::UploadNew),
+            (Some(&same_local), None, Some(&base), FilePlan::DeleteLocal),
+            (Some(&changed_local), None, Some(&base), FilePlan::UploadNew),
+            (None, Some(&same_remote), None, FilePlan::Download),
+            (
+                None,
+                Some(&same_remote),
+                Some(&base),
+                FilePlan::DeleteRemote,
+            ),
+            (None, Some(&changed_remote), Some(&base), FilePlan::Download),
+            (
+                Some(&same_local),
+                Some(&same_remote),
+                None,
+                FilePlan::Conflict,
+            ),
+            (
+                Some(&same_local),
+                Some(&same_remote),
+                Some(&base),
+                FilePlan::Unchanged,
+            ),
+            (
+                Some(&changed_local),
+                Some(&same_remote),
+                Some(&base),
+                FilePlan::UploadRevision,
+            ),
+            (
+                Some(&same_local),
+                Some(&changed_remote),
+                Some(&base),
+                FilePlan::Download,
+            ),
+            (
+                Some(&changed_local),
+                Some(&changed_remote),
+                Some(&base),
+                FilePlan::Conflict,
+            ),
+        ];
+
+        for (local, remote, baseline, expected) in cases {
+            assert_eq!(plan_file(local, remote, baseline), expected);
+        }
+    }
+
+    #[test]
+    fn an_open_writer_overrides_every_other_file_decision() {
+        let mut local = local(11, 20);
+        local.open_for_write = true;
+        let remote = remote(31, 40);
+        let base = baseline(10, 20, 30, 40);
+
+        for (remote, baseline) in [
+            (None, None),
+            (None, Some(&base)),
+            (Some(&remote), None),
+            (Some(&remote), Some(&base)),
+        ] {
+            assert_eq!(
+                plan_file(Some(&local), remote, baseline),
+                FilePlan::Deferred
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_remote_signature_is_treated_as_changed() {
+        let local = local(10, 20);
+        let remote = remote(30, 40);
+        let mut base = baseline(10, 20, 30, 40);
+        base.remote_hash = None;
+
+        assert_eq!(
+            plan_file(Some(&local), Some(&remote), Some(&base)),
+            FilePlan::Download
+        );
+    }
+}
