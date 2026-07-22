@@ -18,6 +18,9 @@ pub(crate) struct Entry {
     pub(crate) uid: NodeUid,
     pub(crate) parent: u64,
     pub(crate) node: Node,
+    pub(crate) lookup_count: u64,
+    pub(crate) open_count: u32,
+    pub(crate) unlinked: bool,
 }
 
 /// A set of non-overlapping `[start, end)` byte ranges, kept sorted and merged.
@@ -105,6 +108,8 @@ pub(crate) struct WriteHandle {
     pub(crate) base_mtime: i64,
     /// Whether anything diverged from the remote and needs an upload.
     pub(crate) dirty: bool,
+    /// Number of file handles currently sharing this scratch state.
+    pub(crate) open_count: usize,
 }
 
 /// A released write whose upload has not happened yet (offline.md Phase 3).
@@ -131,9 +136,11 @@ pub(crate) struct State {
     /// key means the directory has been enumerated.
     pub(crate) children: HashMap<u64, Vec<u64>>,
     pub(crate) next_ino: u64,
-    /// Open write handles keyed by file handle id. Read-only opens use fh 0 and
+    /// Shared write state keyed by inode. Concurrent writers share the scratch file.
+    pub(crate) active_writes: HashMap<u64, WriteHandle>,
+    /// Maps file handle id (fh) to inode (ino). Read-only opens use fh 0 and
     /// have no entry here.
-    pub(crate) handles: HashMap<u64, WriteHandle>,
+    pub(crate) handles: HashMap<u64, u64>,
     pub(crate) next_fh: u64,
     /// Unified SQLite metadata cache. Every map mutation below writes through to
     /// it inside the `State` lock so the DB stays the authoritative copy across
@@ -169,9 +176,24 @@ impl State {
                 uid: node.uid.clone(),
                 parent,
                 node,
+                lookup_count: 1,
+                open_count: 0,
+                unlinked: false,
             },
         );
         ino
+    }
+
+    /// Decrement lookup count for an inode and prune if lookup_count == 0 && open_count == 0 && unlinked.
+    pub(crate) fn forget_lookup(&mut self, ino: u64, nlookup: u64) -> Option<(u64, String)> {
+        if let Some(entry) = self.entries.get_mut(&ino) {
+            entry.lookup_count = entry.lookup_count.saturating_sub(nlookup);
+            if entry.lookup_count == 0 && entry.open_count == 0 && entry.unlinked {
+                let uid = entry.uid.clone();
+                return self.forget(&uid);
+            }
+        }
+        None
     }
 
     /// Allocate (or reuse) a stable inode for a node that came *from* the
@@ -193,6 +215,57 @@ impl State {
             .into_iter()
             .map(|node| self.intern_mem(parent, node))
             .collect()
+    }
+
+    /// Check if a directory inode has any child nodes in memory or in the database.
+    pub(crate) fn has_children(&self, parent: u64) -> bool {
+        if let Some(kids) = self.children.get(&parent)
+            && !kids.is_empty()
+        {
+            return true;
+        }
+        if let Some(entry) = self.entries.get(&parent)
+            && let Ok(has_kids) = self.db.has_children(&entry.uid)
+        {
+            return has_kids;
+        }
+        false
+    }
+
+    /// Check if `ancestor_ino` is `target_ino` or an ancestor of `target_ino` (for rename cycle prevention).
+    pub(crate) fn is_ancestor_of(&self, ancestor_ino: u64, mut target_ino: u64) -> bool {
+        if ancestor_ino == target_ino {
+            return true;
+        }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(target_ino);
+        while let Some(entry) = self.entries.get(&target_ino) {
+            let parent = entry.parent;
+            if parent == ancestor_ino {
+                return true;
+            }
+            if parent == 0 || !visited.insert(parent) {
+                break;
+            }
+            target_ino = parent;
+        }
+        false
+    }
+
+    /// Forget a node or, if open handles exist (open_count > 0), mark it unlinked
+    /// and remove it from parent children so lookups fail while open reads succeed.
+    pub(crate) fn forget_or_unlink(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+        if let Some(&ino) = self.by_uid.get(uid)
+            && let Some(entry) = self.entries.get_mut(&ino)
+            && entry.open_count > 0
+        {
+            entry.unlinked = true;
+            if let Some(kids) = self.children.get_mut(&entry.parent) {
+                kids.retain(|&k| k != ino);
+            }
+            return Some((entry.parent, entry.node.name.clone()));
+        }
+        self.forget(uid)
     }
 
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
@@ -410,6 +483,7 @@ mod tests {
             by_uid: HashMap::new(),
             children: HashMap::new(),
             next_ino: 1,
+            active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
             db: Arc::new(db),
@@ -491,5 +565,48 @@ mod tests {
             "and the listing it would serve is the moved file's absence, \
              with no way to notice anything else changed"
         );
+    }
+
+    #[test]
+    fn test_is_ancestor_of_hierarchy() {
+        let (mut st, _dir) = state();
+        let root = st.intern(0, node("root_id", "none", "root", true));
+        let p1 = st.intern(root, node("p1_id", "root_id", "p1", true));
+        let p2 = st.intern(p1, node("p2_id", "p1_id", "p2", true));
+        let child = st.intern(p2, node("child_id", "p2_id", "child", true));
+
+        assert!(st.is_ancestor_of(root, root), "self is ancestor");
+        assert!(st.is_ancestor_of(root, p1), "root is ancestor of p1");
+        assert!(
+            st.is_ancestor_of(root, child),
+            "root is ancestor of deep child"
+        );
+        assert!(st.is_ancestor_of(p1, child), "p1 is ancestor of deep child");
+        assert!(
+            !st.is_ancestor_of(child, root),
+            "child is not ancestor of root"
+        );
+        assert!(!st.is_ancestor_of(child, p1), "child is not ancestor of p1");
+    }
+
+    #[test]
+    fn test_state_has_children_mem_and_db() {
+        let (mut st, _dir) = state();
+        let folder = st.intern_mem(0, node("dir_uid", "none", "dir", true));
+        assert!(!st.has_children(folder), "initially empty");
+
+        // Memory-only children (using intern_mem so DB is not populated yet)
+        let f1 = st.intern_mem(folder, node("file1_uid", "dir_uid", "file1.txt", false));
+        st.children.insert(folder, vec![f1]);
+        assert!(st.has_children(folder), "has child in memory");
+
+        st.children.insert(folder, vec![]);
+        assert!(!st.has_children(folder), "cleared memory children");
+
+        // DB children
+        st.db
+            .upsert_node(&node("file2_uid", "dir_uid", "file2.txt", false))
+            .unwrap();
+        assert!(st.has_children(folder), "has child in db");
     }
 }

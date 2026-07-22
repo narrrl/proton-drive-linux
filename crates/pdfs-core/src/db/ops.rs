@@ -138,8 +138,8 @@ impl Db {
         };
         conn.execute(
             "INSERT INTO pending_op
-               (kind, uid, parent_uid, name, blob_path, meta_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (kind, uid, parent_uid, name, blob_path, meta_json, created_at, next_attempt_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 op.kind,
                 op.uid,
@@ -147,7 +147,8 @@ impl Db {
                 op.name,
                 op.blob_path,
                 op.meta_json,
-                op.created_at
+                op.created_at,
+                op.next_attempt_at
             ],
         )?;
         Ok((conn.last_insert_rowid(), superseded))
@@ -227,6 +228,17 @@ impl Db {
             params![uid, parent_uid, name, OP_CREATE, OP_MKDIR],
         )?;
         Ok(n > 0)
+    }
+
+    /// Check if a queued create or mkdir op exists for `uid`.
+    pub fn has_create_op(&self, uid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE uid = ?1 AND kind IN (?2, ?3)",
+            params![uid, OP_CREATE, OP_MKDIR],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Drop every op targeting a node **or anything queued beneath it**,
@@ -345,6 +357,28 @@ impl Db {
             })
             .optional()?;
         Ok(op)
+    }
+
+    /// The earliest `next_attempt_at` among all queued ops, or `None` if the
+    /// queue is empty. Used by the drain loop to sleep exactly until the next
+    /// debounced or backed-off op becomes eligible rather than waiting the full
+    /// idle-poll interval.
+    pub fn earliest_due_at(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock();
+        let ts: Option<i64> = conn
+            .query_row(
+                &format!(
+                    "SELECT MIN(next_attempt_at) FROM pending_op \
+                     WHERE parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~'",
+                    v = LOCAL_VOLUME,
+                    n = LOCAL_VOLUME.len() + 1,
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(ts)
     }
 
     /// Every queued op, oldest first. For status read-outs and the CLI — the

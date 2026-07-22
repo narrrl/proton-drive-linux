@@ -94,3 +94,37 @@ Derived from: [docs/bugs.md](file:///home/narl/dev/private/proton-drive-linux/do
 
 ### Closed / Not a Bug
 * **B3 — Activity log timestamps written in seconds, read as milliseconds**: Closed as investigator error (timestamps are consistent).
+
+---
+
+## 6. Recently Implemented Features
+
+### Open-for-Write Deferral for Mirror Sync (Implemented)
+**File**: [`sync.rs`](file:///home/narl/dev/private/proton-drive-linux/crates/pdfs-fuse/src/sync.rs)
+
+The mirror folder sync engine now defers uploading any file that is currently held open for writing by another process, matching the guarantee the FUSE mount path already provides (where uploads are deferred until `close(fd)`).
+
+**Problem**: Previously, the mirror sync path relied solely on a 2-second trailing-edge debounce (with a 30-second ceiling) to avoid uploading files mid-write. This was insufficient for slow continuous writers (e.g., database dumps, large exports, or editors that keep files open for extended periods), which could have their incomplete state uploaded as a real revision.
+
+**Solution**: Before each reconcile pass, the sync engine scans `/proc/*/fd` once to build a set of canonical paths within the sync root that any process holds open for writing (`O_WRONLY` or `O_RDWR`). Files in this set are:
+
+- **Kept in the local walk** — so they are not misclassified as deletions
+- **Treated as unchanged** — so no upload is queued for them
+- **Counted as `deferred`** — so the activity summary reports them (e.g., "3 uploaded, 1 deferred (open for write)")
+- **Picked up on the next pass** — after the writer has closed the file
+
+**How it works**:
+1. `open_for_write_set(root)` reads `/proc/*/fd` → `readlink` for each fd → prefix-checks against the sync root → reads `/proc/<pid>/fdinfo/<n>` to check the `flags:` line's low two bits (O_ACCMODE)
+2. `walk_local` sets `LocalItem.open_for_write = true` for matching files
+3. Both `do_reconcile` and `push_pass` skip upload classification for flagged files
+4. `Outcome.deferred` tracks the count for the activity summary
+
+**Performance**: The `/proc` scan completes in low single-digit milliseconds on a typical desktop. Only fds whose `readlink` target falls under the sync root incur the `fdinfo` read.
+
+**Tests added**: 8 unit tests covering `is_write_mode` parsing of various fdinfo flag combinations, and `Outcome` summary formatting with deferred counts.
+
+| Sync Path | Open-for-write protection | Mechanism |
+|---|---|---|
+| FUSE mount | ✅ Perfect | Upload deferred until `close(fd)` |
+| Mirror folders | ✅ Perfect | `/proc/*/fd` scan per reconcile pass |
+

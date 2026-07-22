@@ -18,9 +18,77 @@ use proton_drive_rs::{NodeKind, ThumbnailType};
 use tracing::{info, warn};
 
 use super::{
-    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, THUMB_GEN_CONCURRENCY, TIMELINE_ENRICH_CHUNK,
-    TIMELINE_TTL, ThumbAttempt, node_size, now_ms, parse_uid, ratio_of, scale_thumbnail,
+    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, node_size,
+    now_ms, parse_uid,
 };
+
+/// Longest edge, in px, of a thumbnail generated locally for a photo the server
+/// has none for. Matches the server's own thumbnail scale closely enough that a
+/// tile can't tell them apart.
+const THUMB_EDGE: u32 = 512;
+/// JPEG quality of a locally generated thumbnail.
+const THUMB_QUALITY: u8 = 82;
+/// How many photos may be downloaded at once to generate their missing
+/// thumbnails. Bounded: a screenful of 20 MB digicam JPEGs would otherwise
+/// saturate the link and starve the rest of the daemon.
+const THUMB_GEN_CONCURRENCY: usize = 4;
+
+/// The aspect ratio (w/h) of an encoded image, read from its header alone — no
+/// pixels are decoded. `None` when the format is unknown or the header is torn.
+fn ratio_of(bytes: &[u8]) -> Option<f64> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    (height > 0).then(|| f64::from(width) / f64::from(height))
+}
+
+/// A thumbnail the daemon made itself, and the aspect ratio of the photo it was
+/// made from (free at that point — the full image had to be decoded anyway).
+struct GeneratedThumb {
+    bytes: Vec<u8>,
+    ratio: f64,
+}
+
+/// How one attempt at generating a missing thumbnail ended. The distinction that
+/// matters is *permanent* versus *transient*: only bytes we cannot decode prove
+/// the photo will never have a thumbnail, and only that verdict is persisted.
+enum ThumbAttempt {
+    Made(GeneratedThumb),
+    /// Decoded nothing — a format this build has no decoder for. Permanent.
+    Undecodable,
+    /// The photo couldn't be downloaded. Transient: try again next time.
+    Unavailable,
+}
+
+/// Scale a full-size photo down to a thumbnail: at most [`THUMB_EDGE`] on its
+/// longest side, JPEG, aspect ratio preserved. `None` when the bytes aren't an
+/// image this build can decode — the caller then writes the photo off as
+/// un-thumbnailable.
+///
+/// CPU-bound (a 20 MP JPEG is real work), so callers run it on the blocking pool.
+fn scale_thumbnail(bytes: &[u8]) -> Option<GeneratedThumb> {
+    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let ratio = f64::from(width) / f64::from(height);
+
+    // `thumbnail` fits the image *inside* the box, so the longest edge lands on
+    // THUMB_EDGE and the ratio is untouched.
+    let thumb = image.thumbnail(THUMB_EDGE, THUMB_EDGE).to_rgb8();
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, THUMB_QUALITY)
+        .encode_image(&thumb)
+        .ok()?;
+    Some(GeneratedThumb { bytes, ratio })
+}
 
 impl Core {
     pub(crate) fn photos_timeline(
@@ -359,5 +427,62 @@ impl Core {
             .store(uid, mtime, size, &bytes)
             .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
         Ok(self.cache.content_path(uid))
+    }
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::{THUMB_EDGE, ratio_of, scale_thumbnail};
+
+    /// A `width`×`height` JPEG, standing in for a camera photo the server never
+    /// generated a thumbnail for.
+    fn jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode_image(&image)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn scaling_fits_the_long_edge_and_keeps_the_aspect_ratio() {
+        let photo = jpeg(4000, 3000);
+        let thumb = scale_thumbnail(&photo).expect("a JPEG scales");
+
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&thumb.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!(width, THUMB_EDGE, "the long edge lands on the target");
+        assert_eq!(height, THUMB_EDGE * 3 / 4, "and nothing is cropped");
+        assert!((thumb.ratio - 4.0 / 3.0).abs() < 1e-6);
+        assert!(
+            thumb.bytes.len() < photo.len(),
+            "a thumbnail that isn't smaller than its photo is no thumbnail"
+        );
+    }
+
+    #[test]
+    fn a_portrait_photo_fits_its_long_edge_too() {
+        let thumb = scale_thumbnail(&jpeg(1000, 2000)).expect("a JPEG scales");
+        assert!(thumb.ratio < 1.0, "portrait stays portrait");
+        assert_eq!(ratio_of(&thumb.bytes).map(|r| r < 1.0), Some(true));
+    }
+
+    #[test]
+    fn undecodable_bytes_are_not_a_thumbnail() {
+        // What a photo in a format this build has no decoder for looks like: the
+        // caller writes it off as un-thumbnailable rather than retrying forever.
+        assert!(scale_thumbnail(b"not an image at all").is_none());
+        assert!(ratio_of(b"not an image at all").is_none());
+    }
+
+    #[test]
+    fn ratio_is_read_from_the_header_alone() {
+        assert_eq!(ratio_of(&jpeg(300, 200)), Some(1.5));
     }
 }

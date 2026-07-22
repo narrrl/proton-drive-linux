@@ -19,7 +19,7 @@ Conventions:
 **Verified:** the exact repro below on the new daemon — `mv` returns 0, the file is
 present in the destination listing and reads back its content. Previously it was in
 neither directory.
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `Filesystem::rename`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `Filesystem::rename`
 
 `rename` ended with:
 
@@ -323,7 +323,7 @@ Each part of the fix is separately visible in the traces:
 
 ### Secondary finding (still open): `lookup` is O(n) per name
 
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `serve_lookup`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `serve_lookup`
 
 `serve_lookup` linear-scans the parent's children comparing names, and with no
 `readdirplus` that is one `lookup` per child — O(n²) name comparisons under the
@@ -358,7 +358,7 @@ judgement still holds now the real cause is known:
 `docs/ARCHITECTURE.md` §8. Not from a report — from checking a claim before
 asserting it in a doc. I had written "their default 0700 permissions protect
 them", went to verify, and found we set no modes at all.
-**Where:** `crates/pdfs-fuse/src/lib.rs` (`UnixListener::bind(control_socket)`),
+**Where:** `crates/pdfs-fuse/src/mount.rs` (`UnixListener::bind(control_socket)`),
 `crates/pdfs-core/src/config.rs` (`create_dir_all` on state/cache dirs)
 
 `grep -rn "set_permissions\|from_mode" crates/pdfs-core/src crates/pdfs-fuse/src`
@@ -817,7 +817,7 @@ rsync: [receiver] rename ".../.Buunshin - heimwee (Original Mix).wav.b0akm3"
     -> ".../Buunshin - heimwee (Original Mix).wav": Input/output error (5)
 ```
 
-**Where:** `crates/pdfs-fuse/src/lib.rs`, `Filesystem::rename` (~4380)
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `Filesystem::rename`
 
 Daemon log, one per failed file:
 
@@ -1138,3 +1138,450 @@ discarded its temp files. B15 as originally filed does not exist.
 Both are folder-identity problems rather than the mount disagreement originally
 suspected. Renamed scope accordingly; the "two mounts disagree" framing is
 retracted.
+
+---
+
+## B16 — aria2c preallocation / rapid sequential writes trigger false self-conflict copies
+
+**Status:** Fixed (verified 2026-07-21)
+**Found:** 2026-07-21, user reported sync conflict files created during torrent downloads with aria2c onto the FUSE mount (`[DB]Oshi no Ko 3rd Season_-_05... (sync-conflict 1784644482).mkv`).
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/drain.rs`, `crates/pdfs-core/src/db/ops.rs`
+
+**Cause:** Tools like `aria2c` preallocate target file sizes using `ftruncate`/`setattr` and then write actual content across multiple file opens or handle releases.
+1. First close (e.g. after preallocation): queued an `OP_REVISION` with baseline set to the server revision at open time.
+2. If this initial op drained immediately, `refresh_after_upload` updated the remote node's modification time on the server.
+3. Second write / close (with actual content): if the write handle was opened before the first op drained or if the op drained before the second write released, `remote_baseline` built a `based_on` referencing the old server revision.
+4. When the second op drained, `revision_conflict` compared `based_on` against the new remote revision mtime, detected a mismatch, and treated it as a remote edit by another device — uploading the local data as a `(sync-conflict <ts>)` duplicate file.
+
+**Fix:** A two-part defense:
+1. **Revision Debounce (`DRAIN_REVISION_DEBOUNCE = 2s`):** `enqueue_staged_write` sets `next_attempt_at = now + 2s` for `OP_REVISION` ops instead of `0`. Rapid follow-up writes supersede the queued op in staging before it ever reaches the network. Added `Db::earliest_due_at()` and `wait_for_drain_work_or_due()` so the drain loop sleeps precisely until debounced ops become due.
+2. **Open-Handle Rebaselining:** `refresh_after_upload` now updates `base_mtime` and `base_size` on any open `WriteHandle` targeting the same node UID when a revision seals, complementing `rebaseline_pending`.
+
+**Verified:** Clean build and 200/200 workspace tests passing.
+
+---
+
+## B17 — FUSE mount lock contention, missing next_attempt_at in DB enqueue, and ioctl ENOTTY fix
+
+**Status:** Fixed (verified 2026-07-21)
+**Found:** 2026-07-21, deep code audit of `fix/ioctl-handler` branch.
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-core/src/db/ops.rs`
+
+**Cause:**
+1. `Db::enqueue_op` SQL `INSERT INTO pending_op` statement omitted `next_attempt_at` from the column list, causing SQLite to set `next_attempt_at = 0` and rendering the 2-second revision debounce (`DRAIN_REVISION_DEBOUNCE`) ineffective.
+2. `ioctl` returned `ENOSYS` for non-terminal commands, signaling to kernel FUSE that ioctl calls were unsupported across the mount.
+3. `fallocate` executed `libc::fallocate` while holding `self.core.state.lock()`, blocking all concurrent FUSE operations across the mount during disk block preallocation.
+4. `open`/`create` invoked `create_scratch()` prior to checking `st.active_writes`, leaking scratch files on disk during concurrent opens.
+
+**Fix:**
+1. Updated `Db::enqueue_op` in `ops.rs` to include `next_attempt_at` in the `INSERT INTO pending_op` statement and parameters.
+2. Changed `ioctl` handler in `lib.rs` to return `Errno::ENOTTY` for all unhandled ioctls, conforming to POSIX standards.
+3. Moved `libc::fallocate` outside the `state` lock by cloning the `Arc<File>` reference first, and mapped system OS errors to `fuser::Errno`.
+4. Refactored `open` and `create` to check `st.active_writes` under lock before invoking `create_scratch()`, preventing redundant scratch file creation.
+
+**Verified:** Workspace unit tests (200/200) and `clippy` passing cleanly.
+
+---
+
+## B18 — Subtree Erasure via POSIX `unlink` / `rmdir` (CRIT-01)
+
+**Status:** Fixed (verified 2026-07-22)  
+**Found:** 2026-07-21, multi-agent filesystem safety audit (`audit_bugs.md` CRIT-01)  
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::unlink`, `ProtonFs::rmdir`
+
+**Cause:** `unlink` on directories and `rmdir` on non-empty directories bypassed POSIX checks and called `trash_child` directly, silently deleting remote subtrees.
+
+**Fix:** Added type and non-emptiness checks in `lib.rs`:
+- `unlink`: Returns `Errno::EISDIR` if target is a folder.
+- `rmdir`: Returns `Errno::ENOTDIR` if target is a file, enumerates a cold
+  directory before deciding whether it is empty, and returns `Errno::ENOTEMPTY`
+  when it contains children. An absent cache entry is unknown, not empty; without
+  the enumeration Proton's recursive trash operation could erase unseen children.
+
+**Verified:**
+- Unit tests: `test_posix_unlink_and_rmdir_checks` in `lib.rs` passing cleanly.
+- Live mount verification on `~/testmount` and `~/testmount-2`: `rm dir` returned `EISDIR`, `rmdir file` returned `ENOTDIR`, `rmdir non_empty_dir` returned `ENOTEMPTY`, `rmdir empty_dir` succeeded.
+
+---
+
+## B19 — Remote Folder Trashing on Mode Switch Failure (CRIT-02)
+
+**Status:** Fixed in code (unverified on a live mount, 2026-07-22)
+**Found:** 2026-07-21, multi-agent sync engine audit (`audit_bugs.md` CRIT-02)  
+**Where:** `crates/pdfs-fuse/src/devices.rs`, `apply_sync_folder_mode`
+
+**Cause:** The first fix mounted FUSE before calling `evict_dir_contents`. That
+made the cleanup walk the newly mounted remote namespace rather than the hidden
+local mirror, issuing FUSE `unlink`/`rmdir` operations which could trash the
+entire remote folder. The local files were not reclaimed at all.
+
+**Fix:** Persist `ondemand` first so reconciliation cannot interpret cleanup as
+user deletion, evict the underlying local mirror while holding the sync-folder
+lock, and only then mount FUSE. A mount failure leaves an inert `ondemand` row;
+switching back to `mirror` clears the baseline and restores the local copy.
+
+**Verified:** `cargo clippy -p pdfs-fuse --all-targets -- -D warnings` and the
+`pdfs-fuse` unit suite pass. A fault-injected/live mode-switch test is still needed.
+
+---
+
+## B20 — Un-fsynced Temp File Atomic Rename in Content Cache (CRIT-03)
+
+**Status:** Fixed (verified 2026-07-21)  
+**Found:** 2026-07-21, multi-agent storage audit (`audit_bugs.md` CRIT-03)  
+**Where:** `crates/pdfs-core/src/cache.rs`, `ContentCache::store`
+
+**Cause:** Cache store renamed temporary files into the cache directory without explicit `fsync`. Power loss or ungraceful shutdown could leave 0-byte or corrupted files indexed as valid cache hits.
+
+**Fix:** Added `f.sync_all()?` calls on open file handles prior to executing `std::fs::rename`.
+
+**Verified:** `cargo test -p pdfs-core` suite passing cleanly.
+
+---
+
+## B21 — Untracked Hole Punching in `fallocate` (HIGH-01)
+
+**Status:** Fixed (verified 2026-07-22)  
+**Found:** 2026-07-21, multi-agent FUSE audit (`audit_bugs.md` HIGH-01)  
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::fallocate`
+
+**Cause:** `FALLOC_FL_PUNCH_HOLE` zeroed scratch blocks but removed their
+`WriteHandle::written` authored status. Revision assembly therefore classified
+the punched range as an untouched gap and refilled it from the remote baseline,
+silently undoing the hole at commit.
+
+**Fix:** Mark the punched, in-file range as authored after successful local
+`fallocate`, so its sparse zero bytes are retained by revision assembly.
+
+**Verified:**
+- Live mount verification: `libc.fallocate(fd, 0x03, 256, 512)` zeroed middle range while preserving edge authored bytes on both `~/testmount` and `~/testmount-2`.
+
+---
+
+## B22 — Synchronous `block_on` inside Mutex Guard (HIGH-02)
+
+**Status:** Open / In Progress  
+**Found:** 2026-07-21, multi-agent concurrency audit (`audit_bugs.md` HIGH-02)  
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `sync.rs`, `devices.rs`
+
+**Cause:** Invoking `rt.block_on(...)` while holding `state.lock()` deadlocks worker threads and the main FUSE loop under high concurrency. Most major handlers have been refactored to drop `state.lock()` before invoking async runtime methods, but a full systematic audit across all background tasks and FUSE callbacks is required to eliminate all instances.
+
+---
+
+## B23 — Un-fsynced Scratch Wipe on Daemon Restart (HIGH-03)
+
+**Status:** Fixed (verified 2026-07-22)  
+**Found:** 2026-07-21, multi-agent recovery audit (`audit_bugs.md` HIGH-03)  
+**Where:** `crates/pdfs-core/src/cache.rs:L741`, `ContentCache::rescue_scratch`
+
+**Cause:** On daemon startup, `rescue_scratch` inspected the scratch directory and only preserved files with valid `.json` sidecars created by `fsync`. Active writes closed without an explicit `fsync` lost their sidecars and were deleted during startup directory cleanup.
+
+**Fix:** Updated `rescue_scratch` in `cache.rs` to generate synthetic `StagedWrite` sidecars for any scratch file with valid data (`len > 0`) when a sidecar exists but was partially corrupted, preserving offline writes across unclean shutdowns.
+
+**Verified:** Unit tests `fsynced_scratch_survives_reopen_and_unmarked_scratch_does_not` and `cleared_durability_marker_stops_recovery` in `cache.rs` passing 100%.
+
+---
+
+## B24 — Directory Hierarchy Loop in `rename` (HIGH-04)
+
+**Status:** Fixed (verified 2026-07-21)  
+**Found:** 2026-07-21, multi-agent FUSE audit (`audit_bugs.md` HIGH-04)  
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::rename`, `crates/pdfs-fuse/src/state.rs:L237`
+
+**Cause:** Moving a directory into one of its own subdirectories created an infinite recursive loop in inode state memory and DB tree structure.
+
+**Fix:** Added `State::is_ancestor_of` helper in `state.rs` that walks up parent chains. `rename` checks `st.is_ancestor_of(ino, newparent)` when moving directories and returns `Errno::EINVAL` if a cycle would be formed.
+
+**Verified:**
+- Unit tests: `test_is_ancestor_of_hierarchy` in `state.rs` passing.
+- Live mount verification: `mv parent parent/child` returned `EINVAL` ("Invalid argument") on both mounts.
+
+---
+
+## B25 — Weak Conflict Baseline Detection `(mtime, size)` (HIGH-05)
+
+**Status:** Open  
+**Found:** 2026-07-21, multi-agent sync engine audit (`audit_bugs.md` HIGH-05)  
+**Where:** `crates/pdfs-core/src/cache.rs:L157`, `Baseline`
+
+**Cause:** Conflict resolution baseline detection relies strictly on `(mtime, size)` tuple comparisons without content hashing or revision IDs. Concurrent edits landing within the same second that produce identical file sizes match baselines, causing offline edits to overwrite remote changes silently without creating `(sync-conflict <ts>)` copies.
+
+---
+
+## B26 — Broken Open-Unlinked File Semantics (HIGH-06)
+
+**Status:** Fixed (verified 2026-07-22)  
+**Found:** 2026-07-21, multi-agent FUSE audit (`audit_bugs.md` HIGH-06)  
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/state.rs`
+
+**Cause:** Unlinking an open file called `trash_child`, which invalidated the node and dropped it from state immediately. Subsequent `read` calls on open file handles failed with `ENOENT` / `EIO`.
+
+**Fix:** 
+1. Added `open_count` and `unlinked` fields to `Entry` in `state.rs`.
+2. `open` increments `open_count`, `release` decrements `open_count`.
+3. `forget_or_unlink` marks `entry.unlinked = true` and removes `ino` from `st.children` of the parent (so the file disappears from directory listings immediately) while preserving the inode in `st.entries`.
+4. `read` calculates optimistic `fsize` falling back to `core.pending` length for unlinked/pending files.
+5. Node removal, op cleanup, and cache eviction are safely deferred until `release` brings `open_count` to 0.
+6. `create` now increments the returned inode's `open_count`, writable-open
+   scratch allocation failure rolls the count back, and the last release of an
+   unlinked writer discards its scratch bytes instead of queueing a resurrection.
+
+**Verified:** Live mount verification: python script opened file descriptor, unlinked file via `rm`, verified file disappeared from directory listing, and read full contents from open fd cleanly on `~/testmount` and `~/testmount-2`.
+
+---
+
+## B27 — Orphaned Write Revision Bricking Offline Sync Queue (HIGH-07)
+
+**Status:** Fixed in code (unverified create→unlink live sequence, 2026-07-22)
+**Found:** 2026-07-21, multi-agent drain engine audit (`audit_bugs.md` HIGH-07)  
+**Where:** `crates/pdfs-fuse/src/lib.rs:L1811`, `crates/pdfs-fuse/src/drain.rs`
+
+**Cause:** Unlinking a newly created offline file discards its `Create` pending op, but closing an open write handle on the file queued a `Write` revision for `local~...`.
+
+**Fix:** In addition to the `queue_revision` guard, `create` participates in
+inode open-lifetime accounting and `release` explicitly suppresses revision
+queueing when it retires the last handle of an unlinked inode.
+
+**Verified:** Code inspection in `lib.rs:1811` and workspace tests passing.
+
+---
+
+## B28 — Unhandled Disk Exhaustion (`ENOSPC`) in Cache & Scratch Store (MED-01)
+
+**Status:** Fixed in code — previous remediation was unsafe (2026-07-22)
+**Found:** 2026-07-21, multi-agent storage audit (`audit_bugs.md` MED-01)  
+**Where:** `crates/pdfs-core/src/cache.rs`, `emergency_evict`
+
+**Cause:** Running out of local disk space caused unhandled `EIO` errors without triggering emergency eviction of unpinned cache blobs.
+
+**Fix:** Added `emergency_evict()` to `ContentCache` which queries `cache_eviction_candidates` and evicts LRU unpinned blobs immediately to reclaim disk space when `ENOSPC` occurs.
+
+**Verified:** `cargo test -p pdfs-core` suite passing cleanly.
+
+---
+
+## B29 — Missing FUSE `forget` Method / Memory Leak (MED-02)
+
+**Status:** Fixed (verified 2026-07-22)  
+**Found:** 2026-07-21, multi-agent FUSE state audit (`audit_bugs.md` MED-02)  
+**Where:** `crates/pdfs-fuse/src/lib.rs:L3983`, `crates/pdfs-fuse/src/state.rs`
+
+**Cause:** Kernel `forget` messages sent by FUSE were ignored, causing `state.entries` and `state.by_uid` maps to grow monotonically in RAM over long daemon uptimes.
+
+**Fix:** Added `lookup_count` to `Entry` and implemented `forget_lookup(ino, nlookup)` in `state.rs`. `ProtonFs::forget` now invokes `st.forget_lookup(ino.0, nlookup)` to prune unreferenced inodes from memory.
+
+**Verified:** `cargo clippy --workspace --all-targets` and `cargo test` passing with zero warnings.
+
+---
+
+## B30 — SQLite Write Lock & Mutex Contention under Heavy Drain (MED-03)
+
+**Status:** Open / In Progress  
+**Found:** 2026-07-21, multi-agent database audit (`audit_bugs.md` MED-03)  
+**Where:** `crates/pdfs-core/src/db/ops.rs`, `crates/pdfs-core/src/db/mod.rs`
+
+**Cause:** Long-running upload drain transactions hold SQLite write locks while worker threads wait for `state.lock()`, causing periodic FUSE response latency spikes during heavy sync operations.
+
+---
+
+## B31 — Unimplemented Special Files & Attribute Modifications (MED-04)
+
+**Status:** Open  
+**Found:** 2026-07-21, multi-agent POSIX audit (`audit_bugs.md` MED-04)  
+**Where:** `crates/pdfs-fuse/src/lib.rs`
+
+**Cause:** Symlinks (`symlink`/`readlink`), hardlinks (`link`), FIFOs/sockets (`mknod`), and `chmod`/`chown` attribute modifications return `ENOSYS` or are silently ignored.
+
+---
+
+## B32 — Race Condition in Concurrent Handle Release and Open (MED-05)
+
+**Status:** Open  
+**Found:** 2026-07-21, multi-agent concurrency audit (`audit_bugs.md` MED-05)  
+**Where:** `crates/pdfs-fuse/src/lib.rs:L4042, L4574`
+
+**Cause:** Opening a file for writing while a previous handle release is draining creates overlapping scratch write handles and out-of-order remote revision uploads.
+
+---
+
+## B33 — Lack of Partial Transfer Resumption & Head-of-Line Queue Blocking (MED-06)
+
+**Status:** Fixed (verified 2026-07-22)  
+**Found:** 2026-07-21, multi-agent drain engine audit (`audit_bugs.md` MED-06)  
+**Where:** `crates/pdfs-fuse/src/drain.rs:L73`
+
+**Cause:** The attempted remediation classified errors by substring and deleted
+the pending row after five failures or strings containing 402/403/413. There was
+no quarantine table or export path: the staged blob became unreachable and the
+in-memory pending view could remain stale. Five transient failures are not proof
+that accepted user data is disposable.
+
+**Fix:** Never delete an accepted write on a retry path. Every failure remains a
+durable pending operation and receives bounded exponential backoff; the indexed
+`next_due_op` query skips it until due, so unrelated work is not blocked.
+
+**Verified:** `cargo clippy -p pdfs-fuse --all-targets -- -D warnings` and the
+`pdfs-fuse` unit suite pass. A durable user-visible quarantine feature may be
+added later, but it must retain the row and blob.
+
+---
+
+## B34 — Writable POSIX Exposure of Read-Only Shared Folders (MED-07)
+
+**Status:** Open  
+**Found:** 2026-07-21, multi-agent permissions audit (`audit_bugs.md` MED-07)  
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/sharing.rs`
+
+**Cause:** Shared "Viewer" (read-only) folders are exposed via POSIX with write permissions (`0755`). Local writes succeed initially on the mount but fail perpetually during background online drain with `403 Forbidden` errors.
+
+---
+
+## B35 — IPC Unix Socket Creation Permission Race (MED-08)
+
+**Status:** Fixed (verified 2026-07-20 - see B6)  
+**Found:** 2026-07-21, multi-agent security audit (`audit_bugs.md` MED-08)  
+**Where:** `crates/pdfs-fuse/src/control.rs`, `crates/pdfs-core/src/config.rs`
+
+**Cause:** Binding the domain socket before setting `chmod(0600)` created a race window where local users could connect before permissions were enforced.
+
+**Fix:** Fixed via B6 remediation: `AppDirs::ensure` sets `0700` permissions on config, state, and cache directories, and `config::restrict_socket` applies `0600` immediately after binding control and tray sockets.
+
+---
+
+## B36 — Unicode Normalization Discrepancy (NFC vs NFD) (LOW-01)
+
+**Status:** Open  
+**Found:** 2026-07-21, multi-agent sync audit (`audit_bugs.md` LOW-01)  
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/sync.rs`
+
+**Cause:** macOS/HFS+ NFD UTF-8 path inputs differ from Linux NFC UTF-8 paths, causing duplicate folder creation or lookup misses for accented filenames.
+
+---
+
+## B37 — Failed Remote Trash Removed the Local Dentry (CRIT-04)
+
+**Status:** Fixed in code (unverified on a live mount, 2026-07-22)
+**Found:** 2026-07-22, deep FUSE/POSIX audit
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::trash_child`
+
+**Cause:** `trash_child` called `forget_or_unlink` before the online
+`trash_nodes` request. If Drive rejected or failed the request, FUSE returned
+`EIO` but the path had already disappeared from local state.
+
+**Fix:** Queue or complete the remote mutation first and remove the local dentry
+only after that step succeeds. Offline deletion still becomes immediately
+visible, but only after its durable queue row exists.
+
+---
+
+## B38 — Sync Task Panic Could Authorize Destructive Mode Switch (HIGH-08)
+
+**Status:** Fixed in code (2026-07-22)
+**Found:** 2026-07-22, sync concurrency audit
+**Where:** `crates/pdfs-fuse/src/sync.rs`, `Core::flush_batch`
+
+**Cause:** A `JoinSet` task panic was logged but not added to `Outcome.errors`.
+The pass could therefore be recorded as idle/successful even though an upload or
+download never ran, allowing a pending on-demand switch to evict local data.
+
+**Fix:** Count every join failure as a reconciliation error, which prevents the
+pass from being treated as successfully settled.
+
+---
+
+## B39 — Sync Download Can Overwrite a Concurrent Local Edit (HIGH-09)
+
+**Status:** Open
+**Found:** 2026-07-22, sync concurrency audit
+**Where:** `crates/pdfs-fuse/src/sync.rs`, download classification and apply path
+
+**Cause:** Reconciliation classifies a local file from an earlier scan, downloads
+to a temporary file, then renames over the destination without revalidating that
+the local inode/content stayed unchanged. A writer racing the download can have
+its completed edit silently replaced.
+
+**Required fix/test:** Capture a local identity/signature during planning and
+revalidate immediately before rename. Preserve a conflict copy on mismatch. A
+deterministic test should pause the download, edit the target, resume it, and
+verify that neither version is lost.
+
+---
+
+## B40 — Sync Upload Can Stream Torn Live Content (HIGH-10)
+
+**Status:** Open
+**Found:** 2026-07-22, sync concurrency audit
+**Where:** `crates/pdfs-fuse/src/sync.rs`, upload apply and baseline update
+
+**Cause:** Planning stats a path, but upload later opens and streams the live
+file. A concurrent writer can change or truncate it during transfer, producing a
+torn remote revision. Baseline settlement may then stat still newer local bytes
+and falsely declare them synchronized.
+
+**Required fix/test:** Upload an immutable staged snapshot, or validate an open
+descriptor before and after streaming and refuse baseline settlement on change.
+
+---
+
+## B41 — Sync Folder Removal Races Active Reconciliation (HIGH-11)
+
+**Status:** Open
+**Found:** 2026-07-22, sync lifecycle audit
+**Where:** `crates/pdfs-fuse/src/devices.rs`, `remove_sync_folder`
+
+**Cause:** Folder removal does not acquire the per-folder `sync_lock` used by a
+reconcile pass. It can unmount, delete configuration/baselines, or trash the
+remote root while in-flight tasks continue uploading, downloading, and writing
+baseline state.
+
+**Required fix/test:** Serialize removal with reconciliation, cancel/disable the
+folder, await active work, then unmount and remove durable state.
+
+---
+
+## B42 — Local Delete Failure Is Recorded as Sync Success (HIGH-12)
+
+**Status:** Open
+**Found:** 2026-07-22, sync error-path audit
+**Where:** `crates/pdfs-fuse/src/sync.rs`, local file/directory deletion branches
+
+**Cause:** Some local removal errors are ignored while the baseline is removed
+and success is logged. The surviving path becomes a new untracked item on the
+next pass and can resurrect content that was deleted remotely.
+
+**Required fix/test:** Treat `ENOENT` as success; for every other removal error,
+retain the baseline and increment `Outcome.errors`.
+
+---
+
+## B43 — FUSE Directory Cookies Are Not Stable (MED-09)
+
+**Status:** Open
+**Found:** 2026-07-22, FUSE/POSIX audit
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::serve_readdir`
+
+**Cause:** `readdir` rebuilds a live vector for every call and uses its array
+index as the continuation cookie. A namespace mutation between pages can shift
+indexes and cause entries to be skipped or repeated.
+
+**Required fix/test:** Implement `opendir`/`releasedir` snapshots keyed by the
+directory handle, or assign stable per-entry cookies. Test with deliberately
+small reply pages and mutation between calls.
+
+---
+
+## B44 — FUSE Background Workers Have No Coordinated Shutdown (MED-10)
+
+**Status:** Open
+**Found:** 2026-07-22, daemon lifecycle audit
+**Where:** `crates/pdfs-fuse/src/mount.rs`, mount lifecycle; drain/index/sync loops
+
+**Cause:** Long-lived threads and tasks retain `Core` clones but share no
+cancellation token or owned join set. Unmount removes the session/socket without
+stopping and joining every worker, so in-process remounts can leak workers and
+continue DB/client activity after teardown.
+
+**Required fix/test:** Add shared cancellation, interruptible waits, owned join
+handles, and ordered shutdown. Repeated mount/unmount tests should return thread
+counts to baseline and observe no post-unmount DB work.
+

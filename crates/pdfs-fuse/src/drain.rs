@@ -23,6 +23,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
@@ -62,23 +63,30 @@ impl Core {
             let due = self.db.next_due_op(now).unwrap_or_default();
 
             let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
-                self.wait_for_drain_work();
+                self.recover_fsynced_writes();
+                // A debounced or backed-off op may be waiting: sleep only
+                // until it becomes due rather than the full idle-poll.
+                self.wait_for_drain_work_or_due();
                 continue;
             };
             if let Err(e) = self.drain_op(&op) {
                 let attempts = op.attempts + 1;
+                let err_str = e.to_string();
+                // Never infer that user data is disposable from an error string
+                // or an arbitrary retry count. The staged blob and this row are
+                // the only durable description of an accepted write. Even a
+                // permission/quota error can become recoverable after the user
+                // changes account state, and deleting the row here made the blob
+                // unreachable after five ordinary network failures.
                 let backoff = DRAIN_BACKOFF_MIN
                     .saturating_mul(1u32 << attempts.min(6))
                     .min(DRAIN_BACKOFF_MAX);
-                warn!(uid = %op.uid, attempts, error = %e, "pending upload failed; will retry");
+                warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
                 if let Err(e) = self.db.record_op_failure(
                     op.id,
-                    &e.to_string(),
+                    &err_str,
                     now_millis() + backoff.as_millis() as i64,
                 ) {
-                    // The backoff is the only thing keeping a failing op from
-                    // being picked again immediately, so without it the loop
-                    // would spin on this op as fast as the API can refuse it.
                     error!(uid = %op.uid, error = %e, "recording a drain failure failed");
                     self.wait_for_drain_work();
                 }
@@ -93,6 +101,25 @@ impl Core {
         let mut woken = lock.lock();
         if !*woken {
             cv.wait_for(&mut woken, DRAIN_IDLE_POLL);
+        }
+        *woken = false;
+    }
+
+    /// Like [`wait_for_drain_work`](Self::wait_for_drain_work), but first
+    /// checks whether a debounced or backed-off op is due before the idle-poll
+    /// ceiling. A 2-second debounce must not sleep 30 seconds.
+    fn wait_for_drain_work_or_due(&self) {
+        let timeout = match self.db.earliest_due_at() {
+            Ok(Some(ts)) => {
+                let remaining = (ts - now_millis()).max(0) as u64;
+                Duration::from_millis(remaining).min(DRAIN_IDLE_POLL)
+            }
+            _ => DRAIN_IDLE_POLL,
+        };
+        let (lock, cv) = &*self.drain_wake;
+        let mut woken = lock.lock();
+        if !*woken {
+            cv.wait_for(&mut woken, timeout);
         }
         *woken = false;
     }
@@ -467,7 +494,7 @@ impl Core {
         uid: &NodeUid,
         meta: &StagedWrite,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let Some(base) = meta.based_on else {
+        let Some(ref base) = meta.based_on else {
             return Ok(None);
         };
         let Some(node) = self.fetch_node_remote(uid)? else {
@@ -727,7 +754,14 @@ impl Core {
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
         self.db.delete_op(op.id)?;
-        self.pending.lock().remove(&uid);
+        {
+            let mut p = self.pending.lock();
+            if let Some(op_in_mem) = p.get(&uid)
+                && op_in_mem.path == blob
+            {
+                p.remove(&uid);
+            }
+        }
 
         // The staged blob now matches the sealed revision, so a pinned file keeps
         // it as its cached content rather than re-downloading what we just sent.
@@ -780,6 +814,28 @@ impl Core {
                 return;
             }
         };
+        // Rebase any *open* write handles targeting this node. A handle opened
+        // before this upload carries a stale base — its `base_mtime`/`base_size`
+        // name the revision we just replaced. Without this update,
+        // `remote_baseline` will build a `based_on` from those stale values, the
+        // drain will compare them against the revision we sealed, and the write
+        // will be diverted into a conflict copy of itself.
+        //
+        // This is the open-handle counterpart of `rebaseline_pending`, which
+        // covers the same gap for *queued* ops.
+        {
+            let sealed_mtime = node.modification_time;
+            let sealed_size = node_size(&node);
+            let mut st = self.state.lock();
+            for aw in st.active_writes.values_mut() {
+                if aw.uid == *uid {
+                    aw.base_mtime = sealed_mtime;
+                    aw.base_size = sealed_size;
+                    debug!(%uid, mtime = sealed_mtime, size = sealed_size,
+                           "rebased open write handle onto the revision just uploaded");
+                }
+            }
+        }
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
         // this overwrites it with the revision the server actually holds.
@@ -818,12 +874,13 @@ impl Core {
         let base = Baseline {
             mtime: sealed.modification_time,
             size: node_size(sealed),
+            hash: None,
         };
         let mut pending = self.pending.lock();
         let Some(p) = pending.get_mut(uid) else {
             return false;
         };
-        p.meta.based_on = Some(base);
+        p.meta.based_on = Some(base.clone());
         match serde_json::to_string(&p.meta) {
             Ok(json) => {
                 if let Err(e) = self.db.update_op_meta(&uid.to_string(), OP_REVISION, &json) {

@@ -153,10 +153,12 @@ pub struct StagedWrite {
 /// The identity of a remote revision, as far as we can observe it: a file whose
 /// size and mtime both still match the ones a queued change was made against has
 /// not been rewritten by anyone else in the meantime.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     pub mtime: i64,
     pub size: u64,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 /// Content cache rooted at a directory, with a sibling pin-registry file.
@@ -431,7 +433,12 @@ impl ContentCache {
         // 64-char hex key with no `.`, so this appends rather than replaces.
         // `store_thumbnail` cannot use the same idiom — see the note there.
         let tmp = blob.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &blob)?;
         let meta = serde_json::to_vec(&Meta { mtime, size })?;
         std::fs::write(self.meta_path(uid), meta)?;
@@ -463,6 +470,9 @@ impl ContentCache {
         let _ = std::fs::remove_file(&tmp);
         if std::fs::hard_link(src, &tmp).is_err() {
             std::fs::copy(src, &tmp)?;
+        }
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_all();
         }
         let bytes = std::fs::metadata(&tmp)?.len();
         std::fs::rename(&tmp, &blob)?;
@@ -526,7 +536,12 @@ impl ContentCache {
         let tmp = self
             .block_dir
             .join(format!("{}.b{idx}.tmp", Self::key(uid)));
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(
             self.block_meta(uid, idx),
@@ -733,14 +748,40 @@ impl ContentCache {
                 continue;
             }
             let side = Self::scratch_sidecar(&blob);
-            // Parsed, not merely present: an unreadable sidecar cannot drive a
-            // recovery, so the blob is rubbish like any other leftover.
-            if std::fs::read(&side)
+            if !side.exists() {
+                // Not marked durable, or durability marker was explicitly cleared on release
+                continue;
+            }
+            // Parsed if valid; if sidecar exists but is corrupted, build synthetic StagedWrite
+            let has_valid_sidecar = std::fs::read(&side)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
-                .is_none()
-            {
-                continue;
+                .is_some();
+            if !has_valid_sidecar {
+                if let Ok(meta) = std::fs::metadata(&blob)
+                    && meta.len() > 0
+                {
+                    let blob_name = blob
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let synthetic = StagedWrite {
+                        uid: format!("recovered~{blob_name}"),
+                        len: meta.len(),
+                        base_size: meta.len(),
+                        base_mtime: 0,
+                        authored: vec![(0, meta.len())],
+                        complete: true,
+                        based_on: None,
+                    };
+                    if let Ok(data) = serde_json::to_vec(&synthetic) {
+                        let _ = std::fs::write(&side, data);
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
             }
             let Some(name) = blob.file_name() else {
                 continue;
@@ -752,6 +793,34 @@ impl ContentCache {
                 continue;
             };
             let _ = std::fs::rename(&side, recovery_dir.join(side_name));
+        }
+    }
+
+    /// Emergency eviction of unpinned blobs when local disk runs out of space (ENOSPC).
+    pub fn emergency_evict(&self) {
+        let pinned: HashSet<String> = self
+            .db
+            .pinned_uids()
+            .unwrap_or_default()
+            .iter()
+            .map(|uid| Self::key_str(uid))
+            .collect();
+        let content_dir = self.content_dir.clone();
+        // Force pool enforcement ignoring current cap check to free disk space immediately
+        let Ok(list) = self.db.cache_eviction_candidates(KIND_BLOB, 10) else {
+            return;
+        };
+        for (key, bytes) in list {
+            if pinned.contains(&key) {
+                continue;
+            }
+            let p = content_dir.join(&key);
+            let m = content_dir.join(format!("{key}.meta"));
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_file(&m);
+            let _ = self.db.cache_remove(&key);
+            self.blob_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            break; // Evict one item at a time until space is freed
         }
     }
 
@@ -1759,6 +1828,7 @@ mod tests {
             based_on: Some(Baseline {
                 mtime: 100,
                 size: 40,
+                hash: None,
             }),
         };
         let staged = c.stage_write(&meta, &scratch).unwrap();

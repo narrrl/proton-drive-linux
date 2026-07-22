@@ -11,6 +11,17 @@
 //! exposed). The baseline is refreshed from ground truth after every applied
 //! action, so a file just uploaded or downloaded reads as "unchanged" on the
 //! next pass and never ping-pongs.
+//!
+//! ## Open-for-write deferral
+//!
+//! A file still held open for writing by another process is not uploaded.
+//! Uploading mid-write produces a torn snapshot — a revision that was never a
+//! real state of the file — wasting the encrypt-and-upload cost and creating a
+//! revision the user never asked for. The FUSE mount path already defers until
+//! `close(fd)` by design; the mirror path now does the same by scanning
+//! `/proc/*/fd` once per reconcile pass and skipping any file whose fd flags
+//! include `O_WRONLY` or `O_RDWR`. Deferred files are picked up on the next
+//! pass, after the writer has closed them.
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use notify::{RecursiveMode, Watcher};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
@@ -31,526 +42,23 @@ use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::syncignore::IgnoreRules;
 
-/// How long the watcher must go quiet before a burst counts as finished.
-///
-/// Measured from the *last* event, not the first: applications do not write a
-/// file once. An editor saves by writing a temp file and renaming it over the
-/// target; an export or a database dump writes continuously for as long as it
-/// takes. Settling a fixed interval after the first event walks the tree while
-/// the file is still growing, and uploads a torn snapshot as a real revision —
-/// corrected on the next pass, but only after spending the encrypt-and-upload
-/// on a file that was never in that state.
-const DEBOUNCE: Duration = Duration::from_secs(2);
-/// Ceiling on the settle wait, so a directory under sustained change still
-/// syncs. Without it, copying a large tree in — events arriving forever —
-/// would postpone the reconcile for as long as the copy ran.
-const MAX_SETTLE: Duration = Duration::from_secs(30);
-/// How often to re-walk remotes so changes made on other clients are pulled in.
-const POLL_INTERVAL: Duration = Duration::from_secs(120);
-/// How many uploads/downloads/folder-creations a reconcile runs at once. The
-/// per-item work is a network round-trip, so a folder with thousands of files is
-/// unusable done one-at-a-time; this bounds concurrency like the bulk-upload
-/// engine ([`crate::run_uploads`]) does.
-const SYNC_CONCURRENCY: usize = 8;
-
-/// A message to the sync engine's control thread.
-pub(crate) enum SyncMsg {
-    /// Reconcile one folder by id (a local change, or a targeted `SyncNow`).
-    Reconcile(i64),
-    /// Reconcile every mirror folder (periodic poll, or startup).
-    ReconcileAll,
-    /// Re-read the folder set and adjust the filesystem watches (after add/remove).
-    Rewatch,
-}
-
-/// Start the sync engine: a control thread that owns the filesystem watcher and
-/// serialises reconcile passes, plus a periodic poll thread. The engine receives
-/// on `rx`; senders live in [`Core::sync_tx`].
-pub(crate) fn spawn(core: Core, rx: Receiver<SyncMsg>) {
-    if let Err(e) = std::thread::Builder::new()
-        .name("pdfs-sync".into())
-        .spawn(move || engine_loop(core, rx))
-    {
-        warn!(error = %e, "failed to start sync engine");
-    }
-}
-
-/// The engine control loop. Single-threaded so reconcile passes never overlap.
-fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
-    // Paths the watcher currently covers, mapped to their folder id, so an event
-    // path can be resolved back to the folder it belongs to.
-    let watched: Mutex<Vec<(PathBuf, i64)>> = Mutex::new(Vec::new());
-
-    let tx_events = core.sync_tx.clone();
-    let mut watcher =
-        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            // Ignore pure metadata/access noise; content changes are what matter.
-            if matches!(event.kind, notify::EventKind::Access(_)) {
-                return;
-            }
-            let _ = tx_events.send(SyncMsg::ReconcileAll);
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(error = %e, "filesystem watcher unavailable; sync is poll-only");
-                // Still run the loop so polling and explicit SyncNow work.
-                poll_only_loop(&core, rx);
-                return;
-            }
-        };
-
-    // Periodic remote poll.
-    {
-        let tx = core.sync_tx.clone();
-        std::thread::Builder::new()
-            .name("pdfs-sync-poll".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(POLL_INTERVAL);
-                    if tx.send(SyncMsg::ReconcileAll).is_err() {
-                        break;
-                    }
-                }
-            })
-            .ok();
-    }
-
-    rewatch(&core, &mut watcher, &watched);
-    reconcile_all(&core);
-
-    while let Ok(msg) = rx.recv() {
-        let mut ids: HashSet<i64> = HashSet::new();
-        let mut all = false;
-        let mut do_rewatch = false;
-        classify(msg, &mut ids, &mut all, &mut do_rewatch);
-        settle(&rx, &mut ids, &mut all, &mut do_rewatch);
-
-        if do_rewatch {
-            rewatch(&core, &mut watcher, &watched);
-        }
-        if all {
-            reconcile_all(&core);
-        } else {
-            for id in ids {
-                if let Ok(Some(folder)) = core.db.sync_folder_get(id) {
-                    core.reconcile_folder(&folder);
-                }
-            }
-        }
-    }
-}
-
-/// Fallback loop when no filesystem watcher could be created: poll + SyncNow only.
-fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
-    {
-        let tx = core.sync_tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(POLL_INTERVAL);
-                if tx.send(SyncMsg::ReconcileAll).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    reconcile_all(core);
-    while let Ok(msg) = rx.recv() {
-        let mut ids: HashSet<i64> = HashSet::new();
-        let mut all = false;
-        let mut do_rewatch = false;
-        classify(msg, &mut ids, &mut all, &mut do_rewatch);
-        settle(&rx, &mut ids, &mut all, &mut do_rewatch);
-        if all {
-            reconcile_all(core);
-        } else {
-            for id in ids {
-                if let Ok(Some(folder)) = core.db.sync_folder_get(id) {
-                    core.reconcile_folder(&folder);
-                }
-            }
-        }
-    }
-}
-
-/// Absorb the rest of an event burst, returning once the watcher has been quiet
-/// for `quiet` or `cap` has elapsed since the first event — whichever comes
-/// first. The caller has already classified the event that opened the burst.
-///
-/// Split out with its timings as parameters so the settling behaviour can be
-/// tested in milliseconds rather than in the tens of seconds the real constants
-/// describe.
-fn settle_with(
-    rx: &Receiver<SyncMsg>,
-    ids: &mut HashSet<i64>,
-    all: &mut bool,
-    do_rewatch: &mut bool,
-    quiet: Duration,
-    cap: Duration,
-) {
-    let deadline = Instant::now() + cap;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        // Never wait past the cap, however quiet the watcher goes.
-        let wait = quiet.min(deadline - now);
-        match rx.recv_timeout(wait) {
-            // Another event: the burst is still going, so the quiet window
-            // starts again from here.
-            Ok(m) => classify(m, ids, all, do_rewatch),
-            // Quiet for a full window: whatever was being written has stopped.
-            Err(RecvTimeoutError::Timeout) => break,
-            // Every sender is gone; the caller's loop is about to end anyway.
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-}
-
-/// [`settle_with`] at the real timings.
-fn settle(rx: &Receiver<SyncMsg>, ids: &mut HashSet<i64>, all: &mut bool, do_rewatch: &mut bool) {
-    settle_with(rx, ids, all, do_rewatch, DEBOUNCE, MAX_SETTLE);
-}
-
-fn classify(msg: SyncMsg, ids: &mut HashSet<i64>, all: &mut bool, rewatch: &mut bool) {
-    match msg {
-        SyncMsg::Reconcile(id) => {
-            ids.insert(id);
-        }
-        SyncMsg::ReconcileAll => *all = true,
-        SyncMsg::Rewatch => *rewatch = true,
-    }
-}
-
-/// Reconcile every mirror folder in turn.
-fn reconcile_all(core: &Core) {
-    let folders = match core.db.sync_folder_list() {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = ?e, "sync: cannot list folders");
-            return;
-        }
-    };
-    for folder in folders {
-        core.reconcile_folder(&folder);
-    }
-}
-
-/// Bring the filesystem watches in line with the current mirror-folder set:
-/// watch newly-added folders, drop removed ones.
-fn rewatch(
-    core: &Core,
-    watcher: &mut notify::RecommendedWatcher,
-    watched: &Mutex<Vec<(PathBuf, i64)>>,
-) {
-    let want: Vec<(PathBuf, i64)> = match core.db.sync_folder_list() {
-        Ok(f) => f
-            .into_iter()
-            .filter(|f| f.mode == "mirror")
-            .map(|f| (PathBuf::from(f.local_path), f.id))
-            .collect(),
-        Err(e) => {
-            warn!(error = ?e, "sync: cannot list folders to watch");
-            return;
-        }
-    };
-    let mut have = watched.lock();
-    // Drop watches no longer wanted.
-    have.retain(|(path, _)| {
-        if want.iter().any(|(p, _)| p == path) {
-            true
-        } else {
-            let _ = watcher.unwatch(path);
-            false
-        }
-    });
-    // Add newly wanted watches.
-    for (path, id) in &want {
-        if have.iter().any(|(p, _)| p == path) {
-            continue;
-        }
-        match watcher.watch(path, RecursiveMode::Recursive) {
-            Ok(()) => have.push((path.clone(), *id)),
-            Err(e) => warn!(path = %path.display(), error = %e, "sync: watch failed"),
-        }
-    }
-}
-
-// ---- reconcile ------------------------------------------------------------
-
-/// One item found while walking a local tree.
-struct LocalItem {
-    is_dir: bool,
-    mtime: i64,
-    size: i64,
-}
-
-/// One item found while walking a remote tree.
-struct RemoteItem {
-    uid: NodeUid,
-    is_dir: bool,
-    mtime: i64,
-    size: i64,
-}
-
-/// The result of a reconcile pass: what it moved, how many paths were kept as
-/// conflict copies, and how many failed to apply (and so still need another
-/// pass). The counts drive both the folder's state and its activity summary.
-#[derive(Default)]
-struct Outcome {
-    uploaded: usize,
-    downloaded: usize,
-    created: usize,
-    deleted: usize,
-    conflicts: usize,
-    errors: usize,
-}
-
-impl Outcome {
-    /// Fold in one applied op.
-    fn record(&mut self, applied: &Applied) {
-        match applied {
-            Applied::Dir(..) => self.created += 1,
-            Applied::Uploaded => self.uploaded += 1,
-            Applied::Downloaded => self.downloaded += 1,
-            Applied::Conflict => self.conflicts += 1,
-        }
-    }
-
-    /// Whether the pass moved nothing at all — the common case on a poll of an
-    /// unchanged folder, which should not add a line to the activity feed.
-    fn is_empty(&self) -> bool {
-        self.uploaded == 0
-            && self.downloaded == 0
-            && self.created == 0
-            && self.deleted == 0
-            && self.conflicts == 0
-            && self.errors == 0
-    }
-
-    /// A human summary of the pass: "3 uploaded, 1 downloaded, 2 failed".
-    fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        for (n, label) in [
-            (self.uploaded, "uploaded"),
-            (self.downloaded, "downloaded"),
-            (self.created, "folder(s) created"),
-            (self.deleted, "deleted"),
-            (self.conflicts, "conflicted"),
-            (self.errors, "failed"),
-        ] {
-            if n > 0 {
-                parts.push(format!("{n} {label}"));
-            }
-        }
-        parts.join(", ")
-    }
-}
-
-/// A network operation queued during classification and run concurrently in a
-/// per-depth batch. Parent uids are resolved up front (the parent folder is one
-/// depth shallower and already created), so tasks share nothing mutable.
-enum Pending {
-    /// Create a new remote folder under `parent`.
-    CreateDir { rel: String, parent: NodeUid },
-    /// Upload a brand-new local file into `parent`.
-    UploadNew { rel: String, parent: NodeUid },
-    /// Upload a changed local file as a new revision of `uid`.
-    UploadRevision { rel: String, uid: NodeUid },
-    /// Download remote `uid` to the local path, stamping `mtime`. `size` is the
-    /// remote's reported size, used as the transfer's expected total.
-    Download {
-        rel: String,
-        uid: NodeUid,
-        mtime: i64,
-        size: i64,
-    },
-    /// Both sides changed: set the local copy aside, then download remote `uid`.
-    Conflict {
-        rel: String,
-        uid: NodeUid,
-        mtime: i64,
-        size: i64,
-    },
-    /// Both sides changed during a [`push pass`](Core::push_pass): upload the local
-    /// copy into `parent` under a conflict name, leaving the remote file as it is.
-    PushConflict { rel: String, parent: NodeUid },
-}
-
-impl Pending {
-    /// The path this op acts on, relative to the folder root.
-    fn rel(&self) -> &str {
-        match self {
-            Pending::CreateDir { rel, .. }
-            | Pending::UploadNew { rel, .. }
-            | Pending::UploadRevision { rel, .. }
-            | Pending::Download { rel, .. }
-            | Pending::Conflict { rel, .. }
-            | Pending::PushConflict { rel, .. } => rel,
-        }
-    }
-
-    /// How this op reads in the activity feed.
-    fn kind(&self) -> ActivityKind {
-        match self {
-            Pending::CreateDir { .. } => ActivityKind::CreateFolder,
-            Pending::UploadNew { .. }
-            | Pending::UploadRevision { .. }
-            | Pending::PushConflict { .. } => ActivityKind::Upload,
-            Pending::Download { .. } | Pending::Conflict { .. } => ActivityKind::Download,
-        }
-    }
-
-    /// The activity line's detail, which distinguishes ops that share a kind.
-    fn detail(&self) -> &'static str {
-        match self {
-            Pending::CreateDir { .. } => "on Drive",
-            Pending::UploadNew { .. } => "new file",
-            Pending::UploadRevision { .. } => "new version",
-            Pending::Download { .. } => "from Drive",
-            Pending::Conflict { .. } => "local changes kept as a conflict copy",
-            Pending::PushConflict { .. } => "local changes uploaded as a conflict copy",
-        }
-    }
-}
-
-/// Why a full reconcile pass stopped without a result.
-enum PassAbort {
-    /// An on-demand switch was queued while the pass was running. Everything left
-    /// to do is work on a local copy about to be evicted, so the pass gives up its
-    /// remaining work to a [`push pass`](Core::push_pass) instead. Not a failure —
-    /// nothing is left half-applied, because each step is applied whole.
-    Interrupted,
-    /// The pass could not establish its diff (a walk or the baseline load failed).
-    Failed(String),
-}
-
-impl From<String> for PassAbort {
-    fn from(e: String) -> Self {
-        PassAbort::Failed(e)
-    }
-}
-
-/// Refuse to run a pass whose local side has vanished in its entirety.
-///
-/// A path in the baseline with no local copy is classified as "the user deleted
-/// this", and the pass answers by trashing it on Drive. That is right for one
-/// file and right for a handful. When it is true of *every* path the baseline
-/// knows, the likely cause is not a user: it is an unmounted external disk, a
-/// mountpoint whose FUSE mount died, a home directory that was not yet decrypted
-/// when the daemon started, or a bug in this client — and the answer to all of
-/// those is to trash the folder's entire contents on Drive.
-///
-/// So this pass abort exists to cap the blast radius rather than to catch a
-/// specific defect. Losing a pass to it costs a retry; the failure it prevents
-/// costs the folder. A user who really did empty the folder can express that by
-/// removing it from sync and re-adding it — the baseline goes with it.
-///
-/// One surviving path is enough to clear the guard, since the classification is
-/// only ever wrong about all of them at once.
-/// The paths a reconcile pass will classify: the union of the local, remote,
-/// and baseline states, minus anything the ignore rules exclude, shallowest
-/// first so a parent folder is created before its children are placed in it.
-///
-/// The ignore filter belongs *here*, on the union, rather than on the local walk
-/// alone — filtering the walk alone would be actively destructive. A file synced
-/// before it became ignored is absent from `local` but present in `remote` and
-/// `baseline`, which is precisely the "local deleted, remote untouched" shape
-/// `do_reconcile` responds to by trashing the remote copy. Adding a line to
-/// `.pdfsignore` must never delete anything from Drive.
-///
-/// Ignored baseline rows are deliberately left in the database rather than
-/// removed: with the row intact, un-ignoring the path later re-adopts the
-/// existing remote file instead of reading as a brand-new local one.
-fn classification_order<L, R, B>(
-    local: &HashMap<String, L>,
-    remote: &HashMap<String, R>,
-    baseline: &HashMap<String, B>,
-    rules: &IgnoreRules,
-) -> Vec<String>
-where
-    L: HasKind,
-    R: HasKind,
-{
-    let mut paths: HashSet<String> = HashSet::new();
-    paths.extend(local.keys().cloned());
-    paths.extend(remote.keys().cloned());
-    paths.extend(baseline.keys().cloned());
-    let mut order: Vec<String> = paths.into_iter().collect();
-    if !rules.is_empty() {
-        order.retain(|rel| {
-            // A baseline-only path has no kind recorded, so it is tested as
-            // both; see `filter_baseline` for why erring towards "ignored" is
-            // the safe direction here.
-            let kind = local
-                .get(rel)
-                .map(HasKind::is_dir)
-                .or_else(|| remote.get(rel).map(HasKind::is_dir));
-            match kind {
-                Some(is_dir) => !rules.is_ignored(rel, is_dir),
-                None => !rules.is_ignored(rel, false) && !rules.is_ignored(rel, true),
-            }
-        });
-    }
-    order.sort_by_key(|p| p.matches('/').count());
-    order
-}
-
-/// Lets [`classification_order`] ask either walk's item whether it is a
-/// directory without knowing which walk it came from.
-trait HasKind {
-    fn is_dir(&self) -> bool;
-}
-
-impl HasKind for LocalItem {
-    fn is_dir(&self) -> bool {
-        self.is_dir
-    }
-}
-
-impl HasKind for RemoteItem {
-    fn is_dir(&self) -> bool {
-        self.is_dir
-    }
-}
-
-/// The baseline minus its ignored paths, for [`guard_local_wipe`].
-///
-/// The guard asks "did every synced path vanish locally?", and an ignored path
-/// is absent from the local walk by rule rather than by loss. Left in, a rule
-/// covering the whole tree would trip the guard on every pass and wedge that
-/// folder's sync for good.
-///
-/// A baseline row does not record whether it was a file or a folder, so a path
-/// counts as ignored if it matches as either. Erring towards "ignored" only ever
-/// shrinks the set the guard checks, which weakens a safety net rather than
-/// causing a deletion — the wrong direction to be wrong in is the other one.
-fn filter_baseline<'a, B>(
-    baseline: &'a HashMap<String, B>,
-    rules: &IgnoreRules,
-) -> HashMap<String, &'a B> {
-    baseline
-        .iter()
-        .filter(|(rel, _)| !rules.is_ignored(rel, false) && !rules.is_ignored(rel, true))
-        .map(|(rel, entry)| (rel.clone(), entry))
-        .collect()
-}
-
-fn guard_local_wipe<B, L>(
-    baseline: &HashMap<String, B>,
-    local: &HashMap<String, L>,
-) -> Result<(), String> {
-    if baseline.len() >= 2 && baseline.keys().all(|rel| !local.contains_key(rel)) {
-        return Err(format!(
-            "every one of the {} synced paths is missing locally; refusing to trash \
-             them on Drive. Check that the folder is mounted and readable.",
-            baseline.len()
-        ));
-    }
-    Ok(())
-}
-
+mod engine;
+mod local_scan;
+mod model;
+mod planner;
+use engine::SYNC_CONCURRENCY;
+pub(crate) use engine::{SyncMsg, spawn};
+#[cfg(test)]
+use engine::{classify, settle_with};
+#[cfg(test)]
+use local_scan::is_write_mode;
+use local_scan::open_for_write_set;
+use model::{LocalItem, Outcome, PassAbort, Pending, RemoteItem};
+pub(crate) use planner::base_name;
+use planner::{
+    FilePlan, classification_order, conflict_path, filter_baseline, guard_local_wipe, join_rel,
+    parent_rel, plan_file, rel_to_path, remote_sig, unchanged_remote_size,
+};
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
 enum Applied {
@@ -783,7 +291,10 @@ impl Core {
         self.progress_scan_total(folder_id, baseline.len());
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
-        self.walk_local(folder_id, local_root, local_root, rules, &mut local)?;
+        let writing = open_for_write_set(local_root);
+        self.walk_local(
+            folder_id, local_root, local_root, rules, &writing, &mut local,
+        )?;
         // The guard compares against the paths this pass could still see: an
         // ignored path is absent from `local` by rule, not by loss, and counting
         // those as missing would trip the guard on every pass — wedging the
@@ -825,7 +336,7 @@ impl Core {
         // anything to push, and the only ones that could be a two-sided edit.
         let changed: Vec<&String> = local
             .iter()
-            .filter(|(_, item)| !item.is_dir)
+            .filter(|(_, item)| !item.is_dir && !item.open_for_write)
             .filter(|(rel, item)| {
                 baseline
                     .get(*rel)
@@ -856,7 +367,10 @@ impl Core {
         };
         let changed: HashSet<&String> = changed.into_iter().collect();
 
-        let mut outcome = Outcome::default();
+        let mut outcome = Outcome {
+            deferred: local.values().filter(|item| item.open_for_write).count(),
+            ..Default::default()
+        };
         let mut order: Vec<&String> = local.keys().collect();
         order.sort_by_key(|p| p.matches('/').count());
 
@@ -1043,7 +557,10 @@ impl Core {
         self.progress_scan_total(folder_id, baseline.len() * 2);
 
         let mut local: HashMap<String, LocalItem> = HashMap::new();
-        self.walk_local(folder_id, local_root, local_root, rules, &mut local)?;
+        let writing = open_for_write_set(local_root);
+        self.walk_local(
+            folder_id, local_root, local_root, rules, &writing, &mut local,
+        )?;
         // See `push_pass`: the guard must not count rule-excluded paths as lost.
         guard_local_wipe(&filter_baseline(&baseline, rules), &local)?;
 
@@ -1149,106 +666,82 @@ impl Core {
                 continue;
             }
 
-            // File.
-            let base = baseline.get(rel);
-            let local_changed = l.is_some_and(|l| {
-                base.is_none_or(|b| b.local_mtime != l.mtime || b.local_size != l.size)
-            });
-            let remote_changed =
-                r.is_some_and(|r| base.is_none_or(|b| remote_sig(b) != Some((r.mtime, r.size))));
-
-            match (l, r) {
-                (Some(_), Some(r)) => {
-                    // With no baseline, both sides read as "changed" and fall to the
-                    // conflict arm — the safe default for a folder re-added over
-                    // existing remote content.
-                    if !local_changed && !remote_changed {
-                        // Both untouched; baseline already matches.
-                    } else if local_changed && !remote_changed {
-                        batch.push(Pending::UploadRevision {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                        });
-                    } else if remote_changed && !local_changed {
-                        batch.push(Pending::Download {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                            mtime: r.mtime,
-                            size: r.size,
-                        });
-                    } else {
-                        batch.push(Pending::Conflict {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                            mtime: r.mtime,
-                            size: r.size,
-                        });
-                    }
+            match plan_file(l, r, baseline.get(rel)) {
+                FilePlan::Unchanged => {}
+                FilePlan::Deferred => {
+                    debug!(
+                        rel,
+                        "sync: file open for write by another process; deferring upload"
+                    );
+                    outcome.deferred += 1;
                 }
-                (Some(_), None) => {
-                    if base.is_none() || local_changed {
-                        // New local file, or remote deleted while local changed →
-                        // (re)upload it as a new remote file.
-                        match remote_dirs.get(parent_rel(rel)) {
-                            Some(parent) => batch.push(Pending::UploadNew {
-                                rel: rel.clone(),
-                                parent: parent.clone(),
-                            }),
-                            None => {
-                                warn!(rel, "sync: no remote parent for file; continuing");
-                                outcome.errors += 1;
-                            }
-                        }
-                    } else {
-                        // Remote deleted, local untouched → delete local.
-                        let _ = std::fs::remove_file(local_root.join(rel_to_path(rel)));
-                        let _ = self.db.sync_entry_remove(folder_id, rel);
+                FilePlan::UploadRevision => {
+                    let remote = r.expect("upload revision requires a remote file");
+                    batch.push(Pending::UploadRevision {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                    });
+                }
+                FilePlan::Download => {
+                    let remote = r.expect("download requires a remote file");
+                    batch.push(Pending::Download {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                        mtime: remote.mtime,
+                        size: remote.size,
+                    });
+                }
+                FilePlan::Conflict => {
+                    let remote = r.expect("conflict requires a remote file");
+                    batch.push(Pending::Conflict {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                        mtime: remote.mtime,
+                        size: remote.size,
+                    });
+                }
+                FilePlan::UploadNew => match remote_dirs.get(parent_rel(rel)) {
+                    Some(parent) => batch.push(Pending::UploadNew {
+                        rel: rel.clone(),
+                        parent: parent.clone(),
+                    }),
+                    None => {
+                        warn!(rel, "sync: no remote parent for file; continuing");
+                        outcome.errors += 1;
+                    }
+                },
+                FilePlan::DeleteLocal => {
+                    let _ = std::fs::remove_file(local_root.join(rel_to_path(rel)));
+                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    self.log_activity(ActivityKind::Trash, base_name(rel), "removed locally", true);
+                    outcome.deleted += 1;
+                }
+                FilePlan::DeleteRemote => {
+                    let remote = r.expect("remote deletion requires a remote file");
+                    if let Err(e) = self
+                        .rt
+                        .block_on(self.client.trash_nodes(std::slice::from_ref(&remote.uid)))
+                    {
+                        warn!(rel, error = %e, "sync: trash remote failed");
                         self.log_activity(
                             ActivityKind::Trash,
                             base_name(rel),
-                            "removed locally",
-                            true,
+                            e.to_string(),
+                            false,
                         );
-                        outcome.deleted += 1;
+                        outcome.errors += 1;
+                        continue;
                     }
+                    let _ = self.db.sync_entry_remove(folder_id, rel);
+                    self.log_activity(
+                        ActivityKind::Trash,
+                        base_name(rel),
+                        "removed on Drive",
+                        true,
+                    );
+                    outcome.deleted += 1;
                 }
-                (None, Some(r)) => {
-                    if base.is_none() || remote_changed {
-                        // New remote file, or local deleted while remote changed →
-                        // (re)download it.
-                        batch.push(Pending::Download {
-                            rel: rel.clone(),
-                            uid: r.uid.clone(),
-                            mtime: r.mtime,
-                            size: r.size,
-                        });
-                    } else {
-                        // Local deleted, remote untouched → delete remote.
-                        if let Err(e) = self
-                            .rt
-                            .block_on(self.client.trash_nodes(std::slice::from_ref(&r.uid)))
-                        {
-                            warn!(rel, error = %e, "sync: trash remote failed");
-                            self.log_activity(
-                                ActivityKind::Trash,
-                                base_name(rel),
-                                e.to_string(),
-                                false,
-                            );
-                            outcome.errors += 1;
-                            continue;
-                        }
-                        let _ = self.db.sync_entry_remove(folder_id, rel);
-                        self.log_activity(
-                            ActivityKind::Trash,
-                            base_name(rel),
-                            "removed on Drive",
-                            true,
-                        );
-                        outcome.deleted += 1;
-                    }
-                }
-                (None, None) => {
+                FilePlan::ForgetBaseline => {
                     let _ = self.db.sync_entry_remove(folder_id, rel);
                 }
             }
@@ -1305,6 +798,7 @@ impl Core {
         root: &Path,
         dir: &Path,
         rules: &IgnoreRules,
+        writing: &HashSet<PathBuf>,
         out: &mut HashMap<String, LocalItem>,
     ) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
@@ -1338,17 +832,25 @@ impl Core {
                         is_dir: true,
                         mtime: 0,
                         size: 0,
+                        open_for_write: false,
                     },
                 );
                 self.progress_scanned(folder_id, base_name(rel));
-                self.walk_local(folder_id, root, &path, rules, out)?;
+                self.walk_local(folder_id, root, &path, rules, writing, out)?;
             } else if meta.is_file() {
+                // Check whether any process holds this file open for writing.
+                // The canonical path is used because /proc/*/fd links resolve
+                // to canonical targets.
+                let ofw = std::fs::canonicalize(&path)
+                    .map(|canon| writing.contains(&canon))
+                    .unwrap_or(false);
                 out.insert(
                     rel.to_string(),
                     LocalItem {
                         is_dir: false,
                         mtime: system_mtime(&meta),
                         size: meta.len() as i64,
+                        open_for_write: ofw,
                     },
                 );
                 self.progress_scanned(folder_id, base_name(rel));
@@ -1554,14 +1056,20 @@ impl Core {
                 });
             }
             let mut out = Vec::new();
+            let mut join_errors = 0usize;
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(result) => out.push(result),
-                    Err(e) => warn!(error = %e, "sync: task panicked"),
+                    Err(e) => {
+                        join_errors += 1;
+                        warn!(error = %e, "sync: task panicked");
+                    }
                 }
             }
-            out
+            (out, join_errors)
         });
+        let (results, join_errors) = results;
+        outcome.errors += join_errors;
         for result in results {
             match result {
                 Ok(applied) => {
@@ -1859,40 +1367,6 @@ fn remote_file_sig(node: &Node) -> (i64, i64) {
     (node.modification_time, size)
 }
 
-/// The size the baseline recorded for `rel`, if its remote signature's mtime
-/// still matches `mtime` — meaning the file has not changed on Drive, so the
-/// recorded size stands and there is no need to decrypt it again.
-///
-/// `None` means the size has to be read for real: either the mtime moved, or
-/// there is no baseline signature to trust (a file the sync has not seen).
-fn unchanged_remote_size(
-    baseline: &HashMap<String, StoredSyncEntry>,
-    rel: &str,
-    mtime: i64,
-) -> Option<i64> {
-    match baseline.get(rel).and_then(remote_sig) {
-        Some((recorded, size)) if recorded == mtime => Some(size),
-        _ => None,
-    }
-}
-
-/// Join a child `name` onto a walk's `prefix`, giving a rel path.
-fn join_rel(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}/{name}")
-    }
-}
-
-/// The stored remote signature of a baseline row, if it has one.
-fn remote_sig(e: &StoredSyncEntry) -> Option<(i64, i64)> {
-    match (&e.remote_rev, &e.remote_hash) {
-        (Some(m), Some(s)) => Some((m.parse().ok()?, s.parse().ok()?)),
-        _ => None,
-    }
-}
-
 /// A file's modification time as epoch seconds (0 if unavailable).
 fn system_mtime(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
@@ -1901,43 +1375,6 @@ fn system_mtime(meta: &std::fs::Metadata) -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
-
-/// The parent of a `/`-joined relative path (`""` for a top-level entry).
-fn parent_rel(rel: &str) -> &str {
-    match rel.rfind('/') {
-        Some(i) => &rel[..i],
-        None => "",
-    }
-}
-
-/// The final component of a `/`-joined relative path.
-pub(crate) fn base_name(rel: &str) -> &str {
-    match rel.rfind('/') {
-        Some(i) => &rel[i + 1..],
-        None => rel,
-    }
-}
-
-/// Turn a `/`-joined relative path into an OS path (`/` is already the separator
-/// on Linux, this keeps the intent explicit).
-fn rel_to_path(rel: &str) -> PathBuf {
-    rel.split('/').collect()
-}
-
-/// The name for a conflict copy of `path`, e.g. `notes (sync-conflict 1700000000).txt`.
-fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str());
-    let name = match ext {
-        Some(ext) => format!("{stem} (sync-conflict {stamp}).{ext}"),
-        None => format!("{stem} (sync-conflict {stamp})"),
-    };
-    match path.parent() {
-        Some(dir) => dir.join(name),
-        None => PathBuf::from(name),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2030,6 +1467,7 @@ mod tests {
             is_dir,
             mtime: 1,
             size: 1,
+            open_for_write: false,
         }
     }
 
@@ -2341,5 +1779,70 @@ mod tests {
         );
         let no_ext = conflict_path(Path::new("/home/me/README"), 42);
         assert_eq!(no_ext, PathBuf::from("/home/me/README (sync-conflict 42)"));
+    }
+
+    // ---- open-for-write detection tests -----------------------------------
+
+    #[test]
+    fn is_write_mode_detects_wronly() {
+        // O_WRONLY = 0o1 → flags octal "0100001" (O_WRONLY | O_LARGEFILE on x86_64)
+        let fdinfo = "pos:\t0\nflags:\t0100001\nmnt_id:\t29\n";
+        assert!(is_write_mode(fdinfo), "O_WRONLY must be detected as write");
+    }
+
+    #[test]
+    fn is_write_mode_detects_rdwr() {
+        // O_RDWR = 0o2 → flags octal "0100002"
+        let fdinfo = "pos:\t0\nflags:\t0100002\nmnt_id:\t29\n";
+        assert!(is_write_mode(fdinfo), "O_RDWR must be detected as write");
+    }
+
+    #[test]
+    fn is_write_mode_ignores_rdonly() {
+        // O_RDONLY = 0o0 → flags octal "0100000" (just O_LARGEFILE)
+        let fdinfo = "pos:\t0\nflags:\t0100000\nmnt_id:\t29\n";
+        assert!(
+            !is_write_mode(fdinfo),
+            "O_RDONLY must not be detected as write"
+        );
+    }
+
+    #[test]
+    fn is_write_mode_handles_bare_zero() {
+        // A plain "0" (no O_LARGEFILE, no access flags).
+        let fdinfo = "pos:\t0\nflags:\t0\nmnt_id:\t29\n";
+        assert!(!is_write_mode(fdinfo), "flags 0 is O_RDONLY");
+    }
+
+    #[test]
+    fn is_write_mode_returns_false_on_missing_flags_line() {
+        let fdinfo = "pos:\t42\nmnt_id:\t29\n";
+        assert!(!is_write_mode(fdinfo));
+    }
+
+    #[test]
+    fn is_write_mode_handles_append() {
+        // O_WRONLY | O_APPEND = 0o1 | 0o2000 = 0o2001 → with O_LARGEFILE: 0o102001
+        let fdinfo = "pos:\t0\nflags:\t0102001\nmnt_id:\t29\n";
+        assert!(is_write_mode(fdinfo), "O_WRONLY|O_APPEND is still a write");
+    }
+
+    #[test]
+    fn outcome_includes_deferred_in_summary() {
+        let o = Outcome {
+            uploaded: 3,
+            deferred: 2,
+            ..Default::default()
+        };
+        assert!(!o.is_empty());
+        assert_eq!(o.summary(), "3 uploaded, 2 deferred (open for write)");
+    }
+
+    #[test]
+    fn outcome_deferred_alone_is_not_empty() {
+        let mut o = Outcome::default();
+        assert!(o.is_empty());
+        o.deferred = 1;
+        assert!(!o.is_empty());
     }
 }

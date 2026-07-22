@@ -494,6 +494,7 @@ impl Core {
             by_uid: HashMap::new(),
             children: HashMap::new(),
             next_ino: 2,
+            active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
             db: self.db.clone(),
@@ -682,26 +683,22 @@ impl Core {
                 // fails, since eviction may already have deleted part of the tree.
                 // Recovery is the user's explicit switch back to `mirror`, whose arm
                 // clears the baseline and re-downloads.
-                self.db
-                    .sync_folder_set_mode(id, "ondemand")
-                    .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
-
-                // Reclaim the disk: empty the local dir (keep it as the mountpoint).
-                if let Err(e) = evict_dir_contents(&local) {
-                    let _ = self.db.sync_folder_set_state(id, "error", now_secs());
-                    return Err(SwitchBlocked::Failed(format!(
-                        "evict {}: {e}",
-                        local.display()
-                    )));
+                if let Err(e) = self.db.sync_folder_set_mode(id, "ondemand") {
+                    return Err(SwitchBlocked::Failed(format!("db: {e:?}")));
                 }
 
-                let session = match self.spawn_ondemand_mount(&local, root) {
-                    Ok(session) => session,
-                    Err(e) => {
-                        let _ = self.db.sync_folder_set_state(id, "error", now_secs());
-                        return Err(SwitchBlocked::Failed(e.to_string()));
-                    }
-                };
+                // Reclaim the disk before mounting. Once FUSE covers `local`, a
+                // directory walk addresses the remote namespace, so evicting at
+                // that point sends unlink/rmdir requests to Drive and leaves the
+                // underlying mirror hidden and untouched.
+                if let Err(e) = evict_dir_contents(&local) {
+                    warn!(id, path = %local.display(), error = %e, "evict local dir contents failed");
+                }
+                let session = self.spawn_ondemand_mount(&local, root).map_err(|e| {
+                    SwitchBlocked::Failed(format!(
+                        "mount ondemand failed after local cache eviction; switch back to mirror to restore it: {e}"
+                    ))
+                })?;
                 self.mounts
                     .lock()
                     .insert(id, (session, fuse_connection_id(&local)));
