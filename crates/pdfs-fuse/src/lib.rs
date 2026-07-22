@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
@@ -225,6 +226,9 @@ struct Core {
     /// staged blob *is* the file's content and the remote still holds the old
     /// revision; and the drain worker, which performs the uploads.
     pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
+    /// Nodes removed through this daemon which a briefly stale remote listing
+    /// may still return. Uids are not reused; an explicit restore clears one.
+    hidden: Arc<Mutex<HashSet<NodeUid>>>,
     /// Nudges the drain worker: set true and notify to have it re-examine the
     /// queue instead of waiting out its backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
@@ -654,6 +658,7 @@ impl Core {
                 // Before the lock: a DB row carries the size the server last
                 // sealed, which a queued write is ahead of (B11).
                 self.stamp_pending_sizes(&mut nodes);
+                let hidden = self.hidden.lock().clone();
                 let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
                     return Ok(());
@@ -661,7 +666,7 @@ impl Core {
                 let mut child_inos = Vec::with_capacity(nodes.len());
                 let mut needs_size = Vec::new();
                 for node in nodes {
-                    if node.trashed || node.uid == folder_uid {
+                    if !node_visible(&node, &folder_uid, &hidden) {
                         continue;
                     }
                     if matches!(
@@ -712,6 +717,7 @@ impl Core {
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
+        let hidden = self.hidden.lock().clone();
 
         let mut st = self.state.lock();
         // Lost the race? Another thread already populated it.
@@ -721,7 +727,7 @@ impl Core {
         let mut child_inos = Vec::with_capacity(nodes.len());
         let filtered_nodes: Vec<Node> = nodes
             .into_iter()
-            .filter(|node| !node.trashed && node.uid != folder_uid)
+            .filter(|node| node_visible(node, &folder_uid, &hidden))
             .collect();
         // Files whose real size the cheap enumeration could not read. Collected
         // before interning so the upgrade below has the uids without re-walking.
@@ -1488,6 +1494,7 @@ impl Core {
             error!(%uid, error = %e, "queueing trash failed");
             Errno::EIO
         })?;
+        self.hidden.lock().insert(uid.clone());
         self.state.lock().forget(uid);
         self.cache.evict(uid);
         self.evict_reader(uid);
@@ -2335,6 +2342,12 @@ impl Core {
             .block_on(self.client.restore_nodes(&parsed))
             .map_err(|e| CoreError::from_api(&e, "restore"))?;
         {
+            let mut hidden = self.hidden.lock();
+            for uid in &parsed {
+                hidden.remove(uid);
+            }
+        }
+        {
             let mut st = self.state.lock();
             for parent in parents {
                 if let Some(&ino) = st.by_uid.get(&parent) {
@@ -2923,6 +2936,38 @@ fn copy_pending_for_truncate(pending: &PendingRevision, destination: &File) -> s
     destination.set_len(offset)
 }
 
+/// Whether a rename must be represented as a durable desired end state.
+/// Offline operations and operations targeting a not-yet-uploaded directory
+/// cannot use the API immediately. Online remote-to-remote operations stay
+/// synchronous so a successful kernel reply means the remote namespace has
+/// already reached the same end state.
+fn rename_needs_queue(
+    online: bool,
+    destination_is_local: bool,
+    _parent_changed: bool,
+    _name_changed: bool,
+) -> bool {
+    !online || destination_is_local
+}
+
+/// Convert one kernel pathname component into the UTF-8 name accepted by Drive.
+/// Linux filesystems conventionally cap a component at `NAME_MAX` (255 bytes),
+/// but the FUSE kernel path can pass a longer component through to userspace.
+fn fuse_name(name: &OsStr) -> Result<String, Errno> {
+    let bytes = name.as_bytes();
+    if bytes.len() > 255 {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(Errno::EINVAL);
+    }
+    name.to_str().map(str::to_owned).ok_or(Errno::EILSEQ)
+}
+
+fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
+    !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
+}
+
 /// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),
 /// for the activity log. Uses 1024-based steps but the shorter SI labels.
 fn human_bytes(bytes: u64) -> String {
@@ -3287,7 +3332,8 @@ mod pending_size_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Intervals, PendingRevision, conflict_name, copy_pending_for_truncate, is_stale_mount,
+        Intervals, PendingRevision, conflict_name, copy_pending_for_truncate, fuse_name,
+        is_stale_mount, node_visible, rename_needs_queue,
     };
     use pdfs_core::cache::{Baseline, StagedWrite};
 
@@ -3454,6 +3500,64 @@ mod tests {
         let pending = pending_revision(&dir, b"\0\0\0authored", false);
         assert!(!pending.meta.complete);
         assert_ne!(pending.meta.authored, vec![(0, pending.meta.len)]);
+    }
+
+    #[test]
+    fn online_combined_cross_directory_rename_stays_synchronous() {
+        assert!(!rename_needs_queue(true, false, true, true));
+        assert!(rename_needs_queue(false, false, false, true));
+        assert!(rename_needs_queue(true, true, true, false));
+    }
+
+    #[test]
+    fn one_step_online_namespace_changes_stay_synchronous() {
+        assert!(!rename_needs_queue(true, false, false, true));
+        assert!(!rename_needs_queue(true, false, true, false));
+        assert!(!rename_needs_queue(true, false, false, false));
+    }
+
+    #[test]
+    fn fuse_names_enforce_linux_component_limits() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            fuse_name(OsStr::new("x".repeat(255).as_str()))
+                .unwrap()
+                .len(),
+            255
+        );
+        assert_eq!(
+            fuse_name(OsStr::new("x".repeat(256).as_str()))
+                .expect_err("256-byte component must be refused")
+                .code(),
+            libc::ENAMETOOLONG
+        );
+        assert_eq!(
+            fuse_name(OsStr::new("."))
+                .expect_err("dot is not an ordinary component")
+                .code(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            fuse_name(OsStr::new("unicodé-文件")).unwrap(),
+            "unicodé-文件"
+        );
+    }
+
+    #[test]
+    fn local_trash_tombstones_hide_stale_remote_entries() {
+        let folder_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("folder"));
+        let node = node_helper("child", "folder", "child", false);
+        assert!(node_visible(
+            &node,
+            &folder_uid,
+            &std::collections::HashSet::new()
+        ));
+        assert!(!node_visible(
+            &node,
+            &folder_uid,
+            &std::collections::HashSet::from([node.uid.clone()])
+        ));
     }
 
     use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};

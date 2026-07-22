@@ -23,13 +23,13 @@ case "${1:-}" in
     -h|--help) usage ;;
     --offline-only|"")
         (( $# <= 1 )) || usage
-        exec python3 "$script_dir/fuse-acceptance.py"
+        exec python3 -u "$script_dir/fuse-acceptance.py"
         ;;
     --live) shift ; (( $# > 0 )) || usage ;;
     --managed-live)
         shift
         (( $# == 2 )) || usage
-        exec python3 "$script_dir/fuse-acceptance.py" --managed-live "$@"
+        exec python3 -u "$script_dir/fuse-acceptance.py" --managed-live "$@"
         ;;
     --*) usage ;;
 esac
@@ -44,4 +44,4 @@ fstype="$(findmnt -T "$1" -n -o FSTYPE | head -n 1)"
     exit 2
 }
 
-exec python3 "$script_dir/fuse-acceptance.py" --live "$@"
+exec python3 -u "$script_dir/fuse-acceptance.py" --live "$@"

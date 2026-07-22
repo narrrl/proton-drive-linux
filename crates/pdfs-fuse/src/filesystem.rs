@@ -5,7 +5,13 @@ use super::*;
 impl Filesystem for ProtonFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
-        let name = name.to_string_lossy().into_owned();
+        let name = match fuse_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
         // A folder that has not been listed yet is enumerated from the remote,
         // so serve it from a worker rather than stalling the dispatch loop. A
         // listed folder — the common case — is a map hit, and answering it
@@ -307,7 +313,13 @@ impl Filesystem for ProtonFs {
             reply.error(e);
             return;
         }
-        let name = name.to_string_lossy().into_owned();
+        let name = match fuse_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
         let parent_uid = {
             let st = self.core.state.lock();
             match st.entries.get(&parent) {
@@ -761,7 +773,13 @@ impl Filesystem for ProtonFs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name_str = name.to_string_lossy();
+        let name_str = match fuse_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
         if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
             let st = self.core.state.lock();
             if let Some(entry) = st.entries.get(&ino)
@@ -775,7 +793,13 @@ impl Filesystem for ProtonFs {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name_str = name.to_string_lossy();
+        let name_str = match fuse_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
         if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
             {
                 let st = self.core.state.lock();
@@ -817,7 +841,13 @@ impl Filesystem for ProtonFs {
             reply.error(e);
             return;
         }
-        let name = name.to_string_lossy().into_owned();
+        let name = match fuse_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
         let parent_uid = {
             let st = self.core.state.lock();
             match st.entries.get(&parent) {
@@ -899,8 +929,20 @@ impl Filesystem for ProtonFs {
     ) {
         let parent = parent.0;
         let newparent = newparent.0;
-        let name = name.to_string_lossy().into_owned();
-        let newname = newname.to_string_lossy().into_owned();
+        let name = match fuse_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
+        let newname = match fuse_name(newname) {
+            Ok(name) => name,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
         let (ino, uid) = match self.core.lookup_child(parent, &name) {
             Ok(x) => x,
             Err(e) => {
@@ -1050,12 +1092,31 @@ impl Filesystem for ProtonFs {
         // take the synchronous path, so a genuine API refusal (permissions, a
         // name clash) surfaces to the caller instead of becoming a queued op
         // that can only ever conflict.
-        if !self.core.online.load(Ordering::Relaxed) || is_local_uid(&new_parent_uid) {
+        if rename_needs_queue(
+            self.core.online.load(Ordering::Relaxed),
+            is_local_uid(&new_parent_uid),
+            newparent != parent,
+            newname != name,
+        ) {
             match self
                 .core
                 .queue_rename(ino, &uid, newparent, &new_parent_uid, &newname)
             {
-                Ok(()) => reply.ok(),
+                Ok(()) => {
+                    // Send the rename response first. Kernel-side rename cache
+                    // updates happen while processing that response; notifying
+                    // before it lets those updates overwrite our invalidation
+                    // and retain an empty destination readdir page.
+                    reply.ok();
+                    if let Some(notifier) = self.core.notifier.get() {
+                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
+                        let _ = notifier.inval_entry(INodeNo(newparent), OsStr::new(&newname));
+                        let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
+                        if newparent != parent {
+                            let _ = notifier.inval_inode(INodeNo(newparent), 0, 0);
+                        }
+                    }
+                }
                 Err(e) => {
                     self.core.restore_replaced(victim.as_ref(), &newname);
                     reply.error(e);
@@ -1063,54 +1124,58 @@ impl Filesystem for ProtonFs {
             }
             return;
         }
-        // Move first if the parent changed, then rename if the name changed.
+        // Rename first if both halves change. Moving first makes the encrypted
+        // name requirements stale and repeatedly failed with InvalidRequirements.
         // A failure past this point has already trashed any node the rename was
         // replacing, so put it back rather than leaving the caller with neither
         // the source moved nor the destination intact.
-        if newparent != parent
-            && let Err(e) = self
+        if newname != name {
+            if let Err(e) = self
                 .core
                 .rt
-                .block_on(self.core.client.move_node(&uid, &new_parent_uid))
-        {
-            error!(%uid, error = %e, "move failed");
-            self.core.restore_replaced(victim.as_ref(), &newname);
-            reply.error(Errno::EIO);
-            return;
+                .block_on(self.core.client.rename_node(&uid, &newname, None))
+            {
+                error!(%uid, error = %e, "rename failed");
+                self.core.restore_replaced(victim.as_ref(), &newname);
+                reply.error(Errno::EIO);
+                return;
+            }
         }
-        if newname != name {
-            // A move changes the node's encrypted name requirements. Proton's
-            // link-details read can remain briefly stale immediately after the
-            // move, making the following rename fail with InvalidRequirements
-            // ("out of date"). Re-read/retry that narrow eventual-consistency
-            // error; other refusals are stable and must surface immediately.
+        if newparent != parent {
             let mut attempts = 0u32;
-            let renamed = loop {
+            let moved = loop {
                 match self
                     .core
                     .rt
-                    .block_on(self.core.client.rename_node(&uid, &newname, None))
+                    .block_on(self.core.client.move_node(&uid, &new_parent_uid))
                 {
                     Ok(()) => break Ok(()),
                     Err(e)
-                        if newparent != parent
+                        if newname != name
                             && api_code(&e) == Some(ResponseCode::InvalidRequirements)
-                            && attempts < 4 =>
+                            && attempts < 20 =>
                     {
                         attempts += 1;
-                        std::thread::sleep(Duration::from_millis(100 * (1 << attempts)));
+                        // Requirement propagation routinely takes longer than
+                        // three seconds. Keep a bounded ten-second window; a
+                        // successful POSIX reply must mean both remote halves
+                        // landed, not merely that the second half was queued.
+                        std::thread::sleep(Duration::from_millis(500));
                     }
                     Err(e) => break Err(e),
                 }
             };
-            if let Err(e) = renamed {
-                error!(%uid, attempts, error = %e, "rename after move failed");
-                // The move half already landed. Keep our inode model honest
-                // even though the combined POSIX operation has to return EIO.
-                self.core
-                    .state
-                    .lock()
-                    .relocate(ino, parent, newparent, &new_parent_uid, &name);
+            if let Err(e) = moved {
+                error!(%uid, attempts, error = %e, "move after rename failed");
+                // The rename half landed in the source directory.
+                let mut state = self.core.state.lock();
+                let old_parent_uid = state
+                    .entries
+                    .get(&parent)
+                    .map(|entry| entry.uid.clone())
+                    .unwrap_or_else(|| uid.clone());
+                state.rename_in_place(ino, parent, &old_parent_uid, &newname);
+                drop(state);
                 self.core.restore_replaced(victim.as_ref(), &newname);
                 reply.error(Errno::EIO);
                 return;
@@ -1385,6 +1450,7 @@ impl ProtonFs {
         }
         // Only remove the namespace entry after Drive accepted the mutation.
         // Otherwise an EIO response still made the path disappear locally.
+        self.core.hidden.lock().insert(uid.clone());
         self.core.state.lock().forget_or_unlink(&uid);
         if !open_now {
             self.core.discard_queued_ops(&uid);

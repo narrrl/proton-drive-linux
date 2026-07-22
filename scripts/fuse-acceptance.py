@@ -160,6 +160,7 @@ def test_namespace_and_errors(root: Path) -> None:
     check(read(root / "victim") == b"source" and not (root / "source").exists(), "replace failed")
     os.rename(root / "victim", b / "moved")
     check(read(b / "moved") == b"source", "cross-directory move failed")
+    check("moved" in os.listdir(b), "cross-directory move missing from readdir")
     os.rename(b / "moved", b / "moved")
     check(read(b / "moved") == b"source", "same-name rename changed data")
 
@@ -257,10 +258,14 @@ def run_contract(parent: Path, label: str) -> tuple[Path, str]:
     root.mkdir()
     print(f"[target] {label}: {parent}")
     try:
-        for name, operation in TESTS:
+        selected = os.environ.get("PDFS_ACCEPTANCE_ONLY")
+        tests = TESTS if not selected else [test for test in TESTS if selected.lower() in test[0].lower()]
+        check(bool(tests), f"PDFS_ACCEPTANCE_ONLY={selected!r} matched no tests")
+        for name, operation in tests:
             print(f"  [test] {name}")
             operation(root)
-        digest = hashlib.sha256(read(root / "positioned.bin")).hexdigest()
+        digest_path = root / "positioned.bin"
+        digest = hashlib.sha256(read(digest_path)).hexdigest() if digest_path.exists() else ""
         return root, digest
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
@@ -310,6 +315,41 @@ class ManagedSyncPair:
         value = json.loads(self.command("sync", "list", json_output=True))
         return value["items"]
 
+    def wait_for_queue(self) -> None:
+        import json
+        deadline = time.monotonic() + self.timeout
+        last = None
+        while time.monotonic() < deadline:
+            value = json.loads(self.command("status", json_output=True))
+            last = value.get("mount") or {}
+            if last.get("pending_uploads", 0) == 0 and last.get("pending_changes", 0) == 0:
+                return
+            time.sleep(1)
+        raise TimeoutError(f"daemon mutation queue did not drain: {last}")
+
+    def remove_tree(self, root: Path) -> None:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                shutil.rmtree(root)
+                return
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                if error.errno != errno.ENOTEMPTY or time.monotonic() >= deadline:
+                    survivors = []
+                    if root.exists():
+                        for directory, dirs, files in os.walk(root):
+                            survivors.extend(str(Path(directory) / name) for name in dirs + files)
+                    raise OSError(
+                        error.errno,
+                        f"{error.strerror}; surviving test entries: {survivors[:50]}",
+                        error.filename,
+                    ) from error
+                # A queued namespace operation can land between rmtree's
+                # enumeration and rmdir. Re-walk the test-owned tree.
+                time.sleep(0.25)
+
     def validate(self) -> None:
         if shutil.which(self.pdfs) is None and not Path(self.pdfs).is_file():
             raise RuntimeError(
@@ -317,7 +357,20 @@ class ManagedSyncPair:
             )
         if self.paths[0] == self.paths[1]:
             raise ValueError("managed live paths must be different directories")
-        registered = {Path(item["local_path"]).resolve() for item in self.folders()}
+        deadline = time.monotonic() + self.timeout
+        last_error = None
+        while True:
+            try:
+                current = self.folders()
+                break
+            except Exception as error:
+                last_error = error
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"pdfs daemon did not become ready within {self.timeout}s: {last_error}"
+                    ) from error
+                time.sleep(1)
+        registered = {Path(item["local_path"]).resolve() for item in current}
         for path in self.paths:
             check(path.is_dir(), f"managed path is not a directory: {path}")
             check(not any(path.iterdir()), f"managed path is not empty: {path}")
@@ -376,13 +429,21 @@ class ManagedSyncPair:
         raise TimeoutError(f"forced sync for {path} did not complete: {last}")
 
     def set_modes(self, modes: tuple[str, str]) -> None:
+        changed_to_mirror: set[Path] = set()
         for path, mode in zip(self.paths, modes, strict=True):
             current = self.wait_for(path)
             if current["mode"] != mode:
                 print(f"[setup] switching {path} to {mode}")
                 self.command("sync", "mode", str(self.ids[path]), mode)
+                if mode == "mirror":
+                    changed_to_mirror.add(path)
         for path, mode in zip(self.paths, modes, strict=True):
             self.wait_for(path, mode=mode)
+            # The mode row flips before the asynchronous restore pass starts,
+            # and its prior idle/last_sync values remain visible meanwhile.
+            # Demand a completed pass before inspecting restored local bytes.
+            if path in changed_to_mirror:
+                self.force_sync(path)
             mounted = is_mountpoint(path)
             check(mounted == (mode == "ondemand"), f"{path}: mode is {mode}, mounted={mounted}")
             check(
@@ -407,6 +468,17 @@ class ManagedSyncPair:
                 self.command("sync", "rm", str(folder_id), "--delete-remote")
             except Exception as error:
                 print(f"WARNING: cleanup failed for sync folder {folder_id}: {error}")
+                continue
+            # Unregistering a mirror intentionally preserves its local copy.
+            # Remove only the sentinel owned by this harness so the next run's
+            # strict empty-directory precondition remains meaningful. Unknown
+            # survivors are left untouched and will fail validate() next time.
+            sentinel = path / "pdfs-mode-preservation.bin"
+            try:
+                if sentinel.exists() and read(sentinel) == self.sentinels[path]:
+                    sentinel.unlink()
+            except OSError as error:
+                print(f"WARNING: could not remove managed sentinel {sentinel}: {error}")
 
 
 def is_mountpoint(path: Path) -> bool:
@@ -432,8 +504,10 @@ def run_managed_matrix(paths: list[Path]) -> None:
             for path, mode in zip(pair.paths, modes, strict=True):
                 root, _ = run_contract(path, f"managed {mode}")
                 roots.append(root)
-                shutil.rmtree(root)
+                pair.wait_for_queue()
+                pair.remove_tree(root)
                 roots.remove(root)
+                pair.wait_for_queue()
                 # Mirror changes are asynchronous; force and await a pass before
                 # changing its mode so authored bytes/deletions cannot be lost.
                 if mode == "mirror":

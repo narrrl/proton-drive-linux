@@ -53,6 +53,10 @@ in `pdfs sync list`. Use `PDFS_ACCEPTANCE_SYNC_TIMEOUT` to extend transition
 timeouts and `PDFS_ACCEPTANCE_PDFS` to select a non-installed CLI binary, for
 example `target/debug/pdfs`.
 
+During development, `PDFS_ACCEPTANCE_ONLY` runs tests whose descriptive name
+contains the supplied text (for example `PDFS_ACCEPTANCE_ONLY=namespace`). A
+release acceptance run must leave it unset so the complete contract executes.
+
 Passing more paths runs the same filesystem suite independently against each.
 The first path must be the FUSE mount under test; later paths may be another
 FUSE mount or a normal local mirror filesystem:
