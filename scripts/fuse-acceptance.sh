@@ -76,6 +76,37 @@ assert got == expected
 print(hashlib.sha256(got).hexdigest())
 PY
 
+step "media-style header and distant seek reads"
+python3 - "$primary/seek-sample.mkv" <<'PY'
+import os, sys
+
+p = sys.argv[1]
+size = 12 * 1024 * 1024 + 137
+header = b"\x1aE\xdf\xa3pdfs-media-header"
+middle = b"pdfs-middle-cue"
+trailer = b"pdfs-media-trailer"
+middle_at = 7 * 1024 * 1024 + 19
+trailer_at = size - len(trailer)
+
+# A player probes the container header, jumps to cues/index data, then commonly
+# seeks near EOF.  Write a sparse fixture so the acceptance test stays cheap,
+# and issue separate unbuffered reads so FUSE receives genuinely distant ranges
+# rather than one accidental sequential read.
+with open(p, "wb", buffering=0) as f:
+    f.truncate(size)
+    f.seek(0); f.write(header)
+    f.seek(middle_at); f.write(middle)
+    f.seek(trailer_at); f.write(trailer)
+
+with open(p, "rb", buffering=0) as f:
+    assert f.read(len(header)) == header
+    f.seek(middle_at); assert f.read(len(middle)) == middle
+    f.seek(trailer_at); assert f.read(len(trailer)) == trailer
+    assert f.read(1) == b""
+    f.seek(size + 4096); assert f.read(16) == b""
+assert os.stat(p).st_size == size
+PY
+
 step "rename, move, and replacement semantics"
 mkdir -- "$primary/dir-a" "$primary/dir-b"
 printf 'source' > "$primary/source"
@@ -141,6 +172,35 @@ if [[ "${PDFS_ACCEPTANCE_CONVERGENCE:-0}" == 1 ]] && (( ${#roots[@]} > 1 )); the
         [[ "$(sha256sum "$secondary/binary.dat" | cut -d' ' -f1)" == "$expected" ]] || {
             echo "content mismatch on $secondary" >&2; exit 1
         }
+
+        # The media fixture may drain after binary.dat.  Wait independently,
+        # then probe only its sparse ranges on the other mount.  Unlike the
+        # same-mount check above, this exercises remote FUSE hydration and seek
+        # reads instead of serving the still-local staged file.
+        deadline=$((SECONDS + ${PDFS_ACCEPTANCE_SYNC_TIMEOUT:-120}))
+        while (( SECONDS < deadline )); do
+            [[ -f "$secondary/seek-sample.mkv" ]] &&
+                [[ "$(stat -c %s "$secondary/seek-sample.mkv" 2>/dev/null)" == 12583049 ]] && break
+            sleep 2
+        done
+        [[ -f "$secondary/seek-sample.mkv" ]] || {
+            echo "media fixture did not appear on $secondary" >&2; exit 1
+        }
+        python3 - "$secondary/seek-sample.mkv" <<'PY'
+import os, sys
+p = sys.argv[1]
+size = 12 * 1024 * 1024 + 137
+checks = [
+    (0, b"\x1aE\xdf\xa3pdfs-media-header"),
+    (7 * 1024 * 1024 + 19, b"pdfs-middle-cue"),
+    (size - len(b"pdfs-media-trailer"), b"pdfs-media-trailer"),
+]
+assert os.stat(p).st_size == size
+with open(p, "rb", buffering=0) as f:
+    for offset, expected in checks:
+        f.seek(offset)
+        assert f.read(len(expected)) == expected
+PY
     done
 fi
 

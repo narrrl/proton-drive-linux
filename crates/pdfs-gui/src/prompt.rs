@@ -1,11 +1,11 @@
 //! `pdfs-prompt` — the launcher: one search field over both Proton Drive and the
 //! files on this machine, styled after Google Drive's search overlay.
 //!
-//! Bind it to a system shortcut (e.g. in Hyprland) for a quick HUD search. It is
-//! a short-lived process: it must draw *now*, so nothing here blocks the main
-//! loop. Every daemon round-trip runs on a worker thread and lands back through
-//! an async channel; the two searches (Drive and local) are fired in parallel and
-//! each section renders as its own reply arrives.
+//! Bind it to a system shortcut (e.g. in Hyprland) for a quick HUD search. The
+//! application is single-instance and keeps its window alive between summons,
+//! so repeat activations only reset and present the existing widget tree. Every
+//! daemon round-trip runs on a worker thread and lands back through an async
+//! channel. Drive and local lookup share one request so a result set paints once.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,12 @@ use adw::prelude::*;
 use gtk4::{gio, glib};
 
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{LocalHit, Request, Response, SearchHit, send};
+use pdfs_core::control::{
+    LocalHit, Request, Response, SearchFilters, SearchHit, SearchKind, SearchSource, send,
+};
+
+mod activation;
+use activation::{DriveActivation, drive_activation, mounted_path};
 
 const APP_ID: &str = "io.narl.proton-drive-linux-prompt";
 
@@ -58,6 +63,16 @@ impl Filter {
             Filter::Documents => !is_dir && is_document(name),
             Filter::Images => !is_dir && is_image(name),
             Filter::Media => !is_dir && is_media(name),
+        }
+    }
+
+    fn search_kind(self) -> SearchKind {
+        match self {
+            Self::All => SearchKind::All,
+            Self::Folders => SearchKind::Folders,
+            Self::Documents => SearchKind::Documents,
+            Self::Images => SearchKind::Images,
+            Self::Media => SearchKind::Media,
         }
     }
 }
@@ -174,6 +189,13 @@ impl Hit {
         matches!(self, Hit::Drive(h) if h.pinned)
     }
 
+    fn score(&self) -> i64 {
+        match self {
+            Self::Drive(hit) => hit.score,
+            Self::Local(hit) => hit.score,
+        }
+    }
+
     /// Stable identity used to preserve the keyboard cursor across re-renders.
     /// The bool keeps a Drive and a local hit at the same path distinct.
     fn key(&self) -> (bool, String) {
@@ -182,6 +204,15 @@ impl Hit {
             Hit::Local(h) => (true, h.path.clone()),
         }
     }
+}
+
+fn rank_hits(hits: &mut [Hit]) {
+    hits.sort_by(|a, b| {
+        b.score()
+            .cmp(&a.score())
+            .then_with(|| a.name().cmp(b.name()))
+            .then_with(|| a.key().cmp(&b.key()))
+    });
 }
 
 /// Everything the window needs to render and act, in one place so the many
@@ -195,6 +226,7 @@ struct Ui {
     stack: gtk4::Stack,
     scroller: gtk4::ScrolledWindow,
     results: gtk4::Box,
+    search_section: Section,
     drive_section: Section,
     local_section: Section,
     placeholder: adw::StatusPage,
@@ -217,8 +249,7 @@ struct Ui {
     /// Monotonic query id. A reply whose id is stale (the user typed again while
     /// it was in flight) is dropped instead of overwriting fresher results.
     query_id: Cell<u64>,
-    /// In-flight searches for the current query id, so the spinner stops only
-    /// once both sections have answered.
+    /// In-flight requests for the current query id.
     pending: Cell<u8>,
     /// True once a Drive open is running: the window is about to close, so
     /// further input is ignored.
@@ -229,6 +260,10 @@ struct Ui {
     /// against the selected row once the fresh results settle, rather than being
     /// dropped — so a plain "type, Enter" always opens something.
     open_pending: Cell<bool>,
+    /// Prevent lifecycle-driven entry resets from also scheduling the normal
+    /// debounced empty-query request; activation performs one explicit daemon
+    /// bootstrap instead.
+    suppress_entry_change: Cell<bool>,
     /// The window, so a deferred open (above) can reach it from `render`.
     window: RefCell<Option<adw::ApplicationWindow>>,
 }
@@ -301,17 +336,33 @@ fn main() -> glib::ExitCode {
         .init();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
+    // GtkApplication normally remains active while it owns a window, including
+    // when that window is hidden. Hold it explicitly as well: residency is a
+    // product requirement here, not an incidental window-lifetime side effect.
+    let _resident = app.hold();
     app.connect_startup(|_| load_css());
-    app.connect_activate(build_window);
+    let prompt: Rc<RefCell<Option<Rc<Ui>>>> = Rc::new(RefCell::new(None));
+    app.connect_activate(move |app| {
+        let ui = if let Some(ui) = prompt.borrow().clone() {
+            ui
+        } else {
+            let Some(ui) = build_window(app) else {
+                return;
+            };
+            *prompt.borrow_mut() = Some(ui.clone());
+            ui
+        };
+        ui.activate();
+    });
     app.run()
 }
 
-fn build_window(app: &adw::Application) {
+fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     let dirs = match AppDirs::new() {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("cannot resolve app dirs: {e}");
-            return;
+            return None;
         }
     };
 
@@ -362,8 +413,10 @@ fn build_window(app: &adw::Application) {
     let results = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     results.add_css_class("results");
 
+    let search_section = Section::new("Best matches", "system-search-symbolic");
     let drive_section = Section::new("Proton Drive", "folder-remote-symbolic");
     let local_section = Section::new("This computer", "drive-harddisk-symbolic");
+    search_section.attach(&results);
     drive_section.attach(&results);
     local_section.attach(&results);
 
@@ -430,6 +483,7 @@ fn build_window(app: &adw::Application) {
         stack,
         scroller,
         results,
+        search_section,
         drive_section,
         local_section,
         placeholder,
@@ -446,6 +500,7 @@ fn build_window(app: &adw::Application) {
         opening: Cell::new(false),
         indexing: Cell::new(false),
         open_pending: Cell::new(false),
+        suppress_entry_change: Cell::new(false),
         window: RefCell::new(None),
     });
     *ui.window.borrow_mut() = Some(window.clone());
@@ -477,15 +532,17 @@ fn build_window(app: &adw::Application) {
         (&ui.local_section.list, true),
     ] {
         let ui_row = ui.clone();
-        let window_row = window.clone();
         list.connect_row_activated(move |_, row| {
             let offset = if is_local { ui_row.drive_count() } else { 0 };
-            ui_row.open(offset + row.index() as usize, &window_row);
+            ui_row.open(offset + row.index() as usize);
         });
     }
+    let ui_row = ui.clone();
+    ui.search_section
+        .list
+        .connect_row_activated(move |_, row| ui_row.open(row.index() as usize));
 
     let ui_key = ui.clone();
-    let window_key = window.clone();
     let keys = gtk4::EventControllerKey::new();
     keys.connect_key_pressed(move |_, key, _, state| {
         if ui_key.opening.get() {
@@ -496,7 +553,7 @@ fn build_window(app: &adw::Application) {
                 // Spotlight-style: first Escape clears a non-empty query, a
                 // second (or an already-empty box) dismisses the launcher.
                 if ui_key.entry.text().is_empty() {
-                    window_key.close();
+                    ui_key.dismiss();
                 } else {
                     ui_key.entry.set_text("");
                 }
@@ -532,19 +589,41 @@ fn build_window(app: &adw::Application) {
     // focused entry is never reached. Enter with focus in the list is covered by
     // `row_activated` above.
     let ui_activate = ui.clone();
-    let window_activate = window.clone();
     entry.connect_activate(move |_| {
         if ui_activate.opening.get() {
             return;
         }
         // Fall back to the top row when nothing is explicitly selected (e.g.
         // results haven't rendered yet); `open` guards the rest.
-        ui_activate.open(ui_activate.cursor.get().unwrap_or(0), &window_activate);
+        ui_activate.open(ui_activate.cursor.get().unwrap_or(0));
     });
+
+    // Some GTK/input-method combinations consume the physical Return binding in
+    // GtkText without emitting Entry::activate. Capture only Return ahead of the
+    // text widget and leave every other key to normal GTK/IME handling. Stopping
+    // propagation also prevents the activate signal above from opening twice;
+    // that signal remains the programmatic/accessibility activation path.
+    let ui_return = ui.clone();
+    let return_key = gtk4::EventControllerKey::new();
+    return_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    return_key.connect_key_pressed(move |_, key, _, _| {
+        if matches!(key, gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter) {
+            if !ui_return.opening.get() {
+                ui_return.open(ui_return.cursor.get().unwrap_or(0));
+            }
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    entry.add_controller(return_key);
 
     let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let ui_changed = ui.clone();
     entry.connect_changed(move |entry| {
+        if ui_changed.suppress_entry_change.get() {
+            return;
+        }
         // A fresh keystroke supersedes any Enter that was waiting on results:
         // the user is still refining the query, not asking to open yet.
         ui_changed.open_pending.set(false);
@@ -564,22 +643,59 @@ fn build_window(app: &adw::Application) {
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| ui_retry.connect());
 
-    // A launcher is modal by convention: losing focus dismisses it.
-    window.connect_is_active_notify(|w| {
-        if !w.is_active() {
-            w.close();
-        }
+    // Keep the widget tree alive when the compositor asks the window to close.
+    // This also avoids running GTK's destruction path while async replies still
+    // hold references to prompt widgets.
+    let ui_close = ui.clone();
+    window.connect_close_request(move |_| {
+        ui_close.dismiss();
+        glib::Propagation::Stop
     });
     let entry_map = entry.clone();
     window.connect_map(move |_| {
         entry_map.grab_focus();
     });
 
-    ui.connect();
-    window.present();
+    Some(ui)
 }
 
 impl Ui {
+    /// Reset and present the resident prompt in response to GApplication
+    /// activation. A second invocation while a file is materialising merely
+    /// raises the progress window; it must not make the in-flight open mutable.
+    fn activate(self: &Rc<Self>) {
+        let Some(window) = self.window.borrow().clone() else {
+            return;
+        };
+        if !self.opening.get() {
+            // Supersede replies from the previous showing before clearing the
+            // query. The daemon work may finish, but it can no longer repaint
+            // the newly activated prompt with stale rows.
+            self.query_id.set(self.query_id.get() + 1);
+            self.pending.set(0);
+            self.open_pending.set(false);
+            self.spinner.stop();
+            self.spinner.set_visible(false);
+            self.suppress_entry_change.set(true);
+            self.entry.set_text("");
+            self.suppress_entry_change.set(false);
+            self.set_filter(Filter::All);
+            self.connect();
+        }
+        window.present();
+        self.entry.grab_focus();
+    }
+
+    /// Dismiss without destroying the application window. GTK continues to
+    /// associate the hidden window with the single application instance, so a
+    /// later desktop shortcut invocation is a cheap `activate` round-trip.
+    fn dismiss(&self) {
+        self.open_pending.set(false);
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_visible(false);
+        }
+    }
+
     /// Ask the daemon for status and, if it answers, load the suggested (pinned)
     /// files. Runs off-thread: a dead daemon must not freeze the first frame.
     fn connect(self: &Rc<Self>) {
@@ -640,6 +756,8 @@ impl Ui {
                         modified: 0,
                         pinned: true,
                         uid: pin.uid,
+                        mounted_path: None,
+                        score: 0,
                     })
                     .collect(),
                 _ => Vec::new(),
@@ -650,32 +768,41 @@ impl Ui {
         });
     }
 
-    /// Fire both searches for `query` in parallel. An empty query falls back to
-    /// the suggestions view.
+    /// Search Drive and local metadata in one daemon round-trip. An empty query
+    /// falls back to the suggestions view.
     fn search(self: &Rc<Self>, query: &str) {
         if query.is_empty() {
             self.load_suggestions();
             return;
         }
 
-        let id = self.begin_query(2);
-
-        let drive = spawn_request(
+        let id = self.begin_query(1);
+        let search = spawn_request(
             self.socket.clone(),
-            Request::Search {
+            Request::SearchV2 {
                 query: query.to_string(),
                 limit: SEARCH_LIMIT,
+                filters: SearchFilters {
+                    sources: vec![SearchSource::Drive, SearchSource::Local],
+                    kind: self.filter.get().search_kind(),
+                },
             },
         );
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let reply = drive.recv().await;
+            let reply = search.recv().await;
             if !ui.finish_query(id) {
                 return;
             }
             match reply {
-                Ok(Ok(Response::SearchResults { hits })) => {
-                    *ui.drive_hits.borrow_mut() = hits;
+                Ok(Ok(Response::SearchResultsV2 {
+                    drive_hits,
+                    local_hits,
+                    local_indexing,
+                })) => {
+                    *ui.drive_hits.borrow_mut() = drive_hits;
+                    *ui.local_hits.borrow_mut() = local_hits;
+                    ui.indexing.set(local_indexing);
                     ui.render();
                 }
                 // Transport failure: the daemon is gone. Don't paint "No
@@ -683,32 +810,6 @@ impl Ui {
                 Ok(Err(_)) | Err(_) => ui.go_offline(),
                 _ => {
                     ui.drive_hits.borrow_mut().clear();
-                    ui.render();
-                }
-            }
-        });
-
-        let local = spawn_request(
-            self.socket.clone(),
-            Request::SearchLocal {
-                query: query.to_string(),
-                limit: SEARCH_LIMIT,
-            },
-        );
-        let ui = self.clone();
-        glib::spawn_future_local(async move {
-            let reply = local.recv().await;
-            if !ui.finish_query(id) {
-                return;
-            }
-            match reply {
-                Ok(Ok(Response::LocalResults { hits, indexing })) => {
-                    ui.indexing.set(indexing);
-                    *ui.local_hits.borrow_mut() = hits;
-                    ui.render();
-                }
-                Ok(Err(_)) | Err(_) => ui.go_offline(),
-                _ => {
                     ui.local_hits.borrow_mut().clear();
                     ui.render();
                 }
@@ -751,7 +852,12 @@ impl Ui {
         for (chip_filter, chip) in self.chips.borrow().iter() {
             chip.set_active(*chip_filter == filter);
         }
-        self.render();
+        let query = self.entry.text().trim().to_string();
+        if query.is_empty() {
+            self.render();
+        } else {
+            self.search(&query);
+        }
     }
 
     fn cycle_filter(self: &Rc<Self>, backwards: bool) {
@@ -776,9 +882,8 @@ impl Ui {
             .count()
     }
 
-    /// Rebuild both sections from the last replies under the active chip, then
-    /// restore the cursor to the top. Every state change funnels through here, so
-    /// the list, the placeholder, and the footer can never disagree.
+    /// Rebuild suggestions or the globally-ranked search section, preserving the
+    /// selected identity when a result survives the update.
     fn render(self: &Rc<Self>) {
         let filter = self.filter.get();
 
@@ -808,17 +913,24 @@ impl Ui {
 
         let query = self.entry.text().trim().to_string();
         let searching = !query.is_empty();
-        let drive_title = if searching {
-            "Proton Drive"
-        } else {
-            "Pinned in Proton Drive"
-        };
-        self.drive_section.set_rows(&drive, Some(drive_title));
-        self.local_section.set_rows(&local, None);
-
         let total = drive.len() + local.len();
         let mut visible = drive;
         visible.extend(local);
+        if searching {
+            rank_hits(&mut visible);
+            self.search_section.set_rows(&visible, Some("Best matches"));
+            self.drive_section.set_rows(&[], None);
+            self.local_section.set_rows(&[], None);
+        } else {
+            self.search_section.set_rows(&[], None);
+            let drive_count = visible
+                .iter()
+                .take_while(|hit| matches!(hit, Hit::Drive(_)))
+                .count();
+            self.drive_section
+                .set_rows(&visible[..drive_count], Some("Pinned in Proton Drive"));
+            self.local_section.set_rows(&visible[drive_count..], None);
+        }
 
         // Find where the previously-selected row landed in the rebuilt list.
         let restored = selected_key.and_then(|key| visible.iter().position(|hit| hit.key() == key));
@@ -854,8 +966,8 @@ impl Ui {
         // so it lands on the final list, not a half-populated one.
         if self.open_pending.get() && self.pending.get() == 0 {
             self.open_pending.set(false);
-            if let (Some(index), Some(window)) = (self.cursor.get(), self.window.borrow().clone()) {
-                self.open(index, &window);
+            if let Some(index) = self.cursor.get() {
+                self.open(index);
             }
         }
     }
@@ -892,6 +1004,19 @@ impl Ui {
     /// section owns it, clear the other section's selection, and scroll it into
     /// view. Focus stays in the entry so typing never breaks.
     fn select(self: &Rc<Self>, index: usize) {
+        if !self.rendered_query.borrow().is_empty() {
+            self.drive_section.list.unselect_all();
+            self.local_section.list.unselect_all();
+            let Some(row) = self.search_section.list.row_at_index(index as i32) else {
+                return;
+            };
+            self.search_section.list.select_row(Some(&row));
+            self.cursor.set(Some(index));
+            self.scroll_into_view(&row);
+            return;
+        }
+
+        self.search_section.list.unselect_all();
         let drive_count = self.drive_count();
         let (list, other, local_index) = if index < drive_count {
             (
@@ -938,7 +1063,7 @@ impl Ui {
     /// straight to the desktop; a Drive hit must first be hydrated into the cache
     /// by the daemon (`OpenFile`), which can take a moment — the window stays up,
     /// with the spinner running, until the path comes back.
-    fn open(self: &Rc<Self>, index: usize, window: &adw::ApplicationWindow) {
+    fn open(self: &Rc<Self>, index: usize) {
         if self.opening.get() {
             return;
         }
@@ -957,15 +1082,36 @@ impl Ui {
         match hit {
             Hit::Local(local) => {
                 xdg_open(Path::new(&local.path));
-                window.close();
-            }
-            // A Drive folder exists in the mount — open it in the file manager
-            // rather than downloading anything.
-            Hit::Drive(drive) if drive.is_dir => {
-                xdg_open(&self.mountpoint.borrow().join(&drive.path));
-                window.close();
+                self.dismiss();
             }
             Hit::Drive(drive) => {
+                // Empty-query rows come from ListPins, whose `recursive` flag is
+                // pin policy rather than reliable node kind metadata. Every pin
+                // already has a mounted path, so activate that path directly;
+                // this handles non-recursively pinned folders without mistaking
+                // them for files and sending an invalid OpenFile request.
+                if self.rendered_query.borrow().is_empty() {
+                    let path = drive.mounted_path.as_deref().map_or_else(
+                        || mounted_path(&self.mountpoint.borrow(), &drive.path),
+                        PathBuf::from,
+                    );
+                    xdg_open(&path);
+                    self.dismiss();
+                    return;
+                }
+                match drive_activation(&drive.name, drive.is_dir) {
+                    DriveActivation::Folder | DriveActivation::MountedMedia => {
+                        let path = drive.mounted_path.as_deref().map_or_else(
+                            || mounted_path(&self.mountpoint.borrow(), &drive.path),
+                            PathBuf::from,
+                        );
+                        xdg_open(&path);
+                        self.dismiss();
+                        return;
+                    }
+                    DriveActivation::Materialize => {}
+                }
+
                 self.opening.set(true);
                 self.spinner.set_visible(true);
                 self.spinner.start();
@@ -978,7 +1124,6 @@ impl Ui {
                     },
                 );
                 let ui = self.clone();
-                let window = window.clone();
                 glib::spawn_future_local(async move {
                     let reply = rx.recv().await;
                     ui.spinner.stop();
@@ -987,7 +1132,7 @@ impl Ui {
                     match reply {
                         Ok(Ok(Response::FilePath { path })) => {
                             xdg_open(Path::new(&path));
-                            window.close();
+                            ui.dismiss();
                         }
                         Ok(Ok(Response::Error { message, .. })) => {
                             ui.hint.set_label(&format!("Could not open: {message}"));
@@ -1286,5 +1431,39 @@ fn load_css() {
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranked_hits_merge_sources_on_one_score_scale() {
+        let mut hits = vec![
+            Hit::Drive(SearchHit {
+                name: "alpha.pdf".into(),
+                path: "Drive/alpha.pdf".into(),
+                is_dir: false,
+                size: 1,
+                modified: 1,
+                pinned: false,
+                uid: "v~a".into(),
+                mounted_path: None,
+                score: 100,
+            }),
+            Hit::Local(LocalHit {
+                name: "better.pdf".into(),
+                path: "/home/me/better.pdf".into(),
+                is_dir: false,
+                size: 1,
+                modified: 1,
+                score: 300,
+            }),
+        ];
+
+        rank_hits(&mut hits);
+        assert!(matches!(&hits[0], Hit::Local(hit) if hit.name == "better.pdf"));
+        assert!(matches!(&hits[1], Hit::Drive(hit) if hit.name == "alpha.pdf"));
     }
 }

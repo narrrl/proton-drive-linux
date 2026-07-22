@@ -1,3 +1,4 @@
+use crate::activation::{DriveActivation, drive_activation, mounted_path};
 use crate::*;
 
 pub(crate) struct BrowserState {
@@ -493,9 +494,9 @@ pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Bo
     popover.set_parent(anchor);
     popover.connect_closed(|p| p.unparent());
 
-    // Videos lead with Play (stream from the mount, no download); the plain Open
+    // Media leads with Play (stream from the mount, no download); the plain Open
     // below still downloads a local copy for anyone who wants one.
-    if is_video_entry(entry) {
+    if is_streamable_media_entry(entry) {
         let play = menu_item("Play (stream)", "media-playback-start-symbolic");
         let ui_play = ui.clone();
         let entry_play = entry.clone();
@@ -514,8 +515,8 @@ pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Bo
     open.connect_clicked(move |_| {
         pop.popdown();
         // Open always means "download a local copy and hand off", even for a
-        // video — `activate_entry` would otherwise stream it.
-        if is_video_entry(&entry_open) {
+        // media file — `activate_entry` would otherwise stream it.
+        if is_streamable_media_entry(&entry_open) {
             download_and_open(&ui_open, &entry_open);
         } else {
             activate_entry(&ui_open, &entry_open);
@@ -610,14 +611,12 @@ pub(crate) fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Op
     Some(entry)
 }
 
-/// Whether an entry's name marks it as a video, reusing the same classifier the
-/// Photos page splits on — so the file browser and the gallery agree on what a
-/// video is.
-pub(crate) fn is_video_entry(entry: &DirEntry) -> bool {
-    !entry.is_dir && PhotoKind::classify(Some(&entry.name), None) == PhotoKind::Video
+/// Whether an entry can be opened through FUSE instead of fully materialized.
+pub(crate) fn is_streamable_media_entry(entry: &DirEntry) -> bool {
+    drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia
 }
 
-/// Stream a video straight from the mount, no download. Drive folders *are* part
+/// Stream media straight from the mount, no download. Drive folders *are* part
 /// of the FUSE mount, so a player pointed at `<mountpoint>/<rel>` reads the file
 /// through [`Core::read_range_remote`] — 4 MB blocks fetched on demand as it
 /// seeks and buffers — instead of waiting for the whole file to land like
@@ -626,11 +625,11 @@ pub(crate) fn is_video_entry(entry: &DirEntry) -> bool {
 pub(crate) fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
     let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
-    let abs = mountpoint.join(&rel);
+    let abs = mounted_path(&mountpoint, &rel);
     let Some(path) = abs.to_str() else {
         toast_error(
             ui,
-            "Couldn't play video",
+            "Couldn't play media",
             "The file path isn't valid UTF-8.",
         );
         return;
@@ -639,7 +638,7 @@ pub(crate) fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     play_external(path);
 }
 
-/// Open an entry the Nautilus way: folders descend, videos stream from the mount,
+/// Open an entry the Nautilus way: folders descend, media streams from the mount,
 /// other files download-and-open.
 pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
@@ -651,8 +650,8 @@ pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
         }
         *ui.browser.path.borrow_mut() = rel;
         load_browser(ui);
-    } else if is_video_entry(entry) {
-        // A video streams rather than downloads: that is exactly the "play it,
+    } else if drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia {
+        // Media streams rather than downloads: that is exactly the "play it,
         // don't fetch the whole thing" behaviour this is for.
         stream_entry(ui, entry);
     } else {

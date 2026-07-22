@@ -1,3 +1,5 @@
+#[path = "../activation.rs"]
+pub(crate) mod activation;
 pub(crate) mod pages;
 pub(crate) mod widgets;
 
