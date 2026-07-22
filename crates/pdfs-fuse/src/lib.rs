@@ -1784,6 +1784,24 @@ impl Core {
             .collect())
     }
 
+    /// Return an absolute path through the most specific live on-demand mount
+    /// covering `uid`. A node may be below several configured roots, so prefer
+    /// the root leaving the shortest descendant path.
+    fn mounted_search_path(&self, uid: &str) -> Option<String> {
+        let live_mounts = self.mounts.lock();
+        let folders = self.db.sync_folder_list().ok()?;
+        folders
+            .into_iter()
+            .filter(|folder| folder.mode == "ondemand" && live_mounts.contains_key(&folder.id))
+            .filter_map(|folder| {
+                let relative = self.db.path_relative_to(&folder.remote_uid, uid).ok()??;
+                let depth = relative.split('/').count();
+                Some((depth, PathBuf::from(folder.local_path).join(relative)))
+            })
+            .min_by_key(|(depth, _)| *depth)
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+    }
+
     /// Full-text search node names against the local SQLite index, mapping each
     /// DB hit to the wire [`SearchHit`] (resolving live pin state from the cache,
     /// which the DB doesn't track). Pure local lookup — never hits the network.
@@ -1802,6 +1820,7 @@ impl Core {
                 modified: h.node.modification_time,
                 pinned: self.cache.is_pinned(&h.node.uid),
                 uid: h.node.uid.to_string(),
+                mounted_path: self.mounted_search_path(&h.node.uid.to_string()),
                 score: 0,
             })
             .collect())
@@ -1865,6 +1884,7 @@ impl Core {
                         modified: hit.node.modification_time,
                         pinned,
                         uid: hit.node.uid.to_string(),
+                        mounted_path: self.mounted_search_path(&hit.node.uid.to_string()),
                         score,
                     })
                 })

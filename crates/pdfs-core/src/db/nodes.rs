@@ -160,6 +160,40 @@ impl Db {
         Ok(count > 0)
     }
 
+    /// Resolve `uid` relative to an ancestor node.
+    ///
+    /// This is used when a remote subtree has its own local sync mount: the
+    /// sync folder stores the ancestor UID, while search results identify the
+    /// selected descendant. Returning `None` for an unrelated or incomplete
+    /// chain keeps callers from accidentally joining a Drive-wide path onto the
+    /// wrong mountpoint. The ancestor itself resolves to the empty path.
+    pub fn path_relative_to(&self, ancestor_uid: &str, uid: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE anc(uid, parent_uid, name, depth) AS (
+               SELECT uid, parent_uid, name, 0 FROM nodes WHERE uid = ?1
+               UNION ALL
+               SELECT n.uid, n.parent_uid, n.name, anc.depth + 1
+               FROM nodes n JOIN anc ON n.uid = anc.parent_uid
+               WHERE anc.depth < 1024
+             )
+             SELECT uid, name FROM anc ORDER BY depth",
+        )?;
+        let rows = stmt.query_map(params![uid], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut parts = Vec::new();
+        for row in rows {
+            let (current_uid, name) = row?;
+            if current_uid == ancestor_uid {
+                parts.reverse();
+                return Ok(Some(parts.join("/")));
+            }
+            parts.push(name);
+        }
+        Ok(None)
+    }
+
     /// Full-text search over node names, newest schema's trigram index giving
     /// substring (not just prefix) matches. Returns up to `limit` non-trashed
     /// hits, each with its mountpoint-relative path resolved. Queries shorter

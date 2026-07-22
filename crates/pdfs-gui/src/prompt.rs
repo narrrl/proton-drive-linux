@@ -756,6 +756,7 @@ impl Ui {
                         modified: 0,
                         pinned: true,
                         uid: pin.uid,
+                        mounted_path: None,
                         score: 0,
                     })
                     .collect(),
@@ -1090,14 +1091,20 @@ impl Ui {
                 // this handles non-recursively pinned folders without mistaking
                 // them for files and sending an invalid OpenFile request.
                 if self.rendered_query.borrow().is_empty() {
-                    let path = mounted_path(&self.mountpoint.borrow(), &drive.path);
+                    let path = drive.mounted_path.as_deref().map_or_else(
+                        || mounted_path(&self.mountpoint.borrow(), &drive.path),
+                        PathBuf::from,
+                    );
                     xdg_open(&path);
                     self.dismiss();
                     return;
                 }
                 match drive_activation(&drive.name, drive.is_dir) {
                     DriveActivation::Folder | DriveActivation::MountedMedia => {
-                        let path = mounted_path(&self.mountpoint.borrow(), &drive.path);
+                        let path = drive.mounted_path.as_deref().map_or_else(
+                            || mounted_path(&self.mountpoint.borrow(), &drive.path),
+                            PathBuf::from,
+                        );
                         xdg_open(&path);
                         self.dismiss();
                         return;
@@ -1442,6 +1449,7 @@ mod tests {
                 modified: 1,
                 pinned: false,
                 uid: "v~a".into(),
+                mounted_path: None,
                 score: 100,
             }),
             Hit::Local(LocalHit {

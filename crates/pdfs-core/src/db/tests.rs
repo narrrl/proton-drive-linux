@@ -5,6 +5,7 @@ use crate::control::{ActivityEntry, ActivityKind};
 use crate::localindex::LocalEntry;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
+use serde_json::json;
 
 /// `Db::open` applies the pragmas that `open_in_memory` skips, so the WAL
 /// settings can only be checked against a real file.
@@ -1179,6 +1180,96 @@ fn pending_mode_is_queued_until_the_mode_is_reached() {
     let folder = db.sync_folder_get(id).unwrap().unwrap();
     assert_eq!(folder.mode, "ondemand");
     assert_eq!(folder.pending_mode, None);
+}
+
+#[test]
+fn node_path_resolves_relative_to_a_sync_root_uid() {
+    let db = Db::open_in_memory().unwrap();
+    let root = node_from(serde_json::Value::Null, "root", "My Files", json!("Folder"));
+    let videos = node_from(json!(uid("root")), "videos", "Videos", json!("Folder"));
+    let anime = node_from(json!(uid("videos")), "anime", "anime", json!("Folder"));
+    let show = node_from(json!(uid("anime")), "show", "Oshi no Ko", json!("Folder"));
+    let episode = node_from(
+        json!(uid("show")),
+        "episode",
+        "episode 01.mkv",
+        json!({"File": {
+            "media_type": "video/x-matroska",
+            "total_size_on_storage": 42,
+            "claimed_size": 42,
+            "claimed_modification_time": null
+        }}),
+    );
+    db.upsert_nodes(&[root, videos, anime, show, episode])
+        .unwrap();
+
+    assert_eq!(
+        db.path_relative_to(&uid("videos").to_string(), &uid("episode").to_string())
+            .unwrap()
+            .as_deref(),
+        Some("anime/Oshi no Ko/episode 01.mkv")
+    );
+    assert_eq!(
+        db.path_relative_to(&uid("videos").to_string(), &uid("videos").to_string())
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        db.path_relative_to(&uid("anime").to_string(), &uid("episode").to_string())
+            .unwrap()
+            .as_deref(),
+        Some("Oshi no Ko/episode 01.mkv")
+    );
+}
+
+#[test]
+fn node_path_rejects_unrelated_missing_and_broken_ancestor_chains() {
+    let db = Db::open_in_memory().unwrap();
+    let root = node_from(serde_json::Value::Null, "root", "My Files", json!("Folder"));
+    let videos = node_from(json!(uid("root")), "videos", "Videos", json!("Folder"));
+    let episode = node_from(
+        json!(uid("videos")),
+        "episode",
+        "episode.mkv",
+        json!({"File": {
+            "media_type": "video/x-matroska",
+            "total_size_on_storage": 42,
+            "claimed_size": 42,
+            "claimed_modification_time": null
+        }}),
+    );
+    let unrelated = node_from(
+        json!(uid("root")),
+        "documents",
+        "Documents",
+        json!("Folder"),
+    );
+    let orphan = node_from(
+        json!(uid("missing-parent")),
+        "orphan",
+        "orphan.mkv",
+        json!({"File": {
+            "media_type": "video/x-matroska",
+            "total_size_on_storage": 42,
+            "claimed_size": 42,
+            "claimed_modification_time": null
+        }}),
+    );
+    db.upsert_nodes(&[root, videos, episode, unrelated, orphan])
+        .unwrap();
+
+    for (ancestor, descendant) in [
+        ("documents", "episode"),
+        ("videos", "missing-node"),
+        ("videos", "orphan"),
+    ] {
+        assert_eq!(
+            db.path_relative_to(&uid(ancestor).to_string(), &uid(descendant).to_string())
+                .unwrap(),
+            None
+        );
+    }
 }
 
 #[test]

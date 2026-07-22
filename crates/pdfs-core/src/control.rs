@@ -678,6 +678,11 @@ pub struct SearchHit {
     pub pinned: bool,
     /// Node uid in `volume~link` form.
     pub uid: String,
+    /// Absolute path through the most specific active on-demand mount, when the
+    /// node is covered by one. Clients should prefer this for folders and
+    /// streamable media, and fall back to `mountpoint/path` when absent.
+    #[serde(default)]
+    pub mounted_path: Option<String>,
     /// Relevance assigned by the daemon. Higher scores sort first. Legacy
     /// daemons omit it, in which case clients retain the daemon's result order.
     #[serde(default)]
@@ -1369,6 +1374,7 @@ mod tests {
                 modified: 123,
                 pinned: true,
                 uid: "vol~link".into(),
+                mounted_path: Some("/home/me/Videos/report.pdf".into()),
                 score: 985,
             }],
             local_hits: vec![LocalHit {
