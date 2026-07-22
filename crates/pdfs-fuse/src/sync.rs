@@ -55,9 +55,11 @@ use local_scan::is_write_mode;
 use local_scan::open_for_write_set;
 use model::{LocalItem, Outcome, PassAbort, Pending, RemoteItem};
 pub(crate) use planner::base_name;
+#[cfg(test)]
+use planner::conflict_path;
 use planner::{
-    FilePlan, classification_order, conflict_path, filter_baseline, guard_local_wipe, join_rel,
-    parent_rel, plan_file, rel_to_path, remote_sig, unchanged_remote_size,
+    FilePlan, classification_order, conflict_path_with_suffix, filter_baseline, guard_local_wipe,
+    join_rel, parent_rel, plan_file, rel_to_path, remote_sig, unchanged_remote_size,
 };
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
@@ -711,7 +713,17 @@ impl Core {
                     }
                 },
                 FilePlan::DeleteLocal => {
-                    let _ = std::fs::remove_file(local_root.join(rel_to_path(rel)));
+                    if let Err(e) = std::fs::remove_file(local_root.join(rel_to_path(rel))) {
+                        warn!(rel, error = %e, "sync: remove local file failed");
+                        self.log_activity(
+                            ActivityKind::Trash,
+                            base_name(rel),
+                            e.to_string(),
+                            false,
+                        );
+                        outcome.errors += 1;
+                        continue;
+                    }
                     let _ = self.db.sync_entry_remove(folder_id, rel);
                     self.log_activity(ActivityKind::Trash, base_name(rel), "removed locally", true);
                     outcome.deleted += 1;
@@ -758,7 +770,12 @@ impl Core {
         // Deferred folder deletions, deepest first.
         delete_local_dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
         for rel in delete_local_dirs {
-            let _ = std::fs::remove_dir_all(local_root.join(rel_to_path(&rel)));
+            if let Err(e) = std::fs::remove_dir_all(local_root.join(rel_to_path(&rel))) {
+                warn!(rel, error = %e, "sync: remove local folder failed");
+                self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);
+                outcome.errors += 1;
+                continue;
+            }
             let _ = self.db.sync_entry_remove(folder_id, &rel);
             self.log_activity(
                 ActivityKind::Trash,
@@ -802,18 +819,24 @@ impl Core {
         out: &mut HashMap<String, LocalItem>,
     ) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read entry in {}: {e}", dir.display()))?;
             let path = entry.path();
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let Ok(stripped) = path.strip_prefix(root) else {
-                continue;
-            };
-            let Some(rel) = stripped.to_str() else {
-                continue;
-            };
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("stat {}: {e}", path.display()))?;
+            let stripped = path.strip_prefix(root).map_err(|e| {
+                format!(
+                    "local path {} escaped sync root {}: {e}",
+                    path.display(),
+                    root.display()
+                )
+            })?;
+            let rel = stripped.to_str().ok_or_else(|| {
+                format!(
+                    "local path {} is not valid UTF-8; refusing a destructive sync pass",
+                    path.display()
+                )
+            })?;
             // Ignore our own in-flight download temp files.
             if rel.contains(".pdfs-tmp-") {
                 continue;
@@ -1153,12 +1176,9 @@ impl Core {
                 // pass), then take the remote version as the shared truth.
                 let path = local_root.join(rel_to_path(rel));
                 if path.exists() {
-                    let conflict = conflict_path(&path, now_secs());
-                    if let Err(e) = std::fs::rename(&path, &conflict) {
-                        warn!(rel, error = %e, "sync: could not set aside conflict copy");
-                    } else {
-                        info!(rel, "sync: kept local changes as a conflict copy");
-                    }
+                    preserve_conflict_copy(&path, now_secs())
+                        .map_err(|e| format!("set aside conflict copy for {rel}: {e}"))?;
+                    info!(rel, "sync: kept local changes as a conflict copy");
                 }
                 self.download_file(folder_id, local_root, rel, uid, *mtime, *size)
                     .await?;
@@ -1171,8 +1191,7 @@ impl Core {
                 // evicted. Push the conflict copy now, while it still exists, and
                 // leave the remote file holding the original path.
                 let path = local_root.join(rel_to_path(rel));
-                let conflict = conflict_path(&path, now_secs());
-                std::fs::rename(&path, &conflict)
+                let conflict = preserve_conflict_copy(&path, now_secs())
                     .map_err(|e| format!("set aside conflict copy for {rel}: {e}"))?;
                 let name = conflict
                     .file_name()
@@ -1297,13 +1316,24 @@ impl Core {
                     let _ = std::fs::remove_file(&tmp);
                     format!("download {rel}: {e}")
                 })?;
-            out.into_inner().flush().ok();
+            let mut out = out.into_inner();
+            out.flush().map_err(|e| format!("flush tmp {rel}: {e}"))?;
+            out.sync_all().map_err(|e| format!("sync tmp {rel}: {e}"))?;
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("place {rel}: {e}"))?;
         // Match local mtime to the remote's so neither side looks "changed" next pass.
-        if let Ok(f) = std::fs::File::options().write(true).open(&path) {
-            let _ =
-                f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64));
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("open placed file {rel}: {e}"))?;
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64))
+            .map_err(|e| format!("set mtime for {rel}: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("sync placed file {rel}: {e}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| format!("sync directory for {rel}: {e}"))?;
         }
         self.record_file_baseline(folder_id, rel, &path, uid).await
     }
@@ -1347,6 +1377,46 @@ impl Core {
                 },
             )
             .map_err(|e| format!("baseline {rel}: {e:?}"))
+    }
+}
+
+/// Publish a conflict copy without overwriting an earlier conflict bearing the
+/// same timestamp. The original is removed only after the new copy is durable.
+fn preserve_conflict_copy(path: &Path, stamp: i64) -> std::io::Result<PathBuf> {
+    let metadata = std::fs::metadata(path)?;
+    for suffix in 0..=u32::MAX {
+        let conflict = conflict_path_with_suffix(path, stamp, suffix);
+        let mut source = std::fs::File::open(path)?;
+        let mut target = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&conflict)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = std::io::copy(&mut source, &mut target).and_then(|_| target.sync_all()) {
+            let _ = std::fs::remove_file(&conflict);
+            return Err(e);
+        }
+        target.set_permissions(metadata.permissions())?;
+        if let Ok(modified) = metadata.modified() {
+            target.set_modified(modified)?;
+        }
+        target.sync_all()?;
+        sync_parent_dir(&conflict)?;
+        std::fs::remove_file(path)?;
+        sync_parent_dir(&conflict)?;
+        return Ok(conflict);
+    }
+    unreachable!("u32 conflict suffix space exhausted")
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => std::fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
     }
 }
 
@@ -1609,9 +1679,10 @@ mod tests {
             guard_local_wipe(&base, &one).is_ok(),
             "one survivor means the tree is readable; the rest are real deletions"
         );
-        // A one-entry baseline is a genuine single delete, not a wipe to detect.
+        // A one-entry folder can disappear because its mount or parent became
+        // unavailable just as easily as a larger tree can.
         let single: HashMap<String, ()> = [("a.txt".to_string(), ())].into_iter().collect();
-        assert!(guard_local_wipe(&single, &none).is_ok());
+        assert!(guard_local_wipe(&single, &none).is_err());
         // Nothing synced yet: a first pass over an empty folder is not a wipe.
         assert!(guard_local_wipe(&none, &none).is_ok());
         // Local paths that are not in the baseline are new uploads, and do not
@@ -1779,6 +1850,52 @@ mod tests {
         );
         let no_ext = conflict_path(Path::new("/home/me/README"), 42);
         assert_eq!(no_ext, PathBuf::from("/home/me/README (sync-conflict 42)"));
+    }
+
+    #[test]
+    fn conflict_preservation_never_replaces_an_existing_copy() {
+        let dir = sync_test_dir("conflict-collision");
+        let source = dir.join("notes.txt");
+        let existing = conflict_path(&source, 1700);
+        std::fs::write(&source, b"new local edit").unwrap();
+        std::fs::write(&existing, b"older conflict").unwrap();
+
+        let preserved = preserve_conflict_copy(&source, 1700).unwrap();
+
+        assert_eq!(std::fs::read(&existing).unwrap(), b"older conflict");
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"new local edit");
+        assert_eq!(
+            preserved.file_name().unwrap(),
+            "notes (sync-conflict 1700-1).txt"
+        );
+        assert!(!source.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn conflict_preservation_failure_keeps_the_source() {
+        let dir = sync_test_dir("conflict-failure");
+        // A directory cannot be copied through the regular-file preservation
+        // path, deterministically forcing publication to fail after the source
+        // has been discovered.
+        let source = dir.join("not-a-file.txt");
+        std::fs::create_dir(&source).unwrap();
+
+        assert!(preserve_conflict_copy(&source, 1700).is_err());
+        assert!(source.is_dir(), "failure must not remove the source");
+        assert!(!conflict_path(&source, 1700).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn sync_test_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("pdfs-sync-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
     }
 
     // ---- open-for-write detection tests -----------------------------------

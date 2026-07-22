@@ -784,6 +784,41 @@ fn opens_and_migrates() {
     assert_eq!(version, SCHEMA_VERSION.to_string());
 }
 
+#[test]
+fn refuses_a_schema_newer_than_the_running_build() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-future-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO sync_state VALUES ('schema_version', '9999');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let err = Db::open(&path)
+        .err()
+        .expect("future schema must fail closed");
+    assert!(err.to_string().contains("newer than this build supports"));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "9999", "failed open must not rewrite the database");
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+}
+
 /// A queued write whose baseline is restamped must keep everything else.
 ///
 /// The restamp happens after our *own* upload seals a new revision under a
@@ -865,6 +900,39 @@ fn a_second_write_supersedes_the_first_pending_op() {
     assert_eq!(ops[0].id, id2);
     assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
     assert_eq!(db.pending_op_counts().unwrap().uploads, 1);
+}
+
+#[test]
+fn failed_superseding_insert_keeps_the_old_pending_op() {
+    let db = Db::open_in_memory().unwrap();
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("atomic").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op("/staging/original")).unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_replacement BEFORE INSERT ON pending_op
+             WHEN NEW.blob_path = '/staging/replacement'
+             BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(db.enqueue_op(&op("/staging/replacement")).is_err());
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/original"));
 }
 
 /// Deleting a folder that was created offline must take the ops queued

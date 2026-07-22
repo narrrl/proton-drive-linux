@@ -118,9 +118,10 @@ pub struct AttachedBlob {
 
 impl Db {
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let superseded: Option<String> = if op_supersedes(&op.kind) {
-            let blob: Option<String> = conn
+            let blob: Option<String> = tx
                 .query_row(
                     "SELECT blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
                     params![op.uid, op.kind],
@@ -128,7 +129,7 @@ impl Db {
                 )
                 .optional()?
                 .flatten();
-            conn.execute(
+            tx.execute(
                 "DELETE FROM pending_op WHERE uid = ?1 AND kind = ?2",
                 params![op.uid, op.kind],
             )?;
@@ -136,7 +137,7 @@ impl Db {
         } else {
             None
         };
-        conn.execute(
+        tx.execute(
             "INSERT INTO pending_op
                (kind, uid, parent_uid, name, blob_path, meta_json, created_at, next_attempt_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -151,7 +152,9 @@ impl Db {
                 op.next_attempt_at
             ],
         )?;
-        Ok((conn.last_insert_rowid(), superseded))
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((id, superseded))
     }
 
     /// Point a queued create at the bytes that were just written to it, returning

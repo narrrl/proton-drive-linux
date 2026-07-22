@@ -241,7 +241,9 @@ impl ContentCache {
         let recovery_dir = content_dir.join("recovery");
         std::fs::create_dir_all(&recovery_dir)?;
         Self::rescue_scratch(&scratch_dir, &recovery_dir);
-        let _ = std::fs::remove_dir_all(&scratch_dir);
+        // A failed rescue may leave the only durable copy here. Never clear the
+        // directory wholesale; discard only blobs that carry no fsync marker.
+        Self::discard_unmarked_scratch(&scratch_dir);
         std::fs::create_dir_all(&scratch_dir)?;
         // Staging, by contrast, is deliberately preserved across runs.
         let staging_dir = content_dir.join("staging");
@@ -669,18 +671,24 @@ impl ContentCache {
     pub fn create_scratch(&self) -> Result<(std::fs::File, PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let path = self.scratch_dir.join(format!(
-            "w-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        Ok((file, path))
+        loop {
+            let path = self.scratch_dir.join(format!(
+                "w-{}-{}-{}",
+                std::process::id(),
+                now_millis(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((file, path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// The sidecar path for a scratch file, holding the [`StagedWrite`] that
@@ -709,16 +717,23 @@ impl ContentCache {
     /// have synced `scratch` first: a sidecar promising bytes that never reached
     /// the disk is worse than no sidecar.
     pub fn mark_scratch_durable(&self, scratch: &Path, meta: &StagedWrite) -> Result<()> {
+        use std::io::Write as _;
+
         let side = Self::scratch_sidecar(scratch);
         let tmp = side.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(meta)?)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&serde_json::to_vec(meta)?)?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, &side)?;
         // The rename is what publishes the sidecar; fsync the directory so the
         // rename itself survives, not just the bytes it points at.
-        if let Some(dir) = side.parent()
-            && let Ok(d) = std::fs::File::open(dir)
-        {
-            let _ = d.sync_all();
+        if let Some(dir) = side.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
         }
         Ok(())
     }
@@ -796,6 +811,21 @@ impl ContentCache {
         }
     }
 
+    fn discard_unmarked_scratch(scratch_dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(scratch_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let blob = entry.path();
+            if blob.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            if !Self::scratch_sidecar(&blob).exists() {
+                let _ = std::fs::remove_file(blob);
+            }
+        }
+    }
+
     /// Emergency eviction of unpinned blobs when local disk runs out of space (ENOSPC).
     pub fn emergency_evict(&self) {
         let pinned: HashSet<String> = self
@@ -826,7 +856,8 @@ impl ContentCache {
 
     /// Writes rescued from an unclean shutdown, as `(blob, meta)` pairs for the
     /// daemon to hand to the upload queue. A blob whose sidecar did not survive
-    /// the rescue is deleted here — nothing can address it.
+    /// is not actionable automatically, but is retained for manual recovery:
+    /// unexplained bytes are never evidence that user data is disposable.
     pub fn recovered_writes(&self) -> Vec<(PathBuf, StagedWrite)> {
         let Ok(entries) = std::fs::read_dir(&self.recovery_dir) else {
             return Vec::new();
@@ -837,14 +868,11 @@ impl ContentCache {
             if blob.extension().is_some_and(|e| e == "json") {
                 continue;
             }
-            match std::fs::read(Self::scratch_sidecar(&blob))
+            if let Some(meta) = std::fs::read(Self::scratch_sidecar(&blob))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
             {
-                Some(meta) => out.push((blob, meta)),
-                None => {
-                    let _ = std::fs::remove_file(&blob);
-                }
+                out.push((blob, meta));
             }
         }
         out
@@ -872,6 +900,8 @@ impl ContentCache {
     /// failure here means we could not save the bytes at all, so it is reported
     /// rather than swallowed.
     pub fn stage_write(&self, meta: &StagedWrite, scratch: &Path) -> Result<PathBuf> {
+        use std::io::Write as _;
+
         static N: AtomicU64 = AtomicU64::new(0);
         // The uid goes in the name so a staged file can be tied back to its node
         // without a database; `/` in a uid would otherwise open a path.
@@ -882,18 +912,32 @@ impl ContentCache {
             now_millis(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        if let Err(e) = std::fs::rename(scratch, &path) {
-            // Cross-device: rename cannot move it, so copy and drop the original.
-            let _ = e;
+        let copied = if let Err(e) = std::fs::rename(scratch, &path) {
+            if e.kind() != std::io::ErrorKind::CrossesDevices {
+                return Err(e.into());
+            }
             std::fs::copy(scratch, &path)?;
-            let _ = std::fs::remove_file(scratch);
-        }
+            true
+        } else {
+            false
+        };
+        std::fs::File::open(&path)?.sync_all()?;
         // Sidecar last: a staged file without one is still recoverable bytes,
         // while a sidecar without a file would describe nothing.
-        std::fs::write(
-            path.with_extension("json"),
-            serde_json::to_vec_pretty(meta)?,
-        )?;
+        let side = path.with_extension("json");
+        let side_tmp = path.with_extension("json.tmp");
+        let mut side_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&side_tmp)?;
+        side_file.write_all(&serde_json::to_vec_pretty(meta)?)?;
+        side_file.sync_all()?;
+        drop(side_file);
+        std::fs::rename(&side_tmp, &side)?;
+        std::fs::File::open(&self.staging_dir)?.sync_all()?;
+        if copied {
+            std::fs::remove_file(scratch)?;
+        }
         Ok(path)
     }
 
@@ -1904,6 +1948,51 @@ mod tests {
         c2.discard_recovered(blob);
         assert_eq!(std::fs::read(&staged).unwrap(), b"fsynced bytes");
         assert!(c2.recovered_writes().is_empty(), "recovery does not repeat");
+    }
+
+    #[test]
+    fn recovery_keeps_an_orphan_blob_when_its_sidecar_is_missing() {
+        let (c, dir) = cache();
+        let orphan = dir.path().join("content/recovery/orphaned-user-bytes");
+        std::fs::write(&orphan, b"retain me").unwrap();
+
+        assert!(c.recovered_writes().is_empty());
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"retain me",
+            "metadata loss must not trigger deletion of unexplained content"
+        );
+    }
+
+    #[test]
+    fn failed_scratch_rescue_does_not_delete_the_durable_source() {
+        use std::io::Write as _;
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"durable source").unwrap();
+        file.sync_all().unwrap();
+        let meta = StagedWrite {
+            uid: uid("rescue").to_string(),
+            len: 14,
+            base_size: 0,
+            base_mtime: 0,
+            authored: vec![(0, 14)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&scratch, &meta).unwrap();
+        let blocking_destination = content.join("recovery").join(scratch.file_name().unwrap());
+        std::fs::create_dir(&blocking_destination).unwrap();
+        drop(file);
+        drop(c);
+
+        let _c2 = ContentCache::open(content, pins, 0, db).unwrap();
+        assert_eq!(std::fs::read(&scratch).unwrap(), b"durable source");
+        assert!(ContentCache::scratch_sidecar(&scratch).exists());
     }
 
     /// Releasing a write hands the bytes to staging, so the sidecar an earlier

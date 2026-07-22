@@ -1129,17 +1129,16 @@ impl Filesystem for ProtonFs {
         // A failure past this point has already trashed any node the rename was
         // replacing, so put it back rather than leaving the caller with neither
         // the source moved nor the destination intact.
-        if newname != name {
-            if let Err(e) = self
+        if newname != name
+            && let Err(e) = self
                 .core
                 .rt
                 .block_on(self.core.client.rename_node(&uid, &newname, None))
-            {
-                error!(%uid, error = %e, "rename failed");
-                self.core.restore_replaced(victim.as_ref(), &newname);
-                reply.error(Errno::EIO);
-                return;
-            }
+        {
+            error!(%uid, error = %e, "rename failed");
+            self.core.restore_replaced(victim.as_ref(), &newname);
+            reply.error(Errno::EIO);
+            return;
         }
         if newparent != parent {
             let mut attempts = 0u32;

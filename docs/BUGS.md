@@ -1772,3 +1772,317 @@ the FUSE handler invalidates both exact dentries and both directory inodes; the
 ordering matters because an invalidation sent before the rename reply is
 overwritten by the kernel's response processing. Uids are immutable and never
 reused, making a session-long tombstone safe.
+
+---
+
+## B49 — Failed Conflict Preservation Still Overwrites the Local File (CRIT-05)
+
+**Status:** Fixed in code with deterministic regressions; live/fault verification pending
+**Found:** 2026-07-22, 1.0 data-safety audit
+**Where:** `crates/pdfs-fuse/src/sync.rs`, download/conflict handling
+
+**Cause:** If renaming a concurrently changed local file to a conflict copy
+fails, sync only logs the error and continues publishing the remote download
+over the local version. Second-resolution conflict names can also collide.
+
+**Required fix/test:** Abort download publication unless preservation succeeds;
+use collision-resistant names. Test existing names, permissions, `ENOSPC`,
+`EIO`, and cross-filesystem behavior. This is B39's failure path; B25 remains
+the separate weak-baseline problem.
+
+---
+
+## B50 — Failed Orphan Staging Deletes the Sole Scratch Copy (CRIT-06)
+
+**Status:** Fixed in code; injected filesystem-failure verification pending
+**Found:** 2026-07-22, 1.0 data-safety audit
+**Where:** `crates/pdfs-fuse/src/lib.rs`, `Core::stage_orphaned_write`
+
+**Cause:** If preserving an orphaned scratch write into staging fails, the
+failure path removes the original even though no other durable copy exists.
+
+**Required fix/test:** Never unlink the source until a durable replacement and
+metadata are committed. Inject `ENOSPC`, `EIO`, `EROFS`, permission, and
+cross-device failures and assert a byte-identical copy remains discoverable.
+Related: B23, B27, and B28.
+
+---
+
+## B51 — Scratch Sidecar Does Not Establish a Durable Recovery Record (CRIT-07)
+
+**Status:** Fixed in code; power-loss verification pending
+**Found:** 2026-07-22, 1.0 crash-consistency audit
+**Where:** `crates/pdfs-core/src/cache.rs`, scratch durability markers
+
+**Cause:** A temporary sidecar is renamed without syncing the sidecar first or
+the directory afterward. Power loss after successful user `fsync` can preserve
+bytes but lose authored-range metadata; recovery may discard the write or treat
+a sparse partial write as complete and replace untouched ranges with zeros.
+
+**Required fix/test:** Sync data, write and sync temporary metadata, rename it,
+then sync the directory before acknowledging durability. Crash-test every
+boundary and corrupt/partial sidecars. B20 and B23 do not cover this invariant.
+
+---
+
+## B52 — Staged-Write Publication Is Not Crash-Safe (CRIT-08)
+
+**Status:** Fixed in code; cross-filesystem and power-loss verification pending
+**Found:** 2026-07-22, 1.0 crash-consistency audit
+**Where:** `crates/pdfs-core/src/cache.rs`, staged-write publication
+
+**Cause:** Rename/copy and direct sidecar writes lack a complete sync protocol.
+The cross-filesystem fallback can remove its source after an unsynced copy,
+leaving no complete data/metadata pair after a crash.
+
+**Required fix/test:** Publish synced temporary data and metadata via atomic
+renames and directory syncs; delete the source only after verification. Inject
+failure after every write, sync, rename, DB enqueue, and deletion. Related: B50
+and B51.
+
+---
+
+## B53 — Superseding a Pending Operation Is Not Transactional (CRIT-09)
+
+**Status:** Fixed with rollback regression; crash/ENOSPC verification pending
+**Found:** 2026-07-22, 1.0 SQLite durability audit
+**Where:** `crates/pdfs-core/src/db/ops.rs`, `Db::enqueue_op`
+
+**Cause:** The old durable row is deleted before its replacement is inserted,
+outside a transaction. A crash, constraint error, full disk, or I/O failure can
+erase acknowledged upload work and orphan its blob.
+
+**Required fix/test:** Select and replace in one transaction; retain the old
+blob until commit and make cleanup recoverable. Inject insert/commit failures
+and prove that old or new operation—never neither—remains queued. B27 concerns
+a retained failing row; this issue erases the row.
+
+---
+
+## B54 — Total-Wipe Guard Does Not Protect a One-Entry Baseline (CRIT-10)
+
+**Status:** Fixed with one-entry regression; live mode-matrix verification pending
+**Found:** 2026-07-22, 1.0 mirror-sync audit
+**Where:** `crates/pdfs-fuse/src/sync/planner.rs`
+
+**Cause:** The safeguard activates only when the baseline has at least two
+paths. A one-file local folder that is missing, unreadable, or wrongly mounted
+can therefore trash its sole remote file.
+
+**Required fix/test:** Protect every non-empty baseline and require an
+independently complete scan plus an explicit deliberate-delete signal for a
+total wipe. Test absent roots, replaced mountpoints, permissions, and one-file
+folders in every mode combination.
+
+---
+
+## B55 — Incomplete Local Scans Are Interpreted as Deletions (CRIT-11)
+
+**Status:** Fixed in code; injected iterator/stat failure tests pending
+**Found:** 2026-07-22, 1.0 mirror-sync audit
+**Where:** `crates/pdfs-fuse/src/sync.rs`, local scan/reconciliation
+
+**Cause:** Directory-entry and metadata errors omit paths instead of marking the
+snapshot incomplete. Reconciliation can treat omissions as intentional local
+deletions and propagate them remotely.
+
+**Required fix/test:** Carry completeness/errors into planning; an incomplete
+subtree must make the pass non-destructive and retain its prior baseline. Test
+`readdir`, `stat`, permission, transient-I/O, and disappearing-entry failures.
+B42 covers the inverse local-delete failure.
+
+---
+
+## B56 — Database Schema Version Parsing Fails Open (HIGH-13)
+
+**Status:** Partly fixed — future schemas are refused; malformed-version handling remains open
+**Found:** 2026-07-22, 1.0 database audit
+**Where:** `crates/pdfs-core/src/db/migrations.rs`, `Db::migrate`
+
+**Cause:** Missing, malformed, or non-numeric version values become zero, while
+all future versions are accepted. Corruption can replay migrations, and an
+older binary can open a newer incompatible database.
+
+**Required fix/test:** Distinguish a new DB from corrupt metadata; reject
+malformed/future versions without mutation and validate required schema. Test
+empty, malformed, negative, future, partial/interrupted migration, and upgrade
+fixtures from every released schema.
+
+---
+
+## B57 — Event Cursor Can Advance Past Unapplied State (HIGH-14)
+
+**Status:** Partly fixed — cursor now advances per successfully invalidated event; DB/apply fault tests remain
+**Found:** 2026-07-22, 1.0 event-recovery audit
+**Where:** `crates/pdfs-fuse/src/background.rs`, `run_event_sync`
+
+**Cause:** Cache invalidation failures are ignored while the batch cursor still
+advances. Cursor-persistence failure also leaves the in-memory cursor moving;
+first-seed persistence failure can later reseed at a newer head. Applying state
+and committing its cursor have no atomic relationship.
+
+**Required fix/test:** Apply idempotently and persist derived DB state plus the
+cursor atomically, or advance only through the last durable event. Retry failed
+prerequisites. Crash/fault-test every event and cursor boundary, first seed,
+duplicate replay, malformed events, and database-full conditions.
+
+---
+
+## B58 — Control Socket Has Unbounded Frames and Connections (HIGH-15)
+
+**Status:** Fixed in code with frame-limit regressions; connection-flood verification pending
+**Found:** 2026-07-22, 1.0 IPC audit
+**Where:** `crates/pdfs-fuse/src/control.rs`
+
+**Cause:** The server uses unbounded `read_line`, a new thread per connection,
+and no concurrency or idle limit. A local process can exhaust memory, file
+descriptors, and threads, blocking filesystem control and safe shutdown.
+
+**Required fix/test:** Bound frames, clients, and idle lifetime. Test slow/no-
+newline clients, oversized/truncated JSON, floods, and recovery. B6/B35 cover
+socket authority and permissions, not resource bounds.
+
+---
+
+## B59 — Private State Permission Enforcement Fails Open (HIGH-16)
+
+**Status:** Fixed in code with symlink regression; wrong-owner integration verification pending
+**Found:** 2026-07-22, 1.0 local-privacy audit
+**Where:** `crates/pdfs-core/src/config.rs`, `AppDirs::ensure`
+
+**Cause:** chmod/creation failures are warned about or ignored while decrypted
+content, plaintext metadata, and the authenticated socket may remain accessible
+to other local users.
+
+**Required fix/test:** Before loading credentials or serving data, verify every
+sensitive directory is owned by the effective user, is not a symlink, and is
+owner-only. Test wrong owner, symlink substitution, read-only filesystems,
+permissive restored directories, and chmod failure. This tightens B6/B35.
+
+---
+
+## B60 — Config Writes Are Non-Atomic and Parse Errors Are Overwritten (HIGH-17)
+
+**Status:** Fixed in code; fault/concurrent-save verification pending
+**Found:** 2026-07-22, 1.0 configuration audit
+**Where:** `crates/pdfs-core/src/config.rs`, `load_config` / `save_config`
+
+**Cause:** Save truncates in place without sync. Load treats read/parse failure
+as absence and best-effort overwrites with defaults, silently losing mountpoint,
+ignore policy, budget, and explicit device adoption.
+
+**Required fix/test:** Atomically publish a restricted, synced temporary file
+and sync its directory. Preserve malformed input and report an actionable error.
+Test invalid/truncated JSON, permissions, `ENOSPC`, crash points, and concurrent
+saves.
+
+---
+
+## B61 — Rotated Single-Use Credentials Can Be Lost (HIGH-18)
+
+**Status:** Open — 1.0 authentication/recovery blocker
+**Found:** 2026-07-22, 1.0 authentication audit
+**Where:** `crates/pdfs-core/src/auth.rs`, refresh callback
+
+**Cause:** Failure to serialize or persist rotated credentials is only logged
+(and some setup failures are silent). The daemon continues in memory while the
+keyring retains an invalid single-use refresh token, so restart loses login.
+
+**Required fix/test:** Expose unhealthy persistence, retry with bounded backoff,
+notify the user, and define a safe re-login/shutdown path. Test locked/full/
+unavailable keyrings, callback races, repeated rotations, death, and restart.
+
+---
+
+## B62 — Debian Artifact Omits Required Service and Autostart Units (HIGH-19)
+
+**Status:** Fixed in workflow; clean-install VM verification pending
+**Found:** 2026-07-22, 1.0 packaging audit
+**Where:** `.github/workflows/release.yml`; `packaging/`
+
+**Cause:** The generated package omits `proton-drive.service` and the tray
+autostart entry even though normal login/GUI flows assume that lifecycle.
+
+**Required fix/test:** Package all units/resources with correct paths, modes,
+and hooks. In clean supported-distribution VMs test install, login, reboot,
+daemon/tray/FUSE, upgrade, rollback, and uninstall without deleting user state.
+
+---
+
+## B63 — Release Version Identity Is Inconsistent and Unenforced (HIGH-20)
+
+**Status:** Partly fixed — tag/workspace/PKGBUILD equality is enforced; protocol identity remains
+**Found:** 2026-07-22, 1.0 release audit
+**Where:** manifests, client identity constants, tags, release workflow
+
+**Cause:** Workspace/binary versions, protocol identity strings, and tags can
+disagree; the workflow trusts any `v*` tag without checking package metadata or
+installed `--version` output.
+
+**Required fix/test:** Establish one version source and fail CI on every tag,
+manifest, package, and binary mismatch. Document any intentionally independent
+protocol identity.
+
+---
+
+## B64 — Stable Publishing Lacks Data-Safety and Recovery Gates (CRIT-12)
+
+**Status:** Partly fixed — automated local gates added; managed-live/recovery approval remains open
+**Found:** 2026-07-22, 1.0 release audit
+**Where:** CI and `.github/workflows/release.yml`
+
+**Cause:** A tag can publish without required format/lint/tests, offline and
+dedicated-account live acceptance, migrations, or crash/recovery drills. Fixes
+still marked unverified can ship as stable.
+
+**Required fix/test:** Publish immutable RC artifacts only after all workspace
+checks, full managed mode matrix, migration/power-loss recovery, clean install/
+upgrade tests, and explicit sign-off for every critical/high integrity issue.
+
+---
+
+## B65 — Release Artifacts Lack Supply-Chain Verification (MED-11)
+
+**Status:** Open — 1.0 release/security blocker
+**Found:** 2026-07-22, 1.0 supply-chain audit
+**Where:** CI and release workflows
+
+**Cause:** Releases do not enforce advisory/license policy or publish signed
+provenance, SBOMs, and verifiable checksums for exact distributed artifacts.
+
+**Required fix/test:** Add locked audit/license gates, SBOM and provenance,
+checksums and signatures, documented verification, and an independent clean-job
+verification/install test.
+
+---
+
+## B66 — Local-Only Pending Data Is Not Protected at Shutdown (HIGH-21)
+
+**Status:** Open — 1.0 data-safety/UX blocker
+**Found:** 2026-07-22, 1.0 recovery audit
+**Where:** shutdown, CLI/GUI status, logout/unregister workflows
+
+**Cause:** Undrained writes may exist only on one machine, but there is no flush
+command with a completion contract, prominent pending byte/count health, or
+shutdown/logout warning/inhibition.
+
+**Required fix/test:** Add `pdfs sync flush`, expose pending operations/bytes
+and last errors, and protect destructive lifecycle actions. Test offline stop,
+logout, unregister, reboot, retry exhaustion, and drain. Credential removal must
+never delete staged bytes.
+
+---
+
+## B67 — Fresh-State Restore Can Silently Select a New Device (HIGH-22)
+
+**Status:** Open — 1.0 recovery blocker
+**Found:** 2026-07-22, 1.0 disaster-recovery audit
+**Where:** device discovery/adoption; `docs/RECOVERY.md`
+
+**Cause:** Restore depends on hostname and folder basename. After local-state
+loss, a mismatch can silently create/select another device rather than attach
+the intended remote roots, making recovery appear complete while data is absent.
+
+**Required fix/test:** Require explicit adoption/confirmation on ambiguity and
+show old/proposed device and root IDs. Test state loss, hostname change,
+duplicates, renamed folders, multiple devices, and byte-identical restoration.

@@ -126,12 +126,16 @@ pub(super) async fn run_event_sync(
                 match client.enumerate_events(&scope, None).await {
                     Ok(events) => {
                         let head = events.last().map(|e| e.id().clone());
-                        if let Some(c) = &head
-                            && let Err(e) = db.set_event_cursor(c.as_str())
-                        {
-                            warn!(error = %e, "persist seed cursor failed");
+                        let Some(c) = &head else {
+                            break None;
+                        };
+                        if let Err(e) = db.set_event_cursor(c.as_str()) {
+                            warn!(error = %e, ?delay, "persist seed cursor failed; retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(ONLINE_PROBE_MAX);
+                            continue;
                         }
-                        break head;
+                        break Some(c.clone());
                     }
                     Err(e) => {
                         warn!(error = %e, ?delay, "seed event cursor failed; retrying");
@@ -168,15 +172,19 @@ pub(super) async fn run_event_sync(
             // the life of the daemon (SDK plan #9). `apply_event` only touches
             // our FUSE state, so nothing else does this.
             if let Err(e) = client.invalidate_caches_for_event(event).await {
-                warn!(error = %e, "sdk cache invalidation for event failed");
+                warn!(error = %e, "sdk cache invalidation for event failed; retaining cursor for retry");
+                break;
             }
             apply_event(&state, &content, &pending, &notifier, event);
-        }
-        cursor = events.last().map(|e| e.id().clone());
-        if let Some(c) = &cursor
-            && let Err(e) = db.set_event_cursor(c.as_str())
-        {
-            warn!(error = %e, "persist event cursor failed");
+            let applied = event.id().clone();
+            if let Err(e) = db.set_event_cursor(applied.as_str()) {
+                warn!(error = %e, "persist event cursor failed; retaining prior cursor for retry");
+                break;
+            }
+            // Advance only after this exact event is durably acknowledged. If a
+            // later event fails, polling resumes from here and replays nothing
+            // that was not already made visible locally.
+            cursor = Some(applied);
         }
     }
 }

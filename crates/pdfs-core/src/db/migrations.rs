@@ -31,7 +31,12 @@ impl Db {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        if current >= SCHEMA_VERSION {
+        if current > SCHEMA_VERSION {
+            return Err(crate::Error::Other(format!(
+                "database schema {current} is newer than this build supports ({SCHEMA_VERSION}); refusing to open it to avoid corrupting user data"
+            )));
+        }
+        if current == SCHEMA_VERSION {
             return Ok(());
         }
 

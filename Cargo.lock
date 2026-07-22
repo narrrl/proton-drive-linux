@@ -3538,6 +3538,7 @@ dependencies = [
  "directories",
  "ignore",
  "keyring",
+ "libc",
  "parking_lot",
  "proton-drive-rs",
  "proton-sdk",

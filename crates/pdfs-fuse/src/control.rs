@@ -12,8 +12,8 @@
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
@@ -26,6 +26,67 @@ use tracing::{info, warn};
 
 use super::transfers::CountingReader;
 use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
+
+const MAX_CONTROL_REQUEST_BYTES: u64 = 1024 * 1024;
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONTROL_HANDLERS: usize = 64;
+static ACTIVE_CONTROL_HANDLERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ControlHandlerPermit;
+
+impl ControlHandlerPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_CONTROL_HANDLERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONTROL_HANDLERS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ControlHandlerPermit {
+    fn drop(&mut self) {
+        ACTIVE_CONTROL_HANDLERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn read_request_line(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if bytes.len().saturating_add(take) > MAX_CONTROL_REQUEST_BYTES as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control request exceeds size limit",
+            ));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if bytes.ends_with(b"\n") {
+            break;
+        }
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() as u64 > MAX_CONTROL_REQUEST_BYTES || !bytes.ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control request exceeds limit or is not newline terminated",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
 
 /// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
 /// must live under `mountpoint`; a relative path is taken as already relative to
@@ -44,6 +105,10 @@ fn rel_to_mount(mountpoint: &Path, path: &str) -> CoreResult<PathBuf> {
 /// Handle one control-socket connection: read a single JSON request line,
 /// dispatch it against `core`, and write back a JSON response line.
 fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: UnixStream) {
+    if let Err(e) = stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)) {
+        warn!(error = %e, "control: could not set request timeout");
+        return;
+    }
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -51,10 +116,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             return;
         }
     });
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-        return;
-    }
+    let line = match read_request_line(&mut reader) {
+        Ok(Some(line)) if !line.trim().is_empty() => line,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(error = %e, "control: rejected request");
+            return;
+        }
+    };
     let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
         Ok(CtlRequest::Status) => {
             let pins = core.cache.list_pins();
@@ -792,12 +861,22 @@ pub(crate) fn run_control_socket(
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                let Some(permit) = ControlHandlerPermit::acquire() else {
+                    warn!(
+                        limit = MAX_CONTROL_HANDLERS,
+                        "control: rejecting connection at handler limit"
+                    );
+                    continue;
+                };
                 let core = core.clone();
                 let username = username.clone();
                 let mountpoint = mountpoint.clone();
                 if let Err(e) = std::thread::Builder::new()
                     .name("pdfs-control".into())
-                    .spawn(move || handle_control_conn(&core, &username, &mountpoint, stream))
+                    .spawn(move || {
+                        let _permit = permit;
+                        handle_control_conn(&core, &username, &mountpoint, stream);
+                    })
                 {
                     warn!(error = %e, "control: spawn handler failed");
                 }
@@ -806,5 +885,40 @@ pub(crate) fn run_control_socket(
                 warn!(error = %e, "control: accept failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod request_limit_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn accepts_one_bounded_newline_terminated_request() {
+        let mut input = Cursor::new(b"{\"Status\":null}\n".to_vec());
+        assert_eq!(
+            read_request_line(&mut input).unwrap().as_deref(),
+            Some("{\"Status\":null}\n")
+        );
+    }
+
+    #[test]
+    fn rejects_a_request_without_a_terminating_newline() {
+        let mut input = Cursor::new(b"{\"Status\":null}".to_vec());
+        assert_eq!(
+            read_request_line(&mut input).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn rejects_a_request_larger_than_the_limit() {
+        let mut bytes = vec![b'x'; MAX_CONTROL_REQUEST_BYTES as usize + 1];
+        bytes.push(b'\n');
+        let mut input = Cursor::new(bytes);
+        assert_eq!(
+            read_request_line(&mut input).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 }
