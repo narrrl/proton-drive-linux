@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
@@ -225,6 +226,9 @@ struct Core {
     /// staged blob *is* the file's content and the remote still holds the old
     /// revision; and the drain worker, which performs the uploads.
     pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
+    /// Nodes removed through this daemon which a briefly stale remote listing
+    /// may still return. Uids are not reused; an explicit restore clears one.
+    hidden: Arc<Mutex<HashSet<NodeUid>>>,
     /// Nudges the drain worker: set true and notify to have it re-examine the
     /// queue instead of waiting out its backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
@@ -654,6 +658,7 @@ impl Core {
                 // Before the lock: a DB row carries the size the server last
                 // sealed, which a queued write is ahead of (B11).
                 self.stamp_pending_sizes(&mut nodes);
+                let hidden = self.hidden.lock().clone();
                 let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
                     return Ok(());
@@ -661,7 +666,7 @@ impl Core {
                 let mut child_inos = Vec::with_capacity(nodes.len());
                 let mut needs_size = Vec::new();
                 for node in nodes {
-                    if node.trashed || node.uid == folder_uid {
+                    if !node_visible(&node, &folder_uid, &hidden) {
                         continue;
                     }
                     if matches!(
@@ -712,6 +717,7 @@ impl Core {
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
+        let hidden = self.hidden.lock().clone();
 
         let mut st = self.state.lock();
         // Lost the race? Another thread already populated it.
@@ -721,7 +727,7 @@ impl Core {
         let mut child_inos = Vec::with_capacity(nodes.len());
         let filtered_nodes: Vec<Node> = nodes
             .into_iter()
-            .filter(|node| !node.trashed && node.uid != folder_uid)
+            .filter(|node| node_visible(node, &folder_uid, &hidden))
             .collect();
         // Files whose real size the cheap enumeration could not read. Collected
         // before interning so the upgrade below has the uids without re-walking.
@@ -1300,6 +1306,21 @@ impl Core {
         if size == base_size {
             return Ok(());
         }
+        // A close immediately followed by truncate is common (`write`, close,
+        // `truncate(2)`) and usually beats the write-back debounce. In that
+        // case the remote is *not* our base: the complete staged revision is.
+        // Compose from those local bytes so the truncate can supersede the
+        // queued upload without fetching stale remote content or returning EIO.
+        let pending_base = self.pending.lock().get(&uid).cloned();
+        if pending_base
+            .as_ref()
+            .is_some_and(|pending| !pending.meta.complete)
+        {
+            // An incomplete pending blob still has holes referring to the
+            // remote revision. Stacking another incomplete transform on it is
+            // not representable safely; preserve the existing refusal.
+            return Err(Errno::EIO);
+        }
         let (authored, complete) = if size == 0 {
             // An empty file has no content to be missing.
             (Vec::new(), true)
@@ -1316,19 +1337,45 @@ impl Core {
             error!(%uid, error = %e, "create scratch file for truncate failed");
             Errno::EIO
         })?;
+        if let Some(pending) = &pending_base
+            && let Err(e) = copy_pending_for_truncate(pending, &file)
+        {
+            error!(%uid, source = %pending.path.display(), error = %e,
+                "copy pending revision for truncate failed");
+            let _ = std::fs::remove_file(&path);
+            return Err(Errno::EIO);
+        }
         file.set_len(size).map_err(|e| {
             error!(%uid, error = %e, "resize scratch file for truncate failed");
             let _ = std::fs::remove_file(&path);
             Errno::EIO
         })?;
-        let meta = StagedWrite {
-            uid: uid.to_string(),
-            len: size,
-            base_size,
-            base_mtime,
-            authored,
-            complete,
-            based_on: self.remote_baseline(&uid, base_mtime, base_size),
+        let meta = match pending_base {
+            Some(pending) => StagedWrite {
+                uid: uid.to_string(),
+                len: size,
+                base_size: pending.meta.len,
+                base_mtime: pending.meta.base_mtime,
+                authored: if size == 0 {
+                    Vec::new()
+                } else {
+                    vec![(0, size)]
+                },
+                complete: true,
+                // Both local revisions descend from the same last-observed
+                // remote revision. Never replace this with the optimistic
+                // mtime/size currently published by State.
+                based_on: pending.meta.based_on,
+            },
+            None => StagedWrite {
+                uid: uid.to_string(),
+                len: size,
+                base_size,
+                base_mtime,
+                authored,
+                complete,
+                based_on: self.remote_baseline(&uid, base_mtime, base_size),
+            },
         };
         self.enqueue_staged_write(&uid, ino, &path, meta)?;
         debug!(%uid, size, complete, "queued truncate");
@@ -1447,6 +1494,7 @@ impl Core {
             error!(%uid, error = %e, "queueing trash failed");
             Errno::EIO
         })?;
+        self.hidden.lock().insert(uid.clone());
         self.state.lock().forget(uid);
         self.cache.evict(uid);
         self.evict_reader(uid);
@@ -2294,6 +2342,12 @@ impl Core {
             .block_on(self.client.restore_nodes(&parsed))
             .map_err(|e| CoreError::from_api(&e, "restore"))?;
         {
+            let mut hidden = self.hidden.lock();
+            for uid in &parsed {
+                hidden.remove(uid);
+            }
+        }
+        {
             let mut st = self.state.lock();
             for parent in parents {
                 if let Some(&ino) = st.by_uid.get(&parent) {
@@ -2861,6 +2915,59 @@ fn count_noun(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Seed a truncate scratch file from a complete queued revision.
+///
+/// `File` writes use an explicit offset so this is independent of either
+/// descriptor's cursor and remains correct when the destination came from the
+/// cache's scratch allocator.
+fn copy_pending_for_truncate(pending: &PendingRevision, destination: &File) -> std::io::Result<()> {
+    let source = File::open(&pending.path)?;
+    destination.set_len(0)?;
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = source.read_at(&mut buffer, offset)?;
+        if count == 0 {
+            break;
+        }
+        destination.write_all_at(&buffer[..count], offset)?;
+        offset += count as u64;
+    }
+    destination.set_len(offset)
+}
+
+/// Whether a rename must be represented as a durable desired end state.
+/// Offline operations and operations targeting a not-yet-uploaded directory
+/// cannot use the API immediately. Online remote-to-remote operations stay
+/// synchronous so a successful kernel reply means the remote namespace has
+/// already reached the same end state.
+fn rename_needs_queue(
+    online: bool,
+    destination_is_local: bool,
+    _parent_changed: bool,
+    _name_changed: bool,
+) -> bool {
+    !online || destination_is_local
+}
+
+/// Convert one kernel pathname component into the UTF-8 name accepted by Drive.
+/// Linux filesystems conventionally cap a component at `NAME_MAX` (255 bytes),
+/// but the FUSE kernel path can pass a longer component through to userspace.
+fn fuse_name(name: &OsStr) -> Result<String, Errno> {
+    let bytes = name.as_bytes();
+    if bytes.len() > 255 {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(Errno::EINVAL);
+    }
+    name.to_str().map(str::to_owned).ok_or(Errno::EILSEQ)
+}
+
+fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
+    !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
+}
+
 /// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),
 /// for the activity log. Uses 1024-based steps but the shorter SI labels.
 fn human_bytes(bytes: u64) -> String {
@@ -3224,7 +3331,11 @@ mod pending_size_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Intervals, conflict_name, is_stale_mount};
+    use super::{
+        Intervals, PendingRevision, conflict_name, copy_pending_for_truncate, fuse_name,
+        is_stale_mount, node_visible, rename_needs_queue,
+    };
+    use pdfs_core::cache::{Baseline, StagedWrite};
 
     /// The predicate must answer *only* for a dead FUSE connection. A healthy
     /// directory and an absent path are both "not stale" — widening it to any
@@ -3329,6 +3440,124 @@ mod tests {
         let new_len = 30u64;
         iv.add(old_len, new_len);
         assert_eq!(segs(&iv, 0, 30), vec![(0, 30, true)]);
+    }
+
+    fn pending_revision(dir: &TestDir, bytes: &[u8], complete: bool) -> PendingRevision {
+        let path = dir.0.join("pending");
+        std::fs::write(&path, bytes).unwrap();
+        PendingRevision {
+            path,
+            meta: StagedWrite {
+                uid: "vol~file".into(),
+                len: bytes.len() as u64,
+                base_size: 3,
+                base_mtime: 42,
+                authored: if complete {
+                    vec![(0, bytes.len() as u64)]
+                } else {
+                    vec![(3, bytes.len() as u64)]
+                },
+                complete,
+                based_on: Some(Baseline {
+                    mtime: 42,
+                    size: 3,
+                    hash: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn complete_pending_revision_can_seed_immediate_shrink() {
+        let (_, dir) = state_test_helper();
+        let pending = pending_revision(&dir, b"0123456789", true);
+        let destination_path = dir.0.join("shrink");
+        let destination = std::fs::File::create(&destination_path).unwrap();
+        copy_pending_for_truncate(&pending, &destination).unwrap();
+        destination.set_len(4).unwrap();
+        assert_eq!(std::fs::read(destination_path).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn complete_pending_revision_can_seed_immediate_growth_and_zero() {
+        let (_, dir) = state_test_helper();
+        let pending = pending_revision(&dir, b"0123456789", true);
+        let destination_path = dir.0.join("grow");
+        let destination = std::fs::File::create(&destination_path).unwrap();
+        copy_pending_for_truncate(&pending, &destination).unwrap();
+        destination.set_len(14).unwrap();
+        assert_eq!(
+            std::fs::read(&destination_path).unwrap(),
+            b"0123456789\0\0\0\0"
+        );
+        destination.set_len(0).unwrap();
+        assert!(std::fs::read(destination_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_pending_revision_is_not_a_safe_truncate_base() {
+        let (_, dir) = state_test_helper();
+        let pending = pending_revision(&dir, b"\0\0\0authored", false);
+        assert!(!pending.meta.complete);
+        assert_ne!(pending.meta.authored, vec![(0, pending.meta.len)]);
+    }
+
+    #[test]
+    fn online_combined_cross_directory_rename_stays_synchronous() {
+        assert!(!rename_needs_queue(true, false, true, true));
+        assert!(rename_needs_queue(false, false, false, true));
+        assert!(rename_needs_queue(true, true, true, false));
+    }
+
+    #[test]
+    fn one_step_online_namespace_changes_stay_synchronous() {
+        assert!(!rename_needs_queue(true, false, false, true));
+        assert!(!rename_needs_queue(true, false, true, false));
+        assert!(!rename_needs_queue(true, false, false, false));
+    }
+
+    #[test]
+    fn fuse_names_enforce_linux_component_limits() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            fuse_name(OsStr::new("x".repeat(255).as_str()))
+                .unwrap()
+                .len(),
+            255
+        );
+        assert_eq!(
+            fuse_name(OsStr::new("x".repeat(256).as_str()))
+                .expect_err("256-byte component must be refused")
+                .code(),
+            libc::ENAMETOOLONG
+        );
+        assert_eq!(
+            fuse_name(OsStr::new("."))
+                .expect_err("dot is not an ordinary component")
+                .code(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            fuse_name(OsStr::new("unicodé-文件")).unwrap(),
+            "unicodé-文件"
+        );
+    }
+
+    #[test]
+    fn local_trash_tombstones_hide_stale_remote_entries() {
+        let folder_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("folder"));
+        let node = node_helper("child", "folder", "child", false);
+        assert!(node_visible(
+            &node,
+            &folder_uid,
+            &std::collections::HashSet::new()
+        ));
+        assert!(!node_visible(
+            &node,
+            &folder_uid,
+            &std::collections::HashSet::from([node.uid.clone()])
+        ));
     }
 
     use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};

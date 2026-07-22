@@ -1587,15 +1587,22 @@ counts to baseline and observe no post-unmount DB work.
 
 ---
 
-## B45 — Truncate After a Queued Rewrite Replaces the Prefix With Zeros
+## B45 — Truncate After a Queued Rewrite Corrupts or Returns EIO
 
 **Status:** Fixed and live-verified (2026-07-22)
 **Found by:** `scripts/fuse-acceptance.sh`
-**Where:** `crates/pdfs-fuse/src/filesystem.rs`, write-open scratch setup
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, write-open scratch setup;
+`crates/pdfs-fuse/src/lib.rs`, `Core::queue_truncate`
 
 **Repro:** Write a file, immediately replace its contents, then run
 `truncate -s 4 file` before the queued replacement drains. Reading it returned
 four NUL bytes instead of the first four replacement bytes.
+
+The expanded managed suite found the path-based variant: create and close a
+10-byte file, then immediately call `truncate(path, 4)`. The close's complete
+revision was still inside the two-second drain debounce. `queue_truncate`
+described the shrink as an incomplete edit over the remote base, noticed the
+pending edit, preserved an orphan staging file, and returned `EIO`.
 
 **Cause:** A new write handle always treated the server revision as its base.
 When a newer complete revision was still queued locally, the handle's scratch
@@ -1604,8 +1611,10 @@ not the prefix of the locally authoritative queued revision.
 
 **Fix:** A write opened over a complete queued revision seeds its scratch file
 from that staged blob and marks the copied range authored. Stacking a write over
-an incomplete queued revision is refused rather than guessed. Live acceptance
-verified the exact rewrite-then-truncate sequence returns `b"a mu"`.
+an incomplete queued revision is refused rather than guessed. Path-based
+truncate now composes the same way: it copies a complete pending blob, applies
+the new length, marks the result complete, and inherits the last real remote
+baseline. Live acceptance verified shrink, zero-filled growth, and sparse I/O.
 
 ---
 
@@ -1624,8 +1633,142 @@ date"), surfaced as `EIO`.
 link-details read can briefly observe the pre-move state, so the new name is
 signed against stale requirements.
 
-**Fix:** Retry only `InvalidRequirements` from the rename-after-move step with a
-short bounded backoff. Stable API failures are not retried. If every retry
-fails, adopt the already-completed move in inode state before returning `EIO`,
-so the local model never claims the node remains in its old parent. The full
-live suite subsequently passed the replacement and combined move/rename cases.
+**Fix history:** A bounded retry of `InvalidRequirements` reduced the window but
+did not close it; the managed matrix reproduced the same failure after all four
+retries. Combined cross-directory move+rename now enters the durable rename
+queue as a desired end state. Its drain re-fetches the node on every attempt,
+skips either half that already landed, renames before moving, and resolves name
+collisions without losing the source. Simple rename-only and move-only calls
+remain synchronous. The managed live suite subsequently passed the replacement
+and combined move/rename cases.
+
+---
+
+## B47 — FUSE Accepts Path Components Longer Than NAME_MAX
+
+**Status:** Fixed (unverified)
+**Found:** 2026-07-22, managed FUSE acceptance suite
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, name-taking callbacks
+
+**Repro:** `open(<mount>/<256 ASCII bytes>, O_CREAT)` succeeded. A conventional
+Linux filesystem must reject a pathname component longer than 255 bytes with
+`ENAMETOOLONG`.
+
+**Cause:** Every callback converted `OsStr` with `to_string_lossy` and passed it
+straight to Drive. This imposed neither Linux's component limit nor Drive's
+UTF-8 requirement, and could silently change non-UTF-8 names.
+
+**Fix:** Route lookup, create, mkdir, unlink, rmdir, and both rename components
+through one validator. It enforces the 255-byte limit, rejects reserved/empty
+components, rejects invalid UTF-8 with `EILSEQ`, and preserves valid Unicode.
+The managed live suite is the verification gate.
+
+---
+
+## T1 — Managed Acceptance Raced Daemon Startup
+
+**Status:** Fixed (2026-07-22)
+**Found:** repeated install/restart/acceptance loop
+**Where:** `scripts/fuse-acceptance.py`, managed setup
+
+**Repro:** Run `systemctl --user restart proton-drive.service` and immediately
+start `--managed-live`. The offline reference completed before the daemon had
+recreated its control socket, so the first `pdfs --json sync list` failed with
+`ENOENT` and setup aborted.
+
+**Fix:** Managed validation polls the supported `sync list` API until the daemon
+is ready or `PDFS_ACCEPTANCE_SYNC_TIMEOUT` expires. This is tracked as a test
+harness defect rather than an application bug.
+
+---
+
+## T2 — Acceptance Cleanup Raced Queued Namespace Replay
+
+**Status:** Fixed (2026-07-22)
+**Found:** managed on-demand/on-demand matrix after every functional test passed
+**Where:** `scripts/fuse-acceptance.py`, per-contract cleanup
+
+**Repro:** A combined move+rename was correctly accepted into the durable queue.
+Cleanup started recursively deleting its test tree while the rename drain was
+still landing. The moved entry appeared in `dir-b` after `rmtree` enumerated it
+but before `rmdir(dir-b)`, producing `ENOTEMPTY`.
+
+**Fix:** Before cleanup, poll `pdfs --json status` until both pending counters
+are zero. Retry `rmtree` only for `ENOTEMPTY` inside the uniquely owned test
+root, then wait for the queued deletions before changing modes. Other errors are
+still immediate failures.
+
+---
+
+## T3 — Mode-Matrix Preservation Check Raced Mirror Restoration
+
+**Status:** Fixed (2026-07-22)
+**Found:** managed on-demand/on-demand → on-demand/mirror transition
+**Where:** `scripts/fuse-acceptance.py`, managed mode switching
+
+**Repro:** Switch a populated managed folder from `ondemand` to `mirror`, wait
+until `sync list` reports mirror/idle, and immediately read a preservation file.
+The file can still be absent even though the subsequent restore pass downloads
+it correctly.
+
+**Cause:** The application commits the new mode before scheduling reconciliation
+and leaves the previous idle state and sync timestamp in the row. Those values
+describe the completed on-demand state, not a completed mirror restoration.
+
+**Fix:** The harness records every transition to mirror and explicitly requests
+and waits for a newer completed sync pass before validating local bytes. This is
+tracked as a harness synchronization defect; transient absence before that pass
+is expected asynchronous behavior, not data loss.
+
+---
+
+## T4 — Successful Managed Cleanup Left Its Own Sentinel Behind
+
+**Status:** Fixed (2026-07-22)
+**Found:** second consecutive managed acceptance run
+**Where:** `scripts/fuse-acceptance.py`, managed cleanup
+
+**Repro:** Complete the mode matrix in mirror/mirror, then immediately start a
+new managed run. Registration cleanup removed the sync-folder records and remote
+test folders, but the next run's empty-directory precheck found the harness's
+128 KiB preservation sentinel in each local directory.
+
+**Cause:** Removing a mirror registration intentionally preserves the local
+copy. The harness treated unregistering as if it also emptied local storage.
+
+**Fix:** After successful unregister, cleanup deletes only the sentinel whose
+contents match the per-run bytes generated by this harness. Unknown files remain
+untouched and continue to fail the strict precheck.
+
+---
+
+## B48 — Successful Unlink Can Reappear From a Stale Remote Listing
+
+**Status:** Fixed (unverified)
+**Found:** 2026-07-22, managed acceptance cleanup after all on-demand I/O passed
+**Where:** `crates/pdfs-fuse/src/lib.rs`, child enumeration and trash paths
+
+**Repro:** Unlink every child of a directory and immediately remove the
+directory. `unlink` returned success, but a parent invalidation followed by an
+eventually consistent remote enumeration returned the just-trashed child again.
+`rmdir` then returned `ENOTEMPTY`; repeated recursive removal could reproduce it
+for the entire acceptance timeout.
+
+**Cause:** Three stale-data paths combined. A queued cross-directory rename
+updated `State` but did not invalidate the kernel's cached empty destination
+listing, so recursive walkers never saw or unlinked the moved child. Removing a node recorded no
+authoritative local tombstone, so an eventually consistent Drive listing could
+intern it again. Separately, `State::has_children` treated a resident empty
+listing as inconclusive and fell back to obsolete SQLite child rows. Thus
+`readdir` could report empty while `rmdir` returned `ENOTEMPTY` forever.
+
+**Fix:** Every successful online or queued trash records its uid in a
+session-shared hidden set. Both persisted and remote child enumeration filter
+that set. Secondary on-demand mounts share it, and an explicit restore removes
+the uid so restored content can appear normally. `has_children` now treats any
+resident listing—including an empty one—as authoritative and consults SQLite
+only when the listing is absent. After replying successfully to a queued rename,
+the FUSE handler invalidates both exact dentries and both directory inodes; the
+ordering matters because an invalidation sent before the rename reply is
+overwritten by the kernel's response processing. Uids are immutable and never
+reused, making a session-long tombstone safe.

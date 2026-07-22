@@ -219,10 +219,12 @@ impl State {
 
     /// Check if a directory inode has any child nodes in memory or in the database.
     pub(crate) fn has_children(&self, parent: u64) -> bool {
-        if let Some(kids) = self.children.get(&parent)
-            && !kids.is_empty()
-        {
-            return true;
+        // A resident listing is authoritative even when empty. Falling through
+        // from `Some([])` to SQLite lets an obsolete child row contradict the
+        // listing `ensure_children` just established, so readdir says empty but
+        // rmdir returns ENOTEMPTY forever.
+        if let Some(kids) = self.children.get(&parent) {
+            return !kids.is_empty();
         }
         if let Some(entry) = self.entries.get(&parent)
             && let Ok(has_kids) = self.db.has_children(&entry.uid)
@@ -607,6 +609,11 @@ mod tests {
         st.db
             .upsert_node(&node("file2_uid", "dir_uid", "file2.txt", false))
             .unwrap();
+        assert!(
+            !st.has_children(folder),
+            "a resident empty listing overrides stale DB children"
+        );
+        st.children.remove(&folder);
         assert!(st.has_children(folder), "has child in db");
     }
 }

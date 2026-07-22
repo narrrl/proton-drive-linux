@@ -192,6 +192,7 @@ pub fn mount(
         db,
         online: Arc::new(AtomicBool::new(online)),
         pending: Arc::new(Mutex::new(HashMap::new())),
+        hidden: Arc::new(Mutex::new(HashSet::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
