@@ -1300,6 +1300,21 @@ impl Core {
         if size == base_size {
             return Ok(());
         }
+        // A close immediately followed by truncate is common (`write`, close,
+        // `truncate(2)`) and usually beats the write-back debounce. In that
+        // case the remote is *not* our base: the complete staged revision is.
+        // Compose from those local bytes so the truncate can supersede the
+        // queued upload without fetching stale remote content or returning EIO.
+        let pending_base = self.pending.lock().get(&uid).cloned();
+        if pending_base
+            .as_ref()
+            .is_some_and(|pending| !pending.meta.complete)
+        {
+            // An incomplete pending blob still has holes referring to the
+            // remote revision. Stacking another incomplete transform on it is
+            // not representable safely; preserve the existing refusal.
+            return Err(Errno::EIO);
+        }
         let (authored, complete) = if size == 0 {
             // An empty file has no content to be missing.
             (Vec::new(), true)
@@ -1316,19 +1331,45 @@ impl Core {
             error!(%uid, error = %e, "create scratch file for truncate failed");
             Errno::EIO
         })?;
+        if let Some(pending) = &pending_base
+            && let Err(e) = copy_pending_for_truncate(pending, &file)
+        {
+            error!(%uid, source = %pending.path.display(), error = %e,
+                "copy pending revision for truncate failed");
+            let _ = std::fs::remove_file(&path);
+            return Err(Errno::EIO);
+        }
         file.set_len(size).map_err(|e| {
             error!(%uid, error = %e, "resize scratch file for truncate failed");
             let _ = std::fs::remove_file(&path);
             Errno::EIO
         })?;
-        let meta = StagedWrite {
-            uid: uid.to_string(),
-            len: size,
-            base_size,
-            base_mtime,
-            authored,
-            complete,
-            based_on: self.remote_baseline(&uid, base_mtime, base_size),
+        let meta = match pending_base {
+            Some(pending) => StagedWrite {
+                uid: uid.to_string(),
+                len: size,
+                base_size: pending.meta.len,
+                base_mtime: pending.meta.base_mtime,
+                authored: if size == 0 {
+                    Vec::new()
+                } else {
+                    vec![(0, size)]
+                },
+                complete: true,
+                // Both local revisions descend from the same last-observed
+                // remote revision. Never replace this with the optimistic
+                // mtime/size currently published by State.
+                based_on: pending.meta.based_on,
+            },
+            None => StagedWrite {
+                uid: uid.to_string(),
+                len: size,
+                base_size,
+                base_mtime,
+                authored,
+                complete,
+                based_on: self.remote_baseline(&uid, base_mtime, base_size),
+            },
         };
         self.enqueue_staged_write(&uid, ino, &path, meta)?;
         debug!(%uid, size, complete, "queued truncate");
@@ -2861,6 +2902,27 @@ fn count_noun(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Seed a truncate scratch file from a complete queued revision.
+///
+/// `File` writes use an explicit offset so this is independent of either
+/// descriptor's cursor and remains correct when the destination came from the
+/// cache's scratch allocator.
+fn copy_pending_for_truncate(pending: &PendingRevision, destination: &File) -> std::io::Result<()> {
+    let source = File::open(&pending.path)?;
+    destination.set_len(0)?;
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = source.read_at(&mut buffer, offset)?;
+        if count == 0 {
+            break;
+        }
+        destination.write_all_at(&buffer[..count], offset)?;
+        offset += count as u64;
+    }
+    destination.set_len(offset)
+}
+
 /// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),
 /// for the activity log. Uses 1024-based steps but the shorter SI labels.
 fn human_bytes(bytes: u64) -> String {
@@ -3224,7 +3286,10 @@ mod pending_size_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Intervals, conflict_name, is_stale_mount};
+    use super::{
+        Intervals, PendingRevision, conflict_name, copy_pending_for_truncate, is_stale_mount,
+    };
+    use pdfs_core::cache::{Baseline, StagedWrite};
 
     /// The predicate must answer *only* for a dead FUSE connection. A healthy
     /// directory and an absent path are both "not stale" — widening it to any
@@ -3329,6 +3394,66 @@ mod tests {
         let new_len = 30u64;
         iv.add(old_len, new_len);
         assert_eq!(segs(&iv, 0, 30), vec![(0, 30, true)]);
+    }
+
+    fn pending_revision(dir: &TestDir, bytes: &[u8], complete: bool) -> PendingRevision {
+        let path = dir.0.join("pending");
+        std::fs::write(&path, bytes).unwrap();
+        PendingRevision {
+            path,
+            meta: StagedWrite {
+                uid: "vol~file".into(),
+                len: bytes.len() as u64,
+                base_size: 3,
+                base_mtime: 42,
+                authored: if complete {
+                    vec![(0, bytes.len() as u64)]
+                } else {
+                    vec![(3, bytes.len() as u64)]
+                },
+                complete,
+                based_on: Some(Baseline {
+                    mtime: 42,
+                    size: 3,
+                    hash: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn complete_pending_revision_can_seed_immediate_shrink() {
+        let (_, dir) = state_test_helper();
+        let pending = pending_revision(&dir, b"0123456789", true);
+        let destination_path = dir.0.join("shrink");
+        let destination = std::fs::File::create(&destination_path).unwrap();
+        copy_pending_for_truncate(&pending, &destination).unwrap();
+        destination.set_len(4).unwrap();
+        assert_eq!(std::fs::read(destination_path).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn complete_pending_revision_can_seed_immediate_growth_and_zero() {
+        let (_, dir) = state_test_helper();
+        let pending = pending_revision(&dir, b"0123456789", true);
+        let destination_path = dir.0.join("grow");
+        let destination = std::fs::File::create(&destination_path).unwrap();
+        copy_pending_for_truncate(&pending, &destination).unwrap();
+        destination.set_len(14).unwrap();
+        assert_eq!(
+            std::fs::read(&destination_path).unwrap(),
+            b"0123456789\0\0\0\0"
+        );
+        destination.set_len(0).unwrap();
+        assert!(std::fs::read(destination_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_pending_revision_is_not_a_safe_truncate_base() {
+        let (_, dir) = state_test_helper();
+        let pending = pending_revision(&dir, b"\0\0\0authored", false);
+        assert!(!pending.meta.complete);
+        assert_ne!(pending.meta.authored, vec![(0, pending.meta.len)]);
     }
 
     use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
