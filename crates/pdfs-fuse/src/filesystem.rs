@@ -129,6 +129,25 @@ impl Filesystem for ProtonFs {
             reply.opened(FileHandle(0), FopenFlags::empty());
             return;
         }
+        // A previous close may already have newer bytes queued locally while
+        // the server still holds the older revision. That staged blob, not the
+        // remote, is the base for this handle. In particular, `truncate file`
+        // opens for writing and then shrinks via setattr; starting its scratch
+        // as a sparse zero file would turn the preserved prefix into zeros.
+        //
+        // Complete pending blobs are the common case and can be copied without
+        // any network access. An incomplete blob still has gaps referring to
+        // the remote base; stacking another write on it cannot be represented
+        // safely by WriteHandle, so fail the open rather than risk corruption.
+        let pending_base = self.core.pending.lock().get(&uid).cloned();
+        if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
+            if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                entry.open_count = entry.open_count.saturating_sub(1);
+            }
+            error!(%uid, "refusing write over incomplete queued revision");
+            reply.error(Errno::EIO);
+            return;
+        }
         let (file, path) = match self.core.cache.create_scratch() {
             Ok(x) => x,
             Err(e) => {
@@ -140,6 +159,20 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
+        let mut initial_written = Intervals::default();
+        if let Some(pending) = &pending_base {
+            if let Err(e) = std::fs::copy(&pending.path, &path) {
+                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                    entry.open_count = entry.open_count.saturating_sub(1);
+                }
+                let _ = std::fs::remove_file(&path);
+                error!(%uid, source = %pending.path.display(), error = %e,
+                    "copy queued revision into write scratch failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+            initial_written.add(0, pending.meta.len);
+        }
         let mut st = self.core.state.lock();
         let fh = st.next_fh;
         st.next_fh += 1;
@@ -149,7 +182,7 @@ impl Filesystem for ProtonFs {
                 uid,
                 file: Arc::new(file),
                 path,
-                written: Intervals::default(),
+                written: initial_written,
                 // Starts at the current size; reads in [0, base_size) come from
                 // the base until overwritten.
                 len: base_size,
@@ -1045,16 +1078,43 @@ impl Filesystem for ProtonFs {
             reply.error(Errno::EIO);
             return;
         }
-        if newname != name
-            && let Err(e) = self
-                .core
-                .rt
-                .block_on(self.core.client.rename_node(&uid, &newname, None))
-        {
-            error!(%uid, error = %e, "rename failed");
-            self.core.restore_replaced(victim.as_ref(), &newname);
-            reply.error(Errno::EIO);
-            return;
+        if newname != name {
+            // A move changes the node's encrypted name requirements. Proton's
+            // link-details read can remain briefly stale immediately after the
+            // move, making the following rename fail with InvalidRequirements
+            // ("out of date"). Re-read/retry that narrow eventual-consistency
+            // error; other refusals are stable and must surface immediately.
+            let mut attempts = 0u32;
+            let renamed = loop {
+                match self
+                    .core
+                    .rt
+                    .block_on(self.core.client.rename_node(&uid, &newname, None))
+                {
+                    Ok(()) => break Ok(()),
+                    Err(e)
+                        if newparent != parent
+                            && api_code(&e) == Some(ResponseCode::InvalidRequirements)
+                            && attempts < 4 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(100 * (1 << attempts)));
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            if let Err(e) = renamed {
+                error!(%uid, attempts, error = %e, "rename after move failed");
+                // The move half already landed. Keep our inode model honest
+                // even though the combined POSIX operation has to return EIO.
+                self.core
+                    .state
+                    .lock()
+                    .relocate(ino, parent, newparent, &new_parent_uid, &name);
+                self.core.restore_replaced(victim.as_ref(), &newname);
+                reply.error(Errno::EIO);
+                return;
+            }
         }
         self.core
             .state

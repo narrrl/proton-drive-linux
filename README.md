@@ -94,6 +94,11 @@ For the local metadata database and content cache:
 the database while it runs, so it is a deliberate operation rather than
 something the daemon does on a timer.
 
+Before a release, run the real-kernel acceptance suite against a dedicated test
+account and mount. See [`docs/TESTING.md`](docs/TESTING.md); it includes optional
+two-mount convergence checks and confines destructive operations to a fresh
+test directory.
+
 ## Scripting (`--json`)
 
 Query commands accept a global `--json` flag and emit machine-readable output:

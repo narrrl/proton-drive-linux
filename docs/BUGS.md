@@ -1585,3 +1585,47 @@ continue DB/client activity after teardown.
 handles, and ordered shutdown. Repeated mount/unmount tests should return thread
 counts to baseline and observe no post-unmount DB work.
 
+---
+
+## B45 — Truncate After a Queued Rewrite Replaces the Prefix With Zeros
+
+**Status:** Fixed and live-verified (2026-07-22)
+**Found by:** `scripts/fuse-acceptance.sh`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, write-open scratch setup
+
+**Repro:** Write a file, immediately replace its contents, then run
+`truncate -s 4 file` before the queued replacement drains. Reading it returned
+four NUL bytes instead of the first four replacement bytes.
+
+**Cause:** A new write handle always treated the server revision as its base.
+When a newer complete revision was still queued locally, the handle's scratch
+file began sparse and zero-filled. Shrinking it preserved those scratch zeros,
+not the prefix of the locally authoritative queued revision.
+
+**Fix:** A write opened over a complete queued revision seeds its scratch file
+from that staged blob and marks the copied range authored. Stacking a write over
+an incomplete queued revision is refused rather than guessed. Live acceptance
+verified the exact rewrite-then-truncate sequence returns `b"a mu"`.
+
+---
+
+## B46 — Combined Cross-Directory Move and Rename Can Fail Out of Date
+
+**Status:** Fixed and live-verified (2026-07-22)
+**Found by:** `scripts/fuse-acceptance.sh`
+**Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::rename`
+
+**Repro:** `mv source victim`, replacing an existing file, followed immediately
+by `mv victim dir/moved`. Proton accepted the move half of the second operation,
+then rejected its rename half with `InvalidRequirements` (HTTP 422, "out of
+date"), surfaced as `EIO`.
+
+**Cause:** Moving changes the node's encrypted-name requirements. The following
+link-details read can briefly observe the pre-move state, so the new name is
+signed against stale requirements.
+
+**Fix:** Retry only `InvalidRequirements` from the rename-after-move step with a
+short bounded backoff. Stable API failures are not retried. If every retry
+fails, adopt the already-completed move in inode state before returning `EIO`,
+so the local model never claims the node remains in its old parent. The full
+live suite subsequently passed the replacement and combined move/rename cases.
