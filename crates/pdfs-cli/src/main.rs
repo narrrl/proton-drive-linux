@@ -1,7 +1,9 @@
 //! `pdfs` — command-line front-end for the Proton Drive Linux client.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1740,16 +1742,95 @@ fn cmd_cache_inspect(deep: bool) -> Result<()> {
     }
 }
 
-/// One line of the `diagnose` report.
-fn check(label: &str, ok: bool, detail: impl AsRef<str>) -> bool {
-    let mark = if ok { "ok  " } else { "FAIL" };
-    let detail = detail.as_ref();
-    if detail.is_empty() {
-        println!("[{mark}] {label}");
-    } else {
-        println!("[{mark}] {label}: {detail}");
+#[derive(Default)]
+struct DiagnoseReport {
+    warnings: usize,
+    failures: usize,
+}
+
+impl DiagnoseReport {
+    fn finding(&mut self, level: DiagnoseLevel, label: &str, detail: impl AsRef<str>) {
+        let mark = match level {
+            DiagnoseLevel::Ok => "ok  ",
+            DiagnoseLevel::Warn => {
+                self.warnings += 1;
+                "WARN"
+            }
+            DiagnoseLevel::Fail => {
+                self.failures += 1;
+                "FAIL"
+            }
+        };
+        let detail = detail.as_ref();
+        if detail.is_empty() {
+            println!("[{mark}] {label}");
+        } else {
+            println!("[{mark}] {label}: {detail}");
+        }
     }
-    ok
+
+    fn check(&mut self, label: &str, ok: bool, detail: impl AsRef<str>) {
+        self.finding(
+            if ok {
+                DiagnoseLevel::Ok
+            } else {
+                DiagnoseLevel::Fail
+            },
+            label,
+            detail,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DiagnoseLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+fn executable_on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .any(|dir| std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file()))
+    })
+}
+
+fn mounted_fs_type(path: &Path) -> Option<String> {
+    let wanted = path.canonicalize().ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let separator = fields.iter().position(|field| *field == "-")?;
+            let encoded = *fields.get(4)?;
+            let decoded = encoded.replace("\\040", " ").replace("\\011", "\t");
+            let mountpoint = PathBuf::from(decoded);
+            if mountpoint.canonicalize().ok()? == wanted {
+                Some(fields.get(separator + 1)?.to_string())
+            } else {
+                None
+            }
+        })
+        .next()
+}
+
+/// Create, sync, and remove a new file without ever replacing an existing one.
+fn writable_probe(dir: &Path) -> std::io::Result<()> {
+    let name = format!(".pdfs-diagnose-probe-{}", std::process::id());
+    let path = dir.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let result = (|| {
+        file.write_all(b"probe")?;
+        file.sync_all()
+    })();
+    drop(file);
+    let remove = std::fs::remove_file(path);
+    result.and(remove)
 }
 
 /// Self-check the installation, reporting each finding and exiting non-zero if
@@ -1759,58 +1840,80 @@ fn check(label: &str, ok: bool, detail: impl AsRef<str>) -> bool {
 /// situation a user runs this in. A missing daemon is reported as a finding,
 /// not an error that aborts the rest of the report.
 fn cmd_diagnose() -> Result<()> {
-    let mut all_ok = true;
+    let mut report = DiagnoseReport::default();
 
     let dirs = AppDirs::new().context("resolve application directories")?;
     let config = dirs.load_config();
 
     println!("Paths");
     let state = dirs.state_dir();
-    all_ok &= check(
+    report.check(
         "  state dir",
         state.is_dir(),
         format!("{}", state.display()),
     );
     let cache_dir = dirs.cache_dir();
-    all_ok &= check(
+    report.check(
         "  cache dir",
         cache_dir.is_dir(),
         format!("{}", cache_dir.display()),
     );
     // Writability is checked by actually writing: permission bits do not
     // account for a full disk, a read-only remount, or an immutable flag.
-    let probe = state.join(".pdfs-diagnose-probe");
-    let writable = std::fs::write(&probe, b"probe").is_ok();
-    let _ = std::fs::remove_file(&probe);
-    all_ok &= check("  state dir writable", writable, "");
+    match writable_probe(&state) {
+        Ok(()) => report.finding(
+            DiagnoseLevel::Ok,
+            "  state dir writable",
+            "write and fsync succeeded",
+        ),
+        Err(e) => report.finding(DiagnoseLevel::Fail, "  state dir writable", e.to_string()),
+    }
 
     let db_path = dirs.db_path();
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    all_ok &= check(
+    report.check(
         "  database",
         db_path.is_file(),
         format!("{} ({})", db_path.display(), human_bytes(db_size)),
     );
 
+    println!("\nFUSE");
+    let fuse = Path::new("/dev/fuse");
+    report.check("  /dev/fuse", fuse.exists(), fuse.display().to_string());
+    let has_fusermount = executable_on_path("fusermount3") || executable_on_path("fusermount");
+    report.check(
+        "  unmount helper",
+        has_fusermount,
+        "fusermount3 or fusermount on PATH",
+    );
+
     println!("\nAccount");
     match pdfs_core::auth::load() {
         Ok(session) => {
-            all_ok &= check("  keyring session", true, session.username);
+            report.finding(DiagnoseLevel::Ok, "  keyring session", session.username);
         }
         Err(e) => {
             // A locked keyring and an absent login look the same from here, so
             // the detail carries the distinction rather than the verdict.
-            all_ok &= check("  keyring session", false, format!("{e}"));
+            report.finding(DiagnoseLevel::Fail, "  keyring session", format!("{e}"));
         }
     }
 
     println!("\nDaemon");
     let socket = dirs.control_socket();
     let socket_exists = socket.exists();
-    check(
+    let socket_kind_ok =
+        std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket());
+    report.finding(
+        if socket_exists && !socket_kind_ok {
+            DiagnoseLevel::Fail
+        } else if socket_exists {
+            DiagnoseLevel::Ok
+        } else {
+            DiagnoseLevel::Warn
+        },
         "  control socket",
-        socket_exists,
-        format!("{}", socket.display()),
+        socket.display().to_string(),
     );
     // A stale socket file with no listener is the common failure, so the reply
     // is what decides this rather than the file's existence.
@@ -1822,47 +1925,127 @@ fn cmd_diagnose() -> Result<()> {
             pending_changes,
             ..
         }) => {
-            check("  daemon responding", true, "");
-            check("  mounted at", true, mountpoint);
-            check("  network", online, if online { "" } else { "offline" });
+            report.finding(DiagnoseLevel::Ok, "  daemon responding", "");
+            let live_type = mounted_fs_type(Path::new(&mountpoint));
+            let is_fuse = live_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("fuse"));
+            report.finding(
+                if is_fuse {
+                    DiagnoseLevel::Ok
+                } else {
+                    DiagnoseLevel::Fail
+                },
+                "  active mount",
+                live_type.map_or_else(
+                    || format!("{mountpoint} is not mounted"),
+                    |kind| format!("{mountpoint} ({kind})"),
+                ),
+            );
+            report.finding(
+                if online {
+                    DiagnoseLevel::Ok
+                } else {
+                    DiagnoseLevel::Warn
+                },
+                "  network",
+                if online {
+                    "online"
+                } else {
+                    "offline; cached data remains available"
+                },
+            );
             let pending = pending_uploads + pending_changes;
-            check(
+            report.finding(
+                if pending == 0 {
+                    DiagnoseLevel::Ok
+                } else {
+                    DiagnoseLevel::Warn
+                },
                 "  queued writes",
-                true,
                 if pending == 0 {
                     "none".to_string()
                 } else {
                     format!("{pending} waiting to upload")
                 },
             );
+            match control_request(CtlRequest::CacheInspect { deep: true }) {
+                Ok(CtlResponse::CacheReport {
+                    integrity_problems, ..
+                }) if integrity_problems.is_empty() => report.finding(
+                    DiagnoseLevel::Ok,
+                    "  database integrity",
+                    "SQLite integrity_check passed",
+                ),
+                Ok(CtlResponse::CacheReport {
+                    integrity_problems, ..
+                }) => report.finding(
+                    DiagnoseLevel::Fail,
+                    "  database integrity",
+                    format!(
+                        "{} problem(s): {}",
+                        integrity_problems.len(),
+                        integrity_problems.join("; ")
+                    ),
+                ),
+                Ok(other) => report.finding(
+                    DiagnoseLevel::Fail,
+                    "  database integrity",
+                    format!("unexpected: {other:?}"),
+                ),
+                Err(e) => report.finding(
+                    DiagnoseLevel::Fail,
+                    "  database integrity",
+                    format!("check failed: {e:#}"),
+                ),
+            }
         }
         Ok(other) => {
-            all_ok &= check(
+            report.finding(
+                DiagnoseLevel::Fail,
                 "  daemon responding",
-                false,
                 format!("unexpected: {other:?}"),
             );
         }
         Err(e) => {
             // Not a failure of the installation: a stopped daemon is a normal
             // state, and the rest of the report is still worth printing.
-            check("  daemon responding", false, format!("{e:#}"));
-            println!("         (start it with `systemctl --user start pdfs.service`)");
+            report.finding(
+                DiagnoseLevel::Warn,
+                "  daemon responding",
+                format!("stopped or unreachable: {e:#}"),
+            );
+            println!("         (start it with `systemctl --user start proton-drive.service`)");
         }
     }
 
     let mountpoint = dirs.resolved_mountpoint(&config);
-    check(
-        "  mountpoint exists",
-        mountpoint.is_dir(),
-        format!("{}", mountpoint.display()),
+    report.finding(
+        if mountpoint.is_dir() {
+            DiagnoseLevel::Ok
+        } else {
+            DiagnoseLevel::Warn
+        },
+        "  configured mountpoint",
+        mountpoint.display().to_string(),
     );
 
-    if all_ok {
-        println!("\nNo problems found.");
+    if report.failures == 0 {
+        if report.warnings == 0 {
+            println!("\nNo problems found.");
+        } else {
+            println!(
+                "\nNo critical problems found; {} warning(s) need attention.",
+                report.warnings
+            );
+        }
         Ok(())
     } else {
-        bail!("one or more checks failed; see the report above")
+        bail!(
+            "{} check(s) failed and {} warning(s) were reported; see above",
+            report.failures,
+            report.warnings
+        )
     }
 }
 
@@ -1872,4 +2055,40 @@ fn control_request(req: CtlRequest) -> Result<CtlResponse> {
     let socket = AppDirs::new()?.control_socket();
     pdfs_core::control::send(&socket, &req)
         .with_context(|| format!("talk to mount daemon at {}", socket.display()))
+}
+
+#[cfg(test)]
+mod diagnose_tests {
+    use super::*;
+
+    #[test]
+    fn finding_severity_is_counted_centrally() {
+        let mut report = DiagnoseReport::default();
+        report.finding(DiagnoseLevel::Ok, "ok", "");
+        report.finding(DiagnoseLevel::Warn, "warn", "");
+        report.finding(DiagnoseLevel::Fail, "fail", "");
+        assert_eq!(report.warnings, 1);
+        assert_eq!(report.failures, 1);
+    }
+
+    #[test]
+    fn writable_probe_never_replaces_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-diagnose-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let collision = dir.join(format!(".pdfs-diagnose-probe-{}", std::process::id()));
+        std::fs::write(&collision, b"keep me").unwrap();
+
+        assert_eq!(
+            writable_probe(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&collision).unwrap(), b"keep me");
+
+        std::fs::remove_file(collision).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

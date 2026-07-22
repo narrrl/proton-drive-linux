@@ -9,7 +9,7 @@
 # Build + install:   cd packaging && makepkg -fi
 
 pkgname=proton-drive-linux
-pkgver=0.7.0
+pkgver=0.7.1
 pkgrel=1
 pkgdesc="Proton Drive client for Linux: FUSE files-on-demand mount, CLI, GTK4 app + tray"
 arch=('x86_64')
