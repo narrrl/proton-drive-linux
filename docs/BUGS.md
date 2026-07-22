@@ -1206,7 +1206,8 @@ retracted.
 
 ## B19 — Remote Folder Trashing on Mode Switch Failure (CRIT-02)
 
-**Status:** Fixed in code (unverified on a live mount, 2026-07-22)
+**Status:** Fixed; all four managed-live mode pairs verified 2026-07-22,
+fault-injected mount failure still pending
 **Found:** 2026-07-21, multi-agent sync engine audit (`audit_bugs.md` CRIT-02)  
 **Where:** `crates/pdfs-fuse/src/devices.rs`, `apply_sync_folder_mode`
 
@@ -1220,8 +1221,9 @@ user deletion, evict the underlying local mirror while holding the sync-folder
 lock, and only then mount FUSE. A mount failure leaves an inert `ondemand` row;
 switching back to `mirror` clears the baseline and restores the local copy.
 
-**Verified:** `cargo clippy -p pdfs-fuse --all-targets -- -D warnings` and the
-`pdfs-fuse` unit suite pass. A fault-injected/live mode-switch test is still needed.
+**Verified:** `cargo clippy -p pdfs-fuse --all-targets -- -D warnings`, the
+`pdfs-fuse` unit suite, and the complete managed-live matrix passed against the
+1.0.0 release binary. A fault-injected mount-failure test is still needed.
 
 ---
 
@@ -1646,7 +1648,7 @@ and combined move/rename cases.
 
 ## B47 — FUSE Accepts Path Components Longer Than NAME_MAX
 
-**Status:** Fixed (unverified)
+**Status:** Fixed and managed-live verified (2026-07-22)
 **Found:** 2026-07-22, managed FUSE acceptance suite
 **Where:** `crates/pdfs-fuse/src/filesystem.rs`, name-taking callbacks
 
@@ -2027,7 +2029,7 @@ protocol identity.
 
 ## B64 — Stable Publishing Lacks Data-Safety and Recovery Gates (CRIT-12)
 
-**Status:** Partly fixed — automated local gates added; managed-live/recovery approval remains open
+**Status:** Partly fixed — automated gates and managed-live matrix pass; recovery approval remains open
 **Found:** 2026-07-22, 1.0 release audit
 **Where:** CI and `.github/workflows/release.yml`
 
@@ -2086,3 +2088,25 @@ the intended remote roots, making recovery appear complete while data is absent.
 **Required fix/test:** Require explicit adoption/confirmation on ambiguity and
 show old/proposed device and root IDs. Test state loss, hostname change,
 duplicates, renamed folders, multiple devices, and byte-identical restoration.
+
+---
+
+## B68 — Profile Backup Cannot Be Written to the Device Root
+
+**Status:** Open — live-reproduced 2026-07-22
+**Found:** complete managed-live mode matrix against the 1.0.0 release binary
+**Where:** `crates/pdfs-fuse/src/profile.rs`, profile backup destination
+
+**Repro:** Every sync-folder registration or mode transition attempted the
+profile backup and received `NotEnoughPermissions` (HTTP 422): `Cannot create
+file at the root of a device`. The filesystem matrix itself passed, but profile
+backup never became durable remotely.
+
+**Impact:** The recovery feature appears active but does not preserve the device
+profile, so a replacement machine still lacks modes, pins, mount settings, and
+the explicit remote-folder mapping. Repeated retries also add noisy warnings.
+
+**Required fix/test:** Store the profile below a writable application folder
+rather than directly at the device root, reuse that folder by stable identity,
+and make backup health visible. Verify upload, replacement, restart restore, and
+byte-identical fresh-state recovery on a dedicated account.
