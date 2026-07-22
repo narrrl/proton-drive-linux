@@ -1548,8 +1548,32 @@ impl Core {
                 );
             }
             Err(e) => {
-                error!(%uid, error = %e, "staging write failed; bytes lost");
-                let _ = std::fs::remove_file(src);
+                // `src` is the only known copy of bytes the kernel already
+                // accepted.  A failure to publish them into staging must never
+                // turn into permission to delete them: leave the scratch file
+                // in place so startup recovery or a human can still salvage it.
+                error!(
+                    %uid,
+                    error = %e,
+                    scratch = %src.display(),
+                    "staging write failed; retaining the only scratch copy"
+                );
+                let name = {
+                    let st = self.state.lock();
+                    st.entries
+                        .get(&ino)
+                        .map(|entry| entry.node.name.clone())
+                        .unwrap_or_default()
+                };
+                self.log_activity(
+                    ActivityKind::Upload,
+                    &name,
+                    format!(
+                        "write not queued and could not be staged; recovery copy retained at {}",
+                        src.display()
+                    ),
+                    false,
+                );
             }
         }
     }

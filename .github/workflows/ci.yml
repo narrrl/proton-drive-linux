@@ -44,6 +44,9 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --locked
 
+      - name: Account-free filesystem acceptance
+        run: scripts/fuse-acceptance.sh --offline-only
+
       - name: Acceptance runner safety guard
         run: |
           if scripts/fuse-acceptance.sh /tmp >acceptance.out 2>&1; then

@@ -35,10 +35,28 @@ jobs:
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: '1.96'
+          components: rustfmt, clippy
 
       - name: Cache Cargo target
         uses: swatinem/rust-cache@v2
+
+      - name: Verify tag and manifest versions
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          pkgbuild_version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD | head -n1)"
+          test "$tag_version" = "$manifest_version"
+          test "$tag_version" = "$pkgbuild_version"
+
+      - name: Release quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --locked
+          scripts/fuse-acceptance.sh --offline-only
 
       - name: Build release binaries
         run: |
@@ -76,6 +94,8 @@ jobs:
           mkdir -p deb/usr/share/applications
           mkdir -p deb/usr/share/icons/hicolor/scalable/apps
           mkdir -p deb/usr/share/licenses/proton-drive-linux
+          mkdir -p deb/usr/lib/systemd/user
+          mkdir -p deb/etc/xdg/autostart
 
           # Copy binaries
           cp target/release/pdfs deb/usr/bin/
@@ -85,7 +105,9 @@ jobs:
 
           # Copy desktop integration files
           cp packaging/io.narl.proton-drive-linux.desktop deb/usr/share/applications/
+          cp packaging/io.narl.proton-drive-linux-tray.desktop deb/etc/xdg/autostart/
           cp packaging/io.narl.proton-drive-linux.svg deb/usr/share/icons/hicolor/scalable/apps/
+          cp packaging/proton-drive.service deb/usr/lib/systemd/user/
           cp LICENSE deb/usr/share/licenses/proton-drive-linux/
 
           # Calculate Installed-Size in KB for the control file

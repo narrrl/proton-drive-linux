@@ -105,11 +105,21 @@ impl AppDirs {
     /// Load config from disk, creating default if missing.
     pub fn load_config(&self) -> AppConfig {
         let path = self.config_path();
-        if path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(config) = serde_json::from_str::<AppConfig>(&content)
-        {
-            return config;
+        if path.exists() {
+            match std::fs::read_to_string(&path)
+                .map_err(Error::from)
+                .and_then(|content| {
+                    serde_json::from_str::<AppConfig>(&content).map_err(Error::from)
+                }) {
+                Ok(config) => return config,
+                Err(e) => {
+                    // Preserve the original bytes for diagnosis/recovery.  In
+                    // particular, never replace a truncated config with defaults
+                    // and silently lose mount, device, or ignore settings.
+                    tracing::error!(path = %path.display(), error = %e, "config is unreadable; using in-memory defaults without overwriting it");
+                    return AppConfig::default();
+                }
+            }
         }
 
         let default_config = AppConfig::default();
@@ -125,10 +135,26 @@ impl AppDirs {
     /// cache budget or mountpoint; the daemon re-reads the file on its next mount.
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
         let path = self.config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(config)?)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Other("configuration path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_extension(format!("json.tmp-{}-{nonce}", std::process::id()));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        use std::io::Write as _;
+        file.write_all(&serde_json::to_vec_pretty(config)?)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -211,24 +237,41 @@ impl AppDirs {
     pub fn ensure(&self) -> Result<()> {
         for dir in [self.state_dir(), self.cache_dir()] {
             std::fs::create_dir_all(&dir)?;
-            restrict_dir(&dir);
+            restrict_dir(&dir)?;
         }
         let config_dir = self.dirs.config_dir().to_path_buf();
-        if std::fs::create_dir_all(&config_dir).is_ok() {
-            restrict_dir(&config_dir);
-        }
+        std::fs::create_dir_all(&config_dir)?;
+        restrict_dir(&config_dir)?;
         Ok(())
     }
 }
 
-/// Make `dir` owner-only (`0700`). Best effort: a mode we cannot set (an
-/// exotic filesystem, a directory we do not own) is not worth refusing to
-/// start over, and the caller has no better answer than continuing.
-fn restrict_dir(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-        tracing::warn!(path = %dir.display(), error = %e, "could not restrict directory to 0700");
+/// Make `dir` owner-only (`0700`). These directories contain decrypted bytes,
+/// plaintext names, and an authenticated control socket, so failure is fatal.
+fn restrict_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
+    let before = std::fs::symlink_metadata(dir)?;
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(Error::Other(format!(
+            "sensitive path is not a real directory: {}",
+            dir.display()
+        )));
     }
+    if before.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::Other(format!(
+            "sensitive directory is not owned by the current user: {}",
+            dir.display()
+        )));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let after = std::fs::symlink_metadata(dir)?;
+    if after.permissions().mode() & 0o777 != 0o700 {
+        return Err(Error::Other(format!(
+            "sensitive directory did not become owner-only: {}",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Make a just-bound Unix socket owner-only (`0600`).
@@ -263,17 +306,38 @@ mod tests {
     /// and the control socket that commands the daemon's session.
     #[test]
     fn restrict_dir_makes_a_directory_owner_only() {
-        let dir = std::env::temp_dir().join(format!("pdfs-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-cfg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Start deliberately world-readable, as `create_dir_all` under a typical
         // umask would leave it.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        restrict_dir(&dir);
+        restrict_dir(&dir).unwrap();
 
         assert_eq!(mode_of(&dir), 0o700, "group and other must have no access");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restrict_dir_refuses_a_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "pdfs-cfg-link-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let target = root.join("target");
+        let link = root.join("state");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(restrict_dir(&link).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Connecting to the control socket confers the daemon's authenticated
@@ -281,11 +345,18 @@ mod tests {
     /// merely private data.
     #[test]
     fn restrict_socket_makes_a_socket_owner_only() {
-        let dir = std::env::temp_dir().join(format!("pdfs-sock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-sock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("control.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // chmod semantics are identical for a socket path and a regular file;
+        // use a file so this regression also runs in sandboxes that prohibit
+        // creating Unix sockets.
+        let listener = std::fs::File::create(&sock).unwrap();
 
         restrict_socket(&sock).unwrap();
 

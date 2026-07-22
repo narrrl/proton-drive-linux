@@ -99,7 +99,7 @@ pub(super) fn guard_local_wipe<B, L>(
     baseline: &HashMap<String, B>,
     local: &HashMap<String, L>,
 ) -> Result<(), String> {
-    if baseline.len() >= 2 && baseline.keys().all(|rel| !local.contains_key(rel)) {
+    if !baseline.is_empty() && baseline.keys().all(|rel| !local.contains_key(rel)) {
         return Err(format!(
             "every one of the {} synced paths is missing locally; refusing to trash \
              them on Drive. Check that the folder is mounted and readable.",
@@ -162,12 +162,24 @@ pub(super) fn rel_to_path(rel: &str) -> PathBuf {
 }
 
 /// The name for a conflict copy of `path`, e.g. `notes (sync-conflict 1700000000).txt`.
+#[cfg(test)]
 pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
+    conflict_path_with_suffix(path, stamp, 0)
+}
+
+/// As [`conflict_path`], with a deterministic suffix used when that name already
+/// exists. This keeps conflict preservation from ever replacing an older copy.
+pub(super) fn conflict_path_with_suffix(path: &Path, stamp: i64, suffix: u32) -> PathBuf {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
+    let suffix = if suffix == 0 {
+        String::new()
+    } else {
+        format!("-{suffix}")
+    };
     let name = match ext {
-        Some(ext) => format!("{stem} (sync-conflict {stamp}).{ext}"),
-        None => format!("{stem} (sync-conflict {stamp})"),
+        Some(ext) => format!("{stem} (sync-conflict {stamp}{suffix}).{ext}"),
+        None => format!("{stem} (sync-conflict {stamp}{suffix})"),
     };
     match path.parent() {
         Some(dir) => dir.join(name),
