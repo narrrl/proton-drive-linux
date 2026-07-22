@@ -10,11 +10,18 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 - **Shared Links & Invites**: Browse files shared with you by other users, and view/manage your own public shared links directly in the GUI.
 - **Local Backup (Computers)**: Sync and back up local directories (like Downloads, Documents, Pictures, etc.) directly to your Proton Drive account.
 - **System Tray Integration**: Background indicator for status monitoring, quick actions, and fast sync controls.
-- **Fuzzy Search Launcher Prompt (HUD)**: A Google Drive-style search launcher (`pdfs-prompt`) for finding and opening files or folders instantly, ideal for binding to a system-wide hotkey.
+- **Unified Search Launcher (HUD)**: A resident Google Drive-style launcher (`pdfs-prompt`) that searches Proton Drive and local files together, ranks the best matches, tolerates abbreviations and typos, and is ideal for a system-wide hotkey.
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
 - **Human Verification (CAPTCHA) Recovery**: Detects sign-in gates (VPN/new IP challenges) and launches an embedded `WebKitWebView` dialog to safely complete the challenge, transparently retrying authentication with the earned token.
 - **Selective Sync (`.pdfsignore`)**: Keep build trees, dependency directories, and editor leftovers out of synced folders using gitignore-style rules.
+- **Data-Safe Offline Writes**: Durable scratch/staging files and a transactional pending queue preserve acknowledged writes across network failures and restarts.
+
+## Quick Search and Media Opening
+
+`pdfs-prompt` searches Drive metadata and the local home-directory index in one request. Results are ranked together rather than split by source. Matching is case-insensitive and supports exact names, prefixes, parent paths, multiple terms, punctuation-separated words, ordered abbreviations, common typos, and adjacent transpositions.
+
+The prompt stays resident after its first launch, so invoking the shortcut again reuses and resets the existing window. Drive folders open from the mount. Audio and video results also open through FUSE, allowing media players to seek and request ranges without downloading the entire file first; ordinary Drive files are materialized into the local cache before opening.
 
 ## Selective Sync (`.pdfsignore`)
 
@@ -131,6 +138,19 @@ The client includes several optimizations designed for high efficiency, a low me
 - **Disk-Backed Writes**: Large file writes are staged on disk in temporary scratch files (rather than fully buffered in RAM) and track modified byte intervals. Only the unedited remote segments are fetched at commit time, keeping memory usage minimal.
 - **Non-Blocking GTK4 Loop**: To prevent UI freezes, all synchronous D-Bus credential checks, control socket requests, and cache usage calculations are offloaded to background worker threads or fetched asynchronously.
 - **Flicker-Free UI Rendering**: The GTK4 application performs differential rendering of the pins list, only modifying list rows when the list content changes, preserving the user's scroll position and widget focus.
+- **Durable Staging**: Scratch metadata and staged writes are synced and atomically published before an upload is acknowledged locally. Rapid revisions supersede pending work transactionally.
+
+## Filesystem Safety
+
+Version 1.0 strengthens the boundaries around local-only data and destructive reconciliation:
+
+- Truncate composes with queued revisions, preserving the authoritative prefix and correct zero-filled growth.
+- Combined move-and-rename operations are queued durably and tolerate partially completed remote state.
+- Session tombstones prevent successfully unlinked entries from reappearing through eventually consistent listings.
+- Names are valid UTF-8 and no longer than Linux's 255-byte component limit.
+- Incomplete mirror scans are non-destructive, and total-wipe protection covers every non-empty baseline.
+- Failed conflict preservation, local deletion, or staging publication does not settle a new baseline or discard the only local copy.
+- State, cache, and config directories must be real, current-user-owned `0700` directories; control sockets are `0600`.
 
 
 ## Screenshots
@@ -258,15 +278,18 @@ This project has a GitHub Actions CI workflow configured under `.github/workflow
 1. **Triggers**: 
    - Pushing a git tag matching `v*` (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
    - Manual runs via the **Actions** tab in GitHub (**workflow_dispatch**).
-2. **Build Process**:
+2. **Quality Gates and Build Process**:
+   - For tagged builds, verifies that the tag, workspace version, and `packaging/PKGBUILD` version agree.
+   - Runs `cargo fmt`, Clippy with warnings denied, the locked workspace test suite, and the account-free FUSE acceptance contract.
    - Spawns an Ubuntu runner and installs GTK4, Libadwaita, FUSE3, and Secret Service packages.
    - Sets up the Rust compiler and caches build targets to speed up runs.
    - Compiles the workspace members in release mode.
 3. **Artifact Packaging**:
    - Generates a `.tar.gz` containing the raw binaries (`pdfs`, `pdfs-app`, `pdfs-tray`, `pdfs-prompt`).
-   - Packs them into a Debian package (`.deb`).
+   - Packs them into Debian (`.deb`) and Fedora (`.rpm`) packages.
+   - Includes the systemd user service and tray autostart entry in the Debian package.
 4. **Publishing**:
-   - Creates a GitHub Release matching the pushed tag and uploads the `.deb` and `.tar.gz` packages as release assets.
+   - Creates a GitHub Release matching the pushed tag and uploads the `.deb`, `.rpm`, and `.tar.gz` packages as release assets.
    - For manual runs, compiles and exposes the packages as workflow run artifacts for testing.
 
 ---

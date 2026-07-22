@@ -30,10 +30,10 @@ graph TD
 
 | Crate | Primary Role | Key Components | State Management |
 |---|---|---|---|
-| [`pdfs-core`](file:///home/narl/dev/private/proton-drive-linux/crates/pdfs-core) | Core Infrastructure & Services | Cache Bookkeeping, Database migrations/schemas, IPC protocol payloads. | Holds the unified SQLite DB (`Db`) connection and the on-disk cache metadata (`ContentCache`). |
-| [`pdfs-fuse`](file:///home/narl/dev/private/proton-drive-linux/crates/pdfs-fuse) | VFS Layer & Reconciliation | FUSE callbacks, background upload queue (`drain`), two-way sync runner. | Manages in-memory inode maps (`State`), active descriptors (`WriteHandle`), and background task threads. |
-| [`pdfs-cli`](file:///home/narl/dev/private/proton-drive-linux/crates/pdfs-cli) | Command Line Interface | Command routing, daemon launcher, IPC client wrapper. | Stateless; communicates with daemon over IPC control socket. |
-| [`pdfs-gui`](file:///home/narl/dev/private/proton-drive-linux/crates/pdfs-gui) | Graphical Interface | GTK Page timelines (My files, Shared, Shared with me, Computers, Photos, Activity, Trash, Settings). | Stateless; polls daemon for status and lists timelines via IPC socket. |
+| [`pdfs-core`](../crates/pdfs-core) | Core Infrastructure & Services | Cache bookkeeping, database migrations/schemas, IPC protocol payloads, and shared search relevance scoring. | Holds the unified SQLite DB (`Db`) connection and the on-disk cache metadata (`ContentCache`). |
+| [`pdfs-fuse`](../crates/pdfs-fuse) | VFS Layer & Reconciliation | FUSE callbacks, background upload queue (`drain`), two-way sync runner. | Manages in-memory inode maps (`State`), active descriptors (`WriteHandle`), and background task threads. |
+| [`pdfs-cli`](../crates/pdfs-cli) | Command Line Interface | Command routing, daemon launcher, IPC client wrapper. | Stateless; communicates with daemon over IPC control socket. |
+| [`pdfs-gui`](../crates/pdfs-gui) | Graphical Interface | GTK pages, tray, and the resident quick-search prompt. | Keeps UI state only; all durable state and Drive access remain behind the IPC socket. |
 
 ---
 
@@ -127,8 +127,8 @@ Because Proton Drive does not support partial byte writes, modified files must b
 1. **Staging writes (`WriteHandle`):** Writes are stored locally in a `scratch` file. The daemon tracks modified regions using `Intervals` (which holds ranges of edited bytes).
 2. **Close/Release (`queue_revision`):** When the application closes the file descriptor, the daemon:
    - Fetches any untouched gaps from the remote base file to compile the full file.
-   - Moves the scratch file to `staging` under a `{uid}-{millis}-{counter}` name, so a staged blob can be tied back to its node without consulting the database.
-   - Queues a pending database operation (`PendingOp`). For `OP_REVISION` ops, execution is debounced by 2 seconds (`DRAIN_REVISION_DEBOUNCE = 2s`) to give rapid follow-up writes (e.g. `aria2c` preallocation followed by writing) time to supersede the staged blob before network transmission.
+   - Durably publishes the scratch data and authored-range sidecar into `staging` under a `{uid}-{millis}-{counter}` name. Temporary data and metadata are synced before atomic rename, and their directory is synced before the source is removed.
+   - Transactionally queues or supersedes a pending database operation (`PendingOp`), so insertion failure cannot erase the previously acknowledged upload. For `OP_REVISION` ops, execution is debounced by 2 seconds (`DRAIN_REVISION_DEBOUNCE = 2s`) to give rapid follow-up writes (e.g. `aria2c` preallocation followed by writing) time to supersede the staged blob before network transmission.
 3. **Async Drain Thread (`run_pending_drain`):** The background drain worker picks up the database operations queue, handles revision uploads, resolves conflicts, and cleans up staging files. Upon landing a revision upload (`refresh_after_upload`), it rebaselines both still-queued ops (`rebaseline_pending`) and open write handles targeting the same node to prevent false self-conflict copies on subsequent writes.
 
 ```mermaid
@@ -170,7 +170,7 @@ sequenceDiagram
 The sync engine handles offline-capable, bidirectional synchronization between the local disk and Proton Drive for directories marked in `mirror` mode.
 
 ### Lifecycle of a Sync Pass
-1. **Walk Local:** Walks the local directory tree recursively, scanning sizes and modification times.
+1. **Walk Local:** Walks the local directory tree recursively, scanning sizes and modification times while carrying a completeness result. A `readdir`, metadata, permission, or transient I/O failure makes the pass non-destructive instead of turning omitted paths into deletions.
 2. **Walk Remote:** Walks the remote database representation. If remote file modification times are updated, it calls the API to decrypt their sizes.
 3. **Load Baseline:** Loads the `sync_entry` database table, which contains the snapshot of both sides during the *last successful sync*.
 4. **Permutation Diffing:** The loop compares the three states (`local`, `remote`, `baseline`) to classify items:
@@ -192,7 +192,7 @@ graph TD
 ```
 
 5. **Depth-Ascending Batching:** Folders are processed first to ensure hierarchies exist before files are placed. Work is executed concurrently up to a set limit.
-6. **Post-Sync Settle:** On success, baseline entries are upserted, timestamps updated, and any pending mode switches (e.g. going on-demand) are evaluated.
+6. **Safety Gate and Settle:** Destructive plans are rejected when the scan is incomplete. Total-wipe protection applies to every non-empty baseline, including a single-entry folder. On success, baseline entries are upserted, timestamps updated, and any pending mode switches (e.g. going on-demand) are evaluated. Failed local deletion or conflict preservation retains the previous baseline and prevents remote content from overwriting the local source.
 
 ---
 
@@ -202,10 +202,17 @@ The CLI and GUI front-ends do not access database files or make network calls di
 
 * **Transport:** IPC over Unix Stream Socket.
 * **Framing:** Line-delimited JSON payloads.
+* **Resource limits:** Requests are limited to 1 MiB, must end with a newline, and must arrive within 10 seconds. At most 64 connection handlers are active at once.
 * **Control Protocol:**
   * Client sends a single JSON line (`Request`).
   * Daemon parses, handles the request, and replies with a single JSON line (`Response`).
   * Timeout durations are separated: **2 seconds** for writes (avoids hangs on defunct sockets) and **120 seconds** for reads (accommodates heavy transfers).
+
+### Unified Search
+
+`SearchV2` is the shared search boundary for the resident prompt. One request carries the query, result limit, requested sources (`Drive`, `Local`), and content kind. The daemon queries Drive metadata and the local home-directory index, then applies [`pdfs_core::search::relevance_score`](../crates/pdfs-core/src/search.rs) to both result sets. Exact and prefix matches rank above substring, abbreviation, and bounded typo matches; all query terms must match either the basename or parent path. Returning scores on one scale lets the GUI merge both sources into a deterministic **Best matches** list.
+
+The prompt is a single-instance GTK application. It retains and hides its window between activations, resets its query state when summoned, and ignores stale asynchronous replies. Folder and streamable audio/video results open through the FUSE mount so applications can issue range reads; ordinary Drive files use the daemon's materialize-then-open path.
 
 ---
 
@@ -215,7 +222,7 @@ The background daemon relies on the following thread topology:
 
 1. **Main Thread / Dispatch Loop:** Blocks on `fuser::Session` loop. Reads kernel FUSE events and hands off network-bound VFS work to the FUSE workers pool.
 2. **FUSE Workers Pool (11 threads, two lanes):** Bounded thread pool handling network operations. Split into 3 threads reserved for metadata (`lookup`, `readdir`) and 8 general threads that serve transfers (block reads) and fall back to metadata when no transfer is waiting. Reserved threads never accept a transfer — that is what keeps a directory listing from queuing behind saturated downloads (audit A6).
-3. **IPC listener Thread:** Listens on Unix socket connections, spawning a lightweight task per connection to serve front-end status/configuration requests.
+3. **IPC listener Thread:** Listens on the Unix socket and admits at most 64 concurrent, timeout-bound handlers for front-end status/configuration requests.
 4. **Sync Engine Loop Thread:** Serializes sync runs. Wakes on debounced local inotify filesystem changes, remote polling intervals, or manual user requests.
 5. **Drain Queue Worker Thread:** Processes staged writes (`PendingOp`) sequentially, uploading revisions and retrying with exponential backoff on failures.
 
@@ -261,13 +268,13 @@ Two exposures this client does **not** currently mitigate, stated plainly rather
 - **Swap.** Content keys, session keys, and decrypted buffers live in ordinary heap memory. Nothing calls `mlock(2)`, so under memory pressure they may be paged out. Raising `LimitMEMLOCK` in the systemd unit would *not* change this — there is no locking to permit. The effective mitigation is encrypted swap (dm-crypt / `systemd-cryptsetup`), which is standard on a LUKS install.
 - **Kernel page cache.** Plaintext returned through FUSE is cached by the kernel like any other file data, and is likewise swappable. Defeating this would mean `direct_io` on every read, forfeiting the readahead and caching that make the mount usable. The trade is taken deliberately in favour of performance.
 
-### 8.5 File modes: currently inherited, not enforced
+### 8.5 Enforced ownership and file modes
 
-**The daemon does not set restrictive permissions on anything it creates.** Cache and state directories come from `create_dir_all`, and `control.sock` from a plain `UnixListener::bind` — all subject to the process umask, which on a typical desktop yields `0755` directories and a `0755` socket.
+On every start, `AppDirs::ensure` verifies that the state, cache, and configuration paths are real directories owned by the effective user, rejects symlink substitution or the wrong owner, and enforces mode `0700`. Both Unix sockets are changed to `0600` immediately after binding; failure is fatal rather than falling back to an unguarded daemon.
 
-What protects them today is the mode of the XDG parents (`~/.cache`, `~/.local/state`), which are conventionally `0700` — but that is a property of the user's system, not something this client establishes or verifies. On a machine where the home directory is group- or world-traversable, the consequences differ by artifact:
+These checks protect the artifacts even when the surrounding home or XDG parent is traversable:
 
-| Artifact | Exposure if the parent is traversable |
+| Artifact | Why access is restricted |
 |---|---|
 | `content/` | Another local user can read cached plaintext file content |
 | `cache.db` | Another local user can read the full decrypted name/structure index |
@@ -275,14 +282,14 @@ What protects them today is the mode of the XDG parents (`~/.cache`, `~/.local/s
 
 The socket is the sharpest of the three, because it is an authority boundary rather than a data one — connecting to it confers the daemon's authenticated session without any credential.
 
-**Fixed (bugs.md B6):** `AppDirs::ensure` now sets `0700` on the state, cache, and config directories on every start — not only at creation, so a directory that already exists with a permissive mode is tightened — and `config::restrict_socket` sets `0600` on both sockets immediately after `bind`. The directories are restricted *before* the socket is bound, which closes the window between `bind` and `chmod`. A control socket whose mode cannot be set takes the daemon down rather than serving unguarded.
+Configuration publication follows the same fail-closed model: a restricted temporary file is written and synced, atomically renamed, and followed by a directory sync. A malformed existing configuration is reported and preserved rather than overwritten with defaults.
 
 See [RECOVERY.md](RECOVERY.md) for what a lost machine means for the plaintext described in this section, and what to revoke.
 
 ### 8.6 Implications for deployment
 
 - Treat the cache and state directories as being as sensitive as the Drive contents themselves.
-- Multi-user machines warrant checking `~/.cache` and `~/.local/state` are `0700` until §8.5 is addressed.
+- Restored or manually copied profiles must remain owned by the user. The daemon refuses to start against wrong-owner or symlinked sensitive directories.
 - Purging the cache (`pdfs` settings, or `PurgeCache` over IPC) removes content but **not** `cache.db`, and deliberately never removes undrained `staging/` or `recovery/` blobs.
 
 ---
@@ -343,4 +350,3 @@ sequenceDiagram
    This ensures compatibility with all versions of Proton's client verification scripts.
 3. **SRP Handshake Reset:** Because a gated login burns the SRP handshake on the API side, the client cannot simply resume the previous request. Instead, `auth::login_interactive` restarts the SRP process from scratch with the verification credentials attached, keeping the complex handshake details isolated from the front-end.
 4. **CLI Fallback:** Since the CLI has no native web browser engine, hitting the CAPTCHA gate fails immediately with a user-friendly message directing the user to sign in once via the GUI (`pdfs-app`) to persist the authenticated session keys to the system keyring.
-

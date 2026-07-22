@@ -1,11 +1,11 @@
-# Pending Development & Verification Tasks
+# Development and Verification Status for 1.0
 
-This document compiles all pending, deferred, and unstarted tasks from the various roadmap, audit, and bug-tracking markdown files in the repository. Completed items have been filtered out.
+This document summarizes the work still pending after the 1.0.0 release branch and records the most important recently completed changes. [`BUGS.md`](BUGS.md) is the authoritative issue ledger; [`TESTING.md`](TESTING.md) defines the acceptance commands.
 
 ---
 
 ## 1. Core Feature Roadmap (Horizon Tasks)
-Derived from: [features.md](file:///home/narl/dev/private/proton-drive-linux/features.md) & [features-plan.md](file:///home/narl/dev/private/proton-drive-linux/features-plan.md)
+Consolidated from the historical feature roadmap; current bug status lives in [`BUGS.md`](BUGS.md).
 
 * **Local Cache & Metadata Encryption at Rest (Priority 5 / Horizon 1)**: Encrypt the SQLite database `cache.db` on disk using SQLCipher (`rusqlite` feature `bundled-sqlcipher`), and encrypt raw content cache blocks (`content/blocks/` and `content/scratch/`) using a fast symmetric scheme like AES-GCM or ChaCha20-Poly1305. The encryption key should be derived from the OS Keyring.
 * **Active Bandwidth Throttling & Traffic Shaping (Horizon 1)**: Add speed governors for daemon uploads and downloads. Support configuration variables `max_upload_rate_kbps` and `max_download_rate_kbps` in `config.json` that can be dynamically adjusted over the Unix control socket.
@@ -26,7 +26,7 @@ Derived from: [features.md](file:///home/narl/dev/private/proton-drive-linux/fea
 ---
 
 ## 2. Performance, Correctness & Robustness Items
-Derived from: [plan.md](file:///home/narl/dev/private/proton-drive-linux/plan.md), [improvements.md](file:///home/narl/dev/private/proton-drive-linux/improvements.md), & [photos-video-streaming.md](file:///home/narl/dev/private/proton-drive-linux/photos-video-streaming.md)
+Consolidated from the performance and media-streaming audit notes.
 
 * **B6. Debounce the LRU access touch**: Keep last-touch times in memory and flush them in batches (debounce window of 30-60 seconds) to avoid performing a SQLite `UPDATE` to the `cache_entries` table on every cache hit.
 * **E12. Client in-flight cap shape**: Address the lock discrepancy between `MAX_CONCURRENT_BLOCK_DOWNLOADS = 10` (per-file) and `DEFAULT_MAX_INFLIGHT_BLOCKS = 12` (global client-wide). Either raise the global cap, lower the per-file window, or dynamically calculate the window to prevent single files from starving concurrent transfers.
@@ -40,13 +40,12 @@ Derived from: [plan.md](file:///home/narl/dev/private/proton-drive-linux/plan.md
   * **F3. Short block yields a short read / EOF**: Address the kernel EOF interpretation on short block reads. Either pad the block or fail loudly rather than silently serving short data.
   * **F4. `stream_readahead` check-then-spawn race**: Prevent duplicate concurrent readahead tasks for the same block. Check-then-spawn is currently racey.
   * **F5. `refresh_blocks` permit lock (SDK)**: Ensure URL refreshing (`refresh_blocks`) does not hold an in-flight block permit, preventing expired URLs from pinning client permits.
-  * **F6. Uncapped Unix control socket thread spawns**: Replace the unbounded `std::thread::spawn` per accepted socket connection in `run_control_socket` with a bounded pool or handler limits to prevent thread exhaustion.
   * **F7. Document temporary cache file safety**: Add explanatory comment to `cache.rs:362` explaining why `with_extension("tmp")` is safe there but not in `store_thumbnail`.
 
 ---
 
 ## 3. Open & Unverified Bugs
-Derived from: [docs/bugs.md](file:///home/narl/dev/private/proton-drive-linux/docs/bugs.md)
+Derived from: [`BUGS.md`](BUGS.md)
 
 * **B2. Unattributed Trash Origin**: Investigate why deleted/moved files are occasionally sent to trash instead of vanishing on older rename operations.
 * **B10. GLib Critical Warning on HUD Close**: Assertion failure `g_list_store_remove: assertion '!g_sequence_iter_is_end (it)' failed` when prompt window closes during active launch (`xdg-open`). Needs investigation under `G_DEBUG=fatal-criticals`.
@@ -54,11 +53,17 @@ Derived from: [docs/bugs.md](file:///home/narl/dev/private/proton-drive-linux/do
 * **B8 (CAPTCHA sign-in bridge)**: Verify a real gated sign-in using Webkit CAPTCHA completion.
 * **Draft Revision Upload loop**: Verify SDK-side deletion and retry logic when a conflicting draft revision exists under the same client UID.
 * **Optimistic Size Loss on Restart**: Verify that pending uploads retain their optimistic sizes across a daemon restart.
+* **B48 — stale listing after unlink**: Session tombstones and authoritative empty listings are implemented; run focused live verification against eventually consistent remote enumeration.
+* **B49–B55 — data-safety fixes**: Conflict preservation, orphan/staging durability, transactional supersession, one-entry wipe protection, and incomplete-scan handling have regression coverage but still require the fault, power-loss, and live mode-matrix cases recorded in `BUGS.md`.
+* **B56–B60 — fail-closed state and IPC fixes**: Future schemas, event cursor advancement, socket limits, private-directory validation, and atomic config saves are implemented. Malformed-schema, database-full, connection-flood, wrong-owner, and concurrent/faulted-save verification remains.
+* **B61 — credential rotation persistence**: Surface and retry keyring persistence failures so a rotated single-use refresh token cannot be lost on restart.
+* **B62–B65 — release assurance**: Clean-install package verification, complete version/protocol identity, recovery sign-off, advisory/license policy, SBOM, provenance, checksums, and signatures remain.
+* **B66–B68 — lifecycle and recovery**: Add queue flush/shutdown protection, explicit device adoption during fresh-state restore, and move profile backup below a writable remote folder.
 
 ---
 
 ## 4. Testing, Verification & Disaster Recovery Drills
-Derived from: [testing.md](file:///home/narl/dev/private/proton-drive-linux/testing.md) & [docs/RECOVERY.md](file:///home/narl/dev/private/proton-drive-linux/docs/RECOVERY.md)
+Derived from: [`TESTING.md`](TESTING.md) and [`RECOVERY.md`](RECOVERY.md)
 
 * **IPC Memory and Performance Stress Tests (Phase 3)**: Verify memory allocations do not balloon when sending large `UploadPhoto` JSON payloads. Test control socket timeout behaviors under long-running block operations.
 * **Fault Injection and Resiliency Tests (Phase 4)**:
@@ -71,11 +76,13 @@ Derived from: [testing.md](file:///home/narl/dev/private/proton-drive-linux/test
   3. Wipe the local state directory and SQLite cache.
   4. Restart the daemon.
   5. Run `pdfs sync restore` and assert the recovered filesystem matches the source byte-for-byte.
+* **Managed live mode matrix**: Before release, run `scripts/fuse-acceptance.sh --managed-live <empty-a> <empty-b>` with `PDFS_ACCEPTANCE_ONLY` unset. It validates on-demand/on-demand, on-demand/mirror, mirror/on-demand, and mirror/mirror transitions.
+* **Crash-consistency matrix**: Inject failure after scratch/sidecar sync, each staging rename, directory sync, pending-op insert/commit, and source deletion; prove that a complete discoverable copy and either the old or new queue record always survives.
 
 ---
 
 ## 5. Fixed & Resolved Bugs
-Derived from: [docs/bugs.md](file:///home/narl/dev/private/proton-drive-linux/docs/bugs.md)
+Derived from: [`BUGS.md`](BUGS.md)
 
 ### Completely Fixed & Verified
 * **B1 — FUSE rename loses the file (data loss)**: In `rename`, the node's database row was deleted while only updating the in-memory state, causing the file to vanish on next listing sync. Fixed by correctly calling `st.invalidate_listing(newparent)` to refresh SQLite cache states.
@@ -88,6 +95,19 @@ Derived from: [docs/bugs.md](file:///home/narl/dev/private/proton-drive-linux/do
 * **B12 — cold enumeration is slow per entry, and goes superlinear past ~500**: S2K decryption and thumbnail resolution loops were serial. Fixed by parallelizing key derivations and caching metadata.
 * **B13 — `rename` over an existing destination fails instead of replacing it**: Fixed POSIX rename target overwrite behavior to replace existing destinations.
 * **B14 — provisional (ciphertext) sizes make rsync read short and abort the file**: Adjusted size reporting to align logical and ciphertext sizing, preventing premature EOF.
+* **B45 — truncate over a queued rewrite**: Path-based and handle-based truncate now compose over the complete pending blob; shrink, growth, and sparse I/O are live-verified.
+* **B46 — combined cross-directory move and rename**: The desired end state is durably queued and reconciles partially completed remote operations; replacement and combined cases are live-verified.
+* **B47 — overlong/invalid names**: All name-taking callbacks share a validator for `NAME_MAX`, reserved components, and UTF-8; managed-live verification passed.
+
+### Implemented in 1.0 (Further Fault Verification Pending)
+
+* **Unified search and resident prompt**: `SearchV2` combines Drive and local lookup with shared relevance scoring and content/source filters. The prompt reuses its window and opens streamable media through FUSE.
+* **Durable write publication**: Scratch sidecars and staged blobs use synced temporary files, atomic renames, and directory synchronization; orphan rescue retains its source on failure.
+* **Transactional pending operations**: Superseding a queued operation cannot delete the old durable record unless the replacement commits.
+* **Safer mirror reconciliation**: Conflict-copy failure aborts publication, incomplete scans are non-destructive, and total-wipe protection includes one-entry baselines.
+* **Bounded IPC**: Control requests are limited to 1 MiB and 10 seconds, with at most 64 active handlers.
+* **Private local state**: Sensitive directories require correct ownership, real-directory identity, and `0700`; sockets use `0600`; config saves are atomic and malformed input is preserved.
+* **Release gates**: Tag/workspace/package versions are checked and formatting, lint, tests, and offline FUSE acceptance run before packaging.
 
 ### Code Fixed / Implemented (Pending Verification)
 * **B8 — no way to complete a CAPTCHA, so a gated sign-in is unrecoverable**: Implemented a Webkit-based bridge to prompt the user to resolve interactive CAPTCHAs during gated logins. (Needs verification on a real gate request).
@@ -100,7 +120,7 @@ Derived from: [docs/bugs.md](file:///home/narl/dev/private/proton-drive-linux/do
 ## 6. Recently Implemented Features
 
 ### Open-for-Write Deferral for Mirror Sync (Implemented)
-**File**: [`sync.rs`](file:///home/narl/dev/private/proton-drive-linux/crates/pdfs-fuse/src/sync.rs)
+**File**: [`sync.rs`](../crates/pdfs-fuse/src/sync.rs)
 
 The mirror folder sync engine now defers uploading any file that is currently held open for writing by another process, matching the guarantee the FUSE mount path already provides (where uploads are deferred until `close(fd)`).
 
@@ -127,4 +147,3 @@ The mirror folder sync engine now defers uploading any file that is currently he
 |---|---|---|
 | FUSE mount | ✅ Perfect | Upload deferred until `close(fd)` |
 | Mirror folders | ✅ Perfect | `/proc/*/fd` scan per reconcile pass |
-
