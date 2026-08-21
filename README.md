@@ -1,6 +1,63 @@
-# Proton Drive client for Linux (unofficial)
+<div align="center">
 
-A fast, unofficial Proton Drive client for Linux. This client features an advanced files-on-demand FUSE virtual mount with block-level caching, a command-line interface (CLI), and a fully non-blocking GTK4 desktop application with system tray integration.
+<img src="images/logo.svg" alt="" width="112" height="112">
+
+# Proton Drive for Linux
+
+**Files-on-demand Proton Drive for the Linux desktop** — a FUSE virtual mount with block-level
+caching, a scriptable CLI, and a native GTK4 app with tray and search launcher.
+
+[![CI](https://github.com/narrrl/proton-drive-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/narrrl/proton-drive-linux/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/narrrl/proton-drive-linux?sort=semver)](https://github.com/narrrl/proton-drive-linux/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
+[![Platform: Linux](https://img.shields.io/badge/platform-linux-lightgrey.svg)](#prerequisites)
+
+<img src="images/files.png" alt="The GTK4 file browser" width="820">
+
+</div>
+
+> [!IMPORTANT]
+> This is an **unofficial**, community-built client. It is not affiliated with, endorsed by, or
+> supported by Proton AG. "Proton" and "Proton Drive" are trademarks of Proton AG, used here only
+> to describe what the software talks to. Use a test account first, and read
+> [`docs/RECOVERY.md`](docs/RECOVERY.md) before trusting it with data you cannot lose.
+
+## Install
+
+```bash
+# Debian / Ubuntu
+sudo apt install ./proton-drive-linux_*.deb
+
+# Fedora
+sudo dnf install ./proton-drive-linux-*.rpm
+
+# Arch Linux
+cd packaging && makepkg -fi
+```
+
+Packages for each release are attached to the [latest
+release](https://github.com/narrrl/proton-drive-linux/releases/latest); see
+[Installation & Packages](#installation--packages) for details and
+[Building from Source](#building-from-source) to compile it yourself.
+
+```bash
+pdfs login          # sign in (SRP + 2FA, credentials go to the system keyring)
+pdfs status         # mount state, queued writes, cache usage
+pdfs-app            # the desktop app
+```
+
+## Contents
+
+- [Features](#features) · [Quick search](#quick-search-and-media-opening) · [Opening files](#choosing-how-files-open)
+- [Selective sync](#selective-sync-pdfsignore) · [Diagnostics](#diagnostics--maintenance) · [Scripting](#scripting---json)
+- [Performance](#performance--caching) · [Filesystem safety](#filesystem-safety) · [Screenshots](#screenshots)
+- [Prerequisites](#prerequisites) · [Building](#building-from-source) · [Packages](#installation--packages) · [Releases](#automated-releases-cicd)
+
+**Documentation:** [Architecture](docs/ARCHITECTURE.md) · [Testing](docs/TESTING.md) ·
+[Recovery](docs/RECOVERY.md) · [Development](docs/DEVELOPMENT.md) ·
+[Known issues](docs/BUGS.md) · [Changelog](docs/CHANGELOG.md) ·
+[Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
 ## Features
 
@@ -302,7 +359,7 @@ Ensure you have Rust and Cargo installed (minimum supported Rust version is 1.96
 
 1. Clone the repository and navigate into the project directory:
    ```bash
-   git clone https://github.com/narl/proton-drive-linux.git
+   git clone https://github.com/narrrl/proton-drive-linux.git
    cd proton-drive-linux
    ```
 2. Build the workspace in release mode:
@@ -372,6 +429,15 @@ This project has a GitHub Actions CI workflow configured under `.github/workflow
 
 ---
 
+## Contributing
+
+Bug reports, packaging fixes, and patches are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for
+the workflow and the quality gates CI enforces, and [SECURITY.md](SECURITY.md) for reporting a
+vulnerability privately.
+
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).
+
+Proton Drive is a service of Proton AG. This project is an independent client and carries no
+affiliation with or endorsement from Proton AG.

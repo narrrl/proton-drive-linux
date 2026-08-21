@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in the client misbehaves
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [`docs/BUGS.md`](../blob/main/docs/BUGS.md) first — the issue may already be
+        tracked there with context.
+
+        **Do not report a security vulnerability here.** See [SECURITY.md](../blob/main/SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `pdfs --version`, and how you installed it (deb / rpm / AUR / source).
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Distribution and desktop
+      placeholder: "Fedora 44, GNOME 48 (Wayland)"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where does it happen
+      multiple: true
+      options:
+        - FUSE mount / file operations
+        - Sync or backed-up folders (Computers)
+        - CLI (pdfs)
+        - Desktop app (pdfs-app)
+        - Tray (pdfs-tray)
+        - Search launcher (pdfs-prompt)
+        - Login / keyring
+        - Photos
+        - Packaging / installation
+    validations:
+      required: true
+  - type: textarea
+    id: diagnose
+    attributes:
+      label: "`pdfs diagnose` output"
+      description: Redact paths or the account address if you prefer.
+      render: console
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon logs
+      description: "`journalctl --user -u proton-drive.service -n 200 --no-pager`"
+      render: console
+  - type: checkboxes
+    id: dataloss
+    attributes:
+      label: Data
+      options:
+        - label: This bug involved missing, truncated, or overwritten file content.

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/narrrl/proton-drive-linux/security/advisories/new
+    about: Report privately — never in a public issue.
+  - name: Known issues
+    url: https://github.com/narrrl/proton-drive-linux/blob/main/docs/BUGS.md
+    about: The authoritative ledger of tracked bugs and their status.
+  - name: Proton Drive service problems
+    url: https://proton.me/support
+    about: This is an unofficial client. Account or service issues go to Proton AG.

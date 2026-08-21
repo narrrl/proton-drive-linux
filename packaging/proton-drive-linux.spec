@@ -12,9 +12,9 @@
 Name:           proton-drive-linux
 Version:        %{version}
 Release:        1%{?dist}
-Summary:        Proton Drive client for Linux (FUSE, CLI, GTK4 app + tray)
+Summary:        Unofficial Proton Drive client for Linux (FUSE, CLI, GTK4 app + tray)
 License:        MIT
-URL:            https://github.com/narl/proton-drive-linux
+URL:            https://github.com/narrrl/proton-drive-linux
 ExclusiveArch:  x86_64
 
 BuildRequires:  cargo
@@ -43,8 +43,9 @@ Recommends:     kwallet
 Provides:       pdfs = %{version}-%{release}
 
 %description
-Unofficial Proton Drive client featuring a FUSE files-on-demand mount,
-CLI, GTK4/Libadwaita GUI, system tray, and search launcher.
+Files-on-demand Proton Drive for the Linux desktop: a FUSE virtual mount with
+block-level caching, a scriptable CLI, and a GTK4/Libadwaita desktop app with
+system tray and search launcher. Unofficial and not affiliated with Proton AG.
 
 %prep
 # In-tree build: no Source tarball. Pass --define "git_dir /path/to/checkout".

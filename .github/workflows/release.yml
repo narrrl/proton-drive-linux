@@ -124,11 +124,12 @@ jobs:
           Maintainer: Nils Pukropp <contact@narl.io>
           Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4
           Installed-Size: ${INSTALLED_SIZE}
-          Description: Proton Drive client for Linux
-           Proton Drive client for Linux featuring:
-           - FUSE files-on-demand mount
-           - Command-line interface (CLI)
-           - GTK4 system tray, desktop application, and search launcher
+          Homepage: https://github.com/narrrl/proton-drive-linux
+          Description: Unofficial Proton Drive client for Linux
+           Files-on-demand Proton Drive for the Linux desktop, unaffiliated with Proton AG:
+           - FUSE virtual mount with block-level caching
+           - Scriptable command-line interface (pdfs)
+           - GTK4 desktop application, system tray, and search launcher
           EOF
 
           # Build Debian package

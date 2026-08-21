@@ -11,9 +11,9 @@
 pkgname=proton-drive-linux
 pkgver=1.9.0
 pkgrel=1
-pkgdesc="Proton Drive client for Linux: FUSE files-on-demand mount, CLI, GTK4 app + tray"
+pkgdesc="Unofficial Proton Drive client for Linux: files-on-demand FUSE mount, CLI, GTK4 app + tray"
 arch=('x86_64')
-url="https://github.com/narl/proton-drive-linux"
+url="https://github.com/narrrl/proton-drive-linux"
 license=('MIT')
 depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0')
 makedepends=('cargo' 'git')

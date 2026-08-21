@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability or an improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the client makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like to see
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which part of the client
+      multiple: true
+      options:
+        - FUSE mount
+        - Sync / Computers
+        - CLI (pdfs)
+        - Desktop app (pdfs-app)
+        - Tray (pdfs-tray)
+        - Search launcher (pdfs-prompt)
+        - Photos
+        - Packaging
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

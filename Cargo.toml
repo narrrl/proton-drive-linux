@@ -8,6 +8,11 @@ edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
+repository = "https://github.com/narrrl/proton-drive-linux"
+homepage = "https://github.com/narrrl/proton-drive-linux"
+readme = "README.md"
+keywords = ["proton", "drive", "fuse", "sync", "linux"]
+categories = ["filesystem", "command-line-utilities"]
 
 [workspace.dependencies]
 proton-sdk = { version = "0.6.1" }

@@ -914,7 +914,7 @@ fn toast_failure(ui: &Rc<Ui>, what: &str, message: &str, kind: ErrorKind) {
 fn build_primary_menu() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
-    menu.append(Some("About Proton Drive"), Some("win.about"));
+    menu.append(Some("About Proton Drive for Linux"), Some("win.about"));
     gtk4::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .tooltip_text("Main menu")
@@ -933,11 +933,17 @@ fn install_window_actions(window: &adw::ApplicationWindow) {
     let win = window.clone();
     about.connect_activate(move |_, _| {
         let dialog = adw::AboutDialog::builder()
-            .application_name("Proton Drive")
-            .application_icon("folder-remote-symbolic")
+            .application_name("Proton Drive for Linux")
+            .application_icon("io.narl.proton-drive-linux")
             .version(pdfs_core::config::APP_VERSION)
-            .developer_name("proton-drive-linux")
-            .comments("On-demand Proton Drive sync for Linux.")
+            .developer_name("Nils Pukropp")
+            .website("https://github.com/narrrl/proton-drive-linux")
+            .issue_url("https://github.com/narrrl/proton-drive-linux/issues")
+            .license_type(gtk4::License::MitX11)
+            .comments(
+                "Files-on-demand Proton Drive for the Linux desktop.\n\n\
+                 Unofficial client — not affiliated with, endorsed by, or supported by Proton AG.",
+            )
             .build();
         dialog.present(Some(&win));
     });

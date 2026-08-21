@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "GTK4 desktop app, tray, and search launcher for the Proton Drive Linux client"
 
 [[bin]]
 name = "pdfs-tray"
