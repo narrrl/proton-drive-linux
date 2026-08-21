@@ -151,6 +151,7 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
     if ui.shared.inflight.get() {
         return;
     }
+    cancel_file_thumbnails(ui);
     let current = ui.shared.nav.borrow().last().cloned();
     if let Some((uid, _)) = current {
         load_shared_folder(ui, uid);
@@ -308,11 +309,7 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
     if let Some(badge) = role_badge(&entry.role) {
         row.add_suffix(&badge);
     }
-    row.add_prefix(&gtk4::Image::from_icon_name(if entry.is_dir {
-        "folder-symbolic"
-    } else {
-        "text-x-generic-symbolic"
-    }));
+    row.add_prefix(&file_thumbnail(ui, entry, 40, 24, true));
     let ui_act = ui.clone();
     let uid = entry.uid.clone();
     let name = entry.name.clone();

@@ -122,7 +122,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: Nils Pukropp <contact@narl.io>
-          Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4
+          Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4, libimage-exiftool-perl
           Installed-Size: ${INSTALLED_SIZE}
           Homepage: https://github.com/narrrl/proton-drive-linux
           Description: Unofficial Proton Drive client for Linux

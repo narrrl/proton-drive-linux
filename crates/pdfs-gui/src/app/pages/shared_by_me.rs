@@ -113,6 +113,7 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
     if ui.shared_by_me.inflight.get() {
         return;
     }
+    cancel_file_thumbnails(ui);
     ui.shared_by_me.inflight.set(true);
     shared_by_me_status(
         ui,
@@ -200,15 +201,12 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
     ui.shared_by_me.content.set_visible_child_name("list");
     let mut rows: Vec<gtk4::Widget> = Vec::new();
     for item in items {
+        let entry = shared_item_as_entry(item);
         let row = adw::ActionRow::builder()
             .title(&item.name)
             .subtitle(shared_item_summary(item))
             .build();
-        row.add_prefix(&gtk4::Image::from_icon_name(if item.is_dir {
-            "folder-symbolic"
-        } else {
-            "text-x-generic-symbolic"
-        }));
+        row.add_prefix(&file_thumbnail(ui, &entry, 40, 24, true));
 
         // Copy / open the public link, when there is one with a recovered URL.
         if let Some(url) = item.link.as_ref().and_then(|l| l.url.clone()) {
@@ -245,7 +243,6 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
             .build();
         manage.add_css_class("flat");
         let ui_manage = ui.clone();
-        let entry = shared_item_as_entry(item);
         manage.connect_clicked(move |_| open_share_dialog(&ui_manage, &entry));
         row.add_suffix(&manage);
 
@@ -289,7 +286,7 @@ pub(crate) fn shared_item_as_entry(item: &SharedItem) -> DirEntry {
         name: item.name.clone(),
         is_dir: item.is_dir,
         size: 0,
-        modified: 0,
+        modified: item.modified,
         pinned: false,
         cached: false,
         uid: item.uid.clone(),

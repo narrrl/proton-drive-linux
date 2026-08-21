@@ -33,6 +33,7 @@ Requires:       gtk4
 Requires:       libadwaita
 Requires:       libsecret
 Requires:       webkitgtk6.0
+Requires:       perl-Image-ExifTool
 Requires:       xdg-utils
 
 # DE-specific; do not Require a single desktop environment.

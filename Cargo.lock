@@ -3578,6 +3578,7 @@ dependencies = [
 name = "pdfs-fuse"
 version = "1.9.0"
 dependencies = [
+ "base64",
  "fuser",
  "futures",
  "image",

@@ -122,7 +122,7 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, list: &gtk4::ListView, empty: &gtk4::Butto
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
 
-        let icon = gtk4::Image::builder().pixel_size(32).build();
+        let thumbnail = file_thumbnail_widget(40, 32);
         let name = gtk4::Label::builder()
             .halign(gtk4::Align::Start)
             .ellipsize(gtk4::pango::EllipsizeMode::Middle)
@@ -169,35 +169,38 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, list: &gtk4::ListView, empty: &gtk4::Butto
         row.set_margin_bottom(6);
         row.set_margin_start(6);
         row.set_margin_end(6);
-        row.append(&icon);
+        row.append(&thumbnail);
         row.append(&text);
         row.append(&restore);
         row.append(&purge);
         item.set_child(Some(&row));
     });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let Some(entry) = bound_entry(item) else {
-            return;
-        };
-        let row = item.child().and_downcast::<gtk4::Box>().unwrap();
-        let Some(icon) = row.first_child().and_downcast::<gtk4::Image>() else {
-            return;
-        };
-        icon.set_icon_name(Some(&format!("{}-symbolic", icon_base_for(&entry))));
-        let Some(text) = icon.next_sibling().and_downcast::<gtk4::Box>() else {
-            return;
-        };
-        if let Some(name) = text.first_child().and_downcast::<gtk4::Label>() {
-            name.set_label(&entry.name);
-        }
-        if let Some(meta) = text.last_child().and_downcast::<gtk4::Label>() {
-            let kind = if entry.is_dir {
-                "Folder".to_string()
-            } else {
-                human_bytes(entry.size)
+    factory.connect_bind({
+        let ui = ui.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            let Some(entry) = bound_entry(item) else {
+                return;
             };
-            meta.set_label(&format!("{kind} · {}", format_modified(entry.modified)));
+            let row = item.child().and_downcast::<gtk4::Box>().unwrap();
+            let Some(thumbnail) = row.first_child().and_downcast::<gtk4::Overlay>() else {
+                return;
+            };
+            bind_file_thumbnail(&ui, &thumbnail, &entry, true);
+            let Some(text) = thumbnail.next_sibling().and_downcast::<gtk4::Box>() else {
+                return;
+            };
+            if let Some(name) = text.first_child().and_downcast::<gtk4::Label>() {
+                name.set_label(&entry.name);
+            }
+            if let Some(meta) = text.last_child().and_downcast::<gtk4::Label>() {
+                let kind = if entry.is_dir {
+                    "Folder".to_string()
+                } else {
+                    human_bytes(entry.size)
+                };
+                meta.set_label(&format!("{kind} · {}", format_modified(entry.modified)));
+            }
         }
     });
     list.set_factory(Some(&factory));
@@ -216,6 +219,7 @@ pub(crate) fn bound_entry(item: &gtk4::ListItem) -> Option<DirEntry> {
 
 /// Fetch the trash listing and repaint the page.
 pub(crate) fn load_trash(ui: &Rc<Ui>) {
+    cancel_file_thumbnails(ui);
     // Drop the old rows first: a stale row here would offer Restore on something
     // that may already be gone.
     ui.trash.model.remove_all();

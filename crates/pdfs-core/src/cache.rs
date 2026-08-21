@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -415,6 +416,10 @@ pub struct ContentCache {
     /// Subdirectory holding cached thumbnails (`<key>.t<n>` + `.meta`). Kept out
     /// of `content_dir` so the budget scan never sees thumbnail files.
     thumb_dir: PathBuf,
+    /// Owner-protected scratch space for decrypted camera RAWs passed to
+    /// exiftool. Files are removed on drop and swept on the next cache open after
+    /// an unclean shutdown.
+    raw_thumb_dir: PathBuf,
     /// Subdirectory holding on-demand block-cache files (`<key>.b<idx>` +
     /// `.meta`). Kept out of `content_dir` so the whole-file budget scan never
     /// sees them; blocks carry their own LRU budget.
@@ -507,6 +512,19 @@ impl ContentCache {
         std::fs::create_dir_all(&content_dir)?;
         let thumb_dir = content_dir.join("thumbs");
         std::fs::create_dir_all(&thumb_dir)?;
+        let raw_thumb_dir = content_dir.join("raw-thumbnails");
+        std::fs::create_dir_all(&raw_thumb_dir)?;
+        std::fs::set_permissions(&raw_thumb_dir, std::fs::Permissions::from_mode(0o700))?;
+        if let Ok(entries) = std::fs::read_dir(&raw_thumb_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("pdfs-raw-")
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let block_dir = content_dir.join("blocks");
         std::fs::create_dir_all(&block_dir)?;
         // Scratch holds disk-backed write buffers. A previous run's leftovers are
@@ -530,6 +548,7 @@ impl ContentCache {
         let cache = Self {
             content_dir,
             thumb_dir,
+            raw_thumb_dir,
             block_dir,
             scratch_dir,
             staging_dir,
@@ -1664,6 +1683,12 @@ impl ContentCache {
     fn thumb_meta(&self, uid: &NodeUid, ttype: i32) -> PathBuf {
         self.thumb_dir
             .join(format!("{}.t{ttype}.meta", Self::key(uid)))
+    }
+
+    /// Owner-protected transient directory used to stage decrypted camera RAWs
+    /// for metadata helpers. Callers still remove individual files promptly.
+    pub fn raw_thumbnail_staging_dir(&self) -> &Path {
+        &self.raw_thumb_dir
     }
 
     /// Serve a cached thumbnail of `ttype` for `uid`, or `None` on miss/stale.

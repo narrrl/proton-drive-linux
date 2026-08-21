@@ -15,7 +15,7 @@ pkgdesc="Unofficial Proton Drive client for Linux: files-on-demand FUSE mount, C
 arch=('x86_64')
 url="https://github.com/narrrl/proton-drive-linux"
 license=('MIT')
-depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0')
+depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'perl-image-exiftool')
 makedepends=('cargo' 'git')
 provides=('pdfs')
 # Files-on-demand mount + keyring need these at runtime.

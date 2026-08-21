@@ -609,6 +609,7 @@ impl Core {
             items.push(SharedItem {
                 uid: uid.to_string(),
                 is_dir: n.is_folder(),
+                modified: n.modification_time,
                 name: n.name,
                 path: self.rel_path_for_uid(&uid).unwrap_or_default(),
                 member_count: members,

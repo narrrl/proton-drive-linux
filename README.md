@@ -64,6 +64,7 @@ pdfs-app            # the desktop app
 - **Files-on-Demand (FUSE)**: Mount your Proton Drive as a virtual filesystem where files are downloaded only when opened, utilizing smart block-level caching and disk-backed writes.
 - **Command-Line Interface (CLI)**: Manage your drive, authenticate, and monitor sync status directly from the terminal.
 - **Non-Blocking GTK4 Desktop App**: Browse files, manage pins, configure options, and monitor active transfers through a modern, native GUI with a fully non-blocking asynchronous main loop.
+- **File Thumbnails**: Browse locally cached image previews in Files, Shared, and Trash, including embedded previews from camera RAW files. Build a whole folder tree from the Files toolbar and resize the grid from the status bar.
 - **Shared Links & Invites**: Browse files shared with you by other users, and view/manage your own public shared links directly in the GUI.
 - **Local Backup (Computers)**: Sync and back up local directories (like Downloads, Documents, Pictures, etc.) directly to your Proton Drive account.
 - **Locations**: One page (and `pdfs locations`) listing every place Proton Drive occupies on this machine — the main mount plus each backed-up folder — with its mode, sync state, and whether it is read-only. Switching a folder between a full local copy and on-demand happens here.
@@ -327,19 +328,21 @@ sudo apt-get install -y \
   libadwaita-1-dev \
   libwebkitgtk-6.0-dev \
   libsecret-1-dev \
-  libdbus-1-dev
+  libdbus-1-dev \
+  libimage-exiftool-perl
 ```
 
 ### Arch Linux
 ```bash
-sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus webkitgtk-6.0
+sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus webkitgtk-6.0 perl-image-exiftool
 ```
 
 ### Fedora (44+)
 ```bash
 sudo dnf install -y \
   pkgconf-pkg-config fuse3-devel gtk4-devel libadwaita-devel \
-  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel cargo rust
+  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel \
+  perl-Image-ExifTool cargo rust
 ```
 
 Runtime extras (pick your desktop):

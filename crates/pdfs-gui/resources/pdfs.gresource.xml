@@ -4,6 +4,7 @@
        icon-theme resource path at startup, so they resolve by name (and recolour
        with the theme) exactly like a stock symbolic icon. -->
   <gresource prefix="/de/nils/protondrivelinux/icons">
+    <file preprocess="xml-stripblanks">scalable/actions/pdfs-build-thumbnails-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-folder-upload-symbolic.svg</file>
   </gresource>
 </gresources>

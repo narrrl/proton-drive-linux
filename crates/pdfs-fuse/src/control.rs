@@ -11,7 +11,7 @@
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -134,12 +134,21 @@ fn route_to_mount(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Cor
 /// the mount root.
 fn rel_to_mount(mountpoint: &Path, path: &str) -> CoreResult<PathBuf> {
     let p = Path::new(path);
-    if p.is_absolute() {
+    let relative = if p.is_absolute() {
         p.strip_prefix(mountpoint)
             .map(Path::to_path_buf)
             .map_err(|_| CoreError::invalid(format!("{path} is not under the mountpoint")))
     } else {
         Ok(p.to_path_buf())
+    }?;
+
+    if relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        Ok(relative)
+    } else {
+        Err(CoreError::invalid(format!("{path} escapes the mountpoint")))
     }
 }
 
@@ -320,6 +329,34 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 items: core.photo_thumbs(&parsed),
             }
         }
+        Ok(CtlRequest::FileThumbs { items, generation }) => {
+            match core.file_thumbs(&items, generation) {
+                Some(items) => CtlResponse::Thumbs { items },
+                None => CtlResponse::FileThumbsStale,
+            }
+        }
+        Ok(CtlRequest::ReserveFileThumbGeneration) => CtlResponse::FileThumbGeneration {
+            generation: core.reserve_file_thumb_generation(),
+        },
+        Ok(CtlRequest::CancelFileThumbs { generation }) => {
+            core.cancel_file_thumbs(generation);
+            CtlResponse::Ok {
+                message: "thumbnail requests cancelled".to_string(),
+            }
+        }
+        Ok(CtlRequest::StartThumbnailBuild { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.start_thumbnail_build(rel) {
+                Ok(status) => CtlResponse::ThumbnailBuild { status },
+                Err(error) => CtlResponse::error(error),
+            },
+            Err(error) => CtlResponse::error(error),
+        },
+        Ok(CtlRequest::CancelThumbnailBuild) => CtlResponse::ThumbnailBuild {
+            status: core.cancel_thumbnail_build(),
+        },
+        Ok(CtlRequest::ThumbnailBuildStatus) => CtlResponse::ThumbnailBuild {
+            status: core.thumbnail_build_status(),
+        },
         Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
             Some(u) => match core.open_photo(&u) {
                 Ok(p) => CtlResponse::FilePath {
@@ -1220,5 +1257,30 @@ mod request_limit_tests {
             read_request_line(&mut input).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn accepts_paths_inside_the_mountpoint() {
+        let mountpoint = Path::new("/mnt/proton");
+        assert_eq!(
+            rel_to_mount(mountpoint, "Photos/2026").unwrap(),
+            Path::new("Photos/2026")
+        );
+        assert_eq!(
+            rel_to_mount(mountpoint, "/mnt/proton/Photos/2026").unwrap(),
+            Path::new("Photos/2026")
+        );
+        assert_eq!(
+            rel_to_mount(mountpoint, "/mnt/proton").unwrap(),
+            Path::new("")
+        );
+    }
+
+    #[test]
+    fn rejects_paths_that_escape_the_mountpoint() {
+        let mountpoint = Path::new("/mnt/proton");
+        assert!(rel_to_mount(mountpoint, "../escape").is_err());
+        assert!(rel_to_mount(mountpoint, "Photos/../../escape").is_err());
+        assert!(rel_to_mount(mountpoint, "/mnt/elsewhere").is_err());
     }
 }

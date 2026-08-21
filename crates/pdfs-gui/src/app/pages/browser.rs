@@ -28,9 +28,21 @@ pub(crate) struct BrowserState {
     pub(crate) new_folder: gtk4::Button,
     pub(crate) upload: gtk4::Button,
     pub(crate) upload_folder: gtk4::Button,
+    /// Starts a daemon-side recursive local-thumbnail build for [`Self::path`].
+    pub(crate) build_thumbnails: gtk4::Button,
+    pub(crate) thumbnail_build_row: gtk4::Box,
+    pub(crate) thumbnail_progress: gtk4::ProgressBar,
+    pub(crate) thumbnail_status: gtk4::Label,
+    pub(crate) thumbnail_poll: RefCell<Option<glib::SourceId>>,
+    pub(crate) thumbnail_build_running: Cell<bool>,
+    pub(crate) thumbnail_cancel_pending: Cell<bool>,
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     pub(crate) search_source: RefCell<Option<glib::SourceId>>,
+    /// Identity of the newest folder/search request. Paths and queries can be
+    /// requested repeatedly, so comparing their text alone cannot reject an
+    /// older response that finishes after a manual refresh.
+    pub(crate) load_generation: Cell<u64>,
     /// The grid/list view stack, read to find out which of the two selections is
     /// the one the user is actually working in.
     pub(crate) views: gtk4::Stack,
@@ -46,6 +58,17 @@ pub(crate) struct BrowserState {
     /// state is a place to act rather than a dead end. Hidden on every other
     /// status (a load error is not the moment to offer an upload).
     pub(crate) empty_actions: gtk4::Box,
+    /// Dolphin-style bottom status bar: current listing counts, the icon-grid
+    /// zoom value, and Proton account storage usage.
+    pub(crate) summary: gtk4::Label,
+    pub(crate) zoom: gtk4::Scale,
+    pub(crate) grid_thumbnail_size: Cell<i32>,
+    /// Weak references to realised grid cells. Zoom resizes only these visible,
+    /// recycled surfaces instead of invalidating the whole list model.
+    pub(crate) grid_tiles: RefCell<Vec<(glib::WeakRef<gtk4::Overlay>, glib::WeakRef<gtk4::Label>)>>,
+    pub(crate) quota_box: gtk4::Box,
+    pub(crate) quota: gtk4::ProgressBar,
+    pub(crate) quota_text: gtk4::Label,
 }
 
 /// Idle pause after the last keystroke before a search query is sent, so typing
@@ -54,6 +77,13 @@ pub(crate) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Cap on search hits requested from the daemon.
 pub(crate) const SEARCH_LIMIT: usize = 200;
+
+/// Browser grid thumbnail size controlled by the bottom zoom slider. The
+/// default preserves the former fixed 72 px presentation.
+pub(crate) const GRID_THUMB_MIN: i32 = 48;
+pub(crate) const GRID_THUMB_MAX: i32 = 144;
+pub(crate) const GRID_THUMB_DEFAULT: i32 = 72;
+pub(crate) const GRID_THUMB_STEP: i32 = 8;
 
 /// The Files page: a Nautilus-style file manager. A back/breadcrumb header with
 /// a grid/list view toggle sits over a [`gtk4::Stack`] that swaps between an
@@ -86,6 +116,15 @@ pub(crate) struct BrowserWidgets {
     pub(crate) new_folder: gtk4::Button,
     pub(crate) upload: gtk4::Button,
     pub(crate) upload_folder: gtk4::Button,
+    pub(crate) build_thumbnails: gtk4::Button,
+    pub(crate) thumbnail_build_row: gtk4::Box,
+    pub(crate) thumbnail_progress: gtk4::ProgressBar,
+    pub(crate) thumbnail_status: gtk4::Label,
+    pub(crate) summary: gtk4::Label,
+    pub(crate) zoom: gtk4::Scale,
+    pub(crate) quota_box: gtk4::Box,
+    pub(crate) quota: gtk4::ProgressBar,
+    pub(crate) quota_text: gtk4::Label,
     pub(crate) refresh: gtk4::Button,
     /// Wraps the views + the details pane; the pane slides in on selection.
     pub(crate) split: adw::OverlaySplitView,
@@ -149,6 +188,12 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     upload_folder.add_css_class("flat");
+    let build_thumbnails = gtk4::Button::builder()
+        .icon_name("pdfs-build-thumbnails-symbolic")
+        .tooltip_text("Build thumbnails in this folder and its subfolders")
+        .valign(gtk4::Align::Center)
+        .build();
+    build_thumbnails.add_css_class("flat");
 
     // Linked grid/list toggle, top-right, Nautilus-style.
     let grid_toggle = gtk4::ToggleButton::builder()
@@ -178,11 +223,23 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     header.append(&back);
     header.append(&crumb_scroll);
     header.append(&refresh);
+    header.append(&build_thumbnails);
     header.append(&new_folder);
     header.append(&upload);
     header.append(&upload_folder);
     header.append(&search);
     header.append(&toggles);
+
+    let thumbnail_status = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
+    thumbnail_status.add_css_class("caption");
+    let thumbnail_progress = gtk4::ProgressBar::builder().hexpand(true).build();
+    let thumbnail_build_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    thumbnail_build_row.append(&thumbnail_status);
+    thumbnail_build_row.append(&thumbnail_progress);
+    thumbnail_build_row.set_visible(false);
 
     // Empty / loading / error surface, shown in place of the views.
     let retry = gtk4::Button::builder()
@@ -314,17 +371,94 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .child(&bulk_box)
         .build();
 
-    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    inner.set_margin_top(12);
-    inner.set_margin_bottom(12);
-    inner.set_margin_start(12);
-    inner.set_margin_end(12);
-    inner.append(&header);
-    inner.append(&bulk);
-    inner.append(&split);
+    // Mirror DolphinStatusBar's full-width order: contextual text (stretch 1),
+    // "Zoom:", its slider, then capacity information. Both visible troughs use
+    // the same CSS dimensions.
+    let summary = gtk4::Label::builder()
+        .label("Loading…")
+        .halign(gtk4::Align::Start)
+        .valign(gtk4::Align::Center)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .hexpand(true)
+        .build();
+    let zoom_label = gtk4::Label::new(Some("Zoom:"));
+    zoom_label.set_valign(gtk4::Align::Center);
+    let zoom = gtk4::Scale::with_range(
+        gtk4::Orientation::Horizontal,
+        f64::from(GRID_THUMB_MIN),
+        f64::from(GRID_THUMB_MAX),
+        f64::from(GRID_THUMB_STEP),
+    );
+    zoom.set_value(f64::from(GRID_THUMB_DEFAULT));
+    zoom.set_draw_value(false);
+    zoom.set_valign(gtk4::Align::Center);
+    zoom.set_tooltip_text(Some("Size: 72 pixels"));
+    zoom.add_css_class("browser-status-meter");
+
+    let quota = gtk4::ProgressBar::new();
+    quota.set_hexpand(false);
+    quota.set_valign(gtk4::Align::Center);
+    quota.set_tooltip_text(Some("Proton account storage"));
+    quota.add_css_class("browser-status-meter");
+    let quota_text = gtk4::Label::builder()
+        .label("Loading…")
+        .halign(gtk4::Align::Start)
+        .valign(gtk4::Align::Center)
+        .margin_end(6)
+        .tooltip_text("Proton account storage")
+        .build();
+    let quota_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    quota_box.set_valign(gtk4::Align::Center);
+    quota_box.append(&quota);
+    quota_box.append(&quota_text);
+    quota_box.set_visible(false);
+
+    let status_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    status_bar.add_css_class("browser-statusbar");
+    status_bar.set_margin_start(6);
+    status_bar.set_margin_end(2);
+    status_bar.append(&summary);
+    status_bar.append(&zoom_label);
+    status_bar.append(&zoom);
+    status_bar.append(&quota_box);
+
+    let zoom_label_for_view = zoom_label.clone();
+    let zoom_for_view = zoom.clone();
+    let content_for_view = content.clone();
+    view_stack.connect_visible_child_name_notify(move |stack| {
+        let visible = content_for_view.visible_child_name().as_deref() == Some("views")
+            && stack.visible_child_name().as_deref() == Some("grid");
+        zoom_label_for_view.set_visible(visible);
+        zoom_for_view.set_visible(visible);
+    });
+    let zoom_label_for_content = zoom_label.clone();
+    let zoom_for_content = zoom.clone();
+    let view_for_content = view_stack.clone();
+    content.connect_visible_child_name_notify(move |stack| {
+        let visible = stack.visible_child_name().as_deref() == Some("views")
+            && view_for_content.visible_child_name().as_deref() == Some("grid");
+        zoom_label_for_content.set_visible(visible);
+        zoom_for_content.set_visible(visible);
+    });
+
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    body.set_vexpand(true);
+    body.set_margin_top(12);
+    body.set_margin_bottom(6);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    body.append(&header);
+    body.append(&thumbnail_build_row);
+    body.append(&bulk);
+    body.append(&split);
+
+    let page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    page.append(&body);
+    page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    page.append(&status_bar);
 
     (
-        inner.upcast(),
+        page.upcast(),
         BrowserWidgets {
             model,
             back,
@@ -338,6 +472,15 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             new_folder,
             upload,
             upload_folder,
+            build_thumbnails,
+            thumbnail_build_row,
+            thumbnail_progress,
+            thumbnail_status,
+            summary,
+            zoom,
+            quota_box,
+            quota,
+            quota_text,
             refresh,
             split,
             details,
@@ -653,23 +796,51 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
         load_browser(&ui_back);
     });
 
-    // Grid tiles: a big icon over an ellipsized name, with a right-click menu.
+    // Resize only realised grid cells. Rebuilding the whole model for every
+    // slider step would repeatedly tear down selection state while the pointer
+    // is still moving.
+    let zoom = ui.browser.zoom.clone();
+    let ui_zoom = ui.clone();
+    let grid_zoom = grid.clone();
+    zoom.connect_value_changed(move |scale| {
+        let size = (scale.value().round() as i32).clamp(GRID_THUMB_MIN, GRID_THUMB_MAX);
+        scale.set_tooltip_text(Some(&format!("Size: {size} pixels")));
+        if ui_zoom.browser.grid_thumbnail_size.replace(size) == size {
+            return;
+        }
+        ui_zoom
+            .browser
+            .grid_tiles
+            .borrow_mut()
+            .retain(|(thumbnail_ref, label_ref)| {
+                let (Some(thumbnail), Some(label)) = (thumbnail_ref.upgrade(), label_ref.upgrade())
+                else {
+                    return false;
+                };
+                resize_grid_tile(&thumbnail, &label, size);
+                true
+            });
+        grid_zoom.queue_resize();
+    });
+
+    // Grid tiles: a thumbnail over an ellipsized name, with a right-click menu.
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_setup({
         let ui = ui.clone();
         move |_, item| {
             let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let icon = gtk4::Image::builder().pixel_size(64).build();
-            // Corner sync-state badge, overlaid on the big icon.
+            let size = ui.browser.grid_thumbnail_size.get();
+            let thumbnail = file_thumbnail_widget(size, grid_fallback_size(size));
+            // Keep the sync-state badge inside the thumbnail surface.
             let badge = gtk4::Image::builder()
                 .pixel_size(18)
                 .halign(gtk4::Align::End)
-                .valign(gtk4::Align::End)
+                .valign(gtk4::Align::Start)
+                .margin_top(2)
+                .margin_end(2)
                 .build();
             badge.add_css_class("file-badge");
-            let overlay = gtk4::Overlay::new();
-            overlay.set_child(Some(&icon));
-            overlay.add_overlay(&badge);
+            thumbnail.add_overlay(&badge);
             // `WordChar` rather than the default `Word`: a name with no spaces
             // offers no word-break opportunity, so word wrapping cannot break it
             // at all and the label asks for its full natural width instead —
@@ -686,9 +857,13 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
                 .wrap_mode(gtk4::pango::WrapMode::WordChar)
                 .lines(2)
                 .build();
+            ui.browser
+                .grid_tiles
+                .borrow_mut()
+                .push((thumbnail.downgrade(), label.downgrade()));
             let tile = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
             tile.add_css_class("file-tile");
-            tile.append(&overlay);
+            tile.append(&thumbnail);
             tile.append(&label);
             attach_context_menu(&ui, item, &tile);
             attach_drag(&ui, item, &tile);
@@ -696,21 +871,29 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
             item.set_child(Some(&tile));
         }
     });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let tile = item.child().and_downcast::<gtk4::Box>().unwrap();
-        let overlay = tile.first_child().and_downcast::<gtk4::Overlay>().unwrap();
-        let icon = overlay.first_child().and_downcast::<gtk4::Image>().unwrap();
-        let badge = overlay.last_child().and_downcast::<gtk4::Image>().unwrap();
-        let label = tile.last_child().and_downcast::<gtk4::Label>().unwrap();
-        let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-        let entry = obj.borrow::<DirEntry>();
-        icon.set_icon_name(Some(icon_base_for(&entry)));
-        label.set_label(&entry.name);
-        // The tile shows at most two lines of it, so the full name has to be
-        // reachable somehow.
-        label.set_tooltip_text(Some(&entry.name));
-        apply_badge(&badge, &entry);
+    factory.connect_bind({
+        let ui = ui.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            let tile = item.child().and_downcast::<gtk4::Box>().unwrap();
+            let thumbnail = tile.first_child().and_downcast::<gtk4::Overlay>().unwrap();
+            let badge = thumbnail
+                .last_child()
+                .and_downcast::<gtk4::Image>()
+                .unwrap();
+            let label = thumbnail
+                .next_sibling()
+                .and_downcast::<gtk4::Label>()
+                .unwrap();
+            let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
+            let entry = obj.borrow::<DirEntry>();
+            let size = ui.browser.grid_thumbnail_size.get();
+            resize_grid_tile(&thumbnail, &label, size);
+            bind_file_thumbnail(&ui, &thumbnail, &entry, false);
+            label.set_label(&entry.name);
+            label.set_tooltip_text(Some(&entry.name));
+            apply_badge(&badge, &entry);
+        }
     });
     grid.set_factory(Some(&factory));
 
@@ -740,15 +923,33 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
     });
 }
 
-/// Build the Name column: a small icon plus the (star-prefixed when pinned) name,
-/// with the same right-click menu the grid tiles carry.
+fn resize_grid_tile(thumbnail: &gtk4::Overlay, label: &gtk4::Label, size: i32) {
+    resize_file_thumbnail(thumbnail, size, grid_fallback_size(size));
+    let name_width = (size / 6 + 1).clamp(8, 24);
+    label.set_width_chars(name_width);
+    label.set_max_width_chars(name_width);
+}
+
+fn grid_fallback_size(thumbnail_size: i32) -> i32 {
+    (thumbnail_size * 8 / 9).clamp(24, thumbnail_size)
+}
+
+/// Build the Name column: a small thumbnail with its local-state badge overlaid,
+/// followed by the name and the same right-click menu the grid tiles carry.
 pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_setup({
         let ui = ui.clone();
         move |_, item| {
             let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let icon = gtk4::Image::builder().pixel_size(16).build();
+            let thumbnail = file_thumbnail_widget(28, 16);
+            let badge = gtk4::Image::builder()
+                .pixel_size(14)
+                .halign(gtk4::Align::End)
+                .valign(gtk4::Align::Start)
+                .build();
+            badge.add_css_class("file-badge");
+            thumbnail.add_overlay(&badge);
             // Ellipsized so the Name column can be *narrower* than its longest
             // name. Without it the label's minimum width is the whole string,
             // the column inherits that minimum, and one long name pushes Size
@@ -757,30 +958,36 @@ pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
                 .halign(gtk4::Align::Start)
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
                 .build();
-            let badge = gtk4::Image::builder().pixel_size(14).build();
-            badge.add_css_class("file-badge");
             let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            cell.append(&icon);
+            cell.append(&thumbnail);
             cell.append(&label);
-            cell.append(&badge);
             attach_context_menu(&ui, item, &cell);
             attach_drag(&ui, item, &cell);
             attach_drop(&ui, item, &cell);
             item.set_child(Some(&cell));
         }
     });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let cell = item.child().and_downcast::<gtk4::Box>().unwrap();
-        let icon = cell.first_child().and_downcast::<gtk4::Image>().unwrap();
-        let badge = cell.last_child().and_downcast::<gtk4::Image>().unwrap();
-        let label = icon.next_sibling().and_downcast::<gtk4::Label>().unwrap();
-        let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-        let entry = obj.borrow::<DirEntry>();
-        icon.set_icon_name(Some(&format!("{}-symbolic", icon_base_for(&entry))));
-        label.set_label(&entry.name);
-        label.set_tooltip_text(Some(&entry.name));
-        apply_badge(&badge, &entry);
+    factory.connect_bind({
+        let ui = ui.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            let cell = item.child().and_downcast::<gtk4::Box>().unwrap();
+            let thumbnail = cell.first_child().and_downcast::<gtk4::Overlay>().unwrap();
+            let badge = thumbnail
+                .last_child()
+                .and_downcast::<gtk4::Image>()
+                .unwrap();
+            let label = thumbnail
+                .next_sibling()
+                .and_downcast::<gtk4::Label>()
+                .unwrap();
+            let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
+            let entry = obj.borrow::<DirEntry>();
+            bind_file_thumbnail(&ui, &thumbnail, &entry, true);
+            label.set_label(&entry.name);
+            label.set_tooltip_text(Some(&entry.name));
+            apply_badge(&badge, &entry);
+        }
     });
     let column = gtk4::ColumnViewColumn::new(Some("Name"), Some(factory));
     column.set_expand(true);
@@ -1254,6 +1461,7 @@ pub(crate) fn wire_browser_actions(
     new_folder: &gtk4::Button,
     upload: &gtk4::Button,
     upload_folder: &gtk4::Button,
+    build_thumbnails: &gtk4::Button,
 ) {
     let ui_nf = ui.clone();
     new_folder.connect_clicked(move |_| prompt_new_folder(&ui_nf));
@@ -1261,6 +1469,229 @@ pub(crate) fn wire_browser_actions(
     upload.connect_clicked(move |_| prompt_upload(&ui_up));
     let ui_uf = ui.clone();
     upload_folder.connect_clicked(move |_| prompt_upload_folder(&ui_uf));
+    let ui_thumbs = ui.clone();
+    build_thumbnails.connect_clicked(move |_| {
+        if ui_thumbs.browser.thumbnail_build_running.get() {
+            cancel_thumbnail_build(&ui_thumbs);
+        } else {
+            start_thumbnail_build(&ui_thumbs);
+        }
+    });
+}
+
+const THUMBNAIL_BUILD_POLL: Duration = Duration::from_millis(500);
+
+/// Start the daemon's deliberate recursive job. Opportunistic requests for
+/// visible rows are cancelled first; the explicit job has its own lifetime and
+/// continues if the user navigates while watching its progress.
+fn start_thumbnail_build(ui: &Rc<Ui>) {
+    if !*ui.mounted.borrow() {
+        toast_error(
+            ui,
+            "Couldn't build thumbnails",
+            "Proton Drive isn't connected.",
+        );
+        return;
+    }
+    cancel_file_thumbnails(ui);
+    ui.browser.thumbnail_build_running.set(true);
+    // Do not expose Cancel until the daemon has acknowledged Start; the two
+    // requests use separate control connections and could otherwise reorder.
+    ui.browser.thumbnail_cancel_pending.set(true);
+    repaint_thumbnail_build_action(ui, true);
+    ui.browser.thumbnail_build_row.set_visible(true);
+    ui.browser.thumbnail_progress.set_fraction(0.0);
+    ui.browser
+        .thumbnail_status
+        .set_label("Starting thumbnail build…");
+
+    let path = ui.browser.path.borrow().clone();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::StartThumbnailBuild { path },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::ThumbnailBuild { status })) => {
+                ui.browser.thumbnail_cancel_pending.set(false);
+                repaint_thumbnail_build(&ui, &status);
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                thumbnail_build_failed(&ui);
+                toast_failure(&ui, "Couldn't build thumbnails", &message, kind);
+            }
+            _ => {
+                let message = "The mount service didn't respond.";
+                thumbnail_build_failed(&ui);
+                toast_error(&ui, "Couldn't build thumbnails", message);
+            }
+        }
+    });
+}
+
+fn cancel_thumbnail_build(ui: &Rc<Ui>) {
+    if ui.browser.thumbnail_cancel_pending.replace(true) {
+        return;
+    }
+    ui.browser.build_thumbnails.set_sensitive(false);
+    ui.browser
+        .thumbnail_status
+        .set_label("Stopping thumbnail build…");
+    let rx = spawn_request(ui.dirs.control_socket(), Request::CancelThumbnailBuild);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::ThumbnailBuild { status })) if !status.running => {
+                repaint_thumbnail_build(&ui, &status)
+            }
+            Ok(Ok(Response::ThumbnailBuild { .. })) => schedule_thumbnail_build_poll(&ui),
+            Ok(Ok(Response::Error { message, kind })) => {
+                thumbnail_cancel_failed(&ui);
+                toast_failure(&ui, "Couldn't cancel thumbnail build", &message, kind);
+            }
+            _ => {
+                thumbnail_cancel_failed(&ui);
+                toast_error(
+                    &ui,
+                    "Couldn't cancel thumbnail build",
+                    "The mount service didn't respond.",
+                );
+            }
+        }
+    });
+}
+
+fn thumbnail_cancel_failed(ui: &Rc<Ui>) {
+    ui.browser.thumbnail_cancel_pending.set(false);
+    ui.browser.thumbnail_build_running.set(true);
+    repaint_thumbnail_build_action(ui, true);
+    schedule_thumbnail_build_poll(ui);
+}
+
+fn schedule_thumbnail_build_poll(ui: &Rc<Ui>) {
+    if let Some(source) = ui.browser.thumbnail_poll.borrow_mut().take() {
+        source.remove();
+    }
+    let ui_poll = ui.clone();
+    let source = glib::timeout_add_local_once(THUMBNAIL_BUILD_POLL, move || {
+        ui_poll.browser.thumbnail_poll.borrow_mut().take();
+        let rx = spawn_request(ui_poll.dirs.control_socket(), Request::ThumbnailBuildStatus);
+        let ui_result = ui_poll.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(Response::ThumbnailBuild { status })) => {
+                    repaint_thumbnail_build(&ui_result, &status)
+                }
+                Ok(Ok(Response::Error { message, .. })) => {
+                    thumbnail_build_failed(&ui_result);
+                    toast_error(&ui_result, "Thumbnail build stopped", &message);
+                }
+                _ => {
+                    thumbnail_build_failed(&ui_result);
+                    toast_error(
+                        &ui_result,
+                        "Thumbnail build stopped",
+                        "The mount service stopped reporting thumbnail progress.",
+                    );
+                }
+            }
+        });
+    });
+    *ui.browser.thumbnail_poll.borrow_mut() = Some(source);
+}
+
+fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
+    ui.browser
+        .thumbnail_build_row
+        .set_visible(show_thumbnail_build_progress(status));
+    let root = if status.path.is_empty() {
+        "Proton Drive"
+    } else {
+        &status.path
+    };
+    let text = if status.scanning {
+        ui.browser.thumbnail_progress.pulse();
+        format!(
+            "Scanning {root}… {} folders, {} images",
+            status.folders_scanned, status.images_found
+        )
+    } else if status.running {
+        let fraction = if status.images_found == 0 {
+            0.0
+        } else {
+            status.completed as f64 / status.images_found as f64
+        };
+        ui.browser
+            .thumbnail_progress
+            .set_fraction(fraction.clamp(0.0, 1.0));
+        format!(
+            "Building thumbnails in {root}… {} of {}",
+            status.completed, status.images_found
+        )
+    } else {
+        ui.browser.thumbnail_progress.set_fraction(1.0);
+        let available = status.completed.saturating_sub(status.failed);
+        match status.failed {
+            0 => format!("Thumbnails ready for {available} images in {root}"),
+            failed => {
+                format!("Thumbnails ready for {available} images in {root}; {failed} unavailable")
+            }
+        }
+    };
+    let text = match status.message.as_deref() {
+        Some(message) => format!("{text}. {message}"),
+        None => text,
+    };
+    ui.browser.thumbnail_status.set_label(&text);
+    ui.browser.thumbnail_status.set_tooltip_text(Some(&text));
+
+    if status.running {
+        ui.browser.thumbnail_build_running.set(true);
+        repaint_thumbnail_build_action(ui, true);
+        schedule_thumbnail_build_poll(ui);
+    } else {
+        ui.browser.thumbnail_build_running.set(false);
+        ui.browser.thumbnail_cancel_pending.set(false);
+        repaint_thumbnail_build_action(ui, false);
+        if ui.stack.visible_child_name().as_deref() == Some("browser") {
+            reload_listing(ui);
+        }
+    }
+}
+
+/// The progress row is transient: once the daemon reports completion, both its
+/// label and bar leave the browser instead of retaining a stale success state.
+fn show_thumbnail_build_progress(status: &ThumbnailBuildStatus) -> bool {
+    status.running
+}
+
+fn repaint_thumbnail_build_action(ui: &Rc<Ui>, running: bool) {
+    ui.browser.build_thumbnails.set_icon_name(if running {
+        "process-stop-symbolic"
+    } else {
+        "pdfs-build-thumbnails-symbolic"
+    });
+    ui.browser
+        .build_thumbnails
+        .set_tooltip_text(Some(if running {
+            "Cancel thumbnail build"
+        } else {
+            "Build thumbnails in this folder and its subfolders"
+        }));
+    ui.browser.build_thumbnails.set_sensitive(
+        *ui.mounted.borrow() && (!running || !ui.browser.thumbnail_cancel_pending.get()),
+    );
+}
+
+fn thumbnail_build_failed(ui: &Rc<Ui>) {
+    ui.browser.thumbnail_build_running.set(false);
+    ui.browser.thumbnail_cancel_pending.set(false);
+    repaint_thumbnail_build_action(ui, false);
+    ui.browser.thumbnail_build_row.set_visible(false);
+    ui.browser.thumbnail_progress.set_fraction(0.0);
+    ui.browser.thumbnail_status.set_label("");
+    ui.browser.thumbnail_status.set_tooltip_text(None);
 }
 
 /// Send a mutating request (rename / move / delete / mkdir / upload, or a trash
@@ -1666,9 +2097,13 @@ pub(crate) fn format_modified(secs: i64) -> String {
 
 /// Request the current browser directory from the daemon and repaint both views.
 pub(crate) fn load_browser(ui: &Rc<Ui>) {
+    cancel_file_thumbnails(ui);
+    let generation = ui.browser.load_generation.get().wrapping_add(1);
+    ui.browser.load_generation.set(generation);
     let path = ui.browser.path.borrow().clone();
     repaint_crumb(ui, &path);
     ui.browser.back.set_sensitive(!path.is_empty());
+    ui.browser.summary.set_label("Loading…");
 
     // Drop the previous folder's rows up front: a slow reply must not leave stale
     // entries visible, where clicking one would open with a wrong relative path.
@@ -1693,7 +2128,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
         // The user may have navigated on while this folder was loading. A stale
         // out-of-order reply must not repaint rows for a folder we've left, or
         // the breadcrumb and the grid would disagree.
-        if *ui.browser.path.borrow() != path {
+        if ui.browser.load_generation.get() != generation || *ui.browser.path.borrow() != path {
             return;
         }
         match result {
@@ -1714,6 +2149,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
 /// (which restarts the service) wouldn't help and isn't offered.
 pub(crate) fn browser_failed(ui: &Rc<Ui>, message: &str, kind: ErrorKind) {
     ui.browser.model.remove_all();
+    ui.browser.summary.set_label("Folder unavailable");
     browser_status(
         ui,
         "dialog-warning-symbolic",
@@ -1730,6 +2166,7 @@ pub(crate) fn browser_failed(ui: &Rc<Ui>, message: &str, kind: ErrorKind) {
 /// once the systemd mount comes up but a real failure stays visible.
 pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
     if service::is_failed() || !service::is_active() {
+        ui.browser.summary.set_label("Not connected");
         browser_status(
             ui,
             "network-offline-symbolic",
@@ -1739,6 +2176,7 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
         );
         return;
     }
+    ui.browser.summary.set_label("Connecting…");
     browser_status(
         ui,
         "folder-remote-symbolic",
@@ -1759,6 +2197,15 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
 /// which refreshes both the grid and the column list.
 pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ui.browser.model.remove_all();
+    ui.browser.summary.set_label(&listing_summary(
+        entries.iter().filter(|entry| !entry.is_dir).count(),
+        entries.iter().filter(|entry| entry.is_dir).count(),
+        entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.size)
+            .sum(),
+    ));
     if entries.is_empty() {
         browser_status(
             ui,
@@ -1810,7 +2257,11 @@ pub(crate) fn wire_search(ui: &Rc<Ui>) {
 /// views, reusing the same row model so click-to-open and pin work unchanged
 /// (each hit carries its full path; see [`entry_rel`]).
 pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
+    cancel_file_thumbnails(ui);
+    let generation = ui.browser.load_generation.get().wrapping_add(1);
+    ui.browser.load_generation.set(generation);
     ui.browser.model.remove_all();
+    ui.browser.summary.set_label("Searching…");
     browser_status(
         ui,
         "system-search-symbolic",
@@ -1835,7 +2286,9 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
         // The box may have been cleared or typed past while the reply was in
         // flight; if the query no longer matches, a fresher load/search already
         // owns the model — drop this stale, possibly out-of-order result.
-        if ui.browser.search.text().trim() != query {
+        if ui.browser.load_generation.get() != generation
+            || ui.browser.search.text().trim() != query
+        {
             return;
         }
         match result {
@@ -1856,6 +2309,17 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
 /// handlers already understand.
 pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     ui.browser.model.remove_all();
+    let counts = listing_summary(
+        hits.iter().filter(|hit| !hit.is_dir).count(),
+        hits.iter().filter(|hit| hit.is_dir).count(),
+        hits.iter()
+            .filter(|hit| !hit.is_dir)
+            .map(|hit| hit.size)
+            .sum(),
+    );
+    ui.browser
+        .summary
+        .set_label(&format!("{counts} — search results"));
     if hits.is_empty() {
         browser_status(
             ui,
@@ -1890,5 +2354,49 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     });
     for entry in entries {
         ui.browser.model.append(&BoxedAnyObject::new(entry));
+    }
+}
+
+fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
+    let file_word = if files == 1 { "file" } else { "files" };
+    let folder_word = if folders == 1 { "folder" } else { "folders" };
+    match (folders, files) {
+        (0, 0) => "0 folders, 0 files".to_string(),
+        (_, 0) => format!("{folders} {folder_word}"),
+        (0, _) => format!("{files} {file_word} ({})", human_bytes(file_bytes)),
+        _ => format!(
+            "{folders} {folder_word}, {files} {file_word} ({})",
+            human_bytes(file_bytes)
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{listing_summary, show_thumbnail_build_progress};
+    use pdfs_core::control::ThumbnailBuildStatus;
+
+    #[test]
+    fn listing_summary_matches_dolphin_order_and_wording() {
+        assert_eq!(listing_summary(0, 0, 0), "0 folders, 0 files");
+        assert_eq!(listing_summary(0, 2, 0), "2 folders");
+        assert_eq!(listing_summary(1, 0, 1024), "1 file (1.0 KiB)");
+        assert_eq!(listing_summary(3, 1, 3072), "1 folder, 3 files (3.0 KiB)");
+    }
+
+    #[test]
+    fn thumbnail_progress_disappears_when_build_finishes() {
+        let mut status = ThumbnailBuildStatus {
+            running: true,
+            scanning: true,
+            ..Default::default()
+        };
+        assert!(show_thumbnail_build_progress(&status));
+
+        status.scanning = false;
+        assert!(show_thumbnail_build_progress(&status));
+
+        status.running = false;
+        assert!(!show_thumbnail_build_progress(&status));
     }
 }

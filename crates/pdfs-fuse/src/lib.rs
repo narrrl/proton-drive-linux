@@ -60,7 +60,7 @@ use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
-    TransferDirection,
+    ThumbnailBuildStatus, TransferDirection,
 };
 use pdfs_core::db::{
     Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
@@ -374,6 +374,45 @@ impl SearchRoots {
     }
 }
 
+/// Negative thumbnail knowledge has two different authorities. A remote miss
+/// only says Proton has no thumbnail to download; it must never suppress local
+/// generation. A local miss says this exact file revision was successfully
+/// inspected and could not be decoded. Both maps are bounded independently.
+#[derive(Default)]
+struct ThumbnailMissCaches {
+    remote: HashMap<(NodeUid, i32), i64>,
+    local: HashMap<(NodeUid, i32), i64>,
+}
+
+impl ThumbnailMissCaches {
+    fn remote_contains(&self, key: &(NodeUid, i32), tag: i64) -> bool {
+        self.remote.get(key) == Some(&tag)
+    }
+
+    fn local_contains(&self, key: &(NodeUid, i32), tag: i64) -> bool {
+        self.local.get(key) == Some(&tag)
+    }
+
+    fn remember_remote(&mut self, key: (NodeUid, i32), tag: i64) {
+        Self::remember(&mut self.remote, key, tag);
+    }
+
+    fn remember_local(&mut self, key: (NodeUid, i32), tag: i64) {
+        Self::remember(&mut self.local, key, tag);
+    }
+
+    fn forget_local(&mut self, key: &(NodeUid, i32)) {
+        self.local.remove(key);
+    }
+
+    fn remember(map: &mut HashMap<(NodeUid, i32), i64>, key: (NodeUid, i32), tag: i64) {
+        if map.len() >= MAX_THUMBNAIL_MISSES && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.insert(key, tag);
+    }
+}
+
 /// `path` expressed relative to `root`, or `None` if it is not below it. The
 /// root itself resolves to the empty path; an empty root is the mount itself
 /// and covers everything.
@@ -511,8 +550,22 @@ struct Core {
     /// those downloads is a full-size photo — so an in-flight uid is never started
     /// twice.
     thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
-    /// Nodes the remote has told us have *no* thumbnail of a given type, keyed by
-    /// `(uid, thumbnail type)` and holding the mtime the answer was learned at.
+    /// Global permit pool for locally generated thumbnails. The old per-request
+    /// limit multiplied when the GUI sent several batches, allowing dozens of
+    /// full-size images to download at once.
+    thumb_gen_budget: Arc<tokio::sync::Semaphore>,
+    /// Current ordinary-file listing generation and a wake-up for tasks waiting
+    /// on a permit or a download when that listing is abandoned.
+    file_thumb_generation: Arc<AtomicU64>,
+    file_thumb_cancel: Arc<tokio::sync::Notify>,
+    /// Progress of the explicit recursive build started from the Files toolbar.
+    thumbnail_build: Arc<Mutex<ThumbnailBuildStatus>>,
+    /// Cancellation for the explicit recursive build. Separate from ordinary
+    /// listing cancellation because the two jobs have independent lifetimes.
+    thumbnail_build_cancelled: Arc<AtomicBool>,
+    thumbnail_build_cancel: Arc<tokio::sync::Notify>,
+    /// Negative thumbnail knowledge, separated by whether the remote lacked a
+    /// thumbnail or local decoding proved this revision unsupported.
     ///
     /// Absence has to be cached or it costs a round trip every time it is asked
     /// for, and it is asked for constantly: an `ls -l` from an xattr-aware lister
@@ -520,7 +573,7 @@ struct Core {
     /// of videos re-probed 130 times per listing at ~186 ms each (B5). The mtime
     /// is the validity tag — a new revision may well have a thumbnail — matching
     /// how [`ContentCache::read_thumbnail`] validates the positive side.
-    no_thumbnail: Arc<Mutex<HashMap<(NodeUid, i32), i64>>>,
+    thumbnail_misses: Arc<Mutex<ThumbnailMissCaches>>,
     /// Last account quota answer and when it was learned, for `statfs(2)`.
     ///
     /// `df` and the free-space preflight of every file manager and installer ask
@@ -3580,7 +3633,7 @@ impl Core {
         // "This file has no thumbnail" is an answer worth remembering: without
         // it every listing pays a round trip per file to be told nothing (B5).
         let key = (uid.clone(), ttype.as_i32());
-        if self.no_thumbnail.lock().get(&key) == Some(&mtime) {
+        if self.thumbnail_misses.lock().remote_contains(&key, mtime) {
             return Ok(None);
         }
         let bytes = self
@@ -3597,15 +3650,7 @@ impl Core {
                     .store_thumbnail(&uid, ttype.as_i32(), mtime, bytes);
             }
             None => {
-                let mut misses = self.no_thumbnail.lock();
-                // Bounded by clearing rather than by LRU: the entries are two
-                // words each, the cap is far above any plausible working set,
-                // and re-learning a miss costs one round trip. Not worth a
-                // second data structure to order them.
-                if misses.len() >= MAX_THUMBNAIL_MISSES {
-                    misses.clear();
-                }
-                misses.insert(key, mtime);
+                self.thumbnail_misses.lock().remember_remote(key, mtime);
             }
         }
         Ok(bytes)
@@ -7543,6 +7588,38 @@ mod tests {
             album: None,
             verification: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_miss_tests {
+    use super::*;
+
+    #[test]
+    fn remote_misses_never_suppress_local_generation() {
+        let uid = parse_uid("volume~node").expect("uid");
+        let key = (uid, ThumbnailType::Thumbnail.as_i32());
+        let mut misses = ThumbnailMissCaches::default();
+
+        misses.remember_remote(key.clone(), 42);
+        assert!(misses.remote_contains(&key, 42));
+        assert!(!misses.local_contains(&key, 42));
+
+        misses.remember_local(key.clone(), 42);
+        assert!(misses.local_contains(&key, 42));
+        misses.forget_local(&key);
+        assert!(!misses.local_contains(&key, 42));
+        assert!(misses.remote_contains(&key, 42));
+    }
+
+    #[test]
+    fn local_miss_cache_is_bounded_on_gui_only_paths() {
+        let mut misses = ThumbnailMissCaches::default();
+        for index in 0..=MAX_THUMBNAIL_MISSES {
+            let uid = parse_uid(&format!("volume~node-{index}")).expect("uid");
+            misses.remember_local((uid, ThumbnailType::Thumbnail.as_i32()), 42);
+        }
+        assert_eq!(misses.local.len(), 1);
     }
 }
 

@@ -572,7 +572,7 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
         refresh_takeout(ui);
     }
     match ui.stack.visible_child_name().as_deref() {
-        Some("main") => refresh_quota(ui),
+        Some("main" | "browser") => refresh_quota(ui),
         Some("locations") => refresh_locations(ui),
         Some("activity") => refresh_activity(ui),
         _ => {}
@@ -580,13 +580,11 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
 }
 
 /// How long a quota reading stays fresh. Account storage barely moves, so the
-/// Settings tick refetches it only this often rather than every 2s.
+/// active-page tick refetches it only this often rather than every 2s.
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 
-/// Fetch the account quota (if the last reading is stale) and paint the Account
-/// storage group. Runs only while Settings is on screen. The group stays hidden
-/// until a reading lands, so an account the API can't report — or a still-starting
-/// daemon — shows nothing rather than an empty bar. A failed fetch leaves the last
+/// Fetch the account quota (if the last reading is stale) and paint both the
+/// Settings storage group and Files status bar. A failed fetch leaves the last
 /// good reading in place.
 pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
     if ui.status.quota_inflight.get() {
@@ -609,26 +607,69 @@ pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
         })) = result
         {
             ui.status.quota_checked_at.set(Some(Instant::now()));
-            let used = used_space.max(0) as u64;
-            if max_space > 0 {
-                let total = max_space as u64;
-                let fraction = (used as f64 / total as f64).min(1.0);
-                ui.status.quota_bar.set_fraction(fraction);
-                let pct = (fraction * 100.0).round() as u64;
-                ui.status.quota_label.set_text(&format!(
-                    "{} of {} used ({pct}%)",
-                    human_bytes(used),
-                    human_bytes(total)
-                ));
-            } else {
-                ui.status.quota_bar.set_fraction(0.0);
-                ui.status
-                    .quota_label
-                    .set_text(&format!("{} used", human_bytes(used)));
-            }
+            paint_account_quota(&ui, max_space, used_space);
             ui.status.quota_group.set_visible(true);
+        } else if ui.status.quota_checked_at.get().is_none() {
+            // Match Dolphin: capacity information does not occupy the bar until
+            // the backing observer has real figures.
+            ui.browser.quota_box.set_visible(false);
         }
     });
+}
+
+fn paint_account_quota(ui: &Rc<Ui>, max_space: i64, used_space: i64) {
+    let (fraction, text) = quota_display(max_space, used_space);
+    ui.status.quota_bar.set_fraction(fraction);
+    ui.status.quota_label.set_text(&text);
+    if let Some((fraction, free_text, tooltip)) = quota_status_display(max_space, used_space) {
+        ui.browser.quota.set_fraction(fraction);
+        ui.browser.quota.set_tooltip_text(Some(&tooltip));
+        ui.browser.quota_text.set_label(&free_text);
+        ui.browser.quota_text.set_tooltip_text(Some(&tooltip));
+        ui.browser.quota_box.set_visible(true);
+    } else {
+        ui.browser.quota_box.set_visible(false);
+    }
+}
+
+fn quota_display(max_space: i64, used_space: i64) -> (f64, String) {
+    let used = used_space.max(0) as u64;
+    if max_space <= 0 {
+        return (0.0, format!("{} used", human_bytes(used)));
+    }
+    let total = max_space as u64;
+    let fraction = (used as f64 / total as f64).clamp(0.0, 1.0);
+    let pct = (fraction * 100.0).round() as u64;
+    (
+        fraction,
+        format!(
+            "{} of {} used ({pct}%)",
+            human_bytes(used),
+            human_bytes(total)
+        ),
+    )
+}
+
+/// Dolphin's status bar shows a bare capacity bar followed by “X free”; the
+/// full free/total/percentage sentence is a tooltip rather than inline bar text.
+fn quota_status_display(max_space: i64, used_space: i64) -> Option<(f64, String, String)> {
+    if max_space <= 0 {
+        return None;
+    }
+    let total = max_space as u64;
+    let used = (used_space.max(0) as u64).min(total);
+    let free = total.saturating_sub(used);
+    let fraction = used as f64 / total as f64;
+    let pct = (fraction * 100.0).round() as u64;
+    Some((
+        fraction,
+        format!("{} free", human_bytes(free)),
+        format!(
+            "{} free out of {} ({pct}% used)",
+            human_bytes(free),
+            human_bytes(total)
+        ),
+    ))
 }
 
 /// Record the mount state seen by the last status poll: gate every control that
@@ -642,6 +683,11 @@ pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     ui.browser.new_folder.set_sensitive(mounted);
     ui.browser.upload.set_sensitive(mounted);
     ui.browser.upload_folder.set_sensitive(mounted);
+    ui.browser.build_thumbnails.set_sensitive(
+        mounted
+            && (!ui.browser.thumbnail_build_running.get()
+                || !ui.browser.thumbnail_cancel_pending.get()),
+    );
     ui.gallery.upload.set_sensitive(mounted);
     ui.details.details.pin_row.set_sensitive(mounted);
     ui.details.details.rename_button.set_sensitive(mounted);
@@ -1008,5 +1054,38 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             .pin_rows
             .borrow_mut()
             .push(PinRow { row, unpin: None });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quota_display, quota_status_display};
+
+    #[test]
+    fn quota_display_reports_used_total_and_percentage() {
+        let gib = 1024_i64.pow(3);
+        let (fraction, text) = quota_display(4 * gib, gib);
+        assert!((fraction - 0.25).abs() < f64::EPSILON);
+        assert_eq!(text, "1.0 GiB of 4.0 GiB used (25%)");
+    }
+
+    #[test]
+    fn quota_display_clamps_bad_api_values() {
+        assert_eq!(quota_display(0, -1), (0.0, "0 B used".to_string()));
+        assert_eq!(quota_display(100, 150).0, 1.0);
+    }
+
+    #[test]
+    fn quota_status_display_matches_dolphin_wording() {
+        let gib = 1024_i64.pow(3);
+        assert_eq!(
+            quota_status_display(4 * gib, gib),
+            Some((
+                0.25,
+                "3.0 GiB free".to_string(),
+                "3.0 GiB free out of 4.0 GiB (25% used)".to_string()
+            ))
+        );
+        assert_eq!(quota_status_display(0, 0), None);
     }
 }

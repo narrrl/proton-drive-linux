@@ -19,6 +19,7 @@ use pages::trash::*;
 use pages::verify::*;
 use widgets::details::*;
 use widgets::share_dialog::*;
+use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
 
 use std::cell::{Cell, RefCell};
@@ -49,8 +50,8 @@ use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind,
     ImportSummary, InvitationInfo, JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope,
     Request, Response, RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind,
-    SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem,
-    pending_summary, send,
+    SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection,
+    TransferItem, pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -107,6 +108,10 @@ struct Ui {
     /// The sidebar/content split. Collapsed while signed out, so the login page
     /// owns the whole window and no destination is reachable without a session.
     nav: adw::NavigationSplitView,
+    /// Shared thumbnails for ordinary image files outside the Photos gallery.
+    /// One cache and request queue serves Files, search, Shared and Trash, so
+    /// the same image is downloaded and decoded only once.
+    pub(crate) file_thumbs: FileThumbnailState,
 
     // Per-page state. Each page module owns its own struct; `Ui` keeps only
     // what more than one page genuinely shares.
@@ -207,10 +212,15 @@ fn load_proton_theme() {
          .file-grid {{ padding: 6px; }}\n\
          .file-tile {{ padding: 8px; border-radius: 10px; }}\n\
          .file-tile:hover {{ background: alpha({PROTON_PURPLE}, 0.10); }}\n\
+         .file-thumbnail {{ border-radius: 7px; }}\n\
          .file-badge {{ -gtk-icon-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }}\n\
          .badge-pinned {{ color: #f5c211; }}\n\
          .badge-cached {{ color: #2ec27e; }}\n\
          .badge-cloud {{ color: #9aa0a6; }}\n\
+         .browser-statusbar {{ background-color: alpha(currentColor, 0.025); }}\n\
+         scale.browser-status-meter trough, progressbar.browser-status-meter trough {{ min-width: 104px; }}\n\
+         scale.browser-status-meter trough {{ min-height: 6px; }}\n\
+         progressbar.browser-status-meter trough, progressbar.browser-status-meter progress {{ min-height: 6px; }}\n\
          .photo-viewer-window {{ background-color: #111014; }}\n\
          .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0)); padding: 10px 16px 28px 20px; color: white; }}\n\
          .viewer-title {{ font-weight: 700; font-size: 1.05rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
@@ -345,6 +355,7 @@ fn build_window(app: &adw::Application) {
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
         nav: split.clone(),
+        file_thumbs: FileThumbnailState::new(),
         login: LoginState {
             email: login_widgets.0,
             password: login_widgets.1,
@@ -390,7 +401,15 @@ fn build_window(app: &adw::Application) {
             new_folder: browser_widgets.new_folder.clone(),
             upload: browser_widgets.upload.clone(),
             upload_folder: browser_widgets.upload_folder.clone(),
+            build_thumbnails: browser_widgets.build_thumbnails.clone(),
+            thumbnail_build_row: browser_widgets.thumbnail_build_row.clone(),
+            thumbnail_progress: browser_widgets.thumbnail_progress.clone(),
+            thumbnail_status: browser_widgets.thumbnail_status.clone(),
+            thumbnail_poll: RefCell::new(None),
+            thumbnail_build_running: Cell::new(false),
+            thumbnail_cancel_pending: Cell::new(false),
             search_source: RefCell::new(None),
+            load_generation: Cell::new(0),
             views: browser_widgets.views.clone(),
             bulk: browser_widgets.bulk.clone(),
             bulk_label: browser_widgets.bulk_label.clone(),
@@ -398,6 +417,13 @@ fn build_window(app: &adw::Application) {
             bulk_pin: browser_widgets.bulk_pin.clone(),
             bulk_unpin: browser_widgets.bulk_unpin.clone(),
             empty_actions: browser_widgets.empty_actions.clone(),
+            summary: browser_widgets.summary.clone(),
+            zoom: browser_widgets.zoom.clone(),
+            grid_thumbnail_size: Cell::new(GRID_THUMB_DEFAULT),
+            grid_tiles: RefCell::new(Vec::new()),
+            quota_box: browser_widgets.quota_box.clone(),
+            quota: browser_widgets.quota.clone(),
+            quota_text: browser_widgets.quota_text.clone(),
         },
         details: DetailsState {
             details: browser_widgets.details,
@@ -552,6 +578,7 @@ fn build_window(app: &adw::Application) {
         &browser_widgets.new_folder,
         &browser_widgets.upload,
         &browser_widgets.upload_folder,
+        &browser_widgets.build_thumbnails,
     );
     wire_details(&ui);
     wire_search(&ui);
@@ -588,6 +615,10 @@ fn build_window(app: &adw::Application) {
     // network round-trip only happens on demand rather than on every refresh.
     let ui_nav = ui.clone();
     stack.connect_visible_child_name_notify(move |st| {
+        // Rows from the page being left must not keep full-size image downloads
+        // alive in the daemon. The page being entered establishes a fresh
+        // thumbnail generation as it paints.
+        cancel_file_thumbnails(&ui_nav);
         sync_sidebar(&ui_nav);
         match st.visible_child_name().as_deref() {
             Some("browser") => load_browser(&ui_nav),
