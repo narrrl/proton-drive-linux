@@ -9,18 +9,18 @@
 
   <rect width="128" height="128" rx="29" fill="url(#pdl-bg)"/>
 
-  <!-- cloud: the remote drive -->
+  <!-- cloud: the remote drive (symmetric about x=64) -->
   <g fill="#FFFFFF">
-    <circle cx="51" cy="50" r="17"/>
-    <circle cx="74" cy="46" r="21"/>
-    <circle cx="90" cy="59" r="14"/>
-    <rect x="40" y="55" width="52" height="18" rx="9"/>
+    <circle cx="64" cy="42" r="20"/>
+    <circle cx="44" cy="52" r="14"/>
+    <circle cx="84" cy="52" r="14"/>
+    <rect x="32" y="50" width="64" height="16" rx="8"/>
   </g>
 
   <!-- pull: files arrive only when opened -->
   <g stroke="#FFFFFF" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M64 82v18"/>
-    <path d="M54 92l10 10 10-10"/>
-    <path d="M46 112h36" stroke-opacity="0.55"/>
+    <path d="M64 75v17"/>
+    <path d="M53 84l11 11 11-11"/>
+    <path d="M45 108h38" stroke-opacity="0.55"/>
   </g>
 </svg>
