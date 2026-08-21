@@ -9,6 +9,63 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [1.9.1] — 2026-08-21
+
+Thumbnails everywhere the GUI lists files, a status bar under the Files browser, and the
+repository's contribution/branding files. No schema change. Schema: **28**; SDK unchanged at
+`proton-sdk` / `proton-drive-rs` **0.6.1**.
+
+`exiftool` (`libimage-exiftool-perl` / `perl-image-exiftool` / `perl-Image-ExifTool`) is a new
+runtime dependency, declared in the `.deb`, `.rpm` and `PKGBUILD` packaging. It is only used to
+pull the embedded preview out of a camera RAW; without it every other image format still gets a
+thumbnail.
+
+### Added
+- **Thumbnails for ordinary Drive files**, not just the Photos timeline — painted in Files (both
+  the grid and the Name column of the list), Shared, Shared by me, and Trash. Standard raster
+  formats (`bmp`, `gif`, `jpeg`, `png`, `tiff`, `webp`) are decoded in the daemon; camera RAWs
+  (`arw`, `cr2`, `cr3`, `dng`, `nef`, `orf`, `raf`, `rw2`, and the rest of the concrete list) are
+  served from their embedded preview via `exiftool`. Previews are cached beside the existing photo
+  thumbnails, outside the cache-budget scan, and tagged with the node's modification time — so a
+  new revision of an image can never be shown with its predecessor's thumbnail.
+- Thumbnails for visible rows are requested opportunistically as tiles scroll in, and the daemon
+  drops work for listings the user has already navigated away from. The listing generation is
+  issued by the daemon (`ReserveFileThumbGeneration`), not seeded from the front-end's clock.
+- **Build a whole folder tree ahead of time** from the Files toolbar: one recursive local-thumbnail
+  job per daemon, with live scan/found/completed/failed progress and a Cancel that appears only
+  once the daemon has acknowledged the start. The job outlives navigation — it is deliberate work,
+  separate from the opportunistic per-tile requests.
+- **A Dolphin-style status bar under the Files browser**: the current listing's counts, a Zoom
+  slider for the icon grid, and account storage usage. Zoom resizes the realised grid cells rather
+  than rebuilding the model, so dragging the slider does not tear down the selection; the default
+  size reproduces the previous fixed 72 px tiles. Capacity stays out of the bar until a real
+  reading lands, and the quota fetch (60 s TTL) now also runs while Files is on screen instead of
+  only in Settings.
+- Repository housekeeping: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue and pull
+  request templates, a project logo, and workspace crate metadata (`repository`, `homepage`,
+  `readme`, `keywords`, `categories`).
+
+### Fixed
+- A remote thumbnail miss no longer suppresses local generation. The two negative results are now
+  held in separate bounded caches: "Proton has no thumbnail for this node" and "this exact revision
+  was decoded locally and could not be read" mean different things, and only the second is a
+  permanent verdict for that revision.
+- A RAW whose preview could not be extracted because of the *environment* — `exiftool` missing, a
+  failed download — is retried instead of being remembered as undecodable. Only bytes conclusively
+  outside the supported formats are cached as a negative.
+- A recursive build that finds a uid an opportunistic tile job already owns waits briefly for it
+  rather than either duplicating the work or blocking on it forever, and a cancellation racing a
+  waiter's registration is caught by a backstop instead of leaving the waiter parked.
+- Starting a build for a root that is already building attaches to that job; starting one for a
+  *different* root is refused explicitly rather than silently reporting the running job's progress
+  as the caller's.
+- Decrypted camera RAWs are staged for `exiftool` in an owner-only (`0700`) directory of their own,
+  removed as soon as the preview is out and swept at cache open after an unclean shutdown.
+- The RAW extension list had `rw` (not a format) and was missing `raw`; both classification helpers
+  now read from one shared table instead of two hand-maintained `matches!` arms.
+- The tray and desktop-entry icons were wrong/missing; `.desktop` files and the packaged SVG were
+  corrected.
+
 ## [1.9.0] — 2026-08-18
 
 Google Photos import, and a pass over the desktop app's interaction gaps. No schema change.
@@ -501,6 +558,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[1.9.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.1
+[1.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.0
 [1.8.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.2
 [1.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.1
 [1.8.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.0
