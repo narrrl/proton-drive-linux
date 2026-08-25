@@ -1448,6 +1448,54 @@ fn cmd_mount(mountpoint: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// How long to wait before the next login check, after `attempts` checks have
+/// already come back [`pdfs_core::Error::NotLoggedIn`].
+///
+/// Doubles from 3s to a 60s ceiling. The interval is not just a sleep:
+/// [`auth::load`] builds a fresh `keyring::Entry` on every call, so each check
+/// opens a new D-Bus connection to the Secret Service and negotiates an
+/// encrypted session over it. A flat 3s poll meant roughly 48,000 of those a
+/// day from a daemon that had nothing to do.
+fn login_poll_delay(attempts: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 3;
+    const MAX_SECS: u64 = 60;
+
+    // `checked_shl` rather than `<<`: the daemon can sit unauthenticated for
+    // weeks, and a shift past the width of the type is a panic, not a big number.
+    let factor = 1u64.checked_shl(attempts).unwrap_or(u64::MAX);
+    std::time::Duration::from_secs(BASE_SECS.saturating_mul(factor).min(MAX_SECS))
+}
+
+/// Block until a session is stored, backing off between checks.
+///
+/// `load` and `sleep` are parameters rather than direct calls so the backoff
+/// schedule can be tested without a keyring and without real time passing.
+fn wait_for_session<L, S>(mut load: L, mut sleep: S) -> Result<()>
+where
+    L: FnMut() -> std::result::Result<(), pdfs_core::Error>,
+    S: FnMut(std::time::Duration),
+{
+    let mut attempts: u32 = 0;
+    loop {
+        match load() {
+            Ok(()) => return Ok(()),
+            Err(pdfs_core::Error::NotLoggedIn) => {
+                let delay = login_poll_delay(attempts);
+                // Say it once at INFO. Repeating it every interval buried the
+                // journal in tens of thousands of identical lines a day.
+                if attempts == 0 {
+                    tracing::info!("not logged in; waiting for a session…");
+                } else {
+                    tracing::debug!(delay_secs = delay.as_secs(), "still not logged in");
+                }
+                sleep(delay);
+                attempts = attempts.saturating_add(1);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Run the auto-mount daemon loop. Waits for a stored login, mounts, and keeps
 /// the mount alive: a clean stop (SIGTERM via `systemctl --user stop`) exits 0;
 /// an external unmount triggers a remount; errors back off and retry. This is
@@ -1456,16 +1504,7 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
     loop {
         // Wait until a session is stored. The GUI enables this service on login,
         // but the service may also start at boot before the user has logged in.
-        loop {
-            match auth::load() {
-                Ok(_) => break,
-                Err(pdfs_core::Error::NotLoggedIn) => {
-                    tracing::info!("not logged in; waiting…");
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        wait_for_session(|| auth::load().map(|_| ()), std::thread::sleep)?;
 
         match mount_once(mountpoint.clone()) {
             Ok(pdfs_fuse::MountOutcome::Shutdown) => {
@@ -2535,5 +2574,66 @@ mod diagnose_tests {
 
         std::fs::remove_file(collision).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod login_wait_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn poll_delay_doubles_then_holds_at_the_ceiling() {
+        assert_eq!(login_poll_delay(0), Duration::from_secs(3));
+        assert_eq!(login_poll_delay(1), Duration::from_secs(6));
+        assert_eq!(login_poll_delay(2), Duration::from_secs(12));
+        assert_eq!(login_poll_delay(3), Duration::from_secs(24));
+        assert_eq!(login_poll_delay(4), Duration::from_secs(48));
+        assert_eq!(login_poll_delay(5), Duration::from_secs(60));
+        // A daemon left unauthenticated for weeks reaches attempt counts well
+        // past the width of the shift; that must cap, not panic.
+        assert_eq!(login_poll_delay(64), Duration::from_secs(60));
+        assert_eq!(login_poll_delay(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn waiting_for_a_session_stops_hammering_the_keyring() {
+        let mut checks_left = 20;
+        let mut slept: Vec<Duration> = Vec::new();
+
+        wait_for_session(
+            || {
+                if checks_left == 0 {
+                    Ok(())
+                } else {
+                    checks_left -= 1;
+                    Err(pdfs_core::Error::NotLoggedIn)
+                }
+            },
+            |delay| slept.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(slept.len(), 20, "one wait per failed check");
+        assert!(
+            slept.windows(2).all(|w| w[1] >= w[0]),
+            "the interval must never shrink: {slept:?}"
+        );
+
+        // The point of the change. Every check is a fresh D-Bus session against
+        // the Secret Service, so 20 of them must not fit inside a single minute
+        // the way a flat 3s poll did.
+        let total: Duration = slept.iter().sum();
+        assert!(
+            total >= Duration::from_secs(15 * 60),
+            "20 checks should span at least 15 minutes, spanned {total:?}"
+        );
+    }
+
+    #[test]
+    fn a_stored_session_is_not_waited_for_at_all() {
+        let mut slept = 0;
+        wait_for_session(|| Ok(()), |_| slept += 1).unwrap();
+        assert_eq!(slept, 0);
     }
 }
