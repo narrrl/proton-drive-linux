@@ -149,6 +149,43 @@ pub enum Request {
         #[serde(default)]
         dry_run: bool,
     },
+    /// Re-date photos whose capture time is when they were *imported* rather
+    /// than when they were taken.
+    ///
+    /// Proton has no API for editing a photo's capture time — it is sealed into
+    /// the revision — so the only repair is to upload the photo again with the
+    /// right time and trash the original. That is what this does, for photos
+    /// whose file name carries a date that disagrees with their stored capture
+    /// time by more than a day: `IMG-20230219-WA0001.jpg` filed under 2026 is
+    /// the signature of an import whose metadata sidecars did not match.
+    ///
+    /// Favourites and album memberships are carried across; the original is
+    /// **trashed**, not deleted, so a bad run is recoverable from Proton's
+    /// trash. With `dry_run` nothing is uploaded or trashed and the report says
+    /// what would have been done.
+    ///
+    /// Acks immediately with [`Response::Ok`] and works in the background — each
+    /// photo is a download plus an upload. Progress shows up in
+    /// [`Request::GetQueueStatus`] as a job, and the counts in
+    /// [`Request::RedateStatus`].
+    RedatePhotos {
+        #[serde(default)]
+        dry_run: bool,
+        /// Stop after this many photos. `None` is the whole library.
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Only consider photos whose *stored* capture time falls in this
+        /// `[from, to)` window — the way to aim the repair at the days an
+        /// import landed on and leave the rest of the library untouched.
+        #[serde(default)]
+        range: Option<(i64, i64)>,
+    },
+    /// How the running (or last finished) re-date is doing. Replies with
+    /// [`Response::RedateStatus`].
+    RedateStatus,
+    /// Ask the running re-date to stop. It finishes the photo on the wire, then
+    /// reports `cancelled`. Replies with [`Response::Ok`].
+    CancelRedate,
     /// How the running (or last finished) Takeout import is doing. Replies with
     /// [`Response::ImportStatus`].
     ImportStatus,
@@ -1109,6 +1146,35 @@ pub struct PhotoMonth {
     pub count: usize,
 }
 
+/// How a photo re-date is going, or how the last one ended
+/// ([`Response::RedateStatus`]). Cumulative for the run, so the same shape
+/// serves progress and the final report.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedateSummary {
+    /// Photos examined.
+    pub examined: usize,
+    /// Photos whose name implies a capture time more than a day from the one
+    /// they carry — what the run would (or did) repair.
+    pub candidates: usize,
+    /// Photos re-uploaded with the right capture time, their original trashed.
+    pub redated: usize,
+    /// Photos that could not be downloaded, re-uploaded, or trashed. The
+    /// original is left alone in every failure case.
+    pub failed: usize,
+    /// Album memberships re-created on the new copies.
+    pub album_links: usize,
+    /// Bytes uploaded.
+    pub bytes: u64,
+    /// True when the run stopped early because it was cancelled.
+    pub cancelled: bool,
+    /// True when nothing was actually uploaded or trashed.
+    pub dry_run: bool,
+    /// Up to a handful of examples, as `(name, stored capture time, the time the
+    /// name implies)` — what a dry run is read for.
+    #[serde(default)]
+    pub samples: Vec<(String, i64, i64)>,
+}
+
 /// How a Google Photos Takeout import is going, or how the last one ended
 /// ([`Response::ImportStatus`]).
 ///
@@ -1433,6 +1499,14 @@ pub enum Response {
         running: bool,
         #[serde(default)]
         summary: Option<ImportSummary>,
+    },
+    /// How the photo re-date is doing (reply to [`Request::RedateStatus`]).
+    /// `running` is false once it has finished, when `summary` is the final
+    /// report; `summary` is `None` when no re-date has run this session.
+    RedateStatus {
+        running: bool,
+        #[serde(default)]
+        summary: Option<RedateSummary>,
     },
     /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
     /// newest first.

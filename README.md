@@ -69,7 +69,7 @@ pdfs-app            # the desktop app
 - **Local Backup (Computers)**: Sync and back up local directories (like Downloads, Documents, Pictures, etc.) directly to your Proton Drive account.
 - **Locations**: One page (and `pdfs locations`) listing every place Proton Drive occupies on this machine — the main mount plus each backed-up folder — with its mode, sync state, and whether it is read-only. Switching a folder between a full local copy and on-demand happens here.
 - **System Tray Integration**: Background indicator for status monitoring, quick actions, and fast sync controls.
-- **Unified Search Launcher (HUD)**: A resident Google Drive-style launcher (`pdfs-prompt`) that searches Proton Drive and local files together, ranks the best matches, tolerates abbreviations and typos, and is ideal for a system-wide hotkey.
+- **Unified Search Launcher (HUD)**: A resident Google Drive-style launcher (`pdfs-prompt`) that searches Proton Drive and local files together, ranks the best matches, tolerates abbreviations and typos, and is ideal for a system-wide hotkey. It can also present the same search in your own launcher (`--dmenu`) or, searching live as you type, in `fzf` (`--fzf`).
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
 - **File Version History**: Every revision Proton Drive still holds for a file, from the browser's details pane (**Versions**) or `pdfs versions list|restore|save|rm`. Restoring is server-side — no re-upload — and an old version can be written out to a local file without touching the live one.
@@ -123,6 +123,51 @@ launcher command, set them in `config.json`:
 `--gtk` overrides `"mode": "dmenu"` for one invocation. A `{prompt}` token
 anywhere in `menu` is replaced by the prompt text; without one, the launcher's
 own prompt flag is appended.
+
+### Live launcher search (fzf)
+
+The two-step above exists because no dmenu-style launcher can call back for new
+results per keystroke. `fzf` can, so `pdfs-prompt --fzf` searches as you type,
+exactly like the built-in window:
+
+```bash
+pdfs-prompt --fzf                    # pinned files, then live results as you type
+pdfs-prompt --fzf --query invoice    # start on a search
+```
+
+Every keystroke re-queries the daemon (debounced, like the GTK prompt) and fzf's
+own matcher is switched off, so the ordering you see is the daemon's ranking —
+abbreviations and typos included, which a launcher filtering a fixed list cannot
+do. Enter opens; Escape closes.
+
+fzf is a terminal program, so when it is started without one — from a WM
+keybinding — it spawns a terminal for itself: foot, ghostty, kitty, alacritty,
+wezterm or xterm, whichever is installed. Each is launched with the app-id/class
+`pdfs-prompt`, so one window rule floats it whichever terminal you have. In
+Hyprland:
+
+```
+windowrulev2 = float, class:^(pdfs-prompt)$
+windowrulev2 = size 900 500, class:^(pdfs-prompt)$
+windowrulev2 = center, class:^(pdfs-prompt)$
+bind = SUPER, space, exec, pdfs-prompt --fzf
+```
+
+Set it as the default front end, and pick the terminal explicitly, in
+`config.json`:
+
+```json
+{
+  "prompt": {
+    "mode": "fzf",
+    "terminal": ["foot", "--app-id=pdfs-prompt", "--"],
+    "menu_limit": 50
+  }
+}
+```
+
+A `{cmd}` token anywhere in `terminal` is replaced by the command to run;
+without one it is appended, which is what every detected terminal expects.
 
 ## Choosing How Files Open
 

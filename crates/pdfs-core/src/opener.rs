@@ -23,8 +23,9 @@
 //! ```
 
 use std::ffi::OsStr;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
@@ -165,12 +166,30 @@ pub fn open_named(policy: &OpenWith, path: &Path, name: &str, is_dir: bool) {
     spawn(&argv, path);
 }
 
+/// Launch `argv`, detached from whatever is opening it.
+///
+/// The child gets its own process group and no inherited stdio, because the
+/// caller may be about to exit and take its terminal with it: `pdfs-prompt
+/// --fzf` runs inside a terminal it spawned for itself, and that terminal
+/// closes the moment the selection is made. A child left in the terminal's
+/// foreground process group is sent `SIGHUP` when the pty hangs up, so
+/// "open this folder in a terminal" would open a window that dies immediately
+/// — which is exactly what it did. Nothing here needs the caller's stdio in the
+/// first place: every `argv` is another application, and a terminal one is
+/// wrapped in its own emulator by the `terminal` rule flag.
 fn spawn(argv: &[String], path: &Path) {
     let Some((program, args)) = argv.split_first() else {
         return;
     };
     tracing::info!(path = %path.display(), command = ?argv, "opening");
-    if let Err(e) = Command::new(program).args(args).spawn() {
+    let spawned = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    if let Err(e) = spawned {
         tracing::error!(command = ?argv, "open failed: {e}");
     }
 }

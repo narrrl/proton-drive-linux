@@ -24,7 +24,7 @@ use widgets::versions_dialog::*;
 
 use std::cell::{Cell, RefCell};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use std::path::{Path, PathBuf};
 
@@ -484,7 +484,8 @@ fn build_window(app: &adw::Application) {
             decode_idle: Cell::new(false),
             thumb_source: RefCell::new(None),
             relayout_source: RefCell::new(None),
-            bound: RefCell::new(HashMap::new()),
+            bound: RefCell::new(BTreeMap::new()),
+            list: gallery_widgets.list.clone(),
         },
         shared: SharedState {
             content: shared_widgets.content.clone(),

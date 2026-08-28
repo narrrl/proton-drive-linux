@@ -72,6 +72,25 @@ const KNOWN_MENUS: [MenuFlavor; 6] = [
     },
 ];
 
+/// Terminals that can host `pdfs-prompt --fzf`, most-preferred first.
+///
+/// The fzf front end is a terminal program, so a keybinding that has no tty
+/// needs one spawned for it. Each entry sets a stable app-id/class
+/// ([`TERMINAL_APP_ID`]) so a tiling WM can be told to float exactly this
+/// window, and ends with the flag after which the command to run follows.
+const KNOWN_TERMINALS: [&[&str]; 6] = [
+    &["foot", "--app-id=pdfs-prompt", "--"],
+    &["ghostty", "--class=pdfs-prompt", "-e"],
+    &["kitty", "--class", "pdfs-prompt"],
+    &["alacritty", "--class", "pdfs-prompt", "-e"],
+    &["wezterm", "start", "--class", "pdfs-prompt", "--"],
+    &["xterm", "-class", "pdfs-prompt", "-e"],
+];
+
+/// The app-id/class every [`KNOWN_TERMINALS`] entry sets, so the window rule a
+/// user writes for one terminal keeps working if they switch.
+pub const TERMINAL_APP_ID: &str = "pdfs-prompt";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptFlag {
     /// `--prompt=TEXT`
@@ -105,6 +124,13 @@ pub struct PromptConfig {
     /// the prompt text; without one the launcher's own prompt flag is appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<Vec<String>>,
+    /// Terminal argv for `pdfs-prompt --fzf` when it is started without a tty.
+    /// Unset means "find one" — see [`resolve_terminal`]. A `{cmd}` token
+    /// anywhere in the argv is replaced by the command to run; without one the
+    /// command is appended, which is what every [`KNOWN_TERMINALS`] entry
+    /// expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<Vec<String>>,
     /// How many results to feed the launcher. Unset means
     /// [`DEFAULT_MENU_LIMIT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +150,8 @@ pub enum PromptMode {
     Gtk,
     /// The user's own launcher, driven over stdin/stdout.
     Dmenu,
+    /// `fzf` in a terminal, re-querying the daemon on every keystroke.
+    Fzf,
 }
 
 /// Rows an external launcher can show without becoming a scroll exercise. Larger
@@ -184,6 +212,43 @@ pub fn resolve_menu(configured: Option<&Vec<String>>) -> Option<Vec<String>> {
     let mut argv = vec![flavor.program.to_string()];
     argv.extend(flavor.mode.iter().map(|f| (*f).to_string()));
     Some(argv)
+}
+
+/// The terminal to host `pdfs-prompt --fzf` in: the configured one, or the
+/// first [`KNOWN_TERMINALS`] entry on `PATH`. Returns the argv up to and
+/// including the "run this command" flag — the caller appends the command, or
+/// substitutes it for a `{cmd}` token, via [`with_command`].
+pub fn resolve_terminal(configured: Option<&Vec<String>>) -> Option<Vec<String>> {
+    if let Some(argv) = configured.filter(|argv| !argv.is_empty()) {
+        return Some(argv.clone());
+    }
+    let flavor = KNOWN_TERMINALS
+        .iter()
+        .find(|argv| argv.first().is_some_and(|program| on_path(program)))?;
+    Some(flavor.iter().map(|arg| (*arg).to_string()).collect())
+}
+
+/// Place `command` into a terminal argv: substituted for a `{cmd}` token if the
+/// user wrote one, otherwise appended.
+///
+/// The token exists for terminals that want the command in the middle of their
+/// own arguments; appending is right for every [`KNOWN_TERMINALS`] entry, whose
+/// last element is the flag the command follows.
+pub fn with_command(argv: &[String], command: &[String]) -> Vec<String> {
+    if !argv.iter().any(|arg| arg == "{cmd}") {
+        let mut argv = argv.to_vec();
+        argv.extend_from_slice(command);
+        return argv;
+    }
+    let mut out = Vec::with_capacity(argv.len() + command.len());
+    for arg in argv {
+        if arg == "{cmd}" {
+            out.extend_from_slice(command);
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
 }
 
 /// Show `items` in the launcher named by `argv` and wait for a choice.
@@ -305,7 +370,8 @@ fn flavor_of(program: &str) -> Option<&'static MenuFlavor> {
     KNOWN_MENUS.iter().find(|flavor| flavor.program == base)
 }
 
-fn on_path(program: &str) -> bool {
+/// Whether `program` is an executable file on `PATH`.
+pub fn on_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -406,6 +472,47 @@ mod tests {
             ),
             vec!["rofi", "-dmenu", "-p", "Drive >"]
         );
+    }
+
+    #[test]
+    fn a_configured_terminal_is_used_verbatim() {
+        let configured = vec!["my-term".to_string(), "-e".to_string()];
+        assert_eq!(
+            resolve_terminal(Some(&configured)),
+            Some(configured.clone())
+        );
+        // An empty list is "not configured", not "run nothing".
+        assert_eq!(
+            resolve_terminal(Some(&Vec::new())),
+            resolve_terminal(None),
+            "an empty terminal list must fall back to detection"
+        );
+    }
+
+    #[test]
+    fn the_command_is_appended_unless_the_user_placed_it() {
+        let command = vec!["pdfs-prompt".to_string(), "--fzf".to_string()];
+        assert_eq!(
+            with_command(&["foot".into(), "--".into()], &command),
+            vec!["foot", "--", "pdfs-prompt", "--fzf"]
+        );
+        assert_eq!(
+            with_command(
+                &["term".into(), "-e".into(), "{cmd}".into(), "--hold".into()],
+                &command
+            ),
+            vec!["term", "-e", "pdfs-prompt", "--fzf", "--hold"]
+        );
+    }
+
+    #[test]
+    fn every_known_terminal_sets_the_same_app_id() {
+        for argv in KNOWN_TERMINALS {
+            assert!(
+                argv.iter().any(|arg| arg.contains(TERMINAL_APP_ID)),
+                "{argv:?} must be floatable by one window rule"
+            );
+        }
     }
 
     #[test]

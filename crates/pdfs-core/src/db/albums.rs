@@ -188,6 +188,19 @@ impl Db {
         Ok(rows)
     }
 
+    /// Which albums hold `uid`, by album node uid. Read by the photo re-date,
+    /// which has to put the re-uploaded copy back into the albums the original
+    /// was in.
+    pub fn albums_of_photo(&self, uid: &str) -> Result<Vec<String>> {
+        let conn = self.read();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT album_uid FROM album_photos WHERE uid = ?1")?;
+        let rows = stmt
+            .query_map([uid], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// How many photos of `album_uid` are persisted.
     pub fn album_photos_count(&self, album_uid: &str) -> Result<usize> {
         let conn = self.read();

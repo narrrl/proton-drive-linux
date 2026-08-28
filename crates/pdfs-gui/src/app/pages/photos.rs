@@ -5,8 +5,12 @@ pub(crate) struct GalleryState {
     /// Every photo loaded so far, newest first — the order the lightbox's
     /// prev/next walks. The visible day sections are derived from this.
     pub(crate) model: gio::ListStore,
-    /// The day sections rendered by the Photos ListView, rebuilt from
-    /// [`Self::model`] by [`repaint_gallery`].
+    /// The Photos ListView's own model: one item per *rendered row* — a day
+    /// heading, or one row of that day's tile grid — rebuilt from
+    /// [`Self::model`] by [`repaint_gallery`]. Rows rather than whole days
+    /// because the ListView only realises what is on screen, and a day holding
+    /// 1,600 photos (a Takeout import lands one) would otherwise be 1,600
+    /// widgets built in a single bind.
     pub(crate) groups: gio::ListStore,
     /// Target tile edge in px, retuned by Ctrl+scroll / Ctrl+± (see
     /// [`zoom_gallery`]). The grid fits as many square tiles of about this size
@@ -110,11 +114,14 @@ pub(crate) struct GalleryState {
     /// re-flow, replaced on each new trigger so only the last one fires.
     pub(crate) thumb_source: RefCell<Option<glib::SourceId>>,
     pub(crate) relayout_source: RefCell<Option<glib::SourceId>>,
-    /// The day sections currently realised by the ListView, by their index in
-    /// [`Self::groups`]. A resize or a zoom step re-flows these in place —
-    /// rebuilding the ListStore instead would reset the scroll position out from
-    /// under the user.
-    pub(crate) bound: RefCell<HashMap<u32, gtk4::Box>>,
+    /// The rows currently realised by the ListView, as row index -> the uid of
+    /// its first photo (absent for a heading row). A resize or a zoom step
+    /// changes how many tiles fit per row, so the row model has to be rebuilt —
+    /// this is what lets the rebuild put the user back where they were.
+    pub(crate) bound: RefCell<BTreeMap<u32, Option<String>>>,
+    /// The ListView itself, so a rebuild can scroll back to the row the user was
+    /// looking at.
+    pub(crate) list: gtk4::ListView,
 }
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
@@ -158,11 +165,69 @@ pub(crate) const RELAYOUT_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// One day-section of the photos timeline: a heading plus the photos captured
 /// that day, in timeline order. Built from the flat [`Ui::gallery_model`] by
-/// [`group_photos`] and rendered as one [`gtk4::ListView`] row.
+/// [`group_photos`], then flattened into [`GalleryRow`]s for rendering.
 pub(crate) struct PhotoGroup {
     /// "Today", "Yesterday", or e.g. "3 June 2026".
     pub(crate) heading: String,
     pub(crate) photos: Vec<PhotoItem>,
+}
+
+/// One item of the ListView's model — the unit the gallery virtualises at.
+///
+/// A whole day is *not* one item: a Google Photos Takeout drops thousands of
+/// photos onto a single date, and one ListView item per day means GTK builds
+/// every one of those tiles in one bind, on the main thread, before the row can
+/// be shown. Splitting the day into its grid rows keeps a bind to a handful of
+/// widgets no matter how big the day is.
+pub(crate) enum GalleryRow {
+    /// A day heading: "Today", "3 June 2026".
+    Heading(String),
+    /// One row of a day's grid, already laid out to the current width and zoom.
+    Tiles {
+        photos: Vec<PhotoItem>,
+        edge: i32,
+        /// True for the last row of its day, which carries the section's bottom
+        /// margin so days stay visually separated.
+        last: bool,
+    },
+}
+
+impl GalleryRow {
+    /// The uid of the row's first photo, or `None` for a heading — the anchor a
+    /// relayout scrolls back to.
+    fn anchor(&self) -> Option<String> {
+        match self {
+            GalleryRow::Heading(_) => None,
+            GalleryRow::Tiles { photos, .. } => photos.first().map(|p| p.uid.clone()),
+        }
+    }
+
+    /// Whether re-rendering `self` would produce exactly what `other` shows —
+    /// the test [`repaint_gallery`] diffs on, so appending a page only touches
+    /// the rows that actually changed.
+    fn same_as(&self, other: &GalleryRow) -> bool {
+        match (self, other) {
+            (GalleryRow::Heading(a), GalleryRow::Heading(b)) => a == b,
+            (
+                GalleryRow::Tiles {
+                    photos: a,
+                    edge: ae,
+                    last: al,
+                },
+                GalleryRow::Tiles {
+                    photos: b,
+                    edge: be,
+                    last: bl,
+                },
+            ) => {
+                ae == be
+                    && al == bl
+                    && a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| x.uid == y.uid)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The widgets [`build_gallery_page`] hands back to [`build_window`].
@@ -611,40 +676,64 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        section.set_margin_bottom(16);
-        let heading = gtk4::Label::builder().halign(gtk4::Align::Start).build();
-        heading.add_css_class("heading");
-        heading.add_css_class("gallery-day");
-        section.append(&heading);
-        item.set_child(Some(&section));
+        // One container for both row kinds: the bind fills it with either a
+        // heading label or a strip of tiles. The alternative — two factories, or
+        // a Stack per row — buys nothing, since a row's children are rebuilt on
+        // bind either way.
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, TILE_GAP);
+        row.set_halign(gtk4::Align::Start);
+        item.set_child(Some(&row));
         item.set_activatable(false);
     });
 
     let ui_bind = ui.clone();
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let section = item.child().and_downcast::<gtk4::Box>().unwrap();
+        let row_box = item.child().and_downcast::<gtk4::Box>().unwrap();
         let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-        let group = obj.borrow::<PhotoGroup>();
+        let row = obj.borrow::<GalleryRow>();
 
-        let heading = section.first_child().and_downcast::<gtk4::Label>().unwrap();
-        heading.set_label(&group.heading);
-
-        fill_section(&ui_bind, &section, &group.photos);
-        // Remember the realised section so a learned aspect ratio or a resize can
-        // re-justify it in place, without rebuilding the ListStore (which would
-        // yank the scroll position back to the top).
+        while let Some(child) = row_box.first_child() {
+            row_box.remove(&child);
+        }
+        match &*row {
+            GalleryRow::Heading(heading) => {
+                row_box.set_margin_top(16);
+                row_box.set_margin_bottom(8);
+                let label = gtk4::Label::builder()
+                    .label(heading)
+                    .halign(gtk4::Align::Start)
+                    .build();
+                label.add_css_class("heading");
+                label.add_css_class("gallery-day");
+                row_box.append(&label);
+            }
+            GalleryRow::Tiles { photos, edge, last } => {
+                row_box.set_margin_top(0);
+                // The last row of a day carries the gap to the next heading.
+                row_box.set_margin_bottom(if *last { 8 } else { TILE_GAP });
+                for photo in photos {
+                    row_box.append(&photo_tile(
+                        &ui_bind,
+                        Tile {
+                            photo: photo.clone(),
+                            edge: *edge,
+                        },
+                    ));
+                }
+                schedule_thumbs(&ui_bind);
+            }
+        }
         ui_bind
             .gallery
             .bound
             .borrow_mut()
-            .insert(item.position(), section);
+            .insert(item.position(), row.anchor());
     });
 
-    // ListView recycles section widgets, so a scrolled-away day must give up its
-    // claim on the widgets — otherwise a thumbnail landing late would paint into
-    // a tile that now shows a different day.
+    // ListView recycles row widgets, so a scrolled-away row must give up its
+    // claim on them — otherwise a thumbnail landing late would paint into a tile
+    // that now shows a different photo.
     let ui_unbind = ui.clone();
     factory.connect_unbind(move |_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
@@ -653,10 +742,11 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
             .bound
             .borrow_mut()
             .remove(&item.position());
-        if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
-            let group = obj.borrow::<PhotoGroup>();
+        if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>()
+            && let GalleryRow::Tiles { photos, .. } = &*obj.borrow::<GalleryRow>()
+        {
             let mut wanted = ui_unbind.gallery.thumb_wanted.borrow_mut();
-            for photo in &group.photos {
+            for photo in photos {
                 wanted.remove(&photo.uid);
             }
         }
@@ -915,34 +1005,6 @@ pub(crate) fn plan_grid(target: i32, width: i32) -> (usize, i32) {
     let gaps = TILE_GAP * (columns as i32 - 1);
     let edge = ((avail - gaps) / columns as i32).max(1);
     (columns, edge)
-}
-
-/// (Re)build a bound day-section's tiles: lay this day's photos out to the
-/// current content width and hand each tile whatever thumbnail is already in
-/// memory, queueing the rest. Replaces the section's rows in place, leaving the
-/// heading — so a re-flow never touches the ListView's model or scroll.
-pub(crate) fn fill_section(ui: &Rc<Ui>, section: &gtk4::Box, photos: &[PhotoItem]) {
-    let Some(heading) = section.first_child() else {
-        return;
-    };
-    while let Some(old) = heading.next_sibling() {
-        section.remove(&old);
-    }
-
-    let width = gallery_width(ui);
-    let rows = gtk4::Box::new(gtk4::Orientation::Vertical, TILE_GAP);
-    for row in grid_rows(ui, photos, width) {
-        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, TILE_GAP);
-        // A short last row stays left-aligned at the same tile size rather than
-        // stretching: an even grid is the whole point of the square layout.
-        row_box.set_halign(gtk4::Align::Start);
-        for tile in row {
-            row_box.append(&photo_tile(ui, tile));
-        }
-        rows.append(&row_box);
-    }
-    section.append(&rows);
-    schedule_thumbs(ui);
 }
 
 /// The width the grid is laid out to: the ListView's own width, less a couple of
@@ -1238,27 +1300,35 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
     *ui.gallery.relayout_source.borrow_mut() = Some(source);
 }
 
-/// Rebuild the tiles of the day sections currently on screen, at the current
-/// width and zoom. Sections that are *not* realised need no work: they lay
-/// themselves out against the current state when the ListView binds them.
+/// Re-flow the timeline at the current width and zoom.
+///
+/// A different column count means different rows, so unlike the old
+/// section-per-day model there is nothing to patch in place — the row model is
+/// rebuilt. What that would cost the user is their scroll position, so the
+/// topmost realised row's first photo is remembered and scrolled back to.
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
-    let bound: Vec<(u32, gtk4::Box)> = ui
-        .gallery
-        .bound
-        .borrow()
-        .iter()
-        .map(|(pos, section)| (*pos, section.clone()))
-        .collect();
-    for (pos, section) in bound {
-        let Some(obj) = ui.gallery.groups.item(pos) else {
-            continue;
-        };
-        let Some(boxed) = obj.downcast_ref::<BoxedAnyObject>() else {
-            continue;
-        };
-        let photos = boxed.borrow::<PhotoGroup>().photos.clone();
-        fill_section(ui, &section, &photos);
-    }
+    let anchor: Option<String> = ui.gallery.bound.borrow().values().flatten().next().cloned();
+    repaint_gallery(ui);
+    let Some(anchor) = anchor else { return };
+    let Some(row) = row_of_photo(&ui.gallery.groups, &anchor) else {
+        return;
+    };
+    ui.gallery
+        .list
+        .scroll_to(row, gtk4::ListScrollFlags::empty(), None);
+}
+
+/// Which row of the rendered model holds `uid`, if any.
+fn row_of_photo(store: &gio::ListStore, uid: &str) -> Option<u32> {
+    (0..store.n_items()).find(|i| {
+        store
+            .item(*i)
+            .and_downcast::<BoxedAnyObject>()
+            .is_some_and(|obj| match &*obj.borrow::<GalleryRow>() {
+                GalleryRow::Heading(_) => false,
+                GalleryRow::Tiles { photos, .. } => photos.iter().any(|p| p.uid == uid),
+            })
+    })
 }
 
 /// Step the tile size by `delta` px and re-flow, clamped to the zoom range.
@@ -1276,46 +1346,75 @@ pub(crate) fn set_gallery_tile(ui: &Rc<Ui>, tile: i32) {
     schedule_relayout(ui);
 }
 
-/// Rebuild the day sections from the flat photo model. The timeline arrives
-/// newest-first, so photos of the same day are already contiguous — one pass
-/// splits them.
+/// Rebuild the ListView's row model from the flat photo model: each day becomes
+/// a heading row followed by its grid rows, laid out to the current width and
+/// zoom.
 ///
-/// The groups are diffed into the existing store rather than replacing it: a
-/// "load more" only really changes the last day (the one the new page continues)
-/// and appends after it, and clearing the store instead would scroll the user
-/// back to the top of the timeline at the exact moment they asked for more.
+/// The rows are diffed into the existing store rather than replacing it: a "load
+/// more" only really changes the last day (the one the new page continues) and
+/// appends after it, and clearing the store instead would scroll the user back
+/// to the top of the timeline at the exact moment they asked for more.
 pub(crate) fn repaint_gallery(ui: &Rc<Ui>) {
-    let groups = group_photos(&ui.gallery.model);
+    let rows = build_rows(ui);
     let store = &ui.gallery.groups;
 
-    for (i, group) in groups.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let i = i as u32;
         let unchanged = store
             .item(i)
             .and_downcast::<BoxedAnyObject>()
-            .is_some_and(|old| {
-                let old = old.borrow::<PhotoGroup>();
-                old.heading == group.heading && old.photos.len() == group.photos.len()
-            });
+            .is_some_and(|old| row.same_as(&old.borrow::<GalleryRow>()));
         if unchanged {
             continue;
         }
-        let boxed = BoxedAnyObject::new(PhotoGroup {
-            heading: group.heading.clone(),
-            photos: group.photos.clone(),
-        });
+        let boxed = BoxedAnyObject::new(clone_row(row));
         if i < store.n_items() {
             store.splice(i, 1, &[boxed]);
         } else {
             store.append(&boxed);
         }
     }
-    // Photos only ever get appended, so a shorter model means a fresh load.
-    if store.n_items() > groups.len() as u32 {
-        let len = groups.len() as u32;
+    if store.n_items() > rows.len() as u32 {
+        let len = rows.len() as u32;
         store.splice(len, store.n_items() - len, &[] as &[BoxedAnyObject]);
     }
 
+    update_gallery_subtitle(ui);
+}
+
+/// Flatten the loaded photos into the rows the ListView renders.
+fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
+    let width = gallery_width(ui);
+    let mut rows = Vec::new();
+    for group in group_photos(&ui.gallery.model) {
+        rows.push(GalleryRow::Heading(group.heading));
+        let grid = grid_rows(ui, &group.photos, width);
+        let last_index = grid.len().saturating_sub(1);
+        for (index, tiles) in grid.into_iter().enumerate() {
+            let edge = tiles.first().map(|t| t.edge).unwrap_or(TILE_DEFAULT);
+            rows.push(GalleryRow::Tiles {
+                photos: tiles.into_iter().map(|t| t.photo).collect(),
+                edge,
+                last: index == last_index,
+            });
+        }
+    }
+    rows
+}
+
+fn clone_row(row: &GalleryRow) -> GalleryRow {
+    match row {
+        GalleryRow::Heading(heading) => GalleryRow::Heading(heading.clone()),
+        GalleryRow::Tiles { photos, edge, last } => GalleryRow::Tiles {
+            photos: photos.clone(),
+            edge: *edge,
+            last: *last,
+        },
+    }
+}
+
+/// "1,204 photos" under the page title.
+fn update_gallery_subtitle(ui: &Rc<Ui>) {
     let loaded = ui.gallery.model.n_items() as usize;
     ui.gallery.subtitle.set_visible(loaded > 0);
     // An album counts what the server says it holds, not how much of it has been

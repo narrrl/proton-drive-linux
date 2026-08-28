@@ -9,6 +9,69 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [Unreleased]
+
+No schema change.
+
+### Added
+- **`pdfs redate-photos`: repair photos filed under the day they were imported.** A Takeout whose
+  metadata sidecars did not match imports with no capture time at all, and the SDK then seals
+  "now" into every revision — a decade of photos lands on one date. The date is still in the file
+  name, so this finds photos whose name disagrees with their stored capture time by more than a
+  day and rewrites them: download, re-upload at the right time, carry favourites and album
+  memberships across, then **trash** (never delete) the original — Proton has no API for editing a
+  sealed capture time. `--dry-run` reports without touching anything, `--from`/`--to` aim the run
+  at the days an import landed on, and `--limit` caps it. Followed with `pdfs redate-status`,
+  stopped with `pdfs cancel-redate`.
+
+- **`pdfs-prompt --fzf`: launcher search that updates as you type.** A dmenu-style launcher
+  (fuzzel, rofi, wofi, …) is handed one static list and filters it itself, which is why `--dmenu`
+  has to make searching two steps — type, Enter, *then* results. `fzf` can re-run a command on
+  every keystroke, so the new mode re-queries the daemon per keystroke (debounced to match the GTK
+  prompt) and keeps `--disabled` on so the daemon's ranking, not fzf's matcher, decides the order.
+  Abbreviation and typo tolerance therefore work here exactly as they do in the built-in window.
+- Started without a tty — from a WM keybinding — `--fzf` spawns a terminal for itself (foot,
+  ghostty, kitty, alacritty, wezterm or xterm, whichever is installed), each with the app-id/class
+  `pdfs-prompt` so a single window rule floats it. Override with `"prompt": { "terminal": [...] }`,
+  where a `{cmd}` token places the command and its absence appends it. `"prompt": { "mode": "fzf" }`
+  makes it the default front end for an existing keybinding.
+
+### Fixed
+- **Google Photos Takeout: sidecars with a localized suffix are matched again.** Google localizes
+  the `.supplemental-metadata` it appends to a photo's JSON sidecar — a German export writes
+  `.ergänzende-Metadaten` — and the scanner only knew the English spelling. No sidecar matched, so
+  no photo had a capture time, so every photo in the export was stamped with the moment it was
+  uploaded. Matching now hangs on the photo name in front of the suffix rather than on the suffix
+  itself, which is locale-agnostic, and covers the misspelt variants Google has also shipped.
+- **A photo with no usable sidecar now takes its date from its file name.** `PXL_20260818_171030868.jpg`,
+  `IMG_20230219_171030.jpg`, `Screenshot_20230101-102950.png`, `IMG-20230219-WA0001.jpg` and
+  `Screenshot from 2023-01-01 10-29-50.png` all carry the date the photo was taken. Read as UTC, so
+  it can be hours out — but never the years out that "the moment it was imported" is. A sidecar
+  still wins.
+
+- **An opened file or folder no longer dies with the window that opened it.** Everything launched
+  through `open_with` was started in the caller's process group with the caller's stdio, which was
+  invisible from a resident GUI but fatal from `--fzf`: the prompt exits the moment you choose
+  something, its terminal closes, and the pty hangup killed the application it had just started —
+  so an `@dir` rule like `alacritty --working-directory {}` opened nothing at all. Opened children
+  now get their own process group and no inherited stdio. Affects every front end; only `--fzf`
+  could observe the bug.
+
+### Changed
+- **The gallery virtualises at the row, not the day.** The Photos ListView had one item per day,
+  and a bind built every one of that day's tiles — fine for a normal day, ruinous for the ~1,600
+  photos a Takeout import drops onto a single date, which was 1,600 widgets constructed on the main
+  thread before the section could be shown. Days are now flattened into heading rows and grid rows,
+  so a bind is a handful of widgets whatever the day holds. A resize or a zoom step rebuilds the row
+  model (the column count decides which photos share a row) and scrolls back to the photo that was
+  at the top.
+- Updated to `proton-sdk` / `proton-drive-rs` 0.6.2 (photos save-to-timeline, `enumerate_events`).
+
+- The daemon side of both launcher front ends — search, pins, mountpoint lookup and the
+  open-a-result policy — moved out of `pdfs-gui/src/dmenu.rs` into a shared `pdfs-gui/src/query.rs`,
+  so `--dmenu` and `--fzf` cannot drift on what a result set is or what "open" means. No behaviour
+  change to `--dmenu`.
+
 ## [1.9.1] — 2026-08-21
 
 Thumbnails everywhere the GUI lists files, a status bar under the Files browser, and the

@@ -393,22 +393,27 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
             .unwrap_or(&file_name)
             .to_string();
 
+        // Sidecar first, then the date stamped into the name.
+        let capture_time = sidecar
+            .photo_taken_time
+            .as_ref()
+            .and_then(SidecarTime::epoch_seconds)
+            .or_else(|| {
+                sidecar
+                    .creation_time
+                    .as_ref()
+                    .and_then(SidecarTime::epoch_seconds)
+            })
+            .or_else(|| capture_time_from_name(&name))
+            .or_else(|| capture_time_from_name(&file_name));
+
         scan.photos.push(TakeoutPhoto {
             archive: raw.archive,
             entry: raw.entry.clone(),
             name,
             size: raw.size,
             media_type: media_type.to_string(),
-            capture_time: sidecar
-                .photo_taken_time
-                .as_ref()
-                .and_then(SidecarTime::epoch_seconds)
-                .or_else(|| {
-                    sidecar
-                        .creation_time
-                        .as_ref()
-                        .and_then(SidecarTime::epoch_seconds)
-                }),
+            capture_time,
             favorite: sidecar.favorited,
             bucket,
         });
@@ -507,34 +512,218 @@ fn unswap_duplicate_marker(stem: &str) -> Option<String> {
     Some(format!("{}{}{}", &head[..dot], marker, &head[dot..]))
 }
 
+/// The capture time a *file name* implies, in epoch seconds, or `None` when it
+/// carries no plausible date.
+///
+/// The last resort when a photo has no sidecar. Camera and messenger apps stamp
+/// the date into the name — `PXL_20260818_171030868.jpg`,
+/// `IMG_20230219_171030.jpg`, `Screenshot_20230101-102950.png`,
+/// `IMG-20230219-WA0001.jpg`, `Screenshot from 2023-01-01 10-29-50.png` — and a
+/// date that is merely *approximately* right still files the photo in the right
+/// year, which "the moment it was imported" does not.
+///
+/// The wall clock in a name has no zone attached, so it is read as UTC. That can
+/// be a few hours out; it is never the years out that the import-time fallback
+/// is. A sidecar always wins over this.
+pub fn capture_time_from_name(name: &str) -> Option<i64> {
+    let bytes = name.as_bytes();
+    let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    let num =
+        |start: usize, len: usize| -> Option<i64> { name.get(start..start + len)?.parse().ok() };
+
+    for start in 0..bytes.len() {
+        if !digit(start) || (start > 0 && digit(start - 1)) {
+            continue;
+        }
+        let run = |from: usize, len: usize| (0..len).all(|k| digit(from + k));
+        // `YYYYMMDD` as one run of exactly eight digits, or `YYYY-MM-DD` with
+        // any single separator repeated between the parts.
+        let (year, month, day, after) = if run(start, 8) && !digit(start + 8) {
+            (
+                num(start, 4)?,
+                num(start + 4, 2)?,
+                num(start + 6, 2)?,
+                start + 8,
+            )
+        } else if run(start, 4)
+            && !digit(start + 4)
+            && bytes.get(start + 4) == bytes.get(start + 7)
+            && run(start + 5, 2)
+            && run(start + 8, 2)
+            && !digit(start + 10)
+        {
+            (
+                num(start, 4)?,
+                num(start + 5, 2)?,
+                num(start + 8, 2)?,
+                start + 10,
+            )
+        } else {
+            continue;
+        };
+        if !(1990..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day)
+        {
+            continue;
+        }
+
+        // An optional time right behind the date, past one separator character.
+        let after = match bytes.get(after) {
+            Some(b'_' | b'-' | b' ' | b'.' | b',' | b'T' | b't' | b'@') => after + 1,
+            _ => after,
+        };
+        let time = if run(after, 6) {
+            // Six digits, possibly with the milliseconds tail Pixel appends.
+            Some((num(after, 2)?, num(after + 2, 2)?, num(after + 4, 2)?))
+        } else if run(after, 2)
+            && !digit(after + 2)
+            && bytes.get(after + 2) == bytes.get(after + 5)
+            && run(after + 3, 2)
+            && run(after + 6, 2)
+        {
+            Some((num(after, 2)?, num(after + 3, 2)?, num(after + 6, 2)?))
+        } else {
+            None
+        };
+        let (hour, minute, second) = match time {
+            Some((h, m, sec)) if h < 24 && m < 60 && sec < 60 => (h, m, sec),
+            _ => (0, 0, 0),
+        };
+
+        return Some(
+            days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second,
+        );
+    }
+    None
+}
+
+/// Days between 1970-01-01 and a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Avoids pulling a date crate in for one conversion.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The inverse of [`unswap_duplicate_marker`]: `IMG_1234(1).jpg` as Google
+/// writes its sidecar, `IMG_1234.jpg(1)`. `None` when the name carries no
+/// duplicate marker.
+fn swap_duplicate_marker(file_name: &str) -> Option<String> {
+    let marker_start = file_name.rfind('(')?;
+    let marker_end = marker_start + file_name[marker_start..].find(')')? + 1;
+    let marker = &file_name[marker_start..marker_end];
+    if !marker[1..marker.len() - 1]
+        .chars()
+        .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let tail = &file_name[marker_end..];
+    if !tail.starts_with('.') {
+        return None;
+    }
+    Some(format!("{}{}{}", &file_name[..marker_start], tail, marker))
+}
+
 /// Find the sidecar belonging to `file_name` among the JSON files of its folder.
 ///
-/// Tried in order of confidence: the exact name, the `(N)`-swapped name, then a
-/// prefix match for the case where truncation cut into the photo name itself.
+/// Tried in order of confidence: the exact name, the `(N)`-swapped name, an
+/// unknown trailing suffix, then a prefix match for the case where truncation
+/// cut into the photo name itself. The best-ranked candidate in the folder wins.
 fn find_sidecar<'a>(
     file_name: &str,
     in_folder: &BTreeMap<String, &'a Vec<u8>>,
 ) -> Option<&'a Vec<u8>> {
-    let mut prefix_match: Option<&'a Vec<u8>> = None;
-    let mut prefix_len = 0usize;
-
+    let mut best: Option<((u8, usize), &'a Vec<u8>)> = None;
     for (sidecar_name, body) in in_folder {
-        let stem = strip_sidecar_suffix(sidecar_name);
-        if stem == file_name {
-            return Some(body);
-        }
-        if unswap_duplicate_marker(&stem).as_deref() == Some(file_name) {
-            return Some(body);
-        }
-        // Truncated: the stem is a prefix of the photo's name. Keep the longest
-        // such prefix — a folder holding `IMG_1.jpg` and `IMG_12.jpg` must not
-        // let the shorter stem claim the longer photo.
-        if !stem.is_empty() && file_name.starts_with(&stem) && stem.len() > prefix_len {
-            prefix_len = stem.len();
-            prefix_match = Some(body);
+        let Some(rank) = sidecar_rank(strip_json_suffix(sidecar_name), file_name) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(current, _)| rank < *current) {
+            best = Some((rank, body));
         }
     }
-    prefix_match
+    best.map(|(_, body)| body)
+}
+
+/// How well a sidecar's `.json`-stripped `stem` matches `file_name`, as a sort
+/// key where **lower is better**: the leading number is the rule that matched,
+/// the second breaks ties within it.
+fn sidecar_rank(stem: &str, file_name: &str) -> Option<(u8, usize)> {
+    // 0 — the stem is the photo name once the (English) suffix is off.
+    let plain = strip_sidecar_suffix(stem);
+    if plain == file_name {
+        return Some((0, 0));
+    }
+    // 1 — the same, for `IMG_1234.jpg(1).json` against `IMG_1234(1).jpg`.
+    if unswap_duplicate_marker(&plain).as_deref() == Some(file_name) {
+        return Some((1, 0));
+    }
+    // 2 — the photo name is intact but a suffix we do not recognise follows it.
+    // Google *localizes* `.supplemental-metadata` (a German export writes
+    // `.ergänzende-Metadaten`) and has shipped misspelt variants of it, so the
+    // suffix cannot be enumerated — matching on the intact name in front of it
+    // is what stays locale-agnostic. The shortest leftover wins, so a folder
+    // holding both `IMG_1.jpg.<suffix>` and `IMG_1.jpg(1).<suffix>` gives each
+    // photo its own.
+    for candidate in [
+        Some(file_name.to_string()),
+        swap_duplicate_marker(file_name),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(rest) = stem.strip_prefix(&candidate)
+            && looks_like_sidecar_suffix(rest)
+        {
+            return Some((2, rest.len()));
+        }
+    }
+    // 3 — truncation ate into the photo name itself, leaving only a prefix of
+    // it. Every suffix boundary in the stem is tried, so this holds for a
+    // localized suffix too; the longest surviving prefix wins, because a folder
+    // with `IMG_1.jpg` and `IMG_12.jpg` must not let the shorter stem claim the
+    // longer photo.
+    let mut longest: Option<usize> = None;
+    for head in suffix_boundaries(stem) {
+        if !head.is_empty()
+            && file_name.starts_with(head)
+            && longest.is_none_or(|len| head.len() > len)
+        {
+            longest = Some(head.len());
+        }
+    }
+    longest.map(|len| (3, usize::MAX - len))
+}
+
+/// The stem plus each of its prefixes ending before a `.`, longest first — the
+/// possible boundaries between a photo name and a sidecar suffix.
+fn suffix_boundaries(stem: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(stem).chain(
+        stem.char_indices()
+            .filter(|(_, c)| *c == '.')
+            .map(|(index, _)| &stem[..index])
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    )
+}
+
+/// Whether `rest` — what follows an intact photo name in a sidecar's stem —
+/// looks like a metadata suffix rather than the tail of a different file's name.
+/// Google's suffixes all start at a `.`, or at the `(N)` duplicate marker.
+fn looks_like_sidecar_suffix(rest: &str) -> bool {
+    rest.starts_with('.') || rest.starts_with('(')
+}
+
+/// Drop a trailing `.json`, case-insensitively.
+fn strip_json_suffix(sidecar: &str) -> &str {
+    match sidecar.len().checked_sub(5) {
+        Some(cut) if sidecar[cut..].eq_ignore_ascii_case(".json") => &sidecar[..cut],
+        _ => sidecar,
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +850,106 @@ mod tests {
         );
 
         assert_eq!(scan.photos[0].capture_time, Some(1_500_000_000));
+    }
+
+    #[test]
+    fn a_localized_supplemental_suffix_still_matches() {
+        // A German export writes `.ergänzende-Metadaten` where an English one
+        // writes `.supplemental-metadata`; the photo name in front of it is
+        // what the match hangs on.
+        let mut sidecars = HashMap::new();
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Fotos/Fotos von 2023/IMG-20230219-WA0001.jpg.ergänzende-Metadaten.json",
+            r#"{"photoTakenTime":{"timestamp":"1676800000"}}"#,
+        );
+        let scan = assemble(
+            vec![entry(
+                0,
+                "Takeout/Google Fotos/Fotos von 2023/IMG-20230219-WA0001.jpg",
+                10,
+            )],
+            &sidecars,
+        );
+        assert_eq!(scan.photos[0].capture_time, Some(1_676_800_000));
+    }
+
+    #[test]
+    fn a_localized_suffix_does_not_let_one_sidecar_claim_a_sibling() {
+        let mut sidecars = HashMap::new();
+        for name in ["IMG_1.jpg", "IMG_1(1).jpg"] {
+            sidecar(
+                &mut sidecars,
+                &format!("Takeout/Google Fotos/Album/{name}.ergänzende-Metadaten.json"),
+                r#"{"photoTakenTime":{"timestamp":"1"}}"#,
+            );
+        }
+        // Google writes the duplicate's sidecar with the marker after the
+        // extension, so this is the spelling that actually ships.
+        sidecars.remove("Album/IMG_1(1).jpg.ergänzende-Metadaten.json");
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Fotos/Album/IMG_1.jpg(1).ergänzende-Metadaten.json",
+            r#"{"photoTakenTime":{"timestamp":"2"}}"#,
+        );
+        let scan = assemble(
+            vec![
+                entry(0, "Takeout/Google Fotos/Album/IMG_1.jpg", 10),
+                entry(0, "Takeout/Google Fotos/Album/IMG_1(1).jpg", 10),
+            ],
+            &sidecars,
+        );
+        assert_eq!(scan.photos[0].capture_time, Some(1));
+        assert_eq!(scan.photos[1].capture_time, Some(2));
+    }
+
+    #[test]
+    fn the_file_name_date_is_the_fallback_when_no_sidecar_matches() {
+        let scan = assemble(
+            vec![entry(
+                0,
+                "Takeout/Google Fotos/Fotos von 2023/IMG-20230219-WA0001.jpg",
+                10,
+            )],
+            &HashMap::new(),
+        );
+        // 2023-02-19 00:00:00 UTC.
+        assert_eq!(scan.photos[0].capture_time, Some(1_676_764_800));
+    }
+
+    #[test]
+    fn file_name_dates_cover_the_common_camera_and_messenger_spellings() {
+        // 2026-08-18 17:10:30 UTC, with Pixel's milliseconds tail.
+        assert_eq!(
+            capture_time_from_name("PXL_20260818_171030868.RAW-01.COVER.jpg"),
+            Some(1_787_073_030)
+        );
+        assert_eq!(
+            capture_time_from_name("IMG_20260818_171030.jpg"),
+            Some(1_787_073_030)
+        );
+        assert_eq!(
+            capture_time_from_name("Screenshot_20260818-171030.png"),
+            Some(1_787_073_030)
+        );
+        assert_eq!(
+            capture_time_from_name("Screenshot from 2026-08-18 17-10-30.png"),
+            Some(1_787_073_030)
+        );
+        // A date with no usable time lands at midnight, not at import time.
+        assert_eq!(
+            capture_time_from_name("IMG-20260818-WA0001.jpg"),
+            Some(1_787_011_200)
+        );
+    }
+
+    #[test]
+    fn a_name_without_a_plausible_date_yields_nothing() {
+        assert_eq!(capture_time_from_name("100_1234.JPG"), None);
+        assert_eq!(capture_time_from_name("DSC00042.jpg"), None);
+        // A nine-digit run is not a date; neither is an out-of-range month.
+        assert_eq!(capture_time_from_name("IMG_202608181.jpg"), None);
+        assert_eq!(capture_time_from_name("IMG_20261818.jpg"), None);
     }
 
     #[test]

@@ -90,6 +90,7 @@ mod mount;
 mod photos;
 mod profile;
 mod reads;
+mod redate;
 mod revisions;
 mod sharing;
 mod shutdown;
@@ -4856,7 +4857,7 @@ fn public_link_info(link: proton_drive_rs::PublicLink) -> PublicLinkInfo {
 
 /// Parse a `volume~link` uid display string back into a [`NodeUid`]. Front-ends
 /// receive uids as strings over the control socket and pass them back verbatim.
-fn parse_uid(s: &str) -> Option<NodeUid> {
+pub(crate) fn parse_uid(s: &str) -> Option<NodeUid> {
     let (vol, link) = s.split_once('~')?;
     if vol.is_empty() || link.is_empty() || link.contains('~') {
         return None;

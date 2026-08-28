@@ -41,6 +41,10 @@ Recommends:     gnome-keyring
 Recommends:     gnome-shell-extension-appindicator
 Recommends:     kwallet
 
+# Only for `pdfs-prompt --fzf`; every other front end works without them.
+Suggests:       fzf
+Suggests:       foot
+
 Provides:       pdfs = %{version}-%{release}
 
 %description

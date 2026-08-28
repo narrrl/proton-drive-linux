@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
-version = "1.9.1"
+version = "1.9.2"
 edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
@@ -15,8 +15,8 @@ keywords = ["proton", "drive", "fuse", "sync", "linux"]
 categories = ["filesystem", "command-line-utilities"]
 
 [workspace.dependencies]
-proton-sdk = { version = "0.6.1" }
-proton-drive-rs = { version = "0.6.1" }
+proton-sdk = { version = "0.6.2" }
+proton-drive-rs = { version = "0.6.2" }
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }

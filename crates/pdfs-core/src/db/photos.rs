@@ -165,6 +165,31 @@ impl Db {
         Ok(rows)
     }
 
+    /// The whole persisted timeline, in stored order. Only for whole-library
+    /// passes (the photo re-date) — the gallery pages with
+    /// [`Db::photos_page`].
+    pub fn photos_all(&self) -> Result<Vec<StoredPhoto>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT uid, capture_time, name, ratio, thumb_state, kind, favorite \
+             FROM photos ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(StoredPhoto {
+                    uid: r.get(0)?,
+                    capture_time: r.get(1)?,
+                    name: r.get(2)?,
+                    ratio: r.get(3)?,
+                    thumb_state: r.get(4)?,
+                    kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                    favorite: r.get::<_, i64>(6)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// The months the timeline spans, newest first, each with how many photos it
     /// holds — the data behind the date scrubber. Buckets are local-time
     /// `(year, month)` so they line up with the day headings the gallery draws

@@ -411,6 +411,36 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 CtlResponse::error(CoreError::invalid("no import is running"))
             }
         }
+        // The scan reads the whole persisted timeline and every candidate is a
+        // download plus an upload, so this goes to a background thread and is
+        // read back through `RedateStatus`.
+        Ok(CtlRequest::RedatePhotos {
+            dry_run,
+            limit,
+            range,
+        }) => match core.spawn_redate(dry_run, limit, range) {
+            Ok(()) => CtlResponse::Ok {
+                message: if dry_run {
+                    "checking photo dates".to_string()
+                } else {
+                    "fixing photo dates".to_string()
+                },
+            },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::RedateStatus) => {
+            let (running, summary) = crate::redate::redate_status();
+            CtlResponse::RedateStatus { running, summary }
+        }
+        Ok(CtlRequest::CancelRedate) => {
+            if crate::redate::cancel_redate() {
+                CtlResponse::Ok {
+                    message: "stopping the re-date".to_string(),
+                }
+            } else {
+                CtlResponse::error(CoreError::invalid("no photo re-date is running"))
+            }
+        }
         Ok(CtlRequest::UploadPhoto {
             name,
             media_type,

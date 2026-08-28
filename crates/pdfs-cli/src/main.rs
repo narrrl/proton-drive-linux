@@ -176,6 +176,43 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
+    /// Fix photos filed under the day they were imported instead of the day
+    /// they were taken.
+    ///
+    /// A Takeout whose metadata sidecars did not match imports with no capture
+    /// time, and Proton then stamps every photo with the moment it arrived. The
+    /// date is still in the file name (`IMG-20230219-WA0001.jpg`), so this finds
+    /// photos whose name disagrees with their capture time by more than a day
+    /// and rewrites them at the right time.
+    ///
+    /// Proton cannot edit a sealed capture time, so a rewrite means re-uploading
+    /// the photo and trashing the original — favourites and albums are carried
+    /// across, and the original goes to Proton's trash, not away. Run it with
+    /// `--dry-run` first.
+    RedatePhotos {
+        /// Report what would be re-dated without uploading or trashing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after this many photos.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Only touch photos whose current capture time is on or after this
+        /// date (`YYYY-MM-DD`, UTC) — aim the repair at the days an import
+        /// landed on.
+        #[arg(long)]
+        from: Option<String>,
+        /// Only touch photos whose current capture time is before this date
+        /// (`YYYY-MM-DD`, UTC).
+        #[arg(long)]
+        to: Option<String>,
+        /// Stay attached and print the report when the run finishes.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Show how the running (or last) photo re-date is doing.
+    RedateStatus,
+    /// Stop the running photo re-date.
+    CancelRedate,
     /// Show how the running (or last) Google Photos import is doing.
     ImportStatus,
     /// Stop the running Google Photos import.
@@ -616,6 +653,15 @@ fn main() -> Result<()> {
             dry_run,
             wait,
         } => cmd_import_google_photos(archives, dry_run, wait),
+        Command::RedatePhotos {
+            dry_run,
+            limit,
+            from,
+            to,
+            wait,
+        } => cmd_redate_photos(dry_run, limit, from, to, wait),
+        Command::RedateStatus => cmd_redate_status(),
+        Command::CancelRedate => cmd_cancel_redate(),
         Command::ImportStatus => cmd_import_status(),
         Command::CancelImport => cmd_cancel_import(),
         Command::Album { uid, limit, offset } => cmd_album(uid, limit, offset),
@@ -1784,6 +1830,115 @@ fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         }
+    }
+}
+
+fn cmd_redate_photos(
+    dry_run: bool,
+    limit: Option<usize>,
+    from: Option<String>,
+    to: Option<String>,
+    wait: bool,
+) -> Result<()> {
+    let range = match (from.as_deref(), to.as_deref()) {
+        (None, None) => None,
+        (from, to) => Some((
+            from.map(parse_day).transpose()?.unwrap_or(i64::MIN),
+            to.map(parse_day).transpose()?.unwrap_or(i64::MAX),
+        )),
+    };
+    match control_request(CtlRequest::RedatePhotos {
+        dry_run,
+        limit,
+        range,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    if !wait {
+        println!("Run `pdfs redate-status` to follow it.");
+        return Ok(());
+    }
+    // Polled for the same reason the import is: request/response protocol, and a
+    // run over a whole library is a download plus an upload per photo.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match control_request(CtlRequest::RedateStatus)? {
+            CtlResponse::RedateStatus { running: true, .. } => continue,
+            CtlResponse::RedateStatus { summary, .. } => {
+                print_redate_summary(summary.as_ref());
+                return Ok(());
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        }
+    }
+}
+
+/// A `YYYY-MM-DD` day as epoch seconds at UTC midnight. Reuses the Takeout
+/// scanner's date reader, which already accepts exactly this spelling.
+fn parse_day(day: &str) -> Result<i64> {
+    pdfs_core::takeout::capture_time_from_name(day)
+        .ok_or_else(|| anyhow!("not a date (expected YYYY-MM-DD): {day}"))
+}
+
+fn cmd_redate_status() -> Result<()> {
+    match control_request(CtlRequest::RedateStatus)? {
+        CtlResponse::RedateStatus { running, summary } => {
+            if running {
+                println!("Re-date running. `pdfs transfers` shows its progress.");
+            }
+            print_redate_summary(summary.as_ref());
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_cancel_redate() -> Result<()> {
+    match control_request(CtlRequest::CancelRedate)? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn print_redate_summary(summary: Option<&pdfs_core::control::RedateSummary>) {
+    let Some(summary) = summary else {
+        println!("No re-date has run yet.");
+        return;
+    };
+    println!("Photos examined  : {}", summary.examined);
+    println!("Mis-dated        : {}", summary.candidates);
+    if summary.dry_run {
+        println!("(dry run — nothing was uploaded or trashed)");
+    } else {
+        println!("Re-dated         : {}", summary.redated);
+        if summary.album_links > 0 {
+            println!("Albums refiled   : {}", summary.album_links);
+        }
+        if summary.failed > 0 {
+            println!("Failed           : {}", summary.failed);
+        }
+        if summary.bytes > 0 {
+            println!("Uploaded bytes   : {}", summary.bytes);
+        }
+    }
+    for (name, stored, wanted) in &summary.samples {
+        // Epoch seconds, as `pdfs photos` prints capture times.
+        println!("  {name}: {stored} -> {wanted}");
+    }
+    if summary.candidates > summary.samples.len() {
+        println!(
+            "  … and {} more",
+            summary.candidates - summary.samples.len()
+        );
+    }
+    if summary.cancelled {
+        println!("Run was cancelled before it finished.");
     }
 }
 

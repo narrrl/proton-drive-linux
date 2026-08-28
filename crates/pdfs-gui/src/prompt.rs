@@ -24,6 +24,8 @@ use pdfs_core::opener::{self, OpenWith};
 
 mod activation;
 mod dmenu;
+mod fzf;
+mod query;
 use activation::{DriveActivation, drive_activation, mounted_or_relative, mounted_target};
 
 const APP_ID: &str = "io.narl.proton-drive-linux-prompt";
@@ -125,7 +127,7 @@ fn is_media(name: &str) -> bool {
 /// One row in the unified result list. The two sections hold different payloads
 /// — a Drive hit must be hydrated through the daemon before it can be opened, a
 /// local file is already on disk — but they share one keyboard cursor.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum Hit {
     Drive(SearchHit),
     Local(LocalHit),
@@ -341,12 +343,20 @@ Options:
                         rofi, …) instead of the built-in GTK window. Also
                         settable permanently as \"prompt\": { \"mode\": \"dmenu\" }
                         in config.json.
+  --fzf                 Search in fzf, in a terminal, re-querying the daemon on
+                        every keystroke — results appear as you type, unlike
+                        --dmenu. Also settable as \"prompt\": { \"mode\": \"fzf\" }.
   --gtk                 Force the built-in window, overriding that setting.
   --menu <COMMAND>      Launcher command line for --dmenu, e.g.
                         --menu 'fuzzel --dmenu --width 60'. Overrides
                         \"prompt\": { \"menu\": [...] }.
   --query <TEXT>        Search for TEXT immediately instead of opening on the
-                        pinned-files list (--dmenu only).
+                        pinned-files list (--dmenu and --fzf only).
+  --feed <TEXT>         Print the hits for TEXT, one per line, and exit. This is
+                        what --fzf re-runs on each keystroke; it is not meant to
+                        be typed.
+  --inner               Run fzf here rather than spawning a terminal. Set by the
+                        terminal --fzf spawns; not meant to be typed.
   -h, --help            Show this help.
 ";
 
@@ -356,6 +366,12 @@ struct Args {
     mode: Option<PromptMode>,
     menu: Option<Vec<String>>,
     query: Option<String>,
+    /// `--feed`: print hits for this text and exit. `Some(None)` is `--feed`
+    /// with an empty argument, which fzf sends for an empty input — a real
+    /// request for the pinned list, not an absent flag.
+    feed: Option<Option<String>>,
+    /// `--inner`: we are the process a spawned terminal is running.
+    inner: bool,
 }
 
 fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -363,12 +379,19 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         mode: None,
         menu: None,
         query: None,
+        feed: None,
+        inner: false,
     };
     let mut argv = argv.peekable();
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--dmenu" => args.mode = Some(PromptMode::Dmenu),
+            "--fzf" => args.mode = Some(PromptMode::Fzf),
             "--gtk" => args.mode = Some(PromptMode::Gtk),
+            "--inner" => args.inner = true,
+            // fzf passes an empty argument for an empty input, so a missing
+            // value here is that case rather than a user error.
+            "--feed" => args.feed = Some(argv.next().filter(|text| !text.trim().is_empty())),
             // A launcher command is one shell-ish string so it can live in a
             // keybinding; splitting on whitespace is enough for flags, and a
             // launcher argument needing spaces belongs in config.json.
@@ -416,16 +439,31 @@ fn main() -> glib::ExitCode {
         }
     };
 
+    // A feed is fzf's own reload child, not a front end: it must print hits and
+    // nothing else, so it is answered before the stored mode is even read.
+    if let Some(query) = args.feed {
+        fzf::feed(query.as_deref());
+        return glib::ExitCode::SUCCESS;
+    }
+
     // The stored mode makes an existing keybinding switch front ends without
     // being re-bound; an explicit flag still wins.
     let stored = AppDirs::new()
         .map(|dirs| dirs.load_config().resolved_prompt().resolved_mode())
         .unwrap_or_default();
-    if args.mode.unwrap_or(stored) == PromptMode::Dmenu {
-        return match dmenu::run(dmenu::Options {
+    let launcher = match args.mode.unwrap_or(stored) {
+        PromptMode::Dmenu => Some(dmenu::run(dmenu::Options {
             menu: args.menu,
             query: args.query,
-        }) {
+        })),
+        PromptMode::Fzf => Some(fzf::run(fzf::Options {
+            query: args.query,
+            inner: args.inner,
+        })),
+        PromptMode::Gtk => None,
+    };
+    if let Some(result) = launcher {
+        return match result {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(message) => {
                 eprintln!("pdfs-prompt: {message}");
