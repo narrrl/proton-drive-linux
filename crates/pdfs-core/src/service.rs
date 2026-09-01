@@ -47,10 +47,18 @@ fn systemctl_query(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Enable the service so it survives reboots/logins and start it now. Called on
-/// successful login.
+/// Enable the service so it survives reboots/logins, and bring it up now.
+/// Called on successful login.
+///
+/// `restart` rather than `enable --now`: the unit may already be active but
+/// parked in the daemon's login-wait backoff (`pdfs daemon` sleeps between
+/// keyring checks). `--now` is a no-op on an active unit, so the daemon would
+/// keep sleeping and the mount would not appear until the next poll fired.
+/// Restarting makes the new session take effect immediately, and starts the
+/// unit when it is not running at all.
 pub fn enable_start() -> bool {
-    systemctl(&["enable", "--now"])
+    let enabled = systemctl(&["enable"]);
+    systemctl(&["restart"]) && enabled
 }
 
 /// Stop the running mount without disabling it. Called by the tray's
