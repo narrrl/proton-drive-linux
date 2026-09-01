@@ -17,6 +17,7 @@ use pdfs_core::control::{
     RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase, pending_summary,
 };
 use pdfs_core::db::Db;
+use pdfs_core::service;
 
 #[derive(Parser)]
 #[command(
@@ -1309,6 +1310,15 @@ fn cmd_login(username: Option<String>) -> Result<()> {
             other => anyhow::Error::new(other).context("login failed"),
         })?;
 
+    // A daemon that is already up is parked in `wait_for_session`, sleeping
+    // between keyring checks; restart it so the mount appears now instead of
+    // whenever the next poll fires. Only when it is already active — `pdfs
+    // login` deliberately does not enable the unit the way the GUI does, so a
+    // headless user driving `pdfs daemon` by hand keeps that setup.
+    if service::is_active() {
+        service::restart();
+    }
+
     println!("Logged in as {username}. Session stored in the system keyring.");
     Ok(())
 }
@@ -1451,14 +1461,19 @@ fn cmd_mount(mountpoint: Option<PathBuf>) -> Result<()> {
 /// How long to wait before the next login check, after `attempts` checks have
 /// already come back [`pdfs_core::Error::NotLoggedIn`].
 ///
-/// Doubles from 3s to a 60s ceiling. The interval is not just a sleep:
+/// Doubles from 3s to a 15s ceiling. The interval is not just a sleep:
 /// [`auth::load`] builds a fresh `keyring::Entry` on every call, so each check
 /// opens a new D-Bus connection to the Secret Service and negotiates an
-/// encrypted session over it. A flat 3s poll meant roughly 48,000 of those a
-/// day from a daemon that had nothing to do.
+/// encrypted session over it. A flat 3s poll meant 28,800 of those a day from a
+/// daemon that had nothing to do; the ceiling cuts that by 80%.
+///
+/// The ceiling stays low because the sleep is also the worst-case login →
+/// mount latency for anything that does *not* poke systemd: front-ends restart
+/// the unit on login (`service::enable_start`), which interrupts the sleep
+/// immediately, but a hand-run `pdfs daemon` has no such wake-up path.
 fn login_poll_delay(attempts: u32) -> std::time::Duration {
     const BASE_SECS: u64 = 3;
-    const MAX_SECS: u64 = 60;
+    const MAX_SECS: u64 = 15;
 
     // `checked_shl` rather than `<<`: the daemon can sit unauthenticated for
     // weeks, and a shift past the width of the type is a panic, not a big number.
@@ -2587,13 +2602,12 @@ mod login_wait_tests {
         assert_eq!(login_poll_delay(0), Duration::from_secs(3));
         assert_eq!(login_poll_delay(1), Duration::from_secs(6));
         assert_eq!(login_poll_delay(2), Duration::from_secs(12));
-        assert_eq!(login_poll_delay(3), Duration::from_secs(24));
-        assert_eq!(login_poll_delay(4), Duration::from_secs(48));
-        assert_eq!(login_poll_delay(5), Duration::from_secs(60));
+        assert_eq!(login_poll_delay(3), Duration::from_secs(15));
+        assert_eq!(login_poll_delay(4), Duration::from_secs(15));
         // A daemon left unauthenticated for weeks reaches attempt counts well
         // past the width of the shift; that must cap, not panic.
-        assert_eq!(login_poll_delay(64), Duration::from_secs(60));
-        assert_eq!(login_poll_delay(u32::MAX), Duration::from_secs(60));
+        assert_eq!(login_poll_delay(64), Duration::from_secs(15));
+        assert_eq!(login_poll_delay(u32::MAX), Duration::from_secs(15));
     }
 
     #[test]
@@ -2625,8 +2639,8 @@ mod login_wait_tests {
         // the way a flat 3s poll did.
         let total: Duration = slept.iter().sum();
         assert!(
-            total >= Duration::from_secs(15 * 60),
-            "20 checks should span at least 15 minutes, spanned {total:?}"
+            total >= Duration::from_secs(4 * 60),
+            "20 checks should span at least 4 minutes, spanned {total:?}"
         );
     }
 
