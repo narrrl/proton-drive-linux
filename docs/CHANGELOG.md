@@ -11,7 +11,38 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-No schema change.
+Nothing yet.
+
+## [1.9.3] — 2026-09-01
+
+The daemon's wait-for-login loop, and the latency that fixing it introduced. No schema change.
+Schema: **28**; SDK unchanged at `proton-sdk` / `proton-drive-rs` **0.6.2**.
+
+### Fixed
+- **An enabled service with no saved session no longer polls the keyring 28,800 times a day.**
+  `wait_for_session` slept a flat 3 s between checks, and a check is not just a sleep — `auth::load`
+  builds a fresh `keyring::Entry`, so every iteration opened a new D-Bus connection to the Secret
+  Service and negotiated a session on it. The wait now backs off, and "not logged in" is said once
+  at `info` instead of on every pass, which also stops the journal filling with tens of thousands
+  of identical lines (`#21`).
+- **Signing in wakes the parked daemon instead of leaving the mount up to an interval late.** The
+  backoff had no wake-up path: a unit started at boot reaches the ceiling within ~90 s, and
+  `enable --now` is a no-op on an already-active unit, so the GUI login and the tray's Connect left
+  it sleeping. `service::enable_start` now runs `enable` + `restart`, which interrupts the sleep and
+  still starts a unit that is down, and `pdfs login` restarts the unit when it is already active —
+  deliberately without touching `enable`, so a headless setup driving `pdfs daemon` by hand is left
+  alone. The ceiling also drops from 60 s to 15 s, still an 80% cut in keyring/D-Bus wakeups
+  (28,800/day → 5,760/day), bounding the worst case for paths that never reach systemd.
+
+### Changed
+- The wait is extracted into `wait_for_session()`, taking the load and sleep calls as parameters,
+  so the schedule is testable without a keyring and without real time passing.
+
+## [1.9.2] — 2026-08-28
+
+Repair for photos a Takeout import filed under the day they were imported, an `fzf` launcher front
+end, and a gallery that survives 1,600 photos on one date. No schema change. Schema: **28**; SDK
+`proton-sdk` / `proton-drive-rs` **0.6.2**.
 
 ### Added
 - **`pdfs redate-photos`: repair photos filed under the day they were imported.** A Takeout whose
@@ -621,6 +652,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[1.9.3]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.3
+[1.9.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.2
 [1.9.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.1
 [1.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.0
 [1.8.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.2
