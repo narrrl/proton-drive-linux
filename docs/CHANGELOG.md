@@ -13,6 +13,25 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 Nothing yet.
 
+## [1.10.1] — 2026-09-15
+
+Dependency upgrade release, clearing both open Dependabot advisories. No schema change.
+Schema: **28**; SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.4**.
+
+### Security
+- **`lru` IterMut Stacked Borrows advisory.** The SDK now depends on `lru` 0.18.
+- **`atty` unaligned read advisory.** The tray moved to `ksni` 0.3, which no longer pulls
+  `dbus-codegen` → `clap` 2 → `atty`.
+
+### Changed
+- **Keyring backend is `keyring-core` + `dbus-secret-service-keyring-store`** (keyring 4's split).
+  Same libdbus Secret Service as before; stored sessions written by earlier releases are still
+  found, so no re-login is needed.
+- **The tray waits for a late StatusNotifierWatcher** instead of failing to start when it beats
+  the desktop's tray host onto the session bus.
+- Upgraded `gtk4` 0.11, `libadwaita` 0.9, `webkit6` 0.6, `rusqlite` 0.40 (bundled SQLite),
+  `fuser` 0.18, `directories` 6, `sha1`/`sha2` 0.11, `base64` 0.23.
+
 ## [1.10.0] — 2026-09-15
 
 One-request move-and-rename in the drain, and who shared an item with you. No schema change.
