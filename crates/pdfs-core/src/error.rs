@@ -11,7 +11,7 @@ pub enum Error {
     Proton(#[from] proton_sdk::ProtonError),
 
     #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
+    Keyring(#[from] keyring_core::Error),
 
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),

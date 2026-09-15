@@ -29,9 +29,9 @@ anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ksni = "0.2"
-gtk4 = { version = "0.9", features = ["v4_12"] }
-adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+ksni = { version = "0.3", features = ["blocking"] }
+gtk4 = { version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 async-channel = "2"
 exif = { version = "0.6", package = "kamadak-exif" }
-webkit6 = "0.4"
+webkit6 = "0.6"

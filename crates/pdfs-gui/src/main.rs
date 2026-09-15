@@ -14,8 +14,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
-use ksni::{MenuItem, Tray, TrayService};
+use ksni::{MenuItem, Tray};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
@@ -282,13 +283,13 @@ fn main() -> Result<()> {
         state: poll_state(&socket, &default_mountpoint),
     };
 
-    let service = TrayService::new(tray);
-    let handle = service.handle();
-    std::thread::spawn(move || {
-        if let Err(e) = service.run() {
-            tracing::error!("tray service stopped: {e:?}");
-        }
-    });
+    // The tray autostarts with the session and can beat the desktop's SNI
+    // watcher onto the bus. Without `assume_sni_available` that race is a hard
+    // spawn error; with it the item waits and registers once the watcher shows.
+    let handle = tray
+        .assume_sni_available(true)
+        .spawn()
+        .context("start tray service")?;
 
     // Poll the daemon forever, pushing each fresh snapshot into the tray so the
     // menu reflects mount/login changes made elsewhere (e.g. via the CLI).

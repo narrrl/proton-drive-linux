@@ -1364,7 +1364,7 @@ fn icon_for(name: &str, is_dir: bool) -> gio::Icon {
     if is_dir {
         return gio::ThemedIcon::new("folder").upcast();
     }
-    let (content_type, _uncertain) = gio::functions::content_type_guess(Some(name), &[]);
+    let (content_type, _uncertain) = gio::functions::content_type_guess(Some(name), None);
     gio::functions::content_type_get_icon(&content_type)
 }
 

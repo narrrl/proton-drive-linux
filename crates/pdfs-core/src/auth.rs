@@ -6,7 +6,7 @@
 //! interactive step; the refresh token auto-renews via the HTTP client's 401
 //! path, so no fresh 2FA is required until the refresh token itself expires.
 
-use keyring::Entry;
+use keyring_core::Entry;
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
 use proton_sdk::api::{HumanVerification, HumanVerificationCredential};
 use proton_sdk::cache::EncryptedCacheRepository;
@@ -81,6 +81,11 @@ fn client_config() -> ProtonClientConfiguration {
 }
 
 fn keyring_entry() -> Result<Entry> {
+    // Installed lazily rather than once at startup so a session bus that was not
+    // up yet on the first attempt is retried on the next one.
+    if keyring_core::get_default_store().is_none() {
+        keyring_core::set_default_store(dbus_secret_service_keyring_store::Store::new()?);
+    }
     Ok(Entry::new(KEYRING_SERVICE, KEYRING_USER)?)
 }
 
@@ -215,7 +220,7 @@ pub fn load() -> Result<StoredSession> {
     let entry = keyring_entry()?;
     match entry.get_password() {
         Ok(json) => Ok(serde_json::from_str(&json)?),
-        Err(keyring::Error::NoEntry) => Err(Error::NotLoggedIn),
+        Err(keyring_core::Error::NoEntry) => Err(Error::NotLoggedIn),
         Err(e) => Err(e.into()),
     }
 }
@@ -238,7 +243,7 @@ pub fn logout() -> Result<()> {
         }
     }
     match keyring_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
