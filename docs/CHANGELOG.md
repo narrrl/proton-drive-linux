@@ -11,7 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.3**. No schema change.
+Nothing yet.
+
+## [1.10.0] — 2026-09-15
+
+One-request move-and-rename in the drain, and who shared an item with you. No schema change.
+Schema: **28**; SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.3**.
 
 ### Added
 - **Shared with me says who shared an item, and when.** The GUI row subtitle and `pdfs
