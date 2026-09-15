@@ -3201,6 +3201,8 @@ fn test_db_has_children_and_trashed_filtering() {
         photo: None,
         album: None,
         verification: Default::default(),
+        direct_role: None,
+        share_id: None,
     };
     db.upsert_node(&parent_node).unwrap();
 
@@ -3227,6 +3229,8 @@ fn test_db_has_children_and_trashed_filtering() {
         photo: None,
         album: None,
         verification: Default::default(),
+        direct_role: None,
+        share_id: None,
     };
     db.upsert_node(&child_node).unwrap();
 

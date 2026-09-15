@@ -3738,6 +3738,9 @@ impl Core {
                 // My own tree: a role only means something under a share, and
                 // this listing never crosses into one.
                 role: String::new(),
+                shared_by: String::new(),
+                shared_at: 0,
+                shared_by_unverified: false,
             })
             .collect())
     }
@@ -4319,6 +4322,9 @@ impl Core {
                 uid: item.uid,
                 path: String::new(),
                 role: String::new(),
+                shared_by: String::new(),
+                shared_at: 0,
+                shared_by_unverified: false,
             })
             .collect())
     }
@@ -4994,6 +5000,8 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
         album: None,
         // Nothing signed it: it has never been near the crypto layer.
         verification: Default::default(),
+        direct_role: None,
+        share_id: None,
     }
 }
 
@@ -5918,6 +5926,8 @@ mod pending_size_tests {
             photo: None,
             album: None,
             verification: Default::default(),
+            direct_role: None,
+            share_id: None,
         }
     }
 
@@ -7128,6 +7138,9 @@ mod tests {
                 share_id,
                 membership_id: ShareMembershipId::from("membership"),
                 permissions,
+                invite_time: None,
+                inviter_email: None,
+                inviter_verification: None,
             });
             node
         };
@@ -7588,6 +7601,8 @@ mod tests {
             photo: None,
             album: None,
             verification: Default::default(),
+            direct_role: None,
+            share_id: None,
         }
     }
 }

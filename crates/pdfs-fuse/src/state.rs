@@ -1120,6 +1120,8 @@ mod tests {
             photo: None,
             album: None,
             verification: Default::default(),
+            direct_role: None,
+            share_id: None,
         }
     }
 
@@ -1128,6 +1130,9 @@ mod tests {
             share_id: ShareId::from("share"),
             membership_id: ShareMembershipId::from("membership"),
             permissions,
+            invite_time: None,
+            inviter_email: None,
+            inviter_verification: None,
         }
     }
 

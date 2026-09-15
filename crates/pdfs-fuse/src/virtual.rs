@@ -51,6 +51,8 @@ pub(crate) fn virtual_node(parent_uid: NodeUid, name: String, timestamp: i64) ->
         photo: None,
         album: None,
         verification: Default::default(),
+        direct_role: None,
+        share_id: None,
     }
 }
 

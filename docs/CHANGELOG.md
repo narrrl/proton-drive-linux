@@ -11,7 +11,28 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Nothing yet.
+SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.3**. No schema change.
+
+### Added
+- **Shared with me says who shared an item, and when.** The GUI row subtitle and `pdfs
+  shared-with-me` show the inviter and invite date for a share root. The invitation's signature is
+  checked against the claimed inviter's keys; when it does not verify, the GUI shows a warning
+  and the CLI prints one, since the sender may be forged. `DirEntry` gains `shared_by`,
+  `shared_at` and `shared_by_unverified` (defaulted, so older front-ends and daemons interoperate).
+
+### Changed
+- **A queued move-and-rename lands as one request.** `drain_rename` used to rename in the source
+  folder and then move, with a rename-out-of-the-way step when the destination held the name. It
+  now calls `move-multiple` with a target name, so there is no half-applied state between the two
+  halves and no second call for the encrypted-name requirements to go stale against (B46). A
+  rename that stays in the same folder still uses the rename endpoint.
+
+### Fixed
+- **Moving a node with no signature email no longer fails.** Such nodes (created anonymously, e.g.
+  through a public link) need the passphrase signed by the mover; SDK 0.6.3 sends that signature.
+- **A node trashed through the newer API field is recognised as trashed.** The SDK now reads
+  `TrashTime` as well as the legacy `Trashed` field, so the drain no longer tries to rename a node
+  that is already in the trash.
 
 ## [1.9.3] — 2026-09-01
 

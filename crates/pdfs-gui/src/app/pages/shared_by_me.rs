@@ -293,5 +293,8 @@ pub(crate) fn shared_item_as_entry(item: &SharedItem) -> DirEntry {
         path: item.path.clone(),
         // Shared *by* me: I own it, so there is no role of mine to report.
         role: String::new(),
+        shared_by: String::new(),
+        shared_at: 0,
+        shared_by_unverified: false,
     }
 }

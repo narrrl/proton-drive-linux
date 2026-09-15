@@ -309,6 +309,17 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
     if let Some(badge) = role_badge(&entry.role) {
         row.add_suffix(&badge);
     }
+    // The "shared by" in the subtitle is what the invitation claims. When its
+    // signature does not check out against that person's keys, the claim must
+    // not read as fact — someone may be impersonating a contact to get a file
+    // opened.
+    if entry.shared_by_unverified {
+        let warning = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+        warning.add_css_class("warning");
+        warning.set_valign(gtk4::Align::Center);
+        warning.set_tooltip_text(Some(UNVERIFIED_INVITER_TOOLTIP));
+        row.add_suffix(&warning);
+    }
     row.add_prefix(&file_thumbnail(ui, entry, 40, 24, true));
     let ui_act = ui.clone();
     let uid = entry.uid.clone();
@@ -329,12 +340,29 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
     row
 }
 
-/// A shared row's subtitle: its size (files only), and where it can be reached
-/// in the local mount once the synthetic `Shared with me/` directory has interned
-/// it. An unlisted share has no local path yet, and says nothing rather than
-/// pointing at a directory that is not there.
+/// Tooltip on the warning shown next to a share whose invitation did not verify.
+const UNVERIFIED_INVITER_TOOLTIP: &str = "The invitation's signature doesn't match the sender's keys. \
+     It may not really be from them.";
+
+/// A shared row's subtitle: who shared it and when (share roots only — that is
+/// where the invitation lives), its size (files only), and where it can be
+/// reached in the local mount once the synthetic `Shared with me/` directory has
+/// interned it. An unlisted share has no local path yet, and says nothing rather
+/// than pointing at a directory that is not there.
 pub(crate) fn shared_row_subtitle(entry: &DirEntry) -> String {
     let mut parts: Vec<String> = Vec::new();
+    if !entry.shared_by.is_empty() {
+        let date = if entry.shared_at > 0 {
+            format_modified(entry.shared_at)
+        } else {
+            String::new()
+        };
+        parts.push(if date.is_empty() {
+            format!("Shared by {}", entry.shared_by)
+        } else {
+            format!("Shared by {} on {date}", entry.shared_by)
+        });
+    }
     if !entry.is_dir {
         parts.push(human_bytes(entry.size));
     }
@@ -723,7 +751,23 @@ mod tests {
             uid: "vol~link".into(),
             path: path.into(),
             role: role.into(),
+            shared_by: String::new(),
+            shared_at: 0,
+            shared_by_unverified: false,
         }
+    }
+
+    #[test]
+    fn a_share_root_says_who_shared_it() {
+        let mut root = entry(true, "", "viewer");
+        root.shared_by = "alice@proton.me".into();
+        assert_eq!(shared_row_subtitle(&root), "Shared by alice@proton.me");
+        root.shared_at = 1_700_000_000;
+        let subtitle = shared_row_subtitle(&root);
+        assert!(
+            subtitle.starts_with("Shared by alice@proton.me on "),
+            "{subtitle}"
+        );
     }
 
     #[test]

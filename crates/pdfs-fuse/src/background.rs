@@ -541,6 +541,8 @@ mod tests {
             photo: None,
             album: None,
             verification: Default::default(),
+            direct_role: None,
+            share_id: None,
         }
     }
 

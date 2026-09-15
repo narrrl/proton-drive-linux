@@ -1129,12 +1129,48 @@ fn cmd_shared_with_me(uid: Option<String>) -> Result<()> {
                     format!("  ({})", e.role)
                 };
                 println!("{kind} {:>12}  {}{role}  [{}]", e.size, e.name, e.uid);
+                if let Some(line) = shared_by_line(&e) {
+                    println!("{:>15}{line}", "");
+                }
             }
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+/// Who shared an entry with me, and when, as a line printed under it — `None`
+/// when the invitation said nothing (owned content, or a node inside a shared
+/// folder rather than its root). An inviter whose signature did not verify is
+/// said to be claimed, not stated: the name may be forged.
+fn shared_by_line(entry: &pdfs_core::control::DirEntry) -> Option<String> {
+    if entry.shared_by.is_empty() {
+        return None;
+    }
+    let mut line = format!("shared by {}", entry.shared_by);
+    if entry.shared_at > 0 {
+        line.push_str(&format!(" at {}", format_epoch_utc(entry.shared_at)));
+    }
+    if entry.shared_by_unverified {
+        line.push_str("  WARNING: invitation signature did not verify; the sender may be forged");
+    }
+    Some(line)
+}
+
+/// `YYYY-MM-DD` (UTC) for epoch seconds, without pulling a date crate into the
+/// CLI for one column. Civil-from-days per Howard Hinnant's algorithm.
+fn format_epoch_utc(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Download a file shared with me. The daemon puts the plaintext in its content
@@ -2804,5 +2840,40 @@ mod login_wait_tests {
         let mut slept = 0;
         wait_for_session(|| Ok(()), |_| slept += 1).unwrap();
         assert_eq!(slept, 0);
+    }
+
+    #[test]
+    fn epoch_seconds_format_as_utc_calendar_dates() {
+        assert_eq!(format_epoch_utc(0), "1970-01-01");
+        assert_eq!(format_epoch_utc(951_782_400), "2000-02-29");
+        assert_eq!(format_epoch_utc(1_700_000_000), "2023-11-14");
+        assert_eq!(format_epoch_utc(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn a_forged_looking_invitation_is_flagged_not_stated() {
+        let mut entry = pdfs_core::control::DirEntry {
+            name: "Budget.ods".into(),
+            is_dir: false,
+            size: 1,
+            modified: 0,
+            pinned: false,
+            cached: false,
+            uid: "vol~link".into(),
+            path: String::new(),
+            role: "viewer".into(),
+            shared_by: String::new(),
+            shared_at: 0,
+            shared_by_unverified: false,
+        };
+        assert_eq!(shared_by_line(&entry), None, "no invitation, no line");
+        entry.shared_by = "alice@proton.me".into();
+        entry.shared_at = 1_700_000_000;
+        assert_eq!(
+            shared_by_line(&entry).as_deref(),
+            Some("shared by alice@proton.me at 2023-11-14")
+        );
+        entry.shared_by_unverified = true;
+        assert!(shared_by_line(&entry).unwrap().contains("WARNING"));
     }
 }

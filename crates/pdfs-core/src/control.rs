@@ -906,6 +906,22 @@ pub struct DirEntry {
     /// report. Defaulted for wire-compat with clients/daemons predating it.
     #[serde(default)]
     pub role: String,
+    /// Who shared this node with me, as the invitation claims it — empty for
+    /// content I own, for a node reached *inside* a shared folder (only the share
+    /// root carries the invitation), and when the API did not say. Trust it only
+    /// as far as [`shared_by_unverified`](Self::shared_by_unverified) allows.
+    /// Defaulted for wire-compat with clients/daemons predating it.
+    #[serde(default)]
+    pub shared_by: String,
+    /// When it was shared with me, epoch seconds; 0 when unknown.
+    #[serde(default)]
+    pub shared_at: i64,
+    /// The invitation's signature did not check out against `shared_by`'s keys,
+    /// so the name may be forged. False when it verified *and* when it could not
+    /// be checked at all (no signature, no keys): only an actual mismatch is a
+    /// warning worth showing.
+    #[serde(default)]
+    pub shared_by_unverified: bool,
 }
 
 /// One hit in a [`Request::Search`] result. Like [`DirEntry`] but carries the

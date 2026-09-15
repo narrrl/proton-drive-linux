@@ -2650,6 +2650,16 @@ collisions without losing the source. Simple rename-only and move-only calls
 remain synchronous. The managed live suite subsequently passed the replacement
 and combined move/rename cases.
 
+**Follow-up (2026-09-15, unverified):** With SDK 0.6.3 the drain sends the
+move and the rename as one `move-multiple` request carrying the target name,
+instead of renaming in the source folder and then moving. That removes the
+second call the stale requirements could hit, and the SDK retries a remaining
+`InvalidRequirements` once with the server's current name hash. A destination
+name collision now moves under a conflict name in one step. Same-folder renames
+are unchanged. The synchronous FUSE `rename` path (`serve_rename`) still renames
+then moves with its bounded retry and has not been converted. Needs a managed
+live run of the combined move/rename cases.
+
 ---
 
 ## B47 — FUSE Accepts Path Components Longer Than NAME_MAX

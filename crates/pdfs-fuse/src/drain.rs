@@ -29,12 +29,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use futures::StreamExt;
 use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, RenameMeta};
-use proton_drive_rs::Node;
+use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
+use proton_drive_rs::{Node, NodeMoveItem};
 use tracing::{debug, error, info, warn};
 
 use super::state::Intervals;
@@ -642,61 +644,46 @@ impl Core {
                 return Ok(());
             }
         };
-        // The name half goes first, so that a collision on the move half below is
-        // about the name the node will actually land under rather than the one it
-        // is about to lose.
-        let mut landed = node.name.clone();
-        if landed != name {
-            match self.rt.block_on(self.client.rename_node(&uid, &name, None)) {
-                Ok(()) => landed = name.clone(),
-                // Someone took the name while we were offline. Renaming to a
+        let landed = if node.parent_uid.as_ref() == Some(&parent) {
+            self.drain_rename_in_place(&uid, &node.name, &name)?
+        } else {
+            // Move and rename land as one request (`move-multiple` takes a
+            // target name), so there is no half-applied state between them and
+            // no window for the requirements to go stale between two calls —
+            // the race B46 queued this op to get away from.
+            let target = (node.name != name).then_some(name.as_str());
+            match self.move_renaming(&uid, &parent, target) {
+                Ok(()) => name.clone(),
+                // The destination holds that name already. Landing under a
                 // *different* name is the non-destructive resolution: it neither
                 // clobbers their file nor drops ours, and it is visible.
                 Err(e) if is_already_exists(&e) => {
                     let alt = conflict_name(&name, now_secs());
-                    warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
-                    self.rt
-                        .block_on(self.client.rename_node(&uid, &alt, None))?;
-                    landed = alt.clone();
+                    warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
+                    self.move_renaming(&uid, &parent, Some(&alt))?;
                     self.adopt_drained_name(&uid, &alt);
                     self.log_activity(
                         ActivityKind::Rename,
                         &name,
-                        format!("name was taken remotely; renamed to {alt}"),
-                        false,
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if node.parent_uid.as_ref() != Some(&parent) {
-            match self.rt.block_on(self.client.move_node(&uid, &parent)) {
-                Ok(()) => {}
-                // The destination holds a `landed` of its own. Same resolution as
-                // a name collision, and it has to happen before the move: the API
-                // has no move-and-rename, so the node is renamed out of the way
-                // here and moved second.
-                Err(e) if is_already_exists(&e) => {
-                    let alt = conflict_name(&landed, now_secs());
-                    warn!(%uid, name = %landed, alt, "destination already holds that name; using a conflict name");
-                    self.rt
-                        .block_on(self.client.rename_node(&uid, &alt, None))?;
-                    self.rt.block_on(self.client.move_node(&uid, &parent))?;
-                    self.adopt_drained_name(&uid, &alt);
-                    self.log_activity(
-                        ActivityKind::Rename,
-                        &landed,
                         format!("destination already had that name; moved as {alt}"),
                         false,
                     );
+                    alt
                 }
                 // The destination folder is gone. Leaving the node in its current
                 // parent is the honest outcome: it is not where the user asked for
-                // it, but it exists, it is where it has always been, and the
-                // rename half above still applied. Retrying could only fail again
-                // — the folder is not coming back — and would wedge the queue.
+                // it, but it exists and it is where it has always been. The name
+                // the user chose still applies there. Retrying the move could
+                // only fail again — the folder is not coming back — and would
+                // wedge the queue.
                 Err(e) if is_gone(&e) => {
-                    warn!(%uid, name = %landed, %parent, "move destination is gone; leaving the node where it is");
+                    warn!(%uid, name, %parent, "move destination is gone; leaving the node where it is");
+                    let landed = match self.drain_rename_in_place(&uid, &node.name, &name) {
+                        Ok(landed) => landed,
+                        // The node went with it; nothing is left to rename.
+                        Err(e) if is_gone(&e) => node.name.clone(),
+                        Err(e) => return Err(e.into()),
+                    };
                     self.log_activity(
                         ActivityKind::Rename,
                         &landed,
@@ -704,14 +691,71 @@ impl Core {
                             .to_string(),
                         false,
                     );
+                    landed
                 }
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
         self.db.delete_op(op.id)?;
         self.note_self_change(&uid);
         info!(%uid, name = %landed, "pending rename landed");
         Ok(())
+    }
+
+    /// Rename `uid` without moving it, from `current` to `name`, and return the
+    /// name it landed under. Someone may have taken the name while we were
+    /// offline; the node then lands under a conflict name instead.
+    fn drain_rename_in_place(
+        &self,
+        uid: &NodeUid,
+        current: &str,
+        name: &str,
+    ) -> Result<String, ProtonError> {
+        if current == name {
+            return Ok(current.to_string());
+        }
+        match self.rt.block_on(self.client.rename_node(uid, name, None)) {
+            Ok(()) => Ok(name.to_string()),
+            Err(e) if is_already_exists(&e) => {
+                let alt = conflict_name(name, now_secs());
+                warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
+                self.rt.block_on(self.client.rename_node(uid, &alt, None))?;
+                self.adopt_drained_name(uid, &alt);
+                self.log_activity(
+                    ActivityKind::Rename,
+                    name,
+                    format!("name was taken remotely; renamed to {alt}"),
+                    false,
+                );
+                Ok(alt)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Move `uid` under `parent` in one request, renaming it to `target_name` on
+    /// the way when one is given.
+    fn move_renaming(
+        &self,
+        uid: &NodeUid,
+        parent: &NodeUid,
+        target_name: Option<&str>,
+    ) -> Result<(), ProtonError> {
+        let item = NodeMoveItem {
+            uid: uid.clone(),
+            target_name: target_name.map(str::to_string),
+        };
+        self.rt.block_on(async {
+            let mut outcomes =
+                std::pin::pin!(self.client.move_nodes_streaming(vec![item], parent.clone()));
+            match outcomes.next().await {
+                Some(Ok((_, outcome))) => outcome,
+                Some(Err(e)) => Err(e),
+                None => Err(ProtonError::invalid_operation(format!(
+                    "move of {uid} reported no outcome"
+                ))),
+            }
+        })
     }
 
     /// Apply a queued trash to the remote.
@@ -1587,6 +1631,8 @@ mod tests {
             photo: None,
             album: None,
             verification: Default::default(),
+            direct_role: None,
+            share_id: None,
         }
     }
 
@@ -1879,6 +1925,8 @@ mod tests {
             photo: None,
             album: None,
             verification: Default::default(),
+            direct_role: None,
+            share_id: None,
         }
     }
 

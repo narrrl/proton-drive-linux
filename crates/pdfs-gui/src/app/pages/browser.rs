@@ -2345,6 +2345,9 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             uid: h.uid.clone(),
             path: h.path.clone(),
             role: String::new(),
+            shared_by: String::new(),
+            shared_at: 0,
+            shared_by_unverified: false,
         })
         .collect();
     entries.sort_by(|a, b| {

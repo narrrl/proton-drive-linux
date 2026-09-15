@@ -15,6 +15,7 @@ use pdfs_core::{CoreError, CoreResult};
 use tracing::debug;
 
 use crate::QUOTA_TTL;
+use proton_drive_rs::proton_sdk::crypto::VerificationStatus;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{MemberRole, NodeKind};
 
@@ -47,6 +48,18 @@ fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
         .map(role_to_str)
         .unwrap_or_default()
         .to_string();
+    let invitation = n.membership.as_ref();
+    let shared_by = invitation
+        .and_then(|m| m.inviter_email.clone())
+        .unwrap_or_default();
+    let shared_at = invitation.and_then(|m| m.invite_time).unwrap_or(0);
+    // Only a signature that is present and wrong is a warning. An invitation
+    // that could not be checked — unsigned, or no keys for the claimed inviter —
+    // is not evidence of forgery, and flagging every such share would teach the
+    // user to ignore the flag.
+    let shared_by_unverified = invitation
+        .and_then(|m| m.inviter_verification)
+        .is_some_and(|status| status == VerificationStatus::Failed);
     DirEntry {
         name: n.name,
         is_dir,
@@ -57,6 +70,9 @@ fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
         path: core.rel_path_for_uid(&n.uid).unwrap_or_default(),
         uid: n.uid.to_string(),
         role,
+        shared_by,
+        shared_at,
+        shared_by_unverified,
     }
 }
 
