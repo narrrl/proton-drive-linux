@@ -487,7 +487,12 @@ fn scan_local_once(
         }
     };
 
-    let excludes = localindex::default_excludes(mountpoint, &dirs.state_dir(), &dirs.cache_dir());
+    let mut excludes =
+        localindex::default_excludes(mountpoint, &dirs.state_dir(), &dirs.cache_dir());
+    // Resolved per scan rather than once at startup: mounts come and go, and a
+    // mount that appeared since the daemon started is exactly the one most
+    // likely to be a half-alive network filesystem (see `nested_mount_points`).
+    excludes.extend(localindex::nested_mount_points(&home));
     indexing.store(true, Ordering::Relaxed);
     let started = Instant::now();
 

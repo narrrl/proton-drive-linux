@@ -12,6 +12,79 @@ Conventions:
 
 ---
 
+## B90 — The local-file indexer walks into foreign FUSE mounts, and a dead one makes the daemon unkillable
+
+**Status:** Fixed (unverified) — the walker no longer stats a nested mountpoint. The stuck-daemon
+half cannot be fixed in userspace at all; see "Why there is no second line of defence".
+**Found:** 2026-09-16, from a user report of `systemctl --user restart` failing in a loop.
+**Where:** `crates/pdfs-core/src/localindex.rs` (`default_excludes`, `scan`),
+`crates/pdfs-fuse/src/background.rs` (`scan_local_once`).
+
+**Symptom.** Stopping the service times out, SIGKILL does not help, and every subsequent start
+fails with `another Proton Drive daemon is already using .../cache.db`:
+
+```
+systemd[2196]: proton-drive.service: State 'final-sigterm' timed out. Killing.
+systemd[2196]: proton-drive.service: Killing process 2221 (pdfs) with signal SIGKILL.
+systemd[2196]: proton-drive.service: Processes still around after final SIGKILL. Entering failed mode.
+systemd[2196]: proton-drive.service: Unit process 2221 (pdfs) remains running after unit stopped.
+pdfs[73921]: ERROR mount failed; retrying in 5s error="open cache db: another Proton Drive daemon
+             is already using /home/narl/.local/state/proton-drive-linux/cache.db"
+```
+
+**Diagnosis.** The surviving process is a zombie that still has a live thread:
+
+```
+$ cat /proc/2221/status | grep -E 'State|Threads'
+State:  Z (zombie)
+Threads: 2
+$ cat /proc/2221/task/73231/comm; cat /proc/2221/task/73231/stack
+pdfs-localindex
+request_wait_answer
+```
+
+`pdfs-localindex` is parked in a FUSE request nobody will answer, in uninterruptible `D` state, so
+it ignores SIGKILL. The thread group leader exits, the thread does not, the process cannot be
+reaped — and it keeps the `cache.db` lock, which is what turns one stuck scan into a permanent
+restart loop. The same dead connection also blocked an unrelated `duf` in `fuse_statfs`
+(`/sys/fs/fuse/connections/69/waiting` was 2).
+
+**Cause.** `scan_local_once` walks `$HOME`, and `default_excludes` only excluded the Drive
+mountpoint plus our own state and cache dirs. The reporter's home also held
+`~/remote/narl.io` (sshfs) and `~/remote/gdrive` (rclone) — third-party FUSE mounts the walk
+descends into.
+
+`scan` does set `same_file_system(true)`, which looks like it should already cover this. It does
+not: in `ignore` 0.4.33 the check is `is_same_file_system` → `device_num(path)` →
+`path.metadata()` (`walk.rs:2164`), i.e. **a stat of the mountpoint**, performed in `run_one`
+*after* the directory has been queued. To discover that a mount is foreign, the walker first has
+to touch it. Against a network FUSE mount whose server is gone, that stat never returns.
+
+**Fix.** `localindex::nested_mount_points` reads `/proc/self/mounts` and returns every mountpoint
+strictly below the scan root; `scan_local_once` appends those to the excludes. `filter_entry` runs
+before the device stat (`walk.rs:1926`, before `send`), so a path-only rejection keeps the walker
+from ever touching the mount. Mountpoint fields are octal-unescaped, because a `\040` left in
+place would silently fail to match and put the mount back in the walk. Re-read per scan, not
+cached at startup: a mount that appeared since the daemon started is the likeliest to be a
+half-alive network filesystem.
+
+This changes nothing about what gets indexed. A nested mount is a different device, so
+`same_file_system(true)` was always going to skip it — the exclude only removes the stat that had
+to happen first.
+
+**Why there is no second line of defence.** Once a thread is in uninterruptible FUSE wait, no
+userspace change rescues it: not a join timeout, not `std::process::exit`, not SIGKILL. The kernel
+will not reap the task until the syscall returns, which needs someone to answer the request or
+abort the connection (`echo 1 > /sys/fs/fuse/connections/<id>/abort`, root-only). Avoiding entry is
+the entire fix. That makes any *new* code path that stats a user-supplied or mount-crossing path
+from a daemon thread a repeat of this bug — mirror-folder scanning is the obvious next candidate.
+
+**Recovery for an already-wedged daemon.** As root, abort the connection with waiters
+(`grep . /sys/fs/fuse/connections/*/waiting` finds it), which releases the thread, lets the zombie
+be reaped and frees the `cache.db` lock. A reboot also clears it.
+
+---
+
 ## B89 — The recorded SDK dependency is three minor versions out of date in the working memory
 
 **Status:** Open — documentation only, but it misdirects every reader of the SDK code.

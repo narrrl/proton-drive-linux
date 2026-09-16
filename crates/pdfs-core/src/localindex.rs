@@ -199,12 +199,75 @@ fn to_entry(entry: &ignore::DirEntry) -> Option<LocalEntry> {
 /// The paths a scan should never descend into: the Drive mountpoint (walking it
 /// would fault every remote node in through FUSE) plus our own state and cache
 /// dirs, which hold blobs no user searches for by name.
+///
+/// Callers should extend this with [`nested_mount_points`] for each scan root —
+/// see that function for why `same_file_system(true)` is not enough on its own.
 pub fn default_excludes(mountpoint: &Path, state_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     vec![
         mountpoint.to_path_buf(),
         state_dir.to_path_buf(),
         cache_dir.to_path_buf(),
     ]
+}
+
+/// Every mountpoint strictly below `root`, read from `/proc/self/mounts`.
+///
+/// [`scan`] already asks the walker to stay on one filesystem, but that check is
+/// a *stat of the mountpoint* (`ignore`'s `is_same_file_system`), performed after
+/// the directory is queued — so the walker has to touch a foreign mount to learn
+/// it should skip it. On a dead network FUSE mount (an sshfs whose server is
+/// gone, an unresponsive rclone) that stat blocks in `request_wait_answer` with
+/// nobody left to answer it, and blocks *uninterruptibly*: the walker thread then
+/// ignores SIGKILL, so the daemon can never exit, systemd's stop times out, and
+/// the half-dead process keeps the cache.db lock that the next start needs
+/// (docs/BUGS.md B90).
+///
+/// Excluding the mountpoints by path avoids that stat entirely. It does not
+/// change what ends up indexed: a nested mount is a different device, so
+/// `same_file_system(true)` was already going to skip it.
+pub fn nested_mount_points(root: &Path) -> Vec<PathBuf> {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    parse_nested_mount_points(&mounts, root)
+}
+
+/// The mountpoint-field parse behind [`nested_mount_points`], split out so it can
+/// be tested without a real `/proc`.
+fn parse_nested_mount_points(mounts: &str, root: &Path) -> Vec<PathBuf> {
+    mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|field| PathBuf::from(unescape_mount_field(field)))
+        // Strictly below: `root` itself being a mountpoint must not exclude the
+        // whole scan.
+        .filter(|path| path.starts_with(root) && path != root)
+        .collect()
+}
+
+/// Undo the octal escaping `/proc/self/mounts` applies to space, tab, newline and
+/// backslash in path fields. An un-unescaped `\040` would simply fail to match a
+/// real path, silently putting a mount with a space in its name back in the walk.
+fn unescape_mount_field(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        let escape = rest[at + 1..].get(..3);
+        match escape.and_then(|digits| u8::from_str_radix(digits, 8).ok()) {
+            Some(byte) => {
+                out.push(byte as char);
+                rest = &rest[at + 4..];
+            }
+            // Not an octal escape after all — keep the backslash verbatim.
+            None => {
+                out.push('\\');
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -267,5 +330,43 @@ mod tests {
         assert!(names.contains(&"mine.conf"), "{names:?}");
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A dead network FUSE mount under the scan root must be skipped by *path*,
+    /// before anything stats it — see `nested_mount_points`. The scan root itself
+    /// being a mountpoint must not exclude the entire walk.
+    #[test]
+    fn nested_mount_points_are_excluded_but_the_root_mount_is_not() {
+        let mounts = "\
+/dev/sda2 /home ext4 rw 0 0
+narl@narl.io:/opt /home/narl/remote/narl.io fuse.sshfs rw 0 0
+google_drive: /home/narl/remote/gdrive fuse.rclone rw 0 0
+tmpfs /run/user/1000 tmpfs rw 0 0
+";
+        let nested = parse_nested_mount_points(mounts, Path::new("/home/narl"));
+        assert_eq!(
+            nested,
+            vec![
+                PathBuf::from("/home/narl/remote/narl.io"),
+                PathBuf::from("/home/narl/remote/gdrive"),
+            ]
+        );
+
+        // `/home` is an ancestor, not a descendant: excluding it would empty the
+        // scan. `/run/user/1000` is unrelated.
+        assert!(parse_nested_mount_points(mounts, Path::new("/home")).len() == 2);
+    }
+
+    /// `/proc/self/mounts` octal-escapes a space; leaving it escaped would put a
+    /// mount whose path contains one back into the walk.
+    #[test]
+    fn mount_paths_are_unescaped() {
+        let mounts = "srv:/x /home/narl/My\\040Cloud fuse.sshfs rw 0 0\n";
+        assert_eq!(
+            parse_nested_mount_points(mounts, Path::new("/home/narl")),
+            vec![PathBuf::from("/home/narl/My Cloud")]
+        );
+        assert_eq!(unescape_mount_field("/a\\134b"), "/a\\b");
+        assert_eq!(unescape_mount_field("/plain/path"), "/plain/path");
     }
 }
