@@ -13,6 +13,22 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 Nothing yet.
 
+## [1.10.2] — 2026-09-16
+
+Fixes a daemon that could not be stopped or restarted. No schema change.
+Schema: **28**; no SDK change.
+
+### Fixed
+- **A dead network mount in your home directory no longer wedges the daemon (B90).** The
+  "This computer" file indexer walked `$HOME` and descended into other FUSE mounts — an sshfs
+  whose server had gone away, an unresponsive rclone. Stat'ing one of those blocks
+  uninterruptibly, so the indexer thread stopped responding to SIGKILL, the daemon could never
+  exit, `systemctl --user stop` timed out, and the half-dead process kept the cache database lock
+  that the next start needed: every restart then failed with "another Proton Drive daemon is
+  already using cache.db". The indexer now skips mountpoints below your home directory by path,
+  without touching them. Nothing changes about which files are indexed — those mounts were always
+  excluded from the results, just not before they had been stat'ed.
+
 ## [1.10.1] — 2026-09-15
 
 Dependency upgrade release, clearing both open Dependabot advisories. No schema change.
