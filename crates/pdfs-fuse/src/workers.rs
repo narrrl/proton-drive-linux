@@ -12,6 +12,8 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 use tracing::warn;
@@ -53,6 +55,13 @@ const META_WORKERS: usize = 3;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// A queued job and the name its caller gave it, so a job that never finishes
+/// can be named in the diagnostics instead of showing up as "a worker is busy".
+struct Queued {
+    label: &'static str,
+    job: Job,
+}
+
 /// Which lane a job belongs in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lane {
@@ -65,10 +74,61 @@ pub(crate) enum Lane {
 
 #[derive(Default)]
 struct Queues {
-    meta: VecDeque<Job>,
-    transfer: VecDeque<Job>,
+    meta: VecDeque<Queued>,
+    transfer: VecDeque<Queued>,
     /// Set when the pool is dropped, to wake and retire every worker.
     closed: bool,
+}
+
+/// What one worker thread is doing, published for [`Workers::snapshot`].
+///
+/// Every field is an atomic (or a lock the worker only ever holds for the length
+/// of a pointer write) because the whole point of the snapshot is to answer
+/// *while the daemon is wedged*: a diagnostic that waits on the same lock the
+/// stuck job holds reports nothing at exactly the moment it is needed.
+struct Slot {
+    name: String,
+    /// True between picking a job up and finishing it.
+    busy: AtomicBool,
+    /// When the current state (busy or idle) began, as milliseconds since the
+    /// pool started. Monotonic, so an age is always a real duration.
+    since_ms: AtomicU64,
+    /// The label of the job in hand. Behind a mutex because a `&'static str` is
+    /// two words and there is no atomic for that; the worker holds it only to
+    /// swap the pointer, and the snapshot never blocks on it (see
+    /// [`Workers::snapshot`]).
+    label: Mutex<&'static str>,
+}
+
+impl Slot {
+    fn new(name: String, now_ms: u64) -> Self {
+        Self {
+            name,
+            busy: AtomicBool::new(false),
+            since_ms: AtomicU64::new(now_ms),
+            label: Mutex::new(""),
+        }
+    }
+}
+
+/// One worker's state at the moment [`Workers::snapshot`] read it.
+pub(crate) struct WorkerSnapshot {
+    pub(crate) name: String,
+    pub(crate) busy: bool,
+    /// How long the worker has been in that state.
+    pub(crate) age_ms: u64,
+    /// The job in hand, or `""` when idle. `"?"` when the label could not be
+    /// read without blocking.
+    pub(crate) label: String,
+}
+
+/// The pool's state at the moment [`Workers::snapshot`] read it.
+pub(crate) struct PoolSnapshot {
+    pub(crate) workers: Vec<WorkerSnapshot>,
+    pub(crate) meta_queued: usize,
+    pub(crate) transfer_queued: usize,
+    pub(crate) meta_completed: u64,
+    pub(crate) transfer_completed: u64,
 }
 
 /// The queues and the two wait sets over them.
@@ -86,6 +146,22 @@ struct Pool {
     meta_cv: Condvar,
     /// Waited on by the general workers.
     general_cv: Condvar,
+    /// Queue depths, mirrored outside the lock so a snapshot can read them
+    /// without waiting on whatever is holding it.
+    meta_queued: AtomicUsize,
+    transfer_queued: AtomicUsize,
+    /// Jobs finished per lane. A depth that stays high while this stays still is
+    /// a stalled lane rather than a busy one.
+    meta_completed: AtomicU64,
+    transfer_completed: AtomicU64,
+    slots: Vec<Slot>,
+    started: Instant,
+}
+
+impl Pool {
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
 }
 
 /// Bounded thread pool behind the network-touching FUSE handlers.
@@ -98,21 +174,35 @@ pub(crate) struct Workers {
 
 impl Workers {
     pub(crate) fn new(n: usize) -> std::io::Result<Self> {
+        // Never leave the pool without a general worker, however small `n` is.
+        let meta_workers = META_WORKERS.min(n.saturating_sub(1));
+        let names: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    "pdfs-fuse-{}{i}",
+                    if i < meta_workers { "meta-" } else { "" }
+                )
+            })
+            .collect();
         let inner = Arc::new(Pool {
             queues: Mutex::new(Queues::default()),
             meta_cv: Condvar::new(),
             general_cv: Condvar::new(),
+            meta_queued: AtomicUsize::new(0),
+            transfer_queued: AtomicUsize::new(0),
+            meta_completed: AtomicU64::new(0),
+            transfer_completed: AtomicU64::new(0),
+            slots: names
+                .iter()
+                .map(|name| Slot::new(name.clone(), 0))
+                .collect(),
+            started: Instant::now(),
         });
-        // Never leave the pool without a general worker, however small `n` is.
-        let meta_workers = META_WORKERS.min(n.saturating_sub(1));
-        for i in 0..n {
+        for (i, name) in names.iter().enumerate() {
             let inner = inner.clone();
             let meta_only = i < meta_workers;
             std::thread::Builder::new()
-                .name(format!(
-                    "pdfs-fuse-{}{i}",
-                    if meta_only { "meta-" } else { "" }
-                ))
+                .name(name.clone())
                 .spawn(move || {
                     let cv = if meta_only {
                         &inner.meta_cv
@@ -121,17 +211,20 @@ impl Workers {
                     };
                     loop {
                         let mut q = inner.queues.lock();
-                        let job = loop {
+                        let picked = loop {
                             // A general worker takes transfers first: metadata
                             // already has threads of its own, so draining the
                             // bulk queue is the useful thing for it to do.
-                            let picked = if meta_only {
-                                q.meta.pop_front()
+                            let taken = if meta_only {
+                                q.meta.pop_front().map(|job| (Lane::Meta, job))
                             } else {
-                                q.transfer.pop_front().or_else(|| q.meta.pop_front())
+                                q.transfer
+                                    .pop_front()
+                                    .map(|job| (Lane::Transfer, job))
+                                    .or_else(|| q.meta.pop_front().map(|job| (Lane::Meta, job)))
                             };
-                            if let Some(job) = picked {
-                                break Some(job);
+                            if let Some(taken) = taken {
+                                break Some(taken);
                             }
                             if q.closed {
                                 break None;
@@ -139,7 +232,15 @@ impl Workers {
                             cv.wait(&mut q);
                         };
                         drop(q);
-                        let Some(job) = job else { break };
+                        let Some((lane, queued)) = picked else { break };
+                        match lane {
+                            Lane::Meta => inner.meta_queued.fetch_sub(1, Ordering::Relaxed),
+                            Lane::Transfer => inner.transfer_queued.fetch_sub(1, Ordering::Relaxed),
+                        };
+                        let slot = &inner.slots[i];
+                        *slot.label.lock() = queued.label;
+                        slot.since_ms.store(inner.now_ms(), Ordering::Relaxed);
+                        slot.busy.store(true, Ordering::Relaxed);
                         // A panicking handler must not cost the pool a worker
                         // for the rest of the run. The dropped `Reply` answers
                         // EIO on its own, so the caller of the failed op is
@@ -164,7 +265,16 @@ impl Workers {
                         // poisoning at all. Anything new reached from a job owes
                         // the same check — an SDK-side `.lock().unwrap()`
                         // silently invalidates this comment.
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(queued.job));
+                        slot.busy.store(false, Ordering::Relaxed);
+                        slot.since_ms.store(inner.now_ms(), Ordering::Relaxed);
+                        *slot.label.lock() = "";
+                        match lane {
+                            Lane::Meta => inner.meta_completed.fetch_add(1, Ordering::Relaxed),
+                            Lane::Transfer => {
+                                inner.transfer_completed.fetch_add(1, Ordering::Relaxed)
+                            }
+                        };
                     }
                 })?;
         }
@@ -179,7 +289,9 @@ impl Workers {
     /// a pending job holds a `Reply` and a few fields, while the 4 MiB block
     /// buffer is allocated inside the job once it runs, and the SDK's in-flight
     /// semaphore is what bounds how many of those exist at once.
-    pub(crate) fn run(&self, lane: Lane, job: impl FnOnce() + Send + 'static) {
+    /// `label` names the work for the diagnostics (`pdfs diagnostics`) and for
+    /// the stall warnings: it is what a hung daemon reports instead of "busy".
+    pub(crate) fn run(&self, lane: Lane, label: &'static str, job: impl FnOnce() + Send + 'static) {
         let mut q = self.inner.queues.lock();
         if q.closed {
             // Pre-pool behaviour: a shut-down pool degrades to a slow mount
@@ -189,9 +301,19 @@ impl Workers {
             job();
             return;
         }
+        let queued = Queued {
+            label,
+            job: Box::new(job),
+        };
         match lane {
-            Lane::Meta => q.meta.push_back(Box::new(job)),
-            Lane::Transfer => q.transfer.push_back(Box::new(job)),
+            Lane::Meta => {
+                q.meta.push_back(queued);
+                self.inner.meta_queued.fetch_add(1, Ordering::Relaxed);
+            }
+            Lane::Transfer => {
+                q.transfer.push_back(queued);
+                self.inner.transfer_queued.fetch_add(1, Ordering::Relaxed);
+            }
         }
         drop(q);
         match lane {
@@ -207,6 +329,41 @@ impl Workers {
             Lane::Transfer => {
                 self.inner.general_cv.notify_one();
             }
+        }
+    }
+
+    /// What every worker is doing right now, without taking the queue lock.
+    ///
+    /// A diagnostic is worth having exactly when the daemon is stuck, so this
+    /// reads atomics only, and `try_lock`s each label rather than waiting for
+    /// it: a label is held for one pointer write, so failing to get it means a
+    /// racing worker, not a wedged one, and `"?"` is a better answer than a
+    /// diagnostics request that hangs too.
+    pub(crate) fn snapshot(&self) -> PoolSnapshot {
+        let now = self.inner.now_ms();
+        let workers = self
+            .inner
+            .slots
+            .iter()
+            .map(|slot| {
+                let label = slot
+                    .label
+                    .try_lock()
+                    .map_or_else(|| "?".to_string(), |label| (*label).to_string());
+                WorkerSnapshot {
+                    name: slot.name.clone(),
+                    busy: slot.busy.load(Ordering::Relaxed),
+                    age_ms: now.saturating_sub(slot.since_ms.load(Ordering::Relaxed)),
+                    label,
+                }
+            })
+            .collect();
+        PoolSnapshot {
+            workers,
+            meta_queued: self.inner.meta_queued.load(Ordering::Relaxed),
+            transfer_queued: self.inner.transfer_queued.load(Ordering::Relaxed),
+            meta_completed: self.inner.meta_completed.load(Ordering::Relaxed),
+            transfer_completed: self.inner.transfer_completed.load(Ordering::Relaxed),
         }
     }
 }
@@ -225,6 +382,35 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// A diagnostic is only useful if it names the work. A running job must show
+    /// up under its label, and the queue behind it must show up as depth.
+    #[test]
+    fn a_snapshot_names_the_running_job_and_the_queue_behind_it() {
+        let pool = Workers::new(2).unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (started_tx, started_rx) = mpsc::channel();
+        {
+            let release_rx = release_rx.clone();
+            pool.run(Lane::Transfer, "read", move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.lock().recv();
+            });
+        }
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the job starts");
+
+        let snapshot = pool.snapshot();
+        assert!(
+            snapshot.workers.iter().any(|w| w.busy && w.label == "read"),
+            "the running job is named"
+        );
+        assert_eq!(snapshot.transfer_completed, 0);
+
+        let _ = release_tx.send(());
+    }
+
     /// Audit A6. Transfers filling every general worker must not delay a
     /// metadata job: that is what the reserved threads are for.
     #[test]
@@ -240,7 +426,7 @@ mod tests {
         for _ in 0..general {
             let release_rx = release_rx.clone();
             let started_tx = started_tx.clone();
-            pool.run(Lane::Transfer, move || {
+            pool.run(Lane::Transfer, "test", move || {
                 started_tx.send(()).unwrap();
                 let _ = release_rx.lock().recv();
             });
@@ -255,13 +441,13 @@ mod tests {
         // in the way that used to starve metadata.
         for _ in 0..16 {
             let release_rx = release_rx.clone();
-            pool.run(Lane::Transfer, move || {
+            pool.run(Lane::Transfer, "test", move || {
                 let _ = release_rx.lock().recv();
             });
         }
 
         let (meta_tx, meta_rx) = mpsc::channel();
-        pool.run(Lane::Meta, move || meta_tx.send(()).unwrap());
+        pool.run(Lane::Meta, "test", move || meta_tx.send(()).unwrap());
         meta_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("a metadata job runs while every transfer thread is stuck");
@@ -279,7 +465,7 @@ mod tests {
         // must have been served by the general worker.
         let pool = Workers::new(1).unwrap();
         let (tx, rx) = mpsc::channel();
-        pool.run(Lane::Meta, move || tx.send(()).unwrap());
+        pool.run(Lane::Meta, "test", move || tx.send(()).unwrap());
         rx.recv_timeout(Duration::from_secs(5))
             .expect("a general worker takes metadata when no transfer is waiting");
     }
@@ -288,9 +474,9 @@ mod tests {
     #[test]
     fn a_panicking_job_does_not_retire_its_worker() {
         let pool = Workers::new(1).unwrap();
-        pool.run(Lane::Meta, || panic!("boom"));
+        pool.run(Lane::Meta, "test", || panic!("boom"));
         let (tx, rx) = mpsc::channel();
-        pool.run(Lane::Meta, move || tx.send(()).unwrap());
+        pool.run(Lane::Meta, "test", move || tx.send(()).unwrap());
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the pool still serves work after a panic");
     }

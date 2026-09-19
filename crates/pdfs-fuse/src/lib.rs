@@ -83,6 +83,7 @@ mod background;
 mod control;
 use control::run_control_socket;
 mod devices;
+mod diagnostics;
 mod drain;
 mod filesystem;
 pub use filesystem::ProtonFs;

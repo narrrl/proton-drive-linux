@@ -49,7 +49,7 @@ impl Filesystem for ProtonFs {
     /// ([`Core::account_quota_cached`] serves a warm one from memory).
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         let core = self.core.clone();
-        self.core.workers.run(Lane::Meta, move || {
+        self.core.workers.run(Lane::Meta, "statfs", move || {
             let (max_space, used_space) = core.account_quota_cached().unwrap_or((0, 0));
             let bsize = u64::from(REPORTED_BLKSIZE);
             let blocks = (max_space.max(0) as u64).div_ceil(bsize);
@@ -89,7 +89,7 @@ impl Filesystem for ProtonFs {
             return;
         }
         let fs = self.clone();
-        self.core.workers.run(Lane::Meta, move || {
+        self.core.workers.run(Lane::Meta, "lookup", move || {
             fs.serve_lookup(parent, &name, reply, true)
         });
     }
@@ -183,7 +183,7 @@ impl Filesystem for ProtonFs {
         let fs = self.clone();
         self.core
             .workers
-            .run(Lane::Meta, move || fs.serve_opendir(ino, reply));
+            .run(Lane::Meta, "opendir", move || fs.serve_opendir(ino, reply));
     }
 
     fn readdir(
@@ -210,9 +210,9 @@ impl Filesystem for ProtonFs {
             return;
         }
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Meta, move || fs.serve_readdir(ino, offset, reply));
+        self.core.workers.run(Lane::Meta, "readdir", move || {
+            fs.serve_readdir(ino, offset, reply)
+        });
     }
 
     fn releasedir(
@@ -237,9 +237,9 @@ impl Filesystem for ProtonFs {
             return;
         }
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Transfer, move || fs.serve_open(ino, flags, reply));
+        self.core.workers.run(Lane::Transfer, "open", move || {
+            fs.serve_open(ino, flags, reply)
+        });
     }
 
     fn read(
@@ -329,7 +329,7 @@ impl Filesystem for ProtonFs {
         // even read off the FUSE device. It only reads `state`, so moving it
         // races with nothing. FUSE does not require replies in request order.
         let core = self.core.clone();
-        self.core.workers.run(Lane::Transfer, move || {
+        self.core.workers.run(Lane::Transfer, "read", move || {
             match core.read_range(&uid, mtime, fsize, offset, size as u64, cache_blocks) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(e),
@@ -366,9 +366,9 @@ impl Filesystem for ProtonFs {
         // one create at a time, with `ls` on the same mount timing out for as
         // long as the burst lasted. See [`Workers`].
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Meta, move || fs.serve_create(parent, &name, reply));
+        self.core.workers.run(Lane::Meta, "create", move || {
+            fs.serve_create(parent, &name, reply)
+        });
     }
 
     fn write(
@@ -506,7 +506,7 @@ impl Filesystem for ProtonFs {
                 // the scratch file).
                 let ino = ino.0;
                 let fs = self.clone();
-                self.core.workers.run(Lane::Transfer, move || {
+                self.core.workers.run(Lane::Transfer, "truncate", move || {
                     if let Err(e) = fs.core.queue_truncate(ino, size) {
                         reply.error(e);
                         return;
@@ -620,7 +620,7 @@ impl Filesystem for ProtonFs {
         let fs = self.clone();
         self.core
             .workers
-            .run(Lane::Transfer, move || fs.serve_fsync(fh, reply));
+            .run(Lane::Transfer, "fsync", move || fs.serve_fsync(fh, reply));
     }
 
     fn release(
@@ -680,7 +680,7 @@ impl Filesystem for ProtonFs {
         };
         // `trash_child` is a remote call; see `serve_create`.
         let fs = self.clone();
-        self.core.workers.run(Lane::Meta, move || {
+        self.core.workers.run(Lane::Meta, "unlink", move || {
             fs.serve_unlink(parent, &name_str, reply)
         });
     }
@@ -701,9 +701,9 @@ impl Filesystem for ProtonFs {
         // Enumerates the folder to apply rmdir's emptiness rule, then trashes
         // it: two remote calls. See `serve_create`.
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Meta, move || fs.serve_rmdir(parent, &name_str, reply));
+        self.core.workers.run(Lane::Meta, "rmdir", move || {
+            fs.serve_rmdir(parent, &name_str, reply)
+        });
     }
 
     fn mkdir(
@@ -731,9 +731,9 @@ impl Filesystem for ProtonFs {
         // remote round trip, and inline it blocks every other request on the
         // mount until it answers.
         let fs = self.clone();
-        self.core
-            .workers
-            .run(Lane::Meta, move || fs.serve_mkdir(parent, &name, reply));
+        self.core.workers.run(Lane::Meta, "mkdir", move || {
+            fs.serve_mkdir(parent, &name, reply)
+        });
     }
 
     fn rename(
@@ -774,7 +774,7 @@ impl Filesystem for ProtonFs {
         // move), and the replaced-destination path adds a trash on top. See
         // `serve_create` for why none of that may run on the dispatch loop.
         let fs = self.clone();
-        self.core.workers.run(Lane::Meta, move || {
+        self.core.workers.run(Lane::Meta, "rename", move || {
             fs.serve_rename(parent, &name, newparent, &newname, flags, reply)
         });
     }
@@ -799,7 +799,7 @@ impl Filesystem for ProtonFs {
         // network per call (B5).
         let fs = self.clone();
         let name = name.to_os_string();
-        self.core.workers.run(Lane::Meta, move || {
+        self.core.workers.run(Lane::Meta, "getxattr", move || {
             fs.serve_getxattr(ino, &name, size, reply)
         });
     }
@@ -1099,7 +1099,7 @@ impl ProtonFs {
         if !off_loop {
             let fs = self.clone();
             let name = name.to_string();
-            self.core.workers.run(Lane::Meta, move || {
+            self.core.workers.run(Lane::Meta, "lookup", move || {
                 fs.serve_lookup(parent, &name, reply, true)
             });
             return;

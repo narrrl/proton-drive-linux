@@ -341,6 +341,9 @@ pub fn mount(
         username,
         sweep_mode,
     } = options;
+    // Start the uptime clock here rather than at the first `pdfs diagnostics`,
+    // so the age it reports is the daemon's own.
+    super::diagnostics::start_clock();
     let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
     let scope = root.tree_event_scope_id();
     db.mount_upsert_my_files(&mountpoint.to_string_lossy(), &root.uid.to_string(), None)

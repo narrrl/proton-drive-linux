@@ -67,6 +67,16 @@ impl Drop for ControlHandlerPermit {
     }
 }
 
+/// Handler threads in use, for the diagnostics. At the limit the daemon refuses
+/// connections, which a front-end cannot tell apart from a dead daemon.
+pub(crate) fn active_handlers() -> usize {
+    ACTIVE_CONTROL_HANDLERS.load(Ordering::Acquire)
+}
+
+pub(crate) fn handler_limit() -> usize {
+    MAX_CONTROL_HANDLERS
+}
+
 fn read_request_line(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
     loop {
@@ -178,6 +188,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             return;
         }
     };
+    // Registered before the request is even parsed, so a handler that wedges
+    // inside the daemon shows up by name in `pdfs diagnostics`.
+    let _inflight = super::diagnostics::InflightGuard::new(super::diagnostics::request_kind(&line));
     let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
         Ok(CtlRequest::Status) => {
             let pins = core.cache.list_pins();
@@ -657,6 +670,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::Diagnostics) => CtlResponse::Diagnostics {
+            diagnostics: core.diagnostics(),
+        },
         Ok(CtlRequest::ListTrash) => match core.list_trash() {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),

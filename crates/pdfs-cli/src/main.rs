@@ -281,6 +281,10 @@ enum Command {
     },
     /// Show the daemon's in-flight transfers (active uploads/downloads).
     Transfers,
+    /// Show what the daemon is doing right now: worker threads, queue depths,
+    /// in-flight control requests and memory. For a daemon that has stopped
+    /// answering rather than one that is merely busy.
+    Diagnostics,
     /// List what is in the account's trash, with the uids the restore and
     /// delete-forever commands take.
     Trash,
@@ -674,6 +678,7 @@ fn main() -> Result<()> {
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
         Command::Upload { sources, parent } => cmd_upload(sources, parent),
         Command::Transfers => cmd_transfers(),
+        Command::Diagnostics => cmd_diagnostics(),
         Command::Trash => cmd_trash(),
         Command::Restore { uids } => cmd_restore(uids),
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
@@ -2147,6 +2152,67 @@ fn cmd_rm(path: PathBuf) -> Result<()> {
         path: path_arg(&path)?,
     })? {
         CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Seconds as something a human reads at a glance: the ages here run from
+/// "still starting" to "wedged since yesterday".
+fn human_secs(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{}s", s / 60, s % 60),
+        s if s < 86400 => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{}h", s / 86400, (s % 86400) / 3600),
+    }
+}
+
+fn cmd_diagnostics() -> Result<()> {
+    let response = control_request(CtlRequest::Diagnostics)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::Diagnostics { diagnostics: d } => {
+            println!(
+                "uptime {}  rss {}  pending ops {}",
+                human_secs(d.uptime_secs),
+                human_bytes(d.rss_bytes),
+                d.pending_ops,
+            );
+            println!(
+                "control handlers {}/{}",
+                d.control_handlers, d.control_handler_limit,
+            );
+            println!(
+                "queued: meta {} (done {}), transfer {} (done {})",
+                d.meta_queued, d.meta_completed, d.transfer_queued, d.transfer_completed,
+            );
+            println!("workers:");
+            for worker in &d.workers {
+                let what = if worker.busy {
+                    worker.label.as_str()
+                } else {
+                    "idle"
+                };
+                println!(
+                    "  {:<20} {:<12} {}",
+                    worker.name,
+                    what,
+                    human_secs(worker.age_secs)
+                );
+            }
+            if d.inflight.is_empty() {
+                println!("in-flight requests: none");
+            } else {
+                println!("in-flight requests (oldest first):");
+                for request in &d.inflight {
+                    println!("  {:<20} {}", request.kind, human_secs(request.age_secs));
+                }
+            }
+        }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }

@@ -299,6 +299,13 @@ pub enum Request {
     /// [`Response::Transfers`]. Cheap to poll: the daemon keeps the registry in
     /// memory, so a front-end can render a live progress widget.
     GetQueueStatus,
+    /// Report what the daemon is doing *right now*, for debugging a daemon that
+    /// stopped answering rather than one that is merely busy. Replies
+    /// [`Response::Diagnostics`].
+    ///
+    /// Answered from lock-free state on purpose: it has to come back while the
+    /// daemon is wedged, which is the only moment anyone asks for it.
+    Diagnostics,
     /// List what is in the account's trash. Replies with [`Response::Entries`];
     /// a trashed node has no path inside the mount, so each entry carries only
     /// its `uid` — the handle for [`Request::Restore`] and
@@ -1400,6 +1407,55 @@ pub fn pending_summary(uploads: u64, changes: u64) -> Option<String> {
     }
 }
 
+/// One worker thread in a [`Diagnostics`] report.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkerState {
+    /// Thread name (`pdfs-fuse-meta-0`, `pdfs-fuse-3`).
+    pub name: String,
+    pub busy: bool,
+    /// The job in hand (`read`, `lookup`), empty when idle.
+    pub label: String,
+    /// How long it has been in that state. A busy worker with a large age is
+    /// the shape of a hang.
+    pub age_secs: u64,
+}
+
+/// One control request the daemon is still serving, in a [`Diagnostics`] report.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InflightRequest {
+    /// The request's variant name (`OpenFile`, `PhotosTimeline`).
+    pub kind: String,
+    pub age_secs: u64,
+}
+
+/// What the daemon is doing right now (reply to [`Request::Diagnostics`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Diagnostics {
+    /// How long this daemon process has been running.
+    pub uptime_secs: u64,
+    /// Resident set size, or `0` where it could not be read. The 2026-09-18 hang
+    /// peaked at 5.2 GiB, so this is the number that says whether the daemon is
+    /// growing again.
+    pub rss_bytes: u64,
+    pub workers: Vec<WorkerState>,
+    /// Jobs waiting for a worker, per lane.
+    pub meta_queued: usize,
+    pub transfer_queued: usize,
+    /// Jobs finished per lane since start. Queue depth that does not move while
+    /// these do not either is a stalled lane, not a loaded one.
+    pub meta_completed: u64,
+    pub transfer_completed: u64,
+    /// Control requests still being served, oldest first.
+    pub inflight: Vec<InflightRequest>,
+    /// Control handler threads in use, and the ceiling. At the ceiling the
+    /// daemon refuses new connections, which looks exactly like a dead daemon
+    /// from the CLI.
+    pub control_handlers: usize,
+    pub control_handler_limit: usize,
+    /// Queued mutations not yet drained.
+    pub pending_ops: u64,
+}
+
 /// The daemon's reply to a [`Request`].
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
@@ -1508,6 +1564,8 @@ pub enum Response {
         available: bool,
         items: Vec<AlbumInfo>,
     },
+    /// What the daemon is doing right now (reply to [`Request::Diagnostics`]).
+    Diagnostics { diagnostics: Diagnostics },
     /// How the Takeout import is doing (reply to [`Request::ImportStatus`]).
     /// `running` is false once it has finished, when `summary` is the final
     /// report; `summary` is `None` when no import has run this session.
