@@ -182,6 +182,10 @@ impl Db {
                     // photo on someone else's volume is not in our timeline, and
                     // favouriting one is not supported yet anyway.
                     favorite: false,
+                    // Nor are album rows grouped: an album is a list the user
+                    // made, and it shows exactly what they put in it.
+                    group_size: 1,
+                    has_raw: false,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -239,6 +243,10 @@ impl Db {
                     // photo on someone else's volume is not in our timeline, and
                     // favouriting one is not supported yet anyway.
                     favorite: false,
+                    // Nor are album rows grouped: an album is a list the user
+                    // made, and it shows exactly what they put in it.
+                    group_size: 1,
+                    has_raw: false,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

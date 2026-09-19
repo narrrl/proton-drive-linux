@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 29;
+pub(super) const SCHEMA_VERSION: i64 = 30;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -234,6 +234,24 @@ impl Db {
             )? > 0;
             if has_trash && !has_column {
                 tx.execute_batch(MIGRATION_V29)?;
+            }
+        }
+        if current < 30 {
+            // Same guards as V26-V29: the column may already be there on a
+            // fixture rewound from the current schema, and a very old fixture
+            // may not have `photos` at all.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('photos') WHERE name = 'group_key'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_photos: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'photos'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_photos && !has_column {
+                tx.execute_batch(MIGRATION_V30)?;
             }
         }
         tx.execute(
@@ -880,4 +898,23 @@ ALTER TABLE sync_entry ADD COLUMN local_mtime_ns INTEGER;
 const MIGRATION_V29: &str = "
 ALTER TABLE trash ADD COLUMN parent_uid TEXT;
 CREATE INDEX IF NOT EXISTS idx_trash_parent ON trash(parent_uid);
+";
+
+/// Schema v30: a RAW and the JPEG of the same shot are one photo to the person
+/// who took it, so the timeline records what ties them together.
+///
+/// `content_hash` and `main_uid` come from the server's own photo properties —
+/// the duplicate-detection hash, and the main photo a related one belongs to.
+/// `group_key` is what the gallery pages by: every member of one shot carries
+/// the same key, and the member the grid shows is the one whose `main_uid` is
+/// its own uid.
+///
+/// All three are `NULL` until the next timeline refresh resolves the photo's
+/// node, and a row without a `group_key` is its own group — which is exactly how
+/// the gallery behaved before this column existed.
+const MIGRATION_V30: &str = "
+ALTER TABLE photos ADD COLUMN content_hash TEXT;
+ALTER TABLE photos ADD COLUMN main_uid TEXT;
+ALTER TABLE photos ADD COLUMN group_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_photos_group ON photos(group_key);
 ";

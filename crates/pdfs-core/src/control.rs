@@ -1287,6 +1287,15 @@ pub struct PhotoItem {
     /// tags it has not learned yet.
     #[serde(default)]
     pub favorite: bool,
+    /// How many files this entry stands for: a shot stored as a RAW and a JPEG
+    /// is one entry and two files. Older daemons omit it, and `0` reads the same
+    /// as `1` — one file, nothing to indicate.
+    #[serde(default)]
+    pub group_size: u32,
+    /// Whether one of those files is a camera raw. The tile badges it, because
+    /// the JPEG it shows is not the whole of what is stored.
+    #[serde(default)]
+    pub has_raw: bool,
 }
 
 /// A daemon too old to classify a timeline entry is assumed to have served a

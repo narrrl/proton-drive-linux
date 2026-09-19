@@ -407,6 +407,16 @@ fn extract_raw_preview(
 pub(crate) type TrashOutcome = (Vec<String>, Vec<(String, String)>);
 
 /// Formats supported by the local thumbnail decoder and exposed by the GUI.
+/// What a timeline enrichment pass resolves for one photo, beyond what the
+/// timeline listing already carries.
+#[derive(Clone, Debug)]
+struct PhotoMeta {
+    name: Option<String>,
+    media_type: Option<String>,
+    favorite: bool,
+    content_hash: Option<String>,
+}
+
 impl Core {
     pub(crate) fn photos_timeline(
         &self,
@@ -458,6 +468,8 @@ impl Core {
             no_thumb: photo.thumb_state == db::THUMB_NONE,
             kind: photo.kind,
             favorite: photo.favorite,
+            group_size: photo.group_size as u32,
+            has_raw: photo.has_raw,
         }
     }
 
@@ -1283,7 +1295,11 @@ impl Core {
         // learned before (or classifies from nothing, i.e. a still photo), so a
         // partial resolve never blanks the timeline.
         let uids: Vec<NodeUid> = items.iter().map(|it| it.uid.clone()).collect();
-        let mut meta: HashMap<String, (Option<String>, Option<String>, bool)> = HashMap::new();
+        let mut meta: HashMap<String, PhotoMeta> = HashMap::new();
+        // A main photo names its related photos rather than the other way round,
+        // so the relation is recorded from whichever end resolves — the two ends
+        // can land in different chunks, and one of them may not resolve at all.
+        let mut main_of: HashMap<String, String> = HashMap::new();
         for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
             match photos.enumerate_nodes(chunk).await {
                 Ok(nodes) => {
@@ -1299,9 +1315,24 @@ impl Core {
                             .photo
                             .as_ref()
                             .is_some_and(|p| p.tags.contains(&PhotoTag::Favorite));
+                        let key = node.uid.to_string();
+                        let content_hash = node.photo.as_ref().and_then(|p| p.content_hash.clone());
+                        if let Some(photo) = node.photo.as_ref() {
+                            if let Some(main) = photo.main_photo_uid.as_ref() {
+                                main_of.insert(key.clone(), main.to_string());
+                            }
+                            for related in &photo.related_photo_uids {
+                                main_of.insert(related.to_string(), key.clone());
+                            }
+                        }
                         meta.insert(
-                            node.uid.to_string(),
-                            (Some(node.name), media_type, favorite),
+                            key,
+                            PhotoMeta {
+                                name: Some(node.name),
+                                media_type,
+                                favorite,
+                                content_hash,
+                            },
                         );
                     }
                 }
@@ -1313,13 +1344,22 @@ impl Core {
             .iter()
             .map(|it| {
                 let key = it.uid.to_string();
+                let main_uid = main_of.get(&key).cloned();
                 // An unresolved photo keeps whatever was learned before, for the
                 // favourite flag as much as for the name and media type.
                 match meta.get(&key).cloned() {
-                    Some((name, media_type, favorite)) => {
-                        (key, it.capture_time, name, media_type, Some(favorite))
-                    }
-                    None => (key, it.capture_time, None, None, None),
+                    Some(m) => db::TimelineRow {
+                        name: m.name,
+                        media_type: m.media_type,
+                        favorite: Some(m.favorite),
+                        content_hash: m.content_hash,
+                        main_uid,
+                        ..db::TimelineRow::new(key, it.capture_time)
+                    },
+                    None => db::TimelineRow {
+                        main_uid,
+                        ..db::TimelineRow::new(key, it.capture_time)
+                    },
                 }
             })
             .collect();

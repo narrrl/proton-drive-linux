@@ -113,9 +113,13 @@ fn node_from(parent: serde_json::Value, link: &str, name: &str, kind: serde_json
 fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     let db = Db::open_in_memory().unwrap();
     db.photos_replace(&[
-        ("p1".into(), 300, None, Some("video/mp4".into()), Some(true)),
-        ("p2".into(), 200, None, None, None),
-        ("p3".into(), 100, None, None, None),
+        TimelineRow {
+            media_type: Some("video/mp4".into()),
+            favorite: Some(true),
+            ..TimelineRow::new("p1", 300)
+        },
+        TimelineRow::new("p2", 200),
+        TimelineRow::new("p3", 100),
     ])
     .unwrap();
 
@@ -126,9 +130,13 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     // The next refresh brings a new photo, keeps p1 and p2, and loses p3.
     // p1's media type arrives as `None` this time and must not be forgotten.
     db.photos_replace(&[
-        ("p0".into(), 400, Some("new.jpg".into()), None, Some(false)),
-        ("p1".into(), 300, None, None, None),
-        ("p2".into(), 200, None, None, None),
+        TimelineRow {
+            name: Some("new.jpg".into()),
+            favorite: Some(false),
+            ..TimelineRow::new("p0", 400)
+        },
+        TimelineRow::new("p1", 300),
+        TimelineRow::new("p2", 200),
     ])
     .unwrap();
 
@@ -200,8 +208,14 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
 fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
     let db = Db::open_in_memory().unwrap();
     db.photos_replace(&[
-        ("p1".into(), 300, None, None, Some(true)),
-        ("p2".into(), 200, None, None, Some(false)),
+        TimelineRow {
+            favorite: Some(true),
+            ..TimelineRow::new("p1", 300)
+        },
+        TimelineRow {
+            favorite: Some(false),
+            ..TimelineRow::new("p2", 200)
+        },
     ])
     .unwrap();
     let favorites = db.photos_page(0, 10, None, None, true).unwrap();
@@ -215,8 +229,11 @@ fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
     // (`None`), and loses to one that could.
     db.photos_set_favorite("p2", true).unwrap();
     db.photos_replace(&[
-        ("p1".into(), 300, None, None, Some(false)),
-        ("p2".into(), 200, None, None, None),
+        TimelineRow {
+            favorite: Some(false),
+            ..TimelineRow::new("p1", 300)
+        },
+        TimelineRow::new("p2", 200),
     ])
     .unwrap();
     let favorites = db.photos_page(0, 10, None, None, true).unwrap();
@@ -232,7 +249,7 @@ fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
 fn photos_page_slices_the_timeline_in_order() {
     let db = Db::open_in_memory().unwrap();
     let items: Vec<_> = (0..5)
-        .map(|i| (format!("p{i}"), 500 - i as i64, None, None::<String>, None))
+        .map(|i| TimelineRow::new(format!("p{i}"), 500 - i as i64))
         .collect();
     db.photos_replace(&items).unwrap();
 
@@ -3926,9 +3943,9 @@ fn an_idle_worker_does_not_wait_on_an_op_another_worker_has() {
 fn photos_delete_removes_the_photo_and_its_album_membership() {
     let db = Db::open_in_memory().unwrap();
     db.photos_replace(&[
-        ("p1".into(), 300, None, None, None),
-        ("p2".into(), 200, None, None, None),
-        ("p3".into(), 100, None, None, None),
+        TimelineRow::new("p1", 300),
+        TimelineRow::new("p2", 200),
+        TimelineRow::new("p3", 100),
     ])
     .unwrap();
     db.albums_replace(&[StoredAlbum {
@@ -3969,4 +3986,118 @@ fn photos_delete_removes_the_photo_and_its_album_membership() {
     // reply can both report the same deletion.
     assert_eq!(db.photos_delete(&["p2".into()]).unwrap(), 0);
     assert_eq!(db.photos_delete(&[]).unwrap(), 0);
+}
+
+/// A shot taken as RAW+JPEG is one photo to the person who took it: the grid
+/// shows the JPEG once, and the Raw tab still lists the raw file.
+#[test]
+fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("img_1234.cr2".into()),
+            ..TimelineRow::new("raw", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_9999.JPG".into()),
+            ..TimelineRow::new("alone", 200)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "alone"],
+        "the pair shows once, as the member that can be displayed"
+    );
+    assert_eq!(page[0].group_size, 2);
+    assert!(page[0].has_raw, "the tile can say the raw is there");
+    assert_eq!(page[1].group_size, 1);
+    assert!(!page[1].has_raw);
+
+    // The Raw tab answers "which raws do I have", so it lists files.
+    let raws = db
+        .photos_page(0, 10, Some(crate::control::PhotoKind::Raw), None, false)
+        .unwrap();
+    assert_eq!(
+        raws.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["raw"]
+    );
+    assert_eq!(db.photos_counts().unwrap(), (2, 0, 1));
+
+    // Both members are reachable from either uid: the lightbox switches between
+    // them, and deleting the tile has to trash both.
+    let group = db.photos_group("raw").unwrap();
+    assert_eq!(
+        group.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "raw"]
+    );
+    assert_eq!(db.photos_group("alone").unwrap().len(), 1);
+}
+
+/// Two files that merely share a name are not one shot: the same stem on
+/// different days, or two files of the same kind, stay apart.
+#[test]
+fn a_shared_name_alone_does_not_group_photos() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("today", 1_700_000_000)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.CR2".into()),
+            ..TimelineRow::new("last-year", 1_600_000_000)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.PNG".into()),
+            ..TimelineRow::new("same-kind", 1_700_000_000)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(page.len(), 3, "three shots, three tiles");
+    assert!(page.iter().all(|p| p.group_size == 1));
+}
+
+/// The server knows about live photos and bursts, so its own relation groups
+/// files this client would never pair by name.
+#[test]
+fn the_servers_photo_relation_groups_a_live_photo() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            main_uid: Some("main".into()),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["main"]
+    );
+    assert_eq!(page[0].group_size, 2);
+    assert!(!page[0].has_raw, "a live photo's video is not a raw file");
+
+    // The relation is learned-and-kept: a refresh that could not resolve the
+    // nodes must not break the group up.
+    db.photos_replace(&[
+        TimelineRow::new("main", 300),
+        TimelineRow::new("related", 299),
+    ])
+    .unwrap();
+    assert_eq!(db.photos_group("related").unwrap().len(), 2);
 }
