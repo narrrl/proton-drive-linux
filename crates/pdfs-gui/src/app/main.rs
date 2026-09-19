@@ -162,6 +162,22 @@ impl Ui {
             }
         }
     }
+
+    /// Mark a cached thumbnail as freshly used, so eviction takes the tiles
+    /// nobody has looked at rather than the oldest ones.
+    ///
+    /// Insertion order alone evicts the top of the timeline first — exactly what
+    /// a scroll back up then asks for again.
+    fn touch_texture(&self, uid: &str) {
+        let mut order = self.gallery.photo_tex_order.borrow_mut();
+        if order.back().is_some_and(|back| back == uid) {
+            return;
+        }
+        if let Some(at) = order.iter().position(|held| held == uid) {
+            order.remove(at);
+            order.push_back(uid.to_string());
+        }
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -237,7 +253,7 @@ fn load_proton_theme() {
          .viewer-status {{ color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }}\n\
          .viewer-info-panel {{ background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }}\n\
          .gallery-day {{ font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 4px 2px 8px 2px; }}\n\
-         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 14px; background: alpha(currentColor, 0.06); box-shadow: none; transition: box-shadow 180ms ease, background 180ms ease; }}\n\
+         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 6px; background: none; box-shadow: none; transition: box-shadow 180ms ease; }}\n\
          .photo-tile:hover {{ box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45); }}\n\
          .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
          .photo-thumb {{ transition: transform 220ms ease; }}\n\
@@ -443,7 +459,11 @@ fn build_window(app: &adw::Application) {
         gallery: GalleryState {
             model: gallery_widgets.model.clone(),
             groups: gallery_widgets.groups.clone(),
-            tile: Cell::new(TILE_DEFAULT),
+            row_height: Cell::new(ROW_DEFAULT),
+            learned_ratios: RefCell::new(HashMap::new()),
+            scrolling_down: Cell::new(true),
+            scroll_offset: Cell::new(0.0),
+            assumed_ratios: RefCell::new(HashSet::new()),
             content: gallery_widgets.content.clone(),
             status: gallery_widgets.status.clone(),
             retry: gallery_widgets.retry.clone(),
@@ -1170,54 +1190,96 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The full width one row of `columns` tiles occupies, gaps included.
-    fn row_width(columns: usize, edge: i32) -> i32 {
-        edge * columns as i32 + TILE_GAP * (columns as i32 - 1)
+    /// The full width a row occupies, gaps included.
+    fn row_width(widths: &[i32]) -> i32 {
+        widths.iter().sum::<i32>() + TILE_GAP * (widths.len() as i32 - 1)
+    }
+
+    /// Ratios of a typical mixed day: landscape phone shots, a portrait, a
+    /// square crop.
+    fn mixed() -> Vec<f64> {
+        vec![
+            1.5, 1.5, 0.75, 1.0, 1.33, 1.5, 0.75, 1.78, 1.0, 1.5, 1.5, 1.33,
+        ]
     }
 
     #[test]
-    fn the_grid_spans_the_content_width() {
-        // Whatever the width, the columns plus their gaps land on it (bar the
-        // few px integer division cannot divide), so no ragged right margin.
+    fn every_full_row_spans_the_content_width() {
+        // The point of justifying: no ragged right margin at any width, at any
+        // zoom, for any mix of shapes.
         for width in [640, 900, 1000, 1440, 1920, 2560] {
-            let (columns, edge) = plan_grid(TILE_DEFAULT, width);
-            let used = row_width(columns, edge);
-            assert!(
-                used <= width && width - used < columns as i32,
-                "{columns} x {edge}px = {used}px does not span {width}px"
-            );
+            let rows = plan_rows(&mixed(), width, ROW_DEFAULT);
+            // The last row is deliberately short, so it is not part of this.
+            for (_, widths) in rows.iter().take(rows.len() - 1) {
+                assert_eq!(row_width(widths), width, "row does not span {width}px");
+            }
         }
     }
 
     #[test]
-    fn tiles_stay_near_the_target_size() {
-        // The column count rounds and the edge absorbs the remainder, so a tile
-        // is never more than one gap-and-a-bit away from what was asked for.
-        let (columns, edge) = plan_grid(TILE_DEFAULT, 1920);
-        assert!(columns >= 7, "1920px should hold several 220px tiles");
-        assert!(
-            (edge - TILE_DEFAULT).abs() < TILE_DEFAULT / 3,
-            "{edge}px is not near the {TILE_DEFAULT}px target"
-        );
+    fn a_tile_keeps_its_photos_shape() {
+        // Each tile is its photo's ratio at the row's height, which is what
+        // makes cropping unnecessary.
+        let ratios = mixed();
+        let rows = plan_rows(&ratios, 1440, ROW_DEFAULT);
+        let (height, widths) = &rows[0];
+        for (width, ratio) in widths.iter().zip(&ratios).take(widths.len() - 1) {
+            let laid_out = *width as f64 / *height as f64;
+            assert!((laid_out - ratio).abs() < 0.02, "{laid_out} is not {ratio}");
+        }
     }
 
     #[test]
-    fn zooming_in_widens_the_tiles_and_drops_columns() {
-        let (wide_columns, small_edge) = plan_grid(TILE_MIN, 1200);
-        let (few_columns, big_edge) = plan_grid(TILE_MAX, 1200);
-        assert!(wide_columns > few_columns);
-        assert!(big_edge > small_edge);
+    fn rows_land_near_the_target_height() {
+        // A row is closed as soon as it no longer fits at the target, so it is
+        // never taller than the target and never far below it.
+        for target in [ROW_MIN, ROW_DEFAULT, ROW_MAX] {
+            let rows = plan_rows(&mixed(), 1600, target);
+            for (height, _) in rows.iter().take(rows.len() - 1) {
+                assert!(
+                    *height <= target,
+                    "{height}px exceeds the {target}px target"
+                );
+                assert!(*height > target / 2, "{height}px is far under {target}px");
+            }
+        }
     }
 
     #[test]
-    fn a_window_narrower_than_one_tile_still_gets_a_column() {
-        // A single column at whatever fits, rather than zero columns (which would
-        // divide by zero) or a zero-px tile.
-        let (columns, edge) = plan_grid(TILE_DEFAULT, 40);
-        assert_eq!(columns, 1);
-        assert!(edge > 0);
-        let (columns, edge) = plan_grid(TILE_DEFAULT, 0);
-        assert_eq!(columns, 1);
-        assert!(edge > 0);
+    fn a_short_day_is_not_stretched_across_the_window() {
+        // Two photos are two photos, not two half-window tiles.
+        let rows = plan_rows(&[1.5, 1.5], 1920, ROW_DEFAULT);
+        assert_eq!(rows.len(), 1);
+        let (height, widths) = &rows[0];
+        assert_eq!(*height, ROW_DEFAULT);
+        assert!(row_width(widths) < 1920 / 2);
+    }
+
+    #[test]
+    fn zooming_in_puts_fewer_photos_in_a_row() {
+        let small = plan_rows(&mixed(), 1200, ROW_MIN);
+        let big = plan_rows(&mixed(), 1200, ROW_MAX);
+        assert!(small[0].1.len() > big[0].1.len());
+    }
+
+    #[test]
+    fn every_photo_is_laid_out_exactly_once() {
+        let ratios = mixed();
+        let placed: usize = plan_rows(&ratios, 1000, ROW_DEFAULT)
+            .iter()
+            .map(|(_, widths)| widths.len())
+            .sum();
+        assert_eq!(placed, ratios.len());
+        assert!(plan_rows(&[], 1000, ROW_DEFAULT).is_empty());
+    }
+
+    #[test]
+    fn a_window_narrower_than_one_photo_still_lays_it_out() {
+        // A tile of at least one px, rather than a zero-width widget or a
+        // division by zero.
+        for width in [0, 40] {
+            let rows = plan_rows(&[1.5, 1.5, 1.5], width, ROW_DEFAULT);
+            assert!(rows.iter().all(|(h, w)| *h > 0 && w.iter().all(|w| *w > 0)));
+        }
     }
 }
