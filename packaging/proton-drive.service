@@ -6,12 +6,28 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
+# Deliberately not Type=notify: the daemon waits for a stored login before it
+# mounts anything, and a machine that boots before the user logs in would then
+# fail the unit on the start timeout. NotifyAccess=all gets the daemon a
+# NOTIFY_SOCKET all the same, which is all the watchdog below needs.
 Type=simple
+NotifyAccess=all
 # The daemon waits for a stored login, mounts ~/ProtonDrive, and keeps it
 # mounted. SIGTERM (from `systemctl --user stop`) triggers a clean lazy unmount.
 ExecStart=/usr/bin/pdfs daemon
-Restart=on-failure
+# Always, not on-failure: a daemon that hangs is not a failure by exit code, and
+# on 2026-09-18 one had to be restarted by hand after wedging overnight.
+Restart=always
 RestartSec=3
+# The supervisor thread pings this, but only after a round trip over the control
+# socket — so a daemon that stops answering its own clients is restarted instead
+# of sitting there looking alive. It pings at half this interval.
+WatchdogSec=120
+# Backstop against unbounded growth: the hung run peaked at 5.2G resident.
+# MemoryHigh throttles and reclaims first; MemoryMax is the hard stop, above any
+# legitimate working set, so it only fires on a leak.
+MemoryHigh=2G
+MemoryMax=6G
 # Give the lazy unmount time to finish before SIGKILL.
 TimeoutStopSec=15
 

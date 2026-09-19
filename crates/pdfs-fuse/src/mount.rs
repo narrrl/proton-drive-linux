@@ -554,6 +554,26 @@ pub fn mount(
             }
         }
     }
+    // The supervisor watches the pool and answers the systemd watchdog. Started
+    // after the listener, because its liveness probe is a round trip over that
+    // socket.
+    {
+        let supervisor_core = core.clone();
+        let socket = control_socket.to_path_buf();
+        match std::thread::Builder::new()
+            .name("pdfs-supervisor".into())
+            .spawn(move || supervisor::run(supervisor_core, socket))
+        {
+            Ok(handle) => workers.push(handle),
+            // Not fatal: the mount works without a supervisor, it just goes back
+            // to being undiagnosable if it wedges.
+            Err(error) => warn!(error = %error, "could not start the daemon supervisor"),
+        }
+    }
+    // The mount is live and the control socket answers: this is the moment the
+    // unit is actually usable, which is what `Type=notify` reports.
+    systemd::ready();
+
     // Re-establish on-demand mounts only after the primary session is live.
     // Keep the worker so shutdown can close publication, wait for any in-flight
     // fetch to observe that closure, and then drain a stable registry.
@@ -680,6 +700,9 @@ pub fn mount(
 /// expected and correct: a worker part-way through an upload finishes it rather
 /// than abandoning the user's bytes mid-flight.
 fn stop_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::JoinHandle<()>>) {
+    // Say so before the joins: a teardown that takes a while must not be read as
+    // a missed watchdog ping and turned into a kill.
+    systemd::stopping();
     core.shutdown.stop();
     core.wake_drain();
     let _ = core.sync_tx.send(sync::SyncMsg::Stop);
