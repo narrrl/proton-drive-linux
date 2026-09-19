@@ -15,8 +15,8 @@ keywords = ["proton", "drive", "fuse", "sync", "linux"]
 categories = ["filesystem", "command-line-utilities"]
 
 [workspace.dependencies]
-proton-sdk = { version = "0.6.4" }
-proton-drive-rs = { version = "0.6.4" }
+proton-sdk = { version = "0.6.5" }
+proton-drive-rs = { version = "0.6.5" }
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }

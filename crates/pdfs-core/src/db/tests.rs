@@ -254,6 +254,7 @@ fn trash_replace_lists_folders_first() {
             is_dir: false,
             size: 10,
             mtime: 1,
+            parent_uid: Some("t2".into()),
         },
         StoredTrash {
             uid: "t2".into(),
@@ -261,6 +262,7 @@ fn trash_replace_lists_folders_first() {
             is_dir: true,
             size: 0,
             mtime: 2,
+            parent_uid: None,
         },
     ])
     .unwrap();
@@ -269,6 +271,18 @@ fn trash_replace_lists_folders_first() {
     assert_eq!(
         items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
         ["Alpha", "zeta.txt"]
+    );
+
+    // The parent links come back with the rows: a restore reads the tree shape
+    // from them.
+    let mut parents = db.trash_parents().unwrap();
+    parents.sort();
+    assert_eq!(
+        parents,
+        [
+            ("t1".to_string(), Some("t2".to_string())),
+            ("t2".to_string(), None),
+        ]
     );
 
     // A replace is a replace: emptying the trash on the server empties it here.

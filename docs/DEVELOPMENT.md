@@ -158,6 +158,8 @@ Needed a small additive SDK change (`ProtonDriveClient::with_entity_repository`,
 
 SDK 0.5.0 made `trash_nodes` / `restore_nodes` / `delete_nodes` report one outcome per node instead of failing the whole call (mirroring upstream's streamed `NodeActionResult`). `pdfs_core::batch::into_unit` collapses the single-node calls back to a `Result`; `batch::split` handles a collected batch.
 
+A restore is expanded before it is sent (`expand_restore`, `pdfs-fuse/src/lib.rs`): the persisted trash listing carries each row's `parent_uid` (schema 29), so a restore takes the connected piece of the trashed tree — every trashed descendant of what was asked for, and every trashed ancestor above it — and sends it shallowest wave first, because the server cannot put a node back under a parent that is still trashed. A uid the listing does not know about (it is materialised in chunks, and can be stale) is restored on its own rather than dropped.
+
 The trash view's restore and permanent-delete use the SDK's **streaming** variants (`restore_nodes_streaming` / `delete_nodes_streaming`) and apply local state per node as each batch lands rather than after the last one. For a permanent delete — which is irreversible — that means a daemon interrupted mid-batch has forgotten exactly the nodes the server destroyed, no more and no fewer. Both report per-node failures and count only what actually succeeded; only a batch where nothing succeeded is an error.
 
 

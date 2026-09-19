@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 28;
+pub(super) const SCHEMA_VERSION: i64 = 29;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -216,6 +216,24 @@ impl Db {
             )? > 0;
             if has_entries && !has_column {
                 tx.execute_batch(MIGRATION_V28)?;
+            }
+        }
+        if current < 29 {
+            // Same guards as V26/V27/V28: an old fixture may not have `trash`,
+            // and a fixture rewound from the current schema already has the
+            // column.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('trash') WHERE name = 'parent_uid'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_trash: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'trash'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_trash && !has_column {
+                tx.execute_batch(MIGRATION_V29)?;
             }
         }
         tx.execute(
@@ -845,4 +863,21 @@ ALTER TABLE pending_op ADD COLUMN access_deferred_since INTEGER NOT NULL DEFAULT
 /// the next time its path is synced.
 const MIGRATION_V28: &str = "
 ALTER TABLE sync_entry ADD COLUMN local_mtime_ns INTEGER;
+";
+
+/// Schema v29: the trash listing remembers each trashed node's parent, so a
+/// restore can reason about the shape of what it is putting back.
+///
+/// Trash is a flat list of uids on the wire, but the user deletes a *tree*: a
+/// folder and, often, items inside it that were trashed separately. Restoring
+/// one of those in isolation is what the parent link fixes — a child restored
+/// under a still-trashed parent lands somewhere invisible, and a folder restored
+/// without its separately-trashed contents comes back empty.
+///
+/// `NULL` means "this row predates the column" (or the node is a volume root);
+/// the next trash refresh fills it in, and until then the restore behaves as it
+/// did before.
+const MIGRATION_V29: &str = "
+ALTER TABLE trash ADD COLUMN parent_uid TEXT;
+CREATE INDEX IF NOT EXISTS idx_trash_parent ON trash(parent_uid);
 ";

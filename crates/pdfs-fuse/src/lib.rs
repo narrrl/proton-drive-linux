@@ -4366,6 +4366,9 @@ impl Core {
                 is_dir: node.is_folder(),
                 size: node_size(&node) as i64,
                 mtime: node.modification_time,
+                // The folder the node will go back to, which is also what tells
+                // a restore whether that folder is itself in the trash.
+                parent_uid: node.parent_uid.as_ref().map(|uid| uid.to_string()),
             }));
             // Cumulative, so the table is always a prefix of the real trash
             // rather than a mix of this refresh and the last one.
@@ -4471,15 +4474,48 @@ impl Core {
             .collect()
     }
 
-    /// Restore trashed nodes to the folders they were trashed from. The parents
-    /// are read *before* the restore — a restored node reappears in a listing the
-    /// daemon may already have cached, so each destination folder is invalidated
-    /// and re-enumerated on next access.
+    /// Restore trashed nodes to the folders they were trashed from, together
+    /// with the rest of the trashed tree they belong to.
+    ///
+    /// The trash is a flat list, but a user deletes a shape: a folder, and often
+    /// items inside it that were trashed separately beforehand. Restoring one of
+    /// those in isolation is not what anyone means by it — a folder would come
+    /// back without the contents that were deleted with it, and a file would come
+    /// back inside a folder that is still in the trash, which is to say nowhere
+    /// the user can see. So a restore takes the whole connected piece:
+    /// every trashed descendant of what was asked for, and every trashed ancestor
+    /// above it. See [`expand_restore`] for the exact rule.
+    ///
+    /// The waves are restored shallowest first, because a node cannot be put back
+    /// under a parent that is still trashed.
+    ///
+    /// The destination parents are read *before* the restore — a restored node
+    /// reappears in a listing the daemon may already have cached, so each one is
+    /// invalidated and re-enumerated on next access.
     fn restore(&self, uids: &[String]) -> CoreResult<usize> {
-        let parsed = Self::parse_uids(uids)?;
+        let requested = Self::parse_uids(uids)?;
+        // A listing we could not read is not a reason to refuse the restore: it
+        // only costs the expansion, and the requested nodes still go back.
+        let relations = self.db.trash_parents().unwrap_or_default();
+        let waves = expand_restore(uids, &relations);
+        let waves: Vec<Vec<NodeUid>> = if waves.is_empty() {
+            vec![requested.clone()]
+        } else {
+            waves
+                .iter()
+                .map(|wave| {
+                    wave.iter()
+                        .filter_map(|uid| parse_uid(uid))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|wave: &Vec<NodeUid>| !wave.is_empty())
+                .collect()
+        };
+
+        let all: Vec<NodeUid> = waves.iter().flatten().cloned().collect();
         let parents: Vec<NodeUid> = self
             .rt
-            .block_on(self.client.enumerate_nodes(&parsed))
+            .block_on(self.client.enumerate_nodes(&all))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?
             .into_iter()
             .filter_map(|n| n.parent_uid)
@@ -4490,27 +4526,29 @@ impl Core {
         // half way through a large restore leaves local state describing what the
         // server actually did. Only a batch that restored nothing is an error the
         // caller can act on.
-        let mut restored: Vec<NodeUid> = Vec::with_capacity(parsed.len());
+        let mut restored: Vec<NodeUid> = Vec::with_capacity(all.len());
         let mut first_error: Option<ProtonError> = None;
-        self.rt
-            .block_on(async {
-                let mut outcomes = std::pin::pin!(self.client.restore_nodes_streaming(&parsed));
-                while let Some(item) = outcomes.next().await {
-                    let (uid, outcome) = item?;
-                    match outcome {
-                        Ok(()) => {
-                            self.hidden.lock().remove(&uid);
-                            restored.push(uid);
-                        }
-                        Err(e) => {
-                            warn!(%uid, error = %e, "restore failed for a node");
-                            first_error.get_or_insert(e);
+        for wave in &waves {
+            self.rt
+                .block_on(async {
+                    let mut outcomes = std::pin::pin!(self.client.restore_nodes_streaming(wave));
+                    while let Some(item) = outcomes.next().await {
+                        let (uid, outcome) = item?;
+                        match outcome {
+                            Ok(()) => {
+                                self.hidden.lock().remove(&uid);
+                                restored.push(uid);
+                            }
+                            Err(e) => {
+                                warn!(%uid, error = %e, "restore failed for a node");
+                                first_error.get_or_insert(e);
+                            }
                         }
                     }
-                }
-                Ok::<(), ProtonError>(())
-            })
-            .map_err(|e| CoreError::from_api(&e, "restore"))?;
+                    Ok::<(), ProtonError>(())
+                })
+                .map_err(|e| CoreError::from_api(&e, "restore"))?;
+        }
         if restored.is_empty()
             && let Some(error) = first_error
         {
@@ -5285,6 +5323,96 @@ fn node_size(node: &Node) -> u64 {
     }
 }
 
+/// Expand a restore request across the trashed tree, and order it so a parent is
+/// always restored before its children.
+///
+/// `relations` is the persisted trash listing as `(uid, parent_uid)` pairs; a
+/// parent that is not itself in the listing is a live folder, which ends the
+/// walk upward. The rule is:
+///
+/// - every trashed descendant of a requested node joins the restore, so a folder
+///   comes back with the items that were trashed inside it;
+/// - every trashed ancestor of a requested node joins it too, so a file never
+///   lands in a folder that is still in the trash;
+/// - a requested uid the listing does not know about is restored on its own,
+///   because a stale or half-materialised listing must not silently drop it.
+///
+/// The result is one wave per depth, shallowest first. Waves are disjoint and
+/// together contain each uid exactly once.
+fn expand_restore(
+    requested: &[String],
+    relations: &[(String, Option<String>)],
+) -> Vec<Vec<String>> {
+    let parents: HashMap<&str, Option<&str>> = relations
+        .iter()
+        .map(|(uid, parent)| (uid.as_str(), parent.as_deref()))
+        .collect();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (uid, parent) in relations {
+        // Only a trashed parent: a live one keeps its child as a root here.
+        if let Some(parent) = parent.as_deref()
+            && parents.contains_key(parent)
+        {
+            children.entry(parent).or_default().push(uid.as_str());
+        }
+    }
+
+    let mut selected: HashSet<&str> = HashSet::new();
+    for uid in requested {
+        let uid = uid.as_str();
+        if !parents.contains_key(uid) {
+            selected.insert(uid);
+            continue;
+        }
+        // Upward: every trashed ancestor, so the destination folder exists again.
+        let mut cursor = Some(uid);
+        while let Some(current) = cursor {
+            // A parent outside the listing is live: the walk stops under it.
+            if !parents.contains_key(current) || !selected.insert(current) {
+                break;
+            }
+            cursor = parents.get(current).copied().flatten();
+        }
+        // Downward: the whole trashed subtree, so the folder comes back full.
+        let mut stack = vec![uid];
+        while let Some(current) = stack.pop() {
+            for child in children.get(current).into_iter().flatten() {
+                if selected.insert(child) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    // Depth within the *trash*, not within the drive: a node whose parent is live
+    // (or unknown) is at depth 0 and can be restored straight away.
+    let mut waves: Vec<Vec<String>> = Vec::new();
+    for uid in &selected {
+        let mut depth = 0usize;
+        let mut cursor = parents.get(uid).copied().flatten();
+        // Only trashed ancestors count, and the walk is bounded by the listing's
+        // size: server data that somehow describes a cycle must not spin here.
+        while let Some(current) = cursor
+            && parents.contains_key(current)
+            && depth < parents.len()
+        {
+            depth += 1;
+            cursor = parents.get(current).copied().flatten();
+        }
+        if waves.len() <= depth {
+            waves.resize(depth + 1, Vec::new());
+        }
+        waves[depth].push((*uid).to_string());
+    }
+    // Stable output, so a restore of the same trash is the same sequence of calls
+    // every time — the batches are what shows up in the log and in the tests.
+    for wave in &mut waves {
+        wave.sort();
+    }
+    waves.retain(|wave| !wave.is_empty());
+    waves
+}
+
 /// The server revision id of a node's active revision, if it is a file that has
 /// one. The stable identity the drain conflict-checks against (see [`Baseline`]).
 fn node_revision_id(node: &Node) -> Option<String> {
@@ -5985,15 +6113,109 @@ mod tests {
     use super::{
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
         SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
-        accepted_share_provenance, conflict_name, copy_pending_for_truncate, fuse_name,
-        is_stale_mount, node_visible, note_self_change, parse_node_uid, prepare_shared_roots,
-        preserve_on_access_denied, publish_virtual_root_in_listing,
+        accepted_share_provenance, conflict_name, copy_pending_for_truncate, expand_restore,
+        fuse_name, is_stale_mount, node_visible, note_self_change, parse_node_uid,
+        prepare_shared_roots, preserve_on_access_denied, publish_virtual_root_in_listing,
         reconcile_virtual_root_in_listing, release_can_discard_unlinked,
         release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
         require_node_parent_access, require_rename_access, resolve_anywhere_with,
         shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
     };
     use super::{Db, WriteAuthority};
+
+    /// `(uid, parent)` pairs in the shape [`Db::trash_parents`] returns.
+    fn relations(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(uid, parent)| (uid.to_string(), parent.map(str::to_string)))
+            .collect()
+    }
+
+    fn uids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// Restoring a folder brings back what was trashed inside it, and the folder
+    /// goes first: the server has nowhere to put a child whose parent is trashed.
+    #[test]
+    fn restoring_a_folder_restores_its_trashed_contents_parents_first() {
+        let trash = relations(&[
+            ("dir", Some("live")),
+            ("file", Some("dir")),
+            ("deep", Some("sub")),
+            ("sub", Some("dir")),
+        ]);
+        assert_eq!(
+            expand_restore(&uids(&["dir"]), &trash),
+            vec![
+                vec!["dir".to_string()],
+                vec!["file".to_string(), "sub".to_string()],
+                vec!["deep".to_string()],
+            ]
+        );
+    }
+
+    /// Restoring a file inside a trashed folder restores the folder too —
+    /// otherwise the file comes back somewhere the user cannot reach.
+    #[test]
+    fn restoring_content_restores_the_trashed_parents_above_it() {
+        let trash = relations(&[
+            ("dir", Some("live")),
+            ("sub", Some("dir")),
+            ("file", Some("sub")),
+            ("other", Some("dir")),
+        ]);
+        // `other` is a sibling of `sub`, not an ancestor of `file`: it stays put.
+        assert_eq!(
+            expand_restore(&uids(&["file"]), &trash),
+            vec![
+                vec!["dir".to_string()],
+                vec!["sub".to_string()],
+                vec!["file".to_string()],
+            ]
+        );
+    }
+
+    /// A node whose parent is not in the trash is already at the top: one wave,
+    /// no ancestors invented.
+    #[test]
+    fn a_node_under_a_live_parent_restores_on_its_own() {
+        let trash = relations(&[("file", Some("live")), ("elsewhere", None)]);
+        assert_eq!(
+            expand_restore(&uids(&["file"]), &trash),
+            vec![vec!["file".to_string()]]
+        );
+    }
+
+    /// The listing is materialised in chunks and can be stale, so a uid it does
+    /// not know about must still be restored rather than dropped.
+    #[test]
+    fn an_unlisted_uid_is_still_restored() {
+        let trash = relations(&[("dir", None)]);
+        assert_eq!(
+            expand_restore(&uids(&["missing"]), &trash),
+            vec![vec!["missing".to_string()]]
+        );
+    }
+
+    /// Asking for both a folder and something inside it restores each node once.
+    #[test]
+    fn overlapping_requests_do_not_duplicate_nodes() {
+        let trash = relations(&[("dir", None), ("file", Some("dir"))]);
+        assert_eq!(
+            expand_restore(&uids(&["dir", "file"]), &trash),
+            vec![vec!["dir".to_string()], vec!["file".to_string()]]
+        );
+    }
+
+    /// A parent chain that loops back on itself must terminate.
+    #[test]
+    fn a_cyclic_listing_terminates() {
+        let trash = relations(&[("a", Some("b")), ("b", Some("a"))]);
+        let waves = expand_restore(&uids(&["a"]), &trash);
+        let total: usize = waves.iter().map(Vec::len).sum();
+        assert_eq!(total, 2);
+    }
 
     /// The collapse [`Core::require_uid_writable`] performs, without a `Core`:
     /// every non-writable authority is one `EACCES` on the syscall path.

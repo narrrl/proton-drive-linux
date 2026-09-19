@@ -11,7 +11,25 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Nothing yet.
+Schema: **29** (`trash.parent_uid`); SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.5**.
+
+### Changed
+- **Restore puts back the whole tree.** The trash is a flat list, but you delete a shape: a
+  folder, and often things you had already deleted inside it. Restoring a folder now also
+  restores the items that were trashed inside it, and restoring one of those items first
+  restores the trashed folders above it — otherwise the file came back into a folder that is
+  still in the trash, which is to say nowhere you can see it. Parents are restored before their
+  children, and each node is still restored individually, so one node the server refuses does
+  not cancel the rest.
+
+### Fixed
+- **A permanently rejected block upload is no longer retried (SDK 0.6.5).** The SDK now knows
+  which API errors are worth replaying: 4xx is permanent, except 404, 408 and 429.
+- **Long downloads no longer fail on expired block URLs (SDK 0.6.5).** A download whose block
+  URLs lapse mid-transfer re-mints them once instead of failing, on the whole-file path and on
+  public links, as reads already did.
+- **A long rate-limit answer can no longer look like a hang (SDK 0.6.5).** A server-supplied
+  `Retry-After` is now capped at 120 s.
 
 ## [1.10.2] — 2026-09-16
 
