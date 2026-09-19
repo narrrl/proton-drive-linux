@@ -260,16 +260,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     // Whatever changed the timeline can just as easily have
                     // changed an album; one scope covers the whole photos view.
                     core.invalidate_albums();
-                    // Clearing the stamp alone only promises the *next* read
-                    // will refetch, which means pressing Refresh paints the
-                    // stale page and corrects it a moment later. The user
-                    // pressed a button to see the truth, so this waits for it.
-                    core.rt.block_on(core.refresh_timeline()).map(|_| ())
+                    // The refresh is started here, not awaited. A library of
+                    // twelve thousand photos is re-read in chunks of
+                    // `TIMELINE_ENRICH_CHUNK` nodes, which takes minutes —
+                    // longer than the client's read bound, so awaiting it
+                    // returned `Resource temporarily unavailable` to a caller
+                    // whose refresh was in fact running fine (B92). The front
+                    // end follows it with `PhotosRefreshStatus`.
+                    core.spawn_timeline_refresh();
+                    Ok(())
                 }
             };
             match result {
                 Ok(()) => CtlResponse::Ok {
-                    message: "refreshed".to_string(),
+                    message: match scope {
+                        RefreshScope::Photos => "refreshing".to_string(),
+                        _ => "refreshed".to_string(),
+                    },
                 },
                 Err(e) => CtlResponse::error(e),
             }
@@ -394,6 +401,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::ThumbnailBuildStatus) => CtlResponse::ThumbnailBuild {
             status: core.thumbnail_build_status(),
+        },
+        Ok(CtlRequest::PhotosRefreshStatus) => CtlResponse::PhotosRefresh {
+            running: core.timeline_refreshing(),
         },
         Ok(CtlRequest::OpenPhoto { uid }) => match parse_uid(&uid) {
             Some(u) => match core.open_photo(&u) {

@@ -12,6 +12,45 @@ Conventions:
 
 ---
 
+## B92 — Refreshing the gallery reported "Resource temporarily unavailable"
+
+**Status:** Fixed (unverified) — the daemon carrying the change has not been driven against a real
+library yet.
+**Found:** 2026-09-19, while checking why a 12,445-photo timeline still showed the pre-grouping
+layout after pressing Refresh. `pdfs refresh photos` failed after about two minutes with:
+
+```
+Caused by:
+    0: io: Resource temporarily unavailable (os error 11)
+    1: Resource temporarily unavailable (os error 11)
+```
+
+**Where:** `crates/pdfs-fuse/src/control.rs` (`RefreshScope::Photos`),
+`crates/pdfs-core/src/control.rs` (`READ_TIMEOUT`, the new `PhotosRefreshStatus`),
+`crates/pdfs-gui/src/app/main.rs` (`refresh_then`), `crates/pdfs-cli/src/main.rs` (`cmd_refresh`).
+
+**Cause.** `Refresh { Photos }` awaited `refresh_timeline()` before replying, on the reasoning that
+somebody who presses Refresh wants the truth rather than a stale page. But the refresh resolves
+every photo's node in batches of `TIMELINE_ENRICH_CHUNK` (200), so a 12,445-photo library is 63
+server round-trips — minutes of work. The client's read bound is `READ_TIMEOUT` = 120 s, so the
+socket timed out with `EAGAIN` while the refresh was running perfectly. In the GUI the timeout was
+invisible: `refresh_then` ignores the reply and loads the page anyway, which re-read the *old*
+timeline and made Refresh look like a dead button.
+
+**What changed.** The daemon starts the refresh (`spawn_timeline_refresh`, which already dedupes)
+and replies `refreshing` at once. `Request::PhotosRefreshStatus` reports whether one is running;
+the gallery polls it every 2 s and reloads the page when it clears, and `pdfs refresh photos`
+polls in the same way so the command still means "the timeline is up to date when I return".
+`refresh_timeline` now logs `photos`, `chunks` and `elapsed_ms`.
+
+**Still open.** Every refresh re-resolves every photo, whatever changed. The metadata the resolve
+learns (name, media type, content hash, photo relation) is already kept across refreshes, so the
+pass could be limited to uids that have none — but the favourite tag is read from the same node,
+and remote favourite changes arrive as `NodeUpdated` events that only ask for "a refresh". Making
+the refresh incremental means deciding where favourites come from first.
+
+---
+
 ## B91 — The daemon hung overnight, and nothing could say what it was waiting on
 
 **Status:** Open — the hang itself is undiagnosed. What is fixed (unverified) is the

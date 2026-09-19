@@ -9,7 +9,7 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
-## [Unreleased]
+## [1.11.0] — 2026-09-19
 
 Schema: **30** (`photos.content_hash` / `main_uid` / `group_key`); SDK bumped to `proton-sdk` /
 `proton-drive-rs` **0.6.5**.
@@ -27,10 +27,11 @@ Schema: **30** (`photos.content_hash` / `main_uid` / `group_key`); SDK bumped to
   holding 1500 textures instead of 600, and the rows just past the edge of the window are
   fetched ahead of the scroll direction. Scrolling fast through a large timeline no longer
   leaves a screen of blank tiles behind.
-- **Refresh on the Photos page really refreshes.** It now waits for the timeline to come back
-  from the server before it answers, instead of only clearing the freshness stamp and letting
-  the next read serve the stale page. The timeline is also considered stale after 60 s rather
-  than 5 minutes.
+- **Refresh on the Photos page really refreshes.** Instead of only clearing the freshness stamp
+  and letting the next read serve the stale page, it starts the timeline re-read and follows it:
+  the page paints from what the daemon holds, then paints again when the new timeline lands. The
+  timeline is also considered stale after 60 s rather than 5 minutes. `pdfs refresh photos`
+  blocks until the re-read is done, as it reads.
 
 - **Restore puts back the whole tree.** The trash is a flat list, but you delete a shape: a
   folder, and often things you had already deleted inside it. Restoring a folder now also
@@ -66,6 +67,25 @@ Schema: **30** (`photos.content_hash` / `main_uid` / `group_key`); SDK bumped to
   daemon that stops answering is restarted instead of sitting there looking healthy (B91).
 
 ### Fixed
+- **A Pixel raw capture groups with its JPEG.** Pixel names the two files of one shot
+  `PXL_….RAW-01.COVER.jpg` and `PXL_….RAW-02.ORIGINAL.dng`, so their stems differ and the pairing
+  rule never saw them as one shot. The part-of-a-shot marker is now cut off before the names are
+  compared, and the grid shows the cover JPEG once. The grouping is computed by a timeline
+  refresh, so an existing library pairs up after the next one.
+- **The Raw tab no longer decodes a raw it does not have to.** A raw file that was written next
+  to a JPEG of the same shot is now given that JPEG's thumbnail, which the server usually already
+  has. No raw download and no raw decode for those tiles.
+- **Photos can be moved to Trash from the gallery again.** Photos live on the photo volume, which
+  the mount never holds, so the write check found no node to consult and refused every photo with
+  "trash access: not allowed". Membership of our own timeline now answers for them; an album photo
+  on someone else's volume is still refused.
+- **A photos refresh no longer fails with "Resource temporarily unavailable" (B92).** Re-reading a
+  twelve-thousand-photo library resolves the nodes in batches of 200 and takes minutes, but the
+  daemon held the control reply until it had finished — well past the client's 120 s read bound.
+  The caller therefore saw `io: Resource temporarily unavailable (os error 11)` for a refresh that
+  was running perfectly, and the gallery reloaded from the old timeline. The daemon now answers as
+  soon as the refresh is running, and the new `PhotosRefreshStatus` request reports when it is
+  done. Each refresh also logs its photo count, batch count and duration.
 - **A worker no longer panics during shutdown (B91).** The FUSE worker pool is joined before the
   tokio runtime is dropped, so a worker still inside a job does not find a runtime that is going
   away underneath it.

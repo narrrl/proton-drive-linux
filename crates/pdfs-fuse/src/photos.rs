@@ -29,8 +29,8 @@ use proton_drive_rs::{NodeKind, PhotoTag, PhotoTagsUpdate, ThumbnailType};
 use tracing::{info, warn};
 
 use super::{
-    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, node_size,
-    now_ms, parse_uid,
+    Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, WriteAuthority,
+    node_size, now_ms, parse_uid,
 };
 
 /// Longest edge, in px, of a thumbnail generated locally for a photo the server
@@ -540,6 +540,36 @@ impl Core {
         out
     }
 
+    /// Mutation admission for a photo, which [`Core::require_uid_writable`]
+    /// cannot answer on its own.
+    ///
+    /// Photos live on the photo volume, and that volume is not part of the FUSE
+    /// tree: a photo has no `nodes` row, so every authority comes back
+    /// [`WriteAuthority::Unknown`] and the plain check refuses the whole
+    /// library. Membership of our own timeline is the authority that does exist
+    /// here — the timeline is enumerated from our photo share, so a uid in it is
+    /// ours to trash. Anything else (an album photo on someone else's volume)
+    /// still fails closed.
+    fn require_photo_writable(&self, uid: &NodeUid) -> Result<(), fuser::Errno> {
+        match self.uid_write_authority(uid) {
+            WriteAuthority::Writable => Ok(()),
+            WriteAuthority::Denied => Err(fuser::Errno::EACCES),
+            WriteAuthority::Unknown => {
+                let key = uid.to_string();
+                let known = self
+                    .db
+                    .photos_by_uid(std::slice::from_ref(&key))
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(false);
+                if known {
+                    Ok(())
+                } else {
+                    Err(fuser::Errno::EACCES)
+                }
+            }
+        }
+    }
+
     /// Trash photos by uid, and forget them locally.
     ///
     /// The gallery is not part of the FUSE mount, so this is the photos-side
@@ -561,7 +591,7 @@ impl Core {
         }
         let uids = &self.expand_photo_groups(uids);
         for uid in uids {
-            self.require_uid_writable(uid)
+            self.require_photo_writable(uid)
                 .map_err(|errno| self.errno_error(errno, "trash access"))?;
         }
         let outcomes = self
@@ -602,8 +632,36 @@ impl Core {
     ///
     /// A photo absent from the persisted timeline is skipped: its capture time is
     /// the cache's validity tag, and guessing that would poison the cache.
-    pub(crate) fn photo_thumbs(&self, uids: &[NodeUid]) -> Vec<PhotoThumb> {
+    ///
+    /// A camera raw is served by the JPEG of the same shot when there is one:
+    /// the two files show one picture, and the JPEG is already decodable in
+    /// milliseconds where the raw costs a full download and a raw decode. The
+    /// tile still answers under the uid that was asked for.
+    pub(crate) fn photo_thumbs(&self, requested: &[NodeUid]) -> Vec<PhotoThumb> {
         let ttype = ThumbnailType::Thumbnail.as_i32();
+        // Only a raw can be stood in for, and that is one batched read; the
+        // per-shot group lookup is then paid for raws alone, not for a page of
+        // ordinary photos.
+        let asked: Vec<String> = requested.iter().map(|u| u.to_string()).collect();
+        let raws: HashSet<String> = self
+            .db
+            .photos_by_uid(&asked)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|photo| photo.kind == PhotoKind::Raw)
+            .map(|photo| photo.uid)
+            .collect();
+        let sources: Vec<NodeUid> = requested
+            .iter()
+            .map(|uid| {
+                if raws.contains(&uid.to_string()) {
+                    self.thumb_source(uid)
+                } else {
+                    uid.clone()
+                }
+            })
+            .collect();
+        let uids = &sources;
         let keys: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
         let mut stored = self.db.photos_by_uid(&keys).unwrap_or_default();
         // Album covers and the contents of an album shared with us are not in our
@@ -686,17 +744,45 @@ impl Core {
         }
 
         let pending = self.thumb_gen.lock();
-        uids.iter()
-            .map(|uid| PhotoThumb {
-                uid: uid.to_string(),
-                path: tags.get(&uid.to_string()).and_then(|&tag| {
+        requested
+            .iter()
+            .zip(uids)
+            .map(|(asked, source)| PhotoThumb {
+                uid: asked.to_string(),
+                path: tags.get(&source.to_string()).and_then(|&tag| {
                     self.cache
-                        .cached_thumbnail_path(uid, ttype, tag)
+                        .cached_thumbnail_path(source, ttype, tag)
                         .map(|p| p.display().to_string())
                 }),
-                pending: pending.contains(uid),
+                pending: pending.contains(source),
             })
             .collect()
+    }
+
+    /// Which file's thumbnail stands for `uid` on a tile.
+    ///
+    /// Itself, for all but a camera raw that was written next to a JPEG of the
+    /// same shot. For that one, the JPEG: same picture, already compressed,
+    /// often carrying a server thumbnail the raw does not have — so the Raw tab
+    /// costs no raw download and no raw decode. A raw that stands alone keeps
+    /// its own local generation.
+    fn thumb_source(&self, uid: &NodeUid) -> NodeUid {
+        let members = match self.db.photos_group(&uid.to_string()) {
+            Ok(members) if members.len() > 1 => members,
+            _ => return uid.clone(),
+        };
+        let key = uid.to_string();
+        if !members
+            .iter()
+            .any(|photo| photo.uid == key && photo.kind == PhotoKind::Raw)
+        {
+            return uid.clone();
+        }
+        members
+            .iter()
+            .find(|photo| photo.kind != PhotoKind::Raw)
+            .and_then(|photo| parse_uid(&photo.uid))
+            .unwrap_or_else(|| uid.clone())
     }
 
     /// Thumbnails for image files shown by the regular file browser, Shared and
@@ -1313,6 +1399,7 @@ impl Core {
     /// Whether the listing stamped under `key` is older than `ttl` (or was never
     /// fetched).
     pub(crate) async fn refresh_timeline(&self) -> CoreResult<bool> {
+        let started = Instant::now();
         let photos = self.photos();
         if photos
             .get_photos_root()
@@ -1407,6 +1494,14 @@ impl Core {
         self.db.photos_replace(&rows).map_err(CoreError::from)?;
         let _ = self.db.set_state_i64(PHOTOS_AVAILABLE, 1);
         let _ = self.db.set_state_i64(PHOTOS_SYNCED_MS, now_ms());
+        // How long this took is the first thing to know when a refresh looks
+        // like it never happened, and the chunk count is what it scales with.
+        info!(
+            photos = rows.len(),
+            chunks = uids.len().div_ceil(TIMELINE_ENRICH_CHUNK),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "photos timeline refreshed"
+        );
         Ok(true)
     }
 
@@ -1423,6 +1518,12 @@ impl Core {
             }
             core.timeline_refreshing.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Whether a timeline refresh is running. A front-end that asked for one
+    /// watches this to know when the new timeline is worth re-reading.
+    pub(crate) fn timeline_refreshing(&self) -> bool {
+        self.timeline_refreshing.load(Ordering::SeqCst)
     }
 
     /// Download a photo's full content into the content cache, returning its

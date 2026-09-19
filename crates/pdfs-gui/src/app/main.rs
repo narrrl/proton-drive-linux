@@ -78,6 +78,15 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// reload by clearing the page's timestamp.
 const PAGE_TTL: Duration = Duration::from_secs(30);
 
+/// How often the gallery asks whether the timeline refresh it started has
+/// finished.
+const PHOTOS_REFRESH_POLL: Duration = Duration::from_secs(2);
+
+/// How long the gallery keeps following one timeline refresh. A library of tens
+/// of thousands of photos is re-read in batches over several minutes; past this
+/// the daemon carries on and the page catches up on its next load.
+const PHOTOS_REFRESH_FOLLOW_LIMIT: Duration = Duration::from_secs(15 * 60);
+
 /// All widgets the periodic refresh and the action handlers mutate, plus the
 /// resolved paths they act on. Wrapped in an [`Rc`] so handlers and the timeout
 /// closure share one instance.
@@ -874,11 +883,54 @@ fn reload_current_page(ui: &Rc<Ui>) {
 /// how to report an unreachable daemon on its own page, and a refresh that fails
 /// silently would read as a dead button.
 fn refresh_then(ui: &Rc<Ui>, scope: RefreshScope, load: fn(&Rc<Ui>)) {
+    // A photos refresh answers as soon as it has started, because re-reading a
+    // large library takes minutes. The page is therefore loaded twice: once from
+    // what the daemon already holds, and again when the refresh has landed.
+    let follow = scope == RefreshScope::Photos;
     let rx = spawn_request(ui.dirs.control_socket(), Request::Refresh { scope });
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let _ = rx.recv().await;
         load(&ui);
+        if follow {
+            follow_photos_refresh(&ui, load);
+        }
+    });
+}
+
+/// Watch the timeline refresh the daemon just started, and load the page again
+/// when it finishes.
+///
+/// Giving up after [`PHOTOS_REFRESH_FOLLOW_LIMIT`] is not a failure: the refresh
+/// keeps running in the daemon and the next visit to the page shows its result.
+/// It only stops this front-end from polling a daemon forever.
+fn follow_photos_refresh(ui: &Rc<Ui>, load: fn(&Rc<Ui>)) {
+    let ui = ui.clone();
+    let give_up_at = Instant::now() + PHOTOS_REFRESH_FOLLOW_LIMIT;
+    glib::spawn_future_local(async move {
+        loop {
+            glib::timeout_future(PHOTOS_REFRESH_POLL).await;
+            // The person may have left the gallery in the meantime; reloading a
+            // page nobody is looking at would only cost the daemon work.
+            if ui.stack.visible_child_name().as_deref() != Some("gallery") {
+                return;
+            }
+            let rx = spawn_request(ui.dirs.control_socket(), Request::PhotosRefreshStatus);
+            match rx.recv().await {
+                Ok(Ok(Response::PhotosRefresh { running: true })) => {
+                    if Instant::now() >= give_up_at {
+                        return;
+                    }
+                }
+                Ok(Ok(Response::PhotosRefresh { running: false })) => {
+                    load(&ui);
+                    return;
+                }
+                // An older daemon does not know the request, and anything else
+                // means we cannot tell — either way, stop asking.
+                _ => return,
+            }
+        }
     });
 }
 

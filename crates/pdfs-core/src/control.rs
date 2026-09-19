@@ -135,6 +135,12 @@ pub enum Request {
     CancelThumbnailBuild,
     /// Read progress for the recursive ordinary-file thumbnail build.
     ThumbnailBuildStatus,
+    /// Whether a photos-timeline refresh is running right now. Replies with
+    /// [`Response::PhotosRefresh`].
+    ///
+    /// [`RefreshScope::Photos`] starts the refresh and returns at once, so this
+    /// is how a front-end knows when the refreshed timeline is worth re-reading.
+    PhotosRefreshStatus,
     /// Download a photo's full content into the cache; replies with its path.
     OpenPhoto { uid: String },
     /// Add or remove Proton's `Favorite` tag on a photo. Replies with
@@ -582,7 +588,10 @@ pub enum RefreshScope {
     Dir { path: String },
     /// The trash listing.
     Trash,
-    /// The photos timeline.
+    /// The photos timeline. The reply comes back as soon as the refresh has
+    /// *started*, not when it has finished: re-reading a large library takes
+    /// minutes, which is far longer than a control reply may take. Poll
+    /// [`Request::PhotosRefreshStatus`] to know when the new timeline is there.
     Photos,
 }
 
@@ -1636,6 +1645,9 @@ pub enum Response {
     FileThumbGeneration { generation: u64 },
     /// Current recursive thumbnail-build progress.
     ThumbnailBuild { status: ThumbnailBuildStatus },
+    /// Whether a photos-timeline refresh is still running (reply to
+    /// [`Request::PhotosRefreshStatus`]).
+    PhotosRefresh { running: bool },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
     FilePath { path: String },
     /// Full-text search results (reply to [`Request::Search`]).
@@ -2061,6 +2073,21 @@ mod tests {
 
         let response = Response::FileThumbsStale;
         let line = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+    }
+
+    /// A photos refresh is followed, not awaited, so the request that reports
+    /// its progress is part of the wire contract.
+    #[test]
+    fn photos_refresh_status_roundtrips() {
+        let line = serde_json::to_string(&Request::PhotosRefreshStatus).unwrap();
+        assert_eq!(line, r#""PhotosRefreshStatus""#);
+        let decoded: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+
+        let line = serde_json::to_string(&Response::PhotosRefresh { running: true }).unwrap();
+        assert_eq!(line, r#"{"PhotosRefresh":{"running":true}}"#);
         let decoded: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(line, serde_json::to_string(&decoded).unwrap());
     }

@@ -2277,12 +2277,41 @@ fn cmd_refresh(target: Option<String>) -> Result<()> {
             path: path.unwrap_or("").to_string(),
         },
     };
+    let photos = scope == RefreshScope::Photos;
     match control_request(CtlRequest::Refresh { scope })? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }
+    if photos {
+        wait_for_photos_refresh()?;
+    }
     Ok(())
+}
+
+/// How often [`wait_for_photos_refresh`] asks the daemon whether the timeline
+/// refresh it started is done.
+const PHOTOS_REFRESH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Block until the daemon's timeline refresh has finished.
+///
+/// The daemon answers `Refresh { Photos }` as soon as the refresh is running,
+/// because re-reading a large library takes minutes and a control reply may not.
+/// `pdfs refresh photos` means "the timeline is up to date when I return", so
+/// the waiting happens here, where no socket read bound applies.
+fn wait_for_photos_refresh() -> Result<()> {
+    loop {
+        std::thread::sleep(PHOTOS_REFRESH_POLL);
+        match control_request(CtlRequest::PhotosRefreshStatus)? {
+            CtlResponse::PhotosRefresh { running: true } => continue,
+            CtlResponse::PhotosRefresh { running: false } => {
+                println!("refreshed");
+                return Ok(());
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        }
+    }
 }
 
 /// Ask for a typed `yes` before an irreversible destroy. Errors (aborting the

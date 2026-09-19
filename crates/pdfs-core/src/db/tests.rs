@@ -4040,6 +4040,51 @@ fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
     assert_eq!(db.photos_group("alone").unwrap().len(), 1);
 }
 
+/// Pixel names the two files of one raw capture after the role each plays, so
+/// their stems differ. The shot is still one shot, and the grid shows the cover
+/// JPEG.
+#[test]
+fn a_pixel_raw_capture_groups_with_its_cover_jpeg() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("PXL_20260919_000625670.RAW-01.COVER.jpg".into()),
+            ..TimelineRow::new("cover", 1_789_776_385)
+        },
+        TimelineRow {
+            name: Some("PXL_20260919_000625670.RAW-02.ORIGINAL.dng".into()),
+            ..TimelineRow::new("original", 1_789_776_385)
+        },
+        // A name that merely contains the marker's opening is not a marker.
+        TimelineRow {
+            name: Some("scan.raw-notes.jpg".into()),
+            ..TimelineRow::new("notes", 1_789_776_385)
+        },
+        TimelineRow {
+            name: Some("scan.raw-other.dng".into()),
+            ..TimelineRow::new("other", 1_789_776_385)
+        },
+    ])
+    .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["cover", "notes", "other"],
+        "the capture shows once, as the cover JPEG"
+    );
+    assert_eq!(page[0].group_size, 2);
+    assert!(page[0].has_raw);
+    assert_eq!(
+        db.photos_group("original")
+            .unwrap()
+            .iter()
+            .map(|p| p.uid.as_str())
+            .collect::<Vec<_>>(),
+        ["cover", "original"]
+    );
+}
+
 /// Two files that merely share a name are not one shot: the same stem on
 /// different days, or two files of the same kind, stay apart.
 #[test]

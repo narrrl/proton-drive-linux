@@ -97,14 +97,39 @@ fn capture_day(conn: &rusqlite::Connection, capture_time: i64) -> Option<String>
 }
 
 /// The file name without its extension, lowercased — `IMG_1234.CR2` and
-/// `IMG_1234.JPG` share `img_1234`.
+/// `IMG_1234.JPG` share `img_1234` — with the camera's own part-of-a-shot
+/// marker removed, so the two files a raw capture writes share a stem too.
 fn name_stem(name: Option<&str>) -> Option<String> {
     let name = name?;
     let stem = match name.rsplit_once('.') {
         Some((stem, _)) if !stem.is_empty() => stem,
         _ => name,
     };
-    Some(stem.to_ascii_lowercase())
+    let stem = stem.to_ascii_lowercase();
+    Some(strip_shot_marker(&stem).to_string())
+}
+
+/// Drop a `.RAW-NN.ROLE` marker from a stem.
+///
+/// Pixel stores one raw capture as `PXL_20260919_000625670.RAW-01.COVER.jpg`
+/// and `PXL_20260919_000625670.RAW-02.ORIGINAL.dng`: one shot, two files, two
+/// stems that differ in exactly the part naming which file of the shot this is.
+/// Cutting the marker off is what lets rule 2 see the pair. The check is narrow
+/// on purpose — digits, then a single role word — so an ordinary name that
+/// happens to contain `.raw-` keeps its stem.
+fn strip_shot_marker(stem: &str) -> &str {
+    let Some(at) = stem.rfind(".raw-") else {
+        return stem;
+    };
+    let rest = &stem[at + ".raw-".len()..];
+    let Some((index, role)) = rest.split_once('.') else {
+        return stem;
+    };
+    let marked = !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit())
+        && !role.is_empty()
+        && role.bytes().all(|b| b.is_ascii_alphabetic());
+    if marked { &stem[..at] } else { stem }
 }
 
 /// One entry of the grouping pass: what rule 2 needs, plus what choosing a
