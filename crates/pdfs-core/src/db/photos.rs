@@ -58,6 +58,11 @@ pub struct TimelineRow {
     /// The main photo this one is *related* to (a live-photo video, a burst
     /// sibling), when the server says it belongs to one.
     pub main_uid: Option<String>,
+    /// When this refresh resolved the photo's node, if it did at all. `Some`
+    /// makes every other field authoritative — including a `None` that means
+    /// "the server no longer reports one" — while `None` means the refresh
+    /// skipped this photo and whatever is stored must be kept.
+    pub resolved_at: Option<i64>,
 }
 
 impl TimelineRow {
@@ -74,12 +79,16 @@ impl TimelineRow {
 /// What a previous refresh learned about a photo and a new one must not lose.
 #[derive(Clone, Debug, Default)]
 struct Learned {
+    name: Option<String>,
     ratio: Option<f64>,
     thumb_state: i64,
     media_type: Option<String>,
     favorite: bool,
     content_hash: Option<String>,
     main_uid: Option<String>,
+    /// When this photo's node was last resolved, kept so a refresh that skips it
+    /// does not make it look unresolved again.
+    resolved_at: Option<i64>,
 }
 
 /// The local calendar day a capture time falls on, as a `YYYY-MM-DD` string.
@@ -253,35 +262,39 @@ fn stored_photo(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPhoto> {
 }
 
 impl Db {
-    /// Replace the timeline wholesale. `favorite`, `media_type`, `content_hash`
-    /// and `main_uid` are `None` when the refresh could not resolve that photo's
-    /// node, in which case what is already stored is kept rather than silently
-    /// cleared.
+    /// Replace the timeline wholesale. A row whose `resolved_at` is `Some` was
+    /// read from the server in this pass, so its fields are taken as they are —
+    /// a `None` there means the server no longer reports that value. A row whose
+    /// `resolved_at` is `None` was skipped or failed to resolve, and keeps
+    /// whatever is already stored rather than having it silently cleared.
     pub fn photos_replace(&self, items: &[TimelineRow]) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        // `media_type` is learned-and-kept like the ratio and thumb verdict: the
-        // timeline DTO carries only the uid and capture time, so the daemon may
-        // not know a photo's media type yet when it replaces the timeline. Keep
-        // any previously learned value so the Photos/Videos/Raw split survives a
-        // refresh instead of collapsing back to name-extension guesses. The photo
-        // relation is kept for the same reason: losing it would break a group up
-        // until the next successful resolve.
+        // `name` and `media_type` are learned-and-kept like the ratio and thumb
+        // verdict: the timeline DTO carries only the uid and capture time, so the
+        // daemon may not know them when it replaces the timeline — because the
+        // refresh skipped an already-resolved photo, or because resolving it
+        // failed. Keep any previously learned value so the tab split and the
+        // RAW+JPEG grouping survive a refresh instead of collapsing to nothing:
+        // both are derived from the name. The photo relation is kept for the same
+        // reason — losing it would break a group up until the next resolve.
         let learned: HashMap<String, Learned> = {
             let mut stmt = tx.prepare(
-                "SELECT uid, ratio, thumb_state, media_type, favorite, content_hash, main_uid \
-                 FROM photos",
+                "SELECT uid, name, ratio, thumb_state, media_type, favorite, content_hash, \
+                 main_uid, resolved_at FROM photos",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     Learned {
-                        ratio: r.get(1)?,
-                        thumb_state: r.get(2)?,
-                        media_type: r.get(3)?,
-                        favorite: r.get::<_, i64>(4)? != 0,
-                        content_hash: r.get(5)?,
-                        main_uid: r.get(6)?,
+                        name: r.get(1)?,
+                        ratio: r.get(2)?,
+                        thumb_state: r.get(3)?,
+                        media_type: r.get(4)?,
+                        favorite: r.get::<_, i64>(5)? != 0,
+                        content_hash: r.get(6)?,
+                        main_uid: r.get(7)?,
+                        resolved_at: r.get(8)?,
                     },
                 ))
             })?;
@@ -296,15 +309,29 @@ impl Db {
                     thumb_state: THUMB_UNKNOWN,
                     ..Learned::default()
                 });
-                carried.media_type = row.media_type.clone().or(carried.media_type);
-                carried.favorite = row.favorite.unwrap_or(carried.favorite);
-                carried.content_hash = row.content_hash.clone().or(carried.content_hash);
-                carried.main_uid = row.main_uid.clone().or(carried.main_uid);
+                if row.resolved_at.is_some() {
+                    // This pass read the node itself, so what it says is the
+                    // truth — including what it no longer says. A photo unlinked
+                    // from its main on another device loses its `main_uid` here,
+                    // which a carry could never express.
+                    carried.name = row.name.clone();
+                    carried.media_type = row.media_type.clone();
+                    carried.favorite = row.favorite.unwrap_or(false);
+                    carried.content_hash = row.content_hash.clone();
+                    carried.main_uid = row.main_uid.clone();
+                } else {
+                    carried.name = row.name.clone().or(carried.name);
+                    carried.media_type = row.media_type.clone().or(carried.media_type);
+                    carried.favorite = row.favorite.unwrap_or(carried.favorite);
+                    carried.content_hash = row.content_hash.clone().or(carried.content_hash);
+                    carried.main_uid = row.main_uid.clone().or(carried.main_uid);
+                }
+                carried.resolved_at = row.resolved_at.or(carried.resolved_at);
                 // The tab this photo lands in is derived here, once, so a page or
                 // count query is a plain indexed `WHERE kind = ?` rather than a
                 // reclassification of every row.
                 let kind = crate::control::PhotoKind::classify(
-                    row.name.as_deref(),
+                    carried.name.as_deref(),
                     carried.media_type.as_deref(),
                 );
                 (row, carried, kind)
@@ -318,7 +345,7 @@ impl Db {
                 kind: *kind,
                 main_uid: carried.main_uid.clone(),
                 day: capture_day(&tx, row.capture_time),
-                stem: name_stem(row.name.as_deref()),
+                stem: name_stem(carried.name.as_deref()),
             })
             .collect();
         let group_keys = group_photos(&entries);
@@ -328,8 +355,8 @@ impl Db {
             let mut stmt = tx.prepare(
                 "INSERT INTO photos
                    (uid, capture_time, name, ratio, thumb_state, seq, media_type, kind, favorite,
-                    content_hash, main_uid, group_key)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    content_hash, main_uid, group_key, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for (seq, ((row, carried, kind), group_key)) in
                 resolved.iter().zip(group_keys.iter()).enumerate()
@@ -337,7 +364,7 @@ impl Db {
                 stmt.execute(params![
                     row.uid,
                     row.capture_time,
-                    row.name,
+                    carried.name,
                     carried.ratio,
                     carried.thumb_state,
                     seq as i64,
@@ -347,11 +374,56 @@ impl Db {
                     carried.content_hash,
                     carried.main_uid,
                     group_key,
+                    carried.resolved_at,
                 ])?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The uids whose node metadata is already resolved, so a refresh can skip
+    /// reading their nodes again. Everything else — a photo never seen before, or
+    /// one a remote event marked stale — is resolved. That is what keeps a
+    /// 12k-photo library off 63 round-trips of `enumerate_nodes` every refresh.
+    pub fn photos_resolved(&self) -> Result<Vec<String>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare("SELECT uid FROM photos WHERE resolved_at IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut uids = Vec::new();
+        for row in rows {
+            uids.push(row?);
+        }
+        Ok(uids)
+    }
+
+    /// Mark photos as needing a fresh metadata resolve, and report how many rows
+    /// that matched. This is how a remote change is recorded: the event feed says
+    /// *which* node changed but never *what* changed about it, so the uid is
+    /// written down and the next refresh reads the node.
+    pub fn photos_mark_unresolved(&self, uids: &[String]) -> Result<usize> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut marked = 0;
+        {
+            let mut stmt = tx.prepare("UPDATE photos SET resolved_at = NULL WHERE uid = ?1")?;
+            for uid in uids {
+                marked += stmt.execute(params![uid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    /// The same for the whole timeline: every photo is resolved again on the next
+    /// refresh. For a continuity loss, where the daemon cannot know what it
+    /// missed, and for an explicit `refresh photos --full`.
+    pub fn photos_mark_all_unresolved(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute("UPDATE photos SET resolved_at = NULL", [])?)
     }
 
     /// Forget photos that have been trashed, so the gallery does not show them

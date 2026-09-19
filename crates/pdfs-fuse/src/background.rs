@@ -489,36 +489,73 @@ pub(super) async fn run_photos_event_sync(core: Core) {
     }
 }
 
-/// Apply one batch of photos-volume events to the gallery's tables.
-fn apply_photo_events(core: &Core, events: &[DriveEvent]) {
-    let mut gone: Vec<String> = Vec::new();
-    let mut refresh = false;
+/// What one batch of photos-volume events asks the gallery's tables to do.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct PhotoEventPlan {
+    /// Photos that left the volume, by delete or by trash.
+    pub(super) gone: Vec<String>,
+    /// Photos whose node changed, so their stored metadata is no longer trusted.
+    pub(super) touched: Vec<String>,
+    /// Whether the whole timeline has to be read again.
+    pub(super) full: bool,
+}
+
+impl PhotoEventPlan {
+    fn is_empty(&self) -> bool {
+        self.gone.is_empty() && self.touched.is_empty() && !self.full
+    }
+}
+
+/// Read one batch of photos-volume events. Pure, so the classification is
+/// testable without a volume behind it.
+///
+/// `is_echo` claims an event as this daemon's own write. The feed replays our
+/// writes back at us and a `NodeUpdated` carries no revision id, so without this
+/// every favourite the user toggles here would mark its own photo stale and buy
+/// a resolve of a node we just wrote.
+fn classify_photo_events(
+    events: &[DriveEvent],
+    mut is_echo: impl FnMut(&NodeUid) -> bool,
+) -> PhotoEventPlan {
+    let mut plan = PhotoEventPlan::default();
     for event in events {
         match event {
-            DriveEvent::NodeDeleted { node_uid, .. } => gone.push(node_uid.to_string()),
+            DriveEvent::NodeDeleted { node_uid, .. } => plan.gone.push(node_uid.to_string()),
             DriveEvent::NodeUpdated {
                 node_uid,
                 is_trashed,
                 ..
             } => {
                 if *is_trashed {
-                    gone.push(node_uid.to_string());
-                } else {
-                    // An untrash, a rename, a new upload from the phone: all of
-                    // them need the timeline itself, which only a refresh has.
-                    refresh = true;
+                    plan.gone.push(node_uid.to_string());
+                } else if !is_echo(node_uid) {
+                    // An untrash, a rename, a favourite toggled on the phone: the
+                    // event says which node changed but never what about it, so
+                    // the uid is marked stale and the next refresh reads it.
+                    plan.touched.push(node_uid.to_string());
                 }
             }
-            // Nothing here can be applied event by event, so the whole timeline
-            // is re-read instead.
+            // The daemon cannot know what it missed here, so everything it
+            // thinks it knows about every photo is dropped.
             DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
-                refresh = true;
+                plan.full = true;
             }
             DriveEvent::CursorAdvanced { .. } | DriveEvent::SharedWithMeUpdated { .. } => {}
         }
     }
+    plan
+}
+
+/// Apply one batch of photos-volume events to the gallery's tables.
+fn apply_photo_events(core: &Core, events: &[DriveEvent]) {
+    let plan = classify_photo_events(events, |uid| core.take_self_change(uid));
+    let PhotoEventPlan {
+        gone,
+        touched,
+        full,
+    } = &plan;
     if !gone.is_empty() {
-        match core.db.photos_delete(&gone) {
+        match core.db.photos_delete(gone) {
             Ok(removed) if removed > 0 => {
                 debug!(removed, "photos removed by a remote event");
             }
@@ -526,7 +563,22 @@ fn apply_photo_events(core: &Core, events: &[DriveEvent]) {
             Err(error) => warn!(%error, "removing remotely deleted photos failed"),
         }
     }
-    if refresh || !gone.is_empty() {
+    // A stale mark is what makes the next refresh cheap: it reads these photos'
+    // nodes and carries every other photo's metadata as it stands.
+    if !touched.is_empty() {
+        match core.db.photos_mark_unresolved(touched) {
+            Ok(marked) if marked > 0 => debug!(marked, "photos changed by a remote event"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "marking remotely changed photos failed"),
+        }
+    }
+    if *full {
+        match core.db.photos_mark_all_unresolved() {
+            Ok(marked) => debug!(marked, "the photo event stream lost continuity"),
+            Err(error) => warn!(%error, "marking the whole timeline unresolved failed"),
+        }
+    }
+    if !plan.is_empty() {
         core.invalidate_photos();
         core.invalidate_albums();
     }
@@ -900,5 +952,97 @@ mod tests {
         );
         assert!(acknowledge_applied_event(&db, &event, applied).is_err());
         assert!(db.get_event_cursor().unwrap().is_none());
+    }
+
+    /// A photo trashed or deleted elsewhere leaves the gallery; one that only
+    /// changed is marked stale, so the next refresh reads that node and no other.
+    #[test]
+    fn a_photo_event_names_what_it_changed() {
+        let plan = classify_photo_events(
+            &[
+                DriveEvent::NodeDeleted {
+                    id: DriveEventId::from("e1"),
+                    node_uid: uid("deleted"),
+                    parent_node_uid: None,
+                },
+                DriveEvent::NodeUpdated {
+                    id: DriveEventId::from("e2"),
+                    node_uid: uid("trashed"),
+                    parent_node_uid: None,
+                    is_trashed: true,
+                    is_shared: false,
+                },
+                DriveEvent::NodeUpdated {
+                    id: DriveEventId::from("e3"),
+                    node_uid: uid("favourited"),
+                    parent_node_uid: None,
+                    is_trashed: false,
+                    is_shared: false,
+                },
+            ],
+            |_| false,
+        );
+        assert_eq!(
+            plan,
+            PhotoEventPlan {
+                gone: vec![uid("deleted").to_string(), uid("trashed").to_string()],
+                touched: vec![uid("favourited").to_string()],
+                full: false,
+            }
+        );
+    }
+
+    /// The feed replays this daemon's own writes. Applying one would cost a
+    /// resolve of a node whose changed field the daemon just wrote itself.
+    #[test]
+    fn our_own_photo_write_is_not_a_remote_change() {
+        let plan = classify_photo_events(
+            &[DriveEvent::NodeUpdated {
+                id: DriveEventId::from("e1"),
+                node_uid: uid("ours"),
+                parent_node_uid: None,
+                is_trashed: false,
+                is_shared: false,
+            }],
+            |claimed| *claimed == uid("ours"),
+        );
+        assert_eq!(plan, PhotoEventPlan::default());
+    }
+
+    /// A gap in the stream means the daemon cannot know what it missed, so it
+    /// keeps nothing.
+    #[test]
+    fn a_lost_photo_event_stream_asks_for_everything() {
+        for event in [
+            DriveEvent::ContinuityLost {
+                id: DriveEventId::from("e1"),
+            },
+            DriveEvent::ScopeAccessLost {
+                id: DriveEventId::from("e1"),
+            },
+        ] {
+            let plan = classify_photo_events(std::slice::from_ref(&event), |_| false);
+            assert!(plan.full, "{event:?}");
+            assert!(plan.gone.is_empty());
+            assert!(plan.touched.is_empty());
+        }
+    }
+
+    /// Bookkeeping events change nothing about the gallery, and must not buy a
+    /// refresh of it.
+    #[test]
+    fn photo_bookkeeping_events_ask_for_nothing() {
+        let plan = classify_photo_events(
+            &[
+                DriveEvent::CursorAdvanced {
+                    id: DriveEventId::from("e1"),
+                },
+                DriveEvent::SharedWithMeUpdated {
+                    id: DriveEventId::from("e2"),
+                },
+            ],
+            |_| false,
+        );
+        assert_eq!(plan, PhotoEventPlan::default());
     }
 }

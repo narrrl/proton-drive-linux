@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 30;
+pub(super) const SCHEMA_VERSION: i64 = 31;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -252,6 +252,22 @@ impl Db {
             )? > 0;
             if has_photos && !has_column {
                 tx.execute_batch(MIGRATION_V30)?;
+            }
+        }
+        if current < 31 {
+            // Same guards as V26-V30.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('photos') WHERE name = 'resolved_at'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_photos: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'photos'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_photos && !has_column {
+                tx.execute_batch(MIGRATION_V31)?;
             }
         }
         tx.execute(
@@ -917,4 +933,22 @@ ALTER TABLE photos ADD COLUMN content_hash TEXT;
 ALTER TABLE photos ADD COLUMN main_uid TEXT;
 ALTER TABLE photos ADD COLUMN group_key TEXT;
 CREATE INDEX IF NOT EXISTS idx_photos_group ON photos(group_key);
+";
+
+/// Schema v31: which photos a refresh still has to read from the server.
+///
+/// A refresh used to resolve every photo's node to learn its name, media type,
+/// favourite tag, content hash and photo relation — minutes of round-trips for a
+/// library of any size, repeated every time the timeline went stale. `resolved_at`
+/// records that the work was already done, so a refresh only reads the photos it
+/// has never read and the ones a remote event marked stale (`resolved_at = NULL`).
+///
+/// The backfill treats an existing timeline as resolved, so an upgrade does not
+/// re-read the whole library once. `WHERE name IS NOT NULL` keeps the photos
+/// whose earlier resolve had failed eligible: a nameless row is one nothing was
+/// ever learned about.
+const MIGRATION_V31: &str = "
+ALTER TABLE photos ADD COLUMN resolved_at INTEGER;
+CREATE INDEX IF NOT EXISTS idx_photos_unresolved ON photos(resolved_at);
+UPDATE photos SET resolved_at = strftime('%s','now') WHERE name IS NOT NULL;
 ";

@@ -848,7 +848,7 @@ fn reload_current_page(ui: &Rc<Ui>) {
         }
         // One scope covers the whole photos view, so Refresh reloads whichever of
         // the two — album grid or timeline/album — is actually on screen.
-        Some("gallery") => refresh_then(ui, RefreshScope::Photos, |ui| {
+        Some("gallery") => refresh_then(ui, RefreshScope::Photos { full: false }, |ui| {
             if ui.gallery.content.visible_child_name().as_deref() == Some("albums") {
                 load_albums(ui);
             } else {
@@ -886,7 +886,7 @@ fn refresh_then(ui: &Rc<Ui>, scope: RefreshScope, load: fn(&Rc<Ui>)) {
     // A photos refresh answers as soon as it has started, because re-reading a
     // large library takes minutes. The page is therefore loaded twice: once from
     // what the daemon already holds, and again when the refresh has landed.
-    let follow = scope == RefreshScope::Photos;
+    let follow = matches!(scope, RefreshScope::Photos { .. });
     let rx = spawn_request(ui.dirs.control_socket(), Request::Refresh { scope });
     let ui = ui.clone();
     glib::spawn_future_local(async move {

@@ -310,6 +310,11 @@ enum Command {
         /// What to refresh: a folder path (inside the mountpoint or relative to
         /// it), `trash`, or `photos`. The mount root if omitted.
         target: Option<String>,
+        /// With `photos`: read every photo's metadata again instead of only what
+        /// changed. Minutes on a large library; for a gallery that disagrees with
+        /// the account.
+        #[arg(long)]
+        full: bool,
     },
 
     /// Manage the account's registered devices.
@@ -683,7 +688,7 @@ fn main() -> Result<()> {
         Command::Restore { uids } => cmd_restore(uids),
         Command::DeleteForever { uids } => cmd_delete_forever(uids),
         Command::EmptyTrash => cmd_empty_trash(),
-        Command::Refresh { target } => cmd_refresh(target),
+        Command::Refresh { target, full } => cmd_refresh(target, full),
         Command::Devices { action } => cmd_devices(action),
         Command::Sync { action } => cmd_sync(action),
         Command::Share {
@@ -2269,15 +2274,15 @@ fn cmd_empty_trash() -> Result<()> {
 /// Drop a cached listing. `trash` and `photos` name those two listings; anything
 /// else is read as a folder path, so a folder actually called "trash" is still
 /// reachable as `./trash`.
-fn cmd_refresh(target: Option<String>) -> Result<()> {
+fn cmd_refresh(target: Option<String>, full: bool) -> Result<()> {
     let scope = match target.as_deref() {
         Some("trash") => RefreshScope::Trash,
-        Some("photos") => RefreshScope::Photos,
+        Some("photos") => RefreshScope::Photos { full },
         path => RefreshScope::Dir {
             path: path.unwrap_or("").to_string(),
         },
     };
-    let photos = scope == RefreshScope::Photos;
+    let photos = matches!(scope, RefreshScope::Photos { .. });
     match control_request(CtlRequest::Refresh { scope })? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),

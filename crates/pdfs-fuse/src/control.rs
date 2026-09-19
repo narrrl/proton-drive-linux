@@ -255,8 +255,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     core.invalidate_trash();
                     Ok(())
                 }
-                RefreshScope::Photos => {
+                RefreshScope::Photos { full } => {
                     core.invalidate_photos();
+                    // A full refresh is "forget what you know", not a second code
+                    // path: the ordinary refresh then finds every photo stale.
+                    if let Some(Err(e)) = full.then(|| core.db.photos_mark_all_unresolved()) {
+                        warn!(error = %e, "marking the whole timeline unresolved failed");
+                    }
                     // Whatever changed the timeline can just as easily have
                     // changed an album; one scope covers the whole photos view.
                     core.invalidate_albums();
@@ -274,7 +279,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             match result {
                 Ok(()) => CtlResponse::Ok {
                     message: match scope {
-                        RefreshScope::Photos => "refreshing".to_string(),
+                        RefreshScope::Photos { .. } => "refreshing".to_string(),
                         _ => "refreshed".to_string(),
                     },
                 },

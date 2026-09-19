@@ -213,7 +213,10 @@ const TIMELINE_TTL: Duration = Duration::from_secs(60);
 /// Photos / Videos / Raw split). Batched so a large library is a handful of
 /// round-trips rather than one request per photo, and bounded so a single call
 /// never asks the server to decrypt the whole library at once.
-const TIMELINE_ENRICH_CHUNK: usize = 200;
+///
+/// 150 because that is the SDK's own `MAX_BATCH_COUNT`: a larger chunk is split
+/// there anyway, into one full request and a ragged tail.
+const TIMELINE_ENRICH_CHUNK: usize = 150;
 /// The same, for the persisted trash listing. Shorter, because the trash is the
 /// one listing a user changes and then immediately looks at — though our own
 /// mutations also invalidate it outright, so this only covers other clients.

@@ -4217,3 +4217,215 @@ fn migration_v30_leaves_a_v29_timeline_intact() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
+
+/// A refresh that skips an already-resolved photo sends a row carrying only the
+/// uid and capture time. The name must survive that, because the tab split and
+/// the grouping are both derived from it.
+#[test]
+fn photos_replace_keeps_a_skipped_photos_name() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            media_type: Some("image/jpeg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.CR2".into()),
+            media_type: Some("application/octet-stream".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("raw", 300)
+        },
+    ])
+    .unwrap();
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(page.len(), 1, "one shot, two files");
+    assert!(page[0].has_raw);
+
+    // The next refresh resolves neither, because both are already resolved.
+    db.photos_replace(&[TimelineRow::new("jpeg", 300), TimelineRow::new("raw", 300)])
+        .unwrap();
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(page.len(), 1, "the group survives a skipped refresh");
+    assert_eq!(page[0].name.as_deref(), Some("IMG_1234.JPG"));
+    assert!(page[0].has_raw, "the raw file is still a raw file");
+    assert_eq!(page[0].group_size, 2);
+}
+
+/// Only the photos a refresh actually read are marked resolved; the rest stay
+/// eligible, so the next refresh tries them again.
+#[test]
+fn photos_replace_marks_only_the_rows_it_resolved() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("ok.jpg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("ok", 300)
+        },
+        // The chunk holding this one failed.
+        TimelineRow::new("failed", 200),
+    ])
+    .unwrap();
+    assert_eq!(db.photos_resolved().unwrap(), ["ok"]);
+
+    // A resolved photo stays resolved across a refresh that skips it.
+    db.photos_replace(&[
+        TimelineRow::new("ok", 300),
+        TimelineRow {
+            name: Some("late.jpg".into()),
+            resolved_at: Some(2),
+            ..TimelineRow::new("failed", 200)
+        },
+    ])
+    .unwrap();
+    let mut resolved = db.photos_resolved().unwrap();
+    resolved.sort();
+    assert_eq!(resolved, ["failed", "ok"]);
+}
+
+/// What a refresh read is the truth, including what it no longer reports: a
+/// photo unlinked from its main on another device leaves the group.
+#[test]
+fn a_resolved_replace_clears_a_relation_the_server_dropped() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            main_uid: Some("main".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+    assert_eq!(db.photos_group("related").unwrap().len(), 2);
+
+    // Both are read again and the server no longer reports the relation.
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            resolved_at: Some(2),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            resolved_at: Some(2),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+    assert_eq!(
+        db.photos_group("related").unwrap().len(),
+        1,
+        "an unlinked photo stands on its own"
+    );
+}
+
+/// A refresh that did *not* read the nodes must not break the group up, which is
+/// the older behaviour and still the one a failed resolve gets.
+#[test]
+fn an_unresolved_replace_keeps_a_relation() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_0001.HEIC".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("main", 300)
+        },
+        TimelineRow {
+            name: Some("clip.mov".into()),
+            main_uid: Some("main".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("related", 299)
+        },
+    ])
+    .unwrap();
+
+    db.photos_replace(&[
+        TimelineRow::new("main", 300),
+        TimelineRow::new("related", 299),
+    ])
+    .unwrap();
+    assert_eq!(db.photos_group("related").unwrap().len(), 2);
+}
+
+/// A remote event names the photo it changed, and that is all it takes to have
+/// the next refresh read that one node again.
+#[test]
+fn marking_a_photo_unresolved_makes_it_eligible_again() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("a.jpg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("a", 300)
+        },
+        TimelineRow {
+            name: Some("b.jpg".into()),
+            resolved_at: Some(1),
+            ..TimelineRow::new("b", 200)
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(db.photos_mark_unresolved(&["a".to_string()]).unwrap(), 1);
+    assert_eq!(db.photos_resolved().unwrap(), ["b"]);
+    // A uid the timeline does not hold changes nothing.
+    assert_eq!(db.photos_mark_unresolved(&["gone".to_string()]).unwrap(), 0);
+
+    assert_eq!(db.photos_mark_all_unresolved().unwrap(), 2);
+    assert!(db.photos_resolved().unwrap().is_empty());
+}
+
+/// An existing timeline opens as resolved, so upgrading does not re-read the
+/// whole library once — except for the photos nothing was ever learned about.
+#[test]
+fn migration_v31_treats_an_existing_timeline_as_resolved() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v30-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.photos_replace(&[
+            TimelineRow {
+                name: Some("IMG_1234.JPG".into()),
+                resolved_at: Some(1),
+                ..TimelineRow::new("named", 300)
+            },
+            // A photo whose resolve had failed: nothing was ever learned.
+            TimelineRow::new("nameless", 200),
+        ])
+        .unwrap();
+    }
+    {
+        // Put the file back in the state a released V30 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_photos_unresolved;
+             ALTER TABLE photos DROP COLUMN resolved_at;
+             UPDATE sync_state SET value = '30' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.photos_resolved().unwrap(),
+        ["named"],
+        "the stored timeline is trusted, a nameless row is not"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}

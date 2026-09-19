@@ -222,8 +222,13 @@ impl Core {
                 tags_to_add: vec![PhotoTag::Favorite],
                 tags_to_remove: Vec::new(),
             };
-            if let Err(e) = self.rt.block_on(photos.update_photos(&[update])) {
-                warn!(name = candidate.name, error = %e, "cannot re-favourite re-dated photo");
+            match self.rt.block_on(photos.update_photos(&[update])) {
+                // As in `set_photo_favorite`: claim our own echo, so the tag we
+                // just set does not come back as a remote change.
+                Ok(_) => self.note_self_change(&new_uid),
+                Err(e) => {
+                    warn!(name = candidate.name, error = %e, "cannot re-favourite re-dated photo")
+                }
             }
         }
         for album in &candidate.albums {

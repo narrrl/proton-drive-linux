@@ -12,6 +12,32 @@ Conventions:
 
 ---
 
+## B93 — A photo whose node would not resolve lost its name, and with it its tab and its group
+
+**Status:** Fixed (unverified) — found and fixed while making the timeline refresh incremental
+(B92); no library with an undecryptable photo in it has been driven against the fix.
+**Found:** 2026-09-19, by reading `photos_replace` before making a refresh skip photos it has
+already resolved. Skipping one means writing a `TimelineRow` that carries only the uid and the
+capture time, which is exactly the row a failed resolve already produced.
+
+**Where:** `crates/pdfs-core/src/db/photos.rs` (`Learned`, `photos_replace`).
+
+**Cause.** `photos_replace` keeps what a refresh could not learn — ratio, thumbnail verdict, media
+type, favourite flag, content hash, photo relation all survive a `None`. The `name` did not:
+`Learned` never held it, the SELECT never read it, and the INSERT bound `row.name` straight
+through. So a photo the SDK could not decrypt (it logs and skips the node) had its stored name
+overwritten with `NULL` on every refresh. That is not a cosmetic loss — both the tab split and the
+grouping are derived from the name. `PhotoKind::classify` is extension-first, so a nameless RAW
+file classifies as a still photo and leaves the Raw tab; `name_stem` returns `None`, so the RAW and
+the JPEG of one shot stop being one shot; and `redate` skips nameless photos outright.
+
+**What changed.** `Learned` carries the name like everything else, and the kind and the group stem
+are computed from the carried name rather than the incoming row. A row that *was* resolved is now
+authoritative instead: its fields are taken as they are, so a photo unlinked from its main on
+another device finally loses its `main_uid` — a carry could never express "the server says none".
+
+---
+
 ## B92 — Refreshing the gallery reported "Resource temporarily unavailable"
 
 **Status:** Fixed (unverified) — the daemon carrying the change has not been driven against a real
@@ -43,11 +69,24 @@ the gallery polls it every 2 s and reloads the page when it clears, and `pdfs re
 polls in the same way so the command still means "the timeline is up to date when I return".
 `refresh_timeline` now logs `photos`, `chunks` and `elapsed_ms`.
 
-**Still open.** Every refresh re-resolves every photo, whatever changed. The metadata the resolve
-learns (name, media type, content hash, photo relation) is already kept across refreshes, so the
-pass could be limited to uids that have none — but the favourite tag is read from the same node,
-and remote favourite changes arrive as `NodeUpdated` events that only ask for "a refresh". Making
-the refresh incremental means deciding where favourites come from first.
+**What changed, second pass (2026-09-19).** The refresh is incremental. `photos.resolved_at`
+(schema v31) records that a photo's node was read, and `refresh_timeline` resolves only the photos
+that have no such mark — the ones it has never read, and the ones a remote event marked stale.
+A library that has already been read costs one `enumerate_timeline` and no `enumerate_nodes` call
+at all.
+
+The favourite question resolved by moving it off the refresh and onto the event feed:
+`classify_photo_events` turns a `NodeUpdated` into `photos_mark_unresolved(uid)` instead of a
+blanket "re-read everything", so a favourite toggled on a phone costs one node read rather than
+63. A local toggle is claimed as our own echo (`note_self_change`), because the feed replays it and
+a `NodeUpdated` carries nothing that says what changed. `ContinuityLost` / `ScopeAccessLost` and
+`pdfs refresh photos --full` drop every mark, which is the one way back to a whole-library read.
+`TIMELINE_ENRICH_CHUNK` is 150, matching the SDK's own `MAX_BATCH_COUNT` — a chunk of 200 was split
+there into a full request and a 50-uid tail.
+
+**Still open.** `invalidate_albums()` drives the same pattern per album
+(`crates/pdfs-fuse/src/albums.rs:96` and `:191`). It is bounded by album size rather than library
+size, so it is nowhere near as expensive, but the technique that fixed this would apply there too.
 
 ---
 

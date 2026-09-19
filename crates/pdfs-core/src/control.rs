@@ -592,7 +592,15 @@ pub enum RefreshScope {
     /// *started*, not when it has finished: re-reading a large library takes
     /// minutes, which is far longer than a control reply may take. Poll
     /// [`Request::PhotosRefreshStatus`] to know when the new timeline is there.
-    Photos,
+    ///
+    /// A refresh normally only reads the photos the daemon has never read and
+    /// the ones a remote event marked changed. `full` drops that knowledge and
+    /// reads every photo's node again — the repair for a timeline that somehow
+    /// disagrees with the account, and minutes of work on a large library.
+    Photos {
+        #[serde(default)]
+        full: bool,
+    },
 }
 
 /// A registered device in a [`Response::Devices`] listing.
@@ -2077,6 +2085,16 @@ mod tests {
         assert_eq!(line, serde_json::to_string(&decoded).unwrap());
     }
 
+    /// `full` defaults, so a front-end built against the older wire shape still
+    /// asks for the ordinary refresh rather than failing to parse.
+    #[test]
+    fn a_photos_refresh_scope_defaults_to_not_full() {
+        let scope: RefreshScope = serde_json::from_str(r#"{"Photos":{}}"#).unwrap();
+        assert_eq!(scope, RefreshScope::Photos { full: false });
+        let line = serde_json::to_string(&RefreshScope::Photos { full: true }).unwrap();
+        assert_eq!(line, r#"{"Photos":{"full":true}}"#);
+    }
+
     /// A photos refresh is followed, not awaited, so the request that reports
     /// its progress is part of the wire contract.
     #[test]
@@ -2262,7 +2280,10 @@ mod tests {
                 scope: RefreshScope::Trash,
             },
             Request::Refresh {
-                scope: RefreshScope::Photos,
+                scope: RefreshScope::Photos { full: false },
+            },
+            Request::Refresh {
+                scope: RefreshScope::Photos { full: true },
             },
         ];
         for req in reqs {

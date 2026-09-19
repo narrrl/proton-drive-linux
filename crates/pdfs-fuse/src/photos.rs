@@ -499,6 +499,11 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "update photo tags"))?;
         pdfs_core::batch::into_unit(outcomes)
             .map_err(|e| CoreError::from_api(&e, "update photo tags"))?;
+        // The photo event feed replays this write back at us as a bare
+        // `NodeUpdated`, which is indistinguishable from the same photo being
+        // favourited on a phone. Claim the echo, or the gallery pays for a
+        // resolve of a node whose one changed field is already stored below.
+        self.note_self_change(uid);
         self.db
             .photos_set_favorite(&uid.to_string(), favorite)
             .map_err(CoreError::from)?;
@@ -1416,13 +1421,30 @@ impl Core {
             .await
             .map_err(|e| CoreError::from_api(&e, "timeline"))?;
 
-        // The timeline DTO carries only a uid and capture time, but the Photos
-        // page has to split into Photos / Videos / Raw — which needs each photo's
-        // name and media type. Resolve those in batches off the request path.
-        // Best-effort: a photo whose node we fail to resolve keeps whatever was
-        // learned before (or classifies from nothing, i.e. a still photo), so a
-        // partial resolve never blanks the timeline.
-        let uids: Vec<NodeUid> = items.iter().map(|it| it.uid.clone()).collect();
+        // The timeline DTO carries only a uid and capture time, but the gallery
+        // has to split into its tabs — which needs each photo's name and media
+        // type. Resolve those in batches off the request path. Best-effort: a
+        // photo whose node we fail to resolve keeps whatever was learned before
+        // (or classifies from nothing, i.e. a still photo), so a partial resolve
+        // never blanks the timeline.
+        //
+        // Only photos the daemon has never read, and ones a remote event marked
+        // stale, are read. Resolving all of them every time is what made a
+        // 12k-photo refresh take minutes (`docs/BUGS.md` B92): this metadata does
+        // not change on its own, and when it does change the event feed names the
+        // uid that changed (`Db::photos_mark_unresolved`).
+        let known: HashSet<String> = self
+            .db
+            .photos_resolved()
+            .map_err(CoreError::from)?
+            .into_iter()
+            .collect();
+        let uids: Vec<NodeUid> = items
+            .iter()
+            .filter(|it| !known.contains(&it.uid.to_string()))
+            .map(|it| it.uid.clone())
+            .collect();
+        let resolved_at = now_ms();
         let mut meta: HashMap<String, PhotoMeta> = HashMap::new();
         // A main photo names its related photos rather than the other way round,
         // so the relation is recorded from whichever end resolves — the two ends
@@ -1482,6 +1504,7 @@ impl Core {
                         favorite: Some(m.favorite),
                         content_hash: m.content_hash,
                         main_uid,
+                        resolved_at: Some(resolved_at),
                         ..db::TimelineRow::new(key, it.capture_time)
                     },
                     None => db::TimelineRow {
@@ -1498,6 +1521,8 @@ impl Core {
         // like it never happened, and the chunk count is what it scales with.
         info!(
             photos = rows.len(),
+            resolved = uids.len(),
+            skipped = rows.len().saturating_sub(uids.len()),
             chunks = uids.len().div_ceil(TIMELINE_ENRICH_CHUNK),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "photos timeline refreshed"
