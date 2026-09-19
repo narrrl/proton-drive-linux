@@ -1283,6 +1283,24 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
         overlay.add_overlay(&badge);
     }
 
+    // A shot stored as more than one file says so, in the corner the caption
+    // does not use. "RAW" is the useful word when one of the members is a raw
+    // file — that is what the person wants to find — and a plain count covers
+    // the rest (a live photo, a burst).
+    if tile.photo.has_raw || tile.photo.group_size > 1 {
+        let badge = gtk4::Label::builder()
+            .label(if tile.photo.has_raw {
+                "RAW".to_string()
+            } else {
+                format!("{}", tile.photo.group_size)
+            })
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Start)
+            .build();
+        badge.add_css_class("photo-group-badge");
+        overlay.add_overlay(&badge);
+    }
+
     // Selection mode marks every tile, picked or not: a check that only appears
     // once a photo is chosen leaves the user guessing what else is clickable.
     if tile.selecting {
@@ -1404,17 +1422,41 @@ fn sync_selection_bar(ui: &Rc<Ui>) {
 }
 
 /// Confirm, then move every selected photo to Proton trash.
+/// How many files the selected tiles stand for. A tile whose photo the model no
+/// longer holds counts as one, which is what it looks like on screen.
+fn selected_file_count(ui: &Rc<Ui>, uids: &[String]) -> usize {
+    let wanted: HashSet<&str> = uids.iter().map(String::as_str).collect();
+    let mut files = 0;
+    for idx in 0..ui.gallery.model.n_items() {
+        let Some(boxed) = ui.gallery.model.item(idx).and_downcast::<BoxedAnyObject>() else {
+            continue;
+        };
+        let photo = boxed.borrow::<PhotoItem>();
+        if wanted.contains(photo.uid.as_str()) {
+            files += photo.group_size.max(1) as usize;
+        }
+    }
+    files.max(uids.len())
+}
+
 pub(crate) fn delete_selected(ui: &Rc<Ui>) {
     let uids: Vec<String> = ui.gallery.selected.borrow().iter().cloned().collect();
     if uids.is_empty() {
         return;
     }
+    // A selected tile can stand for more than one file — a shot kept as RAW and
+    // JPEG — and all of them go. The dialog says so rather than letting the user
+    // find out from the trash.
+    let files = selected_file_count(ui, &uids);
+    let body = match (uids.len(), files) {
+        (1, 1) => "Move this photo to Trash?".to_string(),
+        (1, files) => format!("Move this photo to Trash? It is stored as {files} files."),
+        (n, files) if files == n => format!("Move {n} photos to Trash?"),
+        (n, files) => format!("Move {n} photos to Trash? They are stored as {files} files."),
+    };
     let dialog = adw::AlertDialog::builder()
         .heading("Move to Trash")
-        .body(match uids.len() {
-            1 => "Move this photo to Trash?".to_string(),
-            n => format!("Move {n} photos to Trash?"),
-        })
+        .body(body)
         .build();
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("trash", "Move to Trash");

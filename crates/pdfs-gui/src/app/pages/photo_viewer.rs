@@ -24,6 +24,11 @@ pub(crate) struct Viewer {
     /// uses for its pin switch, so painting a photo doesn't fire a round-trip.
     pub(crate) favorite: gtk4::ToggleButton,
     pub(crate) favorite_suppress: Cell<bool>,
+    /// The button that switches between the files of one shot, and the files it
+    /// switches between (the JPEG and the RAW of a photo, a live photo and its
+    /// clip). Empty, and the button hidden, for a photo stored as one file.
+    pub(crate) group_btn: gtk4::Button,
+    pub(crate) group: RefCell<Vec<PhotoItem>>,
     /// uid of the photo currently on screen.
     pub(crate) uid: RefCell<String>,
     /// On-disk path of the full-size photo, once it has been downloaded.
@@ -81,6 +86,59 @@ fn set_gallery_favorite(ui: &Rc<Ui>, uid: &str, favorite: bool) {
 /// Show the photo behind `uid`: paint its (already cached) thumbnail immediately
 /// so the lightbox never opens on a blank screen, ask the daemon for the
 /// full-size file, and swap it in — plus its EXIF — when it lands.
+/// Ask the daemon which files this shot was stored as, and offer a switch when
+/// there is more than one. The grid shows such a shot as a single tile, so the
+/// lightbox is the only place the RAW is reachable.
+fn load_photo_group(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: &str) {
+    viewer.group.borrow_mut().clear();
+    viewer.group_btn.set_visible(false);
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::PhotoGroup {
+            uid: uid.to_string(),
+        },
+    );
+    let viewer = viewer.clone();
+    let uid = uid.to_string();
+    glib::spawn_future_local(async move {
+        let Ok(Ok(Response::Photos { items, .. })) = rx.recv().await else {
+            return;
+        };
+        // A late reply for a photo the user has already left must not relabel
+        // the button under the one now on screen.
+        if *viewer.uid.borrow() != uid || items.len() < 2 {
+            return;
+        }
+        if let Some(next) = next_group_member(&items, &uid) {
+            viewer
+                .group_btn
+                .set_tooltip_text(Some(&format!("Show {}", member_label(next))));
+        }
+        *viewer.group.borrow_mut() = items;
+        viewer.group_btn.set_visible(true);
+    });
+}
+
+/// The member after `uid`, wrapping round — the button steps through a shot's
+/// files rather than toggling two of them, so a burst of three works too.
+pub(crate) fn next_group_member<'a>(members: &'a [PhotoItem], uid: &str) -> Option<&'a PhotoItem> {
+    let at = members.iter().position(|item| item.uid == uid)?;
+    members.get((at + 1) % members.len())
+}
+
+/// What to call one file of a shot: its name, or its kind when the daemon has
+/// not resolved a name for it.
+pub(crate) fn member_label(item: &PhotoItem) -> String {
+    match item.name.as_deref() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => match item.kind {
+            PhotoKind::Raw => "the raw file".to_string(),
+            PhotoKind::Video => "the video".to_string(),
+            PhotoKind::Photo => "the photo".to_string(),
+        },
+    }
+}
+
 pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     viewer.spinner.set_visible(true);
     viewer.spinner.start();
@@ -96,6 +154,7 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
         .and_downcast::<BoxedAnyObject>()
         .is_some_and(|boxed| boxed.borrow::<PhotoItem>().favorite);
     show_favorite(viewer, favorite);
+    load_photo_group(ui, viewer, &uid);
 
     // The thumbnail the gallery already decoded stands in for the full photo
     // while it downloads: blurry for a moment beats black for a second.
@@ -503,6 +562,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     favorite_btn.add_css_class("flat");
     favorite_btn.add_css_class("viewer-action-btn");
 
+    // Only shown for a shot stored as more than one file; `load_photo_group`
+    // decides that per photo.
+    let group_btn = action("view-paged-symbolic", "Other files of this photo");
+    group_btn.set_visible(false);
+
     let download_btn = action("document-save-symbolic", "Save a copy…");
     let delete_btn = action("user-trash-symbolic", "Move to Trash (Delete)");
     let open_ext_btn = action("document-open-symbolic", "Open with another app");
@@ -514,6 +578,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     top_bar.set_valign(gtk4::Align::Start);
     top_bar.set_hexpand(true);
     top_bar.append(&titles);
+    top_bar.append(&group_btn);
     top_bar.append(&favorite_btn);
     top_bar.append(&info_toggle);
     top_bar.append(&download_btn);
@@ -616,6 +681,8 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         info_map: info_map.clone(),
         favorite: favorite_btn.clone(),
         favorite_suppress: Cell::new(false),
+        group_btn: group_btn.clone(),
+        group: RefCell::new(Vec::new()),
         coords: RefCell::new(None),
         uid: RefCell::new(initial_uid.clone()),
         path: RefCell::new(None),
@@ -707,6 +774,18 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         let uid = viewer_delete.uid.borrow().clone();
         w_delete.close();
         trash_photos(&ui_delete, vec![uid]);
+    });
+
+    let ui_group = ui.clone();
+    let viewer_group = viewer.clone();
+    group_btn.connect_clicked(move |_| {
+        let uid = viewer_group.uid.borrow().clone();
+        let next =
+            next_group_member(&viewer_group.group.borrow(), &uid).map(|item| item.uid.clone());
+        if let Some(next) = next {
+            *viewer_group.uid.borrow_mut() = next.clone();
+            load_photo(&ui_group, &viewer_group, next);
+        }
     });
 
     let w_download = window.clone();

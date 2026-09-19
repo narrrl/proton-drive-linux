@@ -152,6 +152,17 @@ The gallery lays each day out in justified rows (`justify_rows` / `plan_rows` / 
 - **Delete is uid-addressed.** The photos volume is not in the FUSE mount, so the path-based `Request::Delete` cannot reach it. `Request::TrashNodes { uids }` trashes through the SDK and answers `Response::Trashed { trashed, failed }`; the daemon then drops those rows with `Db::photos_delete` (album membership included) so the gallery does not wait for a timeline refresh. The GUI removes the tiles optimistically with an Undo toast and puts back anything the server refused.
 - **Remote deletions arrive on their own.** The Drive volume and the photos volume have separate event streams, so `run_photos_event_sync` polls the photos volume with its own cursor (`photos_event_cursor` in the state table). Trash and delete events remove rows; anything else only invalidates freshness, because there is no inode space to converge on this volume. Together with a 60 s `TIMELINE_TTL` and a `RefreshScope::Photos` that now awaits the refresh, a photo deleted on a phone leaves the grid in about ten seconds.
 
+### RAW + JPEG Grouping (Implemented)
+**Files**: [`photos.rs`](../crates/pdfs-core/src/db/photos.rs), [`migrations.rs`](../crates/pdfs-core/src/db/migrations.rs), [`photos.rs`](../crates/pdfs-fuse/src/photos.rs), [`photo_viewer.rs`](../crates/pdfs-gui/src/app/pages/photo_viewer.rs)
+
+Schema **v30** adds `content_hash`, `main_uid` and an indexed `group_key` to `photos`. The first two come from the server's `PhotoProperties` and are filled by the enrichment pass in `refresh_timeline` that already resolves each photo's name, media type and favourite tag; `group_key` is computed in `photos_replace`, where the whole timeline is in hand.
+
+- **Precedence.** The server relation first (`main_photo_uid` and `related_photo_uids`, read from whichever end resolves — the two can land in different enrichment chunks); then same capture day, same case-insensitive name stem, and one member raw while the other is not; otherwise the photo is its own group. The union-find pass is over the timeline in memory, so it costs one pass per refresh rather than a query per photo.
+- **Representative.** The non-raw member when there is one — a JPEG decodes in milliseconds and is what the person expects to see. `group_key` holds that member's uid, so "is this the tile" is `uid = group_key`, an index scan.
+- **What is grouped and what is not.** `photos_page`, `photos_months` and `photos_counts` count groups, except on the Raw tab, which lists files. Album pages are never grouped: an album is a list someone made. The relation is learned-and-kept like `media_type`, so a refresh that could not resolve a node does not break a group up.
+- **Deleting.** `Core::trash_photos` expands each uid to its group before trashing, because the grid shows the shot as one tile — leaving the RAW behind would put the photo back on the Raw tab and nowhere else. The GUI's confirmation names the file count.
+- **The other files.** `Request::PhotoGroup { uid }` answers with the group's members as ordinary `PhotoItem`s, which is what the lightbox's switch steps through.
+
 ### Persistent SDK Entity Cache (Implemented)
 **Files**: [`sdkcache.rs`](../crates/pdfs-core/src/sdkcache.rs), [`auth.rs`](../crates/pdfs-core/src/auth.rs), [`background.rs`](../crates/pdfs-fuse/src/background.rs)
 

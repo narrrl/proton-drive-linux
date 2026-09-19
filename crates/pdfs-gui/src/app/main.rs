@@ -265,6 +265,7 @@ fn load_proton_theme() {
          .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 180ms ease; }}\n\
          .photo-video-badge {{ color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }}\n\
          .photo-tile:hover .photo-video-badge {{ background: alpha({PROTON_PURPLE}, 0.85); }}\n\
+         .photo-group-badge {{ font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; color: white; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 1px 5px; margin: 6px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }}\n\
          .photo-tile:hover .photo-caption {{ opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }}\n\
          .album-card {{ padding: 0; border-radius: 16px; transition: background 180ms ease; }}\n\
          .album-card:hover {{ background: alpha(currentColor, 0.07); }}\n\
@@ -1285,6 +1286,59 @@ mod tests {
             .sum();
         assert_eq!(placed, ratios.len());
         assert!(plan_rows(&[], 1000, ROW_DEFAULT).is_empty());
+    }
+
+    /// One file of a shot, for the group-switch tests.
+    fn member(uid: &str, name: Option<&str>, kind: PhotoKind) -> PhotoItem {
+        PhotoItem {
+            uid: uid.into(),
+            capture_time: 0,
+            thumb_path: None,
+            name: name.map(str::to_string),
+            ratio: None,
+            no_thumb: false,
+            kind,
+            favorite: false,
+            group_size: 2,
+            has_raw: kind == PhotoKind::Raw,
+        }
+    }
+
+    /// The lightbox steps through a shot's files and comes back round, so a
+    /// burst of three is as reachable as a RAW+JPEG pair.
+    #[test]
+    fn the_group_switch_cycles_through_every_file() {
+        let members = [
+            member("jpeg", Some("IMG_1.JPG"), PhotoKind::Photo),
+            member("raw", Some("IMG_1.CR2"), PhotoKind::Raw),
+            member("clip", None, PhotoKind::Video),
+        ];
+        let next = |uid| next_group_member(&members, uid).map(|item| item.uid.as_str());
+        assert_eq!(next("jpeg"), Some("raw"));
+        assert_eq!(next("raw"), Some("clip"));
+        assert_eq!(next("clip"), Some("jpeg"));
+        // A photo that is not in the group leaves the button alone rather than
+        // jumping somewhere arbitrary.
+        assert_eq!(next("elsewhere"), None);
+        assert!(next_group_member(&[], "jpeg").is_none());
+    }
+
+    /// The switch names what it will show; a file whose name the daemon has not
+    /// resolved still gets a sentence rather than a blank.
+    #[test]
+    fn a_group_member_without_a_name_is_still_described() {
+        assert_eq!(
+            member_label(&member("raw", Some("IMG_1.CR2"), PhotoKind::Raw)),
+            "IMG_1.CR2"
+        );
+        assert_eq!(
+            member_label(&member("raw", None, PhotoKind::Raw)),
+            "the raw file"
+        );
+        assert_eq!(
+            member_label(&member("clip", Some(""), PhotoKind::Video)),
+            "the video"
+        );
     }
 
     #[test]

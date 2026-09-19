@@ -293,6 +293,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::PhotoGroup { uid }) => match core.photo_group(&uid) {
+            Ok(items) => CtlResponse::Photos {
+                available: true,
+                items,
+                counts: None,
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::SetPhotoFavorite { uid, favorite }) => match parse_uid(&uid) {
             Some(node_uid) => match core.set_photo_favorite(&node_uid, favorite) {
                 Ok(()) => CtlResponse::Ok {

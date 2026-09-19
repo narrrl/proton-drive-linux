@@ -68,6 +68,11 @@ pub enum Request {
         #[serde(default)]
         favorites: bool,
     },
+    /// Every photo of one photo's group — the JPEG and the RAW of one shot, a
+    /// live photo and its clip. Replies with [`Response::Photos`], holding one
+    /// item per file in server order; a photo that stands alone comes back as a
+    /// single item. The lightbox uses it to switch between a shot's files.
+    PhotoGroup { uid: String },
     /// The months the timeline spans (newest first, with per-month counts) so a
     /// front-end can build a date scrubber without paging the whole library.
     /// `kind` scopes the counts to one tab when set.
@@ -99,6 +104,10 @@ pub enum Request {
     /// part of the FUSE mount: the gallery knows a photo only by its uid, and
     /// [`Request::Delete`] has no path to take for it. The nodes land in Proton
     /// trash, so this stays recoverable from the Trash page.
+    ///
+    /// A photo that belongs to a group takes the whole group with it: trashing
+    /// the JPEG of a shot and leaving its RAW behind is not what anyone means by
+    /// deleting that photo.
     TrashNodes { uids: Vec<String> },
     /// Fetch thumbnails for ordinary Drive image files shown outside the Photos
     /// timeline. The modification time is the cache validity tag, so replacing
@@ -1954,6 +1963,32 @@ mod tests {
         assert_eq!(generation, 42);
         assert_eq!(items.len(), 1);
         assert!(items[0].name.is_empty());
+    }
+
+    /// The lightbox asks for one shot's files by the uid of the tile that was
+    /// clicked, and gets them back in the shape the gallery already paints.
+    #[test]
+    fn photo_group_requests_roundtrip() {
+        let request = Request::PhotoGroup {
+            uid: "volume~first".into(),
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert_eq!(line, r#"{"PhotoGroup":{"uid":"volume~first"}}"#);
+        let decoded: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+    }
+
+    /// The group fields are new, so a page from a daemon that predates them has
+    /// to keep painting: one file, nothing to badge.
+    #[test]
+    fn an_older_daemons_photo_has_no_group() {
+        let item: PhotoItem = serde_json::from_str(
+            r#"{"uid":"volume~first","capture_time":1700000000,"thumb_path":null,
+                "name":"a.jpg","ratio":1.5,"no_thumb":false}"#,
+        )
+        .unwrap();
+        assert_eq!(item.group_size, 0, "absent reads the same as one file");
+        assert!(!item.has_raw);
     }
 
     /// The gallery trashes by uid, and reports per-uid outcomes back: a partial

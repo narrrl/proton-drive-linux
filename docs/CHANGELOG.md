@@ -11,7 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **29** (`trash.parent_uid`); SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.5**.
+Schema: **30** (`photos.content_hash` / `main_uid` / `group_key`); SDK bumped to `proton-sdk` /
+`proton-drive-rs` **0.6.5**.
 
 ### Changed
 - **The gallery lays photos out in justified rows.** Every tile is now its own photo's shape:
@@ -40,6 +41,13 @@ Schema: **29** (`trash.parent_uid`); SDK bumped to `proton-sdk` / `proton-drive-
   not cancel the rest.
 
 ### Added
+- **A RAW and its JPEG are one photo.** A camera that writes both put two tiles of the same shot
+  in the timeline; now it puts one, badged `RAW`, and the lightbox has a control that switches
+  between the files. The Raw tab still lists every raw file individually, because that is what
+  the tab is for. Grouping follows the server's own photo relation where it has one — which
+  also collapses live photos and bursts — and otherwise pairs files with the same name taken on
+  the same day where one is raw and the other is not. Deleting the tile deletes the whole shot,
+  and the confirmation says how many files that is.
 - **Delete from the gallery.** Select photos with the Select button, with Ctrl+click or with
   Shift+click, then Move to Trash — or press Delete in the lightbox. The tiles leave the grid
   immediately with an Undo toast, and the photos land in Proton's trash, where they stay

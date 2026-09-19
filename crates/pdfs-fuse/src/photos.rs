@@ -505,6 +505,41 @@ impl Core {
         Ok(())
     }
 
+    /// Every file of one photo's group, in server order, as wire items. A photo
+    /// the timeline does not hold comes back empty, which the lightbox reads as
+    /// "nothing to switch between".
+    pub(crate) fn photo_group(&self, uid: &str) -> CoreResult<Vec<PhotoItem>> {
+        let members = self.db.photos_group(uid).map_err(CoreError::from)?;
+        Ok(members
+            .into_iter()
+            .map(|photo| self.photo_item(photo))
+            .collect())
+    }
+
+    /// Every uid asked for, plus the other files of any group they belong to,
+    /// each once. A uid the timeline does not hold (an album photo on someone
+    /// else's volume) is passed through unchanged.
+    fn expand_photo_groups(&self, uids: &[NodeUid]) -> Vec<NodeUid> {
+        let mut out: Vec<NodeUid> = Vec::with_capacity(uids.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        for uid in uids {
+            let members = self.db.photos_group(&uid.to_string()).unwrap_or_default();
+            let mut group: Vec<NodeUid> = members
+                .iter()
+                .filter_map(|photo| parse_uid(&photo.uid))
+                .collect();
+            if group.is_empty() {
+                group.push(uid.clone());
+            }
+            for member in group {
+                if seen.insert(member.to_string()) {
+                    out.push(member);
+                }
+            }
+        }
+        out
+    }
+
     /// Trash photos by uid, and forget them locally.
     ///
     /// The gallery is not part of the FUSE mount, so this is the photos-side
@@ -515,10 +550,16 @@ impl Core {
     /// The server answers per node, and so does this: a batch where one photo
     /// fails still removes the ones that went, and the caller is told which is
     /// which. Only what actually left the server is forgotten locally.
+    ///
+    /// A photo that is one file of a group takes its whole group with it. The
+    /// gallery shows a RAW+JPEG shot as one tile, so deleting that tile has to
+    /// delete the shot — leaving the RAW behind would put the photo back on the
+    /// Raw tab and nowhere else.
     pub(crate) fn trash_photos(&self, uids: &[NodeUid]) -> CoreResult<TrashOutcome> {
         if uids.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let uids = &self.expand_photo_groups(uids);
         for uid in uids {
             self.require_uid_writable(uid)
                 .map_err(|errno| self.errno_error(errno, "trash access"))?;
