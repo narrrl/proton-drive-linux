@@ -142,6 +142,16 @@ The gallery can mark and filter favourites, through the SDK's photo-tag API (`up
 
 Favouriting a photo that is not on this account's own photos volume (shared with us, or album-only) needs it re-encrypted for our timeline root, which the SDK does not implement; the daemon surfaces that as an error rather than silently doing nothing.
 
+### Justified Gallery, Gallery Delete (Implemented)
+**Files**: [`photos.rs`](../crates/pdfs-gui/src/app/pages/photos.rs), [`photo_viewer.rs`](../crates/pdfs-gui/src/app/pages/photo_viewer.rs), [`photos.rs`](../crates/pdfs-fuse/src/photos.rs), [`background.rs`](../crates/pdfs-fuse/src/background.rs)
+
+The gallery lays each day out in justified rows (`justify_rows` / `plan_rows` / `fit_row`): photos are taken in capture order until their summed aspect ratio no longer fits the target row height, and the row is then scaled so it ends exactly on the content width. A tile is therefore its own photo's shape, and `ContentFit::Contain` has nothing left to crop. The last row of a day is left at the target height rather than stretched, because a day holding two photos is a short day, not a layout fault.
+
+- **Ratios that are not known yet.** `PhotoItem::ratio` is persisted, but a photo that has never been decoded has none. Those are laid out square and remembered in `assumed_ratios`; when a decode proves the real shape the day re-flows on the existing debounce timer, so a screenful of decodes costs one re-flow rather than one per photo. Ratios are clamped to 0.4–3.0 so a single panorama cannot decide what a row looks like.
+- **Thumbnails survive recycling.** A reply for a tile that has already been re-bound still lands in the texture cache, which is an LRU of 1500 textures keyed by uid, and the rows just outside the realised range are prefetched in the scroll direction.
+- **Delete is uid-addressed.** The photos volume is not in the FUSE mount, so the path-based `Request::Delete` cannot reach it. `Request::TrashNodes { uids }` trashes through the SDK and answers `Response::Trashed { trashed, failed }`; the daemon then drops those rows with `Db::photos_delete` (album membership included) so the gallery does not wait for a timeline refresh. The GUI removes the tiles optimistically with an Undo toast and puts back anything the server refused.
+- **Remote deletions arrive on their own.** The Drive volume and the photos volume have separate event streams, so `run_photos_event_sync` polls the photos volume with its own cursor (`photos_event_cursor` in the state table). Trash and delete events remove rows; anything else only invalidates freshness, because there is no inode space to converge on this volume. Together with a 60 s `TIMELINE_TTL` and a `RefreshScope::Photos` that now awaits the refresh, a photo deleted on a phone leaves the grid in about ten seconds.
+
 ### Persistent SDK Entity Cache (Implemented)
 **Files**: [`sdkcache.rs`](../crates/pdfs-core/src/sdkcache.rs), [`auth.rs`](../crates/pdfs-core/src/auth.rs), [`background.rs`](../crates/pdfs-fuse/src/background.rs)
 

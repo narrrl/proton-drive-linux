@@ -138,6 +138,16 @@ pub(crate) struct GalleryState {
     /// The ListView itself, so a rebuild can scroll back to the row the user was
     /// looking at.
     pub(crate) list: gtk4::ListView,
+    /// True while the grid is picking photos rather than opening them. A tile
+    /// then toggles instead of activating, and shows a checkbox.
+    pub(crate) selecting: Cell<bool>,
+    /// The photos picked so far, by uid.
+    pub(crate) selected: RefCell<HashSet<String>>,
+    /// The Select toggle, the bar it reveals, and the bar's own widgets.
+    pub(crate) select_btn: gtk4::ToggleButton,
+    pub(crate) select_bar: gtk4::Revealer,
+    pub(crate) select_label: gtk4::Label,
+    pub(crate) select_trash: gtk4::Button,
 }
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
@@ -250,7 +260,11 @@ impl GalleryRow {
                 al == bl
                     && a.len() == b.len()
                     && a.iter().zip(b).all(|(x, y)| {
-                        x.photo.uid == y.photo.uid && x.width == y.width && x.height == y.height
+                        x.photo.uid == y.photo.uid
+                            && x.width == y.width
+                            && x.height == y.height
+                            && x.selecting == y.selecting
+                            && x.selected == y.selected
                     })
             }
             _ => false,
@@ -281,6 +295,12 @@ pub(crate) struct GalleryWidgets {
     pub(crate) empty_upload: gtk4::Button,
     pub(crate) empty_import: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
+    /// The Select toggle and the bar it reveals.
+    pub(crate) select_btn: gtk4::ToggleButton,
+    pub(crate) select_bar: gtk4::Revealer,
+    pub(crate) select_label: gtk4::Label,
+    pub(crate) select_trash: gtk4::Button,
+    pub(crate) select_done: gtk4::Button,
     /// The Albums grid, its own status page and the stack between them, plus the
     /// Photos/Albums switcher and the back button out of an album.
     pub(crate) albums: gtk4::FlowBox,
@@ -422,9 +442,50 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     import.add_css_class("circular");
     let refresh = refresh_button();
 
+    // Picking photos is a mode, so its control is a toggle rather than a button.
+    let select_btn = gtk4::ToggleButton::builder()
+        .icon_name("selection-mode-symbolic")
+        .tooltip_text("Select photos")
+        .valign(gtk4::Align::Center)
+        .build();
+    select_btn.add_css_class("flat");
+    select_btn.add_css_class("circular");
+
+    // What the selection can do, revealed with the mode. A revealer rather than
+    // a hidden box so the grid slides down instead of jumping.
+    let select_label = gtk4::Label::builder()
+        .label("Select photos")
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    let select_trash = gtk4::Button::builder()
+        .label("Move to Trash")
+        .valign(gtk4::Align::Center)
+        .sensitive(false)
+        .build();
+    select_trash.add_css_class("destructive-action");
+    let select_done = gtk4::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Leave selection (Esc)")
+        .valign(gtk4::Align::Center)
+        .build();
+    select_done.add_css_class("flat");
+    select_done.add_css_class("circular");
+    let select_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    select_box.add_css_class("toolbar");
+    select_box.add_css_class("bulk-bar");
+    select_box.append(&select_label);
+    select_box.append(&select_trash);
+    select_box.append(&select_done);
+    let select_bar = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideDown)
+        .child(&select_box)
+        .build();
+
     let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header_box.append(&back);
     header_box.append(&titles);
+    header_box.append(&select_btn);
     header_box.append(&refresh);
     header_box.append(&import);
     header_box.append(&upload);
@@ -502,6 +563,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    timeline.append(&select_bar);
     timeline.append(&scroll);
     timeline.append(&more);
 
@@ -566,6 +628,11 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             empty_upload,
             empty_import,
             refresh,
+            select_btn,
+            select_bar,
+            select_label,
+            select_trash,
+            select_done,
             tabs,
             favorites_btn,
             dates,
@@ -700,7 +767,12 @@ pub(crate) fn wire_gallery_empty(ui: &Rc<Ui>, upload: &gtk4::Button, import: &gt
     import.connect_clicked(move |_| ui_import.stack.set_visible_child_name("takeout"));
 }
 
-pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindow) {
+pub(crate) fn wire_gallery(
+    ui: &Rc<Ui>,
+    list: &gtk4::ListView,
+    scroll: &gtk4::ScrolledWindow,
+    select_done: &gtk4::Button,
+) {
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
@@ -820,10 +892,24 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
     });
     scroll.add_controller(zoom_scroll);
 
-    // Ctrl+plus / Ctrl+minus / Ctrl+0, the keyboard equivalents.
+    // Ctrl+plus / Ctrl+minus / Ctrl+0, the keyboard equivalents, and the two
+    // keys selection mode owns.
     let zoom_keys = gtk4::EventControllerKey::new();
     let ui_keys = ui.clone();
     zoom_keys.connect_key_pressed(move |_, key, _code, state| {
+        if ui_keys.gallery.selecting.get() {
+            match key.name().as_deref() {
+                Some("Escape") => {
+                    set_selection_mode(&ui_keys, false);
+                    return glib::Propagation::Stop;
+                }
+                Some("Delete" | "KP_Delete") => {
+                    delete_selected(&ui_keys);
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
         if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
             return glib::Propagation::Proceed;
         }
@@ -841,6 +927,19 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
     ui.gallery.more.clone().connect_clicked(move |_| {
         load_gallery(&ui_more, true);
     });
+
+    let ui_select = ui.clone();
+    ui.gallery.select_btn.clone().connect_toggled(move |btn| {
+        set_selection_mode(&ui_select, btn.is_active());
+    });
+    let ui_trash = ui.clone();
+    ui.gallery.select_trash.clone().connect_clicked(move |_| {
+        delete_selected(&ui_trash);
+    });
+    let ui_done = ui.clone();
+    select_done
+        .clone()
+        .connect_clicked(move |_| set_selection_mode(&ui_done, false));
 
     // Filter toggles: flipping to a tab reloads the timeline filtered to that
     // kind. Only the button being switched *on* acts — the group also fires a
@@ -994,6 +1093,11 @@ pub(crate) struct Tile {
     pub(crate) photo: PhotoItem,
     pub(crate) width: i32,
     pub(crate) height: i32,
+    /// Whether the grid is in selection mode, and whether this photo is picked.
+    /// Carried on the tile rather than read at bind time so the row diff in
+    /// [`repaint_gallery`] sees a selection change and rebuilds that row.
+    pub(crate) selecting: bool,
+    pub(crate) selected: bool,
 }
 
 /// The aspect ratio to lay `photo` out at: what a decode has learned, else what
@@ -1027,6 +1131,8 @@ fn tile_ratio(ui: &Rc<Ui>, photo: &PhotoItem) -> f64 {
 /// do either way.
 pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec<Vec<Tile>> {
     let ratios: Vec<f64> = photos.iter().map(|photo| tile_ratio(ui, photo)).collect();
+    let selecting = ui.gallery.selecting.get();
+    let selected = ui.gallery.selected.borrow();
     let mut photos = photos.iter();
     plan_rows(&ratios, width, ui.gallery.row_height.get())
         .into_iter()
@@ -1035,6 +1141,8 @@ pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec
                 .into_iter()
                 .filter_map(|width| {
                     photos.next().map(|photo| Tile {
+                        selecting,
+                        selected: selecting && selected.contains(&photo.uid),
                         photo: photo.clone(),
                         width,
                         height,
@@ -1175,6 +1283,28 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
         overlay.add_overlay(&badge);
     }
 
+    // Selection mode marks every tile, picked or not: a check that only appears
+    // once a photo is chosen leaves the user guessing what else is clickable.
+    if tile.selecting {
+        let check = gtk4::Image::builder()
+            .icon_name(if tile.selected {
+                "checkbox-checked-symbolic"
+            } else {
+                "checkbox-symbolic"
+            })
+            .pixel_size(16)
+            .halign(gtk4::Align::Start)
+            .valign(gtk4::Align::Start)
+            .margin_start(6)
+            .margin_top(6)
+            .build();
+        check.add_css_class("photo-check");
+        if tile.selected {
+            check.add_css_class("photo-check-on");
+        }
+        overlay.add_overlay(&check);
+    }
+
     let button = gtk4::Button::builder()
         .child(&overlay)
         .width_request(tile.width)
@@ -1183,23 +1313,229 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
         .build();
     button.add_css_class("photo-tile");
     button.add_css_class("flat");
+    if tile.selected {
+        button.add_css_class("photo-tile-selected");
+    }
     // Clip the thumbnail to the tile's rounded corners.
     button.set_overflow(gtk4::Overflow::Hidden);
 
     want_thumb(ui, &tile.photo, &picture);
 
+    // Ctrl or Shift on a plain click starts a selection — the gesture people
+    // already use for picking things, without having to find the Select button
+    // first. Claimed in the capture phase so the click never also opens the
+    // photo it was picking.
+    let modifier = gtk4::GestureClick::new();
+    modifier.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let ui_modifier = ui.clone();
+    let modifier_uid = tile.photo.uid.clone();
+    modifier.connect_pressed(move |gesture, _, _, _| {
+        let state = gesture.current_event_state().intersects(
+            gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK,
+        );
+        if !state || ui_modifier.gallery.selecting.get() {
+            return;
+        }
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        set_selection_mode(&ui_modifier, true);
+        toggle_selected(&ui_modifier, &modifier_uid);
+    });
+    button.add_controller(modifier);
+
     // A still opens in the in-app lightbox; a video can't render there, so it
-    // downloads and hands off to an external player instead.
+    // downloads and hands off to an external player instead. In selection mode
+    // a tile picks instead of opening: the lightbox is one Escape away.
     let ui_open = ui.clone();
     let uid = tile.photo.uid.clone();
     button.connect_clicked(move |_| {
-        if is_video {
+        if ui_open.gallery.selecting.get() {
+            toggle_selected(&ui_open, &uid);
+        } else if is_video {
             play_video(&ui_open, uid.clone());
         } else {
             open_photo_viewer(&ui_open, uid.clone());
         }
     });
     button
+}
+
+/// Enter or leave selection mode, repainting the tiles so their checkboxes
+/// appear or go. Leaving drops the selection: a hidden selection that a later
+/// Delete would act on is a trap.
+pub(crate) fn set_selection_mode(ui: &Rc<Ui>, selecting: bool) {
+    if ui.gallery.selecting.get() == selecting {
+        return;
+    }
+    ui.gallery.selecting.set(selecting);
+    if !selecting {
+        ui.gallery.selected.borrow_mut().clear();
+    }
+    if ui.gallery.select_btn.is_active() != selecting {
+        ui.gallery.select_btn.set_active(selecting);
+    }
+    sync_selection_bar(ui);
+    repaint_gallery(ui);
+}
+
+/// Pick or unpick one photo.
+fn toggle_selected(ui: &Rc<Ui>, uid: &str) {
+    {
+        let mut selected = ui.gallery.selected.borrow_mut();
+        if !selected.remove(uid) {
+            selected.insert(uid.to_string());
+        }
+    }
+    sync_selection_bar(ui);
+    repaint_gallery(ui);
+}
+
+/// Reflect the selection in the bar above the grid.
+fn sync_selection_bar(ui: &Rc<Ui>) {
+    let count = ui.gallery.selected.borrow().len();
+    ui.gallery.select_label.set_label(&match count {
+        0 => "Select photos".to_string(),
+        1 => "1 selected".to_string(),
+        n => format!("{n} selected"),
+    });
+    ui.gallery.select_trash.set_sensitive(count > 0);
+    ui.gallery
+        .select_bar
+        .set_reveal_child(ui.gallery.selecting.get());
+}
+
+/// Confirm, then move every selected photo to Proton trash.
+pub(crate) fn delete_selected(ui: &Rc<Ui>) {
+    let uids: Vec<String> = ui.gallery.selected.borrow().iter().cloned().collect();
+    if uids.is_empty() {
+        return;
+    }
+    let dialog = adw::AlertDialog::builder()
+        .heading("Move to Trash")
+        .body(match uids.len() {
+            1 => "Move this photo to Trash?".to_string(),
+            n => format!("Move {n} photos to Trash?"),
+        })
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("trash", "Move to Trash");
+    dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let win = ui_window(ui);
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "trash" {
+            trash_photos(&ui, uids.clone());
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Move photos to Proton trash, taking them out of the grid straight away.
+///
+/// The removal is optimistic because the alternative — a grid that keeps showing
+/// photos the user just deleted until a refresh lands — reads as a failure. What
+/// the server refuses comes back, so the grid still ends up telling the truth,
+/// and what succeeded is one Undo away for as long as the toast is up.
+pub(crate) fn trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
+    let removed = remove_photos(ui, &uids);
+    set_selection_mode(ui, false);
+    ui.busy_begin();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::TrashNodes { uids: uids.clone() },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let reply = rx.recv().await;
+        ui.busy_end();
+        match reply {
+            Ok(Ok(Response::Trashed { trashed, failed })) => {
+                // Put back whatever stayed on the server, in its timeline
+                // position rather than at the end.
+                if !failed.is_empty() {
+                    let kept: Vec<PhotoItem> = removed
+                        .iter()
+                        .filter(|photo| failed.iter().any(|f| f.uid == photo.uid))
+                        .cloned()
+                        .collect();
+                    restore_photos(&ui, kept);
+                    let message = failed
+                        .first()
+                        .map(|f| f.message.clone())
+                        .unwrap_or_else(|| "The server refused.".to_string());
+                    toast_error(&ui, "Some photos couldn't be moved to Trash", &message);
+                }
+                if trashed.is_empty() {
+                    return;
+                }
+                let count = trashed.len();
+                let message = match count {
+                    1 => "Moved 1 photo to Trash".to_string(),
+                    n => format!("Moved {n} photos to Trash"),
+                };
+                toast_action(&ui, &message, "Undo", move |ui| {
+                    restore_uids(ui, trashed.clone(), count);
+                    load_gallery(ui, false);
+                });
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                restore_photos(&ui, removed.clone());
+                toast_failure(&ui, "Couldn't move to Trash", &message, kind);
+            }
+            _ => {
+                restore_photos(&ui, removed.clone());
+                toast_error(
+                    &ui,
+                    "Couldn't move to Trash",
+                    "The mount service didn't respond.",
+                );
+            }
+        }
+    });
+}
+
+/// Take photos out of the loaded model, returning them so a failure can put them
+/// back.
+fn remove_photos(ui: &Rc<Ui>, uids: &[String]) -> Vec<PhotoItem> {
+    let model = &ui.gallery.model;
+    let mut removed = Vec::new();
+    let mut index = 0;
+    while index < model.n_items() {
+        let item = model
+            .item(index)
+            .and_downcast::<BoxedAnyObject>()
+            .map(|obj| obj.borrow::<PhotoItem>().clone());
+        match item {
+            Some(photo) if uids.contains(&photo.uid) => {
+                model.remove(index);
+                removed.push(photo);
+            }
+            _ => index += 1,
+        }
+    }
+    repaint_gallery(ui);
+    removed
+}
+
+/// Put photos back into the loaded model, at their place in the timeline.
+fn restore_photos(ui: &Rc<Ui>, photos: Vec<PhotoItem>) {
+    let model = &ui.gallery.model;
+    for photo in photos {
+        // The timeline is newest first, so a photo belongs before the first
+        // entry older than it.
+        let at = (0..model.n_items())
+            .find(|index| {
+                model
+                    .item(*index)
+                    .and_downcast::<BoxedAnyObject>()
+                    .is_some_and(|obj| obj.borrow::<PhotoItem>().capture_time < photo.capture_time)
+            })
+            .unwrap_or(model.n_items());
+        model.insert(at, &BoxedAnyObject::new(photo));
+    }
+    repaint_gallery(ui);
 }
 
 /// Give `picture` its thumbnail: straight from the texture cache when it's there,

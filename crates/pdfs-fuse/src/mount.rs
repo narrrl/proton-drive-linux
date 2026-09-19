@@ -591,6 +591,9 @@ pub fn mount(
         }
     };
     rt.spawn(run_event_sync(client, scope, core.clone()));
+    // The photos volume has its own event stream; without it the gallery only
+    // learns about a phone-side deletion when the timeline goes stale.
+    rt.spawn(run_photos_event_sync(core.clone()));
     if online {
         let repair_core = core.clone();
         let root_uid = core.primary_root_uid.clone();

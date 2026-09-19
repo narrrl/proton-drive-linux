@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ActivityKind, PhotoMonth, RefreshScope, Request as CtlRequest, Response as CtlResponse,
-    TransferDirection,
+    TransferDirection, TrashFailure,
 };
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -260,7 +260,11 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     // Whatever changed the timeline can just as easily have
                     // changed an album; one scope covers the whole photos view.
                     core.invalidate_albums();
-                    Ok(())
+                    // Clearing the stamp alone only promises the *next* read
+                    // will refetch, which means pressing Refresh paints the
+                    // stale page and corrects it a moment later. The user
+                    // pressed a button to see the truth, so this waits for it.
+                    core.rt.block_on(core.refresh_timeline()).map(|_| ())
                 }
             };
             match result {
@@ -342,6 +346,19 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 items: core.photo_thumbs(&parsed),
             }
         }
+        Ok(CtlRequest::TrashNodes { uids }) => match Core::parse_uids(&uids) {
+            Ok(parsed) => match core.trash_photos(&parsed) {
+                Ok((trashed, failed)) => CtlResponse::Trashed {
+                    trashed,
+                    failed: failed
+                        .into_iter()
+                        .map(|(uid, message)| TrashFailure { uid, message })
+                        .collect(),
+                },
+                Err(e) => CtlResponse::error(e),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::FileThumbs { items, generation }) => {
             match core.file_thumbs(&items, generation) {
                 Some(items) => CtlResponse::Thumbs { items },

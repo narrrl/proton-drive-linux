@@ -3919,3 +3919,54 @@ fn an_idle_worker_does_not_wait_on_an_op_another_worker_has() {
         "an op somebody else is draining is not work this worker is waiting for"
     );
 }
+
+/// Trashing a photo from the gallery must not leave it behind on an album page:
+/// the row goes, its album membership goes with it, and nothing else moves.
+#[test]
+fn photos_delete_removes_the_photo_and_its_album_membership() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        ("p1".into(), 300, None, None, None),
+        ("p2".into(), 200, None, None, None),
+        ("p3".into(), 100, None, None, None),
+    ])
+    .unwrap();
+    db.albums_replace(&[StoredAlbum {
+        uid: "a1".into(),
+        name: "Trip".into(),
+        photo_count: 3,
+        cover_uid: Some("p1".into()),
+        last_activity: Some(500),
+        shared: false,
+    }])
+    .unwrap();
+    db.album_photos_replace(
+        "a1",
+        &[
+            ("p1".into(), 300, None, None),
+            ("p2".into(), 200, None, None),
+            ("p3".into(), 100, None, None),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(db.photos_delete(&["p2".into()]).unwrap(), 1);
+
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1", "p3"],
+        "only the trashed photo leaves the timeline"
+    );
+    assert_eq!(db.album_photos_count("a1").unwrap(), 2);
+    let album = db.album_photos_page("a1", 0, 10).unwrap();
+    assert_eq!(
+        album.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1", "p3"]
+    );
+
+    // A uid we no longer hold is not an error: the event poller and the trash
+    // reply can both report the same deletion.
+    assert_eq!(db.photos_delete(&["p2".into()]).unwrap(), 0);
+    assert_eq!(db.photos_delete(&[]).unwrap(), 0);
+}

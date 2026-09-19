@@ -102,6 +102,31 @@ impl Db {
         Ok(())
     }
 
+    /// Forget photos that have been trashed, so the gallery does not show them
+    /// until the next timeline refresh would have caught up.
+    ///
+    /// Album membership goes with them: a trashed photo is gone from every album
+    /// that held it, and leaving the rows behind would keep it on the album
+    /// pages and in the album covers.
+    pub fn photos_delete(&self, uids: &[String]) -> Result<usize> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut removed = 0;
+        {
+            let mut photos = tx.prepare("DELETE FROM photos WHERE uid = ?1")?;
+            let mut albums = tx.prepare("DELETE FROM album_photos WHERE uid = ?1")?;
+            for uid in uids {
+                removed += photos.execute([uid])?;
+                albums.execute([uid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// One page of the persisted timeline, newest first. `kind`, when set,
     /// restricts the page to one tab (Photos / Videos / Raw); `range`, when set,
     /// restricts it to a `[from, to)` capture-time window (epoch seconds) — the

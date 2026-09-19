@@ -258,6 +258,9 @@ fn load_proton_theme() {
          .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
          .photo-thumb {{ transition: transform 220ms ease; }}\n\
          .photo-tile:hover .photo-thumb {{ transform: scale(1.06); }}\n\
+         .photo-check {{ color: white; background: rgba(0, 0, 0, 0.5); border-radius: 999px; padding: 3px; }}\n\
+         .photo-check-on {{ background: {PROTON_PURPLE}; }}\n\
+         .photo-tile-selected {{ outline: 3px solid {PROTON_PURPLE}; outline-offset: -3px; }}\n\
          .photo-placeholder {{ color: alpha(currentColor, 0.35); background: alpha(currentColor, 0.07); }}\n\
          .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 180ms ease; }}\n\
          .photo-video-badge {{ color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }}\n\
@@ -506,6 +509,12 @@ fn build_window(app: &adw::Application) {
             relayout_source: RefCell::new(None),
             bound: RefCell::new(BTreeMap::new()),
             list: gallery_widgets.list.clone(),
+            selecting: Cell::new(false),
+            selected: RefCell::new(HashSet::new()),
+            select_btn: gallery_widgets.select_btn.clone(),
+            select_bar: gallery_widgets.select_bar.clone(),
+            select_label: gallery_widgets.select_label.clone(),
+            select_trash: gallery_widgets.select_trash.clone(),
         },
         shared: SharedState {
             content: shared_widgets.content.clone(),
@@ -603,7 +612,12 @@ fn build_window(app: &adw::Application) {
     );
     wire_details(&ui);
     wire_search(&ui);
-    wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
+    wire_gallery(
+        &ui,
+        &gallery_widgets.list,
+        &gallery_widgets.scroll,
+        &gallery_widgets.select_done,
+    );
     wire_gallery_empty(
         &ui,
         &gallery_widgets.empty_upload,

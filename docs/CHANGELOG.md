@@ -14,6 +14,23 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 Schema: **29** (`trash.parent_uid`); SDK bumped to `proton-sdk` / `proton-drive-rs` **0.6.5**.
 
 ### Changed
+- **The gallery lays photos out in justified rows.** Every tile is now its own photo's shape:
+  photos are taken in capture order until they no longer fit the target height, and the row is
+  then scaled to land exactly on the right margin. Nothing is cropped and nothing is
+  letterboxed, which is what the square centre-cropped tiles used to do to portraits and
+  panoramas. The last row of a day stays at the target height rather than being stretched, and
+  Ctrl+scroll / Ctrl+± now changes that target height. Gaps and tile corners are smaller, so the
+  page reads as photos rather than as cards.
+- **Thumbnails stay on screen while you scroll.** A decoded thumbnail now lands in the texture
+  cache even when the tile that asked for it has already been recycled, the cache is a real LRU
+  holding 1500 textures instead of 600, and the rows just past the edge of the window are
+  fetched ahead of the scroll direction. Scrolling fast through a large timeline no longer
+  leaves a screen of blank tiles behind.
+- **Refresh on the Photos page really refreshes.** It now waits for the timeline to come back
+  from the server before it answers, instead of only clearing the freshness stamp and letting
+  the next read serve the stale page. The timeline is also considered stale after 60 s rather
+  than 5 minutes.
+
 - **Restore puts back the whole tree.** The trash is a flat list, but you delete a shape: a
   folder, and often things you had already deleted inside it. Restoring a folder now also
   restores the items that were trashed inside it, and restoring one of those items first
@@ -23,6 +40,14 @@ Schema: **29** (`trash.parent_uid`); SDK bumped to `proton-sdk` / `proton-drive-
   not cancel the rest.
 
 ### Added
+- **Delete from the gallery.** Select photos with the Select button, with Ctrl+click or with
+  Shift+click, then Move to Trash — or press Delete in the lightbox. The tiles leave the grid
+  immediately with an Undo toast, and the photos land in Proton's trash, where they stay
+  recoverable. A photo the server refuses to trash comes back into the grid.
+- **A photo deleted on your phone disappears here.** The daemon now follows the photos volume's
+  own event stream, so a photo trashed on another device leaves the gallery within about ten
+  seconds instead of waiting for the timeline to go stale.
+
 - **`pdfs diagnostics`.** Reports what the daemon is doing right now: every worker thread with the job
   it holds and for how long, queue depths per lane, the control requests still in flight, resident
   size and the pending-op count. Answers even while the daemon is wedged, which is the only time

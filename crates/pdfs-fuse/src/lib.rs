@@ -105,7 +105,7 @@ mod transfers;
 mod upload;
 mod r#virtual;
 mod workers;
-use background::{run_event_sync, run_local_index};
+use background::{run_event_sync, run_local_index, run_photos_event_sync};
 pub(crate) use mount::is_stale_mount;
 pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
@@ -203,7 +203,11 @@ const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
 /// revalidates it. The SDK hands back the whole timeline at once, so it is stored
 /// in the DB and every page is sliced from there; a stale one is still served
 /// immediately and refreshed in the background.
-const TIMELINE_TTL: Duration = Duration::from_secs(5 * 60);
+///
+/// Short, because the cost of a stale timeline is a photo the user deleted on
+/// their phone still sitting in the gallery, and the cost of the check is one
+/// listing call that only runs when somebody is actually looking at the page.
+const TIMELINE_TTL: Duration = Duration::from_secs(60);
 /// How many photo nodes are resolved per [`ProtonPhotosClient::enumerate_nodes`]
 /// call when enriching a refreshed timeline with names and media types (for the
 /// Photos / Videos / Raw split). Batched so a large library is a handful of

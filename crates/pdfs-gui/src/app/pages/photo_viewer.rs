@@ -504,6 +504,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     favorite_btn.add_css_class("viewer-action-btn");
 
     let download_btn = action("document-save-symbolic", "Save a copy…");
+    let delete_btn = action("user-trash-symbolic", "Move to Trash (Delete)");
     let open_ext_btn = action("document-open-symbolic", "Open with another app");
     let close_btn = action("window-close-symbolic", "Close (Esc)");
     close_btn.add_css_class("viewer-close-btn");
@@ -516,6 +517,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     top_bar.append(&favorite_btn);
     top_bar.append(&info_toggle);
     top_bar.append(&download_btn);
+    top_bar.append(&delete_btn);
     top_bar.append(&open_ext_btn);
     top_bar.append(&close_btn);
     overlay.add_overlay(&top_bar);
@@ -695,6 +697,18 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         });
     });
 
+    // Deleting the photo on screen closes the lightbox: what it was showing is
+    // gone, and leaving it open on a trashed photo invites a second Delete on
+    // something the user cannot see.
+    let ui_delete = ui.clone();
+    let viewer_delete = viewer.clone();
+    let w_delete = window.clone();
+    delete_btn.connect_clicked(move |_| {
+        let uid = viewer_delete.uid.borrow().clone();
+        w_delete.close();
+        trash_photos(&ui_delete, vec![uid]);
+    });
+
     let w_download = window.clone();
     let viewer_download = viewer.clone();
     download_btn.connect_clicked(move |_| {
@@ -756,6 +770,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
                 } else {
                     w_key.fullscreen();
                 }
+            }
+            Some("Delete" | "KP_Delete") => {
+                let uid = viewer_key.uid.borrow().clone();
+                w_key.close();
+                trash_photos(&ui_key, vec![uid]);
             }
             Some("Escape" | "q") => w_key.close(),
             Some("w") if ctrl => w_key.close(),

@@ -425,6 +425,113 @@ pub(super) async fn run_event_sync(
     }
 }
 
+/// The state key holding the photos volume's event cursor. Separate from the
+/// Drive cursor because the two volumes have their own event streams, and one
+/// cursor cannot address both.
+const PHOTOS_EVENT_CURSOR: &str = "photos_event_cursor";
+
+/// Poll the photos volume's event stream, so a photo deleted or added on another
+/// device shows up in the gallery within one poll instead of on the timeline's
+/// freshness window.
+///
+/// Deliberately much smaller than [`run_event_sync`]: the photos volume is not
+/// part of the FUSE mount, so there is no inode space to converge and nothing to
+/// invalidate in the kernel. A trash or a delete removes the rows behind the
+/// gallery; anything else only drops the timeline's freshness stamp, and the
+/// next read re-enumerates. Getting that wrong costs a stale tile, not a wrong
+/// file.
+pub(super) async fn run_photos_event_sync(core: Core) {
+    let photos = core.photos();
+    // The photos volume only exists once the user has used Photos at all, and
+    // the daemon may well start before the network does.
+    let scope = loop {
+        match photos.get_photos_root().await {
+            Ok(Some(root)) => break root.tree_event_scope_id(),
+            Ok(None) => {
+                debug!("no photos volume; photo event sync not started");
+                return;
+            }
+            Err(error) => {
+                warn!(%error, "reading the photos root failed; retrying");
+                tokio::time::sleep(ONLINE_PROBE_MAX).await;
+            }
+        }
+    };
+
+    let mut cursor: Option<DriveEventId> = core
+        .db
+        .state_str(PHOTOS_EVENT_CURSOR)
+        .ok()
+        .flatten()
+        .map(DriveEventId::from);
+    info!(?cursor, "photo event sync started");
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let events = match photos.enumerate_events(&scope, cursor.as_ref()).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%error, "photo event poll failed; retrying after interval");
+                continue;
+            }
+        };
+        let Some(head) = events.last().map(|event| event.id().clone()) else {
+            continue;
+        };
+        apply_photo_events(&core, &events);
+        // One cursor write per batch, after the batch is applied: a crash in
+        // between replays events whose effects are idempotent.
+        if let Err(error) = core.db.set_state_str(PHOTOS_EVENT_CURSOR, head.as_str()) {
+            warn!(%error, "persisting the photo event cursor failed");
+            continue;
+        }
+        cursor = Some(head);
+    }
+}
+
+/// Apply one batch of photos-volume events to the gallery's tables.
+fn apply_photo_events(core: &Core, events: &[DriveEvent]) {
+    let mut gone: Vec<String> = Vec::new();
+    let mut refresh = false;
+    for event in events {
+        match event {
+            DriveEvent::NodeDeleted { node_uid, .. } => gone.push(node_uid.to_string()),
+            DriveEvent::NodeUpdated {
+                node_uid,
+                is_trashed,
+                ..
+            } => {
+                if *is_trashed {
+                    gone.push(node_uid.to_string());
+                } else {
+                    // An untrash, a rename, a new upload from the phone: all of
+                    // them need the timeline itself, which only a refresh has.
+                    refresh = true;
+                }
+            }
+            // Nothing here can be applied event by event, so the whole timeline
+            // is re-read instead.
+            DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
+                refresh = true;
+            }
+            DriveEvent::CursorAdvanced { .. } | DriveEvent::SharedWithMeUpdated { .. } => {}
+        }
+    }
+    if !gone.is_empty() {
+        match core.db.photos_delete(&gone) {
+            Ok(removed) if removed > 0 => {
+                debug!(removed, "photos removed by a remote event");
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "removing remotely deleted photos failed"),
+        }
+    }
+    if refresh || !gone.is_empty() {
+        core.invalidate_photos();
+        core.invalidate_albums();
+    }
+}
+
 /// Keep the local-file index fresh for the launcher prompt's "This computer"
 /// results. Rebuilds the index whenever it is older than [`LOCAL_INDEX_TTL`],
 /// then sleeps; runs on its own thread for the life of the daemon.

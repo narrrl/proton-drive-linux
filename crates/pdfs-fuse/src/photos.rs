@@ -402,6 +402,10 @@ fn extract_raw_preview(
         .map(|preview| (preview, orientation)))
 }
 
+/// What a [`Core::trash_photos`] batch did: the uids that left the server, and
+/// the ones that did not with the reason each was refused.
+pub(crate) type TrashOutcome = (Vec<String>, Vec<(String, String)>);
+
 /// Formats supported by the local thumbnail decoder and exposed by the GUI.
 impl Core {
     pub(crate) fn photos_timeline(
@@ -487,6 +491,53 @@ impl Core {
             .photos_set_favorite(&uid.to_string(), favorite)
             .map_err(CoreError::from)?;
         Ok(())
+    }
+
+    /// Trash photos by uid, and forget them locally.
+    ///
+    /// The gallery is not part of the FUSE mount, so this is the photos-side
+    /// counterpart of [`Core::delete`]: same destination (Proton trash, so the
+    /// Trash page can restore them), addressed by uid because that is all a tile
+    /// has.
+    ///
+    /// The server answers per node, and so does this: a batch where one photo
+    /// fails still removes the ones that went, and the caller is told which is
+    /// which. Only what actually left the server is forgotten locally.
+    pub(crate) fn trash_photos(&self, uids: &[NodeUid]) -> CoreResult<TrashOutcome> {
+        if uids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        for uid in uids {
+            self.require_uid_writable(uid)
+                .map_err(|errno| self.errno_error(errno, "trash access"))?;
+        }
+        let outcomes = self
+            .rt
+            .block_on(self.client.trash_nodes(uids))
+            .map_err(|e| CoreError::from_api(&e, "trash"))?;
+        let (trashed, failed) = pdfs_core::batch::split(outcomes);
+
+        let trashed: Vec<String> = trashed.iter().map(|uid| uid.to_string()).collect();
+        for uid in &trashed {
+            if let Some(parsed) = parse_uid(uid) {
+                self.cache.evict(&parsed);
+                self.evict_reader(&parsed);
+            }
+        }
+        // The timeline is served from the database, so removing the rows is what
+        // makes the photos disappear now rather than at the next refresh.
+        if let Err(error) = self.db.photos_delete(&trashed) {
+            warn!(%error, "trashed photos could not be removed from the timeline");
+        }
+        self.invalidate_photos();
+        self.invalidate_albums();
+        self.invalidate_trash();
+
+        let failed = failed
+            .into_iter()
+            .map(|(uid, error)| (uid.to_string(), error.to_string()))
+            .collect();
+        Ok((trashed, failed))
     }
 
     /// Thumbnails for `uids`, served from the cache, fetched from the server for

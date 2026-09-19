@@ -93,6 +93,13 @@ pub enum Request {
     /// already cached (one batched round-trip) and replying with their on-disk
     /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
     PhotoThumbs { uids: Vec<String> },
+    /// Trash photos by node uid, answered with [`Response::Trashed`].
+    ///
+    /// Uid-addressed rather than path-addressed because the photos volume is not
+    /// part of the FUSE mount: the gallery knows a photo only by its uid, and
+    /// [`Request::Delete`] has no path to take for it. The nodes land in Proton
+    /// trash, so this stays recoverable from the Trash page.
+    TrashNodes { uids: Vec<String> },
     /// Fetch thumbnails for ordinary Drive image files shown outside the Photos
     /// timeline. The modification time is the cache validity tag, so replacing
     /// an image can never reuse its previous revision's thumbnail.
@@ -1288,6 +1295,13 @@ fn default_photo_kind() -> PhotoKind {
     PhotoKind::Photo
 }
 
+/// One node a [`Request::TrashNodes`] batch could not trash, and why.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TrashFailure {
+    pub uid: String,
+    pub message: String,
+}
+
 /// One thumbnail in a [`Response::Thumbs`] batch.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoThumb {
@@ -1587,6 +1601,14 @@ pub enum Response {
     PhotoMonths { months: Vec<PhotoMonth> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
+    /// Per-node outcome of a [`Request::TrashNodes`] batch. Reported per uid
+    /// rather than as one verdict: the server answers each node separately, and
+    /// a front-end that removed all of them on a partial success would show a
+    /// photo as gone that is still there.
+    Trashed {
+        trashed: Vec<String>,
+        failed: Vec<TrashFailure>,
+    },
     /// A [`Request::FileThumbs`] generation is no longer current. This is
     /// retryable after reserving a fresh generation and must never be interpreted
     /// as a permanent "no thumbnail" verdict.
@@ -1923,6 +1945,36 @@ mod tests {
         assert_eq!(generation, 42);
         assert_eq!(items.len(), 1);
         assert!(items[0].name.is_empty());
+    }
+
+    /// The gallery trashes by uid, and reports per-uid outcomes back: a partial
+    /// failure has to survive the wire so the GUI can put those tiles back.
+    #[test]
+    fn trash_requests_and_outcomes_roundtrip() {
+        let request = Request::TrashNodes {
+            uids: vec!["volume~first".into(), "volume~second".into()],
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert!(!line.contains('\n'), "wire form must be a single line");
+        let decoded: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+
+        let response = Response::Trashed {
+            trashed: vec!["volume~first".into()],
+            failed: vec![TrashFailure {
+                uid: "volume~second".into(),
+                message: "permission denied".into(),
+            }],
+        };
+        let line = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&line).unwrap();
+        let Response::Trashed { trashed, failed } = decoded else {
+            panic!("decoded the wrong response variant");
+        };
+        assert_eq!(trashed, ["volume~first"]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].uid, "volume~second");
+        assert_eq!(failed[0].message, "permission denied");
     }
 
     #[test]
