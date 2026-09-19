@@ -22,7 +22,20 @@ Schema: **29** (`trash.parent_uid`); SDK bumped to `proton-sdk` / `proton-drive-
   children, and each node is still restored individually, so one node the server refuses does
   not cancel the rest.
 
+### Added
+- **`pdfs diagnostics`.** Reports what the daemon is doing right now: every worker thread with the job
+  it holds and for how long, queue depths per lane, the control requests still in flight, resident
+  size and the pending-op count. Answers even while the daemon is wedged, which is the only time
+  anyone asks (B91).
+- **A stall watchdog.** The daemon warns in the journal when a worker has held one job for two
+  minutes, when a control request has run that long, or when a queue is not draining — and it now
+  answers the systemd watchdog, but only after a real round trip over its own control socket. A
+  daemon that stops answering is restarted instead of sitting there looking healthy (B91).
+
 ### Fixed
+- **A worker no longer panics during shutdown (B91).** The FUSE worker pool is joined before the
+  tokio runtime is dropped, so a worker still inside a job does not find a runtime that is going
+  away underneath it.
 - **A permanently rejected block upload is no longer retried (SDK 0.6.5).** The SDK now knows
   which API errors are worth replaying: 4xx is permanent, except 404, 408 and 429.
 - **Long downloads no longer fail on expired block URLs (SDK 0.6.5).** A download whose block

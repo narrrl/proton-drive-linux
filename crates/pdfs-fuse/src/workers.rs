@@ -53,6 +53,16 @@ pub(crate) const FUSE_WORKERS: usize = 11;
 /// exactly the blocking this split exists to prevent.
 const META_WORKERS: usize = 3;
 
+/// Queue depth that gets a line in the log, and the step at which it repeats.
+/// Every job holds a `Reply` and a few fields, so depth is cheap — but a lane
+/// this far behind is worth knowing about before the user reports a slow mount.
+const QUEUE_WARN_STEP: usize = 256;
+
+/// Whether a queue reaching `depth` is one of the depths worth logging.
+fn crosses_warn_step(depth: usize) -> bool {
+    depth >= QUEUE_WARN_STEP && depth.is_multiple_of(QUEUE_WARN_STEP)
+}
+
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// A queued job and the name its caller gave it, so a job that never finishes
@@ -170,6 +180,12 @@ impl Pool {
 /// on-demand sync folder), so the bound is per daemon rather than per mount.
 pub(crate) struct Workers {
     inner: Arc<Pool>,
+    /// Kept so teardown can *join* the workers, not merely flag them. A worker
+    /// still inside a job when the process drops its tokio runtime panics with
+    /// "A Tokio 1.x context was found, but it is being shutdown" (seen
+    /// 2026-09-18 09:58:35), which is a teardown ordering bug rather than a real
+    /// failure.
+    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Workers {
@@ -198,10 +214,11 @@ impl Workers {
                 .collect(),
             started: Instant::now(),
         });
+        let mut handles = Vec::with_capacity(n);
         for (i, name) in names.iter().enumerate() {
             let inner = inner.clone();
             let meta_only = i < meta_workers;
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(name.clone())
                 .spawn(move || {
                     let cv = if meta_only {
@@ -277,8 +294,58 @@ impl Workers {
                         };
                     }
                 })?;
+            handles.push(handle);
         }
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            handles: Mutex::new(handles),
+        })
+    }
+
+    /// Stop accepting work, wake every worker, and wait up to `deadline` for the
+    /// jobs in flight to finish.
+    ///
+    /// Bounded because a join is only worth what it costs: a worker wedged on a
+    /// network call would otherwise hold the whole teardown, and the user asked
+    /// for the daemon to stop. What is stuck gets named in the log, and the
+    /// process continues shutting down around it.
+    pub(crate) fn stop_and_join(&self, deadline: std::time::Duration) {
+        self.close();
+        let handles: Vec<_> = std::mem::take(&mut *self.handles.lock());
+        if handles.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::Builder::new()
+            .name("pdfs-fuse-join".into())
+            .spawn(move || {
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                let _ = tx.send(());
+            });
+        if joiner.is_err() {
+            return;
+        }
+        if rx.recv_timeout(deadline).is_err() {
+            let busy: Vec<String> = self
+                .snapshot()
+                .workers
+                .into_iter()
+                .filter(|worker| worker.busy)
+                .map(|worker| format!("{}={}", worker.name, worker.label))
+                .collect();
+            warn!(
+                stuck = busy.join(","),
+                "fuse workers did not finish in time; shutting down around them"
+            );
+        }
+    }
+
+    fn close(&self) {
+        self.inner.queues.lock().closed = true;
+        self.inner.meta_cv.notify_all();
+        self.inner.general_cv.notify_all();
     }
 
     /// Queue `job` in `lane`.
@@ -289,6 +356,12 @@ impl Workers {
     /// a pending job holds a `Reply` and a few fields, while the 4 MiB block
     /// buffer is allocated inside the job once it runs, and the SDK's in-flight
     /// semaphore is what bounds how many of those exist at once.
+    /// The queue is *not* bounded, and the depth warning above is deliberately
+    /// all this does about it: the only caller able to feel backpressure here is
+    /// fuser's dispatch loop, and blocking that is the stall the whole module
+    /// exists to avoid. A depth that keeps climbing is a symptom to read in the
+    /// log, not something to fix by stopping the mount.
+    ///
     /// `label` names the work for the diagnostics (`pdfs diagnostics`) and for
     /// the stall warnings: it is what a hung daemon reports instead of "busy".
     pub(crate) fn run(&self, lane: Lane, label: &'static str, job: impl FnOnce() + Send + 'static) {
@@ -305,17 +378,27 @@ impl Workers {
             label,
             job: Box::new(job),
         };
-        match lane {
+        let depth = match lane {
             Lane::Meta => {
                 q.meta.push_back(queued);
-                self.inner.meta_queued.fetch_add(1, Ordering::Relaxed);
+                self.inner.meta_queued.fetch_add(1, Ordering::Relaxed) + 1
             }
             Lane::Transfer => {
                 q.transfer.push_back(queued);
-                self.inner.transfer_queued.fetch_add(1, Ordering::Relaxed);
+                self.inner.transfer_queued.fetch_add(1, Ordering::Relaxed) + 1
             }
-        }
+        };
         drop(q);
+        if crosses_warn_step(depth) {
+            warn!(
+                lane = if matches!(lane, Lane::Meta) {
+                    "meta"
+                } else {
+                    "transfer"
+                },
+                depth, label, "fuse worker queue is deep"
+            );
+        }
         match lane {
             // Either class can serve metadata, and only one of them needs to:
             // whichever wakes first takes it, and the other finds the queue
@@ -369,10 +452,12 @@ impl Workers {
 }
 
 impl Drop for Workers {
+    /// A backstop for the paths that never call
+    /// [`stop_and_join`](Workers::stop_and_join) — tests, and a mount that fails
+    /// before teardown is wired up. Flag and wake only: a `Drop` that blocks on
+    /// a network call is worse than a worker outliving its pool by a moment.
     fn drop(&mut self) {
-        self.inner.queues.lock().closed = true;
-        self.inner.meta_cv.notify_all();
-        self.inner.general_cv.notify_all();
+        self.close();
     }
 }
 
@@ -381,6 +466,35 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// The depth warning fires on the step, and only on the step: a lane that
+    /// oscillates around the threshold must not log on every single job.
+    #[test]
+    fn queue_depth_warns_on_each_step() {
+        assert!(!crosses_warn_step(1));
+        assert!(!crosses_warn_step(QUEUE_WARN_STEP - 1));
+        assert!(crosses_warn_step(QUEUE_WARN_STEP));
+        assert!(!crosses_warn_step(QUEUE_WARN_STEP + 1));
+        assert!(crosses_warn_step(QUEUE_WARN_STEP * 3));
+    }
+
+    /// Teardown must return even while a job is running, and must not leave the
+    /// pool accepting work.
+    #[test]
+    fn stopping_is_bounded_and_closes_the_pool() {
+        let pool = Workers::new(2).unwrap();
+        let (tx, rx) = mpsc::channel();
+        pool.run(Lane::Meta, "test", move || tx.send(()).unwrap());
+        rx.recv_timeout(Duration::from_secs(5)).expect("it runs");
+
+        pool.stop_and_join(Duration::from_secs(5));
+
+        // A job queued after the stop runs inline rather than disappearing.
+        let (tx, rx) = mpsc::channel();
+        pool.run(Lane::Meta, "test", move || tx.send(()).unwrap());
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("a closed pool serves inline");
+    }
 
     /// A diagnostic is only useful if it names the work. A running job must show
     /// up under its label, and the queue behind it must show up as depth.

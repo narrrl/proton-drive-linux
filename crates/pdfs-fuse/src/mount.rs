@@ -686,6 +686,11 @@ pub fn mount(
     Ok(outcome)
 }
 
+/// How long teardown waits for the FUSE worker pool before proceeding without
+/// it. Long enough for an in-flight block to finish, short enough that
+/// `systemctl --user stop` still returns inside `TimeoutStopSec`.
+const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Signal every background loop, wake the ones that are blocked, and join them.
 ///
 /// The mount used to return with its drain workers, sync engine, sweep, online
@@ -717,6 +722,12 @@ fn stop_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::Jo
             warn!("a background worker panicked before shutdown");
         }
     }
+    // The FUSE worker pool last, and *before* the caller drops the tokio
+    // runtime: a worker still inside a job when the runtime goes away panics on
+    // its next timer with "A Tokio 1.x context was found, but it is being
+    // shutdown" (seen 2026-09-18 09:58:35). Bounded, so a worker wedged on the
+    // network cannot hold the stop the user asked for.
+    core.workers.stop_and_join(WORKER_JOIN_DEADLINE);
     debug!("background workers stopped");
 }
 

@@ -12,6 +12,76 @@ Conventions:
 
 ---
 
+## B91 — The daemon hung overnight, and nothing could say what it was waiting on
+
+**Status:** Open — the hang itself is undiagnosed. What is fixed (unverified) is the
+*undiagnosability*: the daemon now reports what it is doing, warns when it stops making progress,
+and is restarted by systemd when it stops answering.
+**Found:** 2026-09-18, from a user report — the mount stopped responding and only came back after
+`systemctl --user restart`.
+**Where:** `crates/pdfs-fuse/src/{workers.rs,diagnostics.rs,supervisor.rs,systemd.rs,mount.rs}`,
+`packaging/proton-drive.service`.
+
+**Symptom.** The mount stops answering. The process is alive and is not spinning; there is no
+panic, no error, and no log line after the moment it stopped. The accounting for the hung run:
+
+```
+Consumed 43min 39.045s CPU time over 20h 8min 15.733s wall clock time,
+5.2G memory peak, 65.7M memory swap peak
+```
+
+It went silent at 17:10 and stayed that way until the manual stop at 13:18:54 the next day. A
+restart picked everything back up, which rules out corrupt local state.
+
+**What made it undiagnosable.** Nothing in the daemon could be asked what it was doing:
+
+- the worker pool published no state at all — not which threads were busy, not with what, not for
+  how long, not how deep the queues were;
+- control requests were not tracked, so a handler that never returned looked exactly like a
+  handler that was never asked for;
+- there was no watchdog, so a daemon that stopped answering stayed "active (running)" for twenty
+  hours;
+- resident size was never sampled, so the 5.2 G peak was only visible in systemd's post-mortem.
+
+**Related, and a real bug on its own.** At 2026-09-18 09:58:35 a meta worker panicked during
+shutdown:
+
+```
+thread 'pdfs-fuse-meta-0' (3044) panicked at ...:
+A Tokio 1.x context was found, but it is being shutdown.
+```
+
+The pool was flagged closed at teardown but never joined, so the process could drop the tokio
+runtime while a worker was still inside a job. `catch_unwind` caught it, which is why it was only
+ever a log line — but it is teardown ordering, not an error.
+
+**What changed.**
+
+- `Workers` publishes per-thread state (busy, job label, age) plus queue depths and per-lane
+  completion counts, all outside the queue lock, and every FUSE handler labels the job it hands
+  over.
+- `Request::Diagnostics` / `pdfs diagnostics` reports that, the in-flight control requests with
+  their ages, the handler count against its limit, resident size and the pending-op count. It is
+  built to answer while the daemon is wedged: atomics and `try_lock` only, with the one database
+  read on a throwaway thread behind a 500 ms deadline.
+- A supervisor thread WARNs when a worker has held one job for 120 s, when a control request has
+  run that long, or when a lane has a queue but completed nothing since the last tick; it samples
+  RSS every 5 minutes.
+- The supervisor answers the systemd watchdog, but only after a real round trip over the control
+  socket — so the ping means "a client can still talk to this daemon" rather than "a thread is
+  still scheduled". `WatchdogSec=120` and `Restart=always` turn the next hang into a restart
+  instead of a morning of downtime, and `MemoryHigh=2G`/`MemoryMax=6G` bound the growth.
+- Teardown joins the worker pool, with a 10 s deadline, before the caller drops the runtime.
+
+**Still open.** None of this says *why* it hung. The candidates the evidence does not yet separate:
+the 5.2 G working set (a leak, or a legitimately huge listing retained), a lock held across an
+await somewhere in the control plane, and the ~150 `rt.block_on` sites on the control path that
+have no op-level deadline of their own — each individual HTTP call is bounded by the SDK's 30 s
+API / 300 s storage timeouts, but a sequence of them is not. The next occurrence should be a
+one-line answer from `pdfs diagnostics` or from the stall WARN.
+
+---
+
 ## B90 — The local-file indexer walks into foreign FUSE mounts, and a dead one makes the daemon unkillable
 
 **Status:** Fixed (unverified) — the walker no longer stats a nested mountpoint. The stuck-daemon
