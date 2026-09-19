@@ -203,10 +203,14 @@ fn group_photos(entries: &[Grouped]) -> Vec<String> {
 /// The columns every photo read selects, with the group aggregates joined in.
 /// `g.n` is how many photos the group holds and `g.raw` whether any of them is a
 /// camera raw file — one query rather than a second lookup per tile.
+///
+/// `COALESCE(group_key, uid)` is what makes a row written before schema v30 its
+/// own group: the column is `NULL` until the next refresh computes it, and a
+/// `NULL` would otherwise match nothing and drop the photo off the page.
 const PHOTO_SELECT: &str = "SELECT p.uid, p.capture_time, p.name, p.ratio, p.thumb_state, \
      p.kind, p.favorite, g.n, g.raw \
-     FROM photos p JOIN (SELECT group_key, COUNT(*) AS n, MAX(kind = 2) AS raw \
-     FROM photos GROUP BY group_key) g ON g.group_key = p.group_key";
+     FROM photos p JOIN (SELECT COALESCE(group_key, uid) AS k, COUNT(*) AS n, \
+     MAX(kind = 2) AS raw FROM photos GROUP BY k) g ON g.k = COALESCE(p.group_key, p.uid)";
 
 /// Read one row of [`PHOTO_SELECT`].
 fn stored_photo(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPhoto> {
@@ -374,7 +378,7 @@ impl Db {
         let mut binds: Vec<i64> = Vec::new();
         let mut conds: Vec<String> = Vec::new();
         if kind != Some(crate::control::PhotoKind::Raw) {
-            conds.push("p.uid = p.group_key".to_string());
+            conds.push("p.uid = COALESCE(p.group_key, p.uid)".to_string());
         }
         if let Some(k) = kind {
             binds.push(k.as_i64());
@@ -414,8 +418,8 @@ impl Db {
     pub fn photos_group(&self, uid: &str) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         let sql = format!(
-            "{PHOTO_SELECT} WHERE p.group_key = \
-             (SELECT group_key FROM photos WHERE uid = ?1) ORDER BY p.seq"
+            "{PHOTO_SELECT} WHERE COALESCE(p.group_key, p.uid) = \
+             (SELECT COALESCE(group_key, uid) FROM photos WHERE uid = ?1) ORDER BY p.seq"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -451,8 +455,11 @@ impl Db {
         // the page shows: groups everywhere except on the Raw tab.
         let (filter, binds): (&str, Vec<i64>) = match kind {
             Some(crate::control::PhotoKind::Raw) => (" WHERE kind = 2", Vec::new()),
-            Some(k) => (" WHERE uid = group_key AND kind = ?1", vec![k.as_i64()]),
-            None => (" WHERE uid = group_key", Vec::new()),
+            Some(k) => (
+                " WHERE uid = COALESCE(group_key, uid) AND kind = ?1",
+                vec![k.as_i64()],
+            ),
+            None => (" WHERE uid = COALESCE(group_key, uid)", Vec::new()),
         };
         let sql = format!(
             "SELECT CAST(strftime('%Y', capture_time, 'unixepoch', 'localtime') AS INTEGER) AS y, \
@@ -481,7 +488,8 @@ impl Db {
         // files it was stored as. Raw counts files, because the Raw tab lists
         // them individually.
         let mut stmt = conn.prepare(
-            "SELECT kind, COUNT(*) FROM photos WHERE uid = group_key OR kind = 2 GROUP BY kind",
+            "SELECT kind, COUNT(*) FROM photos \
+             WHERE uid = COALESCE(group_key, uid) OR kind = 2 GROUP BY kind",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         let (mut photos, mut videos, mut raw) = (0usize, 0usize, 0usize);

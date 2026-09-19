@@ -4101,3 +4101,74 @@ fn the_servers_photo_relation_groups_a_live_photo() {
     .unwrap();
     assert_eq!(db.photos_group("related").unwrap().len(), 2);
 }
+
+/// A database written before grouping existed opens, keeps its timeline, and
+/// shows every photo — a row with no `group_key` is its own group, which is how
+/// the gallery behaved before the column.
+#[test]
+fn migration_v30_leaves_a_v29_timeline_intact() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v29-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.photos_replace(&[
+            TimelineRow {
+                name: Some("IMG_1234.JPG".into()),
+                ..TimelineRow::new("jpeg", 300)
+            },
+            TimelineRow {
+                name: Some("IMG_1234.CR2".into()),
+                ..TimelineRow::new("raw", 300)
+            },
+        ])
+        .unwrap();
+        db.photo_set_thumb("jpeg", THUMB_HAVE, Some(1.5)).unwrap();
+    }
+    {
+        // Put the file back in the state a released V29 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_photos_group;
+             ALTER TABLE photos DROP COLUMN group_key;
+             ALTER TABLE photos DROP COLUMN main_uid;
+             ALTER TABLE photos DROP COLUMN content_hash;
+             UPDATE sync_state SET value = '29' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "raw"],
+        "no photo goes missing before the next refresh groups them"
+    );
+    assert!(page.iter().all(|p| p.group_size == 1));
+    assert_eq!(page[0].ratio, Some(1.5), "what was learned is still there");
+
+    // The next refresh fills the column in and the pair collapses.
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_1234.CR2".into()),
+            ..TimelineRow::new("raw", 300)
+        },
+    ])
+    .unwrap();
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].uid, "jpeg");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
