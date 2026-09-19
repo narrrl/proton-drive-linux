@@ -12,6 +12,115 @@ Conventions:
 
 ---
 
+## B97 — Photo refreshes stack up on the control socket, and shutdown turns the resolve pass into a burst of "undecryptable photo" warnings
+
+**Status:** Fixed (unverified) — the daemon carrying the change has not been driven against a real
+library yet.
+**Found:** 2026-09-19, while reading the journal for issues that were still open. `pdfs diagnostics`
+had reported a `Refresh` running for 23 minutes with `in_flight` at 5, and every mount that ended
+in a `systemctl --user restart` was followed by ~95 `skipping undecryptable photo` warnings.
+
+**Where:** `crates/pdfs-fuse/src/control.rs` (`Refresh` handler), `crates/pdfs-fuse/src/photos.rs`
+(`refresh_timeline`), `crates/pdfs-fuse/src/diagnostics.rs` (`request_kind`).
+
+**Cause.** Two unrelated faults with one symptom each.
+
+The stall: every `Refresh` arm is individually cheap — a directory refresh resolves and
+invalidates one listing, a photos refresh clears one state key and spawns the real work — but
+nothing stopped several of them running at once. A front end that asks again while the first
+refresh is still going gets a second handler that does the whole thing again: `invalidate_photos`,
+optionally `photos_mark_all_unresolved` over the entire timeline, `invalidate_albums`. Each of
+those takes the database lock the already-running refresh holds for minutes at a time, so the
+duplicates queue behind it, hold a control handler slot, and appear as a wedged `Refresh`. The
+report could not even say which view was wedged: `request_kind` reads only serde's external tag,
+so all three scopes logged as a bare `Refresh`.
+
+The warning burst: `refresh_timeline` resolves photo metadata in chunks and keeps going through
+teardown. The runtime is cancelled under it, every decrypt task in flight fails with "task was
+cancelled", and the SDK logs one `skipping undecryptable photo` per node. Nothing was corrupt —
+the library was fine on the next mount, because `photos_replace` preserves prior metadata and
+leaves `resolved_at` null so the next refresh re-reads exactly those photos.
+
+**What changed.** A refresh scope is now single-flight: `RefreshGuard` holds the scope key
+(`dir:<path>`, `trash`, `photos`, `photos:full`) for as long as one is being served, and a second
+request for that same key is answered `refreshing` immediately instead of repeating the work. A
+non-full photos refresh is additionally skipped while `timeline_refreshing()` is true, since that
+work outlives the request that started it. `request_kind` now names the scope, so the diagnostics
+report says `Refresh(Photos)` rather than `Refresh`. And the resolve loop stops asking for chunks
+once `Shutdown::is_stopping()`, logging `stopped` and the resolved-versus-wanted counts on the way
+out.
+
+---
+
+## B96 — Staged bytes that name no node are never retired, and are re-announced on every boot
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-19, in the journal: the same "staged bytes belong to no queued upload" warning
+appeared once per blob per mount, forever. The staging directory held 138 blobs / 575 MiB, of
+which 95 (~445 MiB) referenced no node at all; the oldest were two months old.
+
+**Where:** `crates/pdfs-fuse/src/lib.rs` (`reconcile_staging`).
+
+**Cause.** Startup reconciliation is deliberately conservative: staged bytes are the only copy of
+an un-uploaded write, so a blob it cannot match to a queued op is kept rather than deleted. But
+"kept" had no end. A blob whose node is gone from the database can never be matched by any future
+boot, so the warning was both permanent and per-blob, and the bytes accumulated with no ceiling.
+
+**What changed.** A blob that names no node and whose mtime is older than `STAGING_ORPHAN_RETAIN`
+(30 days) is retired, with its size logged. A month is long enough that a write stranded by a bug
+can still be recovered by hand. Younger orphans are still kept, but they are now counted and
+reported as one aggregated warning with one example path, not one line each.
+
+---
+
+## B95 — A real `index.tmp` is treated as a browser tempfile and parked forever
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-19, while working out why 43 uploads were parked. Most of them were
+`index.tmp` and `preview.tmp` files from a Google Photos Takeout import — ordinary files whose
+final name simply ends in `.tmp`.
+
+**Where:** `crates/pdfs-core/src/syncignore.rs` (`TRANSIENT_SUFFIXES`).
+
+**Cause.** One suffix list served two mechanisms with very different consequences. On a mirror
+mount, calling a name transient means "do not reconcile it yet", which is reversible and costs
+nothing if wrong. On an on-demand mount it means "park the create until the writer renames it"
+(B70) — and a file whose real, final name ends in `.tmp` is never renamed, so the park stands
+forever and the bytes never go up.
+
+**What changed.** `.tmp` and `.temp` are out of `TRANSIENT_SUFFIXES`. The remaining suffixes
+(`.crdownload`, `.part`, `.partial`, `.download`, `.swp`, `.swx`) belong to writers that always
+rename. A `.tmp` write from a program that does rename is still handled — by the rename itself,
+which supersedes the create.
+
+---
+
+## B94 — A parked create has no exit but the rename, so an abandoned one is stuck forever
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-19, while reading the journal: 43 rows in `pending_op` carried the
+`PARK_UNTIL` sentinel, some for weeks. `pdfs status` reported them as parked uploads that never
+moved.
+
+**Where:** `crates/pdfs-core/src/db/ops.rs` (`parked_create_ops`, `PARK_EXPIRY_MS`),
+`crates/pdfs-fuse/src/drain.rs` (`sweep_parked_creates`).
+
+**Cause.** B70 parks a transient create by writing `PARK_UNTIL` into `next_attempt_at`, and the
+only thing that clears it is the transient-to-final rename (`Db::set_create_hold`). If the rename
+never happens — the writer crashed, the user deleted the temp file, or the name was never
+transient in the first place (B95) — the row is invisible to `claim_next_due_op` and stays in the
+queue permanently, holding its staged blob.
+
+**What changed.** The primary drain worker sweeps parked creates when the queue is idle, which is
+exactly when a park that has outlived its writer matters. A parked create whose node is gone from
+the database has its queued ops discarded. One whose node still exists, that is older than
+`PARK_EXPIRY_MS` (1 hour) and that nobody has open, is un-parked rather than dropped — drain
+invariant 1 says staged bytes are only dropped once their op has landed, so the sweep lets the
+bytes through under the transient name instead of destroying them. An open node is left parked
+whatever its age: it is still being written.
+
+---
+
 ## B93 — A photo whose node would not resolve lost its name, and with it its tab and its group
 
 **Status:** Fixed (unverified) — found and fixed while making the timeline refresh incremental

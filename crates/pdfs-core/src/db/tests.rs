@@ -3049,6 +3049,57 @@ fn a_parked_transient_create_stays_off_the_drain_until_finalized() {
     assert_eq!(due.blob_path.as_deref(), Some("/staging/blob1"));
 }
 
+/// The park sweep's query: parked creates are the rows nothing else in the drain
+/// can see, so it has to find them by the sentinel and report how long each has
+/// been parked. Ordinary queued work is not its business.
+#[test]
+fn parked_creates_are_listed_with_the_age_the_sweep_judges_them_by() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("root").to_string();
+    let parked = uid("swap").to_string();
+    let due = uid("ordinary").to_string();
+    for (node, name, next_attempt_at, created_at) in [
+        (&parked, ".notes.txt.swp", PARK_UNTIL, 1_000),
+        (&due, "notes.txt", 0, 2_000),
+    ] {
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: node.clone(),
+            parent_uid: Some(parent.clone()),
+            name: Some(name.to_string()),
+            blob_path: Some(format!("/staging/{name}")),
+            meta_json: None,
+            created_at,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at,
+        })
+        .unwrap();
+    }
+
+    let rows = db.parked_create_ops().unwrap();
+    assert_eq!(rows.len(), 1, "only the parked create is swept");
+    assert_eq!(rows[0].uid, parked);
+    assert_eq!(rows[0].created_at, 1_000, "the park's age is readable");
+    assert_eq!(
+        rows[0].blob_path.as_deref(),
+        Some("/staging/.notes.txt.swp")
+    );
+
+    // What the sweep does with an expired park: un-park it, and it drains like
+    // any other create rather than waiting for a rename that is not coming.
+    assert!(db.set_create_hold(&parked, false).unwrap());
+    assert!(
+        db.parked_create_ops().unwrap().is_empty(),
+        "an un-parked create is no longer the sweep's business"
+    );
+    assert_eq!(
+        db.next_due_op(1_000 + PARK_EXPIRY_MS).unwrap().unwrap().uid,
+        parked
+    );
+}
+
 /// Backoff still gates: nothing is returned before an op is due.
 #[test]
 fn next_due_op_respects_backoff() {

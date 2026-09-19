@@ -73,7 +73,29 @@ pub(crate) fn request_kind(line: &str) -> String {
         line.strip_prefix('"')
             .and_then(|rest| rest.split('"').next())
     };
-    name.unwrap_or("unknown").to_string()
+    let name = name.unwrap_or("unknown");
+    // A bare `Refresh` says nothing about which view wedged, and the three
+    // scopes cost wildly different amounts of work: a directory refresh is two
+    // cheap calls, a photos refresh can pull a whole library. The scope is one
+    // more peek into the same line.
+    if name == "Refresh"
+        && let Some(scope) = tagged_name_after(line, "\"scope\"")
+    {
+        return format!("Refresh({scope})");
+    }
+    name.to_string()
+}
+
+/// The variant name serde wrote for the value of `key`, whether that value is a
+/// bare string (a unit variant) or an object whose single key is the name.
+fn tagged_name_after(line: &str, key: &str) -> Option<String> {
+    let rest = line.split_once(key)?.1.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('{').map_or(rest, str::trim_start);
+    rest.strip_prefix('"')?
+        .split('"')
+        .next()
+        .map(str::to_string)
 }
 
 /// Resident set size in bytes, or `0` when `/proc` did not answer.
@@ -179,6 +201,26 @@ mod tests {
         assert_eq!(request_kind("{\"Pin\":{\"path\":\"a\"}}"), "Pin");
         assert_eq!(request_kind(" { \"Restore\" : {} } "), "Restore");
         assert_eq!(request_kind("garbage"), "unknown");
+    }
+
+    /// A stuck `Refresh` is only actionable if the report says which view it
+    /// was refreshing, so the scope rides along with the name.
+    #[test]
+    fn a_refresh_reports_its_scope() {
+        assert_eq!(
+            request_kind("{\"Refresh\":{\"scope\":{\"Photos\":{\"full\":true}}}}"),
+            "Refresh(Photos)"
+        );
+        assert_eq!(
+            request_kind("{\"Refresh\":{\"scope\":{\"Dir\":{\"path\":\"a\"}}}}"),
+            "Refresh(Dir)"
+        );
+        assert_eq!(
+            request_kind("{\"Refresh\":{\"scope\":\"Trash\"}}"),
+            "Refresh(Trash)"
+        );
+        // A shape this does not recognise still names the request.
+        assert_eq!(request_kind("{\"Refresh\":{}}"), "Refresh");
     }
 
     /// A guard registers for its lifetime and nothing longer: a handler that

@@ -1450,7 +1450,18 @@ impl Core {
         // so the relation is recorded from whichever end resolves — the two ends
         // can land in different chunks, and one of them may not resolve at all.
         let mut main_of: HashMap<String, String> = HashMap::new();
+        let mut stopped = false;
         for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
+            // Teardown cancels the runtime under this loop, and every chunk
+            // still in flight then fails its decrypt task — a burst of
+            // "skipping undecryptable photo ... task was cancelled" warnings
+            // that read like corruption and are only a shutdown. Stop asking
+            // for chunks instead. What resolved so far is kept below; the rest
+            // stay unresolved and are read by the next refresh.
+            if self.shutdown.is_stopping() {
+                stopped = true;
+                break;
+            }
             match photos.enumerate_nodes(chunk).await {
                 Ok(nodes) => {
                     for node in nodes {
@@ -1521,10 +1532,14 @@ impl Core {
         // like it never happened, and the chunk count is what it scales with.
         info!(
             photos = rows.len(),
-            resolved = uids.len(),
+            // `resolved` is what came back, which is short of `wanted` when
+            // shutdown cut the pass off or a chunk failed.
+            resolved = meta.len(),
+            wanted = uids.len(),
             skipped = rows.len().saturating_sub(uids.len()),
             chunks = uids.len().div_ceil(TIMELINE_ENRICH_CHUNK),
             elapsed_ms = started.elapsed().as_millis() as u64,
+            stopped,
             "photos timeline refreshed"
         );
         Ok(true)

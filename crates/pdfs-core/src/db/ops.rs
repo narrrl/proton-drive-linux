@@ -84,6 +84,25 @@ pub const LOCAL_VOLUME: &str = "local";
 /// stall+resume, fork a `(sync-conflict)` copy (docs/BUGS.md B70).
 pub const PARK_UNTIL: i64 = 8_000_000_000_000;
 
+/// How long a create may stay parked before the park is treated as permanent
+/// and the bytes are let through anyway (ms).
+///
+/// The park has exactly one exit: a rename from the transient name to the
+/// finished one. Every writer that reaches that rename does so in seconds — an
+/// atomic-write scratch file immediately, a download when it completes. A park
+/// still standing an hour later belongs to a writer that will never perform
+/// that rename: an editor that deletes its swap file instead, a download the
+/// user abandoned, or a file that simply *is* named `report.tmp` and is never
+/// going to be called anything else.
+///
+/// Before this existed such a row sat at [`PARK_UNTIL`] for the life of the
+/// database, holding the only copy of the file's bytes in `staging/` and
+/// counting against the queue while promising progress that could not come. The
+/// sweep un-parks it instead of dropping it: bytes the user can see in the mount
+/// are bytes the user expects on Drive, and invariant 1 of the drain (a staged
+/// blob is dropped only once its op has landed) admits no other answer.
+pub const PARK_EXPIRY_MS: i64 = 60 * 60 * 1000;
+
 /// A mutation that has been accepted locally but not yet performed against the
 /// API — the durable half of the write-back queue (offline.md Phase 3).
 ///
@@ -643,6 +662,40 @@ impl Db {
         )?;
         let rows = stmt
             .query_map([], |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    uid: r.get(2)?,
+                    parent_uid: r.get(3)?,
+                    name: r.get(4)?,
+                    blob_path: r.get(5)?,
+                    meta_json: r.get(6)?,
+                    created_at: r.get(7)?,
+                    attempts: r.get(8)?,
+                    last_error: r.get(9)?,
+                    next_attempt_at: r.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every parked create/mkdir, oldest first, for the park sweep.
+    ///
+    /// Parked rows are invisible to [`next_due_op`](Self::next_due_op) by
+    /// construction, so nothing else in the drain ever looks at them. This is
+    /// the one query that does.
+    pub fn parked_create_ops(&self) -> Result<Vec<PendingOp>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                    attempts, last_error, next_attempt_at
+             FROM pending_op
+             WHERE next_attempt_at >= ?1 AND kind IN (?2, ?3)
+             ORDER BY created_at",
+        )?;
+        let rows = stmt
+            .query_map(params![PARK_UNTIL, OP_CREATE, OP_MKDIR], |r| {
                 Ok(PendingOp {
                     id: r.get(0)?,
                     kind: r.get(1)?,

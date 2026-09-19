@@ -22,7 +22,7 @@ use pdfs_core::control::{
 };
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::transfers::CountingReader;
 use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
@@ -164,6 +164,50 @@ fn rel_to_mount(mountpoint: &Path, path: &str) -> CoreResult<PathBuf> {
 
 /// Handle one control-socket connection: read a single JSON request line,
 /// dispatch it against `core`, and write back a JSON response line.
+/// Refresh scopes being served right now, one entry per running refresh.
+///
+/// A `Vec` because there are three scopes and at most `MAX_CONTROL_HANDLERS`
+/// handlers, so a set would buy nothing.
+static REFRESHING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// What makes two refreshes the same work: the scope, and for a directory the
+/// folder, since refreshing one folder says nothing about another. A full
+/// photos refresh is not the same work as an ordinary one — it forgets what the
+/// daemon knows first — so it keys apart.
+fn scope_key(scope: &RefreshScope) -> String {
+    match scope {
+        RefreshScope::Dir { path } => format!("dir:{path}"),
+        RefreshScope::Trash => "trash".to_string(),
+        RefreshScope::Photos { full: true } => "photos:full".to_string(),
+        RefreshScope::Photos { full: false } => "photos".to_string(),
+    }
+}
+
+/// Holds one refresh scope for as long as it is being served. `acquire`
+/// returns `None` when that scope is already in flight.
+struct RefreshGuard(String);
+
+impl RefreshGuard {
+    fn acquire(scope: &RefreshScope) -> Option<Self> {
+        let key = scope_key(scope);
+        let mut running = REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
+        if running.contains(&key) {
+            return None;
+        }
+        running.push(key.clone());
+        Some(Self(key))
+    }
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        let mut running = REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = running.iter().position(|key| *key == self.0) {
+            running.swap_remove(at);
+        }
+    }
+}
+
 fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: UnixStream) {
     if let Err(e) = stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)) {
         warn!(error = %e, "control: could not set request timeout");
@@ -247,45 +291,69 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::Refresh { scope }) => {
-            let result = match &scope {
-                RefreshScope::Dir { path } => route_to_mount(core, mountpoint, path)
-                    .and_then(|(core, rel)| core.refresh_dir(&rel)),
-                RefreshScope::Trash => {
-                    core.invalidate_trash();
-                    Ok(())
+        Ok(CtlRequest::Refresh { scope }) => match RefreshGuard::acquire(&scope) {
+            // The same scope is already being refreshed by another handler.
+            // Running it again cannot make the answer newer, and the duplicate
+            // would spend its whole run contending for the state and database
+            // locks the first one holds — which is how five stacked photo
+            // refreshes sat in flight for twenty-three minutes at mount time.
+            None => {
+                debug!(scope = %scope_key(&scope), "a refresh of this scope is already running");
+                CtlResponse::Ok {
+                    message: "refreshing".to_string(),
                 }
-                RefreshScope::Photos { full } => {
-                    core.invalidate_photos();
-                    // A full refresh is "forget what you know", not a second code
-                    // path: the ordinary refresh then finds every photo stale.
-                    if let Some(Err(e)) = full.then(|| core.db.photos_mark_all_unresolved()) {
-                        warn!(error = %e, "marking the whole timeline unresolved failed");
-                    }
-                    // Whatever changed the timeline can just as easily have
-                    // changed an album; one scope covers the whole photos view.
-                    core.invalidate_albums();
-                    // The refresh is started here, not awaited. A library of
-                    // twelve thousand photos is re-read in chunks of
-                    // `TIMELINE_ENRICH_CHUNK` nodes, which takes minutes —
-                    // longer than the client's read bound, so awaiting it
-                    // returned `Resource temporarily unavailable` to a caller
-                    // whose refresh was in fact running fine (B92). The front
-                    // end follows it with `PhotosRefreshStatus`.
-                    core.spawn_timeline_refresh();
-                    Ok(())
-                }
-            };
-            match result {
-                Ok(()) => CtlResponse::Ok {
-                    message: match scope {
-                        RefreshScope::Photos { .. } => "refreshing".to_string(),
-                        _ => "refreshed".to_string(),
-                    },
-                },
-                Err(e) => CtlResponse::error(e),
             }
-        }
+            Some(_refreshing) => {
+                let result = match &scope {
+                    RefreshScope::Dir { path } => route_to_mount(core, mountpoint, path)
+                        .and_then(|(core, rel)| core.refresh_dir(&rel)),
+                    RefreshScope::Trash => {
+                        core.invalidate_trash();
+                        Ok(())
+                    }
+                    RefreshScope::Photos { full } if !full && core.timeline_refreshing() => {
+                        // A refresh is already running and will publish exactly the
+                        // timeline this request asks for. Doing the work again
+                        // cannot make it newer, and the invalidation plus the
+                        // album read contend with the running refresh for the
+                        // database lock — which is how a handful of stacked photo
+                        // refreshes at mount time left five control requests
+                        // in flight for twenty-three minutes.
+                        debug!("a photos refresh is already running; joining it");
+                        Ok(())
+                    }
+                    RefreshScope::Photos { full } => {
+                        core.invalidate_photos();
+                        // A full refresh is "forget what you know", not a second code
+                        // path: the ordinary refresh then finds every photo stale.
+                        if let Some(Err(e)) = full.then(|| core.db.photos_mark_all_unresolved()) {
+                            warn!(error = %e, "marking the whole timeline unresolved failed");
+                        }
+                        // Whatever changed the timeline can just as easily have
+                        // changed an album; one scope covers the whole photos view.
+                        core.invalidate_albums();
+                        // The refresh is started here, not awaited. A library of
+                        // twelve thousand photos is re-read in chunks of
+                        // `TIMELINE_ENRICH_CHUNK` nodes, which takes minutes —
+                        // longer than the client's read bound, so awaiting it
+                        // returned `Resource temporarily unavailable` to a caller
+                        // whose refresh was in fact running fine (B92). The front
+                        // end follows it with `PhotosRefreshStatus`.
+                        core.spawn_timeline_refresh();
+                        Ok(())
+                    }
+                };
+                match result {
+                    Ok(()) => CtlResponse::Ok {
+                        message: match scope {
+                            RefreshScope::Photos { .. } => "refreshing".to_string(),
+                            _ => "refreshed".to_string(),
+                        },
+                    },
+                    Err(e) => CtlResponse::error(e),
+                }
+            }
+        },
         Ok(CtlRequest::PhotosTimeline {
             offset,
             limit,
@@ -1368,5 +1436,30 @@ mod request_limit_tests {
         assert!(rel_to_mount(mountpoint, "../escape").is_err());
         assert!(rel_to_mount(mountpoint, "Photos/../../escape").is_err());
         assert!(rel_to_mount(mountpoint, "/mnt/elsewhere").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two refreshes of the same scope are one piece of work; two refreshes of
+    /// different scopes are not.
+    #[test]
+    fn a_scope_refreshes_once_at_a_time() {
+        let photos = RefreshScope::Photos { full: false };
+        let held = RefreshGuard::acquire(&photos).expect("first refresh runs");
+        assert!(RefreshGuard::acquire(&photos).is_none());
+        // A full refresh forgets what the daemon knows, so it is other work.
+        assert!(RefreshGuard::acquire(&RefreshScope::Photos { full: true }).is_some());
+        assert!(
+            RefreshGuard::acquire(&RefreshScope::Dir {
+                path: "a".to_string()
+            })
+            .is_some()
+        );
+
+        drop(held);
+        assert!(RefreshGuard::acquire(&photos).is_some());
     }
 }

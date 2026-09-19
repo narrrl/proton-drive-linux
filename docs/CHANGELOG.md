@@ -9,6 +9,33 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [1.11.1] — 2026-09-19
+
+Schema: **30** (unchanged).
+
+### Fixed
+- **An upload parked behind a temp-file rename no longer stays parked forever.** A create for a
+  name that looks like a writer's temporary file waits for the rename to the final name. If that
+  rename never came — the writer crashed, the file was deleted, or the name was never temporary —
+  the upload sat in the queue permanently, holding its staged bytes. The queue now sweeps parked
+  creates while it is idle: one whose file is gone is dropped, and one that has been parked for
+  over an hour with nobody holding it open is uploaded under the name it has. An open file is
+  left alone however old it is (B94).
+- **A file whose real name ends in `.tmp` uploads normally.** `.tmp` and `.temp` were treated as
+  writer temp-file suffixes, so ordinary files — a Google Photos Takeout `index.tmp`, for
+  instance — were parked waiting for a rename that was never going to happen (B95).
+- **Staged bytes that belong to nothing are cleaned up.** A staged blob that matches no queued
+  upload and names no node used to be kept forever and warned about once per blob on every mount.
+  Blobs older than 30 days are now retired with their size logged; younger ones are kept, but
+  reported as a single line instead of one per blob (B96).
+- **Refreshing the gallery repeatedly no longer wedges the control socket.** Each refresh scope
+  now runs one at a time; asking again while one is running is answered immediately rather than
+  repeating work that contends with it for the database. `pdfs diagnostics` also names the scope
+  of a running refresh (B97).
+- **Shutting down during a photo refresh no longer logs a wall of "undecryptable photo"
+  warnings.** The metadata pass stops when teardown begins instead of running into the cancelled
+  runtime. Nothing was wrong with those photos; the next refresh reads them again (B97).
+
 ## [1.11.0] — 2026-09-19
 
 Schema: **30** (`photos.content_hash` / `main_uid` / `group_key`); SDK bumped to `proton-sdk` /

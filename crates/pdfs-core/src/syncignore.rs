@@ -45,18 +45,30 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "Thumbs.db",
 ];
 
-/// Suffixes of files that are, by convention, incomplete or throwaway while they
-/// wear the name: a download in flight, an editor's swap or backup, an atomic
-/// write's scratch copy. On an on-demand mount these should never seal a remote
-/// revision — the app renames the finished file to its real name, and only that
-/// belongs on Drive. See [`is_transient_name`] and docs/BUGS.md B70.
+/// Suffixes that mean a file is incomplete *by construction*: only the program
+/// writing it gives it this name, only while the write is in flight, and the
+/// finished article always arrives under a different one. On an on-demand mount
+/// these should never seal a remote revision — the app renames the finished file
+/// to its real name, and only that belongs on Drive. See [`is_transient_name`]
+/// and docs/BUGS.md B70.
+///
+/// `.tmp`/`.temp` are deliberately **not** here, though they are in
+/// [`DEFAULT_IGNORE_PATTERNS`]. The two lists answer different questions. Skipping
+/// a `report.tmp` during a mirror reconcile costs nothing — the file stays on
+/// disk, and a later pass picks it up if the rules change. Parking one on the
+/// on-demand mount is irreversible in practice: the only exit is a rename to a
+/// finished name, and a file that is simply *called* `index.tmp` — a static-site
+/// template, a tool's output — never gets one. It then never reaches Drive at
+/// all, silently, while its bytes pin `staging/`. That is what a real Takeout
+/// tree of `index.tmp`/`preview.tmp` gallery templates did: 43 creates parked
+/// forever. The generic-scratch case they were added for renames within
+/// milliseconds, so it never needed the park; the download suffixes below, which
+/// stay in flight for minutes, are what B70 was actually about.
 const TRANSIENT_SUFFIXES: &[&str] = &[
     ".crdownload", // Chromium/Brave/Edge
     ".part",       // Firefox, wget, aria2c
     ".partial",    // some downloaders / older IE
     ".download",   // Safari / macOS
-    ".tmp",        // generic scratch
-    ".temp",       // generic scratch
     ".swp",        // vim swap
     ".swx",        // vim swap (secondary)
 ];
@@ -319,8 +331,6 @@ mod tests {
             "movie.mkv.part",
             "big.iso.partial",
             "photo.jpg.download",
-            "export.xml.tmp",
-            "notes.TEMP",
             ".notes.txt.swp",
             "doc.txt~",
             ".~lock.report.odt#",
@@ -340,6 +350,10 @@ mod tests {
             "archive.partly.zip", // ".partly" is not ".part"
             "template.dotx",
             "readme",
+            // A file that is *named* `.tmp` and never renamed: parking it would
+            // keep it off Drive for good.
+            "index.tmp",
+            "notes.TEMP",
         ] {
             assert!(!is_transient_name(name), "{name} should not be transient");
         }

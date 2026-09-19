@@ -197,6 +197,22 @@ const UPLOAD_TIME_MEMORY: usize = 512;
 /// for the SDK's own per-request concurrency.
 const DRAIN_WORKERS: usize = 3;
 
+/// How long a staged blob that names no node is kept before it is retired.
+///
+/// Staging is exempt from the cache budget because it holds the only copy of
+/// writes that have not been uploaded, so nothing there is ever evicted to
+/// reclaim space. That is right for a blob that still describes something. It is
+/// wrong for one whose sidecar is missing or names a `local~` placeholder whose
+/// create is gone: no future run can address it, no UI accounts for it, and it
+/// occupies disk for the life of the machine. Real instance: 95 such blobs,
+/// ~445 MiB, the oldest two months old, re-announced on every mount.
+///
+/// A month is far longer than any transfer or any plausible "I will look at that
+/// later", and the retirement is announced per blob with its size, so the one
+/// case that matters — bytes a human still wants — has a month of warnings and a
+/// path to go and fetch them from.
+const STAGING_ORPHAN_RETAIN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 const ONLINE_PROBE_MIN: Duration = Duration::from_secs(5);
 const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
 /// How long the persisted photos timeline stays good before a page request
@@ -1394,6 +1410,15 @@ fn release_must_retain_queued_trash(db: &Db, uid: &NodeUid) -> pdfs_core::Result
     db.has_pending_op(&uid.to_string(), OP_TRASH)
 }
 
+/// The size of a staged blob that has outlived [`STAGING_ORPHAN_RETAIN`], or
+/// `None` while it is younger than that — or while its age cannot be read at
+/// all, which is never grounds for deleting bytes.
+fn orphan_past_retention(blob: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(blob).ok()?;
+    let age = meta.modified().ok()?.elapsed().ok()?;
+    (age >= STAGING_ORPHAN_RETAIN).then_some(meta.len())
+}
+
 fn release_can_discard_unlinked(db: &Db, uid: &NodeUid) -> bool {
     match release_must_retain_queued_trash(db, uid) {
         Ok(retain) => !retain,
@@ -1718,6 +1743,9 @@ impl Core {
         };
         let mut queued = 0usize;
         let mut stranded = 0usize;
+        let mut retired = 0usize;
+        let mut retired_bytes = 0u64;
+        let mut example: Option<PathBuf> = None;
         for (blob, meta) in staged {
             if claimed.contains(&blob.to_string_lossy().into_owned()) {
                 continue;
@@ -1725,9 +1753,17 @@ impl Core {
             let addressable = meta.as_ref().and_then(|m| parse_node_uid(&m.uid));
             let Some((meta, uid)) = meta.zip(addressable).filter(|(_, uid)| !is_local_uid(uid))
             else {
+                if let Some(bytes) = orphan_past_retention(&blob) {
+                    retired += 1;
+                    retired_bytes += bytes;
+                    warn!(blob = %blob.display(), bytes,
+                          age_days = STAGING_ORPHAN_RETAIN.as_secs() / 86_400,
+                          "retiring staged bytes that name no node and have outlived retention");
+                    self.cache.discard_staged(&blob);
+                    continue;
+                }
                 stranded += 1;
-                warn!(blob = %blob.display(),
-                      "staged bytes belong to no queued upload and name no node; kept for recovery");
+                example.get_or_insert_with(|| blob.clone());
                 continue;
             };
             if self.pending.lock().contains_key(&uid) {
@@ -1773,8 +1809,21 @@ impl Core {
                 }
             }
         }
-        if queued > 0 || stranded > 0 {
-            info!(queued, stranded, "reconciled orphaned staged writes");
+        if stranded > 0 {
+            // One line, not one per blob. A tree of them says exactly as much as
+            // a single count and an example does, and said it on every mount:
+            // 86 identical warnings for the same 86 files, boot after boot.
+            warn!(
+                count = stranded,
+                example = %example.map(|b| b.display().to_string()).unwrap_or_default(),
+                "staged bytes belong to no queued upload and name no node; kept for recovery"
+            );
+        }
+        if queued > 0 || stranded > 0 || retired > 0 {
+            info!(
+                queued,
+                stranded, retired, retired_bytes, "reconciled orphaned staged writes"
+            );
         }
     }
 
@@ -6124,14 +6173,64 @@ mod tests {
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
         SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
         accepted_share_provenance, conflict_name, copy_pending_for_truncate, expand_restore,
-        fuse_name, is_stale_mount, node_visible, note_self_change, parse_node_uid,
-        prepare_shared_roots, preserve_on_access_denied, publish_virtual_root_in_listing,
-        reconcile_virtual_root_in_listing, release_can_discard_unlinked,
-        release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
-        require_node_parent_access, require_rename_access, resolve_anywhere_with,
-        shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
+        fuse_name, is_stale_mount, node_visible, note_self_change, orphan_past_retention,
+        parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
+        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
+        rename_needs_queue, require_node_parent_access, require_rename_access,
+        resolve_anywhere_with, shared_with_me_uid, take_self_change, uid_write_authority,
+        virtual_node,
     };
     use super::{Db, WriteAuthority};
+    use std::time::Duration;
+
+    /// Staged bytes that name no node are kept for a month, because the only
+    /// copy of a write must outlive the bug that stranded it. Past that, one
+    /// boot retires them instead of re-announcing them every boot forever.
+    #[test]
+    fn a_stranded_blob_is_retired_only_once_it_outlives_retention() {
+        let dir = std::env::temp_dir().join(format!("pdfs-orphan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("blob");
+        std::fs::write(&blob, b"twelve bytes").unwrap();
+
+        // Written just now: still recoverable, still kept.
+        assert_eq!(orphan_past_retention(&blob), None);
+
+        set_mtime_ago(
+            &blob,
+            super::STAGING_ORPHAN_RETAIN + Duration::from_secs(60),
+        );
+        assert_eq!(orphan_past_retention(&blob), Some(12));
+
+        // A blob that is not there is not a blob to retire.
+        std::fs::remove_file(&blob).unwrap();
+        assert_eq!(orphan_past_retention(&blob), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Backdate a file's mtime, which is what the retention check reads.
+    fn set_mtime_ago(path: &std::path::Path, ago: Duration) {
+        let when = std::time::SystemTime::now() - ago;
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: both pointers are valid for the call and nothing keeps them.
+        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes: {}", std::io::Error::last_os_error());
+    }
 
     /// `(uid, parent)` pairs in the shape [`Db::trash_parents`] returns.
     fn relations(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {

@@ -33,7 +33,9 @@ use futures::StreamExt;
 use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
-use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, RenameMeta};
+use pdfs_core::db::{
+    OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_EXPIRY_MS, PendingOp, RenameMeta,
+};
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeMoveItem};
@@ -299,6 +301,10 @@ impl Core {
                         // Cheap and a no-op when empty.
                         self.cache.flush_touches();
                         self.recover_fsynced_writes();
+                        // Parked rows are invisible to `claim_next_due_op`, so
+                        // an idle queue is exactly when a park that has outlived
+                        // its writer has to be noticed.
+                        self.sweep_parked_creates();
                     }
                     // A debounced or backed-off op may be waiting: sleep only
                     // until it becomes due rather than the full idle-poll.
@@ -1201,6 +1207,101 @@ impl Core {
         Ok(())
     }
 
+    /// Whether any mount still holds an open handle on `uid`.
+    ///
+    /// A transient file that is still open is still being written, however long
+    /// it has been parked, and the rename that finishes it has not happened yet.
+    fn uid_is_open(&self, uid: &NodeUid) -> bool {
+        let mut open = false;
+        self.for_each_state(|st| {
+            if open {
+                return;
+            }
+            open = st
+                .by_uid
+                .get(uid)
+                .and_then(|ino| st.entries.get(ino))
+                .is_some_and(|entry| entry.open_count > 0);
+        });
+        open
+    }
+
+    /// Retire parks that are never going to end (docs/BUGS.md B70).
+    ///
+    /// A parked create waits for one event: the rename from the transient name
+    /// to the finished one. Nothing else ever un-parks it, and plenty of writers
+    /// never perform it — an editor unlinks its swap file, a download is
+    /// abandoned, or the file was always going to be called `index.tmp`. Such a
+    /// row stayed at [`PARK_UNTIL`] for the life of the database, pinning the
+    /// only copy of its bytes in `staging/` and counting against the queue.
+    ///
+    /// Two outcomes, and neither deletes bytes a user can still see:
+    ///
+    /// * The node is gone from the tree — the file was deleted while its create
+    ///   was parked, so the create is no longer wanted. The op and its blob go,
+    ///   which is what [`Core::discard_queued_ops`] would have done had the
+    ///   delete path reached it.
+    /// * The node is still there and has been parked past
+    ///   [`PARK_EXPIRY_MS`] with nothing holding it open — the park has outlived
+    ///   the writer it was protecting. Un-park it, and the ordinary drain
+    ///   uploads it like any other create.
+    ///
+    /// An open node is left alone whatever its age: it is still being written.
+    fn sweep_parked_creates(&self) {
+        let parked = match self.db.parked_create_ops() {
+            Ok(parked) if !parked.is_empty() => parked,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(%error, "reading parked creates failed; skipping the park sweep");
+                return;
+            }
+        };
+        let now = now_millis();
+        let (mut released, mut dropped) = (0usize, 0usize);
+        for op in &parked {
+            let Some(uid) = parse_node_uid(&op.uid) else {
+                continue;
+            };
+            let name = op.name.as_deref().unwrap_or("?");
+            let known = match self.db.node_by_uid(&op.uid) {
+                Ok(known) => known.is_some(),
+                // Never infer "deleted" from a failed read: that would discard
+                // the bytes over a transient database error.
+                Err(error) => {
+                    debug!(%uid, %error, "cannot tell whether a parked node still exists");
+                    continue;
+                }
+            };
+            if !known {
+                if let Err(error) = self.discard_queued_ops(&uid) {
+                    warn!(%uid, name, ?error, "dropping a deleted transient's parked create failed");
+                    continue;
+                }
+                dropped += 1;
+                debug!(%uid, name, "dropped a parked create whose file was deleted");
+                continue;
+            }
+            if park_verdict(op.created_at, now, self.uid_is_open(&uid)) != ParkVerdict::Release {
+                continue;
+            }
+            match self.db.set_create_hold(&op.uid, false) {
+                Ok(true) => {
+                    released += 1;
+                    info!(%uid, name, parked_ms = now - op.created_at,
+                          "un-parked a transient create that was never renamed; uploading it");
+                }
+                Ok(false) => {}
+                Err(error) => warn!(%uid, name, %error, "un-parking an expired park failed"),
+            }
+        }
+        if released > 0 || dropped > 0 {
+            info!(released, dropped, "swept parked creates");
+        }
+        if released > 0 {
+            self.wake_drain();
+        }
+    }
+
     /// Drop `uid`'s pending entry, but only while it still names `blob`.
     ///
     /// A supersede can replace the entry while the op that owned it is in
@@ -1573,6 +1674,24 @@ fn is_own_self_supersede(complete: bool, remote_rev: Option<&str>, own_rev: Opti
     complete && remote_rev.is_some() && remote_rev == own_rev
 }
 
+/// What the park sweep does with one parked create whose node still exists.
+#[derive(Debug, PartialEq, Eq)]
+enum ParkVerdict {
+    /// Leave it parked: the rename it waits for can still come.
+    Keep,
+    /// Un-park it: nothing will rename it now, so the bytes go up as they are.
+    Release,
+}
+
+/// Judge one parked create by age alone. An open node is kept whatever its age
+/// — it is still being written, and the rename is the writer's last step.
+fn park_verdict(created_at: i64, now: i64, open: bool) -> ParkVerdict {
+    if open || now - created_at < PARK_EXPIRY_MS {
+        return ParkVerdict::Keep;
+    }
+    ParkVerdict::Release
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,6 +1715,28 @@ mod tests {
             last_error: None,
             next_attempt_at: 0,
         }
+    }
+
+    /// The park's only ordinary exit is the transient-to-final rename. The
+    /// sweep is what happens when that rename never comes.
+    #[test]
+    fn a_park_expires_only_once_it_is_old_and_nobody_holds_the_file() {
+        let now = PARK_EXPIRY_MS * 10;
+        // Fresh: the writer may still rename it.
+        assert_eq!(
+            park_verdict(now - PARK_EXPIRY_MS + 1, now, false),
+            ParkVerdict::Keep
+        );
+        // Old, but still open: a slow write is not an abandoned one.
+        assert_eq!(
+            park_verdict(now - PARK_EXPIRY_MS, now, true),
+            ParkVerdict::Keep
+        );
+        // Old and closed: no rename is coming.
+        assert_eq!(
+            park_verdict(now - PARK_EXPIRY_MS, now, false),
+            ParkVerdict::Release
+        );
     }
 
     #[test]
