@@ -32,8 +32,8 @@ sudo apt install ./proton-drive-linux_*.deb
 # Fedora
 sudo dnf install ./proton-drive-linux-*.rpm
 
-# Arch Linux
-cd packaging && makepkg -fi
+# Arch Linux (AUR)
+paru -S proton-drive-for-linux        # or -git / -bin
 ```
 
 Packages for each release are attached to the [latest
@@ -431,8 +431,24 @@ Install the debian package via `dpkg` or `apt`:
 sudo apt install ./proton-drive-linux_*.deb
 ```
 
-### 2. Arch Linux
-A local `PKGBUILD` is available under the `packaging/` directory. You can build and install it using:
+### 2. Arch Linux (AUR)
+Three AUR packages cover the usual choices; they conflict with each other, so
+install one:
+
+| Package | Contents |
+| --- | --- |
+| [`proton-drive-for-linux`](https://aur.archlinux.org/packages/proton-drive-for-linux) | builds the latest tagged release from source |
+| [`proton-drive-for-linux-git`](https://aur.archlinux.org/packages/proton-drive-for-linux-git) | builds `main` from git |
+| [`proton-drive-for-linux-bin`](https://aur.archlinux.org/packages/proton-drive-for-linux-bin) | installs the release binaries, no compile |
+
+```bash
+paru -S proton-drive-for-linux        # or any AUR helper
+```
+
+The package sources live in `packaging/aur/`; see
+[`packaging/aur/README.md`](packaging/aur/README.md) for how they are updated and
+published. A local `PKGBUILD` that compiles the working tree in place is still
+available for development builds:
 ```bash
 cd packaging && makepkg -fi
 ```
