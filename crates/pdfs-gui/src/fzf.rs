@@ -268,6 +268,7 @@ mod tests {
             size: 7,
             modified: 9,
             pinned: false,
+            cached: false,
             uid: "uid~1".into(),
             mounted_path: None,
             score: 42,

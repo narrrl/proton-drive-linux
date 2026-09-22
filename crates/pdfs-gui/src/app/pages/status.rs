@@ -113,8 +113,6 @@ pub(crate) struct MainWidgets {
     /// which is where the folder is changed.
     pub(crate) mountpoint_row: adw::ActionRow,
     pub(crate) mountpoint_button: gtk4::Button,
-    /// Opens the Google Photos Takeout import page.
-    pub(crate) import_row: adw::ActionRow,
 }
 
 /// The main (logged-in) page: a libadwaita settings surface — account header,
@@ -244,22 +242,6 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     mountpoint_row.add_suffix(&mountpoint_button);
     system_group.add(&mountpoint_row);
 
-    // Import: a one-off migration rather than a setting, so it is a doorway to
-    // its own page rather than controls inlined here — staging a set of archives
-    // and watching an hours-long upload needs the room.
-    let import_group = adw::PreferencesGroup::builder()
-        .title("Import")
-        .description("Bring a photo library from another service into Proton Photos.")
-        .build();
-    let import_row = adw::ActionRow::builder()
-        .title("Import from Google Photos")
-        .subtitle("Add a Google Takeout export to your timeline.")
-        .activatable(true)
-        .build();
-    import_row.add_prefix(&gtk4::Image::from_icon_name("folder-download-symbolic"));
-    import_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
-    import_group.add(&import_row);
-
     // Pins group: filled in by refresh.
     let pins_group = adw::PreferencesGroup::builder()
         .title("Pinned files")
@@ -292,7 +274,6 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     inner.append(&transfers_group);
     inner.append(&storage_group);
     inner.append(&system_group);
-    inner.append(&import_group);
     inner.append(&pins_group);
     inner.append(&dev_group);
 
@@ -320,7 +301,6 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
             purge_button,
             mountpoint_row,
             mountpoint_button,
-            import_row,
         },
     )
 }
@@ -346,7 +326,6 @@ pub(crate) fn wire_settings(
     ui: &Rc<Ui>,
     purge_button: &gtk4::Button,
     mountpoint_button: &gtk4::Button,
-    import_row: &adw::ActionRow,
 ) {
     let config = ui.dirs.load_config();
 
@@ -430,10 +409,6 @@ pub(crate) fn wire_settings(
     // local path; this button is the way there.
     let ui_mp = ui.clone();
     mountpoint_button.connect_clicked(move |_| ui_mp.stack.set_visible_child_name("locations"));
-
-    // Import: a doorway, not a setting — everything about it lives on its page.
-    let ui_import = ui.clone();
-    import_row.connect_activated(move |_| ui_import.stack.set_visible_child_name("takeout"));
 }
 
 /// Run a settings control-socket round-trip (budget / purge) on a worker thread,
@@ -693,6 +668,7 @@ pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     ui.details.details.rename_button.set_sensitive(mounted);
     ui.details.details.trash_button.set_sensitive(mounted);
     ui.details.details.open_button.set_sensitive(mounted);
+    ui.details.details.versions_button.set_sensitive(mounted);
 
     // Only notify on a real edge, and never for the first reading: at startup the
     // service is usually still coming up, and "disconnected" would be a lie.
@@ -1000,7 +976,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         let unpin = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
             .valign(gtk4::Align::Center)
-            .tooltip_text("Unpin (remove offline copy)")
+            .tooltip_text("Make online only")
             .sensitive(mounted)
             .build();
         unpin.add_css_class("flat");

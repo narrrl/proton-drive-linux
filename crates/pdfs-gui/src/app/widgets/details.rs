@@ -89,7 +89,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     let offline = adw::PreferencesGroup::new();
     let pin_row = adw::SwitchRow::builder()
         .title("Available offline")
-        .subtitle("Keep a local copy on this device.")
+        .subtitle("Keep a copy on this computer, even without a connection.")
         .build();
     offline.add(&pin_row);
 
@@ -208,7 +208,7 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
     ui.details.details.trash_button.connect_clicked(move |_| {
         let entry = ui_trash.details.details_entry.borrow().clone();
         if let Some(entry) = entry {
-            prompt_delete(&ui_trash, &entry);
+            trash_entry(&ui_trash, &entry);
         }
     });
     let ui_pin = ui.clone();
@@ -256,7 +256,10 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     } else {
         parent
     });
+    // Pinning is per file: the context menu and the selection bar offer it for
+    // files only, so the pane must not offer it for folders either.
     d.pin_row.set_active(entry.pinned);
+    d.pin_row.set_visible(!entry.is_dir);
     d.pin_row.set_sensitive(*ui.mounted.borrow());
     d.open_button
         .set_label(if entry.is_dir { "Open folder" } else { "Open" });

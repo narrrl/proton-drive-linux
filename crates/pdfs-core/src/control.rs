@@ -976,6 +976,10 @@ pub struct SearchHit {
     pub size: u64,
     pub modified: i64,
     pub pinned: bool,
+    /// Whether a valid copy of the content is in the local cache. Legacy
+    /// daemons omit it; clients then treat the file as online-only.
+    #[serde(default)]
+    pub cached: bool,
     /// Node uid in `volume~link` form.
     pub uid: String,
     /// Absolute path through the most specific active on-demand mount, when the
@@ -2133,6 +2137,7 @@ mod tests {
                 size: 12,
                 modified: 123,
                 pinned: true,
+                cached: false,
                 uid: "vol~link".into(),
                 mounted_path: Some("/home/me/Videos/report.pdf".into()),
                 score: 985,

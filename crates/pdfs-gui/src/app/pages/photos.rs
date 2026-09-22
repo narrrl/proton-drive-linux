@@ -423,9 +423,16 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     back.add_css_class("flat");
     back.add_css_class("circular");
 
+    // `label` and `icon_name` both replace a button's child, so the pair needs
+    // an `adw::ButtonContent` to show together.
     let upload = gtk4::Button::builder()
-        .label("Upload")
-        .icon_name("list-add-symbolic")
+        .child(
+            &adw::ButtonContent::builder()
+                .label("Upload")
+                .icon_name("list-add-symbolic")
+                .build(),
+        )
+        .tooltip_text("Upload photos")
         .valign(gtk4::Align::Center)
         .build();
     upload.add_css_class("pill");

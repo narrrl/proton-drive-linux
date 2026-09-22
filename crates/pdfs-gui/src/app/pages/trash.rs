@@ -378,7 +378,8 @@ pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
     let dialog = adw::AlertDialog::builder()
         .heading("Empty Trash")
         .body(format!(
-            "Permanently delete all {count} item(s) in the trash? This cannot be undone."
+            "Permanently delete all {} in the trash? This cannot be undone.",
+            count_noun(count as usize, "item", "items")
         ))
         .build();
     dialog.add_response("cancel", "Cancel");

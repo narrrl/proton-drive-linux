@@ -603,7 +603,6 @@ fn build_window(app: &adw::Application) {
         &ui,
         &main_widgets.purge_button,
         &main_widgets.mountpoint_button,
-        &main_widgets.import_row,
     );
     wire_sidebar(&ui);
     wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
@@ -773,12 +772,12 @@ fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
 }
 
 /// The sidebar destination a page belongs under. Most pages are their own
-/// destination; a sub-page reached from one (Import, off Settings) has no row of
+/// destination; a sub-page reached from one (Import, off Photos) has no row of
 /// its own and answers with its parent, so the sidebar highlights where the user
 /// came from rather than clearing — which would read as "nowhere".
 fn destination_of(page: &str) -> &str {
     match page {
-        "takeout" => "main",
+        "takeout" => "gallery",
         other => other,
     }
 }
@@ -954,6 +953,12 @@ fn sync_sidebar(ui: &Rc<Ui>) {
         // The login page has no destination row.
         None => ui.sidebar.unselect_all(),
     }
+}
+
+/// "1 item" / "5 items": a count with the noun form that agrees with it, so
+/// no user-facing string has to fall back to "item(s)".
+fn count_noun(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// Show a transient toast. Non-blocking by design: an action's outcome is
@@ -1134,7 +1139,11 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
             gtk4::gdk::Key::F2 if on_browser => {
-                if let Some(entry) = selected_entry(&ui) {
+                // Renaming is one name at a time; saying so beats a key that
+                // silently does nothing with several items highlighted.
+                if selected_entries(&ui).len() > 1 {
+                    toast(&ui, "Select a single item to rename it");
+                } else if let Some(entry) = selected_entry(&ui) {
                     prompt_rename(&ui, &entry);
                 }
             }
@@ -1144,7 +1153,7 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::gdk::Key::Delete if on_browser => {
                 let entries = selected_entries(&ui);
                 if !entries.is_empty() {
-                    prompt_delete_many(&ui, entries);
+                    trash_entries(&ui, entries);
                 }
             }
             gtk4::gdk::Key::Escape
@@ -1194,6 +1203,28 @@ fn spawn_request(
 /// The top-level window, for parenting dialogs.
 fn ui_window(ui: &Rc<Ui>) -> Option<gtk4::Window> {
     ui.stack.root().and_downcast::<gtk4::Window>()
+}
+
+/// Ask before an action that has no Undo. `on_confirm` runs only when the user
+/// picks `action`; Cancel is the default, so Enter never destroys anything.
+fn confirm_destructive(
+    parent: &impl IsA<gtk4::Widget>,
+    heading: &str,
+    body: &str,
+    action: &str,
+    on_confirm: impl Fn() + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("confirm", action);
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("confirm"), move |_, _| on_confirm());
+    dialog.present(Some(parent));
 }
 
 /// A dim, non-interactive placeholder row for an empty section.

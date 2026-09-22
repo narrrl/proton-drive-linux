@@ -177,7 +177,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .build();
     new_folder.add_css_class("flat");
     let upload = gtk4::Button::builder()
-        .icon_name("document-send-symbolic")
+        .icon_name("pdfs-upload-symbolic")
         .tooltip_text("Upload files")
         .valign(gtk4::Align::Center)
         .build();
@@ -337,12 +337,12 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // instead of making the whole view jump when a second entry is selected.
     let bulk_label = gtk4::Label::builder().hexpand(true).xalign(0.0).build();
     let bulk_pin = gtk4::Button::builder()
-        .label("Keep offline")
+        .label("Make available offline")
         .valign(gtk4::Align::Center)
         .build();
     bulk_pin.add_css_class("flat");
     let bulk_unpin = gtk4::Button::builder()
-        .label("Remove offline copy")
+        .label("Make online only")
         .valign(gtk4::Align::Center)
         .build();
     bulk_unpin.add_css_class("flat");
@@ -573,39 +573,15 @@ pub(crate) fn sync_bulk_bar(ui: &Rc<Ui>) {
     ui.browser.bulk.set_reveal_child(true);
 }
 
-/// Confirm and move every selected entry to Trash.
+/// Move every selected entry to Trash.
 ///
-/// One dialog for the batch, one pass over the daemon, one toast — and one Undo
-/// that restores the whole batch, because a mis-aimed bulk delete is exactly the
-/// action a user most needs to take back.
-pub(crate) fn prompt_delete_many(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
-    if entries.len() < 2 {
-        if let Some(entry) = entries.first() {
-            prompt_delete(ui, entry);
-        }
-        return;
+/// No confirmation: Trash is itself the safety net, and the toast carries one
+/// Undo that restores the whole batch. Asking first *and* offering Undo after
+/// would put two hurdles in front of a reversible action.
+pub(crate) fn trash_entries(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
+    if !entries.is_empty() {
+        run_bulk_delete(ui, entries);
     }
-    let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
-        .heading("Move to Trash")
-        .body(format!(
-            "Move {} items to Trash? Anything inside a selected folder goes with it.",
-            entries.len()
-        ))
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("trash", "Move to Trash");
-    dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-
-    let ui = ui.clone();
-    dialog.connect_response(None, move |_, resp| {
-        if resp == "trash" {
-            run_bulk_delete(&ui, entries.clone());
-        }
-    });
-    dialog.present(win.as_ref());
 }
 
 /// Trash a batch, one request at a time.
@@ -729,7 +705,7 @@ pub(crate) fn run_bulk_pin(ui: &Rc<Ui>, entries: Vec<DirEntry>, pin: bool) {
                 &if pin {
                     format!("{n} files are now available offline")
                 } else {
-                    format!("{n} files are no longer kept offline")
+                    format!("{n} files are now online only")
                 },
             ),
         }
@@ -746,7 +722,7 @@ pub(crate) fn wire_bulk(
     let ui_trash = ui.clone();
     ui.browser
         .bulk_trash
-        .connect_clicked(move |_| prompt_delete_many(&ui_trash, selected_entries(&ui_trash)));
+        .connect_clicked(move |_| trash_entries(&ui_trash, selected_entries(&ui_trash)));
     let ui_pin = ui.clone();
     ui.browser
         .bulk_pin
@@ -1089,9 +1065,9 @@ pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Bo
 
     if !entry.is_dir {
         let (label, icon) = if entry.pinned {
-            ("Unpin", "non-starred-symbolic")
+            ("Make online only", "pdfs-online-only-symbolic")
         } else {
-            ("Keep offline", "starred-symbolic")
+            ("Make available offline", "pdfs-offline-symbolic")
         };
         let pin = menu_item(label, icon);
         let ui_pin = ui.clone();
@@ -1144,7 +1120,7 @@ pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Bo
     let pop = popover.clone();
     trash.connect_clicked(move |_| {
         pop.popdown();
-        prompt_delete(&ui_tr, &entry_tr);
+        trash_entry(&ui_tr, &entry_tr);
     });
     menu.append(&trash);
 
@@ -1184,7 +1160,7 @@ pub(crate) fn show_bulk_context_menu(
 
     let files_only = entries.iter().all(|e| !e.is_dir);
     if files_only && entries.iter().any(|e| !e.pinned) {
-        let pin = menu_item("Keep offline", "starred-symbolic");
+        let pin = menu_item("Make available offline", "pdfs-offline-symbolic");
         let ui_pin = ui.clone();
         let batch = entries.clone();
         let pop = popover.clone();
@@ -1195,7 +1171,7 @@ pub(crate) fn show_bulk_context_menu(
         menu.append(&pin);
     }
     if files_only && entries.iter().any(|e| e.pinned) {
-        let unpin = menu_item("Remove offline copy", "non-starred-symbolic");
+        let unpin = menu_item("Make online only", "pdfs-online-only-symbolic");
         let ui_unpin = ui.clone();
         let batch = entries.clone();
         let pop = popover.clone();
@@ -1206,14 +1182,18 @@ pub(crate) fn show_bulk_context_menu(
         menu.append(&unpin);
     }
 
-    menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    // Offline items only exist for all-file selections; without them the
+    // separator would sit directly under the header.
+    if files_only {
+        menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    }
 
     let trash = menu_item("Move to Trash", "user-trash-symbolic");
     let ui_tr = ui.clone();
     let pop = popover.clone();
     trash.connect_clicked(move |_| {
         pop.popdown();
-        prompt_delete_many(&ui_tr, entries.clone());
+        trash_entries(&ui_tr, entries.clone());
     });
     menu.append(&trash);
 
@@ -1367,7 +1347,7 @@ pub(crate) fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
                 toast(
                     &ui,
                     &if pinned {
-                        format!("“{name}” is no longer kept offline")
+                        format!("“{name}” is now online only")
                     } else {
                         format!("“{name}” is now available offline")
                     },
@@ -1651,6 +1631,12 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
         repaint_thumbnail_build_action(ui, true);
         schedule_thumbnail_build_poll(ui);
     } else {
+        // The progress row leaves with the run, so the outcome is handed to a
+        // toast instead — otherwise the build ends without a word. Only on the
+        // running → finished edge: a status read at startup is not news.
+        if ui.browser.thumbnail_build_running.get() {
+            toast(ui, &text);
+        }
         ui.browser.thumbnail_build_running.set(false);
         ui.browser.thumbnail_cancel_pending.set(false);
         repaint_thumbnail_build_action(ui, false);
@@ -1829,29 +1815,9 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
     dialog.present(parent.as_ref());
 }
 
-/// Confirm and move the entry to Trash through the daemon.
-pub(crate) fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
-    let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
-        .heading("Move to Trash")
-        .body(format!("Move “{}” to Trash?", entry.name))
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("trash", "Move to Trash");
-    dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-
-    // Routed through the batch path so a single trash gets the same Undo: one
-    // mis-click on one file is no less worth taking back than fifty.
-    let entry = entry.clone();
-    let ui = ui.clone();
-    dialog.connect_response(None, move |_, resp| {
-        if resp == "trash" {
-            run_bulk_delete(&ui, vec![entry.clone()]);
-        }
-    });
-    dialog.present(win.as_ref());
+/// Move one entry to Trash, through the batch path so it gets the same Undo.
+pub(crate) fn trash_entry(ui: &Rc<Ui>, entry: &DirEntry) {
+    run_bulk_delete(ui, vec![entry.clone()]);
 }
 
 /// Prompt for a folder name and create it under the current browser directory.
@@ -1978,11 +1944,11 @@ pub(crate) fn badge_for(entry: &DirEntry) -> Option<(&'static str, &'static str)
         return None;
     }
     Some(if entry.pinned {
-        ("starred-symbolic", "badge-pinned")
+        ("pdfs-offline-symbolic", "badge-pinned")
     } else if entry.cached {
         ("emblem-ok-symbolic", "badge-cached")
     } else {
-        ("weather-overcast-symbolic", "badge-cloud")
+        ("pdfs-online-only-symbolic", "badge-cloud")
     })
 }
 
@@ -2340,8 +2306,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             size: h.size,
             modified: h.modified,
             pinned: h.pinned,
-            // Search hits don't carry cache state; the badge shows in listings.
-            cached: false,
+            cached: h.cached,
             uid: h.uid.clone(),
             path: h.path.clone(),
             role: String::new(),

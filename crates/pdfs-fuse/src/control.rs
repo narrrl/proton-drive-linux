@@ -810,9 +810,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::EmptyTrash) => match core.empty_trash() {
             Ok(n) => {
-                core.log_activity(ActivityKind::EmptyTrash, format!("{n} item(s)"), "", true);
+                let items = if n == 1 {
+                    "1 item".to_string()
+                } else {
+                    format!("{n} items")
+                };
+                core.log_activity(ActivityKind::EmptyTrash, items.clone(), "", true);
                 CtlResponse::Ok {
-                    message: format!("emptied trash ({n} item(s))"),
+                    message: format!("emptied trash ({items})"),
                 }
             }
             Err(e) => CtlResponse::error(e),

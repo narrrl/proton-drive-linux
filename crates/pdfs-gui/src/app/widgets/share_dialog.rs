@@ -361,13 +361,24 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
         let state_rm = state.clone();
         let id = entry.id.clone();
         let kind = entry.kind;
-        remove.connect_clicked(move |_| {
-            share_dialog_op(
-                &state_rm,
-                state_rm.target.remove_entry(id.clone(), kind),
-                "Access removed",
-                "Couldn't remove access",
-                None,
+        let who = entry.email.clone();
+        remove.connect_clicked(move |btn| {
+            let state = state_rm.clone();
+            let id = id.clone();
+            confirm_destructive(
+                btn,
+                "Remove Access?",
+                &format!("{who} will no longer be able to open this item."),
+                "Remove",
+                move || {
+                    share_dialog_op(
+                        &state,
+                        state.target.remove_entry(id.clone(), kind),
+                        "Access removed",
+                        "Couldn't remove access",
+                        None,
+                    );
+                },
             );
         });
         row.add_suffix(&remove);
@@ -390,9 +401,12 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
         Some(link) => {
             let url = link.url.clone().unwrap_or_default();
             let subtitle = if link.has_password {
-                format!("Anyone with the link ({}) · password-protected", link.role)
+                format!(
+                    "Anyone with the link ({}) · password-protected",
+                    capitalize(&link.role)
+                )
             } else {
-                format!("Anyone with the link ({})", link.role)
+                format!("Anyone with the link ({})", capitalize(&link.role))
             };
             let row = adw::ActionRow::builder()
                 .title(if url.is_empty() { "Public link" } else { &url })
@@ -424,13 +438,24 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             remove.add_css_class("flat");
             let state_rm = state.clone();
             let id = link.id.clone();
-            remove.connect_clicked(move |_| {
-                share_dialog_op(
-                    &state_rm,
-                    state_rm.target.remove_link(id.clone()),
-                    "Public link removed",
-                    "Couldn't remove the link",
-                    None,
+            remove.connect_clicked(move |btn| {
+                let state = state_rm.clone();
+                let id = id.clone();
+                confirm_destructive(
+                    btn,
+                    "Remove Public Link?",
+                    "The link stops working for everyone who has it. A new link will have \
+                     a different address.",
+                    "Remove Link",
+                    move || {
+                        share_dialog_op(
+                            &state,
+                            state.target.remove_link(id.clone()),
+                            "Public link removed",
+                            "Couldn't remove the link",
+                            None,
+                        );
+                    },
                 );
             });
             row.add_suffix(&remove);

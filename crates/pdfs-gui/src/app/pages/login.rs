@@ -268,17 +268,27 @@ pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) 
     dialog.present(parent.as_ref());
 }
 
-/// Connect the sign-out button: disable+stop the mount service (so the daemon
-/// isn't left running without credentials), forget the stored session, and drop
-/// back to the login page.
+/// Connect the sign-out button: after a confirmation, disable+stop the mount
+/// service (so the daemon isn't left running without credentials), forget the
+/// stored session, and drop back to the login page.
 pub(crate) fn wire_logout(ui: &Rc<Ui>, button: &gtk4::Button) {
     let ui = ui.clone();
-    button.connect_clicked(move |_| {
-        service::disable_stop();
-        if let Err(e) = auth::logout() {
-            tracing::error!("logout failed: {e}");
-        }
-        *ui.session.borrow_mut() = None;
-        refresh(&ui);
+    button.connect_clicked(move |btn| {
+        let ui = ui.clone();
+        confirm_destructive(
+            btn,
+            "Sign Out?",
+            "Proton Drive will disconnect and stop syncing until you sign in again. \
+             Files already on this computer stay where they are.",
+            "Sign Out",
+            move || {
+                service::disable_stop();
+                if let Err(e) = auth::logout() {
+                    tracing::error!("logout failed: {e}");
+                }
+                *ui.session.borrow_mut() = None;
+                refresh(&ui);
+            },
+        );
     });
 }

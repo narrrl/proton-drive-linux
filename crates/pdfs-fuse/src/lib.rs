@@ -3865,6 +3865,12 @@ impl Core {
                 size: node_size(&h.node),
                 modified: h.node.modification_time,
                 pinned: pinned.contains(&h.node.uid.to_string()),
+                cached: !h.node.is_folder()
+                    && self.cache.is_cached(
+                        &h.node.uid,
+                        h.node.modification_time,
+                        node_size(&h.node),
+                    ),
                 uid: h.node.uid.to_string(),
                 mounted_path: roots.resolve(&h.path),
                 path: h.path,
@@ -3932,6 +3938,12 @@ impl Core {
                         size: node_size(&hit.node),
                         modified: hit.node.modification_time,
                         pinned: is_pinned,
+                        cached: !hit.node.is_folder()
+                            && self.cache.is_cached(
+                                &hit.node.uid,
+                                hit.node.modification_time,
+                                node_size(&hit.node),
+                            ),
                         uid,
                         mounted_path: roots.resolve(&hit.path),
                         path: hit.path,

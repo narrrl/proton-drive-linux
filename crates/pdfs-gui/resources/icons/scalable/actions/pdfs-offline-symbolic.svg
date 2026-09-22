@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- "Available offline": a filled disc with a down arrow knocked out of it
+       (one path, fill-rule evenodd, so symbolic recolouring keeps working).
+       Replaces the star, which every desktop uses for "favourite". -->
+  <path fill="#222222" fill-rule="evenodd" d="M 8,1 A 7,7 0 1 0 8,15 A 7,7 0 1 0 8,1 Z M 7,4 H 9 V 8.6 L 10.8,6.8 L 12.2,8.2 L 8,12.4 L 3.8,8.2 L 5.2,6.8 L 7,8.6 Z"/>
+</svg>

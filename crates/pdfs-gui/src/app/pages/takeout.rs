@@ -1,8 +1,8 @@
 //! The Import page: bringing a Google Photos **Takeout** export into Proton
 //! Photos.
 //!
-//! Reached from Settings → *Import from Google Photos* (and from the Gallery's
-//! import button), because it is a one-off migration rather than something the
+//! Reached from the Photos page's import button (and its empty timeline),
+//! because it is a one-off migration rather than something the
 //! photo timeline does every day. It gets a page of its own instead of a dialog
 //! for two reasons: an export is a *set* of archives that has to be staged and
 //! checked before anything is sent, and the import that follows runs for hours,
@@ -126,11 +126,11 @@ pub(crate) struct TakeoutWidgets {
 }
 
 pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
-    // Header: a back button out to Settings, since this page is reached from
+    // Header: a back button out to Photos, since this page is reached from
     // there and has no sidebar row of its own to navigate back with.
     let back_button = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to Settings")
+        .tooltip_text("Back to Photos")
         .valign(gtk4::Align::Center)
         .build();
     back_button.add_css_class("flat");
@@ -386,9 +386,10 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
         let dialog = adw::AlertDialog::builder()
             .heading("Import this export?")
             .body(format!(
-                "{count} archive(s) will be uploaded to Proton Photos, creating albums as they \
-                 appear in the export. This can take hours; you can stop it at any point and \
-                 what has been uploaded stays. Photos you already have are skipped.",
+                "{} will be uploaded to Proton Photos, creating albums as they appear in \
+                 the export. This can take hours; you can stop it at any point and what has \
+                 been uploaded stays. Photos you already have are skipped.",
+                count_noun(count, "archive", "archives")
             ))
             .build();
         dialog.add_response("cancel", "Cancel");
@@ -429,7 +430,7 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
     let ui_back = ui.clone();
     widgets
         .back_button
-        .connect_clicked(move |_| ui_back.stack.set_visible_child_name("main"));
+        .connect_clicked(move |_| ui_back.stack.set_visible_child_name("gallery"));
 
     // Restore whatever was staged when the window last closed, before the first
     // paint, so the page comes up as the user left it.
@@ -473,7 +474,10 @@ pub(crate) fn add_archives(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
             "Only Takeout .zip files can be imported — extracted folders aren't supported.",
         );
     } else if added > 0 {
-        toast(ui, &format!("Added {added} archive(s)"));
+        toast(
+            ui,
+            &format!("Added {}", count_noun(added, "archive", "archives")),
+        );
     }
 }
 
@@ -526,8 +530,8 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
             rows.push(row.upcast());
         }
         ui.takeout.list_group.set_description(Some(&format!(
-            "{} archive(s), {} in total. {EMPTY_LIST_DESCRIPTION}",
-            staged.len(),
+            "{}, {} in total. {EMPTY_LIST_DESCRIPTION}",
+            count_noun(staged.len(), "archive", "archives"),
             human_bytes(total)
         )));
     }

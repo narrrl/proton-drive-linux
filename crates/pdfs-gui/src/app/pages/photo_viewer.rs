@@ -592,8 +592,12 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let info_rows = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
 
     let info_map = gtk4::Button::builder()
-        .label("Show on map")
-        .icon_name("map-symbolic")
+        .child(
+            &adw::ButtonContent::builder()
+                .label("Show on map")
+                .icon_name("map-symbolic")
+                .build(),
+        )
         .halign(gtk4::Align::Start)
         .build();
     info_map.add_css_class("pill");

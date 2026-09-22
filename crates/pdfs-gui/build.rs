@@ -22,10 +22,5 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=resources/pdfs.gresource.xml");
-    println!(
-        "cargo:rerun-if-changed=resources/icons/scalable/actions/pdfs-build-thumbnails-symbolic.svg"
-    );
-    println!(
-        "cargo:rerun-if-changed=resources/icons/scalable/actions/pdfs-folder-upload-symbolic.svg"
-    );
+    println!("cargo:rerun-if-changed=resources/icons");
 }

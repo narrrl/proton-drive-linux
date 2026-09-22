@@ -541,8 +541,17 @@ pub(crate) fn repaint_shared(
             });
             let ui_rej = ui.clone();
             let id_rej = inv.id.clone();
-            reject.connect_clicked(move |_| {
-                respond_invitation(&ui_rej, &id_rej, false);
+            let name_rej = inv.name.clone().unwrap_or_else(|| "this item".into());
+            reject.connect_clicked(move |btn| {
+                let ui = ui_rej.clone();
+                let id = id_rej.clone();
+                confirm_destructive(
+                    btn,
+                    "Reject Invitation?",
+                    &format!("You won't have access to {name_rej} unless it is shared again."),
+                    "Reject",
+                    move || respond_invitation(&ui, &id, false),
+                );
             });
             row.add_suffix(&accept);
             row.add_suffix(&reject);

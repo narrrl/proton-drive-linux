@@ -43,9 +43,10 @@ pub(crate) struct DevicesWidgets {
     pub(crate) refresh: gtk4::Button,
 }
 
-/// The Computers page: a "This computer" section listing the local folders synced
-/// to this machine's device (each row offering a mode toggle and Remove), plus an
-/// "Other devices" section listing the account's other registered devices.
+/// The Computers page: a "This computer" section naming the device this machine
+/// backs up to (renamable from its header), plus an "Other computers" section
+/// listing the account's other registered devices. The synced folders
+/// themselves live on the Locations page.
 pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     let title = gtk4::Label::builder()
         .label("Computers")
@@ -588,7 +589,7 @@ fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
 /// Flip a synced folder between `mirror` and `ondemand`. Reloads after so the
 /// row's subtitle and switch reflect the daemon's real state (the request may be
 /// rejected, e.g. switching to on-demand while a folder is mid-sync).
-pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &str) {
+pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &'static str) {
     let rx = spawn_request(
         ui.dirs.control_socket(),
         Request::SetSyncFolderMode {
@@ -599,7 +600,17 @@ pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &str) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
-            Ok(Ok(Response::Ok { message })) => toast(&ui, &message),
+            // The daemon's own text is written for the log; the toast says what
+            // the person will see happen. A switch may be queued behind a running
+            // pass, hence "will".
+            Ok(Ok(Response::Ok { .. })) => toast(
+                &ui,
+                if mode == "ondemand" {
+                    "Folder will switch to on-demand"
+                } else {
+                    "Folder will download and stay synced"
+                },
+            ),
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, "Couldn't change mode", &message, kind)
             }
@@ -609,10 +620,20 @@ pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &str) {
                 "The mount service didn't respond.",
             ),
         }
-        if ui.stack.visible_child_name().as_deref() == Some("devices") {
-            load_devices(&ui);
-        }
+        reload_sync_pages(&ui);
     });
+}
+
+/// Repaint whichever of the two pages that show sync folders is on screen. Sync
+/// folder changes are raised from Locations as well as Computers, and both must
+/// show the daemon's answer at once rather than on the next tick — a rejected
+/// mode switch would otherwise stay visibly flipped.
+pub(crate) fn reload_sync_pages(ui: &Rc<Ui>) {
+    match ui.stack.visible_child_name().as_deref() {
+        Some("devices") => load_devices(ui),
+        Some("locations") => refresh_locations(ui),
+        _ => {}
+    }
 }
 
 /// Confirm, then stop syncing a folder. Offers to also delete the cloud copy.
@@ -790,7 +811,7 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     dialog.present(win.as_ref());
 }
 
-/// Run a mutation raised from the Devices page and reload the page on success.
+/// Run a mutation raised from Computers or Locations and reload the page on success.
 pub(crate) fn run_devices_mutation(
     ui: &Rc<Ui>,
     req: Request,
@@ -806,7 +827,7 @@ pub(crate) fn run_devices_mutation(
         ui.busy_end();
         match result {
             Ok(Ok(Response::Ok { .. })) => {
-                load_devices(&ui);
+                reload_sync_pages(&ui);
                 toast(&ui, &done);
             }
             Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),

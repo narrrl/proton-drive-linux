@@ -182,16 +182,20 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
             .filter(|size| *size >= 0)
             .unwrap_or(item.size_on_storage)
             .max(0) as u64;
-        let mut subtitle = format!("{} · {}", activity_time(item.created), human_bytes(size));
+        // A revision id means nothing to a person; name earlier versions by
+        // when they were saved instead.
+        let (title, mut subtitle) = if item.is_active {
+            (
+                "Current version".to_string(),
+                format!("{} · {}", activity_time(item.created), human_bytes(size)),
+            )
+        } else {
+            (activity_time(item.created), human_bytes(size))
+        };
         if let Some(email) = &item.signed_by {
             subtitle.push_str(" · ");
             subtitle.push_str(email);
         }
-        let title = if item.is_active {
-            "Current version".to_string()
-        } else {
-            format!("Version {}", item.id)
-        };
         let row = adw::ActionRow::builder()
             .title(title)
             .subtitle(subtitle)

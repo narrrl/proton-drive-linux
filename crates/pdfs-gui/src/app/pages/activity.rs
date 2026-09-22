@@ -248,16 +248,28 @@ pub(crate) fn repaint_activity(ui: &Rc<Ui>, items: &[ActivityEntry]) {
         if !a.detail.is_empty() {
             subtitle = format!("{subtitle} · {}", a.detail);
         }
+        let title = match a.kind {
+            // The target of an empty is a count, not a name to lead with a verb.
+            ActivityKind::EmptyTrash => format!("Emptied Trash ({})", a.target),
+            kind => format!("{} {}", activity_verb(kind), a.target),
+        };
         let row = adw::ActionRow::builder()
-            .title(format!("{} {}", activity_verb(a.kind), a.target))
+            .title(title)
             .subtitle(subtitle)
             .build();
-        let icon = if a.ok {
+        // A failure and a conflict are different news: a conflict kept both
+        // copies, a failure lost the action. Each gets its own icon and colour.
+        let icon = gtk4::Image::from_icon_name(if a.ok {
             activity_icon(a.kind)
         } else {
-            "dialog-warning-symbolic"
-        };
-        row.add_prefix(&gtk4::Image::from_icon_name(icon));
+            "dialog-error-symbolic"
+        });
+        if !a.ok {
+            icon.add_css_class("error");
+        } else if a.kind == ActivityKind::Conflict {
+            icon.add_css_class("warning");
+        }
+        row.add_prefix(&icon);
         row.set_activatable(false);
         ui.activity.group.add(&row);
         rows.push(row.upcast());
@@ -277,9 +289,9 @@ pub(crate) fn activity_verb(kind: ActivityKind) -> &'static str {
         ActivityKind::Trash => "Trashed",
         ActivityKind::Restore => "Restored",
         ActivityKind::DeleteForever => "Deleted",
-        ActivityKind::EmptyTrash => "Emptied trash —",
+        ActivityKind::EmptyTrash => "Emptied Trash",
         ActivityKind::Share => "Shared",
-        ActivityKind::PublicLink => "Linked",
+        ActivityKind::PublicLink => "Created a link to",
         ActivityKind::Unshare => "Unshared",
         ActivityKind::Conflict => "Conflict",
     }
@@ -288,15 +300,14 @@ pub(crate) fn activity_verb(kind: ActivityKind) -> &'static str {
 /// A themed icon for an activity kind.
 pub(crate) fn activity_icon(kind: ActivityKind) -> &'static str {
     match kind {
-        ActivityKind::Upload => "document-send-symbolic",
+        ActivityKind::Upload => "pdfs-upload-symbolic",
         ActivityKind::Download => "document-save-symbolic",
         ActivityKind::Sync => "emblem-synchronizing-symbolic",
         ActivityKind::Rename => "document-edit-symbolic",
         ActivityKind::Move => "go-jump-symbolic",
         ActivityKind::CreateFolder => "folder-new-symbolic",
-        ActivityKind::Trash | ActivityKind::DeleteForever | ActivityKind::EmptyTrash => {
-            "user-trash-symbolic"
-        }
+        ActivityKind::Trash => "user-trash-symbolic",
+        ActivityKind::DeleteForever | ActivityKind::EmptyTrash => "edit-delete-symbolic",
         ActivityKind::Restore => "edit-undo-symbolic",
         ActivityKind::Share | ActivityKind::PublicLink => "emblem-shared-symbolic",
         ActivityKind::Unshare => "action-unavailable-symbolic",

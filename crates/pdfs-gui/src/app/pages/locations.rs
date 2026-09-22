@@ -327,8 +327,8 @@ pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
 }
 
 /// The primary mount's only control: where it lives. Changing it rewrites config
-/// and offers a service restart, which is why it stays a single prompt shared
-/// with the (now removed) Settings row.
+/// and offers a service restart, which is why it goes through the shared
+/// [`prompt_mountpoint`] dialog.
 fn add_my_files_controls(ui: &Rc<Ui>, row: &adw::ActionRow) {
     let change = gtk4::Button::builder()
         .label("Change")
@@ -341,8 +341,8 @@ fn add_my_files_controls(ui: &Rc<Ui>, row: &adw::ActionRow) {
     row.add_suffix(&change);
 }
 
-/// Sync now (mirror only), the on-demand switch, and Remove — the same three
-/// controls, and the same handlers, the Computers page used to carry.
+/// Sync now (mirror only), the on-demand switch, and Stop syncing for one
+/// synced folder.
 fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: i64) {
     if spec.mode != MountMode::OnDemand {
         let sync_now = gtk4::Button::builder()
@@ -371,14 +371,23 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
         .active(target == MountMode::OnDemand)
         .build();
     let ui_mode = ui.clone();
+    let mode_path = spec.local_path.clone();
     ondemand.connect_state_set(move |_, on| {
-        set_sync_folder_mode(&ui_mode, id, if on { "ondemand" } else { "mirror" });
-        glib::Propagation::Proceed
+        if on {
+            // Going on-demand deletes the local copies, so it is asked for rather
+            // than done on a flick of the switch. Stop leaves the switch's state
+            // alone; the next repaint paints whatever the daemon then reports.
+            confirm_ondemand(&ui_mode, id, &mode_path);
+            glib::Propagation::Stop
+        } else {
+            set_sync_folder_mode(&ui_mode, id, "mirror");
+            glib::Propagation::Proceed
+        }
     });
     row.add_suffix(&ondemand);
 
     let remove = gtk4::Button::builder()
-        .icon_name("user-trash-symbolic")
+        .icon_name("media-playback-stop-symbolic")
         .tooltip_text("Stop syncing this folder")
         .valign(gtk4::Align::Center)
         .build();
@@ -390,6 +399,33 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
     let is_ondemand = spec.mode == MountMode::OnDemand;
     remove.connect_clicked(move |_| prompt_remove_sync_folder(&ui_rm, id, &path, is_ondemand));
     row.add_suffix(&remove);
+}
+
+/// Ask before switching a synced folder to on-demand: the switch frees disk
+/// space by removing the local copies, which is not something to do by accident.
+fn confirm_ondemand(ui: &Rc<Ui>, id: i64, path: &str) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Make Folder On-Demand?")
+        .body(format!(
+            "Files in {path} will be removed from this computer and kept in Proton \
+             Drive only. Each file downloads again when you open it."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ondemand", "Make On-Demand");
+    dialog.set_response_appearance("ondemand", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let win = ui_window(ui);
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "ondemand" {
+            set_sync_folder_mode(&ui, id, "ondemand");
+        } else {
+            refresh_locations(&ui);
+        }
+    });
+    dialog.present(win.as_ref());
 }
 
 /// Ask the daemon for an immediate pass over one folder.
