@@ -7,18 +7,24 @@ pub(crate) struct StatusState {
     /// Guards the [`Request::GetQueueStatus`] poll the same way: at most one
     /// in-flight at a time so a wedged daemon can't stack worker threads.
     pub(crate) transfers_inflight: Cell<bool>,
-    /// Activity group + its current rows, hidden when no transfer is in flight.
+    /// Transfers group (on the Sync page) + its current rows, hidden when no
+    /// transfer is in flight.
     pub(crate) transfers_group: adw::PreferencesGroup,
     pub(crate) transfer_rows: RefCell<Vec<TransferRow>>,
-    // Main page.
-    pub(crate) account_row: adw::ActionRow,
-    /// Read-only mount status line. The mount is driven by the systemd user
-    /// service (enabled on login), not by the user — so this only reports.
-    pub(crate) mount_row: adw::ActionRow,
+    /// The Preferences dialog, built once and presented on demand.
+    pub(crate) prefs: adw::PreferencesDialog,
+    /// Sidebar footer: signed-in identity.
+    pub(crate) account_name: gtk4::Label,
+    pub(crate) avatar: adw::Avatar,
+    /// Sidebar footer: the one-line sync state. The mount is driven by the
+    /// systemd user service, not by the user — so this only reports.
+    pub(crate) status_icon: gtk4::Image,
+    pub(crate) status_title: gtk4::Label,
+    pub(crate) status_detail: gtk4::Label,
     pub(crate) cache_bar: gtk4::ProgressBar,
     pub(crate) cache_label: gtk4::Label,
-    /// Account-quota group + its bar/label. Hidden until the first reading.
-    pub(crate) quota_group: adw::PreferencesGroup,
+    /// Sidebar footer: account quota bar/label. Hidden until the first reading.
+    pub(crate) quota_box: gtk4::Box,
     pub(crate) quota_bar: gtk4::ProgressBar,
     pub(crate) quota_label: gtk4::Label,
     /// One `AccountQuota` in flight at a time, and when it last succeeded — quota
@@ -31,9 +37,10 @@ pub(crate) struct StatusState {
     /// Cache-budget editor (GiB). Populated once from config; user edits drive a
     /// `SetCacheBudget` round-trip. Guarded by [`Self::settings_suppress`].
     pub(crate) budget_row: adw::SpinRow,
-    /// Shows where the primary mount lives; the folder itself is managed on the
-    /// Locations page, which owns every local path.
+    /// Shows where the primary mount lives; its Change button picks a new one.
     pub(crate) mountpoint_row: adw::ActionRow,
+    /// "Proton purple accent" toggle. Guarded by [`Self::settings_suppress`].
+    pub(crate) accent_row: adw::SwitchRow,
     /// Set while a settings widget is being populated programmatically, so its
     /// change handler skips the IPC/systemd side effect.
     pub(crate) settings_suppress: Cell<bool>,
@@ -45,7 +52,7 @@ pub(crate) struct StatusState {
     pub(crate) pins_group: adw::PreferencesGroup,
     /// Whether the pin list is showing every pin or only the first
     /// [`PINS_COLLAPSED`]. A long pin list would otherwise push everything below
-    /// it — including the Developer group — off the end of the page.
+    /// it off the end of the Storage page.
     pub(crate) pins_expanded: Cell<bool>,
     /// Rows currently shown under [`Self::pins_group`], retained so a refresh can
     /// diff against them and only rebuild when the pin set actually changes.
@@ -89,100 +96,94 @@ pub(crate) struct ActivityLine {
     pub(crate) fraction: Option<f64>,
 }
 
-/// Widgets the settings page hands back for the refresh loop and action wiring.
+/// Widgets the Preferences dialog and the sidebar footer hand back for the
+/// refresh loop and action wiring.
 pub(crate) struct MainWidgets {
-    pub(crate) account_row: adw::ActionRow,
-    pub(crate) mount_row: adw::ActionRow,
-    /// Live upload/download progress, populated by the refresh loop.
-    pub(crate) transfers_group: adw::PreferencesGroup,
-    /// Account-quota group; hidden until `refresh_quota` gets a reading.
-    pub(crate) quota_group: adw::PreferencesGroup,
+    pub(crate) prefs: adw::PreferencesDialog,
+    /// The sidebar footer: sync status, quota, account.
+    pub(crate) footer: gtk4::Box,
+    /// Opens the Sync page; the footer's status strip is this button.
+    pub(crate) status_button: gtk4::Button,
+    pub(crate) account_name: gtk4::Label,
+    pub(crate) avatar: adw::Avatar,
+    pub(crate) status_icon: gtk4::Image,
+    pub(crate) status_title: gtk4::Label,
+    pub(crate) status_detail: gtk4::Label,
+    pub(crate) quota_box: gtk4::Box,
     pub(crate) quota_bar: gtk4::ProgressBar,
     pub(crate) quota_label: gtk4::Label,
     pub(crate) cache_bar: gtk4::ProgressBar,
     pub(crate) cache_label: gtk4::Label,
     pub(crate) pins_group: adw::PreferencesGroup,
-    pub(crate) logout_button: gtk4::Button,
     /// "Start on login" toggle, reflecting the systemd unit's enabled state.
     pub(crate) autostart_row: adw::SwitchRow,
     /// Cache soft-cap editor, in GiB; `0` = unlimited.
     pub(crate) budget_row: adw::SpinRow,
     /// Purges all unpinned cached content.
     pub(crate) purge_button: gtk4::Button,
-    /// Shows the active mountpoint; its suffix button opens the Locations page,
-    /// which is where the folder is changed.
+    /// Shows the active mountpoint; its suffix button picks a new one.
     pub(crate) mountpoint_row: adw::ActionRow,
     pub(crate) mountpoint_button: gtk4::Button,
+    pub(crate) accent_row: adw::SwitchRow,
 }
 
-/// The main (logged-in) page: a libadwaita settings surface — account header,
-/// mount status, storage controls (cache budget + purge), system integration
-/// (start-on-login, mountpoint), the pin list, and developer overrides. Returns
-/// the widgets the refresh loop updates plus the controls to wire.
-pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
-    // Account group: identity + sign-out.
-    let account_group = adw::PreferencesGroup::new();
-    let account_row = adw::ActionRow::builder().title("Not signed in").build();
-    let avatar = adw::Avatar::new(40, None, true);
-    account_row.add_prefix(&avatar);
-    let logout_button = gtk4::Button::builder()
-        .label("Sign out")
+/// Build the two surfaces that replaced the old Settings page:
+///
+/// - the Preferences dialog (General: start on login, mount location,
+///   appearance; Storage: cache usage, budget, clear, offline files), and
+/// - the sidebar footer (sync status strip, account quota, account menu).
+///
+/// Live state (transfers, the folder list) lives on the Sync page instead, and
+/// the app version and user agent in About → Troubleshooting.
+pub(crate) fn build_main_page() -> MainWidgets {
+    // ---- Preferences: General
+    let startup_group = adw::PreferencesGroup::builder().title("Startup").build();
+    let autostart_row = adw::SwitchRow::builder()
+        .title("Start on login")
+        .subtitle("Connect Proton Drive automatically when you log in")
+        .build();
+    startup_group.add(&autostart_row);
+
+    let location_group = adw::PreferencesGroup::builder().title("Location").build();
+    let mountpoint_row = adw::ActionRow::builder()
+        .title("Proton Drive folder")
+        .subtitle("—")
+        .build();
+    mountpoint_row.add_css_class("property");
+    let mountpoint_button = gtk4::Button::builder()
+        .label("Change…")
+        .tooltip_text("Choose a different folder for the Proton Drive mount")
         .valign(gtk4::Align::Center)
         .build();
-    logout_button.add_css_class("flat");
-    account_row.add_suffix(&logout_button);
-    account_group.add(&account_row);
+    mountpoint_button.add_css_class("flat");
+    mountpoint_row.add_suffix(&mountpoint_button);
+    location_group.add(&mountpoint_row);
 
-    // Account storage: the Proton account quota (used of total), distinct from
-    // the local content cache below. A progress bar + "X of Y used" line, painted
-    // by `refresh_quota`. Hidden until the first successful read so a cold start
-    // (or an account the API can't report) shows nothing rather than an empty bar.
-    let quota_group = adw::PreferencesGroup::builder()
-        .title("Account storage")
-        .description("Your Proton storage across all products.")
-        .visible(false)
+    let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
+    let accent_row = adw::SwitchRow::builder()
+        .title("Proton purple accent")
+        .subtitle("Use the Proton brand colour instead of the system accent colour")
         .build();
-    let quota_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    quota_box.set_margin_top(6);
-    quota_box.set_margin_bottom(6);
-    let quota_bar = gtk4::ProgressBar::new();
-    let quota_label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
-    quota_label.add_css_class("dim-label");
-    quota_box.append(&quota_bar);
-    quota_box.append(&quota_label);
-    let quota_row = adw::PreferencesRow::builder()
-        .activatable(false)
-        .child(&quota_box)
-        .build();
-    quota_group.add(&quota_row);
+    appearance_group.add(&accent_row);
 
-    // Mount group: a read-only status line. The mount is managed automatically
-    // by the systemd user service; there is no toggle to fiddle with.
-    let mount_group = adw::PreferencesGroup::builder().title("Drive").build();
-    let mount_row = adw::ActionRow::builder()
-        .title("Proton Drive")
-        .subtitle("Not mounted")
+    let general = adw::PreferencesPage::builder()
+        .title("General")
+        .icon_name("preferences-system-symbolic")
         .build();
-    mount_group.add(&mount_row);
+    general.add(&startup_group);
+    general.add(&location_group);
+    general.add(&appearance_group);
 
-    // Activity group: live upload/download progress. Hidden until the refresh
-    // loop sees an in-flight transfer from `Request::GetQueueStatus`.
-    let transfers_group = adw::PreferencesGroup::builder()
-        .title("Activity")
-        .description("Files moving to and from Proton Drive.")
-        .visible(false)
-        .build();
-
-    // Storage group: a progress bar + "X of Y used" label, plus the cache-budget
-    // editor and a purge button. `budget_row`/`purge_button` are wired in
-    // `wire_settings`; the bar + label are repainted by the refresh loop.
+    // ---- Preferences: Storage
     let storage_group = adw::PreferencesGroup::builder()
-        .title("Storage")
-        .description("Local cache for pinned and recently opened files.")
+        .title("Cache")
+        .description("Pinned and recently opened files, kept on this computer.")
         .build();
     let storage_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    storage_box.set_margin_top(6);
-    storage_box.set_margin_bottom(6);
+    storage_box.set_margin_top(12);
+    storage_box.set_margin_bottom(12);
+    storage_box.set_margin_start(12);
+    storage_box.set_margin_end(12);
     let cache_bar = gtk4::ProgressBar::new();
     let cache_label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
     cache_label.add_css_class("dim-label");
@@ -198,114 +199,152 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     // as "no eviction". Step in 0.5 GiB; the upper bound is generous.
     let budget_adj = gtk4::Adjustment::new(0.0, 0.0, 1024.0, 0.5, 1.0, 0.0);
     let budget_row = adw::SpinRow::builder()
-        .title("Cache budget (GiB)")
-        .subtitle("Soft cap for cached content; 0 = unlimited.")
+        .title("Cache size limit (GiB)")
+        .subtitle("Older files are removed past this size; 0 means no limit")
         .adjustment(&budget_adj)
         .digits(1)
         .build();
     storage_group.add(&budget_row);
     let purge_row = adw::ActionRow::builder()
-        .title("Purge cache")
-        .subtitle("Delete cached content. Pinned files are kept.")
+        .title("Clear cache")
+        .subtitle("Remove cached copies. Files kept offline stay.")
         .build();
     let purge_button = gtk4::Button::builder()
-        .label("Purge")
+        .label("Clear…")
         .valign(gtk4::Align::Center)
         .build();
-    purge_button.add_css_class("destructive-action");
+    purge_button.add_css_class("flat");
     purge_row.add_suffix(&purge_button);
     storage_group.add(&purge_row);
 
-    // System integration: start-on-login + mountpoint chooser.
-    let system_group = adw::PreferencesGroup::builder()
-        .title("System integration")
-        .build();
-    let autostart_row = adw::SwitchRow::builder()
-        .title("Start on login")
-        .subtitle("Mount Proton Drive automatically when you log in.")
-        .build();
-    system_group.add(&autostart_row);
-    // The mountpoint is a *location*, and every other local path this client
-    // owns is managed on the Locations page. Keeping a second chooser here would
-    // be a second source of truth for the same setting, so this row reports the
-    // path and hands the change over.
-    let mountpoint_row = adw::ActionRow::builder()
-        .title("Mountpoint")
-        .subtitle("—")
-        .build();
-    let mountpoint_button = gtk4::Button::builder()
-        .label("Locations")
-        .tooltip_text("Manage this computer's Proton Drive locations")
-        .valign(gtk4::Align::Center)
-        .build();
-    mountpoint_button.add_css_class("flat");
-    mountpoint_row.add_suffix(&mountpoint_button);
-    system_group.add(&mountpoint_row);
-
     // Pins group: filled in by refresh.
     let pins_group = adw::PreferencesGroup::builder()
-        .title("Pinned files")
-        .description("Kept available offline on this device.")
+        .title("Available offline")
+        .description("Files kept on this computer, even without a connection.")
         .build();
 
-    // Developer overrides: read-only client identity, for support/debugging.
-    let dev_group = adw::PreferencesGroup::builder().title("Developer").build();
-    let version_row = adw::ActionRow::builder()
-        .title("App version")
-        .subtitle(pdfs_core::config::APP_VERSION)
+    let storage = adw::PreferencesPage::builder()
+        .title("Storage")
+        .icon_name("drive-harddisk-symbolic")
         .build();
-    version_row.add_css_class("property");
-    let agent_row = adw::ActionRow::builder()
-        .title("User agent")
-        .subtitle(pdfs_core::config::USER_AGENT)
+    storage.add(&storage_group);
+    storage.add(&pins_group);
+
+    let prefs = adw::PreferencesDialog::builder()
+        .search_enabled(false)
         .build();
-    agent_row.add_css_class("property");
-    dev_group.add(&version_row);
-    dev_group.add(&agent_row);
+    prefs.add(&general);
+    prefs.add(&storage);
 
-    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
-    inner.set_margin_top(18);
-    inner.set_margin_bottom(18);
-    inner.set_margin_start(12);
-    inner.set_margin_end(12);
-    inner.append(&account_group);
-    inner.append(&quota_group);
-    inner.append(&mount_group);
-    inner.append(&transfers_group);
-    inner.append(&storage_group);
-    inner.append(&system_group);
-    inner.append(&pins_group);
-    inner.append(&dev_group);
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(560)
-        .child(&inner)
+    // ---- Sidebar footer
+    let status_icon = gtk4::Image::from_icon_name("content-loading-symbolic");
+    let status_title = gtk4::Label::builder()
+        .label("Connecting…")
+        .halign(gtk4::Align::Start)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
-    let scroll = gtk4::ScrolledWindow::builder().child(&clamp).build();
+    status_title.add_css_class("heading");
+    let status_detail = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .visible(false)
+        .build();
+    status_detail.add_css_class("caption");
+    status_detail.add_css_class("dim-label");
+    let status_text = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    status_text.set_hexpand(true);
+    status_text.append(&status_title);
+    status_text.append(&status_detail);
+    let status_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    status_content.append(&status_icon);
+    status_content.append(&status_text);
+    let status_button = gtk4::Button::builder()
+        .child(&status_content)
+        .tooltip_text("Show sync status")
+        .build();
+    status_button.add_css_class("flat");
+    status_button.add_css_class("sidebar-status");
 
-    (
-        scroll.upcast(),
-        MainWidgets {
-            account_row,
-            mount_row,
-            transfers_group,
-            quota_group,
-            quota_bar,
-            quota_label,
-            cache_bar,
-            cache_label,
-            pins_group,
-            logout_button,
-            autostart_row,
-            budget_row,
-            purge_button,
-            mountpoint_row,
-            mountpoint_button,
-        },
-    )
+    let quota_bar = gtk4::ProgressBar::new();
+    let quota_label = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .build();
+    quota_label.add_css_class("caption");
+    quota_label.add_css_class("dim-label");
+    let quota_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    quota_box.add_css_class("sidebar-quota");
+    quota_box.set_margin_start(8);
+    quota_box.set_margin_end(8);
+    quota_box.set_visible(false);
+    quota_box.append(&quota_bar);
+    quota_box.append(&quota_label);
+
+    let avatar = adw::Avatar::new(28, None, true);
+    let account_name = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+        .build();
+    let account_menu = gio::Menu::new();
+    account_menu.append(Some("Preferences"), Some("win.preferences"));
+    let sign_out = gio::Menu::new();
+    sign_out.append(Some("Sign Out…"), Some("win.sign-out"));
+    account_menu.append_section(None, &sign_out);
+    let account_button = gtk4::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("Account")
+        .menu_model(&account_menu)
+        .valign(gtk4::Align::Center)
+        .build();
+    account_button.add_css_class("flat");
+    let account = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    account.add_css_class("sidebar-account");
+    account.append(&avatar);
+    account.append(&account_name);
+    account.append(&account_button);
+
+    let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    footer.add_css_class("sidebar-footer");
+    footer.append(&status_button);
+    footer.append(&quota_box);
+    footer.append(&account);
+
+    MainWidgets {
+        prefs,
+        footer,
+        status_button,
+        account_name,
+        avatar,
+        status_icon,
+        status_title,
+        status_detail,
+        quota_box,
+        quota_bar,
+        quota_label,
+        cache_bar,
+        cache_label,
+        pins_group,
+        autostart_row,
+        budget_row,
+        purge_button,
+        mountpoint_row,
+        mountpoint_button,
+        accent_row,
+    }
 }
 
-/// How many pins the Settings list shows before collapsing the rest behind a
+/// The Sync page's live-transfers group, hidden until the refresh loop sees an
+/// in-flight transfer from [`Request::GetQueueStatus`].
+pub(crate) fn build_transfers_group() -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder()
+        .title("Transfers")
+        .description("Files moving to and from Proton Drive.")
+        .visible(false)
+        .build()
+}
+
+/// How many pins the Storage preferences list before collapsing the rest behind a
 /// "Show all" row. Enough to recognise the list at a glance; short enough that
 /// the groups below it stay reachable.
 pub(crate) const PINS_COLLAPSED: usize = 6;
@@ -317,8 +356,8 @@ pub(crate) const BUDGET_DEBOUNCE: Duration = Duration::from_millis(600);
 /// Bytes per GiB, for the cache-budget editor's unit conversion.
 pub(crate) const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// Wire the Settings-page controls: the cache-budget editor, the purge button,
-/// the start-on-login switch and the mountpoint chooser. Initial widget state is
+/// Wire the Preferences controls: the cache-budget editor, the purge button, the
+/// start-on-login switch, the mountpoint chooser and the accent toggle. Initial widget state is
 /// read once from config / systemd here (the refresh loop owns only the live
 /// mount + cache-usage read-out), with [`Ui::settings_suppress`] set around the
 /// programmatic populate so the change handlers don't fire on it.
@@ -338,6 +377,9 @@ pub(crate) fn wire_settings(
         .mountpoint_row
         .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
     ui.status.autostart_row.set_active(service::is_enabled());
+    ui.status
+        .accent_row
+        .set_active(config.proton_accent.unwrap_or(false));
     ui.status.settings_suppress.set(false);
 
     // Cache budget: a user edit applies the new soft cap on the daemon (which
@@ -370,11 +412,14 @@ pub(crate) fn wire_settings(
     purge_button.connect_clicked(move |_| {
         let ui = ui_purge.clone();
         let dialog = adw::AlertDialog::builder()
-            .heading("Purge cache")
-            .body("Delete all cached content that isn't pinned? Pinned files stay offline.")
+            .heading("Clear Cache?")
+            .body(
+                "Cached copies are removed from this computer and download again when \
+                 you open them. Files kept available offline stay.",
+            )
             .build();
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("purge", "Purge");
+        dialog.add_response("purge", "Clear Cache");
         dialog.set_response_appearance("purge", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -383,12 +428,12 @@ pub(crate) fn wire_settings(
                 settings_request(
                     &ui,
                     Request::PurgeCache,
-                    "Cache purged",
-                    "Couldn't purge cache",
+                    "Cache cleared",
+                    "Couldn't clear the cache",
                 );
             }
         });
-        dialog.present(ui_window(&ui_purge).as_ref());
+        dialog.present(Some(&ui_purge.status.prefs));
     });
 
     // Start on login: enable/disable the systemd unit without stopping a live
@@ -405,10 +450,27 @@ pub(crate) fn wire_settings(
         }
     });
 
-    // Mountpoint: the chooser lives on the Locations page, next to every other
-    // local path; this button is the way there.
     let ui_mp = ui.clone();
-    mountpoint_button.connect_clicked(move |_| ui_mp.stack.set_visible_child_name("locations"));
+    mountpoint_button.connect_clicked(move |_| prompt_mountpoint(&ui_mp));
+
+    // Accent: saved with the rest of the config, applied right away.
+    let ui_accent = ui.clone();
+    ui.status.accent_row.connect_active_notify(move |row| {
+        if ui_accent.status.settings_suppress.get() {
+            return;
+        }
+        let on = row.is_active();
+        set_proton_accent(on);
+        let mut config = ui_accent.dirs.load_config();
+        config.proton_accent = Some(on);
+        if let Err(e) = ui_accent.dirs.save_config(&config) {
+            toast_error(
+                &ui_accent,
+                "Couldn't save the accent colour",
+                &e.to_string(),
+            );
+        }
+    });
 }
 
 /// Run a settings control-socket round-trip (budget / purge) on a worker thread,
@@ -522,8 +584,11 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
                     ui.stack.set_visible_child_name("browser");
                 }
                 ui.nav.set_collapsed(false);
-                ui.status.account_row.set_title(&s.username);
-                ui.status.account_row.set_subtitle("Proton account");
+                if ui.status.account_name.label() != s.username {
+                    ui.status.account_name.set_label(&s.username);
+                    ui.status.account_name.set_tooltip_text(Some(&s.username));
+                    ui.status.avatar.set_text(Some(&s.username));
+                }
             }
             None => {
                 ui.stack.set_visible_child_name("login");
@@ -546,8 +611,10 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     if ui.stack.visible_child_name().as_deref() == Some("takeout") || ui.takeout.running.get() {
         refresh_takeout(ui);
     }
+    // The quota sits in the sidebar footer, visible on every page; its TTL
+    // keeps this from asking more than once a minute.
+    refresh_quota(ui);
     match ui.stack.visible_child_name().as_deref() {
-        Some("main" | "browser") => refresh_quota(ui),
         Some("locations") => refresh_locations(ui),
         Some("activity") => refresh_activity(ui),
         _ => {}
@@ -559,7 +626,7 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 
 /// Fetch the account quota (if the last reading is stale) and paint both the
-/// Settings storage group and Files status bar. A failed fetch leaves the last
+/// sidebar footer and Files status bar. A failed fetch leaves the last
 /// good reading in place.
 pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
     if ui.status.quota_inflight.get() {
@@ -583,7 +650,7 @@ pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
         {
             ui.status.quota_checked_at.set(Some(Instant::now()));
             paint_account_quota(&ui, max_space, used_space);
-            ui.status.quota_group.set_visible(true);
+            ui.status.quota_box.set_visible(true);
         } else if ui.status.quota_checked_at.get().is_none() {
             // Match Dolphin: capacity information does not occupy the bar until
             // the backing observer has real figures.
@@ -871,6 +938,8 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 online,
                 pending_uploads,
                 pending_changes,
+                failing_ops,
+                failing_error,
                 ..
             })) => {
                 set_mounted(&ui, true);
@@ -878,14 +947,19 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 // in it: it is why a file that looks saved is not on the remote
                 // yet, and offline is usually the reason it is still queued.
                 let queued = pending_summary(pending_uploads, pending_changes);
-                ui.status.mount_row.set_subtitle(&match (online, queued) {
-                    (true, None) => format!("Mounted at {mountpoint}"),
-                    (true, Some(q)) => format!("Mounted at {mountpoint} — {q}"),
-                    (false, None) => {
-                        format!("Mounted at {mountpoint} — offline, cached files only")
+                let state = if failing_ops > 0 {
+                    SyncState::Attention {
+                        count: failing_ops,
+                        error: failing_error,
                     }
-                    (false, Some(q)) => format!("Mounted at {mountpoint} — offline, {q}"),
-                });
+                } else if !online {
+                    SyncState::Offline { queued }
+                } else if let Some(queued) = queued {
+                    SyncState::Syncing { queued }
+                } else {
+                    SyncState::UpToDate { mountpoint }
+                };
+                paint_sync_status(&ui, state);
                 let fraction = if budget == 0 {
                     0.0
                 } else {
@@ -907,7 +981,7 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
             // rows and cache read-out so the page doesn't flicker on a blip.
             _ => {
                 set_mounted(&ui, false);
-                ui.status.mount_row.set_subtitle("Not mounted");
+                paint_sync_status(&ui, SyncState::Disconnected);
                 for r in ui.status.pin_rows.borrow().iter() {
                     if let Some(b) = &r.unpin {
                         b.set_sensitive(false);
@@ -916,6 +990,82 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
             }
         }
     });
+}
+
+/// What the sidebar's status strip reports, most urgent first.
+pub(crate) enum SyncState {
+    /// Operations keep failing; the user may have to act.
+    Attention {
+        count: u64,
+        error: Option<String>,
+    },
+    /// No connection to Proton: cached files only, changes wait.
+    Offline {
+        queued: Option<String>,
+    },
+    /// Local changes are on their way up.
+    Syncing {
+        queued: String,
+    },
+    UpToDate {
+        mountpoint: String,
+    },
+    /// No mount daemon answered: still starting, or the service is down.
+    Disconnected,
+}
+
+/// Paint the sidebar status strip: icon, one-line state, and a detail line.
+fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
+    let (icon, class, title, detail) = match state {
+        SyncState::Attention { count, error } => (
+            "dialog-warning-symbolic",
+            Some("error"),
+            format!(
+                "{} need{} attention",
+                count_noun(count as usize, "change", "changes"),
+                if count == 1 { "s" } else { "" }
+            ),
+            error,
+        ),
+        SyncState::Offline { queued } => (
+            "network-offline-symbolic",
+            Some("warning"),
+            "Offline".to_string(),
+            Some(queued.unwrap_or_else(|| "Cached files only".to_string())),
+        ),
+        SyncState::Syncing { queued } => (
+            "emblem-synchronizing-symbolic",
+            None,
+            "Syncing".to_string(),
+            Some(queued),
+        ),
+        SyncState::UpToDate { mountpoint } => (
+            "emblem-ok-symbolic",
+            Some("success"),
+            "Up to date".to_string(),
+            Some(mountpoint),
+        ),
+        SyncState::Disconnected => (
+            "network-offline-symbolic",
+            Some("warning"),
+            "Not connected".to_string(),
+            Some("Proton Drive isn't running".to_string()),
+        ),
+    };
+    let image = &ui.status.status_icon;
+    image.set_icon_name(Some(icon));
+    for c in ["success", "warning", "error"] {
+        image.remove_css_class(c);
+    }
+    if let Some(class) = class {
+        image.add_css_class(class);
+    }
+    ui.status.status_title.set_label(&title);
+    ui.status.status_detail.set_visible(detail.is_some());
+    ui.status
+        .status_detail
+        .set_label(detail.as_deref().unwrap_or_default());
+    ui.status.status_detail.set_tooltip_text(detail.as_deref());
 }
 
 /// Render the pins group from `pins`, with the unpin buttons enabled only while a
@@ -941,8 +1091,8 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
 
     if pins.is_empty() {
         let row = adw::ActionRow::builder()
-            .title("No pinned files")
-            .subtitle("Right-click a file in the mount to keep it offline.")
+            .title("No files kept offline")
+            .subtitle("Right-click a file and choose “Make available offline”.")
             .build();
         ui.status.pins_group.add(&row);
         ui.status
@@ -970,11 +1120,11 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             .title(&name)
             .subtitle(&pin.path)
             .build();
-        let icon = gtk4::Image::from_icon_name("emblem-documents-symbolic");
+        let icon = gtk4::Image::from_icon_name("pdfs-offline-symbolic");
         row.add_prefix(&icon);
 
         let unpin = gtk4::Button::builder()
-            .icon_name("user-trash-symbolic")
+            .icon_name("pdfs-online-only-symbolic")
             .valign(gtk4::Align::Center)
             .tooltip_text("Make online only")
             .sensitive(mounted)
@@ -983,12 +1133,24 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         let ui_btn = ui.clone();
         let path = pin.path.clone();
         unpin.connect_clicked(move |_| {
-            let socket = ui_btn.dirs.control_socket();
-            match send(&socket, &Request::Unpin { path: path.clone() }) {
-                Ok(Response::Error { message, .. }) => tracing::error!("unpin failed: {message}"),
-                Ok(_) => refresh(&ui_btn),
-                Err(e) => tracing::error!("unpin request failed: {e}"),
-            }
+            let rx = spawn_request(
+                ui_btn.dirs.control_socket(),
+                Request::Unpin { path: path.clone() },
+            );
+            let ui = ui_btn.clone();
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(Response::Error { message, kind })) => {
+                        toast_failure(&ui, "Couldn't make it online only", &message, kind)
+                    }
+                    Ok(Ok(_)) => refresh(&ui),
+                    _ => toast_error(
+                        &ui,
+                        "Couldn't make it online only",
+                        "The mount service didn't respond.",
+                    ),
+                }
+            });
         });
         row.add_suffix(&unpin);
 
@@ -1004,7 +1166,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             .title(if expanded {
                 "Show fewer".to_string()
             } else {
-                format!("Show all {} pinned files", pins.len())
+                format!("Show all {}", count_noun(pins.len(), "file", "files"))
             })
             .activatable(true)
             .build();

@@ -46,33 +46,17 @@ pub(crate) struct DevicesWidgets {
 /// The Computers page: a "This computer" section naming the device this machine
 /// backs up to (renamable from its header), plus an "Other computers" section
 /// listing the account's other registered devices. The synced folders
-/// themselves live on the Locations page.
+/// themselves live on the Sync page.
 pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
-    let title = gtk4::Label::builder()
-        .label("Computers")
-        .halign(gtk4::Align::Start)
-        .build();
-    title.add_css_class("title-2");
-    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    titles.set_hexpand(true);
-    titles.append(&title);
-
     let restore = gtk4::Button::builder()
-        .label("Restore Folders")
+        .label("Restore Folders…")
         .tooltip_text("Sync this computer's Drive folders back to local directories")
-        .valign(gtk4::Align::Center)
         .build();
-    restore.add_css_class("flat");
     let refresh = refresh_button();
-
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.append(&titles);
-    header.append(&refresh);
-    header.append(&restore);
 
     // This page is about device *identity* — which computer this is, which other
     // computers back up to the account, and how to adopt one. The folders
-    // themselves are local paths, so they live on the Locations page; keeping a
+    // themselves are local paths, so they live on the Sync page; keeping a
     // second copy of that list here would be two places to change the same mode.
     let sync_group = adw::PreferencesGroup::builder()
         .title("This computer")
@@ -124,15 +108,17 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    inner.set_margin_top(12);
-    inner.set_margin_bottom(12);
-    inner.set_margin_start(12);
-    inner.set_margin_end(12);
-    inner.append(&header);
+    inner.set_margin_top(18);
+    inner.set_margin_bottom(18);
+    inner.set_margin_start(18);
+    inner.set_margin_end(18);
     inner.append(&content);
+    let (frame, header, _) = page_frame("Computers", &inner);
+    header.pack_start(&restore);
+    header.pack_end(&refresh);
 
     (
-        inner.upcast(),
+        frame.upcast(),
         DevicesWidgets {
             content,
             status,

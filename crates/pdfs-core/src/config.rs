@@ -119,6 +119,11 @@ pub struct AppConfig {
     /// field.
     #[serde(default)]
     pub prompt: Option<PromptConfig>,
+    /// Paint the desktop app in Proton purple instead of the system accent
+    /// colour. `None` means "follow the system". Defaulted for configs
+    /// predating the field.
+    #[serde(default)]
+    pub proton_accent: Option<bool>,
 }
 
 impl Default for AppConfig {
@@ -133,6 +138,7 @@ impl Default for AppConfig {
             conflict_sweep: None,
             open_with: None,
             prompt: None,
+            proton_accent: None,
         }
     }
 }
@@ -477,11 +483,13 @@ mod tests {
             conflict_sweep: Some(SweepMode::Enforce),
             open_with: None,
             prompt: None,
+            proton_accent: Some(true),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
         assert_eq!(decoded.user_agent, "test-agent/1.0");
+        assert_eq!(decoded.proton_accent, Some(true));
     }
 
     #[test]

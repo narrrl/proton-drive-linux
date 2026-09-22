@@ -25,17 +25,7 @@ pub(crate) struct SharedByMeWidgets {
 /// each row summarizing who has access and carrying its public link (copy/open)
 /// and a Manage shortcut into the per-node Share dialog.
 pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
-    let title = gtk4::Label::builder()
-        .label("Shared")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    title.add_css_class("title-2");
     let refresh = refresh_button();
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.set_hexpand(true);
-    header.append(&title);
-    header.append(&refresh);
 
     let group = adw::PreferencesGroup::new();
     let clamp = adw::Clamp::builder().child(&group).build();
@@ -65,15 +55,16 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
     content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    inner.set_margin_top(12);
-    inner.set_margin_bottom(12);
-    inner.set_margin_start(12);
-    inner.set_margin_end(12);
-    inner.append(&header);
+    inner.set_margin_top(18);
+    inner.set_margin_bottom(18);
+    inner.set_margin_start(18);
+    inner.set_margin_end(18);
     inner.append(&content);
+    let (frame, header, _) = page_frame("Shared by Me", &inner);
+    header.pack_end(&refresh);
 
     (
-        inner.upcast(),
+        frame.upcast(),
         SharedByMeWidgets {
             content,
             status,

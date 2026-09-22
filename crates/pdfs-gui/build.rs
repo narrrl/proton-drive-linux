@@ -9,6 +9,8 @@ fn main() {
             &format!("{}/pdfs.gresource", out_dir),
             "--sourcedir",
             "resources/icons",
+            "--sourcedir",
+            "resources",
             "resources/pdfs.gresource.xml",
         ])
         .status()
@@ -23,4 +25,5 @@ fn main() {
 
     println!("cargo:rerun-if-changed=resources/pdfs.gresource.xml");
     println!("cargo:rerun-if-changed=resources/icons");
+    println!("cargo:rerun-if-changed=resources/style.css");
 }

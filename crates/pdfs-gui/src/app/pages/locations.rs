@@ -1,4 +1,5 @@
-//! The Locations page: every local place Proton Drive occupies on this machine.
+//! The Sync page (formerly Locations): what is moving right now, and every local
+//! place Proton Drive occupies on this machine.
 //!
 //! One row per [`MountSpec`] from [`Request::ListLocations`] — the primary
 //! `~/ProtonDrive` mount, plus each folder this computer backs up, whether it is
@@ -31,33 +32,22 @@ pub(crate) struct LocationsWidgets {
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
     pub(crate) add_folder: gtk4::Button,
+    /// Live transfers, above the folder list; painted by the refresh loop.
+    pub(crate) transfers_group: adw::PreferencesGroup,
 }
 
 pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
-    let title = gtk4::Label::builder()
-        .label("Locations")
-        .halign(gtk4::Align::Start)
-        .build();
-    title.add_css_class("title-2");
-
     let add_folder = gtk4::Button::builder()
-        .label("Add Folder")
+        .child(
+            &adw::ButtonContent::builder()
+                .label("Add Folder")
+                .icon_name("list-add-symbolic")
+                .build(),
+        )
         .tooltip_text("Back a local folder up to this computer's Proton Drive device")
-        .valign(gtk4::Align::Center)
         .build();
-    add_folder.add_css_class("flat");
     let refresh = refresh_button();
-
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    titles.set_hexpand(true);
-    titles.append(&title);
-    header.append(&titles);
-    header.append(&refresh);
-    header.append(&add_folder);
-    // Clamped to the same width as the rows below, or the page title floats off
-    // to the left of the list it names.
-    let header_clamp = adw::Clamp::builder().child(&header).build();
+    let transfers_group = build_transfers_group();
 
     // Same warning the Computers page carried, for the same reason: the
     // on-demand switch removes the local copy, which is not a thing to discover
@@ -72,6 +62,7 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .build();
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    groups.append(&transfers_group);
     groups.append(&group);
     let clamp = adw::Clamp::builder().child(&groups).build();
     // Never scroll sideways: a location's title is a full path, and letting the
@@ -114,8 +105,10 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
     page.set_margin_bottom(18);
     page.set_margin_start(18);
     page.set_margin_end(18);
-    page.append(&header_clamp);
     page.append(&content);
+    let (frame, header, _) = page_frame("Sync", &page);
+    header.pack_start(&add_folder);
+    header.pack_end(&refresh);
 
     let widgets = LocationsWidgets {
         content: content.clone(),
@@ -124,8 +117,9 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         retry: retry.clone(),
         refresh,
         add_folder,
+        transfers_group,
     };
-    (page.upcast(), widgets)
+    (frame.upcast(), widgets)
 }
 
 pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk4::Button) {

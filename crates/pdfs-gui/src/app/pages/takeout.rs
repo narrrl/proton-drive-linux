@@ -17,12 +17,12 @@
 //! The daemon owns the run itself ([`Request::ImportTakeout`]): this page only
 //! stages paths, launches, polls [`Request::ImportStatus`] for the final report,
 //! and reads live progress off the import's job in the transfer snapshot the
-//! Settings tick already fetches (see [`takeout_progress`]).
+//! status tick already fetches (see [`takeout_progress`]).
 
 use crate::*;
 
 /// The title the daemon gives the import's job in [`Request::GetQueueStatus`].
-/// Matching on it is how this page borrows the progress the Settings tick is
+/// Matching on it is how this page borrows the progress the status tick is
 /// already polling instead of adding a second poll of its own.
 const IMPORT_JOB: &str = "Importing Google Photos";
 
@@ -135,11 +135,6 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
         .build();
     back_button.add_css_class("flat");
 
-    let title = gtk4::Label::builder()
-        .label("Import from Google Photos")
-        .halign(gtk4::Align::Start)
-        .build();
-    title.add_css_class("title-2");
     let subtitle = gtk4::Label::builder()
         .label("Add a Google Takeout export to your Proton Photos timeline.")
         .halign(gtk4::Align::Start)
@@ -148,15 +143,7 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
         .build();
     subtitle.add_css_class("dim-label");
 
-    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    titles.set_hexpand(true);
-    titles.append(&title);
-    titles.append(&subtitle);
-
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.append(&back_button);
-    header.append(&titles);
-    let header_clamp = adw::Clamp::builder().child(&header).build();
+    let subtitle_clamp = adw::Clamp::builder().child(&subtitle).build();
 
     // Drop zone. It is a hint, not the only way in — the button under it does
     // the same thing for anyone not dragging, and the drop target covers the
@@ -235,7 +222,7 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     actions.append(&import_button);
 
     // Progress: the import's job from the transfer snapshot, so this page shows
-    // the same numbers the Settings Activity list does.
+    // the same numbers the Sync page's Transfers list does.
     let progress_group = adw::PreferencesGroup::builder()
         .title("Import in progress")
         .visible(false)
@@ -284,8 +271,10 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     page.set_margin_bottom(18);
     page.set_margin_start(18);
     page.set_margin_end(18);
-    page.append(&header_clamp);
+    page.append(&subtitle_clamp);
     page.append(&scroll);
+    let (frame, header, _) = page_frame("Import from Google Photos", &page);
+    header.pack_start(&back_button);
 
     let widgets = TakeoutWidgets {
         list_group: list_group.clone(),
@@ -302,7 +291,7 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
         progress_bar: progress_bar.clone(),
         summary_group: summary_group.clone(),
     };
-    (page.upcast(), widgets)
+    (frame.upcast(), widgets)
 }
 
 pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
@@ -755,7 +744,7 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
     ui.takeout.summary_group.set_visible(true);
 }
 
-/// Paint the import's progress from the transfer snapshot the Settings tick
+/// Paint the import's progress from the transfer snapshot the status tick
 /// already fetched, so this page costs no extra poll. A job with no known total
 /// pulses instead of showing a fraction, the same as the Activity list.
 pub(crate) fn takeout_progress(ui: &Rc<Ui>, jobs: &[JobItem]) {

@@ -1,0 +1,79 @@
+/* Proton Drive for Linux — app stylesheet.
+ *
+ * Colours come from the libadwaita palette (var(--accent-bg-color),
+ * var(--success-color), ...) so the app follows the system accent, light/dark
+ * and high contrast. The one exception is the photo viewer, which always sits
+ * on a near-black backdrop and so uses fixed light-on-dark colours. The Proton
+ * purple accent is opt-in and lives in its own provider (see main.rs).
+ */
+
+/* Brand */
+.brand-title { font-size: 1.6rem; font-weight: 800; }
+.brand-icon { color: #6d4aff; }
+
+/* Sidebar footer */
+.sidebar-footer { padding: 6px 12px 12px 12px; }
+.sidebar-status { padding: 6px 8px; border-radius: 8px; }
+.sidebar-status image.success { color: var(--success-color); }
+.sidebar-status image.warning { color: var(--warning-color); }
+.sidebar-status image.error { color: var(--error-color); }
+.sidebar-quota progressbar trough, .sidebar-quota progressbar progress { min-height: 4px; }
+.sidebar-account { padding: 4px 4px 4px 8px; }
+
+/* File browser */
+.file-grid { padding: 6px; }
+.file-tile { padding: 8px; border-radius: 10px; }
+.file-tile:hover { background: color-mix(in srgb, var(--accent-bg-color) 10%, transparent); }
+.file-tile:selected, .file-tile:hover:selected { background: color-mix(in srgb, var(--accent-bg-color) 20%, transparent); }
+.file-thumbnail { border-radius: 7px; }
+.file-badge { -gtk-icon-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }
+.badge-pinned { color: var(--yellow-3); }
+.badge-cached { color: var(--success-color); }
+.badge-cloud { color: color-mix(in srgb, currentColor 55%, transparent); }
+.browser-statusbar { background-color: alpha(currentColor, 0.025); }
+scale.browser-status-meter trough, progressbar.browser-status-meter trough { min-width: 104px; }
+scale.browser-status-meter trough { min-height: 6px; }
+progressbar.browser-status-meter trough, progressbar.browser-status-meter progress { min-height: 6px; }
+.bulk-bar { padding: 6px 8px; border-radius: 12px; background: color-mix(in srgb, var(--accent-bg-color) 12%, transparent); }
+.dropzone { border: 2px dashed alpha(currentColor, 0.25); border-radius: 16px; padding: 28px 18px; transition: background 160ms ease, border-color 160ms ease; }
+.dropzone-active { border-color: var(--accent-bg-color); background: color-mix(in srgb, var(--accent-bg-color) 10%, transparent); }
+
+/* Photo viewer: always light-on-dark, whatever the system style */
+.photo-viewer-window { background-color: #111014; }
+.viewer-top-bar { background: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0)); padding: 10px 16px 28px 20px; color: white; }
+.viewer-title { font-weight: 700; font-size: 1.05rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }
+.viewer-counter { font-size: 0.8rem; color: rgba(255, 255, 255, 0.72); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }
+.viewer-action-btn { color: white; background-color: rgba(255, 255, 255, 0.12); border-radius: 50%; min-width: 34px; min-height: 34px; margin-left: 4px; }
+.viewer-action-btn:hover { background-color: rgba(255, 255, 255, 0.28); color: white; }
+.viewer-action-btn:checked { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
+.viewer-close-btn { background-color: rgba(255, 255, 255, 0.2); margin-left: 10px; }
+.viewer-close-btn:hover { background-color: var(--destructive-bg-color); color: var(--destructive-fg-color); }
+.viewer-nav-btn { background-color: rgba(0, 0, 0, 0.45); color: white; margin: 20px; min-width: 44px; min-height: 44px; border-radius: 50%; opacity: 0.7; transition: opacity 150ms ease, background-color 150ms ease; }
+.viewer-nav-btn:hover { background-color: rgba(0, 0, 0, 0.85); color: white; opacity: 1; }
+.viewer-nav-btn:disabled { opacity: 0; }
+.viewer-spinner { color: white; }
+.viewer-status { color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }
+.viewer-info-panel { background-color: var(--window-bg-color); border-left: 1px solid alpha(currentColor, 0.12); }
+
+/* Photos grid */
+.gallery-day { font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 4px 2px 8px 2px; }
+.photo-tile { padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 6px; background: none; box-shadow: none; transition: box-shadow 180ms ease; }
+.photo-tile:hover { box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45); }
+.photo-tile:focus { outline: 2px solid var(--accent-color); outline-offset: -2px; }
+.photo-thumb { transition: transform 220ms ease; }
+.photo-tile:hover .photo-thumb { transform: scale(1.06); }
+.photo-check { color: white; background: rgba(0, 0, 0, 0.5); border-radius: 999px; padding: 3px; }
+.photo-check-on { background: var(--accent-bg-color); color: var(--accent-fg-color); }
+.photo-tile-selected { outline: 3px solid var(--accent-bg-color); outline-offset: -3px; }
+.photo-placeholder { color: alpha(currentColor, 0.35); background: alpha(currentColor, 0.07); }
+.photo-caption { font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 180ms ease; }
+.photo-tile:hover .photo-caption { opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }
+.photo-video-badge { color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }
+.photo-tile:hover .photo-video-badge { background: color-mix(in srgb, var(--accent-bg-color) 85%, transparent); }
+.photo-group-badge { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; color: white; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 1px 5px; margin: 6px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }
+.album-card { padding: 0; border-radius: 16px; transition: background 180ms ease; }
+.album-card:hover { background: alpha(currentColor, 0.07); }
+.album-cover { border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }
+.album-card:hover .album-cover { box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5); }
+.album-card:hover .photo-thumb { transform: scale(1.05); }
+.view-switch button { padding-left: 18px; padding-right: 18px; }

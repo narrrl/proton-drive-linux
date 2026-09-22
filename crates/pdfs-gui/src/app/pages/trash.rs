@@ -10,7 +10,7 @@ pub(crate) struct TrashState {
     /// Empties the trash; insensitive while it is empty (or unread).
     pub(crate) empty: gtk4::Button,
     /// "12 items" under the page title.
-    pub(crate) subtitle: gtk4::Label,
+    pub(crate) subtitle: adw::WindowTitle,
 }
 
 /// The widgets of the Trash page that a load repaints.
@@ -22,7 +22,7 @@ pub(crate) struct TrashWidgets {
     pub(crate) retry: gtk4::Button,
     pub(crate) empty: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
-    pub(crate) subtitle: gtk4::Label,
+    pub(crate) subtitle: adw::WindowTitle,
 }
 
 /// The Trash page: a flat list of everything Drive is holding in the trash, each
@@ -35,30 +35,12 @@ pub(crate) struct TrashWidgets {
 pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
 
-    let title = gtk4::Label::builder()
-        .label("Trash")
-        .halign(gtk4::Align::Start)
-        .build();
-    title.add_css_class("title-2");
-    let subtitle = gtk4::Label::builder().halign(gtk4::Align::Start).build();
-    subtitle.add_css_class("dim-label");
-    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    titles.set_hexpand(true);
-    titles.append(&title);
-    titles.append(&subtitle);
-
     let empty = gtk4::Button::builder()
-        .label("Empty Trash")
-        .valign(gtk4::Align::Center)
+        .label("Empty…")
+        .tooltip_text("Permanently delete everything in the Trash")
         .sensitive(false)
         .build();
-    empty.add_css_class("destructive-action");
     let refresh = refresh_button();
-
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.append(&titles);
-    header.append(&refresh);
-    header.append(&empty);
 
     let retry = gtk4::Button::builder()
         .label("Retry")
@@ -91,15 +73,17 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    inner.set_margin_top(12);
-    inner.set_margin_bottom(12);
-    inner.set_margin_start(12);
-    inner.set_margin_end(12);
-    inner.append(&header);
+    inner.set_margin_top(18);
+    inner.set_margin_bottom(18);
+    inner.set_margin_start(18);
+    inner.set_margin_end(18);
     inner.append(&content);
+    let (frame, header, subtitle) = page_frame("Trash", &inner);
+    header.pack_start(&empty);
+    header.pack_end(&refresh);
 
     (
-        inner.upcast(),
+        frame.upcast(),
         TrashWidgets {
             model,
             list,
@@ -294,7 +278,7 @@ pub(crate) fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &s
     ui.trash.status.set_description(Some(description));
     ui.trash.retry.set_visible(retry);
     ui.trash.content.set_visible_child_name("status");
-    ui.trash.subtitle.set_label("");
+    ui.trash.subtitle.set_subtitle("");
 }
 
 /// Repopulate the trash list, most recently modified first — the order in which a
@@ -313,7 +297,7 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
         return;
     }
     ui.trash.content.set_visible_child_name("list");
-    ui.trash.subtitle.set_label(&match entries.len() {
+    ui.trash.subtitle.set_subtitle(&match entries.len() {
         1 => "1 item".to_string(),
         n => format!("{n} items"),
     });

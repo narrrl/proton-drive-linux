@@ -192,9 +192,8 @@ fn want_cover(ui: &Rc<Ui>, uid: String, picture: &gtk4::Picture) {
 /// Open one album in the gallery: the timeline view, paged from the album
 /// instead, with the filters that don't apply to it out of the way.
 pub(crate) fn open_album(ui: &Rc<Ui>, album: AlbumInfo) {
-    ui.gallery.title.set_label(&album.name);
-    ui.gallery.subtitle.set_label(&album_subtitle(&album));
-    ui.gallery.subtitle.set_visible(true);
+    ui.gallery.title.set_title(&album.name);
+    ui.gallery.title.set_subtitle(&album_subtitle(&album));
     *ui.gallery.album.borrow_mut() = Some(album);
 
     // An album page carries no kind or date filter, and Upload targets the
@@ -219,7 +218,7 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
     if ui.gallery.album.borrow_mut().take().is_none() {
         return;
     }
-    ui.gallery.title.set_label("Gallery");
+    ui.gallery.title.set_title("Photos");
     ui.gallery.filters.set_visible(true);
     ui.gallery.view_switch.set_visible(true);
     ui.gallery.upload.set_visible(true);

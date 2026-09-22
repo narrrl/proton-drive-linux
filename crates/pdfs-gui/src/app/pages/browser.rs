@@ -219,16 +219,11 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 
     let refresh = refresh_button();
 
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.append(&back);
-    header.append(&crumb_scroll);
-    header.append(&refresh);
-    header.append(&build_thumbnails);
-    header.append(&new_folder);
-    header.append(&upload);
-    header.append(&upload_folder);
-    header.append(&search);
-    header.append(&toggles);
+    // The path bar stays in the page, under the header bar: the header's title
+    // slot carries the page name and the busy spinner.
+    let path_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    path_bar.append(&back);
+    path_bar.append(&crumb_scroll);
 
     let thumbnail_status = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
@@ -447,7 +442,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     body.set_margin_bottom(6);
     body.set_margin_start(12);
     body.set_margin_end(12);
-    body.append(&header);
+    body.append(&path_bar);
     body.append(&thumbnail_build_row);
     body.append(&bulk);
     body.append(&split);
@@ -457,8 +452,17 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     page.append(&status_bar);
 
+    let (frame, header, _) = page_frame("My Files", &page);
+    header.pack_start(&upload);
+    header.pack_start(&upload_folder);
+    header.pack_start(&new_folder);
+    header.pack_end(&refresh);
+    header.pack_end(&toggles);
+    header.pack_end(&build_thumbnails);
+    header.pack_end(&search);
+
     (
-        page.upcast(),
+        frame.upcast(),
         BrowserWidgets {
             model,
             back,

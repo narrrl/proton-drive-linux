@@ -60,8 +60,8 @@ use pdfs_core::service;
 
 const APP_ID: &str = "io.narl.proton-drive-linux";
 
-/// Proton brand purple, applied as the libadwaita accent so switches, buttons,
-/// links and the storage bar all pick it up.
+/// Proton brand purple, applied as the libadwaita accent when the user opts in
+/// (Preferences → Appearance), so switches, buttons and links all pick it up.
 const PROTON_PURPLE: &str = "#6d4aff";
 
 /// How often the window re-reads mount status, cache usage and the pin list.
@@ -97,9 +97,9 @@ struct Ui {
     /// rename, a failed upload, a purge) is reported here rather than in a modal,
     /// so an action never interrupts what the user is doing next.
     toasts: adw::ToastOverlay,
-    /// Header spinner shown while any open/load round-trip is in flight; ref-
-    /// counted via [`Self::busy`] so concurrent operations don't stop it early.
-    spinner: gtk4::Spinner,
+    /// How many open/load round-trips are in flight. While any is, every page
+    /// header shows its spinner (see [`page_frame`]); ref-counted so concurrent
+    /// operations don't hide it early.
     busy: Cell<u32>,
     /// Keys (relative path / photo uid) of open requests currently in flight, so
     /// a double-click on the same entry is a no-op instead of a second download.
@@ -111,7 +111,7 @@ struct Ui {
     /// Whether the last refresh saw a live mount daemon. Gates the unpin buttons
     /// (which need the daemon to evict + re-hydrate) and every mutating action.
     mounted: RefCell<bool>,
-    /// Sidebar destination list (Files / Photos / Settings). Selecting a row swaps
+    /// Sidebar destination list (My files, Photos, …, Sync). Selecting a row swaps
     /// the page stack; [`sync_sidebar`] mirrors navigation that starts elsewhere.
     sidebar: gtk4::ListBox,
     /// The sidebar/content split. Collapsed while signed out, so the login page
@@ -142,8 +142,7 @@ impl Ui {
     /// Begin a unit of background work: show + spin the header spinner.
     fn busy_begin(&self) {
         self.busy.set(self.busy.get() + 1);
-        self.spinner.set_visible(true);
-        self.spinner.start();
+        set_busy_spinners(true);
     }
 
     /// End a unit of background work: stop the spinner once the last one is done.
@@ -151,8 +150,7 @@ impl Ui {
         let remaining = self.busy.get().saturating_sub(1);
         self.busy.set(remaining);
         if remaining == 0 {
-            self.spinner.stop();
-            self.spinner.set_visible(false);
+            set_busy_spinners(false);
         }
     }
 
@@ -199,6 +197,9 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| {
         load_proton_theme();
+        if let Ok(dirs) = AppDirs::new() {
+            set_proton_accent(dirs.load_config().proton_accent.unwrap_or(false));
+        }
         // Refresh the file manager's right-click pin/unpin scripts, so they always
         // match the installed `pdfs`.
         pdfs_core::shell::install_file_manager_scripts();
@@ -216,11 +217,10 @@ fn spawn_tray() {
     }
 }
 
-/// Install a CSS provider that overrides libadwaita's accent colour with Proton
-/// purple, app-wide. Named-colour overrides recolour the stock widgets (switch,
-/// buttons, progress fill) without per-widget styling.
+/// Register the bundled GResources (custom icons, the stylesheet) and load the
+/// app stylesheet. The Proton accent is a separate provider, applied by
+/// [`set_proton_accent`] from the saved preference.
 fn load_proton_theme() {
-    // Compile-in and register our custom GResources (e.g. custom icons)
     let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/pdfs.gresource"));
     let resource_data = glib::Bytes::from_static(bytes);
     if let Ok(resource) = gio::Resource::from_data(&resource_data) {
@@ -229,82 +229,53 @@ fn load_proton_theme() {
         tracing::error!("failed to load gresource bundle");
     }
 
-    let css = format!(
-        "@define-color accent_bg_color {PROTON_PURPLE};\n\
-         @define-color accent_color {PROTON_PURPLE};\n\
-         .brand-title {{ font-size: 1.6rem; font-weight: 800; }}\n\
-         .brand-icon {{ color: {PROTON_PURPLE}; }}\n\
-         .file-grid {{ padding: 6px; }}\n\
-         .file-tile {{ padding: 8px; border-radius: 10px; }}\n\
-         .file-tile:hover {{ background: alpha({PROTON_PURPLE}, 0.10); }}\n\
-         .file-thumbnail {{ border-radius: 7px; }}\n\
-         .file-badge {{ -gtk-icon-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }}\n\
-         .badge-pinned {{ color: #f5c211; }}\n\
-         .badge-cached {{ color: #2ec27e; }}\n\
-         .badge-cloud {{ color: #9aa0a6; }}\n\
-         .browser-statusbar {{ background-color: alpha(currentColor, 0.025); }}\n\
-         scale.browser-status-meter trough, progressbar.browser-status-meter trough {{ min-width: 104px; }}\n\
-         scale.browser-status-meter trough {{ min-height: 6px; }}\n\
-         progressbar.browser-status-meter trough, progressbar.browser-status-meter progress {{ min-height: 6px; }}\n\
-         .photo-viewer-window {{ background-color: #111014; }}\n\
-         .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0)); padding: 10px 16px 28px 20px; color: white; }}\n\
-         .viewer-title {{ font-weight: 700; font-size: 1.05rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
-         .viewer-counter {{ font-size: 0.8rem; color: rgba(255, 255, 255, 0.72); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }}\n\
-         .viewer-action-btn {{ color: white; background-color: rgba(255, 255, 255, 0.12); border-radius: 50%; min-width: 34px; min-height: 34px; margin-left: 4px; }}\n\
-         .viewer-action-btn:hover {{ background-color: rgba(255, 255, 255, 0.28); color: white; }}\n\
-         .viewer-action-btn:checked {{ background-color: {PROTON_PURPLE}; color: white; }}\n\
-         .viewer-close-btn {{ background-color: rgba(255, 255, 255, 0.2); margin-left: 10px; }}\n\
-         .viewer-close-btn:hover {{ background-color: #e01b24; color: white; }}\n\
-         .viewer-nav-btn {{ background-color: rgba(0, 0, 0, 0.45); color: white; margin: 20px; min-width: 44px; min-height: 44px; border-radius: 50%; opacity: 0.7; transition: opacity 150ms ease, background-color 150ms ease; }}\n\
-         .viewer-nav-btn:hover {{ background-color: rgba(0, 0, 0, 0.85); color: white; opacity: 1; }}\n\
-         .viewer-nav-btn:disabled {{ opacity: 0; }}\n\
-         .viewer-spinner {{ color: white; }}\n\
-         .viewer-status {{ color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }}\n\
-         .viewer-info-panel {{ background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }}\n\
-         .gallery-day {{ font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 4px 2px 8px 2px; }}\n\
-         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 6px; background: none; box-shadow: none; transition: box-shadow 180ms ease; }}\n\
-         .photo-tile:hover {{ box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45); }}\n\
-         .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
-         .photo-thumb {{ transition: transform 220ms ease; }}\n\
-         .photo-tile:hover .photo-thumb {{ transform: scale(1.06); }}\n\
-         .photo-check {{ color: white; background: rgba(0, 0, 0, 0.5); border-radius: 999px; padding: 3px; }}\n\
-         .photo-check-on {{ background: {PROTON_PURPLE}; }}\n\
-         .photo-tile-selected {{ outline: 3px solid {PROTON_PURPLE}; outline-offset: -3px; }}\n\
-         .photo-placeholder {{ color: alpha(currentColor, 0.35); background: alpha(currentColor, 0.07); }}\n\
-         .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 180ms ease; }}\n\
-         .photo-video-badge {{ color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }}\n\
-         .photo-tile:hover .photo-video-badge {{ background: alpha({PROTON_PURPLE}, 0.85); }}\n\
-         .photo-group-badge {{ font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; color: white; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 1px 5px; margin: 6px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }}\n\
-         .photo-tile:hover .photo-caption {{ opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }}\n\
-         .album-card {{ padding: 0; border-radius: 16px; transition: background 180ms ease; }}\n\
-         .album-card:hover {{ background: alpha(currentColor, 0.07); }}\n\
-         .album-cover {{ border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }}\n\
-         .album-card:hover .album-cover {{ box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5); }}\n\
-         .album-card:hover .photo-thumb {{ transform: scale(1.05); }}\n\
-         .view-switch button {{ padding-left: 18px; padding-right: 18px; }}\n\
-         .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
-         .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n\
-         .navigation-sidebar row {{ border-radius: 8px; margin: 2px 6px; }}\n\
-         .navigation-sidebar row:selected {{ background: alpha({PROTON_PURPLE}, 0.16); color: {PROTON_PURPLE}; font-weight: 600; }}\n\
-         .navigation-sidebar row:selected image {{ color: {PROTON_PURPLE}; }}\n\
-         .file-tile:selected, .file-tile:hover:selected {{ background: alpha({PROTON_PURPLE}, 0.20); }}\n\
-         .bulk-bar {{ padding: 6px 8px; border-radius: 12px; background: alpha({PROTON_PURPLE}, 0.12); }}\n\
-         .dropzone {{ border: 2px dashed alpha(currentColor, 0.25); border-radius: 16px; padding: 28px 18px; transition: background 160ms ease, border-color 160ms ease; }}\n\
-         .dropzone-active {{ border-color: {PROTON_PURPLE}; background: alpha({PROTON_PURPLE}, 0.10); }}\n"
-    );
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
     let provider = gtk4::CssProvider::new();
-    provider.load_from_string(&css);
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+    provider.load_from_resource("/de/nils/protondrivelinux/style.css");
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    gtk4::IconTheme::for_display(&display).add_resource_path("/de/nils/protondrivelinux/icons");
+}
 
-        // Register custom icons directory from our GResource with the icon theme
-        let icon_theme = gtk4::IconTheme::for_display(&display);
-        icon_theme.add_resource_path("/de/nils/protondrivelinux/icons");
-    }
+thread_local! {
+    /// The Proton purple accent provider while it is installed. Kept so turning
+    /// the preference off can remove exactly what turning it on added.
+    static PROTON_ACCENT: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+}
+
+/// Paint the app in Proton purple (`on`) or follow the system accent colour.
+/// Every accent-coloured widget reads `--accent-bg-color`, so overriding that
+/// one variable recolours the whole app.
+fn set_proton_accent(on: bool) {
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+    PROTON_ACCENT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match (on, slot.as_ref()) {
+            (true, None) => {
+                let provider = gtk4::CssProvider::new();
+                provider
+                    .load_from_string(&format!(":root {{ --accent-bg-color: {PROTON_PURPLE}; }}"));
+                gtk4::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+                *slot = Some(provider);
+            }
+            (false, Some(provider)) => {
+                gtk4::style_context_remove_provider_for_display(&display, provider);
+                *slot = None;
+            }
+            _ => {}
+        }
+    });
 }
 
 /// Build the application window, wire the two pages, kick off the refresh loop,
@@ -320,7 +291,7 @@ fn build_window(app: &adw::Application) {
 
     let stack = adw::ViewStack::new();
     let (login_page, login_widgets) = build_login_page();
-    let (main_page, main_widgets) = build_main_page();
+    let main_widgets = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
     let (gallery_page, gallery_widgets) = build_gallery_page();
     let (shared_page, shared_widgets) = build_shared_page();
@@ -330,8 +301,16 @@ fn build_window(app: &adw::Application) {
     let (activity_page, activity_widgets) = build_activity_page();
     let (trash_page, trash_widgets) = build_trash_page();
     let (takeout_page, takeout_widgets) = build_takeout_page();
-    stack.add_named(&login_page, Some("login"));
-    stack.add_named(&main_page, Some("main"));
+    // The login page has no title and no actions, but it still needs a header
+    // bar: it is the only thing carrying the window controls.
+    let login_frame = adw::ToolbarView::new();
+    login_frame.add_top_bar(&{
+        let header = adw::HeaderBar::new();
+        header.set_show_title(false);
+        header
+    });
+    login_frame.set_content(Some(&login_page));
+    stack.add_named(&login_frame, Some("login"));
     stack.add_named(&browser_page, Some("browser"));
     stack.add_named(&gallery_page, Some("gallery"));
     stack.add_named(&shared_by_me_page, Some("sharedbyme"));
@@ -345,21 +324,13 @@ fn build_window(app: &adw::Application) {
     // Sidebar: the signed-in destinations. Selecting a row swaps the page stack;
     // `sync_sidebar` pushes the other way when navigation happens elsewhere (e.g.
     // login lands on Files).
-    let (sidebar_page, sidebar_list) = build_sidebar();
+    let (sidebar_page, sidebar_list) = build_sidebar(&main_widgets.footer);
 
-    // Header spinner, hidden until a background open/load is in flight.
-    let spinner = gtk4::Spinner::new();
-    spinner.set_visible(false);
-    let header = adw::HeaderBar::new();
-    header.pack_end(&build_primary_menu());
-    header.pack_end(&spinner);
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&stack));
-
+    // Every page brings its own header bar (see `page_frame`), so the content
+    // side is the bare stack.
     let content_page = adw::NavigationPage::builder()
         .title("Proton Drive")
-        .child(&toolbar)
+        .child(&stack)
         .build();
     let split = adw::NavigationSplitView::builder()
         .sidebar(&sidebar_page)
@@ -377,7 +348,6 @@ fn build_window(app: &adw::Application) {
         dirs,
         stack: stack.clone(),
         toasts: toasts.clone(),
-        spinner: spinner.clone(),
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
         session: RefCell::new(auth::load().ok()),
@@ -393,14 +363,18 @@ fn build_window(app: &adw::Application) {
         },
         status: StatusState {
             status_inflight: Cell::new(false),
-            account_row: main_widgets.account_row.clone(),
-            mount_row: main_widgets.mount_row.clone(),
-            transfers_group: main_widgets.transfers_group.clone(),
+            transfers_group: locations_widgets.transfers_group.clone(),
+            prefs: main_widgets.prefs.clone(),
+            account_name: main_widgets.account_name.clone(),
+            avatar: main_widgets.avatar.clone(),
+            status_icon: main_widgets.status_icon.clone(),
+            status_title: main_widgets.status_title.clone(),
+            status_detail: main_widgets.status_detail.clone(),
             transfer_rows: RefCell::new(Vec::new()),
             transfers_inflight: Cell::new(false),
             cache_bar: main_widgets.cache_bar.clone(),
             cache_label: main_widgets.cache_label.clone(),
-            quota_group: main_widgets.quota_group.clone(),
+            quota_box: main_widgets.quota_box.clone(),
             quota_bar: main_widgets.quota_bar.clone(),
             quota_label: main_widgets.quota_label.clone(),
             quota_inflight: Cell::new(false),
@@ -408,6 +382,7 @@ fn build_window(app: &adw::Application) {
             autostart_row: main_widgets.autostart_row.clone(),
             budget_row: main_widgets.budget_row.clone(),
             mountpoint_row: main_widgets.mountpoint_row.clone(),
+            accent_row: main_widgets.accent_row.clone(),
             settings_suppress: Cell::new(false),
             budget_source: RefCell::new(None),
             pins_expanded: Cell::new(false),
@@ -485,7 +460,6 @@ fn build_window(app: &adw::Application) {
             import: gallery_widgets.import.clone(),
             empty_actions: gallery_widgets.empty_actions.clone(),
             title: gallery_widgets.title.clone(),
-            subtitle: gallery_widgets.subtitle.clone(),
             albums: gallery_widgets.albums.clone(),
             albums_stack: gallery_widgets.albums_stack.clone(),
             albums_status: gallery_widgets.albums_status.clone(),
@@ -598,7 +572,10 @@ fn build_window(app: &adw::Application) {
         },
     });
     wire_login(&ui);
-    wire_logout(&ui, &main_widgets.logout_button);
+    let ui_status = ui.clone();
+    main_widgets
+        .status_button
+        .connect_clicked(move |_| ui_status.stack.set_visible_child_name("locations"));
     wire_settings(
         &ui,
         &main_widgets.purge_button,
@@ -698,7 +675,9 @@ fn build_window(app: &adw::Application) {
         .content(&toasts)
         .build();
     install_shortcuts(&ui, &window);
-    install_window_actions(&window);
+    install_window_actions(&ui, &window);
+    app.set_accels_for_action("win.preferences", &["<Control>comma"]);
+    app.set_accels_for_action("win.shortcuts", &["<Control>question"]);
 
     refresh(&ui);
     // Periodic refresh while the window lives. The closure holds a strong `Rc`;
@@ -720,40 +699,59 @@ fn build_window(app: &adw::Application) {
 }
 
 /// The sidebar destinations, in order: the row index is the index into this table,
-/// and each entry is `(stack page name, label, icon)`.
-const DESTINATIONS: [(&str, &str, &str); 9] = [
+/// and each entry is `(stack page name, label, icon)`. The places in the account
+/// come first; the rows from [`SIDEBAR_SYNC_SECTION`] on are about this computer's
+/// sync, set off by a separator.
+const DESTINATIONS: [(&str, &str, &str); 8] = [
     ("browser", "My files", "folder-symbolic"),
-    ("sharedbyme", "Shared", "emblem-shared-symbolic"),
+    ("gallery", "Photos", "image-x-generic-symbolic"),
     ("shared", "Shared with me", "system-users-symbolic"),
-    ("locations", "Locations", "drive-harddisk-symbolic"),
+    ("sharedbyme", "Shared by me", "emblem-shared-symbolic"),
     ("devices", "Computers", "computer-symbolic"),
-    ("gallery", "Gallery", "image-x-generic-symbolic"),
-    ("activity", "Activity", "document-open-recent-symbolic"),
     ("trash", "Trash", "user-trash-symbolic"),
-    ("main", "Settings", "emblem-system-symbolic"),
+    ("locations", "Sync", "emblem-synchronizing-symbolic"),
+    ("activity", "Activity", "document-open-recent-symbolic"),
 ];
 
-/// The navigation sidebar: a Proton-branded header over one row per destination.
-/// Returns the page (for the split view) and the list (to drive + reflect the
-/// current page).
-fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
+/// Index of the first row in the sidebar's sync section.
+const SIDEBAR_SYNC_SECTION: i32 = 6;
+
+/// The navigation sidebar: the destinations over a footer carrying the sync
+/// status, the account quota and the account menu. Returns the page (for the
+/// split view) and the list (to drive + reflect the current page).
+fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
     for (_, label, icon) in DESTINATIONS {
-        let row = adw::ActionRow::builder().title(label).build();
-        row.add_prefix(&gtk4::Image::from_icon_name(icon));
+        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        row_box.append(&gtk4::Image::from_icon_name(icon));
+        row_box.append(&gtk4::Label::new(Some(label)));
+        let row = gtk4::ListBoxRow::builder().child(&row_box).build();
         list.append(&row);
     }
+    list.set_header_func(|row, _| {
+        if row.index() == SIDEBAR_SYNC_SECTION {
+            let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            separator.set_margin_top(6);
+            separator.set_margin_bottom(6);
+            row.set_header(Some(&separator));
+        } else {
+            row.set_header(gtk4::Widget::NONE);
+        }
+    });
 
     let brand = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     let icon = gtk4::Image::from_icon_name("folder-remote-symbolic");
     icon.add_css_class("brand-icon");
     brand.append(&icon);
-    brand.append(&gtk4::Label::new(Some("Proton Drive")));
+    let name = gtk4::Label::new(Some("Proton Drive"));
+    name.add_css_class("heading");
+    brand.append(&name);
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&brand));
+    header.pack_end(&build_primary_menu());
 
     let scroll = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -763,12 +761,53 @@ fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&scroll));
+    toolbar.add_bottom_bar(footer);
 
     let page = adw::NavigationPage::builder()
         .title("Proton Drive")
         .child(&toolbar)
         .build();
     (page, list)
+}
+
+thread_local! {
+    /// Every page header's busy spinner. There is one per page because each
+    /// page has its own header bar; [`Ui::busy_begin`] shows them all, so the one
+    /// on screen is always the right one.
+    static BUSY_SPINNERS: RefCell<Vec<gtk4::Spinner>> = const { RefCell::new(Vec::new()) };
+}
+
+fn set_busy_spinners(visible: bool) {
+    BUSY_SPINNERS.with(|spinners| {
+        for spinner in spinners.borrow().iter() {
+            spinner.set_visible(visible);
+            spinner.set_spinning(visible);
+        }
+    });
+}
+
+/// A destination page's frame: its own header bar over the page content, the
+/// way GNOME apps lay a split view out. The title sits in the middle with the
+/// busy spinner beside it; the page packs its actions into the returned header
+/// bar and may give the returned title a subtitle.
+fn page_frame(
+    title: &str,
+    content: &impl IsA<gtk4::Widget>,
+) -> (adw::ToolbarView, adw::HeaderBar, adw::WindowTitle) {
+    let window_title = adw::WindowTitle::new(title, "");
+    let spinner = gtk4::Spinner::new();
+    spinner.set_visible(false);
+    BUSY_SPINNERS.with(|spinners| spinners.borrow_mut().push(spinner.clone()));
+    let title_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    title_box.append(&window_title);
+    title_box.append(&spinner);
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&title_box));
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(content));
+    (toolbar, header, window_title)
 }
 
 /// The sidebar destination a page belongs under. Most pages are their own
@@ -1033,21 +1072,39 @@ fn toast_failure(ui: &Rc<Ui>, what: &str, message: &str, kind: ErrorKind) {
     }
 }
 
-/// The header's primary (hamburger) menu: the app-level entries that don't belong
-/// on any one page.
+/// The sidebar's primary (hamburger) menu: the app-level entries that don't
+/// belong on any one page.
 fn build_primary_menu() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
+    menu.append(Some("Preferences"), Some("win.preferences"));
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("About Proton Drive for Linux"), Some("win.about"));
     gtk4::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .tooltip_text("Main menu")
+        .primary(true)
         .menu_model(&menu)
         .build()
 }
 
-/// Back the primary menu's entries with window actions.
-fn install_window_actions(window: &adw::ApplicationWindow) {
+/// Back the primary and account menus' entries with window actions.
+fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
+    let preferences = gio::SimpleAction::new("preferences", None);
+    let ui_prefs = ui.clone();
+    let win = window.clone();
+    preferences.connect_activate(move |_, _| {
+        // Signed out there is nothing to configure: every page needs a session.
+        if ui_prefs.session.borrow().is_some() {
+            ui_prefs.status.prefs.present(Some(&win));
+        }
+    });
+    window.add_action(&preferences);
+
+    let sign_out_action = gio::SimpleAction::new("sign-out", None);
+    let ui_out = ui.clone();
+    sign_out_action.connect_activate(move |_, _| sign_out(&ui_out));
+    window.add_action(&sign_out_action);
+
     let shortcuts = gio::SimpleAction::new("shortcuts", None);
     let win = window.clone();
     shortcuts.connect_activate(move |_, _| show_shortcuts(&win));
@@ -1055,6 +1112,7 @@ fn install_window_actions(window: &adw::ApplicationWindow) {
 
     let about = gio::SimpleAction::new("about", None);
     let win = window.clone();
+    let ui_about = ui.clone();
     about.connect_activate(move |_, _| {
         let dialog = adw::AboutDialog::builder()
             .application_name("Proton Drive for Linux")
@@ -1068,41 +1126,98 @@ fn install_window_actions(window: &adw::ApplicationWindow) {
                 "Files-on-demand Proton Drive for the Linux desktop.\n\n\
                  Unofficial client — not affiliated with, endorsed by, or supported by Proton AG.",
             )
+            .debug_info(debug_info(&ui_about))
+            .debug_info_filename("proton-drive-linux-debug.txt")
             .build();
         dialog.present(Some(&win));
     });
     window.add_action(&about);
 }
 
+/// The About dialog's Troubleshooting text: what a bug report needs and what
+/// used to sit in a "Developer" group on the Settings page.
+fn debug_info(ui: &Rc<Ui>) -> String {
+    let config = ui.dirs.load_config();
+    format!(
+        "App version: {}\nUser agent: {}\nlibadwaita: {}.{}.{}\nGTK: {}.{}.{}\n\
+         Mountpoint: {}\nControl socket: {}\nMount service running: {}\n",
+        pdfs_core::config::APP_VERSION,
+        pdfs_core::config::USER_AGENT,
+        adw::major_version(),
+        adw::minor_version(),
+        adw::micro_version(),
+        gtk4::major_version(),
+        gtk4::minor_version(),
+        gtk4::micro_version(),
+        ui.dirs.resolved_mountpoint(&config).display(),
+        ui.dirs.control_socket().display(),
+        if *ui.mounted.borrow() { "yes" } else { "no" },
+    )
+}
+
 /// The keyboard-shortcut cheatsheet behind the menu entry, listing exactly what
-/// [`install_shortcuts`] binds.
+/// [`install_shortcuts`], the Photos page and the photo viewer bind.
 fn show_shortcuts(window: &adw::ApplicationWindow) {
-    const KEYS: [(&str, &str); 6] = [
-        ("Ctrl+F", "Search Drive"),
-        ("Ctrl+N", "New folder"),
-        ("Ctrl+U", "Upload file"),
-        ("F2", "Rename selection"),
-        ("Delete", "Move selection to Trash"),
-        ("Escape", "Close the details pane"),
+    const GROUPS: [(&str, &[(&str, &str)]); 4] = [
+        (
+            "General",
+            &[
+                ("<Control>f", "Search Drive"),
+                ("F5", "Refresh"),
+                ("<Control>comma", "Preferences"),
+                ("<Control>question", "Keyboard shortcuts"),
+            ],
+        ),
+        (
+            "Files",
+            &[
+                ("<Control>n", "New folder"),
+                ("<Control>u", "Upload files"),
+                ("F2", "Rename"),
+                ("Delete", "Move to Trash"),
+                ("Escape", "Clear the selection"),
+            ],
+        ),
+        (
+            "Photos",
+            &[
+                ("<Control>plus", "Larger thumbnails"),
+                ("<Control>minus", "Smaller thumbnails"),
+                ("<Control>0", "Reset thumbnail size"),
+            ],
+        ),
+        (
+            "Photo Viewer",
+            &[
+                ("Left Right", "Previous / next photo"),
+                ("Home End", "First / last photo"),
+                ("i", "Show details"),
+                ("f", "Fullscreen"),
+                ("Delete", "Move to Trash"),
+                ("Escape", "Close"),
+            ],
+        ),
     ];
-    let group = adw::PreferencesGroup::builder().title("Files").build();
-    for (keys, action) in KEYS {
-        let row = adw::ActionRow::builder().title(action).build();
-        let label = gtk4::Label::builder()
-            .label(keys)
-            .valign(gtk4::Align::Center)
-            .build();
-        label.add_css_class("dim-label");
-        label.add_css_class("monospace");
-        row.add_suffix(&label);
-        group.add(&row);
-    }
     let page = adw::PreferencesPage::new();
-    page.add(&group);
+    for (title, keys) in GROUPS {
+        let group = adw::PreferencesGroup::builder().title(title).build();
+        for (accel, action) in keys {
+            let row = adw::ActionRow::builder().title(*action).build();
+            row.add_suffix(
+                &gtk4::ShortcutLabel::builder()
+                    .accelerator(*accel)
+                    .valign(gtk4::Align::Center)
+                    .build(),
+            );
+            group.add(&row);
+        }
+        page.add(&group);
+    }
 
     let dialog = adw::Dialog::builder()
         .title("Keyboard Shortcuts")
-        .content_width(420)
+        .content_width(460)
+        .content_height(620)
         .child(&{
             let toolbar = adw::ToolbarView::new();
             toolbar.add_top_bar(&adw::HeaderBar::new());

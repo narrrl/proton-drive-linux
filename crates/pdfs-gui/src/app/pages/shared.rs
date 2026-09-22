@@ -39,26 +39,16 @@ pub(crate) struct SharedWidgets {
 /// links I've bookmarked (open / remove). All three live outside the mount tree,
 /// so the page addresses them by uid/id/token and always re-lists from the daemon.
 pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
-    let title = gtk4::Label::builder()
-        .label("Shared with me")
-        .halign(gtk4::Align::Start)
-        .build();
-    title.add_css_class("title-2");
-    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    titles.set_hexpand(true);
-    titles.append(&title);
-
     let add_bookmark = gtk4::Button::builder()
-        .label("Add Bookmark")
-        .valign(gtk4::Align::Center)
+        .child(
+            &adw::ButtonContent::builder()
+                .label("Add Bookmark")
+                .icon_name("list-add-symbolic")
+                .build(),
+        )
+        .tooltip_text("Save a shared link to open it from here")
         .build();
-    add_bookmark.add_css_class("flat");
     let refresh = refresh_button();
-
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.append(&titles);
-    header.append(&refresh);
-    header.append(&add_bookmark);
 
     let shared_with_me = adw::PreferencesGroup::builder()
         .title("Shared with me")
@@ -99,15 +89,17 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    inner.set_margin_top(12);
-    inner.set_margin_bottom(12);
-    inner.set_margin_start(12);
-    inner.set_margin_end(12);
-    inner.append(&header);
+    inner.set_margin_top(18);
+    inner.set_margin_bottom(18);
+    inner.set_margin_start(18);
+    inner.set_margin_end(18);
     inner.append(&content);
+    let (frame, header, _) = page_frame("Shared with Me", &inner);
+    header.pack_start(&add_bookmark);
+    header.pack_end(&refresh);
 
     (
-        inner.upcast(),
+        frame.upcast(),
         SharedWidgets {
             content,
             status,

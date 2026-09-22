@@ -10,4 +10,10 @@
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-offline-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-online-only-symbolic.svg</file>
   </gresource>
+  <!-- The app stylesheet, loaded once at startup. Colours come from the
+       libadwaita palette so the app follows the system accent, light/dark and
+       high contrast; the Proton purple accent is a separate, opt-in provider. -->
+  <gresource prefix="/de/nils/protondrivelinux">
+    <file>style.css</file>
+  </gresource>
 </gresources>

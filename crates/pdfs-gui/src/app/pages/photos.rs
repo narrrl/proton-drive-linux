@@ -40,9 +40,8 @@ pub(crate) struct GalleryState {
     /// status: a load error is not the moment to offer an upload.
     pub(crate) empty_actions: gtk4::Box,
     /// "Photos", or the album's name while one is open.
-    pub(crate) title: gtk4::Label,
-    /// "1,204 photos" under the page title.
-    pub(crate) subtitle: gtk4::Label,
+    /// "1,204 photos" as its subtitle.
+    pub(crate) title: adw::WindowTitle,
     /// The album grid, and the stack that swaps it for its own status page.
     pub(crate) albums: gtk4::FlowBox,
     pub(crate) albums_stack: gtk4::Stack,
@@ -283,8 +282,7 @@ pub(crate) struct GalleryWidgets {
     /// Albums grid.
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
-    pub(crate) title: gtk4::Label,
-    pub(crate) subtitle: gtk4::Label,
+    pub(crate) title: adw::WindowTitle,
     pub(crate) more: gtk4::Button,
     pub(crate) list: gtk4::ListView,
     pub(crate) scroll: gtk4::ScrolledWindow,
@@ -394,24 +392,6 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .child(&list)
         .build();
 
-    let title_label = gtk4::Label::builder()
-        .label("Gallery")
-        .halign(gtk4::Align::Start)
-        .build();
-    title_label.add_css_class("title-2");
-
-    let subtitle = gtk4::Label::builder()
-        .halign(gtk4::Align::Start)
-        .visible(false)
-        .build();
-    subtitle.add_css_class("dim-label");
-    subtitle.add_css_class("caption");
-
-    let titles = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    titles.set_hexpand(true);
-    titles.append(&title_label);
-    titles.append(&subtitle);
-
     // Leaves an open album for the grid it came from. Only an open album shows
     // it — the Albums toggle is what leaves the grid itself.
     let back = gtk4::Button::builder()
@@ -435,7 +415,6 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .tooltip_text("Upload photos")
         .valign(gtk4::Align::Center)
         .build();
-    upload.add_css_class("pill");
     upload.add_css_class("suggested-action");
 
     // Importing an export is a rarer, heavier action than adding one photo, so
@@ -488,14 +467,6 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .transition_type(gtk4::RevealerTransitionType::SlideDown)
         .child(&select_box)
         .build();
-
-    let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header_box.append(&back);
-    header_box.append(&titles);
-    header_box.append(&select_btn);
-    header_box.append(&refresh);
-    header_box.append(&import);
-    header_box.append(&upload);
 
     // All / Photos / Videos / Raw filter. Linked toggles acting as one segmented
     // control: exactly one is active, and flipping it reloads the timeline
@@ -611,20 +582,25 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.set_margin_bottom(12);
     inner.set_margin_start(12);
     inner.set_margin_end(12);
-    inner.append(&header_box);
     inner.append(&view_switch);
     inner.append(&filter_bar);
     inner.append(&content);
 
+    let (frame, header, title) = page_frame("Photos", &inner);
+    header.pack_start(&back);
+    header.pack_start(&upload);
+    header.pack_end(&refresh);
+    header.pack_end(&select_btn);
+    header.pack_end(&import);
+
     (
-        inner.upcast(),
+        frame.upcast(),
         GalleryWidgets {
             model,
             groups,
             content,
             status,
-            title: title_label,
-            subtitle,
+            title,
             more,
             list,
             scroll,
@@ -1995,7 +1971,9 @@ fn clone_row(row: &GalleryRow) -> GalleryRow {
 /// "1,204 photos" under the page title.
 fn update_gallery_subtitle(ui: &Rc<Ui>) {
     let loaded = ui.gallery.model.n_items() as usize;
-    ui.gallery.subtitle.set_visible(loaded > 0);
+    if loaded == 0 {
+        ui.gallery.title.set_subtitle("");
+    }
     // An album counts what the server says it holds, not how much of it has been
     // paged in — the subtitle would otherwise climb as the user scrolls.
     if ui.gallery.album.borrow().is_some() {
@@ -2020,7 +1998,10 @@ fn update_gallery_subtitle(ui: &Rc<Ui>) {
         },
         _ => loaded,
     };
-    ui.gallery.subtitle.set_label(&match total {
+    if loaded == 0 {
+        return;
+    }
+    ui.gallery.title.set_subtitle(&match total {
         1 => format!("1 {one}"),
         n => format!("{} {many}", thousands(n)),
     });
