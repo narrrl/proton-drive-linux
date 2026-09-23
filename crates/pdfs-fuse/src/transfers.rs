@@ -389,11 +389,11 @@ impl<R: Read> Read for CountingReader<'_, R> {
             && cancel.load(Ordering::Relaxed)
         {
             // Not `Ok(0)`: a short read is how this reader says "end of file",
-            // and the SDK would seal a truncated revision from it.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "upload superseded by a newer write",
-            ));
+            // and the SDK would seal a truncated revision from it. Not
+            // `Interrupted` either: every reader loop, the SDK's included,
+            // retries that kind, and this flag never clears, so the drain
+            // thread spun forever with the transfer stuck at 0 bytes (B98).
+            return Err(std::io::Error::other("upload superseded by a newer write"));
         }
         let n = self.inner.read(buf)?;
         self.guard.add(n as u64);
@@ -432,5 +432,18 @@ mod tests {
         let now = Instant::now();
         assert_eq!(limit.charge(1500, now), Duration::from_millis(500));
         assert_eq!(limit.charge(1500, now), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_cancelled_upload_fails_its_read_instead_of_asking_for_a_retry() {
+        let reg = TransferRegistry::new();
+        let guard = reg.begin("f", "", TransferDirection::Upload, 4);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut reader = CountingReader::new(&b"data"[..], &guard).with_cancel(cancel);
+        // `read_exact` retries `Interrupted` the way the SDK's block loop does,
+        // so this hangs rather than fails if the cancel asks for a retry.
+        let err = reader.read_exact(&mut [0; 4]).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(guard.entry.done.load(Ordering::Relaxed), 0);
     }
 }

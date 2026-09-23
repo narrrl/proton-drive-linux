@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## B98 — A superseded upload spins its drain thread forever and shows as "Uploading" at 0 bytes
+
+**Status:** Fixed (unverified) — the daemon carrying the change has not been driven against a
+superseded upload yet.
+**Found:** 2026-09-23. The Sync page showed `Unconfirmed 654050.crdownload — 0 bytes of 23.8 MiB`
+for hours after Brave had finished and renamed the download. `pdfs transfers` listed the same
+entry, `pdfs diagnostics` showed every worker idle, and `/proc/<pid>/task` showed `pdfs-drain-1`
+in state `R` at 100% CPU, holding a deleted staging blob open.
+
+**Where:** `crates/pdfs-fuse/src/transfers.rs` (`CountingReader::read`).
+
+**Cause.** A write that lands while a revision is on the wire cancels that upload through the
+flag `CountingReader` checks before every read. The reader reported the cancel as
+`ErrorKind::Interrupted`. Every read loop treats that kind as "try again", including the SDK's
+`read_full_block`, and the flag never clears, so the loop never ended. The `TransferGuard` was
+never dropped, so the transfer stayed in the registry, and the drain thread was lost until the
+daemon restarted. A browser download is the natural trigger: the `.crdownload` file keeps growing,
+so each new write supersedes the upload of the previous one.
+
+**Fix.** The cancel is reported as `ErrorKind::Other`, which the SDK turns into an error.
+`drain_revision` already recognises a cancelled upload and returns without counting a failure.
+Regression test: `a_cancelled_upload_fails_its_read_instead_of_asking_for_a_retry`.
+
+---
+
 ## B97 — Photo refreshes stack up on the control socket, and shutdown turns the resolve pass into a burst of "undecryptable photo" warnings
 
 **Status:** Fixed (unverified) — the daemon carrying the change has not been driven against a real
