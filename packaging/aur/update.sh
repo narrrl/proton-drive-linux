@@ -21,6 +21,11 @@ for pkg in proton-drive-for-linux proton-drive-for-linux-bin; do
   (cd "$pkg" && updpkgsums)
 done
 
+# --printsrcinfo does not run pkgver(), so let makepkg clone the source and
+# write the current git describe version back into the -git PKGBUILD first.
+# --noprepare skips the cargo fetch in prepare().
+(cd proton-drive-for-linux-git && makepkg -od --noprepare --noconfirm && rm -rf src)
+
 for pkg in proton-drive-for-linux proton-drive-for-linux-git proton-drive-for-linux-bin; do
   (cd "$pkg" && makepkg --printsrcinfo > .SRCINFO)
   echo "updated $pkg"
