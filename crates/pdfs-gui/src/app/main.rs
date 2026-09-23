@@ -459,6 +459,7 @@ fn build_window(app: &adw::Application) {
             status: gallery_widgets.status.clone(),
             retry: gallery_widgets.retry.clone(),
             more: gallery_widgets.more.clone(),
+            import_banner: gallery_widgets.import_banner.clone(),
             upload: gallery_widgets.upload.clone(),
             import: gallery_widgets.import.clone(),
             empty_actions: gallery_widgets.empty_actions.clone(),
@@ -1126,6 +1127,12 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     sign_out_action.connect_activate(move |_, _| sign_out(&ui_out));
     window.add_action(&sign_out_action);
 
+    // The Photos page's import banner leads here.
+    let show_import = gio::SimpleAction::new("show-import", None);
+    let ui_import = ui.clone();
+    show_import.connect_activate(move |_, _| ui_import.stack.set_visible_child_name("takeout"));
+    window.add_action(&show_import);
+
     let shortcuts = gio::SimpleAction::new("shortcuts", None);
     let win = window.clone();
     shortcuts.connect_activate(move |_, _| show_shortcuts(&win));
@@ -1208,6 +1215,7 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("<Control>plus", "Larger thumbnails"),
                 ("<Control>minus", "Smaller thumbnails"),
                 ("<Control>0", "Reset thumbnail size"),
+                ("<Control>a", "Select all"),
             ],
         ),
         (

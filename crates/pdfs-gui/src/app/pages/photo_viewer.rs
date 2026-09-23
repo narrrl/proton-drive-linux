@@ -70,7 +70,7 @@ fn set_favorite_icon(button: &gtk4::ToggleButton, favorite: bool) {
 
 /// Write a favourite change back into the loaded gallery page, so returning to
 /// the grid (or reopening the photo) shows what was just set without a reload.
-fn set_gallery_favorite(ui: &Rc<Ui>, uid: &str, favorite: bool) {
+pub(crate) fn set_gallery_favorite(ui: &Rc<Ui>, uid: &str, favorite: bool) {
     let Some(idx) = find_photo_index(&ui.gallery.model, uid) else {
         return;
     };

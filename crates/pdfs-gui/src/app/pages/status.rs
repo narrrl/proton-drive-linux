@@ -608,6 +608,9 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     // A Takeout import outlives the page that started it, so it is polled
     // wherever the user has navigated to — otherwise leaving the page means
     // never being told it finished.
+    ui.gallery
+        .import_banner
+        .set_revealed(ui.takeout.running.get());
     if ui.stack.visible_child_name().as_deref() == Some("takeout") || ui.takeout.running.get() {
         refresh_takeout(ui);
     }

@@ -32,6 +32,8 @@ pub(crate) struct GalleryState {
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     pub(crate) more: gtk4::Button,
+    /// Says a Google Photos import is running, with a way to its page.
+    pub(crate) import_banner: adw::Banner,
     pub(crate) upload: gtk4::Button,
     /// Opens the Google Photos Takeout import chooser.
     pub(crate) import: gtk4::Button,
@@ -150,7 +152,7 @@ pub(crate) struct GalleryState {
 }
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
-pub(crate) const PHOTOS_PAGE: usize = 60;
+pub(crate) const PHOTOS_PAGE: usize = 200;
 
 /// Gallery row height in px: the zoom range, its default, and the step one
 /// Ctrl+scroll notch (or Ctrl+±) moves it by. A justified row is scaled to the
@@ -284,6 +286,8 @@ pub(crate) struct GalleryWidgets {
     pub(crate) status: adw::StatusPage,
     pub(crate) title: adw::WindowTitle,
     pub(crate) more: gtk4::Button,
+    /// Says a Google Photos import is running, with a way to its page.
+    pub(crate) import_banner: adw::Banner,
     pub(crate) list: gtk4::ListView,
     pub(crate) scroll: gtk4::ScrolledWindow,
     pub(crate) retry: gtk4::Button,
@@ -521,8 +525,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // The page's two views, as one segmented control under the title: the
     // timeline, and the albums. This is navigation, not a filter — which is why
     // it sits above the filter row rather than beside the kind toggles.
+    // "Timeline", not "Photos": the kind filter below has a Photos tab too.
     let photos_btn = gtk4::ToggleButton::builder()
-        .label("Photos")
+        .label("Timeline")
         .active(true)
         .build();
     let albums_btn = gtk4::ToggleButton::builder().label("Albums").build();
@@ -577,6 +582,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     content.add_named(&status, Some("status"));
     content.add_named(&albums_stack, Some("albums"));
 
+    let import_banner = adw::Banner::builder()
+        .title("Importing from Google Photos…")
+        .button_label("View")
+        .action_name("win.show-import")
+        .build();
+
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
     inner.set_margin_bottom(12);
@@ -586,7 +597,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.append(&filter_bar);
     inner.append(&content);
 
-    let (frame, header, title) = page_frame("Photos", &inner);
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    body.append(&import_banner);
+    body.append(&inner);
+    let (frame, header, title) = page_frame("Photos", &body);
     header.pack_start(&back);
     header.pack_start(&upload);
     header.pack_end(&refresh);
@@ -602,6 +616,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             status,
             title,
             more,
+            import_banner,
             list,
             scroll,
             retry,
@@ -900,6 +915,7 @@ pub(crate) fn wire_gallery(
             Some("plus" | "equal" | "KP_Add") => zoom_gallery(&ui_keys, ROW_STEP),
             Some("minus" | "KP_Subtract") => zoom_gallery(&ui_keys, -ROW_STEP),
             Some("0" | "KP_0") => set_gallery_tile(&ui_keys, ROW_DEFAULT),
+            Some("a" | "A") => select_all_photos(&ui_keys),
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
@@ -1343,6 +1359,17 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     });
     button.add_controller(modifier);
 
+    let context = gtk4::GestureClick::builder().button(3).build();
+    let ui_context = ui.clone();
+    let photo = tile.photo.clone();
+    context.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        if let Some(anchor) = gesture.widget().and_downcast::<gtk4::Button>() {
+            show_photo_menu(&ui_context, &photo, &anchor, x, y);
+        }
+    });
+    button.add_controller(context);
+
     // A still opens in the in-app lightbox; a video can't render there, so it
     // downloads and hands off to an external player instead. In selection mode
     // a tile picks instead of opening: the lightbox is one Escape away.
@@ -1424,6 +1451,11 @@ fn selected_file_count(ui: &Rc<Ui>, uids: &[String]) -> usize {
 
 pub(crate) fn delete_selected(ui: &Rc<Ui>) {
     let uids: Vec<String> = ui.gallery.selected.borrow().iter().cloned().collect();
+    confirm_trash_photos(ui, uids);
+}
+
+/// Confirm, then move the photos behind `uids` to Proton trash.
+pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
     if uids.is_empty() {
         return;
     }
@@ -2086,6 +2118,175 @@ pub(crate) fn short_capture_time(secs: i64) -> String {
 
 /// Fetch a timeline page from the daemon. When `append` is false the model is
 /// cleared first (fresh load); otherwise the next page is tacked on.
+/// The empty state for a timeline filtered to `kind`, favourites and/or a
+/// `month`: what is missing, in the filter's own words.
+pub(crate) fn empty_timeline_text(
+    kind: Option<PhotoKind>,
+    favorites: bool,
+    month: Option<&str>,
+) -> (String, String) {
+    let what = match kind {
+        None => "photos",
+        Some(PhotoKind::Photo) => "photos",
+        Some(PhotoKind::Video) => "videos",
+        Some(PhotoKind::Raw) => "raw files",
+    };
+    let when = month.map(|m| format!(" in {m}")).unwrap_or_default();
+    match (favorites, kind, month) {
+        (false, None, None) => (
+            "No photos yet".to_string(),
+            "Photos you upload to Proton Drive appear here.".to_string(),
+        ),
+        (true, None, None) => (
+            "No favourites yet".to_string(),
+            "Star a photo in the viewer or from its menu to find it here.".to_string(),
+        ),
+        (true, _, _) => (
+            format!("No favourite {what}{when}"),
+            "Turn off the favourites filter to see everything.".to_string(),
+        ),
+        (false, _, _) => (
+            format!("No {what}{when}"),
+            "Try another filter or month.".to_string(),
+        ),
+    }
+}
+
+/// Load the next page when the timeline does not fill the window yet: with no
+/// scrollbar there is no scrolling to trigger it.
+fn fill_viewport(ui: &Rc<Ui>) {
+    let ui = ui.clone();
+    glib::idle_add_local_once(move || {
+        let Some(adj) = ui.gallery.list.vadjustment() else {
+            return;
+        };
+        if ui.gallery.more.is_visible()
+            && ui.gallery.more.is_sensitive()
+            && adj.upper() <= adj.page_size() + 1.0
+        {
+            load_gallery(&ui, true);
+        }
+    });
+}
+
+/// Select every photo loaded so far (Ctrl+A).
+pub(crate) fn select_all_photos(ui: &Rc<Ui>) {
+    set_selection_mode(ui, true);
+    {
+        let mut selected = ui.gallery.selected.borrow_mut();
+        for idx in 0..ui.gallery.model.n_items() {
+            if let Some(boxed) = ui.gallery.model.item(idx).and_downcast::<BoxedAnyObject>() {
+                selected.insert(boxed.borrow::<PhotoItem>().uid.clone());
+            }
+        }
+    }
+    sync_selection_bar(ui);
+    repaint_gallery(ui);
+}
+
+/// A tile's right-click menu.
+fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64, y: f64) {
+    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let popover = gtk4::Popover::builder()
+        .has_arrow(false)
+        .position(gtk4::PositionType::Bottom)
+        .pointing_to(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1))
+        .child(&menu)
+        .build();
+    popover.set_parent(anchor);
+    popover.connect_closed(|p| p.unparent());
+    let item = |label: &str, icon: &str, run: Box<dyn Fn()>| {
+        let button = menu_item(label, icon);
+        let pop = popover.clone();
+        button.connect_clicked(move |_| {
+            pop.popdown();
+            run();
+        });
+        menu.append(&button);
+    };
+
+    let (ui_c, uid) = (ui.clone(), photo.uid.clone());
+    if photo.kind == PhotoKind::Video {
+        item(
+            "Play",
+            "media-playback-start-symbolic",
+            Box::new(move || play_video(&ui_c, uid.clone())),
+        );
+    } else {
+        item(
+            "Open",
+            "document-open-symbolic",
+            Box::new(move || open_photo_viewer(&ui_c, uid.clone())),
+        );
+    }
+    let (ui_c, uid, favorite) = (ui.clone(), photo.uid.clone(), photo.favorite);
+    item(
+        if favorite {
+            "Remove from Favourites"
+        } else {
+            "Add to Favourites"
+        },
+        if favorite {
+            "non-starred-symbolic"
+        } else {
+            "starred-symbolic"
+        },
+        Box::new(move || set_photo_favorite(&ui_c, uid.clone(), !favorite)),
+    );
+    let (ui_c, uid) = (ui.clone(), photo.uid.clone());
+    item(
+        "Select",
+        "selection-mode-symbolic",
+        Box::new(move || {
+            set_selection_mode(&ui_c, true);
+            toggle_selected(&ui_c, &uid);
+        }),
+    );
+    let (ui_c, uid) = (ui.clone(), photo.uid.clone());
+    item(
+        "Move to Trash…",
+        "user-trash-symbolic",
+        Box::new(move || confirm_trash_photos(&ui_c, vec![uid.clone()])),
+    );
+    popover.popup();
+}
+
+/// Star or unstar a photo from the grid, and show the new state.
+fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::SetPhotoFavorite {
+            uid: uid.clone(),
+            favorite,
+        },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => {
+                set_gallery_favorite(&ui, &uid, favorite);
+                repaint_gallery(&ui);
+                toast(
+                    &ui,
+                    if favorite {
+                        "Added to Favourites"
+                    } else {
+                        "Removed from Favourites"
+                    },
+                );
+            }
+            Ok(Ok(Response::Error { message, .. })) => {
+                toast_error(&ui, "Couldn't change the favourite", &message)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't change the favourite",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
 pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     if ui.gallery.loading.get() {
         return;
@@ -2171,26 +2372,51 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 }
                 repaint_gallery(&ui);
                 if ui.gallery.model.n_items() == 0 {
+                    let filtered = ui.gallery.kind.get().is_some()
+                        || ui.gallery.favorites.get()
+                        || ui.gallery.range.get().is_some();
                     let (title, description) = if ui.gallery.album.borrow().is_some() {
-                        ("Empty album", "This album has no photos in it.")
-                    } else {
                         (
-                            "No photos yet",
-                            "Photos you upload to Proton Drive appear here.",
+                            "Empty album".to_string(),
+                            "This album has no photos in it.".to_string(),
+                        )
+                    } else {
+                        let month = ui
+                            .gallery
+                            .range
+                            .get()
+                            .and_then(|_| ui.gallery.dates.selected_item())
+                            .and_downcast::<gtk4::StringObject>()
+                            .map(|month| month.string().to_string());
+                        empty_timeline_text(
+                            ui.gallery.kind.get(),
+                            ui.gallery.favorites.get(),
+                            month.as_deref(),
                         )
                     };
-                    gallery_status(&ui, "image-x-generic-symbolic", title, description, false);
-                    // Only the whole-timeline empty state: an empty *album* is
-                    // filled by adding existing photos to it, not by uploading
-                    // into it, so the buttons would point the wrong way.
+                    gallery_status(
+                        &ui,
+                        if ui.gallery.favorites.get() {
+                            "starred-symbolic"
+                        } else {
+                            "image-x-generic-symbolic"
+                        },
+                        &title,
+                        &description,
+                        false,
+                    );
+                    // Only the whole, unfiltered timeline offers Upload: an
+                    // empty *album* is filled by adding existing photos to it,
+                    // and an empty filter is not a library that needs photos.
                     ui.gallery
                         .empty_actions
-                        .set_visible(ui.gallery.album.borrow().is_none());
+                        .set_visible(ui.gallery.album.borrow().is_none() && !filtered);
                     return;
                 }
                 ui.gallery.content.set_visible_child_name("timeline");
                 // Offer "Load more" only when the page came back full.
                 ui.gallery.more.set_visible(items.len() == PHOTOS_PAGE);
+                fill_viewport(&ui);
             }
             // A failed *next* page keeps the photos already on screen — the failure
             // goes to a toast rather than wiping the timeline for a status page.
@@ -2304,4 +2530,24 @@ pub(crate) fn play_video(ui: &Rc<Ui>, uid: String) {
             ),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_timeline_text;
+    use pdfs_core::control::PhotoKind;
+
+    #[test]
+    fn an_empty_filter_names_what_it_filtered() {
+        assert_eq!(empty_timeline_text(None, false, None).0, "No photos yet");
+        assert_eq!(empty_timeline_text(None, true, None).0, "No favourites yet");
+        assert_eq!(
+            empty_timeline_text(Some(PhotoKind::Video), false, Some("June 2024")).0,
+            "No videos in June 2024"
+        );
+        assert_eq!(
+            empty_timeline_text(Some(PhotoKind::Raw), true, None).0,
+            "No favourite raw files"
+        );
+    }
 }

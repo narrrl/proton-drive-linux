@@ -41,6 +41,11 @@ Schema: **30** (unchanged).
   whole selection. Rename selects the name without its extension.
 - **Drop to upload.** Files and folders dropped on My Files upload into the folder on screen. The
   upload toast links to the Sync page.
+- **Photos.** The main view is called Timeline. Right-clicking a photo opens a menu to open it,
+  favourite it, select it or move it to Trash; Ctrl+A selects every loaded photo. An empty filter
+  says what it filtered ("No videos in June 2024") instead of the first-run hint. A banner shows
+  while a Takeout import runs and links to it. Pages load 200 photos at a time and keep loading
+  until the window is full.
 
 ## [1.11.1] — 2026-09-19
 
