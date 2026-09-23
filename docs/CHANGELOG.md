@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-09-23
+
+The desktop app, the tray and the search prompt speak German, British English, Spanish, French,
+Italian, Dutch, Polish and Brazilian Portuguese, picked from the system language or chosen in
+Preferences.
+
 Schema: **31** (unchanged).
 
 ### Added
@@ -995,6 +1001,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.1.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.1.0
 [2.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.0.0
 [1.11.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.1
 [1.11.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.0
