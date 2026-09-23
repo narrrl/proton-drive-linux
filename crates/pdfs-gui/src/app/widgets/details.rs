@@ -39,6 +39,8 @@ pub(crate) struct DetailsWidgets {
     /// fills the pane; it is shown while this is on, so a click never moves
     /// the files under the pointer halfway through a double-click.
     pub(crate) toggle: gtk4::ToggleButton,
+    /// "details" while an entry is shown, "empty" with nothing selected.
+    pub(crate) pages: gtk4::Stack,
 }
 
 /// The details pane shown beside the file views: a big type icon over the entry's
@@ -171,8 +173,37 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&inner)
         .build();
+    // With the pane open and nothing selected (a fresh folder, a cleared
+    // selection) it says so rather than closing: opening and closing it by
+    // itself would move the files under the pointer.
+    let empty_close = gtk4::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Close details")
+        .halign(gtk4::Align::End)
+        .margin_top(12)
+        .margin_end(12)
+        .build();
+    empty_close.add_css_class("flat");
+    empty_close.add_css_class("circular");
+    let toggle_off = toggle.clone();
+    empty_close.connect_clicked(move |_| toggle_off.set_active(false));
+    let empty_status = adw::StatusPage::builder()
+        .icon_name("sidebar-show-right-symbolic")
+        .title("No item selected")
+        .description("Select a file or folder to see its details.")
+        .vexpand(true)
+        .build();
+    empty_status.add_css_class("compact");
+    let empty = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    empty.append(&empty_close);
+    empty.append(&empty_status);
+
+    let pages = gtk4::Stack::new();
+    pages.add_named(&scroll, Some("details"));
+    pages.add_named(&empty, Some("empty"));
+    pages.set_visible_child_name("empty");
     let pane = adw::ToolbarView::new();
-    pane.set_content(Some(&scroll));
+    pane.set_content(Some(&pages));
     pane.add_css_class("background");
 
     (
@@ -196,6 +227,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
             trash_button,
             close_button,
             toggle,
+            pages,
         },
     )
 }
@@ -214,7 +246,7 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
                 let entries = selected_entries(&ui_sel);
                 match entries.as_slice() {
                     [entry] => show_details(&ui_sel, entry),
-                    _ => hide_details(&ui_sel),
+                    _ => clear_details(&ui_sel),
                 }
                 sync_bulk_bar(&ui_sel);
             });
@@ -227,8 +259,16 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
 
     let ui_toggle = ui.clone();
     ui.details.details.toggle.connect_toggled(move |toggle| {
-        let show = toggle.is_active() && ui_toggle.details.details_entry.borrow().is_some();
-        ui_toggle.browser.split.set_show_sidebar(show);
+        ui_toggle.browser.split.set_show_sidebar(toggle.is_active());
+    });
+    // On a narrow window the pane overlays the files, and a click outside it
+    // closes it; the toggle follows so the next click on it opens it again.
+    let ui_split = ui.clone();
+    ui.browser.split.connect_show_sidebar_notify(move |split| {
+        let toggle = &ui_split.details.details.toggle;
+        if toggle.is_active() != split.shows_sidebar() {
+            toggle.set_active(split.shows_sidebar());
+        }
     });
 
     let ui_open = ui.clone();
@@ -301,7 +341,7 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
         });
 }
 
-/// Reveal the details pane and paint it from `entry`.
+/// Paint the details pane from `entry`. It shows while the header toggle is on.
 pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     ui.details.details_suppress.set(true);
     let d = &ui.details.details;
@@ -348,23 +388,11 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     if mounted {
         load_details_extras(ui, entry);
     }
-    // Only a pane the user asked for is revealed. This runs from
-    // `selection_changed`, which fires on the *first* press of a double-click:
-    // sliding the pane in there reflows the files, so the second press lands on
-    // a different spot (or item) and the folder never opens. With the pane
-    // already up, a new selection only repaints it. Deferred to idle all the
-    // same, since mutating the widget tree mid-gesture cancels GtkGridView's
-    // multi-press tracking; the guard lets a navigation that clears the entry
-    // win the race.
-    if !ui.details.details.toggle.is_active() {
-        return;
-    }
-    let ui = ui.clone();
-    glib::idle_add_local_once(move || {
-        if ui.details.details_entry.borrow().is_some() {
-            ui.browser.split.set_show_sidebar(true);
-        }
-    });
+    // Only the content changes. Whether the pane shows is the toggle's call:
+    // this runs from `selection_changed`, on the *first* press of a
+    // double-click, and sliding the pane in there would move the files so the
+    // second press lands elsewhere and the folder never opens.
+    d.pages.set_visible_child_name("details");
 }
 
 /// Fill the Sharing and Versions rows, which need the network. The answers
@@ -449,8 +477,6 @@ pub(crate) fn versions_summary(items: &[RevisionInfo]) -> String {
     }
 }
 
-/// Hide the details pane and forget the entry it was showing, so a stale entry
-/// can't be acted on after the listing moves on.
 /// Show the pane for `entry`, turning the header toggle on.
 pub(crate) fn open_details(ui: &Rc<Ui>, entry: &DirEntry) {
     ui.details.details.toggle.set_active(true);
@@ -463,8 +489,11 @@ pub(crate) fn toggle_details(ui: &Rc<Ui>) {
     toggle.set_active(!toggle.is_active());
 }
 
-pub(crate) fn hide_details(ui: &Rc<Ui>) {
-    ui.browser.split.set_show_sidebar(false);
+/// Forget the entry the pane was showing, so a stale entry can't be acted on
+/// after the listing moves on. An open pane stays open and says nothing is
+/// selected.
+pub(crate) fn clear_details(ui: &Rc<Ui>) {
+    ui.details.details.pages.set_visible_child_name("empty");
     *ui.details.details_entry.borrow_mut() = None;
 }
 

@@ -129,6 +129,12 @@ Schema: **31** (unchanged).
   so the folder did not open. The pane now shows on request, from the header's Details toggle,
   Alt+Enter or the item menu's Details, and then follows the selection. Closing it keeps the
   selection.
+- **The details pane opens only when asked.** On a wide window it used to show at start, empty,
+  and close again whenever you entered a folder. It now follows the header toggle alone. With
+  nothing selected it says so instead of closing, so opening a folder no longer moves the files.
+- **Context menus no longer have wide margins under some themes.** A menu opened on a file tile
+  was placed inside the tile, so a theme's rules for tile contents (Catppuccin's
+  `gridview > child box { margin: 12px }`) spaced out every section.
 - **My Files behaves more like a file manager.** A click on empty space between the files clears
   the selection; Ctrl or Shift held keeps it. Backspace goes back while the focus is on the files.
 - **An upload parked behind a temp-file rename no longer stays parked forever.** A create for a

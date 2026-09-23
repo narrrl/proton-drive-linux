@@ -1501,7 +1501,8 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             {
                 clear_selection(&ui);
                 sync_bulk_bar(&ui);
-                hide_details(&ui);
+                clear_details(&ui);
+                ui.details.details.toggle.set_active(false);
             }
             _ => return glib::Propagation::Proceed,
         }

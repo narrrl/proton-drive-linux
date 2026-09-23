@@ -369,6 +369,9 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .sidebar_position(gtk4::PackType::End)
         .collapsed(true)
         .show_sidebar(false)
+        // Unpinned, uncollapsing at the wide breakpoint would show the pane by
+        // itself; the header toggle alone decides.
+        .pin_sidebar(true)
         .max_sidebar_width(300.0)
         .content(&content)
         .sidebar(&details_pane)
@@ -568,7 +571,7 @@ pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     // status (loading, offline, error) turns them back off.
     ui.browser.empty_actions.set_visible(false);
     ui.browser.content.set_visible_child_name("status");
-    hide_details(ui);
+    clear_details(ui);
 }
 
 /// The selection model shared by the grid and the list.
