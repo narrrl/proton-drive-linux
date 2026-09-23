@@ -18,6 +18,7 @@ use pages::takeout::*;
 use pages::trash::*;
 use pages::verify::*;
 use widgets::details::*;
+use widgets::menu::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
@@ -1310,6 +1311,12 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 ui.browser.actions.activate_action("up", None)
             }
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
+            gtk4::gdk::Key::Menu if on_browser => popup_keyboard_context_menu(&ui),
+            gtk4::gdk::Key::F10
+                if on_browser && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) =>
+            {
+                popup_keyboard_context_menu(&ui)
+            }
             gtk4::gdk::Key::F2 if on_browser => {
                 // Renaming is one name at a time; saying so beats a key that
                 // silently does nothing with several items highlighted.

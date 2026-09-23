@@ -799,6 +799,8 @@ pub(crate) fn browser_views(ui: &Rc<Ui>) {
 /// button. Split out from [`build_browser_page`] because every renderer needs
 /// the [`Ui`] handle to open entries and raise the context menu.
 pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk4::ColumnView) {
+    attach_background_menu(ui, grid);
+    attach_background_menu(ui, column_view);
     // Resize only realised grid cells. Rebuilding the whole model for every
     // slider step would repeatedly tear down selection state while the pointer
     // is still moving.
@@ -1023,251 +1025,243 @@ pub(crate) fn text_column(
 /// Attach a secondary-button [`gtk4::GestureClick`] to a cell that pops a context
 /// menu for whatever entry the owning `item` is currently bound to. Capturing the
 /// [`gtk4::ListItem`] (rather than a snapshot of the entry) keeps the menu correct
-/// as the view recycles cells while scrolling.
+/// as the view recycles cells while scrolling. The click is claimed, so the
+/// view's own background menu does not open on top of it.
 pub(crate) fn attach_context_menu(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
     let ui = ui.clone();
     let item = item.clone();
     let target = anchor.clone();
-    gesture.connect_pressed(move |_, _, x, y| {
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
         if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
             let entry = obj.borrow::<DirEntry>().clone();
             // Right-clicking a row that is part of a multi-selection acts on the
             // batch; right-clicking outside one acts on the row, as before.
             let selected = selected_entries(&ui);
             if selected.len() > 1 && selected.iter().any(|e| e.uid == entry.uid) {
-                show_bulk_context_menu(&ui, selected, &target, x, y);
+                bulk_context_menu(&ui, selected).popup_at(&target, x, y);
             } else {
-                show_context_menu(&ui, &entry, &target, x, y);
+                entry_context_menu(&ui, &entry).popup_at(&target, x, y);
             }
         }
     });
     anchor.add_controller(gesture);
 }
 
-/// Pop a context menu next to `anchor` at the click point, offering Open and a
-/// Pin/Unpin toggle (files only). Built fresh per click because the items are
-/// entry-specific; it unparents itself once dismissed.
-pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Box, x: f64, y: f64) {
-    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    let popover = gtk4::Popover::builder()
-        .has_arrow(false)
-        .position(gtk4::PositionType::Bottom)
-        .pointing_to(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1))
-        .child(&menu)
-        .build();
-    popover.set_parent(anchor);
-    popover.connect_closed(|p| p.unparent());
+/// Right-clicking the empty space of a view offers the folder's own actions.
+pub(crate) fn attach_background_menu(ui: &Rc<Ui>, view: &impl IsA<gtk4::Widget>) {
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+    let ui = ui.clone();
+    let target = view.clone().upcast::<gtk4::Widget>();
+    gesture.connect_pressed(move |_, _, x, y| {
+        background_context_menu(&ui).popup_at(&target, x, y);
+    });
+    view.add_controller(gesture);
+}
 
-    // Media leads with Play (stream from the mount, no download); the plain Open
-    // below still downloads a local copy for anyone who wants one.
-    if is_streamable_media_entry(entry) {
-        let play = menu_item("Play (stream)", "media-playback-start-symbolic");
-        let ui_play = ui.clone();
-        let entry_play = entry.clone();
-        let pop = popover.clone();
-        play.connect_clicked(move |_| {
-            pop.popdown();
-            stream_entry(&ui_play, &entry_play);
-        });
-        menu.append(&play);
-    }
+/// The Menu key or Shift+F10: the menu for the selection, or for the folder
+/// when nothing is selected, opened at the focused item.
+pub(crate) fn popup_keyboard_context_menu(ui: &Rc<Ui>) {
+    let view = ui
+        .browser
+        .views
+        .visible_child()
+        .unwrap_or_else(|| ui.browser.views.clone().upcast());
+    // The focused cell is where the eye is; without one, the middle of the view.
+    let (x, y) = view
+        .root()
+        .and_then(|root| root.focus())
+        .filter(|focus| focus.is_ancestor(&view))
+        .and_then(|focus| focus.compute_bounds(&view))
+        .map(|b| {
+            (
+                (b.x() + b.width() / 2.0) as f64,
+                (b.y() + b.height() / 2.0) as f64,
+            )
+        })
+        .unwrap_or((view.width() as f64 / 2.0, view.height() as f64 / 2.0));
+    let selected = selected_entries(ui);
+    let menu = match selected.len() {
+        0 => background_context_menu(ui),
+        1 => entry_context_menu(ui, &selected[0]),
+        _ => bulk_context_menu(ui, selected),
+    };
+    menu.popup_at(&view, x, y);
+}
 
-    let open = menu_item("Open", "document-open-symbolic");
-    let ui_open = ui.clone();
-    let entry_open = entry.clone();
-    let pop = popover.clone();
-    open.connect_clicked(move |_| {
-        pop.popdown();
+/// The menu for one entry, in the order of `docs/UI_UX_PLAN.md` §6: open,
+/// offline, sharing, organising, and the destructive item last on its own.
+pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Open", move || {
         // Open always means "download a local copy and hand off", even for a
         // media file — `activate_entry` would otherwise stream it.
-        if is_streamable_media_entry(&entry_open) {
-            download_and_open(&ui_open, &entry_open);
+        if is_streamable_media_entry(&entry_c) {
+            download_and_open(&ui_c, &entry_c);
         } else {
-            activate_entry(&ui_open, &entry_open);
+            activate_entry(&ui_c, &entry_c);
         }
     });
-    menu.append(&open);
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Open With…", move || open_entry_with(&ui_c, &entry_c));
+    // Play streams from the mount, no download; Open above still fetches a
+    // local copy for anyone who wants one.
+    if is_streamable_media_entry(entry) {
+        let (ui_c, entry_c) = (ui.clone(), entry.clone());
+        menu.item("Play", move || stream_entry(&ui_c, &entry_c));
+    }
+    menu.section();
 
     if !entry.is_dir {
-        let (label, icon) = if entry.pinned {
-            ("Make online only", "pdfs-online-only-symbolic")
-        } else {
-            ("Make available offline", "pdfs-offline-symbolic")
-        };
-        let pin = menu_item(label, icon);
-        let ui_pin = ui.clone();
-        let entry_pin = entry.clone();
-        let pop = popover.clone();
-        pin.connect_clicked(move |_| {
-            pop.popdown();
-            toggle_pin(&ui_pin, &entry_pin);
+        let (ui_c, entry_c) = (ui.clone(), entry.clone());
+        menu.toggle("Available offline", entry.pinned, move |_| {
+            toggle_pin(&ui_c, &entry_c)
         });
-        menu.append(&pin);
+        menu.section();
     }
 
-    menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Share…", move || open_share_dialog(&ui_c, &entry_c));
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Copy Link", move || copy_entry_link(&ui_c, &entry_c));
+    menu.section();
 
-    let rename = menu_item("Rename…", "document-edit-symbolic");
-    let ui_rn = ui.clone();
-    let entry_rn = entry.clone();
-    let pop = popover.clone();
-    rename.connect_clicked(move |_| {
-        pop.popdown();
-        prompt_rename(&ui_rn, &entry_rn);
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Rename…", move || prompt_rename(&ui_c, &entry_c));
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Move To…", move || {
+        prompt_move(&ui_c, vec![entry_c.clone()])
     });
-    menu.append(&rename);
+    if !entry.is_dir {
+        let (ui_c, entry_c) = (ui.clone(), entry.clone());
+        menu.item("Versions…", move || open_versions_dialog(&ui_c, &entry_c));
+    }
+    menu.section();
 
-    let move_it = menu_item("Move…", "folder-move-symbolic");
-    let ui_mv = ui.clone();
-    let entry_mv = entry.clone();
-    let pop = popover.clone();
-    move_it.connect_clicked(move |_| {
-        pop.popdown();
-        prompt_move(&ui_mv, vec![entry_mv.clone()]);
-    });
-    menu.append(&move_it);
-
-    menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-    let share = menu_item("Share…", "emblem-shared-symbolic");
-    let ui_sh = ui.clone();
-    let entry_sh = entry.clone();
-    let pop = popover.clone();
-    share.connect_clicked(move |_| {
-        pop.popdown();
-        open_share_dialog(&ui_sh, &entry_sh);
-    });
-    menu.append(&share);
-
-    let trash = menu_item("Move to Trash", "user-trash-symbolic");
-    let ui_tr = ui.clone();
-    let entry_tr = entry.clone();
-    let pop = popover.clone();
-    trash.connect_clicked(move |_| {
-        pop.popdown();
-        trash_entry(&ui_tr, &entry_tr);
-    });
-    menu.append(&trash);
-
-    popover.popup();
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Move to Trash", move || trash_entry(&ui_c, &entry_c));
+    menu
 }
 
-/// The context menu for a multi-selection: the batch-capable actions only.
-/// Rename, Move, Share and the revision history all need a single subject, so
-/// they are simply absent here rather than offered and then refused.
-pub(crate) fn show_bulk_context_menu(
-    ui: &Rc<Ui>,
-    entries: Vec<DirEntry>,
-    anchor: &gtk4::Box,
-    x: f64,
-    y: f64,
-) {
-    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    let popover = gtk4::Popover::builder()
-        .has_arrow(false)
-        .position(gtk4::PositionType::Bottom)
-        .pointing_to(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1))
-        .child(&menu)
-        .build();
-    popover.set_parent(anchor);
-    popover.connect_closed(|p| p.unparent());
-
-    let header = gtk4::Label::builder()
-        .label(format!("{} selected", entries.len()))
-        .halign(gtk4::Align::Start)
-        .build();
-    header.add_css_class("dim-label");
-    header.add_css_class("caption");
-    header.set_margin_top(6);
-    header.set_margin_bottom(4);
-    header.set_margin_start(10);
-    menu.append(&header);
-
-    let files_only = entries.iter().all(|e| !e.is_dir);
-    if files_only && entries.iter().any(|e| !e.pinned) {
-        let pin = menu_item("Make available offline", "pdfs-offline-symbolic");
-        let ui_pin = ui.clone();
-        let batch = entries.clone();
-        let pop = popover.clone();
-        pin.connect_clicked(move |_| {
-            pop.popdown();
-            run_bulk_pin(&ui_pin, batch.clone(), true);
+/// The menu for a multi-selection: the batch-capable actions only. Rename,
+/// Share and the revision history all need a single subject, so they are
+/// simply absent here rather than offered and then refused.
+pub(crate) fn bulk_context_menu(ui: &Rc<Ui>, entries: Vec<DirEntry>) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    // Offline state is a file-only notion; the check shows whether the whole
+    // batch already is.
+    if entries.iter().all(|e| !e.is_dir) {
+        let (ui_c, batch) = (ui.clone(), entries.clone());
+        let all_pinned = entries.iter().all(|e| e.pinned);
+        menu.toggle("Available offline", all_pinned, move |pin| {
+            run_bulk_pin(&ui_c, batch.clone(), pin)
         });
-        menu.append(&pin);
     }
-    if files_only && entries.iter().any(|e| e.pinned) {
-        let unpin = menu_item("Make online only", "pdfs-online-only-symbolic");
-        let ui_unpin = ui.clone();
-        let batch = entries.clone();
-        let pop = popover.clone();
-        unpin.connect_clicked(move |_| {
-            pop.popdown();
-            run_bulk_pin(&ui_unpin, batch.clone(), false);
-        });
-        menu.append(&unpin);
-    }
+    let (ui_c, batch) = (ui.clone(), entries.clone());
+    menu.item("Move To…", move || prompt_move(&ui_c, batch.clone()));
+    menu.labelled_section(&format!("{} selected", entries.len()));
 
-    // Offline items only exist for all-file selections; without them the
-    // separator would sit directly under the header.
-    if files_only {
-        menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    }
-
-    let trash = menu_item("Move to Trash", "user-trash-symbolic");
-    let ui_tr = ui.clone();
-    let pop = popover.clone();
-    trash.connect_clicked(move |_| {
-        pop.popdown();
-        trash_entries(&ui_tr, entries.clone());
+    let ui_c = ui.clone();
+    menu.item("Move to Trash", move || {
+        trash_entries(&ui_c, entries.clone())
     });
-    menu.append(&trash);
-
-    popover.popup();
+    menu
 }
 
-/// A left-aligned, flat icon+label button for the context menu.
-pub(crate) fn menu_item(label: &str, icon: &str) -> gtk4::Button {
-    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    row.append(&gtk4::Image::from_icon_name(icon));
-    row.append(
-        &gtk4::Label::builder()
-            .label(label)
-            .halign(gtk4::Align::Start)
-            .hexpand(true)
-            .build(),
+/// The menu for the folder on screen, opened on empty space.
+pub(crate) fn background_context_menu(ui: &Rc<Ui>) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    let run = |name: &'static str| {
+        let ui = ui.clone();
+        move || ui.browser.actions.activate_action(name, None)
+    };
+    let mounted = *ui.mounted.borrow();
+    if mounted && ui.browser.search.text().is_empty() {
+        menu.item("New Folder…", run("new-folder"));
+        menu.item("Upload Files…", run("upload"));
+        menu.item("Upload Folder…", run("upload-folder"));
+        menu.section();
+    }
+    let ui_c = ui.clone();
+    menu.item("Select All", move || {
+        active_selection(&ui_c).select_all();
+    });
+    let ui_c = ui.clone();
+    menu.item("Refresh", move || reload_listing(&ui_c));
+    if mounted {
+        menu.item("Open in File Manager", run("open-folder"));
+    }
+    menu
+}
+
+/// Let the user pick the application, through the mount where the file keeps
+/// its real name, so the chooser can tell what kind of file it is.
+pub(crate) fn open_entry_with(ui: &Rc<Ui>, entry: &DirEntry) {
+    let rel = entry_rel(ui, entry);
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    let Some(path) = mounted_target_rel(&mountpoint, &rel) else {
+        toast_error(
+            ui,
+            "Couldn't open file",
+            "Open With needs the Proton Drive folder to be mounted.",
+        );
+        return;
+    };
+    let launcher = gtk4::FileLauncher::new(Some(&gio::File::for_path(path)));
+    launcher.set_always_ask(true);
+    let ui = ui.clone();
+    launcher.launch(
+        ui_window(&ui).as_ref(),
+        gio::Cancellable::NONE,
+        move |result| {
+            if let Err(e) = result
+                && !e.matches(gtk4::DialogError::Dismissed)
+            {
+                toast_error(&ui, "Couldn't open file", &e.to_string());
+            }
+        },
     );
-    let button = gtk4::Button::builder().child(&row).build();
-    button.add_css_class("flat");
-    button
 }
 
-/// An action run by a [`more_menu_button`] item.
-pub(crate) type MenuAction = Box<dyn Fn()>;
-
-/// A flat ⋮ button whose popover lists `items` as (label, icon, action). The
-/// popover closes before the action runs, so a dialog it opens gets the focus.
-pub(crate) fn more_menu_button(items: Vec<(&str, &str, MenuAction)>) -> gtk4::MenuButton {
-    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    let popover = gtk4::Popover::builder().child(&menu).build();
-    for (label, icon, run) in items {
-        let button = menu_item(label, icon);
-        let pop = popover.clone();
-        button.connect_clicked(move |_| {
-            pop.popdown();
-            run();
-        });
-        menu.append(&button);
-    }
-    let button = gtk4::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .tooltip_text("More")
-        .valign(gtk4::Align::Center)
-        .popover(&popover)
-        .build();
-    button.add_css_class("flat");
-    button
+/// Copy the entry's public link, when it has one this client can read the
+/// password of. A listed link carries no URL, since the password fragment is
+/// only known when the link is made, so otherwise open the Share dialog.
+pub(crate) fn copy_entry_link(ui: &Rc<Ui>, entry: &DirEntry) {
+    let req = if entry.path.is_empty() && !entry.uid.is_empty() {
+        Request::ListShareByUid {
+            uid: entry.uid.clone(),
+        }
+    } else {
+        Request::ListShare {
+            path: entry_rel(ui, entry),
+        }
+    };
+    let rx = spawn_request(ui.dirs.control_socket(), req);
+    let (ui, entry) = (ui.clone(), entry.clone());
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Share {
+                link: Some(PublicLinkInfo { url: Some(url), .. }),
+                ..
+            })) => {
+                ui.stack.clipboard().set_text(&url);
+                toast(&ui, "Link copied");
+            }
+            Ok(Ok(Response::Share { .. })) => open_share_dialog(&ui, &entry),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't copy link", &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't copy link",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
 }
 
 /// Fetch the [`DirEntry`] backing the model item at `pos`, if any.

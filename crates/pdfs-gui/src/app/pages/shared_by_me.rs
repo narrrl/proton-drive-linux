@@ -236,32 +236,22 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
 /// Manage access opens the per-node Share dialog, which addresses a pathless
 /// node by uid, so every shared item can be managed from here.
 fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry, url: Option<String>) -> gtk4::MenuButton {
-    let mut items: Vec<(&str, &str, MenuAction)> = Vec::new();
+    let mut items: Vec<(&str, MenuAction)> = Vec::new();
     if !entry.path.is_empty() {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        items.push((
-            "Open",
-            "document-open-symbolic",
-            Box::new(move || open_shared_by_me(&ui_c, &entry_c)),
-        ));
+        items.push(("Open", Box::new(move || open_shared_by_me(&ui_c, &entry_c))));
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
         items.push((
             "Show in My Files",
-            "folder-symbolic",
             Box::new(move || show_in_my_files(&ui_c, &entry_c)),
         ));
     }
     if let Some(url) = url {
-        items.push((
-            "Open Link",
-            "external-link-symbolic",
-            Box::new(move || open_uri(&url)),
-        ));
+        items.push(("Open Link", Box::new(move || open_uri(&url))));
     }
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     items.push((
         "Manage Access…",
-        "system-users-symbolic",
         Box::new(move || open_share_dialog(&ui_c, &entry_c)),
     ));
     more_menu_button(items)

@@ -299,17 +299,14 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
         row.add_suffix(&more_menu_button(vec![
             (
                 "Rename…",
-                "document-edit-symbolic",
                 Box::new(move || prompt_rename_device(&ui_ren, &uid_ren, &name_ren)),
             ),
             (
                 "Use This Computer's Identity…",
-                "insert-object-symbolic",
                 Box::new(move || prompt_adopt_device(&ui_ad, &uid_ad, &name_ad)),
             ),
             (
                 "Remove Computer…",
-                "user-trash-symbolic",
                 Box::new(move || prompt_remove_device(&ui_rm, &uid_rm, &name_rm)),
             ),
         ]));

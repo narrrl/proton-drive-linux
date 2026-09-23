@@ -66,6 +66,12 @@ Schema: **31** (unchanged).
   keyring, a skipped two-factor or verification step — instead of the raw error. The button spins
   while signing in, and the page links to account creation and password reset. The two-factor
   dialog mentions recovery codes.
+- **Real menus.** Right-click menus in My Files, Photos, Shared by Me and Computers are GTK menus:
+  arrow keys, Enter and Escape work, and the Menu key or Shift+F10 opens the one for the selection
+  in My Files. Items follow one order — Open, Open With…, Play · Available offline · Share…,
+  Copy Link · Rename…, Move To…, Versions… · Move to Trash. Right-clicking empty space offers New
+  Folder, the uploads, Select All, Refresh and Open in File Manager. Open With… asks which
+  application to use.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

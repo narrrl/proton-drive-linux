@@ -2186,69 +2186,28 @@ pub(crate) fn select_all_photos(ui: &Rc<Ui>) {
 
 /// A tile's right-click menu.
 fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64, y: f64) {
-    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    let popover = gtk4::Popover::builder()
-        .has_arrow(false)
-        .position(gtk4::PositionType::Bottom)
-        .pointing_to(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1))
-        .child(&menu)
-        .build();
-    popover.set_parent(anchor);
-    popover.connect_closed(|p| p.unparent());
-    let item = |label: &str, icon: &str, run: Box<dyn Fn()>| {
-        let button = menu_item(label, icon);
-        let pop = popover.clone();
-        button.connect_clicked(move |_| {
-            pop.popdown();
-            run();
-        });
-        menu.append(&button);
-    };
-
+    let mut menu = ActionMenu::new();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     if photo.kind == PhotoKind::Video {
-        item(
-            "Play",
-            "media-playback-start-symbolic",
-            Box::new(move || play_video(&ui_c, uid.clone())),
-        );
+        menu.item("Play", move || play_video(&ui_c, uid.clone()));
     } else {
-        item(
-            "Open",
-            "document-open-symbolic",
-            Box::new(move || open_photo_viewer(&ui_c, uid.clone())),
-        );
+        menu.item("Open", move || open_photo_viewer(&ui_c, uid.clone()));
     }
-    let (ui_c, uid, favorite) = (ui.clone(), photo.uid.clone(), photo.favorite);
-    item(
-        if favorite {
-            "Remove from Favorites"
-        } else {
-            "Add to Favorites"
-        },
-        if favorite {
-            "non-starred-symbolic"
-        } else {
-            "starred-symbolic"
-        },
-        Box::new(move || set_photo_favorite(&ui_c, uid.clone(), !favorite)),
-    );
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    item(
-        "Select",
-        "selection-mode-symbolic",
-        Box::new(move || {
-            set_selection_mode(&ui_c, true);
-            toggle_selected(&ui_c, &uid);
-        }),
-    );
+    menu.toggle("Favorite", photo.favorite, move |favorite| {
+        set_photo_favorite(&ui_c, uid.clone(), favorite)
+    });
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    item(
-        "Move to Trash…",
-        "user-trash-symbolic",
-        Box::new(move || confirm_trash_photos(&ui_c, vec![uid.clone()])),
-    );
-    popover.popup();
+    menu.item("Select", move || {
+        set_selection_mode(&ui_c, true);
+        toggle_selected(&ui_c, &uid);
+    });
+    menu.section();
+    let (ui_c, uid) = (ui.clone(), photo.uid.clone());
+    menu.item("Move to Trash…", move || {
+        confirm_trash_photos(&ui_c, vec![uid.clone()])
+    });
+    menu.popup_at(anchor, x, y);
 }
 
 /// Star or unstar a photo from the grid, and show the new state.
