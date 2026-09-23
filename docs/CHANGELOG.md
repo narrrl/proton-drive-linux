@@ -74,6 +74,10 @@ Schema: **31** (unchanged).
   application to use.
 - **One selection in My Files.** The grid and the list share their selection, so switching views
   keeps what is selected, and dragging across empty space draws a selection box in both.
+- **Details pane.** On a window at least 1000 px wide the details pane docks beside the files
+  instead of covering them. It has Info, Offline, Sharing and Versions sections: who has access or
+  whether there is a public link, how many versions there are, and Share…, Copy Link and
+  Versions… buttons.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

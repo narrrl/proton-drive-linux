@@ -51,8 +51,8 @@ use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
     DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem,
     PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder, RestoreItem,
-    SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress,
-    ThumbnailBuildStatus, TransferDirection, TransferItem, pending_summary, send,
+    RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase,
+    SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem, pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -697,6 +697,13 @@ fn build_window(app: &adw::Application) {
         .default_height(680)
         .content(&toasts)
         .build();
+    // A wide window docks the details pane beside the files instead of laying it
+    // over them.
+    let wide = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("min-width: 1000sp").expect("static breakpoint"),
+    );
+    wide.add_setter(&ui.browser.split, "collapsed", Some(&false.to_value()));
+    window.add_breakpoint(wide);
     install_shortcuts(&ui, &window);
     install_window_actions(&ui, &window);
     app.set_accels_for_action("win.preferences", &["<Control>comma"]);
