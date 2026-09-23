@@ -684,7 +684,7 @@ CREATE INDEX idx_album_photos_seq ON album_photos(album_uid, seq);
 CREATE INDEX idx_album_photos_uid ON album_photos(uid);
 ";
 
-/// V20: whether a photo is a favourite.
+/// V20: whether a photo is a favorite.
 ///
 /// A column rather than a tag table: `Favorite` is the only Proton photo tag a
 /// user sets by hand (the rest — Video, Screenshot, Selfie, Raw… — are the
@@ -938,7 +938,7 @@ CREATE INDEX IF NOT EXISTS idx_photos_group ON photos(group_key);
 /// Schema v31: which photos a refresh still has to read from the server.
 ///
 /// A refresh used to resolve every photo's node to learn its name, media type,
-/// favourite tag, content hash and photo relation — minutes of round-trips for a
+/// favorite tag, content hash and photo relation — minutes of round-trips for a
 /// library of any size, repeated every time the timeline went stale. `resolved_at`
 /// records that the work was already done, so a refresh only reads the photos it
 /// has never read and the ones a remote event marked stale (`resolved_at = NULL`).

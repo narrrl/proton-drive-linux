@@ -511,7 +511,7 @@ impl PhotoEventPlan {
 ///
 /// `is_echo` claims an event as this daemon's own write. The feed replays our
 /// writes back at us and a `NodeUpdated` carries no revision id, so without this
-/// every favourite the user toggles here would mark its own photo stale and buy
+/// every favorite the user toggles here would mark its own photo stale and buy
 /// a resolve of a node we just wrote.
 fn classify_photo_events(
     events: &[DriveEvent],
@@ -529,7 +529,7 @@ fn classify_photo_events(
                 if *is_trashed {
                     plan.gone.push(node_uid.to_string());
                 } else if !is_echo(node_uid) {
-                    // An untrash, a rename, a favourite toggled on the phone: the
+                    // An untrash, a rename, a favorite toggled on the phone: the
                     // event says which node changed but never what about it, so
                     // the uid is marked stale and the next refresh reads it.
                     plan.touched.push(node_uid.to_string());
@@ -974,7 +974,7 @@ mod tests {
                 },
                 DriveEvent::NodeUpdated {
                     id: DriveEventId::from("e3"),
-                    node_uid: uid("favourited"),
+                    node_uid: uid("favorited"),
                     parent_node_uid: None,
                     is_trashed: false,
                     is_shared: false,
@@ -986,7 +986,7 @@ mod tests {
             plan,
             PhotoEventPlan {
                 gone: vec![uid("deleted").to_string(), uid("trashed").to_string()],
-                touched: vec![uid("favourited").to_string()],
+                touched: vec![uid("favorited").to_string()],
                 full: false,
             }
         );

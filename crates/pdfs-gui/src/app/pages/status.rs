@@ -190,7 +190,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
     let accent_row = adw::SwitchRow::builder()
         .title("Proton purple accent")
-        .subtitle("Use the Proton brand colour instead of the system accent colour")
+        .subtitle("Use the Proton brand color instead of the system accent color")
         .build();
     appearance_group.add(&accent_row);
 
@@ -531,11 +531,7 @@ pub(crate) fn wire_settings(
         let mut config = ui_accent.dirs.load_config();
         config.proton_accent = Some(on);
         if let Err(e) = ui_accent.dirs.save_config(&config) {
-            toast_error(
-                &ui_accent,
-                "Couldn't save the accent colour",
-                &e.to_string(),
-            );
+            toast_error(&ui_accent, "Couldn't save the accent color", &e.to_string());
         }
     });
 }

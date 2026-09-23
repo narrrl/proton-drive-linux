@@ -455,7 +455,7 @@ impl Db {
     /// restricts the page to one tab (Photos / Videos / Raw); `range`, when set,
     /// restricts it to a `[from, to)` capture-time window (epoch seconds) — the
     /// date scrubber's jump. `offset` is relative to whatever the filters leave.
-    /// `favorites` restricts the page to favourited photos.
+    /// `favorites` restricts the page to favorited photos.
     ///
     /// The page holds one row per *group*: the RAW and the JPEG of one shot are
     /// one tile. The Raw tab is the exception and lists every raw file, because
@@ -620,7 +620,7 @@ impl Db {
         Ok(photos)
     }
 
-    /// Record a photo's favourite flag locally, after the server accepted the
+    /// Record a photo's favorite flag locally, after the server accepted the
     /// change. A uid the timeline does not hold is a no-op — an album photo on
     /// someone else's volume is never in our own `photos` table.
     pub fn photos_set_favorite(&self, uid: &str, favorite: bool) -> Result<()> {

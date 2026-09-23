@@ -11,7 +11,7 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **30** (unchanged).
+Schema: **31** (unchanged).
 
 ### Added
 - **Pause and resume sync.** The Sync page, the tray and `pdfs sync pause [--for 1h]` /
@@ -66,10 +66,12 @@ Schema: **30** (unchanged).
   keyring, a skipped two-factor or verification step — instead of the raw error. The button spins
   while signing in, and the page links to account creation and password reset. The two-factor
   dialog mentions recovery codes.
+- **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
+  `pdfs favorite` command.
 
 ## [1.11.1] — 2026-09-19
 
-Schema: **30** (unchanged).
+Schema: **31** (unchanged).
 
 ### Fixed
 - **An upload parked behind a temp-file rename no longer stays parked forever.** A create for a
@@ -96,7 +98,7 @@ Schema: **30** (unchanged).
 
 ## [1.11.0] — 2026-09-19
 
-Schema: **30** (`photos.content_hash` / `main_uid` / `group_key`); SDK bumped to `proton-sdk` /
+Schema: **31** (V30 `photos.content_hash` / `main_uid` / `group_key`, V31 `photos.resolved_at`); SDK bumped to `proton-sdk` /
 `proton-drive-rs` **0.6.5**.
 
 ### Changed
@@ -882,6 +884,11 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[1.11.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.1
+[1.11.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.0
+[1.10.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.10.2
+[1.10.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.10.1
+[1.10.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.10.0
 [1.9.3]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.3
 [1.9.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.2
 [1.9.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.9.1

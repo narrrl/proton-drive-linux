@@ -63,7 +63,7 @@ pub enum Request {
         /// timeline. Like `kind`, the offset is relative to the filtered set.
         #[serde(default)]
         range: Option<(i64, i64)>,
-        /// Restrict the page to favourited photos. Older front-ends omit it and
+        /// Restrict the page to favorited photos. Older front-ends omit it and
         /// get the whole timeline, as before.
         #[serde(default)]
         favorites: bool,
@@ -181,7 +181,7 @@ pub enum Request {
     /// time by more than a day: `IMG-20230219-WA0001.jpg` filed under 2026 is
     /// the signature of an import whose metadata sidecars did not match.
     ///
-    /// Favourites and album memberships are carried across; the original is
+    /// Favorites and album memberships are carried across; the original is
     /// **trashed**, not deleted, so a bad run is recoverable from Proton's
     /// trash. With `dry_run` nothing is uploaded or trashed and the report says
     /// what would have been done.
@@ -1395,8 +1395,8 @@ pub struct PhotoItem {
     /// the split omit it; a front-end then treats everything as a still photo.
     #[serde(default = "default_photo_kind")]
     pub kind: PhotoKind,
-    /// Whether the photo is favourited. Older daemons omit it, which a front-end
-    /// reads as "not favourited" — the same thing it would show for a photo whose
+    /// Whether the photo is favorited. Older daemons omit it, which a front-end
+    /// reads as "not favorited" — the same thing it would show for a photo whose
     /// tags it has not learned yet.
     #[serde(default)]
     pub favorite: bool,
@@ -2703,7 +2703,7 @@ mod tests {
         }
     }
 
-    /// A front-end that predates the favourites filter sends no `favorites`
+    /// A front-end that predates the favorites filter sends no `favorites`
     /// field, and must keep getting the whole timeline rather than an empty page.
     #[test]
     fn timeline_requests_without_the_favorites_filter_still_decode() {

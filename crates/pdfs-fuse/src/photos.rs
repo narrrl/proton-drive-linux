@@ -501,7 +501,7 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "update photo tags"))?;
         // The photo event feed replays this write back at us as a bare
         // `NodeUpdated`, which is indistinguishable from the same photo being
-        // favourited on a phone. Claim the echo, or the gallery pays for a
+        // favorited on a phone. Claim the echo, or the gallery pays for a
         // resolve of a node whose one changed field is already stored below.
         self.note_self_change(uid);
         self.db
@@ -1469,7 +1469,7 @@ impl Core {
                             NodeKind::File { media_type, .. } => Some(media_type.clone()),
                             NodeKind::Folder => None,
                         };
-                        // The favourite state is a tag on the photo node, so it
+                        // The favorite state is a tag on the photo node, so it
                         // rides along with the metadata resolve rather than
                         // costing a listing of its own.
                         let favorite = node
@@ -1507,7 +1507,7 @@ impl Core {
                 let key = it.uid.to_string();
                 let main_uid = main_of.get(&key).cloned();
                 // An unresolved photo keeps whatever was learned before, for the
-                // favourite flag as much as for the name and media type.
+                // favorite flag as much as for the name and media type.
                 match meta.get(&key).cloned() {
                     Some(m) => db::TimelineRow {
                         name: m.name,

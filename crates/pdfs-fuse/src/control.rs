@@ -387,9 +387,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Some(node_uid) => match core.set_photo_favorite(&node_uid, favorite) {
                 Ok(()) => CtlResponse::Ok {
                     message: if favorite {
-                        "added to favourites".to_string()
+                        "added to favorites".to_string()
                     } else {
-                        "removed from favourites".to_string()
+                        "removed from favorites".to_string()
                     },
                 },
                 Err(e) => CtlResponse::error(e),

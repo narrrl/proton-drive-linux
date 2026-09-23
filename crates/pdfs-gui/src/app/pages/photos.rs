@@ -84,7 +84,7 @@ pub(crate) struct GalleryState {
     /// The capture-time window the timeline is currently filtered to, or `None`
     /// for the whole span. Read by [`load_gallery`], set by the date dropdown.
     pub(crate) range: Cell<Option<(i64, i64)>>,
-    /// The favourites toggle, and whether it is on. When on, the timeline is
+    /// The favorites toggle, and whether it is on. When on, the timeline is
     /// restricted to photos carrying Proton's `Favorite` tag.
     pub(crate) favorites_btn: gtk4::ToggleButton,
     pub(crate) favorites: Cell<bool>,
@@ -495,12 +495,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         tab_group.append(btn);
     }
 
-    // Favourites: a filter, not a tab — it cuts across Photos / Videos / Raw, so
+    // Favorites: a filter, not a tab — it cuts across Photos / Videos / Raw, so
     // it stays outside the segmented control rather than becoming a fifth option
     // that would silently drop the kind the user picked.
     let favorites_btn = gtk4::ToggleButton::builder()
         .icon_name("starred-symbolic")
-        .tooltip_text("Show only favourites")
+        .tooltip_text("Show only favorites")
         .build();
     favorites_btn.add_css_class("pill");
 
@@ -962,7 +962,7 @@ pub(crate) fn wire_gallery(
         });
     }
 
-    // Favourites: reload the timeline restricted to favourites (or back to all).
+    // Favorites: reload the timeline restricted to favorites (or back to all).
     // Independent of the kind tabs and the date jump, both of which keep their
     // current value across the toggle.
     let ui_fav = ui.clone();
@@ -2118,7 +2118,7 @@ pub(crate) fn short_capture_time(secs: i64) -> String {
 
 /// Fetch a timeline page from the daemon. When `append` is false the model is
 /// cleared first (fresh load); otherwise the next page is tacked on.
-/// The empty state for a timeline filtered to `kind`, favourites and/or a
+/// The empty state for a timeline filtered to `kind`, favorites and/or a
 /// `month`: what is missing, in the filter's own words.
 pub(crate) fn empty_timeline_text(
     kind: Option<PhotoKind>,
@@ -2138,12 +2138,12 @@ pub(crate) fn empty_timeline_text(
             "Photos you upload to Proton Drive appear here.".to_string(),
         ),
         (true, None, None) => (
-            "No favourites yet".to_string(),
+            "No favorites yet".to_string(),
             "Star a photo in the viewer or from its menu to find it here.".to_string(),
         ),
         (true, _, _) => (
-            format!("No favourite {what}{when}"),
-            "Turn off the favourites filter to see everything.".to_string(),
+            format!("No favorite {what}{when}"),
+            "Turn off the favorites filter to see everything.".to_string(),
         ),
         (false, _, _) => (
             format!("No {what}{when}"),
@@ -2222,9 +2222,9 @@ fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64
     let (ui_c, uid, favorite) = (ui.clone(), photo.uid.clone(), photo.favorite);
     item(
         if favorite {
-            "Remove from Favourites"
+            "Remove from Favorites"
         } else {
-            "Add to Favourites"
+            "Add to Favorites"
         },
         if favorite {
             "non-starred-symbolic"
@@ -2269,18 +2269,18 @@ fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
                 toast(
                     &ui,
                     if favorite {
-                        "Added to Favourites"
+                        "Added to Favorites"
                     } else {
-                        "Removed from Favourites"
+                        "Removed from Favorites"
                     },
                 );
             }
             Ok(Ok(Response::Error { message, .. })) => {
-                toast_error(&ui, "Couldn't change the favourite", &message)
+                toast_error(&ui, "Couldn't change the favorite", &message)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't change the favourite",
+                "Couldn't change the favorite",
                 "The mount service didn't respond.",
             ),
         }
@@ -2540,14 +2540,14 @@ mod tests {
     #[test]
     fn an_empty_filter_names_what_it_filtered() {
         assert_eq!(empty_timeline_text(None, false, None).0, "No photos yet");
-        assert_eq!(empty_timeline_text(None, true, None).0, "No favourites yet");
+        assert_eq!(empty_timeline_text(None, true, None).0, "No favorites yet");
         assert_eq!(
             empty_timeline_text(Some(PhotoKind::Video), false, Some("June 2024")).0,
             "No videos in June 2024"
         );
         assert_eq!(
             empty_timeline_text(Some(PhotoKind::Raw), true, None).0,
-            "No favourite raw files"
+            "No favorite raw files"
         );
     }
 }

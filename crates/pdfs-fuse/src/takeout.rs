@@ -357,9 +357,9 @@ impl Core {
             }
         }
 
-        // Favourites are a separate call: the upload seal takes classification
+        // Favorites are a separate call: the upload seal takes classification
         // tags, but `Favorite` is not one of them — it goes through the photos
-        // volume's dedicated favourite endpoint.
+        // volume's dedicated favorite endpoint.
         if !favorites.is_empty() {
             let updates: Vec<PhotoTagsUpdate> = favorites
                 .into_iter()
@@ -370,7 +370,7 @@ impl Core {
                 })
                 .collect();
             if let Err(e) = self.rt.block_on(photos.update_photos(&updates)) {
-                warn!(error = %e, "marking imported favourites failed");
+                warn!(error = %e, "marking imported favorites failed");
             }
         }
         Ok(())

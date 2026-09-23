@@ -222,7 +222,7 @@ fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
     assert_eq!(
         favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p1"],
-        "only the favourited photo is in a favourites page"
+        "only the favorited photo is in a favorites page"
     );
 
     // A local toggle survives a refresh that could not resolve the photo's node

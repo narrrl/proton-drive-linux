@@ -21,7 +21,7 @@ The client is functionally rich but the UI is built page by page, and it shows:
   `AdwHeaderBar` whose title is always "Proton Drive". Two stacked bars, wasted height, no current
   folder in the title.
 - **Icons and wording drift.** Upload uses `document-send-symbolic` (reads as "send"), offline uses
-  stars (reads as "favourite"), trash icons mean "stop syncing", "remove device" and "remove
+  stars (reads as "favorite"), trash icons mean "stop syncing", "remove device" and "remove
   bookmark". "Keep offline" / "Unpin" / "Remove offline copy" / "Available offline" are one concept.
   "Computers" vs "device", "Gallery" vs "Photos", "mount service" vs "daemon" vs "Connect".
 - **Theming is hardcoded.** `PROTON_PURPLE` overrides the system accent; badge, viewer and tile
@@ -212,7 +212,7 @@ Header: `[‹ ›]  Path bar (breadcrumbs, scroll to end, Ctrl+L to edit)  … [
 - Header: title "Photos", `InlineViewSwitcher` Timeline | Albums in the header, Select toggle,
   `+ Upload` (fix: use `adw::ButtonContent`, today `.icon_name()` overwrites `.label()` at
   `photos.rs:426-432`), ⋮ menu: Import from Google Photos…, Refresh, Rebuild library.
-- Filters: a single filter dropdown/`ToggleGroup` (All, Photos, Videos, RAW, Favourites) instead of
+- Filters: a single filter dropdown/`ToggleGroup` (All, Photos, Videos, RAW, Favorites) instead of
   two segmented rows where "Photos" appears twice. Counts follow the active filter.
 - **Month scrubber** on the right edge that *jumps* (not filters); the month dropdown becomes a real
   "Filter by date" if kept.
@@ -221,9 +221,9 @@ Header: `[‹ ›]  Path bar (breadcrumbs, scroll to end, Ctrl+L to edit)  … [
 - Tiles: `ContentFit::Cover` (crop) in justified rows, known aspect ratio from metadata to prevent
   reflow, placeholder as a tinted card of the final size, subtle hover (no 1.06 scale with heavy
   shadow on a 2 px gap grid), last row justified up to a max stretch.
-- Context menu on tiles: Open, Favourite, Add to album, Download/Save copy, Show in My files, Move to
-  Trash. Selection: Shift range, Ctrl+A, bulk Favourite, Add to album, Download.
-- Empty states per filter ("No favourites yet", "No videos in June 2024") instead of the global
+- Context menu on tiles: Open, Favorite, Add to album, Download/Save copy, Show in My files, Move to
+  Trash. Selection: Shift range, Ctrl+A, bulk Favorite, Add to album, Download.
+- Empty states per filter ("No favorites yet", "No videos in June 2024") instead of the global
   "No photos yet" with upload buttons.
 - Import: runs show a banner on Photos ("Importing from Google Photos — 1,204 of 5,000 · View") and
   Back returns to where the user came from.
@@ -233,7 +233,7 @@ Header: `[‹ ›]  Path bar (breadcrumbs, scroll to end, Ctrl+L to edit)  … [
   (pinch, Ctrl+scroll, double-click), info panel beside the image instead of over the top bar,
   pages beyond the loaded 60, counter against the real total, videos play inline with
   `gtk::Video`, trash with the same confirm/undo rule as the grid, real filename in "Save a copy",
-  success toast, "Open with…" app chooser, favourite tooltip reflects state, readable dates.
+  success toast, "Open with…" app chooser, favorite tooltip reflects state, readable dates.
 
 ### Shared with me / Shared by me
 
@@ -292,7 +292,8 @@ Header: `[‹ ›]  Path bar (breadcrumbs, scroll to end, Ctrl+L to edit)  … [
 | Photos section | Photos | `image-x-generic-symbolic` |
 | Sharing | Shared by me / Shared with me | distinct icons (`emblem-shared` / `folder-publicshare`) |
 
-Spelling: pick one (US "Favorite" or UK "Favourite") and apply it everywhere. Title Case for
+Spelling: US English throughout ("Favorite", "color"), matching the `pdfs favorite` command and
+Proton's own apps. Title Case for
 dialog headings and buttons in dialogs, Sentence case for menu items and rows (HIG).
 
 ## 9. Bugs found during the audit (quick wins)

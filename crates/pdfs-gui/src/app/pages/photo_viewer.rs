@@ -19,7 +19,7 @@ pub(crate) struct Viewer {
     pub(crate) info_map: gtk4::Button,
     /// Coordinates behind `info_map`, once a photo with GPS tags is shown.
     pub(crate) coords: RefCell<Option<(f64, f64)>>,
-    /// The favourite toggle in the top bar, and whether it is being set from
+    /// The favorite toggle in the top bar, and whether it is being set from
     /// the model rather than by the user — the same suppression the details pane
     /// uses for its pin switch, so painting a photo doesn't fire a round-trip.
     pub(crate) favorite: gtk4::ToggleButton,
@@ -51,7 +51,7 @@ pub(crate) struct ExifInfo {
     pub(crate) coords: Option<(f64, f64)>,
 }
 
-/// Paint the favourite toggle without firing its handler.
+/// Paint the favorite toggle without firing its handler.
 pub(crate) fn show_favorite(viewer: &Rc<Viewer>, favorite: bool) {
     viewer.favorite_suppress.set(true);
     viewer.favorite.set_active(favorite);
@@ -59,7 +59,7 @@ pub(crate) fn show_favorite(viewer: &Rc<Viewer>, favorite: bool) {
     viewer.favorite_suppress.set(false);
 }
 
-/// Filled star for a favourite, outline for the rest.
+/// Filled star for a favorite, outline for the rest.
 fn set_favorite_icon(button: &gtk4::ToggleButton, favorite: bool) {
     button.set_icon_name(if favorite {
         "starred-symbolic"
@@ -68,7 +68,7 @@ fn set_favorite_icon(button: &gtk4::ToggleButton, favorite: bool) {
     });
 }
 
-/// Write a favourite change back into the loaded gallery page, so returning to
+/// Write a favorite change back into the loaded gallery page, so returning to
 /// the grid (or reopening the photo) shows what was just set without a reload.
 pub(crate) fn set_gallery_favorite(ui: &Rc<Ui>, uid: &str, favorite: bool) {
     let Some(idx) = find_photo_index(&ui.gallery.model, uid) else {
@@ -147,7 +147,7 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     *viewer.path.borrow_mut() = None;
     clear_info(viewer);
 
-    // The favourite state comes from the timeline page the gallery already has,
+    // The favorite state comes from the timeline page the gallery already has,
     // so the button is right on the first frame instead of after a round-trip.
     let favorite = find_photo_index(&ui.gallery.model, &uid)
         .and_then(|idx| ui.gallery.model.item(idx))
@@ -556,7 +556,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let favorite_btn = gtk4::ToggleButton::builder()
         .icon_name("non-starred-symbolic")
-        .tooltip_text("Favourite")
+        .tooltip_text("Favorite")
         .valign(gtk4::Align::Center)
         .build();
     favorite_btn.add_css_class("flat");
@@ -758,7 +758,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
                 _ => Some("The mount service didn't respond.".to_string()),
             };
             if let Some(detail) = failed {
-                toast_error(&ui_result, "Couldn't change the favourite", &detail);
+                toast_error(&ui_result, "Couldn't change the favorite", &detail);
                 // The server refused, so the button must go back to describing
                 // what is actually stored — without firing this handler again.
                 if *viewer_result.uid.borrow() == uid {

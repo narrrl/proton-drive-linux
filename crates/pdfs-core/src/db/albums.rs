@@ -178,7 +178,7 @@ impl Db {
                     ratio: r.get(3)?,
                     thumb_state: r.get(4)?,
                     kind: crate::control::PhotoKind::from_i64(r.get(5)?),
-                    // Album rows have no favourite state of their own: an album
+                    // Album rows have no favorite state of their own: an album
                     // photo on someone else's volume is not in our timeline, and
                     // favouriting one is not supported yet anyway.
                     favorite: false,
@@ -239,7 +239,7 @@ impl Db {
                     ratio: r.get(3)?,
                     thumb_state: r.get(4)?,
                     kind: crate::control::PhotoKind::from_i64(r.get(5)?),
-                    // Album rows have no favourite state of their own: an album
+                    // Album rows have no favorite state of their own: an album
                     // photo on someone else's volume is not in our timeline, and
                     // favouriting one is not supported yet anyway.
                     favorite: false,

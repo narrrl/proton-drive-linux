@@ -8,7 +8,7 @@
 //!
 //! Proton has no API for editing a sealed capture time, so the repair is a
 //! rewrite: download the photo, upload it again with the capture time its file
-//! name implies, put the new copy back into the albums and favourites the old
+//! name implies, put the new copy back into the albums and favorites the old
 //! one was in, then **trash** (not delete) the original. Trash rather than
 //! delete so a bad run is recoverable from Proton's own trash for 30 days.
 //!
@@ -213,7 +213,7 @@ impl Core {
         drop(guard);
         let new_uid = uploaded.map_err(|e| CoreError::from_api(&e, "re-upload photo"))?;
 
-        // Favourite and albums before the trash: a failure here leaves both
+        // Favorite and albums before the trash: a failure here leaves both
         // copies on the account, which is recoverable by hand. Losing the
         // original first would not be.
         if candidate.favorite {
@@ -227,7 +227,7 @@ impl Core {
                 // just set does not come back as a remote change.
                 Ok(_) => self.note_self_change(&new_uid),
                 Err(e) => {
-                    warn!(name = candidate.name, error = %e, "cannot re-favourite re-dated photo")
+                    warn!(name = candidate.name, error = %e, "cannot re-favorite re-dated photo")
                 }
             }
         }

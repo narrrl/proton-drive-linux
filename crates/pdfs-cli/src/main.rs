@@ -146,11 +146,11 @@ enum Command {
         /// Skip this many photos from the start of the timeline.
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// List only favourited photos.
+        /// List only favorited photos.
         #[arg(long)]
         favorites: bool,
     },
-    /// Add or remove a photo's favourite mark.
+    /// Add or remove a photo's favorite mark.
     Favorite {
         /// Photo node uid in `volume~link` form (from `pdfs photos`).
         uid: String,
@@ -188,7 +188,7 @@ enum Command {
     /// and rewrites them at the right time.
     ///
     /// Proton cannot edit a sealed capture time, so a rewrite means re-uploading
-    /// the photo and trashing the original — favourites and albums are carried
+    /// the photo and trashing the original — favorites and albums are carried
     /// across, and the original goes to Proton's trash, not away. Run it with
     /// `--dry-run` first.
     RedatePhotos {

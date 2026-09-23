@@ -812,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_supplies_capture_time_and_favourite() {
+    fn sidecar_supplies_capture_time_and_favorite() {
         let mut sidecars = HashMap::new();
         sidecar(
             &mut sidecars,
