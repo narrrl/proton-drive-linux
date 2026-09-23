@@ -46,6 +46,32 @@ const MAX_ROW_LIMIT: usize = 1000;
 fn clamp_limit(limit: usize) -> usize {
     limit.min(MAX_ROW_LIMIT)
 }
+/// Answer an album add or remove: parse the uids, run `change`, and report
+/// per photo.
+fn album_change(
+    uid: &str,
+    photos: &[String],
+    change: impl FnOnce(&NodeUid, &[NodeUid]) -> CoreResult<super::albums::AlbumOutcome>,
+) -> CtlResponse {
+    let Some(album) = parse_uid(uid) else {
+        return CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}")));
+    };
+    let photos = match Core::parse_uids(photos) {
+        Ok(photos) => photos,
+        Err(e) => return CtlResponse::error(e),
+    };
+    match change(&album, &photos) {
+        Ok((changed, failed)) => CtlResponse::AlbumChanged {
+            changed,
+            failed: failed
+                .into_iter()
+                .map(|(uid, message)| TrashFailure { uid, message })
+                .collect(),
+        },
+        Err(e) => CtlResponse::error(e),
+    }
+}
+
 static ACTIVE_CONTROL_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 
 struct ControlHandlerPermit;
@@ -421,6 +447,38 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
         },
+        Ok(CtlRequest::CreateAlbum { name }) => match core.create_album(&name) {
+            Ok(uid) => CtlResponse::AlbumCreated { uid },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::RenameAlbum { uid, name }) => match parse_uid(&uid) {
+            Some(album) => match core.rename_album(&album, &name) {
+                Ok(()) => CtlResponse::Ok {
+                    message: format!("renamed album to {name}"),
+                },
+                Err(e) => CtlResponse::error(e),
+            },
+            None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
+        },
+        Ok(CtlRequest::DeleteAlbum { uid, delete_photos }) => match parse_uid(&uid) {
+            Some(album) => match core.delete_album(&album, delete_photos) {
+                Ok(()) => CtlResponse::Ok {
+                    message: "album deleted".to_string(),
+                },
+                Err(e) => CtlResponse::error(e),
+            },
+            None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
+        },
+        Ok(CtlRequest::AddToAlbum { uid, photos }) => {
+            album_change(&uid, &photos, |album, photos| {
+                core.add_to_album(album, photos)
+            })
+        }
+        Ok(CtlRequest::RemoveFromAlbum { uid, photos }) => {
+            album_change(&uid, &photos, |album, photos| {
+                core.remove_from_album(album, photos)
+            })
+        }
         Ok(CtlRequest::PhotoMonths { kind }) => match core.db.photos_months(kind) {
             Ok(months) => CtlResponse::PhotoMonths {
                 months: months

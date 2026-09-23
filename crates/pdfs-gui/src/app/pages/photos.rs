@@ -63,6 +63,12 @@ pub(crate) struct GalleryState {
     /// Leaves an open album for the grid it was opened from. Visible only while
     /// an album is open.
     pub(crate) back: gtk4::Button,
+    /// Set when an album replaced the timeline in [`Self::model`], so going
+    /// back to the timeline has to reload it; otherwise the timeline is shown
+    /// as it was left, scroll position included.
+    pub(crate) timeline_stale: Cell<bool>,
+    /// The albums the grid shows, as last listed.
+    pub(crate) album_list: RefCell<Vec<AlbumInfo>>,
     /// The kind toggles and the date jump, hidden while an album is open — an
     /// album page is served whole, not filtered.
     pub(crate) filters: gtk4::Box,
@@ -149,6 +155,7 @@ pub(crate) struct GalleryState {
     pub(crate) select_bar: gtk4::Revealer,
     pub(crate) select_label: gtk4::Label,
     pub(crate) select_trash: gtk4::Button,
+    pub(crate) select_album: gtk4::Button,
 }
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
@@ -302,6 +309,7 @@ pub(crate) struct GalleryWidgets {
     pub(crate) select_bar: gtk4::Revealer,
     pub(crate) select_label: gtk4::Label,
     pub(crate) select_trash: gtk4::Button,
+    pub(crate) select_album: gtk4::Button,
     pub(crate) select_done: gtk4::Button,
     /// The Albums grid, its own status page and the stack between them, plus the
     /// Photos/Albums switcher and the back button out of an album.
@@ -454,6 +462,11 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .sensitive(false)
         .build();
     select_trash.add_css_class("destructive-action");
+    let select_album = gtk4::Button::builder()
+        .label("Add to Album…")
+        .valign(gtk4::Align::Center)
+        .sensitive(false)
+        .build();
     let select_done = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
         .tooltip_text("Leave selection (Esc)")
@@ -465,6 +478,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     select_box.add_css_class("toolbar");
     select_box.add_css_class("bulk-bar");
     select_box.append(&select_label);
+    select_box.append(&select_album);
     select_box.append(&select_trash);
     select_box.append(&select_done);
     let select_bar = gtk4::Revealer::builder()
@@ -574,13 +588,23 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     albums_stack.set_vexpand(true);
     albums_stack.add_named(&albums_scroll, Some("grid"));
     albums_stack.add_named(&albums_status, Some("status"));
+    let new_album = gtk4::Button::builder()
+        .icon_name("list-add-symbolic")
+        .label("New Album…")
+        .halign(gtk4::Align::Start)
+        .action_name("win.new-album")
+        .build();
+    new_album.add_css_class("pill");
+    let albums_page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    albums_page.append(&new_album);
+    albums_page.append(&albums_stack);
 
     let content = gtk4::Stack::new();
     content.set_vexpand(true);
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
     content.add_named(&timeline, Some("timeline"));
     content.add_named(&status, Some("status"));
-    content.add_named(&albums_stack, Some("albums"));
+    content.add_named(&albums_page, Some("albums"));
 
     let import_banner = adw::Banner::builder()
         .title("Importing from Google Photos…")
@@ -630,6 +654,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             select_bar,
             select_label,
             select_trash,
+            select_album,
             select_done,
             tabs,
             favorites_btn,
@@ -932,6 +957,11 @@ pub(crate) fn wire_gallery(
         set_selection_mode(&ui_select, btn.is_active());
     });
     let ui_trash = ui.clone();
+    let ui_album = ui.clone();
+    ui.gallery.select_album.clone().connect_clicked(move |_| {
+        let uids: Vec<String> = ui_album.gallery.selected.borrow().iter().cloned().collect();
+        prompt_add_to_album(&ui_album, uids);
+    });
     ui.gallery.select_trash.clone().connect_clicked(move |_| {
         delete_selected(&ui_trash);
     });
@@ -1426,6 +1456,7 @@ fn sync_selection_bar(ui: &Rc<Ui>) {
         n => format!("{n} selected"),
     });
     ui.gallery.select_trash.set_sensitive(count > 0);
+    ui.gallery.select_album.set_sensitive(count > 0);
     ui.gallery
         .select_bar
         .set_reveal_child(ui.gallery.selecting.get());
@@ -1555,7 +1586,7 @@ pub(crate) fn trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
 
 /// Take photos out of the loaded model, returning them so a failure can put them
 /// back.
-fn remove_photos(ui: &Rc<Ui>, uids: &[String]) -> Vec<PhotoItem> {
+pub(crate) fn remove_photos(ui: &Rc<Ui>, uids: &[String]) -> Vec<PhotoItem> {
     let model = &ui.gallery.model;
     let mut removed = Vec::new();
     let mut index = 0;
@@ -1577,7 +1608,7 @@ fn remove_photos(ui: &Rc<Ui>, uids: &[String]) -> Vec<PhotoItem> {
 }
 
 /// Put photos back into the loaded model, at their place in the timeline.
-fn restore_photos(ui: &Rc<Ui>, photos: Vec<PhotoItem>) {
+pub(crate) fn restore_photos(ui: &Rc<Ui>, photos: Vec<PhotoItem>) {
     let model = &ui.gallery.model;
     for photo in photos {
         // The timeline is newest first, so a photo belongs before the first
@@ -2001,7 +2032,7 @@ fn clone_row(row: &GalleryRow) -> GalleryRow {
 }
 
 /// "1,204 photos" under the page title.
-fn update_gallery_subtitle(ui: &Rc<Ui>) {
+pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     let loaded = ui.gallery.model.n_items() as usize;
     if loaded == 0 {
         ui.gallery.title.set_subtitle("");
@@ -2202,6 +2233,18 @@ fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64
         set_selection_mode(&ui_c, true);
         toggle_selected(&ui_c, &uid);
     });
+    menu.section();
+    let (ui_c, uid) = (ui.clone(), photo.uid.clone());
+    menu.item("Add to Album…", move || {
+        prompt_add_to_album(&ui_c, vec![uid.clone()])
+    });
+    let open_album = ui.gallery.album.borrow().clone();
+    if let Some(album) = open_album.filter(|album| !album.shared) {
+        let (ui_c, uid) = (ui.clone(), photo.uid.clone());
+        menu.item("Remove from Album", move || {
+            remove_from_album(&ui_c, &album, vec![uid.clone()])
+        });
+    }
     menu.section();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     menu.item("Move to Trash…", move || {

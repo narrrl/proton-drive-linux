@@ -475,6 +475,8 @@ fn build_window(app: &adw::Application) {
             view_switch: gallery_widgets.view_switch.clone(),
             albums_loading: Cell::new(false),
             album: RefCell::new(None),
+            timeline_stale: Cell::new(false),
+            album_list: RefCell::new(Vec::new()),
             back: gallery_widgets.back.clone(),
             filters: gallery_widgets.filters.clone(),
             kind: Cell::new(None),
@@ -506,6 +508,7 @@ fn build_window(app: &adw::Application) {
             select_bar: gallery_widgets.select_bar.clone(),
             select_label: gallery_widgets.select_label.clone(),
             select_trash: gallery_widgets.select_trash.clone(),
+            select_album: gallery_widgets.select_album.clone(),
         },
         shared: SharedState {
             content: shared_widgets.content.clone(),
@@ -1142,6 +1145,12 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     let ui_import = ui.clone();
     show_import.connect_activate(move |_, _| ui_import.stack.set_visible_child_name("takeout"));
     window.add_action(&show_import);
+
+    // The Albums view's New Album button.
+    let new_album = gio::SimpleAction::new("new-album", None);
+    let ui_album = ui.clone();
+    new_album.connect_activate(move |_, _| prompt_new_album(&ui_album, Vec::new()));
+    window.add_action(&new_album);
 
     let shortcuts = gio::SimpleAction::new("shortcuts", None);
     let win = window.clone();

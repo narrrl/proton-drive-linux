@@ -221,6 +221,84 @@ impl Core {
         Ok(())
     }
 
+    /// Create an album and return its uid. The listing is refreshed before
+    /// answering, so the next [`Core::albums`] already shows it.
+    pub(crate) fn create_album(&self, name: &str) -> CoreResult<String> {
+        let uid = self
+            .rt
+            .block_on(self.photos().create_album(name))
+            .map_err(|e| CoreError::from_api(&e, "create album"))?;
+        self.after_album_change(None);
+        Ok(uid.to_string())
+    }
+
+    pub(crate) fn rename_album(&self, album: &NodeUid, name: &str) -> CoreResult<()> {
+        self.rt
+            .block_on(self.photos().rename_album(album, name))
+            .map_err(|e| CoreError::from_api(&e, "rename album"))?;
+        self.after_album_change(None);
+        Ok(())
+    }
+
+    /// Delete an album. Its photos stay in the timeline unless `delete_photos`,
+    /// which only matters for photos that exist in the album alone.
+    pub(crate) fn delete_album(&self, album: &NodeUid, delete_photos: bool) -> CoreResult<()> {
+        self.rt
+            .block_on(self.photos().delete_album(album, delete_photos))
+            .map_err(|e| CoreError::from_api(&e, "delete album"))?;
+        let key = album.to_string();
+        if let Err(error) = self.db.album_photos_replace(&key, &[]) {
+            warn!(%album, %error, "a deleted album's photos could not be dropped");
+        }
+        self.after_album_change(None);
+        Ok(())
+    }
+
+    /// Add photos to an album, per photo: `(added, failed)`.
+    pub(crate) fn add_to_album(
+        &self,
+        album: &NodeUid,
+        photos: &[NodeUid],
+    ) -> CoreResult<AlbumOutcome> {
+        let outcomes = self
+            .rt
+            .block_on(self.photos().add_photos_to_album(album, photos))
+            .map_err(|e| CoreError::from_api(&e, "add to album"))?;
+        self.after_album_change(Some(album));
+        Ok(album_outcome(outcomes))
+    }
+
+    /// Take photos out of an album, per photo: `(removed, failed)`. The photos
+    /// stay in the timeline.
+    pub(crate) fn remove_from_album(
+        &self,
+        album: &NodeUid,
+        photos: &[NodeUid],
+    ) -> CoreResult<AlbumOutcome> {
+        let outcomes = self
+            .rt
+            .block_on(self.photos().remove_photos_from_album(album, photos))
+            .map_err(|e| CoreError::from_api(&e, "remove from album"))?;
+        self.after_album_change(Some(album));
+        Ok(album_outcome(outcomes))
+    }
+
+    /// Bring the persisted listing, and `album`'s contents when given, up to
+    /// date after a change made here, so the reply is followed by a listing
+    /// that shows it. A failed refresh only leaves them stale: the change
+    /// itself went through.
+    fn after_album_change(&self, album: Option<&NodeUid>) {
+        self.invalidate_albums();
+        if let Err(error) = self.rt.block_on(self.refresh_albums()) {
+            warn!(%error, "album listing refresh after a change failed");
+        }
+        if let Some(album) = album
+            && let Err(error) = self.rt.block_on(self.refresh_album(album))
+        {
+            warn!(%album, %error, "album refresh after a change failed");
+        }
+    }
+
     /// Drop the album listing's and every album's freshness stamp, so the next
     /// request re-enumerates. Paired with [`Core::invalidate_photos`] — a change
     /// to the timeline can just as easily be a change to an album.
@@ -228,6 +306,20 @@ impl Core {
         let _ = self.db.clear_state(ALBUMS_SYNCED_MS);
         let _ = self.db.clear_state_prefix(ALBUM_SYNCED_PREFIX);
     }
+}
+
+/// Photos an album change applied to, and the ones it failed for with why.
+pub(crate) type AlbumOutcome = (Vec<String>, Vec<(String, String)>);
+
+fn album_outcome(outcomes: Vec<pdfs_core::batch::Outcome>) -> AlbumOutcome {
+    let (done, failed) = pdfs_core::batch::split(outcomes);
+    (
+        done.iter().map(|uid| uid.to_string()).collect(),
+        failed
+            .into_iter()
+            .map(|(uid, error)| (uid.to_string(), error.to_string()))
+            .collect(),
+    )
 }
 
 /// Project a persisted album into the wire item a front-end paints.

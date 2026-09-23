@@ -94,6 +94,25 @@ pub enum Request {
         offset: usize,
         limit: usize,
     },
+    /// Create an album named `name`. Replies with [`Response::AlbumCreated`].
+    CreateAlbum { name: String },
+    /// Rename the album `uid`. Replies with [`Response::Ok`].
+    RenameAlbum { uid: String, name: String },
+    /// Delete the album `uid`. Its photos stay in the timeline; with
+    /// `delete_photos` set, photos that exist only in the album (saved from a
+    /// shared album) are deleted with it, which the server otherwise refuses.
+    /// Replies with [`Response::Ok`].
+    DeleteAlbum {
+        uid: String,
+        #[serde(default)]
+        delete_photos: bool,
+    },
+    /// Add timeline photos to the album `uid`. Replies with
+    /// [`Response::AlbumChanged`].
+    AddToAlbum { uid: String, photos: Vec<String> },
+    /// Take photos out of the album `uid`. They stay in the timeline: this is
+    /// not a trash. Replies with [`Response::AlbumChanged`].
+    RemoveFromAlbum { uid: String, photos: Vec<String> },
     /// Fetch thumbnails for the given photo uids, downloading the ones not
     /// already cached (one batched round-trip) and replying with their on-disk
     /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
@@ -1745,6 +1764,15 @@ pub enum Response {
         trashed: Vec<String>,
         failed: Vec<TrashFailure>,
     },
+    /// The album a [`Request::CreateAlbum`] made.
+    AlbumCreated { uid: String },
+    /// Outcome of a [`Request::AddToAlbum`] or [`Request::RemoveFromAlbum`],
+    /// per photo like [`Response::Trashed`]: `changed` photos were added or
+    /// removed, `failed` ones were not.
+    AlbumChanged {
+        changed: Vec<String>,
+        failed: Vec<TrashFailure>,
+    },
     /// A [`Request::FileThumbs`] generation is no longer current. This is
     /// retryable after reserving a fresh generation and must never be interpreted
     /// as a permanent "no thumbnail" verdict.
@@ -2357,6 +2385,15 @@ mod tests {
         assert!(matches!(
             local,
             Request::SearchLocal { query, limit } if query == "old" && limit == 10
+        ));
+    }
+
+    #[test]
+    fn delete_album_keeps_photos_unless_asked() {
+        let request: Request = serde_json::from_str(r#"{"DeleteAlbum":{"uid":"v~a"}}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::DeleteAlbum { uid, delete_photos: false } if uid == "v~a"
         ));
     }
 

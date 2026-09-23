@@ -230,6 +230,43 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    /// Create a photo album and print its uid.
+    NewAlbum {
+        /// Album name.
+        name: String,
+    },
+    /// Rename a photo album.
+    RenameAlbum {
+        /// Album node uid in `volume~link` form (from `pdfs albums`).
+        uid: String,
+        /// New name.
+        name: String,
+    },
+    /// Delete a photo album. Its photos stay in the timeline.
+    DeleteAlbum {
+        /// Album node uid in `volume~link` form (from `pdfs albums`).
+        uid: String,
+        /// Also delete photos that exist only in this album (saved from a
+        /// shared album); without it the server refuses to delete such an album.
+        #[arg(long)]
+        with_photos: bool,
+    },
+    /// Add photos to an album.
+    AddToAlbum {
+        /// Album node uid in `volume~link` form (from `pdfs albums`).
+        uid: String,
+        /// Photo node uids (from `pdfs photos`).
+        #[arg(required = true)]
+        photos: Vec<String>,
+    },
+    /// Take photos out of an album. They stay in the timeline.
+    RemoveFromAlbum {
+        /// Album node uid in `volume~link` form (from `pdfs albums`).
+        uid: String,
+        /// Photo node uids (from `pdfs album <uid>`).
+        #[arg(required = true)]
+        photos: Vec<String>,
+    },
     /// Download a photo by uid (`volume~link`) and print its cached path.
     OpenPhoto {
         /// Photo node uid in `volume~link` form (from `pdfs photos`).
@@ -732,6 +769,22 @@ fn main() -> Result<()> {
         Command::ImportStatus => cmd_import_status(),
         Command::CancelImport => cmd_cancel_import(),
         Command::Album { uid, limit, offset } => cmd_album(uid, limit, offset),
+        Command::NewAlbum { name } => cmd_new_album(name),
+        Command::RenameAlbum { uid, name } => {
+            ok_or_bail(control_request(CtlRequest::RenameAlbum { uid, name })?)
+        }
+        Command::DeleteAlbum { uid, with_photos } => {
+            ok_or_bail(control_request(CtlRequest::DeleteAlbum {
+                uid,
+                delete_photos: with_photos,
+            })?)
+        }
+        Command::AddToAlbum { uid, photos } => {
+            cmd_album_change(CtlRequest::AddToAlbum { uid, photos }, "added")
+        }
+        Command::RemoveFromAlbum { uid, photos } => {
+            cmd_album_change(CtlRequest::RemoveFromAlbum { uid, photos }, "removed")
+        }
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
         Command::Search {
             query,
@@ -2066,6 +2119,42 @@ fn cmd_albums() -> Result<()> {
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+fn cmd_new_album(name: String) -> Result<()> {
+    match control_request(CtlRequest::CreateAlbum { name })? {
+        CtlResponse::AlbumCreated { uid } => println!("{uid}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Send an album add or remove and report it per photo; any failed photo
+/// fails the command.
+fn cmd_album_change(request: CtlRequest, verb: &str) -> Result<()> {
+    match control_request(request)? {
+        CtlResponse::AlbumChanged { changed, failed } => {
+            println!("{} {verb}", photo_count(changed.len()));
+            for failure in &failed {
+                eprintln!("{}: {}", failure.uid, failure.message);
+            }
+            if !failed.is_empty() {
+                bail!("{} failed", photo_count(failed.len()));
+            }
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn photo_count(n: usize) -> String {
+    if n == 1 {
+        "1 photo".to_string()
+    } else {
+        format!("{n} photos")
+    }
 }
 
 fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -> Result<()> {

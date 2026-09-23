@@ -16,9 +16,16 @@ const COVER_EDGE: i32 = 200;
 
 /// Show the Albums grid and (re)load it. Called when the Albums toggle goes on.
 pub(crate) fn show_albums(ui: &Rc<Ui>) {
-    close_album(ui);
-    ui.gallery.content.set_visible_child_name("albums");
+    show_album_grid(ui);
     load_albums(ui);
+}
+
+/// Switch to the album grid as it was last filled, keeping its scroll
+/// position. The timeline's filters do not apply to albums, so they go.
+fn show_album_grid(ui: &Rc<Ui>) {
+    close_album(ui);
+    ui.gallery.filters.set_visible(false);
+    ui.gallery.content.set_visible_child_name("albums");
 }
 
 /// Ask the daemon for the album listing and rebuild the grid.
@@ -27,12 +34,16 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
         return;
     }
     ui.gallery.albums_loading.set(true);
-    albums_status(
-        ui,
-        "view-grid-symbolic",
-        "Loading albums…",
-        "Reading your Proton Drive albums.",
-    );
+    // A grid already on screen stays there while it refreshes, rather than
+    // blinking to a loading page and losing its scroll position.
+    if ui.gallery.albums_stack.visible_child_name().as_deref() != Some("grid") {
+        albums_status(
+            ui,
+            "view-grid-symbolic",
+            "Loading albums…",
+            "Reading your Proton Drive albums.",
+        );
+    }
 
     let rx = spawn_request(ui.dirs.control_socket(), Request::PhotoAlbums);
     let ui = ui.clone();
@@ -52,7 +63,7 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
                 &ui,
                 "view-grid-symbolic",
                 "No albums",
-                "Albums you create in Proton Photos appear here.",
+                "Create one with New Album, or in Proton Photos.",
             ),
             Ok(Ok(Response::Albums { items, .. })) => {
                 fill_albums(&ui, &items);
@@ -80,8 +91,20 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
 /// Replace the grid's cards with `albums`, in the order the daemon gave them
 /// (newest activity first).
 fn fill_albums(ui: &Rc<Ui>, albums: &[AlbumInfo]) {
+    let scroll = ui
+        .gallery
+        .albums
+        .ancestor(gtk4::ScrolledWindow::static_type())
+        .and_downcast::<gtk4::ScrolledWindow>();
+    let position = scroll.as_ref().map(|s| s.vadjustment().value());
     while let Some(child) = ui.gallery.albums.first_child() {
         ui.gallery.albums.remove(&child);
+    }
+    *ui.gallery.album_list.borrow_mut() = albums.to_vec();
+    if ui.gallery.album.borrow().is_none() {
+        ui.gallery
+            .title
+            .set_subtitle(&count_noun(albums.len(), "album", "albums"));
     }
     for album in albums {
         ui.gallery.albums.append(&album_card(ui, album));
@@ -89,6 +112,10 @@ fn fill_albums(ui: &Rc<Ui>, albums: &[AlbumInfo]) {
     // The covers are ordinary photos as far as the daemon is concerned, so the
     // batch that fills them is the gallery's own.
     schedule_thumbs(ui);
+    // A refresh rebuilds the cards; put the view back where the user was.
+    if let (Some(scroll), Some(position)) = (scroll, position) {
+        glib::idle_add_local_once(move || scroll.vadjustment().set_value(position));
+    }
 }
 
 /// One album as a clickable card: its cover, its name, and how many photos it
@@ -150,10 +177,352 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
         want_cover(ui, uid, &picture);
     }
 
+    let context = gtk4::GestureClick::builder().button(3).build();
+    let ui_context = ui.clone();
+    let menu_album = album.clone();
+    context.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        if let Some(anchor) = gesture.widget() {
+            show_album_menu(&ui_context, &menu_album, &anchor, x, y);
+        }
+    });
+    button.add_controller(context);
+
     let ui_open = ui.clone();
     let album = album.clone();
     button.connect_clicked(move |_| open_album(&ui_open, album.clone()));
     button
+}
+
+/// The album card's menu. Albums shared with us belong to someone else, so
+/// they only open.
+fn show_album_menu(ui: &Rc<Ui>, album: &AlbumInfo, anchor: &gtk4::Widget, x: f64, y: f64) {
+    let mut menu = ActionMenu::new();
+    let (ui_c, album_c) = (ui.clone(), album.clone());
+    menu.item("Open", move || open_album(&ui_c, album_c.clone()));
+    if !album.shared {
+        menu.section();
+        let (ui_c, album_c) = (ui.clone(), album.clone());
+        menu.item("Rename…", move || prompt_rename_album(&ui_c, &album_c));
+        menu.section();
+        let (ui_c, album_c) = (ui.clone(), album.clone());
+        menu.item("Delete Album…", move || {
+            confirm_delete_album(&ui_c, &album_c)
+        });
+    }
+    menu.popup_at(anchor, x, y);
+}
+
+/// Ask for an album name. `on_name` gets the trimmed name; Create stays off
+/// while the entry is blank.
+fn prompt_album_name(
+    ui: &Rc<Ui>,
+    heading: &str,
+    action: &str,
+    current: &str,
+    on_name: impl Fn(String) + 'static,
+) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder().heading(heading).build();
+    let group = adw::PreferencesGroup::new();
+    let row = adw::EntryRow::builder()
+        .title("Album name")
+        .activates_default(true)
+        .build();
+    row.set_text(current);
+    group.add(&row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", action);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    dialog.set_response_enabled("ok", !current.trim().is_empty());
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    let dialog_typed = dialog.clone();
+    row.connect_changed(move |row| {
+        dialog_typed.set_response_enabled("ok", !row.text().trim().is_empty());
+    });
+    dialog.connect_response(None, move |_, resp| {
+        let name = row.text().trim().to_string();
+        if resp == "ok" && !name.is_empty() {
+            on_name(name);
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Ask for a name and create an album, then add `photos` to it, if any.
+pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
+    let ui_c = ui.clone();
+    prompt_album_name(ui, "New Album", "Create", "", move |name| {
+        let rx = spawn_request(ui_c.dirs.control_socket(), Request::CreateAlbum { name });
+        let ui = ui_c.clone();
+        let photos = photos.clone();
+        ui.busy_begin();
+        glib::spawn_future_local(async move {
+            let reply = rx.recv().await;
+            ui.busy_end();
+            match reply {
+                Ok(Ok(Response::AlbumCreated { uid })) => {
+                    if photos.is_empty() {
+                        toast(&ui, "Album created");
+                        reload_album_grid(&ui);
+                    } else {
+                        add_to_album(&ui, uid, photos);
+                    }
+                }
+                Ok(Ok(Response::Error { message, kind })) => {
+                    toast_failure(&ui, "Couldn't create the album", &message, kind)
+                }
+                _ => toast_error(
+                    &ui,
+                    "Couldn't create the album",
+                    "The mount service didn't respond.",
+                ),
+            }
+        });
+    });
+}
+
+fn prompt_rename_album(ui: &Rc<Ui>, album: &AlbumInfo) {
+    let (ui_c, uid) = (ui.clone(), album.uid.clone());
+    prompt_album_name(ui, "Rename Album", "Rename", &album.name, move |name| {
+        run_album_request(
+            &ui_c,
+            Request::RenameAlbum {
+                uid: uid.clone(),
+                name,
+            },
+            "Album renamed",
+            "Couldn't rename the album",
+        );
+    });
+}
+
+fn confirm_delete_album(ui: &Rc<Ui>, album: &AlbumInfo) {
+    let Some(win) = ui_window(ui) else { return };
+    let (ui_c, uid) = (ui.clone(), album.uid.clone());
+    confirm_destructive(
+        &win,
+        "Delete Album?",
+        &format!(
+            "“{}” is deleted. Its photos stay in your timeline.",
+            album.name
+        ),
+        "Delete",
+        move || {
+            run_album_request(
+                &ui_c,
+                Request::DeleteAlbum {
+                    uid: uid.clone(),
+                    delete_photos: false,
+                },
+                "Album deleted",
+                "Couldn't delete the album",
+            )
+        },
+    );
+}
+
+/// Send an album rename or delete and refresh the grid once it lands.
+fn run_album_request(ui: &Rc<Ui>, request: Request, done: &'static str, failed: &'static str) {
+    let rx = spawn_request(ui.dirs.control_socket(), request);
+    let ui = ui.clone();
+    ui.busy_begin();
+    glib::spawn_future_local(async move {
+        let reply = rx.recv().await;
+        ui.busy_end();
+        match reply {
+            Ok(Ok(Response::Ok { .. })) => {
+                toast(&ui, done);
+                reload_album_grid(&ui);
+            }
+            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
+            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+        }
+    });
+}
+
+/// Refill the album grid if it is on screen; otherwise it reloads when shown.
+fn reload_album_grid(ui: &Rc<Ui>) {
+    if ui.gallery.content.visible_child_name().as_deref() == Some("albums") {
+        load_albums(ui);
+    }
+}
+
+/// Offer our own albums to add `photos` to, plus a new one.
+pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
+    let rx = spawn_request(ui.dirs.control_socket(), Request::PhotoAlbums);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let albums: Vec<AlbumInfo> = match rx.recv().await {
+            Ok(Ok(Response::Albums { items, .. })) => {
+                items.into_iter().filter(|album| !album.shared).collect()
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't load albums", &message, kind);
+                return;
+            }
+            _ => {
+                toast_error(
+                    &ui,
+                    "Couldn't load albums",
+                    "The mount service didn't respond.",
+                );
+                return;
+            }
+        };
+        if albums.is_empty() {
+            prompt_new_album(&ui, photos);
+            return;
+        }
+
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .build();
+        list.add_css_class("boxed-list");
+        for album in &albums {
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&album.name))
+                .subtitle(album_subtitle(album))
+                .activatable(true)
+                .build();
+            list.append(&row);
+        }
+        let scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(360)
+            .child(&list)
+            .build();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Add to Album")
+            .body(match photos.len() {
+                1 => "Choose an album for this photo.".to_string(),
+                n => format!("Choose an album for {n} photos."),
+            })
+            .extra_child(&scroll)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("new", "New Album…");
+        dialog.set_close_response("cancel");
+
+        let (ui_c, dialog_c, photos_c) = (ui.clone(), dialog.clone(), photos.clone());
+        list.connect_row_activated(move |_, row| {
+            if let Some(album) = albums.get(row.index().max(0) as usize) {
+                dialog_c.close();
+                add_to_album(&ui_c, album.uid.clone(), photos_c.clone());
+            }
+        });
+        let ui_c = ui.clone();
+        dialog.connect_response(Some("new"), move |_, _| {
+            prompt_new_album(&ui_c, photos.clone())
+        });
+        dialog.present(ui_window(&ui).as_ref());
+    });
+}
+
+fn add_to_album(ui: &Rc<Ui>, album: String, photos: Vec<String>) {
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::AddToAlbum { uid: album, photos },
+    );
+    let ui = ui.clone();
+    ui.busy_begin();
+    glib::spawn_future_local(async move {
+        let reply = rx.recv().await;
+        ui.busy_end();
+        match reply {
+            Ok(Ok(Response::AlbumChanged { changed, failed })) => {
+                if let Some(failure) = failed.first() {
+                    toast_error(&ui, "Some photos couldn't be added", &failure.message);
+                } else {
+                    toast(
+                        &ui,
+                        &format!(
+                            "Added {} to the album",
+                            count_noun(changed.len(), "photo", "photos")
+                        ),
+                    );
+                }
+                reload_album_grid(&ui);
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't add to the album", &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't add to the album",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
+/// Take photos out of the open album. They leave the view at once and come
+/// back if the server refuses; the timeline keeps them either way.
+pub(crate) fn remove_from_album(ui: &Rc<Ui>, album: &AlbumInfo, photos: Vec<String>) {
+    let removed = remove_photos(ui, &photos);
+    set_selection_mode(ui, false);
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::RemoveFromAlbum {
+            uid: album.uid.clone(),
+            photos,
+        },
+    );
+    let ui = ui.clone();
+    ui.busy_begin();
+    glib::spawn_future_local(async move {
+        let reply = rx.recv().await;
+        ui.busy_end();
+        match reply {
+            Ok(Ok(Response::AlbumChanged { changed, failed })) => {
+                if !failed.is_empty() {
+                    let kept: Vec<PhotoItem> = removed
+                        .iter()
+                        .filter(|photo| failed.iter().any(|f| f.uid == photo.uid))
+                        .cloned()
+                        .collect();
+                    restore_photos(&ui, kept);
+                    toast_error(
+                        &ui,
+                        "Some photos couldn't be removed from the album",
+                        &failed[0].message,
+                    );
+                }
+                if changed.is_empty() {
+                    return;
+                }
+                // The open album's count, as the header shows it.
+                let mut open = ui.gallery.album.borrow_mut();
+                if let Some(album) = open.as_mut() {
+                    album.photo_count = album.photo_count.saturating_sub(changed.len());
+                    ui.gallery.title.set_subtitle(&album_subtitle(album));
+                }
+                drop(open);
+                toast(
+                    &ui,
+                    &format!(
+                        "Removed {} from the album",
+                        count_noun(changed.len(), "photo", "photos")
+                    ),
+                );
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                restore_photos(&ui, removed);
+                toast_failure(&ui, "Couldn't remove from the album", &message, kind)
+            }
+            _ => {
+                restore_photos(&ui, removed);
+                toast_error(
+                    &ui,
+                    "Couldn't remove from the album",
+                    "The mount service didn't respond.",
+                )
+            }
+        }
+    });
 }
 
 /// "12 photos", plus where the album came from when it isn't ours.
@@ -195,6 +564,7 @@ pub(crate) fn open_album(ui: &Rc<Ui>, album: AlbumInfo) {
     ui.gallery.title.set_title(&album.name);
     ui.gallery.title.set_subtitle(&album_subtitle(&album));
     *ui.gallery.album.borrow_mut() = Some(album);
+    ui.gallery.timeline_stale.set(true);
 
     // An album page carries no kind or date filter, and Upload targets the
     // timeline rather than an album — hide those rather than offer controls that
@@ -219,7 +589,6 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
         return;
     }
     ui.gallery.title.set_title("Photos");
-    ui.gallery.filters.set_visible(true);
     ui.gallery.view_switch.set_visible(true);
     ui.gallery.upload.set_visible(true);
     ui.gallery.back.set_visible(false);
@@ -250,15 +619,28 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
         if !btn.is_active() {
             return;
         }
-        // The timeline is reloaded rather than restored, because an open album
-        // left the model holding its own photos.
         close_album(&ui_photos);
+        ui_photos.gallery.filters.set_visible(true);
         ui_photos.gallery.content.set_visible_child_name("timeline");
-        load_gallery(&ui_photos, false);
+        // The timeline comes back as it was left unless an album took over the
+        // model since; then it has to be reloaded.
+        if ui_photos.gallery.timeline_stale.replace(false) || ui_photos.gallery.model.n_items() == 0
+        {
+            load_gallery(&ui_photos, false);
+        } else {
+            update_gallery_subtitle(&ui_photos);
+        }
     });
 
+    // Back returns to the grid the album was opened from, scrolled where it
+    // was, instead of reloading it.
     let ui_back = ui.clone();
     ui.gallery.back.clone().connect_clicked(move |_| {
-        show_albums(&ui_back);
+        show_album_grid(&ui_back);
+        let count = ui_back.gallery.album_list.borrow().len();
+        ui_back
+            .gallery
+            .title
+            .set_subtitle(&count_noun(count, "album", "albums"));
     });
 }

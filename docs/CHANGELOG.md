@@ -83,6 +83,16 @@ Schema: **31** (unchanged).
   In the list view a Location column shows which folder each hit is in. Pinned files listed by the
   search prompt and `pdfs-query` show whether they are on disk, instead of always showing them as
   not downloaded.
+- **Album management.** The Albums view has a New Album button, and an album's right-click menu
+  offers Rename… and Delete Album…. Deleting an album keeps its photos in the timeline. A photo's
+  menu and the selection bar offer Add to Album…, and inside an album, Remove from Album takes a
+  photo out without trashing it. Albums shared with you only open. The CLI gains `pdfs new-album`,
+  `rename-album`, `delete-album`, `add-to-album` and `remove-from-album`. This needs
+  proton-drive-rs 0.6.6.
+- **Albums view fixes.** The timeline's filter row no longer shows over the album grid. The header
+  counts albums. Back from an album returns to the grid where you left it instead of reloading it,
+  and going from Albums back to Timeline keeps the timeline's scroll position unless an album was
+  opened in between.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 
