@@ -348,11 +348,15 @@ Version 1.0 strengthens the boundaries around local-only data and destructive re
     <td align="center" width="50%"><img src="images/shared_with_me.png" alt="Shared with me" width="100%"><br><sub><b>Shared with me</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="images/computers.png" alt="Local Backups (Computers)" width="100%"><br><sub><b>Local Backups (Computers)</b></sub></td>
+    <td align="center" width="50%"><img src="images/restore_devices.png" alt="Local Backups (Computers)" width="100%"><br><sub><b>Local Backups (Computers)</b></sub></td>
     <td align="center" width="50%"><img src="images/photos.png" alt="Photos Timeline" width="100%"><br><sub><b>Photos Timeline</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="images/prompt.png" alt="Search Launcher Prompt" width="100%"><br><sub><b>Search Launcher Prompt</b></sub></td>
+    <td align="center" width="50%"><img src="images/prompt_gtk.png" alt="Search Launcher Prompt (GTK)" width="100%"><br><sub><b>Search Launcher Prompt (GTK)</b></sub></td>
+    <td align="center" width="50%"><img src="images/prompt_fzf.png" alt="Search Launcher Prompt (fzf)" width="100%"><br><sub><b>Search Launcher Prompt (fzf)</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="images/activity.png" alt="Activity" width="100%"><br><sub><b>Activity</b></sub></td>
     <td align="center" width="50%"><img src="images/settings.png" alt="Settings" width="100%"><br><sub><b>Settings</b></sub></td>
   </tr>
 </table>
