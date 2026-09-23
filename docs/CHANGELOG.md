@@ -11,6 +11,24 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-09-23
+
+Schema: **32**. Videos that earlier got no thumbnail are tried again.
+
+### Added
+- **Video thumbnails.** Videos without a thumbnail from Drive now show a frame from the clip in
+  Photos. This needs `ffmpeg`, a new optional dependency.
+- **Uploads carry a thumbnail.** Photos and videos uploaded from this client now include one, so
+  they show a preview in Proton's own apps as well, without downloading the whole file.
+
+### Fixed
+- **The Photos gallery no longer jumps** while thumbnails load, when zooming, or when switching
+  tabs and back.
+- **The month scrubber no longer collides with the scrollbar.**
+- **The photo details panel is no longer empty.**
+- **Photo details read like a camera's:** "Google Pixel 6" instead of quoted EXIF values, shutter
+  speeds such as 1/19 s, and a labelled ISO.
+
 ## [2.1.1] — 2026-09-23
 
 Schema: **31** (unchanged).
