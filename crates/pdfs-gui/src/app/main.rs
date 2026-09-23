@@ -355,12 +355,7 @@ fn build_window(app: &adw::Application) {
         sidebar: sidebar_list.clone(),
         nav: split.clone(),
         file_thumbs: FileThumbnailState::new(),
-        login: LoginState {
-            email: login_widgets.0,
-            password: login_widgets.1,
-            login_button: login_widgets.2,
-            login_status: login_widgets.3,
-        },
+        login: login_widgets,
         status: StatusState {
             status_inflight: Cell::new(false),
             transfers_group: locations_widgets.transfers_group.clone(),
@@ -446,6 +441,9 @@ fn build_window(app: &adw::Application) {
             retry: trash_widgets.retry.clone(),
             empty: trash_widgets.empty.clone(),
             subtitle: trash_widgets.subtitle.clone(),
+            selection: trash_widgets.selection.clone(),
+            selection_bar: trash_widgets.selection_bar.clone(),
+            selection_label: trash_widgets.selection_label.clone(),
         },
         gallery: GalleryState {
             model: gallery_widgets.model.clone(),
@@ -628,7 +626,7 @@ fn build_window(app: &adw::Application) {
         &gallery_widgets.empty_import,
     );
     wire_albums(&ui);
-    wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
+    wire_trash(&ui, &trash_widgets);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
     wire_devices(&ui, &devices_widgets.retry, &devices_widgets.restore);

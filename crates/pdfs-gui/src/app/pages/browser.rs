@@ -1243,6 +1243,33 @@ pub(crate) fn menu_item(label: &str, icon: &str) -> gtk4::Button {
     button
 }
 
+/// An action run by a [`more_menu_button`] item.
+pub(crate) type MenuAction = Box<dyn Fn()>;
+
+/// A flat ⋮ button whose popover lists `items` as (label, icon, action). The
+/// popover closes before the action runs, so a dialog it opens gets the focus.
+pub(crate) fn more_menu_button(items: Vec<(&str, &str, MenuAction)>) -> gtk4::MenuButton {
+    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let popover = gtk4::Popover::builder().child(&menu).build();
+    for (label, icon, run) in items {
+        let button = menu_item(label, icon);
+        let pop = popover.clone();
+        button.connect_clicked(move |_| {
+            pop.popdown();
+            run();
+        });
+        menu.append(&button);
+    }
+    let button = gtk4::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More")
+        .valign(gtk4::Align::Center)
+        .popover(&popover)
+        .build();
+    button.add_css_class("flat");
+    button
+}
+
 /// Fetch the [`DirEntry`] backing the model item at `pos`, if any.
 pub(crate) fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Option<DirEntry> {
     let obj = model?.item(pos).and_downcast::<BoxedAnyObject>()?;

@@ -6,22 +6,20 @@ pub(crate) struct LoginState {
     pub(crate) email: adw::EntryRow,
     pub(crate) password: adw::PasswordEntryRow,
     pub(crate) login_button: gtk4::Button,
+    /// Spins inside the Sign in button while a sign-in is running.
+    pub(crate) login_spinner: gtk4::Spinner,
     pub(crate) login_status: gtk4::Label,
 }
 
-/// The login page: an email row, password row, a primary "Sign in" button and a
-/// status label, centred in a clamp. The 2FA code is prompted lazily in a
-/// dialog (see [`prompt_2fa`]) only when the account actually requires it.
-#[allow(clippy::type_complexity)]
-pub(crate) fn build_login_page() -> (
-    gtk4::Widget,
-    (
-        adw::EntryRow,
-        adw::PasswordEntryRow,
-        gtk4::Button,
-        gtk4::Label,
-    ),
-) {
+/// Where the login page's account links go.
+const SIGNUP_URL: &str = "https://account.proton.me/drive/signup";
+const RESET_PASSWORD_URL: &str = "https://account.proton.me/reset-password";
+
+/// The login page: an email row, password row, a primary "Sign in" button, a
+/// status label and links to create an account or reset the password, centred
+/// in a clamp. The 2FA code is prompted lazily in a dialog (see [`prompt_2fa`])
+/// only when the account actually requires it.
+pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
     let group = adw::PreferencesGroup::builder()
         .title("Sign in to Proton")
         .description("Use your Proton account to connect Drive.")
@@ -32,8 +30,12 @@ pub(crate) fn build_login_page() -> (
     group.add(&email);
     group.add(&password);
 
+    let login_spinner = gtk4::Spinner::builder().visible(false).build();
+    let button_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    button_content.append(&login_spinner);
+    button_content.append(&gtk4::Label::new(Some("Sign in")));
     let login_button = gtk4::Button::builder()
-        .label("Sign in")
+        .child(&button_content)
         .halign(gtk4::Align::Center)
         .build();
     login_button.add_css_class("suggested-action");
@@ -64,6 +66,14 @@ pub(crate) fn build_login_page() -> (
     inner.append(&group);
     inner.append(&login_button);
     inner.append(&login_status);
+    let links = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    links.set_halign(gtk4::Align::Center);
+    links.append(&gtk4::LinkButton::with_label(SIGNUP_URL, "Create account"));
+    links.append(&gtk4::LinkButton::with_label(
+        RESET_PASSWORD_URL,
+        "Forgot password?",
+    ));
+    inner.append(&links);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(420)
@@ -73,7 +83,13 @@ pub(crate) fn build_login_page() -> (
 
     (
         scroll.upcast(),
-        (email, password, login_button, login_status),
+        LoginState {
+            email,
+            password,
+            login_button,
+            login_spinner,
+            login_status,
+        },
     )
 }
 
@@ -103,7 +119,7 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
             return;
         }
 
-        ui.login.login_button.set_sensitive(false);
+        set_signing_in(&ui, true);
         ui.login.login_status.set_text("Signing in…");
         let (rx, totp_req_rx, hv_req_rx) = spawn_login(username, password);
 
@@ -140,7 +156,7 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                 .recv()
                 .await
                 .unwrap_or_else(|_| Err("login cancelled".into()));
-            ui.login.login_button.set_sensitive(true);
+            set_signing_in(&ui, false);
             match result {
                 Ok(()) => {
                     ui.login.login_status.set_text("");
@@ -151,13 +167,51 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     service::enable_start();
                     refresh(&ui);
                 }
-                Err(e) => ui
-                    .login
-                    .login_status
-                    .set_text(&format!("Sign-in failed: {e}")),
+                Err(e) => ui.login.login_status.set_text(&e),
             }
         });
     });
+}
+
+/// Lock the form and spin the button while a sign-in runs.
+fn set_signing_in(ui: &Rc<Ui>, running: bool) {
+    ui.login.login_button.set_sensitive(!running);
+    ui.login.email.set_sensitive(!running);
+    ui.login.password.set_sensitive(!running);
+    ui.login.login_spinner.set_visible(running);
+    ui.login.login_spinner.set_spinning(running);
+}
+
+/// What to tell the person when sign-in fails. Proton's own API messages are
+/// written for people ("Incorrect login credentials…"), so they pass through;
+/// everything else is mapped from its kind rather than shown as a debug string.
+pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
+    use pdfs_core::proton_sdk::ProtonError;
+    match error {
+        pdfs_core::Error::Proton(ProtonError::Api(api)) if api.http_status == 429 => {
+            "Too many sign-in attempts. Wait a few minutes and try again.".to_string()
+        }
+        pdfs_core::Error::Proton(ProtonError::Api(api)) if !api.message.is_empty() => {
+            api.message.clone()
+        }
+        pdfs_core::Error::Proton(ProtonError::Transport(_)) => {
+            "Couldn't reach Proton. Check your internet connection and try again.".to_string()
+        }
+        pdfs_core::Error::Keyring(_) => {
+            "Signed in, but the session couldn't be saved to the system keyring. Make sure a \
+             keyring (GNOME Keyring or KWallet) is running and unlocked."
+                .to_string()
+        }
+        pdfs_core::Error::Other(message) if message.contains("two-factor") => {
+            "Sign-in cancelled: no two-factor code was entered.".to_string()
+        }
+        pdfs_core::Error::Other(message) if message.contains("verification") => {
+            "Sign-in cancelled: the verification wasn't completed. Sign in again to get a new \
+             one."
+                .to_string()
+        }
+        other => format!("Sign-in failed: {other}"),
+    }
 }
 
 /// Run the async SRP + optional 2FA login on a dedicated current-thread Tokio
@@ -223,7 +277,7 @@ pub(crate) fn spawn_login(
                 },
             )
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| login_error_message(&e))
         });
         let _ = tx.send_blocking(result);
     });
@@ -236,7 +290,7 @@ pub(crate) fn spawn_login(
 pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
     let dialog = adw::AlertDialog::builder()
         .heading("Two-factor authentication")
-        .body("Enter the code from your authenticator app.")
+        .body("Enter the code from your authenticator app, or one of your recovery codes.")
         .build();
 
     let group = adw::PreferencesGroup::new();
@@ -289,4 +343,23 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
             refresh(&ui);
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_error_message;
+
+    #[test]
+    fn a_cancelled_prompt_says_which_step_was_skipped() {
+        let totp = pdfs_core::Error::Other("two-factor entry cancelled".into());
+        assert!(login_error_message(&totp).contains("two-factor code"));
+        let hv = pdfs_core::Error::Other("verification cancelled".into());
+        assert!(login_error_message(&hv).contains("verification wasn't completed"));
+    }
+
+    #[test]
+    fn an_unmapped_error_keeps_its_text() {
+        let error = pdfs_core::Error::Other("something odd".into());
+        assert_eq!(login_error_message(&error), "Sign-in failed: something odd");
+    }
 }

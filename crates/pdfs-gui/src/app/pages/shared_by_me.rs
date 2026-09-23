@@ -22,8 +22,8 @@ pub(crate) struct SharedByMeWidgets {
 }
 
 /// The Shared page: one section listing the items I have shared with others —
-/// each row summarizing who has access and carrying its public link (copy/open)
-/// and a Manage shortcut into the per-node Share dialog.
+/// each row summarizing who has access, opening the item when activated, with
+/// Copy link and a menu for the link and the per-node Share dialog.
 pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
     let refresh = refresh_button();
 
@@ -199,8 +199,17 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
             .build();
         row.add_prefix(&file_thumbnail(ui, &entry, 40, 24, true));
 
-        // Copy / open the public link, when there is one with a recovered URL.
-        if let Some(url) = item.link.as_ref().and_then(|l| l.url.clone()) {
+        // A node the daemon can place in my tree opens like it would in My Files.
+        if !item.path.is_empty() {
+            row.set_activatable(true);
+            let ui_open = ui.clone();
+            let entry_open = entry.clone();
+            row.connect_activated(move |_| open_shared_by_me(&ui_open, &entry_open));
+        }
+
+        let url = item.link.as_ref().and_then(|l| l.url.clone());
+        // The one action people come here for most gets its own button.
+        if let Some(url) = url.clone() {
             let copy = gtk4::Button::builder()
                 .icon_name("edit-copy-symbolic")
                 .tooltip_text("Copy link")
@@ -208,39 +217,77 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
                 .build();
             copy.add_css_class("flat");
             let ui_copy = ui.clone();
-            let url_copy = url.clone();
             copy.connect_clicked(move |btn| {
-                btn.clipboard().set_text(&url_copy);
+                btn.clipboard().set_text(&url);
                 toast(&ui_copy, "Link copied");
             });
-            let open = gtk4::Button::builder()
-                .icon_name("external-link-symbolic")
-                .tooltip_text("Open link")
-                .valign(gtk4::Align::Center)
-                .build();
-            open.add_css_class("flat");
-            let url_open = url.clone();
-            open.connect_clicked(move |_| open_uri(&url_open));
             row.add_suffix(&copy);
-            row.add_suffix(&open);
         }
-
-        // Manage opens the per-node Share dialog. It used to be offered only for
-        // an item whose path the daemon could resolve; the dialog now addresses a
-        // pathless node by uid, so every shared item can be managed from here.
-        let manage = gtk4::Button::builder()
-            .label("Manage")
-            .valign(gtk4::Align::Center)
-            .build();
-        manage.add_css_class("flat");
-        let ui_manage = ui.clone();
-        manage.connect_clicked(move |_| open_share_dialog(&ui_manage, &entry));
-        row.add_suffix(&manage);
+        row.add_suffix(&shared_by_me_menu(ui, &entry, url));
 
         ui.shared_by_me.group.add(&row);
         rows.push(row.upcast());
     }
     *ui.shared_by_me.rows.borrow_mut() = rows;
+}
+
+/// The ⋮ menu on a shared item: open it, the link, and the Share dialog.
+///
+/// Manage access opens the per-node Share dialog, which addresses a pathless
+/// node by uid, so every shared item can be managed from here.
+fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry, url: Option<String>) -> gtk4::MenuButton {
+    let mut items: Vec<(&str, &str, MenuAction)> = Vec::new();
+    if !entry.path.is_empty() {
+        let (ui_c, entry_c) = (ui.clone(), entry.clone());
+        items.push((
+            "Open",
+            "document-open-symbolic",
+            Box::new(move || open_shared_by_me(&ui_c, &entry_c)),
+        ));
+        let (ui_c, entry_c) = (ui.clone(), entry.clone());
+        items.push((
+            "Show in My Files",
+            "folder-symbolic",
+            Box::new(move || show_in_my_files(&ui_c, &entry_c)),
+        ));
+    }
+    if let Some(url) = url {
+        items.push((
+            "Open Link",
+            "external-link-symbolic",
+            Box::new(move || open_uri(&url)),
+        ));
+    }
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    items.push((
+        "Manage Access…",
+        "system-users-symbolic",
+        Box::new(move || open_share_dialog(&ui_c, &entry_c)),
+    ));
+    more_menu_button(items)
+}
+
+/// Open a shared item: a folder in My Files, a file the way My Files would.
+fn open_shared_by_me(ui: &Rc<Ui>, entry: &DirEntry) {
+    if entry.is_dir {
+        ui.stack.set_visible_child_name("browser");
+        ui.browser.search.set_text("");
+        browse_to(ui, entry.path.clone());
+    } else {
+        activate_entry(ui, entry);
+    }
+}
+
+/// Go to the folder holding a shared item in My Files.
+fn show_in_my_files(ui: &Rc<Ui>, entry: &DirEntry) {
+    let parent = entry
+        .path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default();
+    ui.stack.set_visible_child_name("browser");
+    ui.browser.search.set_text("");
+    browse_to(ui, parent);
 }
 
 /// A one-line summary of who can reach a shared item, for its row subtitle.

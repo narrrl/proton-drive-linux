@@ -11,6 +11,10 @@ pub(crate) struct TrashState {
     pub(crate) empty: gtk4::Button,
     /// "12 items" under the page title.
     pub(crate) subtitle: adw::WindowTitle,
+    pub(crate) selection: gtk4::MultiSelection,
+    /// The bottom bar acting on the selection; revealed while anything is selected.
+    pub(crate) selection_bar: gtk4::Revealer,
+    pub(crate) selection_label: gtk4::Label,
 }
 
 /// The widgets of the Trash page that a load repaints.
@@ -23,10 +27,17 @@ pub(crate) struct TrashWidgets {
     pub(crate) empty: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
     pub(crate) subtitle: adw::WindowTitle,
+    pub(crate) selection: gtk4::MultiSelection,
+    pub(crate) selection_bar: gtk4::Revealer,
+    pub(crate) selection_label: gtk4::Label,
+    pub(crate) restore_selected: gtk4::Button,
+    pub(crate) delete_selected: gtk4::Button,
 }
 
 /// The Trash page: a flat list of everything Drive is holding in the trash, each
-/// row offering Restore and Delete Forever, with Empty Trash in the header.
+/// row offering Restore and Delete Forever, with Empty Trash in the header. A
+/// selection (click, Shift/Ctrl+click, Ctrl+A) gets the same two actions in a
+/// bottom bar.
 ///
 /// A trashed node has no path inside the mount — the daemon forgets it when it is
 /// trashed — so unlike the Files page this one addresses entries by uid and always
@@ -36,7 +47,7 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
 
     let empty = gtk4::Button::builder()
-        .label("Empty…")
+        .label("Empty Trash…")
         .tooltip_text("Permanently delete everything in the Trash")
         .sensitive(false)
         .build();
@@ -56,11 +67,10 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
         .build();
     status.add_css_class("compact");
 
-    // No selection model: every action lives on the row it acts on, so a
-    // mis-aimed Delete Forever isn't one click away from a stale selection.
-    let list = gtk4::ListView::builder()
-        .model(&gtk4::NoSelection::new(Some(model.clone())))
-        .build();
+    // Bulk Delete Forever always confirms with the count, so a stale selection
+    // can't delete anything silently.
+    let selection = gtk4::MultiSelection::new(Some(model.clone()));
+    let list = gtk4::ListView::builder().model(&selection).build();
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
         .child(&list)
@@ -78,6 +88,21 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     inner.set_margin_start(18);
     inner.set_margin_end(18);
     inner.append(&content);
+
+    let selection_label = gtk4::Label::new(None);
+    let restore_selected = gtk4::Button::with_label("Restore");
+    let delete_selected = gtk4::Button::with_label("Delete Permanently…");
+    delete_selected.add_css_class("destructive-action");
+    let bar = gtk4::ActionBar::new();
+    bar.set_center_widget(Some(&selection_label));
+    bar.pack_start(&restore_selected);
+    bar.pack_end(&delete_selected);
+    let selection_bar = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideUp)
+        .child(&bar)
+        .build();
+    inner.append(&selection_bar);
+
     let (frame, header, subtitle) = page_frame("Trash", &inner);
     header.pack_start(&empty);
     header.pack_end(&refresh);
@@ -93,6 +118,11 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
             empty,
             refresh,
             subtitle,
+            selection,
+            selection_bar,
+            selection_label,
+            restore_selected,
+            delete_selected,
         },
     )
 }
@@ -100,7 +130,9 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
 /// Install the row factory and the Empty Trash button. The row's two buttons read
 /// the entry off the [`gtk4::ListItem`] they were clicked on rather than a
 /// captured copy, so a recycled row always acts on the item it currently shows.
-pub(crate) fn wire_trash(ui: &Rc<Ui>, list: &gtk4::ListView, empty: &gtk4::Button) {
+pub(crate) fn wire_trash(ui: &Rc<Ui>, widgets: &TrashWidgets) {
+    let list = &widgets.list;
+    let empty = &widgets.empty;
     let factory = gtk4::SignalListItemFactory::new();
     let ui_setup = ui.clone();
     factory.connect_setup(move |_, item| {
@@ -144,7 +176,7 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, list: &gtk4::ListView, empty: &gtk4::Butto
         let item_purge = item.clone();
         purge.connect_clicked(move |_| {
             if let Some(entry) = bound_entry(&item_purge) {
-                prompt_delete_forever(&ui_purge, &entry);
+                prompt_delete_forever(&ui_purge, std::slice::from_ref(&entry));
             }
         });
 
@@ -191,6 +223,46 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, list: &gtk4::ListView, empty: &gtk4::Butto
 
     let ui_empty = ui.clone();
     empty.connect_clicked(move |_| prompt_empty_trash(&ui_empty));
+
+    let ui_sel = ui.clone();
+    widgets
+        .selection
+        .connect_selection_changed(move |_, _, _| sync_trash_selection(&ui_sel));
+    let ui_restore = ui.clone();
+    widgets.restore_selected.connect_clicked(move |_| {
+        let entries = selected_trash(&ui_restore);
+        if !entries.is_empty() {
+            restore_entries(&ui_restore, &entries);
+        }
+    });
+    let ui_delete = ui.clone();
+    widgets.delete_selected.connect_clicked(move |_| {
+        let entries = selected_trash(&ui_delete);
+        if !entries.is_empty() {
+            prompt_delete_forever(&ui_delete, &entries);
+        }
+    });
+}
+
+/// The trashed entries currently selected, in list order.
+fn selected_trash(ui: &Rc<Ui>) -> Vec<DirEntry> {
+    let selected = ui.trash.selection.selection();
+    (0..selected.size())
+        .filter_map(|i| ui.trash.model.item(selected.nth(i as u32)))
+        .filter_map(|obj| obj.downcast::<BoxedAnyObject>().ok())
+        .map(|obj| obj.borrow::<DirEntry>().clone())
+        .collect()
+}
+
+/// Reveal the selection bar while anything is selected and count what is.
+fn sync_trash_selection(ui: &Rc<Ui>) {
+    let count = ui.trash.selection.selection().size() as usize;
+    ui.trash.selection_bar.set_reveal_child(count > 0);
+    if count > 0 {
+        ui.trash
+            .selection_label
+            .set_label(&format!("{} selected", count_noun(count, "item", "items")));
+    }
 }
 
 /// The [`DirEntry`] a list item is currently bound to, or `None` for an unbound
@@ -208,6 +280,7 @@ pub(crate) fn load_trash(ui: &Rc<Ui>) {
     // that may already be gone.
     ui.trash.model.remove_all();
     ui.trash.empty.set_sensitive(false);
+    sync_trash_selection(ui);
     trash_status(
         ui,
         "user-trash-symbolic",
@@ -285,6 +358,7 @@ pub(crate) fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &s
 /// user looks for what they just deleted.
 pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ui.trash.model.remove_all();
+    sync_trash_selection(ui);
     ui.trash.empty.set_sensitive(!entries.is_empty());
     if entries.is_empty() {
         trash_status(
@@ -297,10 +371,9 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
         return;
     }
     ui.trash.content.set_visible_child_name("list");
-    ui.trash.subtitle.set_subtitle(&match entries.len() {
-        1 => "1 item".to_string(),
-        n => format!("{n} items"),
-    });
+    ui.trash
+        .subtitle
+        .set_subtitle(&count_noun(entries.len(), "item", "items"));
 
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.modified));
@@ -311,27 +384,37 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
 
 /// Restore one trashed entry to the folder it was trashed from.
 pub(crate) fn restore_entry(ui: &Rc<Ui>, entry: &DirEntry) {
-    let name = entry.name.clone();
+    restore_entries(ui, std::slice::from_ref(entry));
+}
+
+/// Restore trashed entries to the folders they were trashed from.
+pub(crate) fn restore_entries(ui: &Rc<Ui>, entries: &[DirEntry]) {
     run_mutation(
         ui,
         Request::Restore {
-            uids: vec![entry.uid.clone()],
+            uids: entries.iter().map(|e| e.uid.clone()).collect(),
         },
-        format!("Restored “{name}”"),
+        format!("Restored {}", entries_label(entries)),
         "Couldn't restore",
     );
 }
 
-/// Confirm, then permanently delete one trashed entry. Irreversible, so it asks.
-pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entry: &DirEntry) {
+/// “name” for one entry, “3 items” for several.
+fn entries_label(entries: &[DirEntry]) -> String {
+    match entries {
+        [one] => format!("“{}”", one.name),
+        _ => count_noun(entries.len(), "item", "items"),
+    }
+}
+
+/// Confirm, then permanently delete trashed entries. Irreversible, so it asks.
+pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entries: &[DirEntry]) {
     let win = ui_window(ui);
-    let uid = entry.uid.clone();
-    let name = entry.name.clone();
+    let uids: Vec<String> = entries.iter().map(|e| e.uid.clone()).collect();
+    let name = entries_label(entries);
     let dialog = adw::AlertDialog::builder()
-        .heading("Delete permanently")
-        .body(format!(
-            "Permanently delete “{name}”? This cannot be undone."
-        ))
+        .heading("Delete Permanently")
+        .body(format!("Permanently delete {name}? This cannot be undone."))
         .build();
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("delete", "Delete Permanently");
@@ -344,10 +427,8 @@ pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entry: &DirEntry) {
         if resp == "delete" {
             run_mutation(
                 &ui,
-                Request::DeleteForever {
-                    uids: vec![uid.clone()],
-                },
-                format!("Deleted “{name}” permanently"),
+                Request::DeleteForever { uids: uids.clone() },
+                format!("Deleted {name} permanently"),
                 "Couldn't delete",
             );
         }

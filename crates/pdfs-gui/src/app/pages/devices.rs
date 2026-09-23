@@ -60,7 +60,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     // second copy of that list here would be two places to change the same mode.
     let sync_group = adw::PreferencesGroup::builder()
         .title("This computer")
-        .description("The device this machine backs up to.")
+        .description("The computer this machine backs up as.")
         .build();
     // Rename control for *this* machine's device, in the section header. The
     // current device is filtered out of "Other computers", so this is the only
@@ -75,7 +75,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     sync_group.set_header_suffix(Some(&rename_this));
     let group = adw::PreferencesGroup::builder()
         .title("Other computers")
-        .description("Other devices backing up to this account.")
+        .description("Other computers backing up to this account.")
         .build();
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
@@ -170,7 +170,7 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
         ui,
         "computer-symbolic",
         "Loading…",
-        "Reading your devices.",
+        "Reading your computers.",
         false,
     );
     ui.busy_begin();
@@ -258,6 +258,9 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
     match devices.iter().find(|d| d.this_device) {
         Some(me) => {
             *ui.devices.this_device.borrow_mut() = Some((me.uid.clone(), me.name.clone()));
+            ui.devices
+                .sync_group
+                .set_description(Some(&format!("Backing up as “{}”.", me.name)));
             ui.devices.rename_this.set_sensitive(true);
             ui.devices
                 .rename_this
@@ -286,43 +289,30 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
             .subtitle(device_subtitle(dev))
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
-        let remove = gtk4::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove this computer and everything it backed up")
-            .valign(gtk4::Align::Center)
-            .build();
-        remove.add_css_class("flat");
-        let rename = gtk4::Button::builder()
-            .icon_name("document-edit-symbolic")
-            .tooltip_text("Rename computer")
-            .valign(gtk4::Align::Center)
-            .build();
-        rename.add_css_class("flat");
         // Adoption is how a reinstalled or renamed machine re-attaches to the
         // device it used to be, instead of registering a duplicate. It only
-        // makes sense on *another* device's row, which is the only place this
+        // makes sense on *another* computer's row, which is the only place this
         // loop paints.
-        let adopt = gtk4::Button::builder()
-            .icon_name("insert-object-symbolic")
-            .tooltip_text("Use this computer's identity for this machine")
-            .valign(gtk4::Align::Center)
-            .build();
-        adopt.add_css_class("flat");
-        let ui_ad = ui.clone();
-        let uid_ad = dev.uid.clone();
-        let name_ad = dev.name.clone();
-        adopt.connect_clicked(move |_| prompt_adopt_device(&ui_ad, &uid_ad, &name_ad));
-        row.add_suffix(&adopt);
-        let ui_ren = ui.clone();
-        let uid_ren = dev.uid.clone();
-        let name_ren = dev.name.clone();
-        rename.connect_clicked(move |_| prompt_rename_device(&ui_ren, &uid_ren, &name_ren));
-        let ui_rm = ui.clone();
-        let uid_rm = dev.uid.clone();
-        let name_rm = dev.name.clone();
-        remove.connect_clicked(move |_| prompt_remove_device(&ui_rm, &uid_rm, &name_rm));
-        row.add_suffix(&rename);
-        row.add_suffix(&remove);
+        let (ui_ren, uid_ren, name_ren) = (ui.clone(), dev.uid.clone(), dev.name.clone());
+        let (ui_ad, uid_ad, name_ad) = (ui.clone(), dev.uid.clone(), dev.name.clone());
+        let (ui_rm, uid_rm, name_rm) = (ui.clone(), dev.uid.clone(), dev.name.clone());
+        row.add_suffix(&more_menu_button(vec![
+            (
+                "Rename…",
+                "document-edit-symbolic",
+                Box::new(move || prompt_rename_device(&ui_ren, &uid_ren, &name_ren)),
+            ),
+            (
+                "Use This Computer's Identity…",
+                "insert-object-symbolic",
+                Box::new(move || prompt_adopt_device(&ui_ad, &uid_ad, &name_ad)),
+            ),
+            (
+                "Remove Computer…",
+                "user-trash-symbolic",
+                Box::new(move || prompt_remove_device(&ui_rm, &uid_rm, &name_rm)),
+            ),
+        ]));
         ui.devices.group.add(&row);
         rows.push(row.upcast());
     }
@@ -357,7 +347,7 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
     let manage = gtk4::Button::builder()
-        .label("Locations")
+        .label("Open Sync")
         .tooltip_text("Manage this computer's folders and mountpoint")
         .valign(gtk4::Align::Center)
         .build();
@@ -373,7 +363,7 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
 /// attention — the one fact worth surfacing away from the folder list itself.
 pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
     if folders.is_empty() {
-        return "No folders backed up yet — add one under Locations.".to_string();
+        return "No folders backed up yet — add one on the Sync page.".to_string();
     }
     let count = match folders.len() {
         1 => "1 folder backed up".to_string(),
@@ -384,7 +374,7 @@ pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
         .filter(|f| f.state == "error" || f.state == "conflict")
         .count();
     match attention {
-        0 => format!("{count} · manage them under Locations"),
+        0 => format!("{count} · manage them on the Sync page"),
         1 => format!("{count} · 1 needs attention"),
         n => format!("{count} · {n} need attention"),
     }
@@ -686,7 +676,7 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
 pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Rename device")
+        .heading("Rename Computer")
         .body(format!("Rename “{current}”."))
         .build();
     let group = adw::PreferencesGroup::new();
@@ -710,7 +700,7 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
         }
         let name = row.text().trim().to_string();
         if name.is_empty() {
-            toast_error(&ui, "Couldn't rename device", "A name is required.");
+            toast_error(&ui, "Couldn't rename the computer", "A name is required.");
             return;
         }
         run_devices_mutation(
@@ -719,29 +709,42 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
                 uid: uid.clone(),
                 name,
             },
-            "Device renamed",
-            "Couldn't rename the device",
+            "Computer renamed",
+            "Couldn't rename the computer",
         );
     });
     dialog.present(win.as_ref());
 }
 
-/// Confirm, then remove (deregister) a device.
+/// Confirm, then remove (deregister) a computer. Removing deletes everything the
+/// computer backed up, so the confirm button stays off until the name is typed.
 pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
+    let confirm = adw::EntryRow::builder()
+        .title(format!("Type “{name}” to confirm"))
+        .build();
+    let group = adw::PreferencesGroup::new();
+    group.add(&confirm);
     let dialog = adw::AlertDialog::builder()
-        .heading("Remove computer")
+        .heading("Remove Computer")
         .body(format!(
             "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is \
              deleted along with it. The files on that computer itself are not touched — but \
              this cannot be undone from here."
         ))
+        .extra_child(&group)
         .build();
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("remove", "Remove");
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_response_enabled("remove", false);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
+    let dialog_typed = dialog.clone();
+    let expected = name.to_string();
+    confirm.connect_changed(move |row| {
+        dialog_typed.set_response_enabled("remove", row.text().trim() == expected);
+    });
     let ui = ui.clone();
     let uid = uid.to_string();
     dialog.connect_response(None, move |_, resp| {
@@ -749,8 +752,8 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
             run_devices_mutation(
                 &ui,
                 Request::DeleteDevice { uid: uid.clone() },
-                "Device removed",
-                "Couldn't remove the device",
+                "Computer removed",
+                "Couldn't remove the computer",
             );
         }
     });
@@ -843,7 +846,7 @@ mod tests {
     fn a_machine_with_no_folders_is_told_where_to_add_one() {
         assert_eq!(
             this_computer_subtitle(&[]),
-            "No folders backed up yet — add one under Locations."
+            "No folders backed up yet — add one on the Sync page."
         );
     }
 
@@ -853,7 +856,7 @@ mod tests {
         // the Computers page can surface that something is wrong.
         assert_eq!(
             this_computer_subtitle(&[folder("idle"), folder("idle")]),
-            "2 folders backed up · manage them under Locations"
+            "2 folders backed up · manage them on the Sync page"
         );
         assert_eq!(
             this_computer_subtitle(&[folder("idle"), folder("error")]),

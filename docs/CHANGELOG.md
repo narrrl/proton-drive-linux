@@ -46,6 +46,17 @@ Schema: **30** (unchanged).
   says what it filtered ("No videos in June 2024") instead of the first-run hint. A banner shows
   while a Takeout import runs and links to it. Pages load 200 photos at a time and keep loading
   until the window is full.
+- **Trash.** Select several items (click, Shift/Ctrl+click, Ctrl+A) to restore or permanently
+  delete them together; the permanent delete still asks first, with the count.
+- **Shared by Me.** A row opens the item. Copy link stays one click away; Open, Show in My Files,
+  Open Link and Manage Access… are in the row's menu.
+- **Computers.** Rename, Use This Computer's Identity and Remove are in one menu per computer.
+  Removing a computer deletes its backups, so the dialog now asks for its name to be typed. The
+  page says which computer this machine backs up as, and says "computer" throughout.
+- **Sign in.** Failures read as sentences — wrong password, too many attempts, no connection, no
+  keyring, a skipped two-factor or verification step — instead of the raw error. The button spins
+  while signing in, and the page links to account creation and password reset. The two-factor
+  dialog mentions recovery codes.
 
 ## [1.11.1] — 2026-09-19
 
