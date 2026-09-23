@@ -127,6 +127,9 @@ Schema: **31** (unchanged).
 - **New app icon.** A white cloud with the download arrow cut out of it, on a rounded Proton
   purple tile with a darker lower edge, drawn to the GNOME app-icon grid. It stays legible down to
   16 px on light and dark panels.
+- **Shared with Me.** Inside a shared folder the header shows the path from the share down, and a
+  back button in the header replaces the Back row. Pending invitations are announced in a banner
+  at the top of the page; Review scrolls to them.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

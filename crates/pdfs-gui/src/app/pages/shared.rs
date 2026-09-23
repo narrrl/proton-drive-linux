@@ -10,6 +10,14 @@ pub(crate) struct SharedState {
     pub(crate) with_me_group: adw::PreferencesGroup,
     pub(crate) invitations_group: adw::PreferencesGroup,
     pub(crate) bookmarks_group: adw::PreferencesGroup,
+    /// The header title; its subtitle carries the path inside a shared folder.
+    pub(crate) title: adw::WindowTitle,
+    /// Header button that leaves the current shared folder.
+    pub(crate) back: gtk4::Button,
+    pub(crate) add_bookmark: gtk4::Button,
+    /// "N pending invitations" above the sections at the top level.
+    pub(crate) banner: adw::Banner,
+    pub(crate) scroll: gtk4::ScrolledWindow,
     /// Where in a shared folder the page currently is, as `(uid, name)` from the
     /// top level down. Empty = the top level. Shared subtrees have no path in the
     /// mount, so descending is uid-addressed and the stack *is* the breadcrumb.
@@ -32,6 +40,10 @@ pub(crate) struct SharedWidgets {
     pub(crate) retry: gtk4::Button,
     pub(crate) add_bookmark: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
+    pub(crate) title: adw::WindowTitle,
+    pub(crate) back: gtk4::Button,
+    pub(crate) banner: adw::Banner,
+    pub(crate) scroll: gtk4::ScrolledWindow,
 }
 
 /// The Shared page: three stacked sections — items shared *with* me (each with a
@@ -94,7 +106,19 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     inner.set_margin_start(18);
     inner.set_margin_end(18);
     inner.append(&content);
-    let (frame, header, _) = page_frame("Shared with Me", &inner);
+
+    let banner = adw::Banner::builder().button_label("Review").build();
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    body.append(&banner);
+    body.append(&inner);
+
+    let back = gtk4::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back")
+        .visible(false)
+        .build();
+    let (frame, header, title) = page_frame("Shared with Me", &body);
+    header.pack_start(&back);
     header.pack_start(&add_bookmark);
     header.pack_end(&refresh);
 
@@ -109,12 +133,37 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
             retry,
             add_bookmark,
             refresh,
+            title,
+            back,
+            banner,
+            scroll,
         },
     )
 }
 
-/// Install the Shared page's retry and Add-Bookmark buttons.
+/// Install the Shared page's retry, back and Add-Bookmark buttons and the
+/// invitations banner.
 pub(crate) fn wire_shared(ui: &Rc<Ui>, retry: &gtk4::Button, add_bookmark: &gtk4::Button) {
+    let ui_back = ui.clone();
+    ui.shared.back.connect_clicked(move |_| {
+        ui_back.shared.nav.borrow_mut().pop();
+        load_shared(&ui_back);
+    });
+    // Review scrolls the Invitations section into view; the page keeps it
+    // below the shares, where it is easy to miss on a long list.
+    let ui_review = ui.clone();
+    ui.shared.banner.connect_button_clicked(move |_| {
+        let shared = &ui_review.shared;
+        let Some(child) = shared.scroll.child() else {
+            return;
+        };
+        if let Some(bounds) = shared.invitations_group.compute_bounds(&child) {
+            shared.scroll.vadjustment().set_value(f64::from(bounds.y()));
+        }
+        shared
+            .invitations_group
+            .child_focus(gtk4::DirectionType::TabForward);
+    });
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
         service::restart();
@@ -237,8 +286,26 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
     });
 }
 
-/// Paint the contents of the shared folder at the top of the nav stack: a row to
-/// go back up, then the children. Invitations and bookmarks are hidden here —
+/// The header subtitle inside a shared folder: the folders from the share root
+/// down, the way a breadcrumb reads.
+pub(crate) fn shared_path(nav: &[(String, String)]) -> String {
+    nav.iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// The invitations banner's text, or `None` when there are none to review.
+pub(crate) fn invitations_banner_title(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 pending invitation".to_string()),
+        n => Some(format!("{n} pending invitations")),
+    }
+}
+
+/// Paint the contents of the shared folder at the top of the nav stack; the
+/// header's back button leads up again. Invitations and bookmarks are hidden here —
 /// they are top-level things, not contents of this folder.
 fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
     for (group, row) in ui.shared.rows.borrow_mut().drain(..) {
@@ -247,28 +314,17 @@ fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ui.shared.content.set_visible_child_name("list");
     ui.shared.invitations_group.set_visible(false);
     ui.shared.bookmarks_group.set_visible(false);
+    ui.shared.banner.set_revealed(false);
+    ui.shared.back.set_visible(true);
+    ui.shared.add_bookmark.set_visible(false);
 
     let nav = ui.shared.nav.borrow().clone();
-    let title = nav
-        .iter()
-        .map(|(_, name)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(" / ");
-    ui.shared.with_me_group.set_title(&title);
+    ui.shared.title.set_subtitle(&shared_path(&nav));
+    ui.shared
+        .with_me_group
+        .set_title(nav.last().map_or("", |(_, name)| name.as_str()));
 
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
-    let up = adw::ActionRow::builder()
-        .title("Back")
-        .activatable(true)
-        .build();
-    up.add_prefix(&gtk4::Image::from_icon_name("go-up-symbolic"));
-    let ui_up = ui.clone();
-    up.connect_activated(move |_| {
-        ui_up.shared.nav.borrow_mut().pop();
-        load_shared(&ui_up);
-    });
-    ui.shared.with_me_group.add(&up);
-    rows.push((ui.shared.with_me_group.clone(), up.upcast()));
 
     if entries.is_empty() {
         let row = dim_row("This folder is empty.");
@@ -470,6 +526,16 @@ pub(crate) fn repaint_shared(
     ui.shared.invitations_group.set_visible(true);
     ui.shared.bookmarks_group.set_visible(true);
     ui.shared.with_me_group.set_title("Shared with me");
+    ui.shared.title.set_subtitle("");
+    ui.shared.back.set_visible(false);
+    ui.shared.add_bookmark.set_visible(true);
+    match invitations_banner_title(invitations.len()) {
+        Some(text) => {
+            ui.shared.banner.set_title(&text);
+            ui.shared.banner.set_revealed(true);
+        }
+        None => ui.shared.banner.set_revealed(false),
+    }
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
 
     // Shared with me: name + Leave.
@@ -799,5 +865,28 @@ mod tests {
         }
         assert!(role_label("").is_none());
         assert!(role_label("inherited").is_none());
+    }
+
+    #[test]
+    fn the_header_path_reads_from_the_share_root_down() {
+        assert_eq!(shared_path(&[]), "");
+        let nav = vec![
+            ("u1".to_string(), "Team".to_string()),
+            ("u2".to_string(), "Reports".to_string()),
+        ];
+        assert_eq!(shared_path(&nav), "Team / Reports");
+    }
+
+    #[test]
+    fn the_invitations_banner_counts_and_hides_at_zero() {
+        assert_eq!(invitations_banner_title(0), None);
+        assert_eq!(
+            invitations_banner_title(1).as_deref(),
+            Some("1 pending invitation")
+        );
+        assert_eq!(
+            invitations_banner_title(3).as_deref(),
+            Some("3 pending invitations")
+        );
     }
 }
