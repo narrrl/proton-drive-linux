@@ -48,10 +48,10 @@ use pdfs_core::config::AppDirs;
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind,
-    ImportSummary, InvitationInfo, JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope,
-    Request, Response, RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind,
-    SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection,
-    TransferItem, pending_summary, send,
+    ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem, PhotoKind, PublicLinkInfo,
+    RefreshScope, Request, Response, RestorableFolder, RestoreItem, SearchHit, ShareEntry,
+    ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus,
+    TransferDirection, TransferItem, pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -542,6 +542,19 @@ fn build_window(app: &adw::Application) {
             rows: RefCell::new(Vec::new()),
             inflight: Cell::new(false),
             loaded_at: Cell::new(None),
+            card: SyncCard {
+                icon: locations_widgets.card_icon.clone(),
+                row: locations_widgets.card_row.clone(),
+                pause: locations_widgets.pause.clone(),
+                paused: Cell::new(false),
+            },
+            queue: QueueState {
+                group: locations_widgets.queue_group.clone(),
+                retry_all: locations_widgets.retry_all.clone(),
+                rows: RefCell::new(Vec::new()),
+                painted: RefCell::new(Vec::new()),
+                inflight: Cell::new(false),
+            },
         },
         activity: ActivityState {
             content: activity_widgets.content.clone(),

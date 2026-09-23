@@ -615,7 +615,10 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     // keeps this from asking more than once a minute.
     refresh_quota(ui);
     match ui.stack.visible_child_name().as_deref() {
-        Some("locations") => refresh_locations(ui),
+        Some("locations") => {
+            refresh_locations(ui);
+            refresh_queue(ui);
+        }
         Some("activity") => refresh_activity(ui),
         _ => {}
     }
@@ -940,6 +943,8 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 pending_changes,
                 failing_ops,
                 failing_error,
+                paused,
+                paused_until,
                 ..
             })) => {
                 set_mounted(&ui, true);
@@ -947,7 +952,12 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 // in it: it is why a file that looks saved is not on the remote
                 // yet, and offline is usually the reason it is still queued.
                 let queued = pending_summary(pending_uploads, pending_changes);
-                let state = if failing_ops > 0 {
+                let state = if paused {
+                    SyncState::Paused {
+                        until: paused_until,
+                        queued,
+                    }
+                } else if failing_ops > 0 {
                     SyncState::Attention {
                         count: failing_ops,
                         error: failing_error,
@@ -994,6 +1004,13 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
 
 /// What the sidebar's status strip reports, most urgent first.
 pub(crate) enum SyncState {
+    /// The user paused syncing; nothing goes up until it resumes. Outranks
+    /// everything else, because it is the reason for everything else.
+    Paused {
+        /// Unix second the pause ends by itself; `None` until resumed.
+        until: Option<i64>,
+        queued: Option<String>,
+    },
     /// Operations keep failing; the user may have to act.
     Attention {
         count: u64,
@@ -1014,9 +1031,23 @@ pub(crate) enum SyncState {
     Disconnected,
 }
 
-/// Paint the sidebar status strip: icon, one-line state, and a detail line.
+/// Paint the sidebar status strip and the Sync page's status card: icon,
+/// one-line state, and a detail line.
 fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
+    let paused = matches!(state, SyncState::Paused { .. });
+    let connected = !matches!(state, SyncState::Disconnected);
     let (icon, class, title, detail) = match state {
+        SyncState::Paused { until, queued } => (
+            "media-playback-pause-symbolic",
+            Some("warning"),
+            "Sync paused".to_string(),
+            Some(match (until, queued) {
+                (Some(until), Some(queued)) => format!("{queued} · resumes {}", clock_time(until)),
+                (Some(until), None) => format!("Resumes {}", clock_time(until)),
+                (None, Some(queued)) => queued,
+                (None, None) => "Until you resume".to_string(),
+            }),
+        ),
         SyncState::Attention { count, error } => (
             "dialog-warning-symbolic",
             Some("error"),
@@ -1066,6 +1097,35 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
         .status_detail
         .set_label(detail.as_deref().unwrap_or_default());
     ui.status.status_detail.set_tooltip_text(detail.as_deref());
+    paint_sync_card(
+        ui,
+        icon,
+        class,
+        &title,
+        detail.as_deref(),
+        paused,
+        connected,
+    );
+}
+
+/// "at 14:30" today, "Tue 09:00" within the week, a date beyond that.
+pub(crate) fn clock_time(unix: i64) -> String {
+    let (Ok(at), Ok(now)) = (
+        glib::DateTime::from_unix_local(unix),
+        glib::DateTime::now_local(),
+    ) else {
+        return "later".to_string();
+    };
+    let format = if at.ymd() == now.ymd() {
+        "at %H:%M"
+    } else if at.difference(&now).as_seconds() < 6 * 86_400 {
+        "%a %H:%M"
+    } else {
+        "%e %b"
+    };
+    at.format(format)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "later".to_string())
 }
 
 /// Render the pins group from `pins`, with the unpin buttons enabled only while a

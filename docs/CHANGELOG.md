@@ -9,6 +9,25 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [Unreleased]
+
+Schema: **30** (unchanged).
+
+### Added
+- **Pause and resume sync.** The Sync page, the tray and `pdfs sync pause [--for 1h]` /
+  `pdfs sync resume` hold back queued uploads and mirror-folder reconciles. Reads through the mount
+  keep working, writes keep being accepted and staged, and a timed pause ends by itself. The pause
+  survives a restart.
+- **See what is waiting to upload.** The Sync page lists the queue with each item's last error and
+  next retry, with Retry now per item and Retry All; `pdfs sync queue` and `pdfs sync retry [id]`
+  do the same from the CLI. Nothing in the queue is ever dropped from here.
+
+### Changed
+- **New app shell.** Every page has its own header bar; the sidebar ends in a footer with sync
+  state, storage and the account; the Settings page became a Preferences dialog (Ctrl+,), with
+  transfers on the Sync page and developer details in About. The app follows the system accent
+  colour; the Proton purple accent is a preference.
+
 ## [1.11.1] — 2026-09-19
 
 Schema: **30** (unchanged).

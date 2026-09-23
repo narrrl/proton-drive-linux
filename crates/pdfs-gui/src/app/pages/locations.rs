@@ -22,6 +22,31 @@ pub(crate) struct LocationsState {
     pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
     pub(crate) inflight: Cell<bool>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
+    pub(crate) card: SyncCard,
+    pub(crate) queue: QueueState,
+}
+
+/// The status card heading the Sync page: what sync is doing, and Pause/Resume.
+pub(crate) struct SyncCard {
+    pub(crate) icon: gtk4::Image,
+    pub(crate) row: adw::ActionRow,
+    pub(crate) pause: adw::SplitButton,
+    /// Whether the last status said paused, so the button knows which way to go.
+    pub(crate) paused: Cell<bool>,
+}
+
+/// What a queue row shows that can change: id, attempts, next attempt, parked.
+pub(crate) type QueueKey = (i64, i64, Option<i64>, bool);
+
+/// The "Waiting to Upload" list: the daemon's pending-op queue.
+pub(crate) struct QueueState {
+    pub(crate) group: adw::PreferencesGroup,
+    pub(crate) retry_all: gtk4::Button,
+    pub(crate) rows: RefCell<Vec<adw::ActionRow>>,
+    /// What the rows were built from, so an unchanged queue is not rebuilt on
+    /// every tick.
+    pub(crate) painted: RefCell<Vec<QueueKey>>,
+    pub(crate) inflight: Cell<bool>,
 }
 
 /// Widgets the Locations page's load/repaint touch.
@@ -34,6 +59,11 @@ pub(crate) struct LocationsWidgets {
     pub(crate) add_folder: gtk4::Button,
     /// Live transfers, above the folder list; painted by the refresh loop.
     pub(crate) transfers_group: adw::PreferencesGroup,
+    pub(crate) card_icon: gtk4::Image,
+    pub(crate) card_row: adw::ActionRow,
+    pub(crate) pause: adw::SplitButton,
+    pub(crate) queue_group: adw::PreferencesGroup,
+    pub(crate) retry_all: gtk4::Button,
 }
 
 pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
@@ -48,6 +78,8 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .build();
     let refresh = refresh_button();
     let transfers_group = build_transfers_group();
+    let (card, card_icon, card_row, pause) = build_sync_card();
+    let (queue_group, retry_all) = build_queue_group();
 
     // Same warning the Computers page carried, for the same reason: the
     // on-demand switch removes the local copy, which is not a thing to discover
@@ -62,6 +94,8 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .build();
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    groups.append(&card);
+    groups.append(&queue_group);
     groups.append(&transfers_group);
     groups.append(&group);
     let clamp = adw::Clamp::builder().child(&groups).build();
@@ -118,6 +152,11 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         refresh,
         add_folder,
         transfers_group,
+        card_icon,
+        card_row,
+        pause,
+        queue_group,
+        retry_all,
     };
     (frame.upcast(), widgets)
 }
@@ -130,6 +169,309 @@ pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk
     });
     let ui_add = ui.clone();
     add_folder.connect_clicked(move |_| prompt_add_sync_folder(&ui_add));
+    wire_pause(ui);
+    let ui_retry = ui.clone();
+    ui.locations
+        .queue
+        .retry_all
+        .connect_clicked(move |_| retry_queued(&ui_retry, None));
+}
+
+/// The status card: a large state icon, the state in words, and Pause/Resume
+/// with timed pauses in its menu.
+fn build_sync_card() -> (
+    adw::PreferencesGroup,
+    gtk4::Image,
+    adw::ActionRow,
+    adw::SplitButton,
+) {
+    let icon = gtk4::Image::builder()
+        .icon_name("emblem-synchronizing-symbolic")
+        .pixel_size(32)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    icon.add_css_class("sidebar-status");
+    let menu = gio::Menu::new();
+    menu.append(Some("Pause for 1 Hour"), Some("sync.pause-for(int64 3600)"));
+    menu.append(
+        Some("Pause for 8 Hours"),
+        Some("sync.pause-for(int64 28800)"),
+    );
+    menu.append(
+        Some("Pause for 24 Hours"),
+        Some("sync.pause-for(int64 86400)"),
+    );
+    let pause = adw::SplitButton::builder()
+        .label("Pause")
+        .menu_model(&menu)
+        .valign(gtk4::Align::Center)
+        .tooltip_text("Stop uploading until you resume. Files still open as usual.")
+        .dropdown_tooltip("Pause for a while")
+        .build();
+    let row = adw::ActionRow::builder()
+        .title("Checking…")
+        .title_lines(1)
+        .subtitle_lines(2)
+        .build();
+    row.add_css_class("property");
+    row.add_prefix(&icon);
+    row.add_suffix(&pause);
+    let group = adw::PreferencesGroup::new();
+    group.add(&row);
+    (group, icon, row, pause)
+}
+
+/// Paint the Sync page's status card from what the sidebar strip shows.
+pub(crate) fn paint_sync_card(
+    ui: &Rc<Ui>,
+    icon: &str,
+    class: Option<&str>,
+    title: &str,
+    detail: Option<&str>,
+    paused: bool,
+    connected: bool,
+) {
+    let card = &ui.locations.card;
+    card.icon.set_icon_name(Some(icon));
+    for c in ["success", "warning", "error"] {
+        card.icon.remove_css_class(c);
+    }
+    if let Some(class) = class {
+        card.icon.add_css_class(class);
+    }
+    card.row.set_title(title);
+    card.row.set_subtitle(detail.unwrap_or_default());
+    card.paused.set(paused);
+    card.pause
+        .set_label(if paused { "Resume" } else { "Pause" });
+    card.pause.set_tooltip_text(Some(if paused {
+        "Upload everything that waited while sync was paused"
+    } else {
+        "Stop uploading until you resume. Files still open as usual."
+    }));
+    if paused {
+        card.pause.add_css_class("suggested-action");
+    } else {
+        card.pause.remove_css_class("suggested-action");
+    }
+    card.pause.set_sensitive(connected);
+}
+
+/// Pause/Resume on the card: the button flips, the menu pauses for a while.
+fn wire_pause(ui: &Rc<Ui>) {
+    let ui_click = ui.clone();
+    ui.locations.card.pause.connect_clicked(move |_| {
+        let resume = ui_click.locations.card.paused.get();
+        set_sync_paused(&ui_click, !resume, None);
+    });
+    let actions = gio::SimpleActionGroup::new();
+    let pause_for = gio::SimpleAction::new("pause-for", Some(glib::VariantTy::INT64));
+    let ui_for = ui.clone();
+    pause_for.connect_activate(move |_, param| {
+        let Some(secs) = param.and_then(|p| p.get::<i64>()) else {
+            return;
+        };
+        let until = glib::DateTime::now_utc()
+            .map(|now| now.to_unix())
+            .unwrap_or_default()
+            + secs;
+        set_sync_paused(&ui_for, true, Some(until));
+    });
+    actions.add_action(&pause_for);
+    ui.locations
+        .card
+        .pause
+        .insert_action_group("sync", Some(&actions));
+}
+
+fn set_sync_paused(ui: &Rc<Ui>, paused: bool, until: Option<i64>) {
+    ui.locations.card.pause.set_sensitive(false);
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::SetSyncPaused { paused, until },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let what = if paused {
+            "Couldn't pause sync"
+        } else {
+            "Couldn't resume sync"
+        };
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => toast(
+                &ui,
+                match (paused, until) {
+                    (false, _) => "Sync resumed",
+                    (true, None) => "Sync paused until you resume",
+                    (true, Some(_)) => "Sync paused",
+                },
+            ),
+            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, what, &message, kind),
+            _ => toast_error(&ui, what, "The mount service didn't respond."),
+        }
+        ui.locations.card.pause.set_sensitive(true);
+        refresh_status(&ui);
+    });
+}
+
+/// The queue list, hidden while nothing waits.
+fn build_queue_group() -> (adw::PreferencesGroup, gtk4::Button) {
+    let retry_all = gtk4::Button::builder()
+        .label("Retry All")
+        .valign(gtk4::Align::Center)
+        .tooltip_text("Try every failed change again now")
+        .visible(false)
+        .build();
+    retry_all.add_css_class("flat");
+    let group = adw::PreferencesGroup::builder()
+        .title("Waiting to Upload")
+        .description("Changes made on this computer that are not on Proton Drive yet.")
+        .header_suffix(&retry_all)
+        .visible(false)
+        .build();
+    (group, retry_all)
+}
+
+/// Most queue rows shown at once. The queue can hold thousands after a big copy;
+/// the first screenful says what is going on, and the count says the rest.
+const QUEUE_ROWS_SHOWN: usize = 50;
+
+/// Poll the pending-op queue while the Sync page is on screen.
+pub(crate) fn refresh_queue(ui: &Rc<Ui>) {
+    if ui.locations.queue.inflight.get() {
+        return;
+    }
+    ui.locations.queue.inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListPendingOps);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.locations.queue.inflight.set(false);
+        match result {
+            Ok(Ok(Response::PendingOps { items })) => repaint_queue(&ui, &items),
+            // An older daemon without the request, or none at all: say nothing
+            // rather than show a list that cannot be kept current.
+            _ => repaint_queue(&ui, &[]),
+        }
+    });
+}
+
+fn repaint_queue(ui: &Rc<Ui>, items: &[PendingOpInfo]) {
+    let queue = &ui.locations.queue;
+    // Stuck first — they are why the user is here — then oldest first.
+    let mut items: Vec<&PendingOpInfo> = items.iter().collect();
+    items.sort_by_key(|op| (!op.failing, op.attempts == 0, op.id));
+    let key: Vec<QueueKey> = items
+        .iter()
+        .map(|op| (op.id, op.attempts, op.next_attempt_at, op.parked))
+        .collect();
+    if *queue.painted.borrow() == key {
+        return;
+    }
+    *queue.painted.borrow_mut() = key;
+
+    for row in queue.rows.borrow_mut().drain(..) {
+        queue.group.remove(&row);
+    }
+    queue.group.set_visible(!items.is_empty());
+    queue
+        .retry_all
+        .set_visible(items.iter().any(|op| op.attempts > 0 && !op.parked));
+    let hidden = items.len().saturating_sub(QUEUE_ROWS_SHOWN);
+    queue.group.set_description(Some(&if hidden > 0 {
+        format!(
+            "Changes made on this computer that are not on Proton Drive yet. \
+             Showing the first {QUEUE_ROWS_SHOWN} of {}.",
+            items.len()
+        )
+    } else {
+        "Changes made on this computer that are not on Proton Drive yet.".to_string()
+    }));
+    let now = glib::DateTime::now_utc()
+        .map(|now| now.to_unix())
+        .unwrap_or_default();
+    let mut rows = queue.rows.borrow_mut();
+    for op in items.into_iter().take(QUEUE_ROWS_SHOWN) {
+        let row = queue_row(ui, op, now);
+        queue.group.add(&row);
+        rows.push(row);
+    }
+}
+
+fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
+    let (icon, action) = match op.kind.as_str() {
+        "revision" => ("pdfs-upload-symbolic", "Upload changes"),
+        "create" => ("pdfs-upload-symbolic", "Upload new file"),
+        "mkdir" => ("folder-new-symbolic", "Create folder"),
+        "rename" => ("document-edit-symbolic", "Rename or move"),
+        "trash" => ("user-trash-symbolic", "Move to trash"),
+        _ => ("emblem-synchronizing-symbolic", "Change"),
+    };
+    let state = match (op.parked, op.next_attempt_at) {
+        (true, _) => "waiting for the app writing it to finish".to_string(),
+        (false, Some(at)) if at > now && op.attempts > 0 => {
+            format!("retrying {}", clock_time(at))
+        }
+        (false, _) if ui.locations.card.paused.get() => "waiting for sync to resume".to_string(),
+        (false, _) => "up next".to_string(),
+    };
+    let mut subtitle = format!("{action} · {state}");
+    if let Some(error) = &op.last_error {
+        subtitle.push_str(&format!(
+            "\nFailed {}: {error}",
+            count_noun(op.attempts.max(0) as usize, "time", "times")
+        ));
+    }
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&op.path).as_str())
+        .subtitle(glib::markup_escape_text(&subtitle).as_str())
+        .title_lines(1)
+        .subtitle_lines(3)
+        .tooltip_text(&op.path)
+        .build();
+    let image = gtk4::Image::from_icon_name(if op.failing {
+        "dialog-warning-symbolic"
+    } else {
+        icon
+    });
+    if op.failing {
+        image.add_css_class("error");
+    }
+    row.add_prefix(&image);
+    let waiting = !op.parked && op.attempts > 0 && op.next_attempt_at.is_some_and(|at| at > now);
+    if waiting {
+        let retry = gtk4::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text("Retry now")
+            .valign(gtk4::Align::Center)
+            .build();
+        retry.add_css_class("flat");
+        let ui = ui.clone();
+        let id = op.id;
+        retry.connect_clicked(move |_| retry_queued(&ui, Some(id)));
+        row.add_suffix(&retry);
+    }
+    row
+}
+
+/// Ask the daemon to stop waiting out one op's backoff, or every failed op's.
+fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
+    let rx = spawn_request(ui.dirs.control_socket(), Request::RetryPendingOp { id });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => {
+                toast(&ui, "Retrying now…");
+                ui.locations.queue.painted.borrow_mut().clear();
+                refresh_queue(&ui);
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't retry", &message, kind)
+            }
+            _ => toast_error(&ui, "Couldn't retry", "The mount service didn't respond."),
+        }
+    });
 }
 
 /// Show a status page in place of the locations list.

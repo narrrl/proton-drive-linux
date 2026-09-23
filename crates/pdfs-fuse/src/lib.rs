@@ -42,7 +42,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::ReplyXattr;
@@ -88,8 +88,10 @@ mod drain;
 mod filesystem;
 pub use filesystem::ProtonFs;
 mod mount;
+mod pause;
 mod photos;
 mod profile;
+mod queue;
 mod reads;
 mod redate;
 mod revisions;
@@ -508,6 +510,10 @@ struct Core {
     /// `Response::Status` so the UI can say so rather than leaving the user to
     /// infer it from a wall of EIO.
     online: Arc<AtomicBool>,
+    /// When the user paused syncing, the Unix second it resumes by itself;
+    /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
+    /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
+    sync_paused_until: Arc<AtomicI64>,
     /// Writes accepted from the kernel but not yet uploaded, keyed by node
     /// (offline.md Phase 3). The in-memory face of the `pending_op` table, from
     /// which it is rebuilt on mount.

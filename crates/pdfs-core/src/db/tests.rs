@@ -4480,3 +4480,58 @@ fn migration_v31_treats_an_existing_timeline_as_resolved() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
+
+fn queued_op(db: &Db, uid: &str, failures: i64, next_attempt_at: i64) -> i64 {
+    let (id, _) = db
+        .enqueue_op(&ops::PendingOp {
+            id: 0,
+            kind: ops::OP_REVISION.to_string(),
+            uid: uid.to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: None,
+            meta_json: None,
+            created_at: 1000,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at,
+        })
+        .unwrap();
+    for _ in 0..failures {
+        db.record_op_failure(id, "boom", next_attempt_at).unwrap();
+    }
+    id
+}
+
+/// "Retry now" must make a backed-off op due, but never un-park a transient
+/// file's op: that one waits for its finishing rename, not for time.
+#[test]
+fn retry_now_makes_a_backed_off_op_due_but_leaves_parked_ops_parked() {
+    let db = Db::open_in_memory().unwrap();
+    let backed_off = queued_op(&db, "vol~a", 3, 90_000);
+    let parked = queued_op(&db, "vol~b", 0, ops::PARK_UNTIL);
+
+    assert!(db.retry_op_now(backed_off, 5_000).unwrap());
+    assert!(!db.retry_op_now(parked, 5_000).unwrap());
+
+    let ops = db.pending_ops().unwrap();
+    let due = |id: i64| ops.iter().find(|op| op.id == id).unwrap().next_attempt_at;
+    assert_eq!(due(backed_off), 5_000);
+    assert_eq!(due(parked), ops::PARK_UNTIL);
+}
+
+#[test]
+fn retry_all_touches_only_ops_that_have_failed() {
+    let db = Db::open_in_memory().unwrap();
+    let failed = queued_op(&db, "vol~a", 2, 90_000);
+    let debounced = queued_op(&db, "vol~b", 0, 7_000);
+    let parked = queued_op(&db, "vol~c", 4, ops::PARK_UNTIL);
+
+    assert_eq!(db.retry_failed_ops_now(5_000).unwrap(), 1);
+
+    let ops = db.pending_ops().unwrap();
+    let due = |id: i64| ops.iter().find(|op| op.id == id).unwrap().next_attempt_at;
+    assert_eq!(due(failed), 5_000);
+    assert_eq!(due(debounced), 7_000);
+    assert_eq!(due(parked), ops::PARK_UNTIL);
+}

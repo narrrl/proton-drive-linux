@@ -357,6 +357,7 @@ pub fn mount(
     // handlers can trigger reconciles.
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<sync::SyncMsg>();
 
+    let paused_until = pause::load_paused_until(&db);
     let core = Core {
         client: client.clone(),
         rt: rt.clone(),
@@ -377,6 +378,7 @@ pub fn mount(
         shared_generation: Arc::new(AtomicU64::new(0)),
         shared_refresh_deadlines: Arc::new(Mutex::new(SharedRefreshDeadlines::default())),
         online: Arc::new(AtomicBool::new(online)),
+        sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
@@ -451,6 +453,10 @@ pub fn mount(
     // Start the folder-sync engine. It watches every mirror folder, polls the
     // remotes, and reconciles on its own thread — never in front of a FUSE call.
     workers.extend(sync::spawn(core.clone(), sync_rx));
+    // A timed pause persisted by an earlier run still has to end on time.
+    if pause::paused_at(paused_until, now_secs()) && paused_until != pause::PAUSED_INDEFINITELY {
+        core.arm_pause_timer(paused_until);
+    }
 
     // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
     // out identical to the live file, surface the ones that genuinely diverge.

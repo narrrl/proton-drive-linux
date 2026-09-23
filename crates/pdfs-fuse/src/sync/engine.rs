@@ -115,6 +115,9 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
             reconcile_all(&core);
         } else {
             for id in ids {
+                if core.sync_paused() {
+                    break;
+                }
                 if let Ok(Some(folder)) = core.db.sync_folder_get(id) {
                     core.reconcile_folder(&folder);
                 }
@@ -151,6 +154,9 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
             reconcile_all(core);
         } else {
             for id in ids {
+                if core.sync_paused() {
+                    break;
+                }
                 if let Ok(Some(folder)) = core.db.sync_folder_get(id) {
                     core.reconcile_folder(&folder);
                 }
@@ -230,8 +236,14 @@ pub(super) fn classify(
     true
 }
 
-/// Reconcile every mirror folder in turn.
+/// Reconcile every mirror folder in turn. Skipped while sync is paused: the
+/// resume sends a fresh [`SyncMsg::ReconcileAll`], which walks everything the
+/// watcher reported meanwhile.
 fn reconcile_all(core: &Core) {
+    if core.sync_paused() {
+        debug!("sync: paused, skipping reconcile");
+        return;
+    }
     let folders = match core.db.sync_folder_list() {
         Ok(f) => f,
         Err(e) => {

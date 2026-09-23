@@ -384,6 +384,18 @@ pub enum Request {
     /// Force a reconcile pass: one folder by id, or all when `id` is `None`.
     /// Replies with [`Response::Ok`].
     SyncNow { id: Option<i64> },
+    /// Pause or resume syncing: queued uploads and changes stop draining and
+    /// mirror folders stop reconciling, while reads through the mount keep
+    /// working. `until` is the Unix second a pause ends by itself; `None`
+    /// pauses until resumed. Ignored when resuming. Replies with
+    /// [`Response::Ok`].
+    SetSyncPaused { paused: bool, until: Option<i64> },
+    /// List the queue of uploads and changes not yet on the remote. Replies
+    /// with [`Response::PendingOps`].
+    ListPendingOps,
+    /// Retry a backed-off queued op now instead of waiting out its backoff;
+    /// every failed op when `id` is `None`. Replies with [`Response::Ok`].
+    RetryPendingOp { id: Option<i64> },
     /// List the folders under this machine's device that can be synced here,
     /// each with a proposed local path (features.md 5.2). Replies with
     /// [`Response::RestorableFolders`].
@@ -624,6 +636,30 @@ pub struct DeviceInfo {
     /// an adopted device survives a hostname change or a reinstall.
     #[serde(default)]
     pub adopted: bool,
+}
+
+/// One queued upload or change (in [`Response::PendingOps`]).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingOpInfo {
+    /// Queue row id, for [`Request::RetryPendingOp`].
+    pub id: i64,
+    /// `revision`, `create`, `mkdir`, `rename` or `trash`.
+    pub kind: String,
+    /// Mountpoint-relative path of the file or folder, or its name when the
+    /// path is no longer known.
+    pub path: String,
+    /// Failed attempts so far.
+    pub attempts: i64,
+    /// The latest failure, when there has been one.
+    pub last_error: Option<String>,
+    /// Unix second the op was queued.
+    pub queued_at: i64,
+    /// Unix second of the next attempt; `None` while parked.
+    pub next_attempt_at: Option<i64>,
+    /// Held back until a transient file gets its final name.
+    pub parked: bool,
+    /// Failed often enough to count as stuck.
+    pub failing: bool,
 }
 
 /// One synced local folder on this machine's device (in [`Response::SyncFolders`]).
@@ -1562,6 +1598,13 @@ pub enum Response {
         /// Age of the oldest staged write, in seconds.
         #[serde(default)]
         staged_oldest_secs: u64,
+        /// True while the user has sync paused (see [`Request::SetSyncPaused`]).
+        #[serde(default)]
+        paused: bool,
+        /// The Unix second a timed pause ends; `None` when paused until
+        /// resumed, or not paused.
+        #[serde(default)]
+        paused_until: Option<i64>,
     },
     /// A human-readable success message.
     Ok { message: String },
@@ -1691,6 +1734,8 @@ pub enum Response {
     Locations { items: Vec<MountSpec> },
     /// This device's synced folders (reply to [`Request::ListSyncFolders`]).
     SyncFolders { items: Vec<SyncFolderInfo> },
+    /// The upload/change queue (reply to [`Request::ListPendingOps`]).
+    PendingOps { items: Vec<PendingOpInfo> },
     /// Folders offered for restore (reply to [`Request::ListRestorableFolders`]).
     RestorableFolders { items: Vec<RestorableFolder> },
     /// A node's share: members + pending invitations, and its public link if any

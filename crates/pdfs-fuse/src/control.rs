@@ -246,6 +246,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 failing_error: queued.last_error.clone(),
                 staged_bytes: staging.bytes,
                 staged_oldest_secs: staging.oldest_secs,
+                paused: core.sync_pause().is_some(),
+                paused_until: core.sync_pause().flatten(),
                 username: username.to_string(),
                 mountpoint: mountpoint.display().to_string(),
                 pinned: pins.len(),
@@ -989,6 +991,32 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 },
             }
         }
+        Ok(CtlRequest::SetSyncPaused { paused, until }) => {
+            match core.set_sync_paused(paused, until) {
+                Ok(()) => CtlResponse::Ok {
+                    message: match (paused, until) {
+                        (false, _) => "sync resumed".to_string(),
+                        (true, None) => "sync paused until resumed".to_string(),
+                        (true, Some(_)) => "sync paused".to_string(),
+                    },
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::ListPendingOps) => match core.pending_op_infos() {
+            Ok(items) => CtlResponse::PendingOps { items },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::RetryPendingOp { id }) => match core.retry_pending_ops(id) {
+            Ok(0) if id.is_some() => CtlResponse::Ok {
+                message: "nothing to retry: the operation is already due or waiting for a rename"
+                    .to_string(),
+            },
+            Ok(moved) => CtlResponse::Ok {
+                message: format!("retrying {moved} queued operation(s) now"),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::ListRestorableFolders) => match core.list_restorable_folders() {
             Ok(items) => CtlResponse::RestorableFolders { items },
             Err(e) => CtlResponse::error(e),

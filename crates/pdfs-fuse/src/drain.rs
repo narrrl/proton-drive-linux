@@ -285,8 +285,9 @@ impl Core {
                 }
             };
             let online = self.online.load(Ordering::Relaxed);
+            let paused = self.sync_paused();
             let op = match due {
-                Some(op) if online => op,
+                Some(op) if online && !paused => op,
                 idle => {
                     // Claimed but offline: hand it straight back, or it stays
                     // invisible to every worker until this one happens to be
@@ -305,6 +306,14 @@ impl Core {
                         // an idle queue is exactly when a park that has outlived
                         // its writer has to be noticed.
                         self.sweep_parked_creates();
+                    }
+                    // Paused, nothing due changes that: sleep until a resume
+                    // wakes the worker (or the idle poll notices a timed pause
+                    // ran out), not until the next op falls due — that is
+                    // "now" for everything already queued.
+                    if paused {
+                        self.wait_for_drain_work();
+                        continue;
                     }
                     // A debounced or backed-off op may be waiting: sleep only
                     // until it becomes due rather than the full idle-poll.

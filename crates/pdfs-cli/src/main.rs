@@ -543,6 +543,22 @@ enum SyncCmd {
         /// Optional synced-folder id; omit to reconcile every folder.
         id: Option<i64>,
     },
+    /// Pause syncing: queued uploads and mirror folders wait, reads keep working.
+    Pause {
+        /// End the pause by itself after this long, e.g. `30m`, `1h`, `2d`.
+        /// Omit to pause until `pdfs sync resume`.
+        #[arg(long = "for", value_parser = parse_pause_duration)]
+        duration: Option<u64>,
+    },
+    /// Resume syncing after `pdfs sync pause`.
+    Resume,
+    /// List uploads and changes not yet on Proton Drive.
+    Queue,
+    /// Retry a queued operation now (by id from `sync queue`), or every failed one.
+    Retry {
+        /// Queue id; omit to retry every failed operation.
+        id: Option<i64>,
+    },
     /// Switch a folder between full-copy sync and on-demand (FUSE, no local storage).
     Mode {
         /// Synced-folder id (from `sync list`).
@@ -834,10 +850,55 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Now { id } => ok_or_bail(control_request(CtlRequest::SyncNow { id })?)?,
+        SyncCmd::Pause { duration } => {
+            let until = duration.map(|secs| unix_now().saturating_add(secs as i64));
+            ok_or_bail(control_request(CtlRequest::SetSyncPaused {
+                paused: true,
+                until,
+            })?)?
+        }
+        SyncCmd::Queue => return cmd_sync_queue(),
+        SyncCmd::Retry { id } => ok_or_bail(control_request(CtlRequest::RetryPendingOp { id })?)?,
+        SyncCmd::Resume => ok_or_bail(control_request(CtlRequest::SetSyncPaused {
+            paused: false,
+            until: None,
+        })?)?,
         SyncCmd::Mode { id, mode } => {
             ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
         }
         SyncCmd::Restore { yes } => return cmd_sync_restore(yes),
+    }
+    Ok(())
+}
+
+/// `pdfs sync queue`: what has not reached Proton Drive yet, and why.
+fn cmd_sync_queue() -> Result<()> {
+    let response = control_request(CtlRequest::ListPendingOps)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::PendingOps { items } if items.is_empty() => {
+            println!("Nothing queued: everything is on Proton Drive.");
+        }
+        CtlResponse::PendingOps { items } => {
+            let now = unix_now();
+            for op in items {
+                let state = match (op.parked, op.next_attempt_at) {
+                    (true, _) => "waiting for its final name".to_string(),
+                    (false, Some(at)) if at > now => {
+                        format!("next try in {}", human_age((at - now) as u64))
+                    }
+                    (false, _) => "due now".to_string(),
+                };
+                println!("[{}]  {}  {}  ({state})", op.id, op.kind, op.path);
+                if let Some(error) = &op.last_error {
+                    println!("      failed {} time(s): {error}", op.attempts);
+                }
+            }
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
 }
@@ -1472,9 +1533,15 @@ fn cmd_status() -> Result<()> {
             failing_error,
             staged_bytes,
             staged_oldest_secs,
+            paused,
+            paused_until,
             ..
         }) => {
-            let state = if online { "" } else { ", offline" };
+            let state = match (online, paused) {
+                (_, true) => ", sync paused",
+                (false, false) => ", offline",
+                (true, false) => "",
+            };
             let queued = match pending_summary(pending_uploads, pending_changes) {
                 Some(s) => format!(", {s}"),
                 None => String::new(),
@@ -1489,6 +1556,10 @@ fn cmd_status() -> Result<()> {
                     human_bytes(staged_bytes),
                     human_age(staged_oldest_secs),
                 );
+            }
+            if let Some(until) = paused_until {
+                let left = until.saturating_sub(unix_now()).max(0) as u64;
+                println!("Paused     sync resumes in {}", human_age(left.max(1)));
             }
             if parked_uploads > 0 {
                 println!("Parked     {parked_uploads} upload(s) waiting for a final filename");
@@ -2384,6 +2455,31 @@ fn path_arg(path: &Path) -> Result<String> {
 
 /// Format an age in seconds for a report line, coarsely — the point of the
 /// number is whether it is minutes or weeks.
+/// Parse a `sync pause --for` duration: a whole number followed by `m`, `h` or
+/// `d`. Returns seconds.
+fn parse_pause_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text.char_indices().last().map_or(0, |(at, _)| at);
+    let (number, unit) = text.split_at(split);
+    let per_unit: u64 = match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err("use a number followed by m, h or d, e.g. 30m".to_string()),
+    };
+    match number.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n.saturating_mul(per_unit)),
+        _ => Err("use a positive whole number, e.g. 30m".to_string()),
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn human_age(secs: u64) -> String {
     const UNITS: [(&str, u64); 4] = [("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)];
     for (unit, scale) in UNITS {
@@ -2845,6 +2941,28 @@ fn control_request(req: CtlRequest) -> Result<CtlResponse> {
     let socket = AppDirs::new()?.control_socket();
     pdfs_core::control::send(&socket, &req)
         .with_context(|| format!("talk to mount daemon at {}", socket.display()))
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    #[test]
+    fn pause_durations_read_minutes_hours_and_days() {
+        assert_eq!(parse_pause_duration("30m"), Ok(1800));
+        assert_eq!(parse_pause_duration("1h"), Ok(3600));
+        assert_eq!(parse_pause_duration("2d"), Ok(172_800));
+    }
+
+    #[test]
+    fn pause_durations_reject_what_they_cannot_read() {
+        assert!(parse_pause_duration("").is_err());
+        assert!(parse_pause_duration("0h").is_err());
+        assert!(parse_pause_duration("1w").is_err());
+        assert!(parse_pause_duration("h").is_err());
+        assert!(parse_pause_duration("-1h").is_err());
+        assert!(parse_pause_duration("1ä").is_err());
+    }
 }
 
 #[cfg(test)]

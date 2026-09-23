@@ -39,6 +39,8 @@ struct DriveState {
     /// One-line sync summary of in-flight transfers, empty when idle. Shown as a
     /// disabled menu line under the status line.
     sync: String,
+    /// Whether the user has sync paused; decides Pause vs Resume.
+    paused: bool,
 }
 
 /// Summarise a work snapshot into one menu line, or empty when idle. A single
@@ -82,6 +84,7 @@ fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
 
 struct DriveTray {
     state: DriveState,
+    socket: PathBuf,
 }
 
 /// Ask the daemon for its status, falling back to the stored session so the
@@ -94,15 +97,23 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             online,
             pending_uploads,
             pending_changes,
+            failing_ops,
+            paused,
             ..
         }) => DriveState {
             line: match (online, pending_summary(pending_uploads, pending_changes)) {
+                _ if paused => "Sync paused".to_string(),
+                _ if failing_ops > 0 => match failing_ops {
+                    1 => "1 change needs attention".to_string(),
+                    n => format!("{n} changes need attention"),
+                },
                 (true, None) => format!("Mounted at {mountpoint} ({pinned} pinned)"),
                 (true, Some(q)) => format!("Syncing — {q} ({pinned} pinned)"),
                 (false, None) => format!("Offline — cached files only ({pinned} pinned)"),
                 (false, Some(q)) => format!("Offline — {q}"),
             },
             mounted: true,
+            paused,
             mountpoint: PathBuf::from(mountpoint),
             // Same daemon is up, so a cheap follow-up poll gives the sync line.
             sync: match send(socket, &Request::GetQueueStatus) {
@@ -116,6 +127,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             mounted: true,
             mountpoint: default_mountpoint.to_path_buf(),
             sync: String::new(),
+            paused: false,
         },
         // No daemon: describe login state instead so the menu is still useful.
         Err(_) => {
@@ -129,6 +141,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 mounted: false,
                 mountpoint: default_mountpoint.to_path_buf(),
                 sync: String::new(),
+                paused: false,
             }
         }
     }
@@ -209,6 +222,27 @@ impl Tray for DriveTray {
                 }
                 .into(),
             );
+            // Pause holds uploads back but leaves the mount readable, so it
+            // sits apart from Disconnect, which takes the whole mount away.
+            let paused = self.state.paused;
+            items.push(
+                StandardItem {
+                    label: if paused { "Resume Sync" } else { "Pause Sync" }.into(),
+                    activate: Box::new(move |this: &mut Self| {
+                        let request = Request::SetSyncPaused {
+                            paused: !paused,
+                            until: None,
+                        };
+                        match send(&this.socket, &request) {
+                            Ok(Response::Ok { .. }) => this.state.paused = !paused,
+                            Ok(other) => tracing::warn!("pause sync: {other:?}"),
+                            Err(e) => tracing::warn!("pause sync: {e}"),
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
             // Stop the systemd service (clean SIGTERM → lazy unmount). The next
             // login or reboot brings it back; this is a deliberate disconnect.
             items.push(
@@ -281,6 +315,7 @@ fn main() -> Result<()> {
 
     let tray = DriveTray {
         state: poll_state(&socket, &default_mountpoint),
+        socket: socket.clone(),
     };
 
     // The tray autostarts with the session and can beat the desktop's SNI

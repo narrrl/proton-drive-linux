@@ -772,6 +772,31 @@ impl Db {
         Ok(())
     }
 
+    /// Make one backed-off op due now, for the user's "Retry now". Parked ops are
+    /// left alone: they wait for a rename, not for time, and un-parking one would
+    /// upload a file its writer has not finished. Returns whether a row changed.
+    pub fn retry_op_now(&self, id: i64, now: i64) -> Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE pending_op SET next_attempt_at = ?2
+             WHERE id = ?1 AND next_attempt_at > ?2 AND next_attempt_at < ?3",
+            params![id, now, PARK_UNTIL],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// [`retry_op_now`](Self::retry_op_now) for every op that has failed at
+    /// least once. Returns how many rows changed.
+    pub fn retry_failed_ops_now(&self, now: i64) -> Result<usize> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE pending_op SET next_attempt_at = ?1
+             WHERE attempts > 0 AND next_attempt_at > ?1 AND next_attempt_at < ?2",
+            params![now, PARK_UNTIL],
+        )?;
+        Ok(changed)
+    }
+
     /// Record a failed attempt and when to next try. Leaves the row in place —
     /// the staged bytes are still the only copy of the user's write.
     ///
