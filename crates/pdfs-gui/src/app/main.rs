@@ -586,10 +586,16 @@ fn build_window(app: &adw::Application) {
             content: activity_widgets.content.clone(),
             status: activity_widgets.status.clone(),
             retry: activity_widgets.retry.clone(),
-            group: activity_widgets.group.clone(),
-            rows: RefCell::new(Vec::new()),
+            attention: activity_widgets.attention.clone(),
+            attention_rows: RefCell::new(Vec::new()),
+            days: activity_widgets.days.clone(),
             inflight: Cell::new(false),
             key: RefCell::new(None),
+            items: RefCell::new(Vec::new()),
+            filter: Cell::new(ActivityFilter::All),
+            conflicts: RefCell::new(None),
+            conflicts_inflight: Cell::new(false),
+            conflicts_at: Cell::new(None),
         },
         takeout: TakeoutState {
             archives: RefCell::new(Vec::new()),
@@ -648,7 +654,7 @@ fn build_window(app: &adw::Application) {
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
     wire_devices(&ui, &devices_widgets.retry, &devices_widgets.restore);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
-    wire_activity(&ui, &activity_widgets.retry);
+    wire_activity(&ui, &activity_widgets.retry, &activity_widgets.filters);
     wire_takeout(&ui, &takeout_widgets);
     wire_refresh(
         &ui,

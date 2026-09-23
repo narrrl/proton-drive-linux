@@ -103,6 +103,11 @@ Schema: **31** (unchanged).
   still a screen and a half from the end, with a spinner under it while a page is on its way. A
   month scrubber on the right edge of the whole timeline, marked by year, jumps to the month you
   drag it to and follows the scroll otherwise.
+- **Activity log redesign.** The feed is grouped by day (Today, Yesterday, weekday, date), with
+  a time column and filter chips for All, Transfers, Changes, Sharing and Problems. A conflict the
+  daemon logs again on every run now shows once, with a count. A "Needs attention" section on top
+  lists the conflicts still waiting for a decision. Each logged conflict has a Resolve… button that
+  opens the same dialog as the Sync page, and reads as resolved once the copy is gone.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

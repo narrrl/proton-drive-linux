@@ -501,7 +501,7 @@ fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
 }
 
 /// How long a conflict listing stays fresh on the refresh tick.
-const CONFLICTS_TTL: Duration = Duration::from_secs(30);
+pub(crate) const CONFLICTS_TTL: Duration = Duration::from_secs(30);
 
 /// Poll the conflict list while the Sync page is on screen. `force` skips the
 /// TTL, for navigation and right after a resolution.
@@ -572,7 +572,7 @@ fn conflict_side(size: u64, modified: i64) -> String {
     )
 }
 
-fn conflict_row(ui: &Rc<Ui>, conflict: &ConflictInfo) -> adw::ActionRow {
+pub(crate) fn conflict_row(ui: &Rc<Ui>, conflict: &ConflictInfo) -> adw::ActionRow {
     let verdict = if !conflict.original_exists {
         "The original is gone; only this copy is left".to_string()
     } else if conflict.identical {
@@ -598,12 +598,12 @@ fn conflict_row(ui: &Rc<Ui>, conflict: &ConflictInfo) -> adw::ActionRow {
 }
 
 /// The last component of a mount-relative path.
-fn file_name(path: &str) -> &str {
+pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Ask which version of a conflicted file to keep.
-fn prompt_resolve_conflict(ui: &Rc<Ui>, conflict: &ConflictInfo) {
+pub(crate) fn prompt_resolve_conflict(ui: &Rc<Ui>, conflict: &ConflictInfo) {
     let win = ui_window(ui);
     let copy_name = file_name(&conflict.path).to_string();
     let original_name = file_name(&conflict.original_path).to_string();
@@ -690,6 +690,7 @@ fn resolve_conflict(ui: &Rc<Ui>, path: String, keep: ConflictKeep) {
             Ok(Ok(Response::Ok { message })) => {
                 toast(&ui, &capitalize(&message));
                 refresh_conflicts(&ui, true);
+                refresh_activity_conflicts(&ui, true);
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, "Couldn't resolve the conflict", &message, kind)
@@ -704,7 +705,7 @@ fn resolve_conflict(ui: &Rc<Ui>, path: String, keep: ConflictKeep) {
 }
 
 /// First letter upper-cased, for a daemon message used as a sentence.
-fn capitalize(message: &str) -> String {
+pub(crate) fn capitalize(message: &str) -> String {
     let mut chars = message.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
