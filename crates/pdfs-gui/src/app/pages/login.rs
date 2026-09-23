@@ -21,19 +21,23 @@ const RESET_PASSWORD_URL: &str = "https://account.proton.me/reset-password";
 /// only when the account actually requires it.
 pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
     let group = adw::PreferencesGroup::builder()
-        .title("Sign in to Proton")
-        .description("Use your Proton account to connect Drive.")
+        .title(gettext("Sign in to Proton"))
+        .description(gettext("Use your Proton account to connect Drive."))
         .build();
 
-    let email = adw::EntryRow::builder().title("Email or username").build();
-    let password = adw::PasswordEntryRow::builder().title("Password").build();
+    let email = adw::EntryRow::builder()
+        .title(gettext("Email or username"))
+        .build();
+    let password = adw::PasswordEntryRow::builder()
+        .title(gettext("Password"))
+        .build();
     group.add(&email);
     group.add(&password);
 
     let login_spinner = gtk4::Spinner::builder().visible(false).build();
     let button_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     button_content.append(&login_spinner);
-    button_content.append(&gtk4::Label::new(Some("Sign in")));
+    button_content.append(&gtk4::Label::new(Some(&gettext("Sign in"))));
     let login_button = gtk4::Button::builder()
         .child(&button_content)
         .halign(gtk4::Align::Center)
@@ -68,10 +72,13 @@ pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
     inner.append(&login_status);
     let links = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     links.set_halign(gtk4::Align::Center);
-    links.append(&gtk4::LinkButton::with_label(SIGNUP_URL, "Create account"));
+    links.append(&gtk4::LinkButton::with_label(
+        SIGNUP_URL,
+        &gettext("Create account"),
+    ));
     links.append(&gtk4::LinkButton::with_label(
         RESET_PASSWORD_URL,
-        "Forgot password?",
+        &gettext("Forgot password?"),
     ));
     inner.append(&links);
 
@@ -115,12 +122,12 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
         if username.is_empty() || password.is_empty() {
             ui.login
                 .login_status
-                .set_text("Enter your email and password.");
+                .set_text(&gettext("Enter your email and password."));
             return;
         }
 
         set_signing_in(&ui, true);
-        ui.login.login_status.set_text("Signing in…");
+        ui.login.login_status.set_text(&gettext("Signing in…"));
         let (rx, totp_req_rx, hv_req_rx) = spawn_login(username, password);
 
         // Surface the 2FA dialog only if the SDK actually asks for a code (i.e.
@@ -145,7 +152,7 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                 ui_hv
                     .login
                     .login_status
-                    .set_text("Complete the verification to continue…");
+                    .set_text(&gettext("Complete the verification to continue…"));
                 prompt_human_verification(&ui_hv, &url, token_tx);
             }
         });
@@ -155,7 +162,7 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
             let result = rx
                 .recv()
                 .await
-                .unwrap_or_else(|_| Err("login cancelled".into()));
+                .unwrap_or_else(|_| Err(gettext("login cancelled")));
             set_signing_in(&ui, false);
             match result {
                 Ok(()) => {
@@ -189,28 +196,28 @@ pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
     use pdfs_core::proton_sdk::ProtonError;
     match error {
         pdfs_core::Error::Proton(ProtonError::Api(api)) if api.http_status == 429 => {
-            "Too many sign-in attempts. Wait a few minutes and try again.".to_string()
+            gettext("Too many sign-in attempts. Wait a few minutes and try again.")
         }
         pdfs_core::Error::Proton(ProtonError::Api(api)) if !api.message.is_empty() => {
             api.message.clone()
         }
         pdfs_core::Error::Proton(ProtonError::Transport(_)) => {
-            "Couldn't reach Proton. Check your internet connection and try again.".to_string()
+            gettext("Couldn't reach Proton. Check your internet connection and try again.")
         }
-        pdfs_core::Error::Keyring(_) => {
-            "Signed in, but the session couldn't be saved to the system keyring. Make sure a \
-             keyring (GNOME Keyring or KWallet) is running and unlocked."
-                .to_string()
-        }
+        pdfs_core::Error::Keyring(_) => gettext(
+            "Signed in, but the session couldn't be saved to the system keyring. Make sure a keyring (GNOME Keyring or KWallet) is running and unlocked.",
+        ),
         pdfs_core::Error::Other(message) if message.contains("two-factor") => {
-            "Sign-in cancelled: no two-factor code was entered.".to_string()
+            gettext("Sign-in cancelled: no two-factor code was entered.")
         }
-        pdfs_core::Error::Other(message) if message.contains("verification") => {
-            "Sign-in cancelled: the verification wasn't completed. Sign in again to get a new \
-             one."
-                .to_string()
+        pdfs_core::Error::Other(message) if message.contains("verification") => gettext(
+            "Sign-in cancelled: the verification wasn't completed. Sign in again to get a new one.",
+        ),
+        other => {
+            let error = other.to_string();
+            // Translators: {error} is an error message, usually in English.
+            gettext_f("Sign-in failed: {error}", &[("error", &error)])
         }
-        other => format!("Sign-in failed: {other}"),
     }
 }
 
@@ -289,20 +296,22 @@ pub(crate) fn spawn_login(
 /// the worker reads as a cancelled login.
 pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Two-factor authentication")
-        .body("Enter the code from your authenticator app, or one of your recovery codes.")
+        .heading(gettext("Two-factor authentication"))
+        .body(gettext(
+            "Enter the code from your authenticator app, or one of your recovery codes.",
+        ))
         .build();
 
     let group = adw::PreferencesGroup::new();
     let entry = adw::EntryRow::builder()
-        .title("Authentication code")
+        .title(gettext("Authentication code"))
         .activates_default(true)
         .build();
     group.add(&entry);
     dialog.set_extra_child(Some(&group));
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("confirm", "Confirm");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("confirm", &gettext("Confirm"));
     dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("confirm"));
     dialog.set_close_response("cancel");
@@ -330,10 +339,11 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
     let ui = ui.clone();
     confirm_destructive(
         &window,
-        "Sign Out?",
-        "Proton Drive will disconnect and stop syncing until you sign in again. \
-         Files already on this computer stay where they are.",
-        "Sign Out",
+        &gettext("Sign Out?"),
+        &gettext(
+            "Proton Drive will disconnect and stop syncing until you sign in again. Files already on this computer stay where they are.",
+        ),
+        &gettext("Sign Out"),
         move || {
             service::disable_stop();
             if let Err(e) = auth::logout() {

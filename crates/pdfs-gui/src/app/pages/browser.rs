@@ -165,14 +165,14 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 
     let back = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Back (Alt+Left)")
+        .tooltip_text(gettext("Back (Alt+Left)"))
         .valign(gtk4::Align::Center)
         .action_name("files.back")
         .build();
     back.add_css_class("flat");
     let forward = gtk4::Button::builder()
         .icon_name("go-next-symbolic")
-        .tooltip_text("Forward (Alt+Right)")
+        .tooltip_text(gettext("Forward (Alt+Right)"))
         .valign(gtk4::Align::Center)
         .action_name("files.forward")
         .build();
@@ -196,14 +196,18 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // Everything that makes something new here, in one menu: three bare icons
     // side by side read as a toolbar puzzle.
     let new_menu = gio::Menu::new();
-    new_menu.append(Some("New Folder"), Some("files.new-folder"));
+    new_menu.append(Some(&gettext("New Folder")), Some("files.new-folder"));
     let uploads = gio::Menu::new();
-    uploads.append(Some("Upload Files…"), Some("files.upload"));
-    uploads.append(Some("Upload Folder…"), Some("files.upload-folder"));
+    uploads.append(Some(&gettext("Upload Files…")), Some("files.upload"));
+    uploads.append(
+        Some(&gettext("Upload Folder…")),
+        Some("files.upload-folder"),
+    );
     new_menu.append_section(None, &uploads);
     let new_button = gtk4::MenuButton::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("New")
+        // Translators: tooltip of the menu button that creates a folder or uploads files.
+        .tooltip_text(pgettext("create", "New"))
         .menu_model(&new_menu)
         .valign(gtk4::Align::Center)
         .build();
@@ -212,22 +216,25 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // Grid or list on a click; the order lives in the arrow's menu.
     let view_menu = gio::Menu::new();
     let layouts = gio::Menu::new();
-    layouts.append(Some("Grid"), Some("files.view::grid"));
-    layouts.append(Some("List"), Some("files.view::list"));
+    layouts.append(Some(&pgettext("layout", "Grid")), Some("files.view::grid"));
+    layouts.append(Some(&pgettext("layout", "List")), Some("files.view::list"));
     view_menu.append_section(None, &layouts);
     let sorts = gio::Menu::new();
-    sorts.append(Some("Name"), Some("files.sort::name"));
-    sorts.append(Some("Size"), Some("files.sort::size"));
-    sorts.append(Some("Last Modified"), Some("files.sort::modified"));
-    view_menu.append_section(Some("Sort By"), &sorts);
+    sorts.append(Some(&pgettext("column", "Name")), Some("files.sort::name"));
+    sorts.append(Some(&pgettext("column", "Size")), Some("files.sort::size"));
+    sorts.append(
+        Some(&gettext("Last Modified")),
+        Some("files.sort::modified"),
+    );
+    view_menu.append_section(Some(&gettext("Sort By")), &sorts);
     let order = gio::Menu::new();
-    order.append(Some("Reversed Order"), Some("files.descending"));
-    order.append(Some("Folders First"), Some("files.folders-first"));
+    order.append(Some(&gettext("Reversed Order")), Some("files.descending"));
+    order.append(Some(&gettext("Folders First")), Some("files.folders-first"));
     view_menu.append_section(None, &order);
     let view_button = adw::SplitButton::builder()
         .icon_name("view-list-symbolic")
-        .tooltip_text("Show as list (Ctrl+2)")
-        .dropdown_tooltip("Sort and view options")
+        .tooltip_text(gettext("Show as list (Ctrl+2)"))
+        .dropdown_tooltip(gettext("Sort and view options"))
         .menu_model(&view_menu)
         .valign(gtk4::Align::Center)
         .action_name("files.toggle-view")
@@ -235,11 +242,17 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 
     // What applies to the folder on screen rather than to a selection.
     let folder_menu = gio::Menu::new();
-    folder_menu.append(Some("Open in File Manager"), Some("files.open-folder"));
-    folder_menu.append(Some("Build Thumbnails"), Some("files.build-thumbnails"));
+    folder_menu.append(
+        Some(&gettext("Open in File Manager")),
+        Some("files.open-folder"),
+    );
+    folder_menu.append(
+        Some(&gettext("Build Thumbnails")),
+        Some("files.build-thumbnails"),
+    );
     let folder_button = gtk4::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("Folder actions")
+        .tooltip_text(gettext("Folder actions"))
         .menu_model(&folder_menu)
         .valign(gtk4::Align::Center)
         .build();
@@ -248,13 +261,13 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // shows while one runs.
     let build_thumbnails = gtk4::Button::builder()
         .icon_name("process-stop-symbolic")
-        .tooltip_text("Cancel thumbnail build")
+        .tooltip_text(gettext("Cancel thumbnail build"))
         .valign(gtk4::Align::Center)
         .build();
     build_thumbnails.add_css_class("flat");
 
     let search = gtk4::SearchEntry::builder()
-        .placeholder_text("Search Drive")
+        .placeholder_text(gettext("Search Drive"))
         .valign(gtk4::Align::Center)
         .build();
     search.set_width_chars(18);
@@ -262,7 +275,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // folder" is everywhere.
     let search_scope = gtk4::ToggleButton::builder()
         .icon_name("folder-symbolic")
-        .tooltip_text("Search this folder only")
+        .tooltip_text(gettext("Search this folder only"))
         .valign(gtk4::Align::Center)
         .visible(false)
         .build();
@@ -290,7 +303,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 
     // Empty / loading / error surface, shown in place of the views.
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -298,10 +311,12 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     retry.set_visible(false);
     // The empty-folder state's way out. `StatusPage` takes one child, so Retry
     // and these share a box; each is shown only for the state it belongs to.
-    let empty_upload = gtk4::Button::builder().label("Upload files").build();
+    let empty_upload = gtk4::Button::builder()
+        .label(gettext("Upload files"))
+        .build();
     empty_upload.add_css_class("pill");
     empty_upload.add_css_class("suggested-action");
-    let empty_new_folder = gtk4::Button::builder().label("New folder").build();
+    let empty_new_folder = gtk4::Button::builder().label(gettext("New folder")).build();
     empty_new_folder.add_css_class("pill");
     let empty_actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     empty_actions.set_halign(gtk4::Align::Center);
@@ -381,28 +396,28 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // instead of making the whole view jump when a second entry is selected.
     let bulk_label = gtk4::Label::builder().hexpand(true).xalign(0.0).build();
     let bulk_pin = gtk4::Button::builder()
-        .label("Make available offline")
+        .label(gettext("Make available offline"))
         .valign(gtk4::Align::Center)
         .build();
     bulk_pin.add_css_class("flat");
     let bulk_unpin = gtk4::Button::builder()
-        .label("Make online only")
+        .label(gettext("Make online only"))
         .valign(gtk4::Align::Center)
         .build();
     bulk_unpin.add_css_class("flat");
     let bulk_move = gtk4::Button::builder()
-        .label("Move to…")
+        .label(gettext("Move to…"))
         .valign(gtk4::Align::Center)
         .build();
     bulk_move.add_css_class("flat");
     let bulk_trash = gtk4::Button::builder()
-        .label("Move to Trash")
+        .label(gettext("Move to Trash"))
         .valign(gtk4::Align::Center)
         .build();
     bulk_trash.add_css_class("destructive-action");
     let bulk_clear = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
-        .tooltip_text("Clear selection (Esc)")
+        .tooltip_text(gettext("Clear selection (Esc)"))
         .valign(gtk4::Align::Center)
         .build();
     bulk_clear.add_css_class("flat");
@@ -425,13 +440,14 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // "Zoom:", its slider, then capacity information. Both visible troughs use
     // the same CSS dimensions.
     let summary = gtk4::Label::builder()
-        .label("Loading…")
+        .label(gettext("Loading…"))
         .halign(gtk4::Align::Start)
         .valign(gtk4::Align::Center)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .hexpand(true)
         .build();
-    let zoom_label = gtk4::Label::new(Some("Zoom:"));
+    // Translators: label in front of the icon-size slider in the status bar.
+    let zoom_label = gtk4::Label::new(Some(&gettext("Zoom:")));
     zoom_label.set_valign(gtk4::Align::Center);
     let zoom = gtk4::Scale::with_range(
         gtk4::Orientation::Horizontal,
@@ -442,20 +458,25 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     zoom.set_value(f64::from(GRID_THUMB_DEFAULT));
     zoom.set_draw_value(false);
     zoom.set_valign(gtk4::Align::Center);
-    zoom.set_tooltip_text(Some("Size: 72 pixels"));
+    zoom.set_tooltip_text(Some(&ngettext_f(
+        "Size: {n} pixel",
+        "Size: {n} pixels",
+        GRID_THUMB_DEFAULT as u64,
+        &[],
+    )));
     zoom.add_css_class("browser-status-meter");
 
     let quota = gtk4::ProgressBar::new();
     quota.set_hexpand(false);
     quota.set_valign(gtk4::Align::Center);
-    quota.set_tooltip_text(Some("Proton account storage"));
+    quota.set_tooltip_text(Some(&gettext("Proton account storage")));
     quota.add_css_class("browser-status-meter");
     let quota_text = gtk4::Label::builder()
-        .label("Loading…")
+        .label(gettext("Loading…"))
         .halign(gtk4::Align::Start)
         .valign(gtk4::Align::Center)
         .margin_end(6)
-        .tooltip_text("Proton account storage")
+        .tooltip_text(gettext("Proton account storage"))
         .build();
     let quota_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
     quota_box.set_valign(gtk4::Align::Center);
@@ -507,7 +528,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     page.append(&status_bar);
 
-    let (frame, header, _) = page_frame("My Files", &page);
+    let (frame, header, _) = page_frame(&gettext("My Files"), &page);
     header.pack_start(&new_button);
     header.pack_end(&folder_button);
     header.pack_end(&refresh);
@@ -613,9 +634,12 @@ pub(crate) fn sync_bulk_bar(ui: &Rc<Ui>) {
     let any_pinned = entries.iter().any(|e| e.pinned);
     let any_unpinned = entries.iter().any(|e| !e.pinned);
     let mounted = *ui.mounted.borrow();
-    ui.browser
-        .bulk_label
-        .set_label(&format!("{} selected", entries.len()));
+    ui.browser.bulk_label.set_label(&ngettext_f(
+        "{n} selected",
+        "{n} selected",
+        entries.len() as u64,
+        &[],
+    ));
     ui.browser.bulk_trash.set_sensitive(mounted);
     ui.browser
         .bulk_pin
@@ -647,8 +671,8 @@ pub(crate) fn run_bulk_delete(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
     if !*ui.mounted.borrow() {
         toast_error(
             ui,
-            "Couldn't move to Trash",
-            "Proton Drive isn't connected.",
+            &gettext("Couldn't move to Trash"),
+            &gettext("Proton Drive isn't connected."),
         );
         return;
     }
@@ -675,22 +699,32 @@ pub(crate) fn run_bulk_delete(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
                     failure.get_or_insert(message);
                 }
                 _ => {
-                    failure.get_or_insert_with(|| "The mount service didn't respond.".to_string());
+                    failure.get_or_insert_with(|| gettext("The mount service didn't respond."));
                 }
             }
         }
         ui.busy_end();
         reload_listing(&ui);
         match (trashed.len(), failure) {
-            (0, Some(message)) => toast_error(&ui, "Couldn't move to Trash", &message),
+            (0, Some(message)) => toast_error(&ui, &gettext("Couldn't move to Trash"), &message),
             (0, None) => {}
             (n, failure) => {
                 let message = match (failure, &single) {
-                    (Some(_), _) => format!("Moved {n} items to Trash — some couldn't be moved"),
-                    (None, Some(name)) => format!("Moved “{name}” to Trash"),
-                    (None, None) => format!("Moved {n} items to Trash"),
+                    (Some(_), _) => ngettext_f(
+                        "Moved {n} item to Trash — some couldn't be moved",
+                        "Moved {n} items to Trash — some couldn't be moved",
+                        n as u64,
+                        &[],
+                    ),
+                    (None, Some(name)) => gettext_f("Moved “{name}” to Trash", &[("name", name)]),
+                    (None, None) => ngettext_f(
+                        "Moved {n} item to Trash",
+                        "Moved {n} items to Trash",
+                        n as u64,
+                        &[],
+                    ),
                 };
-                toast_action(&ui, &message, "Undo", move |ui| {
+                toast_action(&ui, &message, &gettext("Undo"), move |ui| {
                     restore_uids(ui, trashed.clone(), n);
                 });
             }
@@ -704,11 +738,16 @@ pub(crate) fn restore_uids(ui: &Rc<Ui>, uids: Vec<String>, count: usize) {
         ui,
         Request::Restore { uids },
         if count == 1 {
-            "Restored from Trash".to_string()
+            gettext("Restored from Trash")
         } else {
-            format!("Restored {count} items from Trash")
+            ngettext_f(
+                "Restored {n} item from Trash",
+                "Restored {n} items from Trash",
+                count as u64,
+                &[],
+            )
         },
-        "Couldn't restore from Trash",
+        gettext_noop("Couldn't restore from Trash"),
     );
 }
 
@@ -744,21 +783,33 @@ pub(crate) fn run_bulk_pin(ui: &Rc<Ui>, entries: Vec<DirEntry>, pin: bool) {
                     failure.get_or_insert(message);
                 }
                 _ => {
-                    failure.get_or_insert_with(|| "The mount service didn't respond.".to_string());
+                    failure.get_or_insert_with(|| gettext("The mount service didn't respond."));
                 }
             }
         }
         ui.busy_end();
         load_browser(&ui);
         match (done, failure) {
-            (0, Some(message)) => toast_error(&ui, "Couldn't change offline state", &message),
+            (0, Some(message)) => {
+                toast_error(&ui, &gettext("Couldn't change offline state"), &message)
+            }
             (0, None) => {}
             (n, _) => toast(
                 &ui,
                 &if pin {
-                    format!("{n} files are now available offline")
+                    ngettext_f(
+                        "{n} file is now available offline",
+                        "{n} files are now available offline",
+                        n as u64,
+                        &[],
+                    )
                 } else {
-                    format!("{n} files are now online only")
+                    ngettext_f(
+                        "{n} file is now online only",
+                        "{n} files are now online only",
+                        n as u64,
+                        &[],
+                    )
                 },
             ),
         }
@@ -828,7 +879,12 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
     let grid_zoom = grid.clone();
     zoom.connect_value_changed(move |scale| {
         let size = (scale.value().round() as i32).clamp(GRID_THUMB_MIN, GRID_THUMB_MAX);
-        scale.set_tooltip_text(Some(&format!("Size: {size} pixels")));
+        scale.set_tooltip_text(Some(&ngettext_f(
+            "Size: {n} pixel",
+            "Size: {n} pixels",
+            size as u64,
+            &[],
+        )));
         if ui_zoom.browser.grid_thumbnail_size.replace(size) == size {
             return;
         }
@@ -930,16 +986,18 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
 
     // Column list: Name (icon + label, right-clickable), Size, Modified.
     column_view.append_column(&name_column(ui));
-    column_view.append_column(&text_column("Size", |e| {
+    column_view.append_column(&text_column(&pgettext("column", "Size"), |e| {
         if e.is_dir {
             "—".to_string()
         } else {
             human_bytes(e.size)
         }
     }));
-    column_view.append_column(&text_column("Modified", |e| format_modified(e.modified)));
+    column_view.append_column(&text_column(&pgettext("column", "Modified"), |e| {
+        format_modified(e.modified)
+    }));
     // Search hits come from anywhere in the Drive; this says where.
-    let location = text_column(LOCATION_COLUMN, |e| hit_location(&e.path));
+    let location = text_column(&gettext(LOCATION_COLUMN), |e| hit_location(&e.path));
     location.set_visible(false);
     column_view.append_column(&location);
 
@@ -1017,18 +1075,19 @@ pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
             apply_badge(&badge, &entry);
         }
     });
-    let column = gtk4::ColumnViewColumn::new(Some("Name"), Some(factory));
+    let column = gtk4::ColumnViewColumn::new(Some(&pgettext("column", "Name")), Some(factory));
     column.set_expand(true);
     column
 }
 
-const LOCATION_COLUMN: &str = "Location";
+/// Title of the search-hit folder column, also how the column is found again.
+const LOCATION_COLUMN: &str = gettext_noop("Location");
 
 /// The folder holding a search hit, as a mountpoint-relative path.
 fn hit_location(path: &str) -> String {
     match path.rsplit_once('/') {
         Some((parent, _)) => parent.to_string(),
-        None => "My Files".to_string(),
+        None => gettext("My Files"),
     }
 }
 
@@ -1038,7 +1097,7 @@ fn show_location_column(ui: &Rc<Ui>, visible: bool) {
     for column in (0..columns.n_items())
         .filter_map(|i| columns.item(i).and_downcast::<gtk4::ColumnViewColumn>())
     {
-        if column.title().as_deref() == Some(LOCATION_COLUMN) {
+        if column.title().as_deref() == Some(gettext(LOCATION_COLUMN).as_str()) {
             column.set_visible(visible);
         }
     }
@@ -1184,7 +1243,7 @@ pub(crate) fn popup_keyboard_context_menu(ui: &Rc<Ui>) {
 pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     let mut menu = ActionMenu::new();
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Open", move || {
+    menu.item(&pgettext("verb", "Open"), move || {
         // Open always means "download a local copy and hand off", even for a
         // media file — `activate_entry` would otherwise stream it.
         if is_streamable_media_entry(&entry_c) {
@@ -1194,45 +1253,59 @@ pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
         }
     });
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Open With…", move || open_entry_with(&ui_c, &entry_c));
+    menu.item(&gettext("Open With…"), move || {
+        open_entry_with(&ui_c, &entry_c)
+    });
     // Play streams from the mount, no download; Open above still fetches a
     // local copy for anyone who wants one.
     if is_streamable_media_entry(entry) {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        menu.item("Play", move || stream_entry(&ui_c, &entry_c));
+        menu.item(&pgettext("verb", "Play"), move || {
+            stream_entry(&ui_c, &entry_c)
+        });
     }
     menu.section();
 
     if !entry.is_dir {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        menu.toggle("Available offline", entry.pinned, move |_| {
+        menu.toggle(&gettext("Available offline"), entry.pinned, move |_| {
             toggle_pin(&ui_c, &entry_c)
         });
         menu.section();
     }
 
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Share…", move || open_share_dialog(&ui_c, &entry_c));
+    menu.item(&gettext("Share…"), move || {
+        open_share_dialog(&ui_c, &entry_c)
+    });
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Copy Link", move || copy_entry_link(&ui_c, &entry_c));
+    menu.item(&gettext("Copy Link"), move || {
+        copy_entry_link(&ui_c, &entry_c)
+    });
     menu.section();
 
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Rename…", move || prompt_rename(&ui_c, &entry_c));
+    menu.item(&gettext("Rename…"), move || {
+        prompt_rename(&ui_c, &entry_c)
+    });
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Move To…", move || {
+    menu.item(&gettext("Move To…"), move || {
         prompt_move(&ui_c, vec![entry_c.clone()])
     });
     if !entry.is_dir {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        menu.item("Versions…", move || open_versions_dialog(&ui_c, &entry_c));
+        menu.item(&gettext("Versions…"), move || {
+            open_versions_dialog(&ui_c, &entry_c)
+        });
     }
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Details", move || open_details(&ui_c, &entry_c));
+    menu.item(&gettext("Details"), move || open_details(&ui_c, &entry_c));
     menu.section();
 
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
-    menu.item("Move to Trash", move || trash_entry(&ui_c, &entry_c));
+    menu.item(&gettext("Move to Trash"), move || {
+        trash_entry(&ui_c, &entry_c)
+    });
     menu
 }
 
@@ -1246,16 +1319,23 @@ pub(crate) fn bulk_context_menu(ui: &Rc<Ui>, entries: Vec<DirEntry>) -> ActionMe
     if entries.iter().all(|e| !e.is_dir) {
         let (ui_c, batch) = (ui.clone(), entries.clone());
         let all_pinned = entries.iter().all(|e| e.pinned);
-        menu.toggle("Available offline", all_pinned, move |pin| {
+        menu.toggle(&gettext("Available offline"), all_pinned, move |pin| {
             run_bulk_pin(&ui_c, batch.clone(), pin)
         });
     }
     let (ui_c, batch) = (ui.clone(), entries.clone());
-    menu.item("Move To…", move || prompt_move(&ui_c, batch.clone()));
-    menu.labelled_section(&format!("{} selected", entries.len()));
+    menu.item(&gettext("Move To…"), move || {
+        prompt_move(&ui_c, batch.clone())
+    });
+    menu.labelled_section(&ngettext_f(
+        "{n} selected",
+        "{n} selected",
+        entries.len() as u64,
+        &[],
+    ));
 
     let ui_c = ui.clone();
-    menu.item("Move to Trash", move || {
+    menu.item(&gettext("Move to Trash"), move || {
         trash_entries(&ui_c, entries.clone())
     });
     menu
@@ -1270,19 +1350,19 @@ pub(crate) fn background_context_menu(ui: &Rc<Ui>) -> ActionMenu {
     };
     let mounted = *ui.mounted.borrow();
     if mounted && ui.browser.search.text().is_empty() {
-        menu.item("New Folder…", run("new-folder"));
-        menu.item("Upload Files…", run("upload"));
-        menu.item("Upload Folder…", run("upload-folder"));
+        menu.item(&gettext("New Folder…"), run("new-folder"));
+        menu.item(&gettext("Upload Files…"), run("upload"));
+        menu.item(&gettext("Upload Folder…"), run("upload-folder"));
         menu.section();
     }
     let ui_c = ui.clone();
-    menu.item("Select All", move || {
+    menu.item(&gettext("Select All"), move || {
         active_selection(&ui_c).select_all();
     });
     let ui_c = ui.clone();
-    menu.item("Refresh", move || reload_listing(&ui_c));
+    menu.item(&gettext("Refresh"), move || reload_listing(&ui_c));
     if mounted {
-        menu.item("Open in File Manager", run("open-folder"));
+        menu.item(&gettext("Open in File Manager"), run("open-folder"));
     }
     menu
 }
@@ -1295,8 +1375,8 @@ pub(crate) fn open_entry_with(ui: &Rc<Ui>, entry: &DirEntry) {
     let Some(path) = mounted_target_rel(&mountpoint, &rel) else {
         toast_error(
             ui,
-            "Couldn't open file",
-            "Open With needs the Proton Drive folder to be mounted.",
+            &gettext("Couldn't open file"),
+            &gettext("Open With needs the Proton Drive folder to be mounted."),
         );
         return;
     };
@@ -1310,7 +1390,7 @@ pub(crate) fn open_entry_with(ui: &Rc<Ui>, entry: &DirEntry) {
             if let Err(e) = result
                 && !e.matches(gtk4::DialogError::Dismissed)
             {
-                toast_error(&ui, "Couldn't open file", &e.to_string());
+                toast_error(&ui, &gettext("Couldn't open file"), &e.to_string());
             }
         },
     );
@@ -1338,16 +1418,16 @@ pub(crate) fn copy_entry_link(ui: &Rc<Ui>, entry: &DirEntry) {
                 ..
             })) => {
                 ui.stack.clipboard().set_text(&url);
-                toast(&ui, "Link copied");
+                toast(&ui, &gettext("Link copied"));
             }
             Ok(Ok(Response::Share { .. })) => open_share_dialog(&ui, &entry),
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't copy link", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't copy link"), &message, kind)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't copy link",
-                "The mount service didn't respond.",
+                &gettext("Couldn't copy link"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -1378,12 +1458,15 @@ pub(crate) fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let Some(path) = abs.to_str() else {
         toast_error(
             ui,
-            "Couldn't play media",
-            "The file path isn't valid UTF-8.",
+            &gettext("Couldn't play media"),
+            &gettext("The file path isn't valid UTF-8."),
         );
         return;
     };
-    toast(ui, &format!("Streaming “{}”…", entry.name));
+    toast(
+        ui,
+        &gettext_f("Streaming “{name}”…", &[("name", &entry.name)]),
+    );
     play_external(path);
 }
 
@@ -1447,12 +1530,12 @@ pub(crate) fn download_and_open(ui: &Rc<Ui>, entry: &DirEntry) {
             // against the Drive name the user clicked, not that path.
             Ok(Ok(Response::FilePath { path })) => open_named_path(&path, &name),
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't open file", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't open file"), &message, kind)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't open file",
-                "The mount service didn't respond.",
+                &gettext("Couldn't open file"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -1474,7 +1557,12 @@ pub(crate) fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
     glib::spawn_future_local(async move {
         match rx.recv().await {
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't change offline state", &message, kind);
+                toast_failure(
+                    &ui,
+                    &gettext("Couldn't change offline state"),
+                    &message,
+                    kind,
+                );
                 // The details switch may be showing the state we failed to reach.
                 load_browser(&ui);
             }
@@ -1483,17 +1571,17 @@ pub(crate) fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
                 toast(
                     &ui,
                     &if pinned {
-                        format!("“{name}” is now online only")
+                        gettext_f("“{name}” is now online only", &[("name", &name)])
                     } else {
-                        format!("“{name}” is now available offline")
+                        gettext_f("“{name}” is now available offline", &[("name", &name)])
                     },
                 );
             }
             _ => {
                 toast_error(
                     &ui,
-                    "Couldn't change offline state",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't change offline state"),
+                    &gettext("The mount service didn't respond."),
                 );
                 load_browser(&ui);
             }
@@ -1712,7 +1800,7 @@ pub(crate) fn set_files_view(ui: &Rc<Ui>, view: FilesView) {
     let mut config = ui.dirs.load_config();
     config.files_view = view;
     if let Err(e) = ui.dirs.save_config(&config) {
-        toast_error(ui, "Couldn't save the view", &e.to_string());
+        toast_error(ui, &gettext("Couldn't save the view"), &e.to_string());
     }
     if (old.sort, old.descending, old.folders_first)
         != (view.sort, view.descending, view.folders_first)
@@ -1734,10 +1822,10 @@ fn apply_files_view(ui: &Rc<Ui>, view: FilesView) {
     } else {
         "view-list-symbolic"
     });
-    ui.browser.view_button.set_tooltip_text(Some(if view.list {
-        "Show as grid (Ctrl+1)"
+    ui.browser.view_button.set_tooltip_text(Some(&if view.list {
+        gettext("Show as grid (Ctrl+1)")
     } else {
-        "Show as list (Ctrl+2)"
+        gettext("Show as list (Ctrl+2)")
     }));
     let actions = &ui.browser.actions;
     for (name, state) in [
@@ -1868,7 +1956,7 @@ fn open_current_folder(ui: &Rc<Ui>) {
     let dir = mounted_path(&mountpoint, &path);
     let uri = gio::File::for_path(&dir).uri();
     if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE) {
-        toast_error(ui, "Couldn't open the folder", &e.to_string());
+        toast_error(ui, &gettext("Couldn't open the folder"), &e.to_string());
     }
 }
 
@@ -1881,8 +1969,8 @@ fn start_thumbnail_build(ui: &Rc<Ui>) {
     if !*ui.mounted.borrow() {
         toast_error(
             ui,
-            "Couldn't build thumbnails",
-            "Proton Drive isn't connected.",
+            &gettext("Couldn't build thumbnails"),
+            &gettext("Proton Drive isn't connected."),
         );
         return;
     }
@@ -1896,7 +1984,7 @@ fn start_thumbnail_build(ui: &Rc<Ui>) {
     ui.browser.thumbnail_progress.set_fraction(0.0);
     ui.browser
         .thumbnail_status
-        .set_label("Starting thumbnail build…");
+        .set_label(&gettext("Starting thumbnail build…"));
 
     let path = ui.browser.path.borrow().clone();
     let rx = spawn_request(
@@ -1912,12 +2000,12 @@ fn start_thumbnail_build(ui: &Rc<Ui>) {
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 thumbnail_build_failed(&ui);
-                toast_failure(&ui, "Couldn't build thumbnails", &message, kind);
+                toast_failure(&ui, &gettext("Couldn't build thumbnails"), &message, kind);
             }
             _ => {
-                let message = "The mount service didn't respond.";
+                let message = gettext("The mount service didn't respond.");
                 thumbnail_build_failed(&ui);
-                toast_error(&ui, "Couldn't build thumbnails", message);
+                toast_error(&ui, &gettext("Couldn't build thumbnails"), &message);
             }
         }
     });
@@ -1930,7 +2018,7 @@ fn cancel_thumbnail_build(ui: &Rc<Ui>) {
     ui.browser.build_thumbnails.set_sensitive(false);
     ui.browser
         .thumbnail_status
-        .set_label("Stopping thumbnail build…");
+        .set_label(&gettext("Stopping thumbnail build…"));
     let rx = spawn_request(ui.dirs.control_socket(), Request::CancelThumbnailBuild);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -1941,14 +2029,19 @@ fn cancel_thumbnail_build(ui: &Rc<Ui>) {
             Ok(Ok(Response::ThumbnailBuild { .. })) => schedule_thumbnail_build_poll(&ui),
             Ok(Ok(Response::Error { message, kind })) => {
                 thumbnail_cancel_failed(&ui);
-                toast_failure(&ui, "Couldn't cancel thumbnail build", &message, kind);
+                toast_failure(
+                    &ui,
+                    &gettext("Couldn't cancel thumbnail build"),
+                    &message,
+                    kind,
+                );
             }
             _ => {
                 thumbnail_cancel_failed(&ui);
                 toast_error(
                     &ui,
-                    "Couldn't cancel thumbnail build",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't cancel thumbnail build"),
+                    &gettext("The mount service didn't respond."),
                 );
             }
         }
@@ -1978,14 +2071,14 @@ fn schedule_thumbnail_build_poll(ui: &Rc<Ui>) {
                 }
                 Ok(Ok(Response::Error { message, .. })) => {
                     thumbnail_build_failed(&ui_result);
-                    toast_error(&ui_result, "Thumbnail build stopped", &message);
+                    toast_error(&ui_result, &gettext("Thumbnail build stopped"), &message);
                 }
                 _ => {
                     thumbnail_build_failed(&ui_result);
                     toast_error(
                         &ui_result,
-                        "Thumbnail build stopped",
-                        "The mount service stopped reporting thumbnail progress.",
+                        &gettext("Thumbnail build stopped"),
+                        &gettext("The mount service stopped reporting thumbnail progress."),
                     );
                 }
             }
@@ -2005,9 +2098,12 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
     };
     let text = if status.scanning {
         ui.browser.thumbnail_progress.pulse();
-        format!(
-            "Scanning {root}… {} folders, {} images",
-            status.folders_scanned, status.images_found
+        let folders = ngettext_f("{n} folder", "{n} folders", status.folders_scanned, &[]);
+        let images = ngettext_f("{n} image", "{n} images", status.images_found, &[]);
+        // Translators: {root} is a folder path or "Proton Drive"; {folders} and {images} are counts such as "3 folders" and "12 images".
+        gettext_f(
+            "Scanning {root}… {folders}, {images}",
+            &[("root", root), ("folders", &folders), ("images", &images)],
         )
     } else if status.running {
         let fraction = if status.images_found == 0 {
@@ -2018,22 +2114,41 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
         ui.browser
             .thumbnail_progress
             .set_fraction(fraction.clamp(0.0, 1.0));
-        format!(
-            "Building thumbnails in {root}… {} of {}",
-            status.completed, status.images_found
+        // Translators: {root} is a folder path or "Proton Drive"; {done} and {total} are image counts.
+        gettext_f(
+            "Building thumbnails in {root}… {done} of {total}",
+            &[
+                ("root", root),
+                ("done", &status.completed.to_string()),
+                ("total", &status.images_found.to_string()),
+            ],
         )
     } else {
         ui.browser.thumbnail_progress.set_fraction(1.0);
         let available = status.completed.saturating_sub(status.failed);
         match status.failed {
-            0 => format!("Thumbnails ready for {available} images in {root}"),
-            failed => {
-                format!("Thumbnails ready for {available} images in {root}; {failed} unavailable")
-            }
+            // Translators: {root} is a folder path or "Proton Drive".
+            0 => ngettext_f(
+                "Thumbnails ready for {n} image in {root}",
+                "Thumbnails ready for {n} images in {root}",
+                available,
+                &[("root", root)],
+            ),
+            // Translators: {root} is a folder path or "Proton Drive"; {failed} is how many images could not get a thumbnail.
+            failed => ngettext_f(
+                "Thumbnails ready for {n} image in {root}; {failed} unavailable",
+                "Thumbnails ready for {n} images in {root}; {failed} unavailable",
+                available,
+                &[("root", root), ("failed", &failed.to_string())],
+            ),
         }
     };
     let text = match status.message.as_deref() {
-        Some(message) => format!("{text}. {message}"),
+        // Translators: {status} is the thumbnail build progress; {message} is a problem the mount service reported.
+        Some(message) => gettext_f(
+            "{status}. {message}",
+            &[("status", &text), ("message", message)],
+        ),
         None => text,
     };
     ui.browser.thumbnail_status.set_label(&text);
@@ -2087,9 +2202,13 @@ fn thumbnail_build_failed(ui: &Rc<Ui>) {
 /// confirm with a toast, or report the daemon's error in one. `done` is the
 /// past-tense confirmation ("Renamed to “x”"); `failed` names the attempt
 /// ("Couldn't rename").
+///
+/// `failed` is an untranslated msgid: callers mark it with [`gettext_noop`] and
+/// it is translated here.
 pub(crate) fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'static str) {
+    let failed = gettext(failed);
     if !*ui.mounted.borrow() {
-        toast_error(ui, failed, "Proton Drive isn't connected.");
+        toast_error(ui, &failed, &gettext("Proton Drive isn't connected."));
         return;
     }
     ui.busy_begin();
@@ -2105,8 +2224,10 @@ pub(crate) fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'st
                 reload_listing(&ui);
                 toast(&ui, &done);
             }
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
-            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
         }
     });
 }
@@ -2127,10 +2248,12 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
     let parent = ui_window(ui);
     let rel = entry_rel(ui, entry);
     let original = entry.name.clone();
-    let dialog = adw::AlertDialog::builder().heading("Rename").build();
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Rename"))
+        .build();
     let group = adw::PreferencesGroup::new();
     let row = adw::EntryRow::builder()
-        .title("New name")
+        .title(gettext("New name"))
         .activates_default(true)
         .build();
     row.set_text(&original);
@@ -2147,8 +2270,8 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
         row_focus.grab_focus();
         row_focus.select_region(0, stem);
     });
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("confirm", "Rename");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("confirm", &gettext("Rename"));
     dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("confirm"));
     dialog.set_close_response("cancel");
@@ -2162,7 +2285,7 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
         if new_name.is_empty() || new_name == original {
             return;
         }
-        let done = format!("Renamed to “{new_name}”");
+        let done = gettext_f("Renamed to “{name}”", &[("name", &new_name)]);
         run_mutation(
             &ui,
             Request::Rename {
@@ -2170,7 +2293,7 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
                 new_name,
             },
             done,
-            "Couldn't rename",
+            gettext_noop("Couldn't rename"),
         );
     });
     dialog.present(parent.as_ref());
@@ -2184,17 +2307,17 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
     }
     let sources: Vec<String> = entries.iter().map(|e| entry_rel(ui, e)).collect();
     let heading = match entries.as_slice() {
-        [one] => format!("Move “{}”", one.name),
-        many => format!("Move {}", count_noun(many.len(), "item", "items")),
+        [one] => gettext_f("Move “{name}”", &[("name", &one.name)]),
+        many => ngettext_f("Move {n} item", "Move {n} items", many.len() as u64, &[]),
     };
     let dialog = adw::AlertDialog::builder()
         .heading(heading)
-        .body("Choose the folder to move into.")
+        .body(gettext("Choose the folder to move into."))
         .build();
 
     let up = gtk4::Button::builder()
         .icon_name("go-up-symbolic")
-        .tooltip_text("Parent folder")
+        .tooltip_text(gettext("Parent folder"))
         .build();
     up.add_css_class("flat");
     let location = gtk4::Label::builder()
@@ -2219,8 +2342,8 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
     body.append(&bar);
     body.append(&scroll);
     dialog.set_extra_child(Some(&body));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("move", "Move Here");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("move", &gettext("Move Here"));
     dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("move"));
     dialog.set_close_response("cancel");
@@ -2286,7 +2409,7 @@ impl MovePicker {
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
-        self.list.append(&picker_note("Loading…"));
+        self.list.append(&picker_note(&gettext("Loading…")));
         let rx = spawn_request(
             self.ui.dirs.control_socket(),
             Request::ListDir {
@@ -2305,7 +2428,7 @@ impl MovePicker {
             let Ok(Ok(Response::Entries { entries })) = result else {
                 picker
                     .list
-                    .append(&picker_note("Couldn't read this folder."));
+                    .append(&picker_note(&gettext("Couldn't read this folder.")));
                 return;
             };
             let mut folders: Vec<DirEntry> = entries.into_iter().filter(|e| e.is_dir).collect();
@@ -2333,7 +2456,9 @@ impl MovePicker {
                 shown += 1;
             }
             if shown == 0 {
-                picker.list.append(&picker_note("No folders here."));
+                picker
+                    .list
+                    .append(&picker_note(&gettext("No folders here.")));
             }
         });
     }
@@ -2372,7 +2497,11 @@ pub(crate) fn move_target_allowed(sources: &[String], target: &str) -> bool {
 /// once for the lot.
 pub(crate) fn run_bulk_move(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
     if !*ui.mounted.borrow() {
-        toast_error(ui, "Couldn't move", "Proton Drive isn't connected.");
+        toast_error(
+            ui,
+            &gettext("Couldn't move"),
+            &gettext("Proton Drive isn't connected."),
+        );
         return;
     }
     let socket = ui.dirs.control_socket();
@@ -2398,7 +2527,7 @@ pub(crate) fn run_bulk_move(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
                 _ => {
                     failure.get_or_insert_with(|| {
                         (
-                            "The mount service didn't respond.".to_string(),
+                            gettext("The mount service didn't respond."),
                             ErrorKind::Internal,
                         )
                     });
@@ -2408,22 +2537,38 @@ pub(crate) fn run_bulk_move(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
         ui.busy_end();
         reload_listing(&ui);
         let place = match target.rsplit('/').next() {
-            Some(name) if !name.is_empty() => format!("“{name}”"),
+            // Translators: a folder name in quotes, filled in as {place} in "Moved to {place}".
+            Some(name) if !name.is_empty() => gettext_f("“{name}”", &[("name", name)]),
             _ => "Proton Drive".to_string(),
         };
         match (done, failure) {
-            (0, Some((message, kind))) => toast_failure(&ui, "Couldn't move", &message, kind),
+            (0, Some((message, kind))) => {
+                toast_failure(&ui, &gettext("Couldn't move"), &message, kind)
+            }
             (0, None) => {}
             (n, Some((message, _))) => toast_error(
                 &ui,
-                &format!(
-                    "Moved {} to {place}, but not all",
-                    count_noun(n, "item", "items")
+                // Translators: {place} is a quoted folder name or "Proton Drive".
+                &ngettext_f(
+                    "Moved {n} item to {place}, but not all",
+                    "Moved {n} items to {place}, but not all",
+                    n as u64,
+                    &[("place", &place)],
                 ),
                 &message,
             ),
-            (1, None) => toast(&ui, &format!("Moved to {place}")),
-            (n, None) => toast(&ui, &format!("Moved {n} items to {place}")),
+            // Translators: {place} is a quoted folder name or "Proton Drive".
+            (1, None) => toast(&ui, &gettext_f("Moved to {place}", &[("place", &place)])),
+            (n, None) => toast(
+                &ui,
+                // Translators: {place} is a quoted folder name or "Proton Drive".
+                &ngettext_f(
+                    "Moved {n} item to {place}",
+                    "Moved {n} items to {place}",
+                    n as u64,
+                    &[("place", &place)],
+                ),
+            ),
         }
     });
 }
@@ -2438,18 +2583,18 @@ pub(crate) fn prompt_new_folder(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let parent = ui.browser.path.borrow().clone();
     let dialog = adw::AlertDialog::builder()
-        .heading("New folder")
-        .body("Create a folder in the current directory.")
+        .heading(gettext("New folder"))
+        .body(gettext("Create a folder in the current directory."))
         .build();
     let group = adw::PreferencesGroup::new();
     let row = adw::EntryRow::builder()
-        .title("Folder name")
+        .title(gettext("Folder name"))
         .activates_default(true)
         .build();
     group.add(&row);
     dialog.set_extra_child(Some(&group));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("confirm", "Create");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("confirm", &gettext("Create"));
     dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("confirm"));
     dialog.set_close_response("cancel");
@@ -2463,7 +2608,7 @@ pub(crate) fn prompt_new_folder(ui: &Rc<Ui>) {
         if name.is_empty() {
             return;
         }
-        let done = format!("Created “{name}”");
+        let done = gettext_f("Created “{name}”", &[("name", &name)]);
         run_mutation(
             &ui,
             Request::CreateFolder {
@@ -2471,7 +2616,7 @@ pub(crate) fn prompt_new_folder(ui: &Rc<Ui>) {
                 name,
             },
             done,
-            "Couldn't create folder",
+            gettext_noop("Couldn't create folder"),
         );
     });
     dialog.present(win.as_ref());
@@ -2482,7 +2627,9 @@ pub(crate) fn prompt_new_folder(ui: &Rc<Ui>) {
 /// the GUI — even a large multi-file selection.
 pub(crate) fn prompt_upload(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let dialog = gtk4::FileDialog::builder().title("Upload Files").build();
+    let dialog = gtk4::FileDialog::builder()
+        .title(gettext("Upload Files"))
+        .build();
     let ui = ui.clone();
     dialog.open_multiple(win.as_ref(), gio::Cancellable::NONE, move |res| {
         let Ok(files) = res else { return };
@@ -2501,7 +2648,9 @@ pub(crate) fn prompt_upload(ui: &Rc<Ui>) {
 /// browser directory. The daemon recreates the directory structure remotely.
 pub(crate) fn prompt_upload_folder(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let dialog = gtk4::FileDialog::builder().title("Upload Folder").build();
+    let dialog = gtk4::FileDialog::builder()
+        .title(gettext("Upload Folder"))
+        .build();
     let ui = ui.clone();
     dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
         let Ok(folder) = res else { return };
@@ -2521,7 +2670,11 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
         return;
     }
     if !*ui.mounted.borrow() {
-        toast_error(ui, "Couldn't upload", "Proton Drive isn't connected.");
+        toast_error(
+            ui,
+            &gettext("Couldn't upload"),
+            &gettext("Proton Drive isn't connected."),
+        );
         return;
     }
     let parent = ui.browser.path.borrow().clone();
@@ -2535,19 +2688,23 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
         match rx.recv().await {
             Ok(Ok(Response::Ok { .. })) => {
                 let what = if n == 1 {
-                    "Uploading…".to_string()
+                    gettext("Uploading…")
                 } else {
-                    format!("Uploading {n} items…")
+                    ngettext_f("Uploading {n} item…", "Uploading {n} items…", n as u64, &[])
                 };
                 // Progress lives on the Sync page; say where.
-                toast_action(&ui, &what, "View", |ui| {
+                toast_action(&ui, &what, &pgettext("verb", "View"), |ui| {
                     ui.stack.set_visible_child_name("locations")
                 });
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't upload", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't upload"), &message, kind)
             }
-            _ => toast_error(&ui, "Couldn't upload", "The mount service didn't respond."),
+            _ => toast_error(
+                &ui,
+                &gettext("Couldn't upload"),
+                &gettext("The mount service didn't respond."),
+            ),
         }
     });
 }
@@ -2625,7 +2782,7 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
         if src == dest_path || dest_path.starts_with(&format!("{src}/")) {
             return false;
         }
-        let done = format!("Moved into “{}”", dest.name);
+        let done = gettext_f("Moved into “{name}”", &[("name", &dest.name)]);
         run_mutation(
             &ui,
             Request::Move {
@@ -2633,7 +2790,7 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
                 new_parent: dest_path,
             },
             done,
-            "Couldn't move",
+            gettext_noop("Couldn't move"),
         );
         true
     });
@@ -2670,7 +2827,8 @@ pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {
 pub(crate) fn format_modified(secs: i64) -> String {
     match glib::DateTime::from_unix_local(secs) {
         Ok(dt) => dt
-            .format("%-d %b %Y")
+            // Translators: strftime format for a modification date, such as "23 Sep 2026".
+            .format(&gettext("%-d %b %Y"))
             .map(|s| s.to_string())
             .unwrap_or_default(),
         Err(_) => String::new(),
@@ -2686,7 +2844,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     repaint_crumb(ui, &path);
     sync_history_actions(ui);
     sync_search_scope(ui);
-    ui.browser.summary.set_label("Loading…");
+    ui.browser.summary.set_label(&gettext("Loading…"));
 
     // Drop the previous folder's rows up front: a slow reply must not leave stale
     // entries visible, where clicking one would open with a wrong relative path.
@@ -2694,8 +2852,8 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     browser_status(
         ui,
         "folder-symbolic",
-        "Loading…",
-        "Reading this folder.",
+        &gettext("Loading…"),
+        &gettext("Reading this folder."),
         false,
     );
 
@@ -2719,7 +2877,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
             Ok(Ok(Response::Error { message, kind })) => browser_failed(&ui, &message, kind),
             Ok(Ok(_)) => browser_failed(
                 &ui,
-                "Unexpected reply from the mount service.",
+                &gettext("Unexpected reply from the mount service."),
                 ErrorKind::Internal,
             ),
             Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
@@ -2732,11 +2890,11 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
 /// (which restarts the service) wouldn't help and isn't offered.
 pub(crate) fn browser_failed(ui: &Rc<Ui>, message: &str, kind: ErrorKind) {
     ui.browser.model.remove_all();
-    ui.browser.summary.set_label("Folder unavailable");
+    ui.browser.summary.set_label(&gettext("Folder unavailable"));
     browser_status(
         ui,
         "dialog-warning-symbolic",
-        error_headline(kind, "Couldn't open this folder"),
+        error_headline(kind, &gettext("Couldn't open this folder")),
         message,
         // Offer Retry only where repeating the request could actually work.
         // A folder that is gone stays gone however many times it is asked for.
@@ -2749,22 +2907,22 @@ pub(crate) fn browser_failed(ui: &Rc<Ui>, message: &str, kind: ErrorKind) {
 /// once the systemd mount comes up but a real failure stays visible.
 pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
     if service::is_failed() || !service::is_active() {
-        ui.browser.summary.set_label("Not connected");
+        ui.browser.summary.set_label(&gettext("Not connected"));
         browser_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
     }
-    ui.browser.summary.set_label("Connecting…");
+    ui.browser.summary.set_label(&gettext("Connecting…"));
     browser_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -2795,8 +2953,8 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
         browser_status(
             ui,
             "folder-open-symbolic",
-            "This folder is empty",
-            "Drop files here, or upload a file or create a folder to get started.",
+            &gettext("This folder is empty"),
+            &gettext("Drop files here, or upload a file or create a folder to get started."),
             false,
         );
         ui.browser.empty_actions.set_visible(true);
@@ -2836,10 +2994,10 @@ pub(crate) fn wire_search(ui: &Rc<Ui>) {
     });
     let ui_s = ui.clone();
     ui.browser.search_scope.connect_toggled(move |scope| {
-        scope.set_tooltip_text(Some(if scope.is_active() {
-            "Search everywhere"
+        scope.set_tooltip_text(Some(&if scope.is_active() {
+            gettext("Search everywhere")
         } else {
-            "Search this folder only"
+            gettext("Search this folder only")
         }));
         let query = ui_s.browser.search.text().trim().to_string();
         if !query.is_empty() {
@@ -2869,12 +3027,12 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
     let generation = ui.browser.load_generation.get().wrapping_add(1);
     ui.browser.load_generation.set(generation);
     ui.browser.model.remove_all();
-    ui.browser.summary.set_label("Searching…");
+    ui.browser.summary.set_label(&gettext("Searching…"));
     browser_status(
         ui,
         "system-search-symbolic",
-        "Searching…",
-        &format!("Looking for “{query}”."),
+        &gettext("Searching…"),
+        &gettext_f("Looking for “{query}”.", &[("query", query)]),
         false,
     );
 
@@ -2905,7 +3063,7 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
             Ok(Ok(Response::Error { message, kind })) => browser_failed(&ui, &message, kind),
             Ok(Ok(_)) => browser_failed(
                 &ui,
-                "Unexpected reply from the mount service.",
+                &gettext("Unexpected reply from the mount service."),
                 ErrorKind::Internal,
             ),
             Ok(Err(_)) | Err(_) => browser_unreachable(&ui),
@@ -2930,16 +3088,23 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     ui.browser
         .summary
         .set_label(&if hits.len() >= SEARCH_LIMIT {
-            format!("{counts} — showing the first {SEARCH_LIMIT} search results")
+            // Translators: {summary} counts the hits, such as "2 folders, 5 files (3.0 MB)".
+            ngettext_f(
+                "{summary} — showing the first {n} search result",
+                "{summary} — showing the first {n} search results",
+                SEARCH_LIMIT as u64,
+                &[("summary", &counts)],
+            )
         } else {
-            format!("{counts} — search results")
+            // Translators: {summary} counts the hits, such as "2 folders, 5 files (3.0 MB)".
+            gettext_f("{summary} — search results", &[("summary", &counts)])
         });
     if hits.is_empty() {
         browser_status(
             ui,
             "system-search-symbolic",
-            "No matches",
-            "No files or folders match that search.",
+            &gettext("No matches"),
+            &gettext("No files or folders match that search."),
             false,
         );
         return;
@@ -2970,15 +3135,29 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
 }
 
 fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
-    let file_word = if files == 1 { "file" } else { "files" };
-    let folder_word = if folders == 1 { "folder" } else { "folders" };
+    let folder_count = ngettext_f("{n} folder", "{n} folders", folders as u64, &[]);
+    let file_count = ngettext_f("{n} file", "{n} files", files as u64, &[]);
+    let size = human_bytes(file_bytes);
     match (folders, files) {
-        (0, 0) => "0 folders, 0 files".to_string(),
-        (_, 0) => format!("{folders} {folder_word}"),
-        (0, _) => format!("{files} {file_word} ({})", human_bytes(file_bytes)),
-        _ => format!(
-            "{folders} {folder_word}, {files} {file_word} ({})",
-            human_bytes(file_bytes)
+        (1.., 0) => folder_count,
+        // Translators: {files} is a count such as "3 files"; {size} is their total size such as "4.2 MB".
+        (0, 1..) => gettext_f(
+            "{files} ({size})",
+            &[("files", &file_count), ("size", &size)],
+        ),
+        // Translators: {folders} and {files} are counts such as "2 folders" and "0 files".
+        (0, 0) => gettext_f(
+            "{folders}, {files}",
+            &[("folders", &folder_count), ("files", &file_count)],
+        ),
+        // Translators: {folders} and {files} are counts such as "1 folder" and "3 files"; {size} is the files' total size such as "4.2 MB".
+        _ => gettext_f(
+            "{folders}, {files} ({size})",
+            &[
+                ("folders", &folder_count),
+                ("files", &file_count),
+                ("size", &size),
+            ],
         ),
     }
 }

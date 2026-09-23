@@ -31,6 +31,7 @@ jobs:
             libsecret-1-dev \
             libdbus-1-dev \
             desktop-file-utils \
+            gettext \
             rpm
 
       - name: Set up Rust
@@ -84,6 +85,7 @@ jobs:
           cp target/release/pdfs-tray dist/binaries/
           cp target/release/pdfs-app dist/binaries/
           cp target/release/pdfs-prompt dist/binaries/
+          po/build.sh dist/binaries/locale
           
           # Create tarball
           tar -czf proton-drive-linux-${{ env.VERSION }}-x86_64.tar.gz -C dist/binaries .
@@ -110,6 +112,7 @@ jobs:
           cp packaging/io.narl.proton-drive-linux.svg deb/usr/share/icons/hicolor/scalable/apps/
           cp packaging/proton-drive.service deb/usr/lib/systemd/user/
           cp LICENSE deb/usr/share/licenses/proton-drive-linux/
+          po/build.sh deb/usr/share/locale
 
           # Calculate Installed-Size in KB for the control file
           INSTALLED_SIZE=$(du -sk deb | cut -f1)

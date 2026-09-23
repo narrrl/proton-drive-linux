@@ -380,7 +380,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     // Shown only when a load failed because the mount is down; restarts it.
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -389,11 +389,13 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     // The empty-timeline state's two ways forward. `StatusPage` takes one child,
     // so Retry and these share a box and each is shown only for its own state.
-    let empty_upload = gtk4::Button::builder().label("Upload photos").build();
+    let empty_upload = gtk4::Button::builder()
+        .label(gettext("Upload photos"))
+        .build();
     empty_upload.add_css_class("pill");
     empty_upload.add_css_class("suggested-action");
     let empty_import = gtk4::Button::builder()
-        .label("Import from Google Photos")
+        .label(gettext("Import from Google Photos"))
         .build();
     empty_import.add_css_class("pill");
     let empty_actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -433,7 +435,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .margin_top(12)
         .margin_bottom(12)
         .margin_end(4)
-        .tooltip_text("Jump to a month")
+        .tooltip_text(gettext("Jump to a month"))
         .visible(false)
         .build();
     scrubber.add_css_class("photo-scrubber");
@@ -450,7 +452,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // it — the Albums toggle is what leaves the grid itself.
     let back = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to albums")
+        .tooltip_text(gettext("Back to albums"))
         .valign(gtk4::Align::Center)
         .visible(false)
         .build();
@@ -462,11 +464,11 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let upload = gtk4::Button::builder()
         .child(
             &adw::ButtonContent::builder()
-                .label("Upload")
+                .label(pgettext("verb", "Upload"))
                 .icon_name("list-add-symbolic")
                 .build(),
         )
-        .tooltip_text("Upload photos")
+        .tooltip_text(gettext("Upload photos"))
         .valign(gtk4::Align::Center)
         .build();
     upload.add_css_class("suggested-action");
@@ -475,7 +477,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // it sits beside Upload as a plain button rather than a second accent one.
     let import = gtk4::Button::builder()
         .icon_name("folder-download-symbolic")
-        .tooltip_text("Import a Google Photos Takeout export")
+        .tooltip_text(gettext("Import a Google Photos Takeout export"))
         .valign(gtk4::Align::Center)
         .build();
     import.add_css_class("flat");
@@ -485,7 +487,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // Picking photos is a mode, so its control is a toggle rather than a button.
     let select_btn = gtk4::ToggleButton::builder()
         .icon_name("selection-mode-symbolic")
-        .tooltip_text("Select photos")
+        .tooltip_text(gettext("Select photos"))
         .valign(gtk4::Align::Center)
         .build();
     select_btn.add_css_class("flat");
@@ -494,24 +496,24 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // What the selection can do, revealed with the mode. A revealer rather than
     // a hidden box so the grid slides down instead of jumping.
     let select_label = gtk4::Label::builder()
-        .label("Select photos")
+        .label(gettext("Select photos"))
         .hexpand(true)
         .xalign(0.0)
         .build();
     let select_trash = gtk4::Button::builder()
-        .label("Move to Trash")
+        .label(gettext("Move to Trash"))
         .valign(gtk4::Align::Center)
         .sensitive(false)
         .build();
     select_trash.add_css_class("destructive-action");
     let select_album = gtk4::Button::builder()
-        .label("Add to Album…")
+        .label(gettext("Add to Album…"))
         .valign(gtk4::Align::Center)
         .sensitive(false)
         .build();
     let select_done = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
-        .tooltip_text("Leave selection (Esc)")
+        .tooltip_text(gettext("Leave selection (Esc)"))
         .valign(gtk4::Align::Center)
         .build();
     select_done.add_css_class("flat");
@@ -556,16 +558,16 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // that would silently drop the kind the user picked.
     let favorites_btn = gtk4::ToggleButton::builder()
         .icon_name("starred-symbolic")
-        .tooltip_text("Show only favorites")
+        .tooltip_text(gettext("Show only favorites"))
         .build();
     favorites_btn.add_css_class("pill");
 
     // Date jump: "All dates" plus a row per month, filled in once the timeline's
     // months are known (see [`refresh_photo_months`]). Pushed to the far end of
     // the filter row, opposite the kind toggles.
-    let dates = gtk4::DropDown::from_strings(&["All dates"]);
+    let dates = gtk4::DropDown::from_strings(&[gettext("All dates").as_str()]);
     dates.add_css_class("pill");
-    dates.set_tooltip_text(Some("Jump to a month"));
+    dates.set_tooltip_text(Some(&gettext("Jump to a month")));
 
     // The kind toggles and the date jump travel together: they filter the
     // timeline, and neither applies to the album grid or to an open album.
@@ -583,10 +585,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // it sits above the filter row rather than beside the kind toggles.
     // "Timeline", not "Photos": the kind filter below has a Photos tab too.
     let photos_btn = gtk4::ToggleButton::builder()
-        .label("Timeline")
+        .label(gettext("Timeline"))
         .active(true)
         .build();
-    let albums_btn = gtk4::ToggleButton::builder().label("Albums").build();
+    let albums_btn = gtk4::ToggleButton::builder()
+        .label(gettext("Albums"))
+        .build();
     albums_btn.set_group(Some(&photos_btn));
     let view_switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     view_switch.add_css_class("linked");
@@ -634,7 +638,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     albums_stack.add_named(&albums_status, Some("status"));
     let new_album = gtk4::Button::builder()
         .icon_name("list-add-symbolic")
-        .label("New Album…")
+        .label(gettext("New Album…"))
         .halign(gtk4::Align::Start)
         .action_name("win.new-album")
         .build();
@@ -651,8 +655,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     content.add_named(&albums_page, Some("albums"));
 
     let import_banner = adw::Banner::builder()
-        .title("Importing from Google Photos…")
-        .button_label("View")
+        .title(gettext("Importing from Google Photos…"))
+        .button_label(pgettext("verb", "View"))
         .action_name("win.show-import")
         .build();
 
@@ -668,7 +672,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     body.append(&import_banner);
     body.append(&inner);
-    let (frame, header, title) = page_frame("Photos", &body);
+    let (frame, header, title) = page_frame(&gettext("Photos"), &body);
     header.pack_start(&back);
     header.pack_start(&upload);
     header.pack_end(&refresh);
@@ -736,21 +740,16 @@ pub(crate) fn month_range(year: i32, month: i32) -> Option<(i64, i64)> {
     Some((start.to_unix(), end.to_unix()))
 }
 
-/// English month names, indexed 1..=12.
-pub(crate) const MONTH_NAMES: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
+/// "June 2024": a calendar month in the user's language, for the date jump
+/// and the scrubber. The month name comes from glib, so it follows the locale.
+pub(crate) fn month_label(year: i32, month: i32) -> String {
+    // Translators: strftime format for a month on its own, such as "June 2024". %OB is the month name in its standalone (nominative) form; use %B if your language has no separate form.
+    let format = gettext("%OB %Y");
+    glib::DateTime::from_local(year, month, 1, 0, 0, 0.0)
+        .and_then(|date| date.format(&format))
+        .map(|label| label.to_string())
+        .unwrap_or_else(|_| format!("{year}-{month:02}"))
+}
 
 /// Rebuild the date-jump dropdown for the active kind: ask the daemon which
 /// months the timeline spans and turn them into "Month YYYY (count)" rows, each
@@ -769,15 +768,15 @@ pub(crate) fn refresh_photo_months(ui: &Rc<Ui>) {
         let Ok(Ok(Response::PhotoMonths { months })) = rx.recv().await else {
             return;
         };
-        let mut labels = vec!["All dates".to_string()];
+        let mut labels = vec![gettext("All dates")];
         let mut ranges: Vec<Option<(i64, i64)>> = vec![None];
         fill_scrubber(&ui, &months);
         for m in months {
-            let name = MONTH_NAMES
-                .get((m.month - 1) as usize)
-                .copied()
-                .unwrap_or("?");
-            labels.push(format!("{name} {} ({})", m.year, m.count));
+            let count = m.count.to_string();
+            let month = month_label(m.year, m.month);
+            // Translators: a row of the date jump; {month} is a month such as "June 2024", {count} how many photos it holds.
+            let label = gettext_f("{month} ({count})", &[("month", &month), ("count", &count)]);
+            labels.push(label);
             ranges.push(month_range(m.year, m.month));
         }
         let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
@@ -1079,11 +1078,11 @@ pub(crate) fn wire_gallery(
     let ui_upload = ui.clone();
     ui.gallery.upload.connect_clicked(move |_| {
         let dialog = gtk4::FileDialog::builder()
-            .title("Select Photo to Upload")
+            .title(gettext("Select Photo to Upload"))
             .build();
 
         let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Images"));
+        filter.set_name(Some(&gettext("Images")));
         filter.add_mime_type("image/*");
         let filters = gio::ListStore::new::<gtk4::FileFilter>();
         filters.append(&filter);
@@ -1139,16 +1138,21 @@ pub(crate) fn wire_gallery(
                         Ok(Ok(Response::Ok { message })) => {
                             tracing::info!("Photo uploaded: {message}");
                             load_gallery(&ui_clone, false);
-                            toast(&ui_clone, "Photo uploaded");
+                            toast(&ui_clone, &gettext("Photo uploaded"));
                         }
                         Ok(Ok(Response::Error { message, kind })) => {
-                            toast_failure(&ui_clone, "Couldn't upload photo", &message, kind);
+                            toast_failure(
+                                &ui_clone,
+                                &gettext("Couldn't upload photo"),
+                                &message,
+                                kind,
+                            );
                         }
                         _ => {
                             toast_error(
                                 &ui_clone,
-                                "Couldn't upload photo",
-                                "The mount service didn't respond.",
+                                &gettext("Couldn't upload photo"),
+                                &gettext("The mount service didn't respond."),
                             );
                         }
                     }
@@ -1361,7 +1365,8 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     if tile.photo.has_raw || tile.photo.group_size > 1 {
         let badge = gtk4::Label::builder()
             .label(if tile.photo.has_raw {
-                "RAW".to_string()
+                // Translators: badge on a photo tile whose shot includes a raw camera file.
+                gettext("RAW")
             } else {
                 format!("{}", tile.photo.group_size)
             })
@@ -1491,9 +1496,9 @@ fn toggle_selected(ui: &Rc<Ui>, uid: &str) {
 fn sync_selection_bar(ui: &Rc<Ui>) {
     let count = ui.gallery.selected.borrow().len();
     ui.gallery.select_label.set_label(&match count {
-        0 => "Select photos".to_string(),
-        1 => "1 selected".to_string(),
-        n => format!("{n} selected"),
+        0 => gettext("Select photos"),
+        // Translators: {n} is how many items are selected: files and folders in My Files, photos here.
+        n => ngettext_f("{n} selected", "{n} selected", n as u64, &[]),
     });
     ui.gallery.select_trash.set_sensitive(count > 0);
     ui.gallery.select_album.set_sensitive(count > 0);
@@ -1535,17 +1540,33 @@ pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
     // find out from the trash.
     let files = selected_file_count(ui, &uids);
     let body = match (uids.len(), files) {
-        (1, 1) => "Move this photo to Trash?".to_string(),
-        (1, files) => format!("Move this photo to Trash? It is stored as {files} files."),
-        (n, files) if files == n => format!("Move {n} photos to Trash?"),
-        (n, files) => format!("Move {n} photos to Trash? They are stored as {files} files."),
+        (1, 1) => gettext("Move this photo to Trash?"),
+        (1, files) => ngettext_f(
+            "Move this photo to Trash? It is stored as {n} file.",
+            "Move this photo to Trash? It is stored as {n} files.",
+            files as u64,
+            &[],
+        ),
+        (n, files) if files == n => ngettext_f(
+            "Move {n} photo to Trash?",
+            "Move {n} photos to Trash?",
+            n as u64,
+            &[],
+        ),
+        // Translators: {n} is how many photos are selected, {files} how many files they are stored as (always more than {n}).
+        (n, files) => ngettext_f(
+            "Move {n} photo to Trash? They are stored as {files} files.",
+            "Move {n} photos to Trash? They are stored as {files} files.",
+            n as u64,
+            &[("files", &files.to_string())],
+        ),
     };
     let dialog = adw::AlertDialog::builder()
-        .heading("Move to Trash")
+        .heading(gettext("Move to Trash"))
         .body(body)
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("trash", "Move to Trash");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("trash", &gettext("Move to Trash"));
     dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -1592,32 +1613,38 @@ pub(crate) fn trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
                     let message = failed
                         .first()
                         .map(|f| f.message.clone())
-                        .unwrap_or_else(|| "The server refused.".to_string());
-                    toast_error(&ui, "Some photos couldn't be moved to Trash", &message);
+                        .unwrap_or_else(|| gettext("The server refused."));
+                    toast_error(
+                        &ui,
+                        &gettext("Some photos couldn't be moved to Trash"),
+                        &message,
+                    );
                 }
                 if trashed.is_empty() {
                     return;
                 }
                 let count = trashed.len();
-                let message = match count {
-                    1 => "Moved 1 photo to Trash".to_string(),
-                    n => format!("Moved {n} photos to Trash"),
-                };
-                toast_action(&ui, &message, "Undo", move |ui| {
+                let message = ngettext_f(
+                    "Moved {n} photo to Trash",
+                    "Moved {n} photos to Trash",
+                    count as u64,
+                    &[],
+                );
+                toast_action(&ui, &message, &gettext("Undo"), move |ui| {
                     restore_uids(ui, trashed.clone(), count);
                     load_gallery(ui, false);
                 });
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 restore_photos(&ui, removed.clone());
-                toast_failure(&ui, "Couldn't move to Trash", &message, kind);
+                toast_failure(&ui, &gettext("Couldn't move to Trash"), &message, kind);
             }
             _ => {
                 restore_photos(&ui, removed.clone());
                 toast_error(
                     &ui,
-                    "Couldn't move to Trash",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't move to Trash"),
+                    &gettext("The mount service didn't respond."),
                 );
             }
         }
@@ -2133,7 +2160,7 @@ pub(crate) fn group_photos(model: &gio::ListStore) -> Vec<PhotoGroup> {
 /// Section heading for a capture time: "Today", "Yesterday", or the local date.
 pub(crate) fn day_heading(secs: i64) -> String {
     let Ok(date) = glib::DateTime::from_unix_local(secs) else {
-        return "Unknown date".into();
+        return gettext("Unknown date");
     };
     let same_day = |other: &glib::DateTime| {
         other.year() == date.year()
@@ -2142,17 +2169,19 @@ pub(crate) fn day_heading(secs: i64) -> String {
     };
     if let Ok(now) = glib::DateTime::now_local() {
         if same_day(&now) {
-            return "Today".into();
+            return gettext("Today");
         }
         if let Ok(yesterday) = glib::DateTime::from_unix_local(now.to_unix() - 86_400)
             && same_day(&yesterday)
         {
-            return "Yesterday".into();
+            return gettext("Yesterday");
         }
     }
-    date.format("%-d %B %Y")
+    // Translators: strftime format for a day heading in the photo timeline, such as "3 June 2026".
+    let format = gettext("%-d %B %Y");
+    date.format(&format)
         .map(|s| s.to_string())
-        .unwrap_or_else(|_| "Unknown date".into())
+        .unwrap_or_else(|_| gettext("Unknown date"))
 }
 
 pub(crate) fn find_photo_index(model: &gio::ListStore, uid: &str) -> Option<u32> {
@@ -2169,20 +2198,24 @@ pub(crate) fn find_photo_index(model: &gio::ListStore, uid: &str) -> Option<u32>
 
 pub(crate) fn format_capture_time(secs: i64) -> String {
     let date = glib::DateTime::from_unix_local(secs);
+    // Translators: strftime format for a photo's capture date and time, such as "2026-06-03 14:05:09".
+    let format = gettext("%Y-%m-%d %H:%M:%S");
     match date {
-        Ok(d) => match d.format("%Y-%m-%d %H:%M:%S") {
+        Ok(d) => match d.format(&format) {
             Ok(s) => s.to_string(),
-            Err(_) => "Unknown Date".to_string(),
+            Err(_) => gettext("Unknown Date"),
         },
-        Err(_) => "Unknown Date".to_string(),
+        Err(_) => gettext("Unknown Date"),
     }
 }
 
 /// The capture time as a tile caption: the clock time alone, since the day is
 /// already the section heading right above it.
 pub(crate) fn short_capture_time(secs: i64) -> String {
+    // Translators: strftime format for the time a photo was taken, shown on its tile, such as "14:05".
+    let format = gettext("%H:%M");
     glib::DateTime::from_unix_local(secs)
-        .and_then(|d| d.format("%H:%M"))
+        .and_then(|d| d.format(&format))
         .map(|s| s.to_string())
         .unwrap_or_default()
 }
@@ -2257,13 +2290,9 @@ pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
 
 /// "March 2024" for the scrubber's month `index`.
 fn scrubber_label(months: &[PhotoMonth], index: usize) -> String {
-    months.get(index).map_or_else(String::new, |m| {
-        let name = MONTH_NAMES
-            .get((m.month - 1) as usize)
-            .copied()
-            .unwrap_or("?");
-        format!("{name} {}", m.year)
-    })
+    months
+        .get(index)
+        .map_or_else(String::new, |m| month_label(m.year, m.month))
 }
 
 /// Move the knob to the month at the top of the timeline, unless the user is
@@ -2443,35 +2472,37 @@ fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64
     let mut menu = ActionMenu::new();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     let label = if photo.kind == PhotoKind::Video {
-        "Play"
+        pgettext("verb", "Play")
     } else {
-        "Open"
+        pgettext("verb", "Open")
     };
-    menu.item(label, move || open_photo_viewer(&ui_c, uid.clone()));
+    menu.item(&label, move || open_photo_viewer(&ui_c, uid.clone()));
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    menu.toggle("Favorite", photo.favorite, move |favorite| {
+    // Translators: a check item in a photo's menu, on while the photo is a favorite.
+    let favorite_label = pgettext("state", "Favorite");
+    menu.toggle(&favorite_label, photo.favorite, move |favorite| {
         set_photo_favorite(&ui_c, uid.clone(), favorite)
     });
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    menu.item("Select", move || {
+    menu.item(&pgettext("verb", "Select"), move || {
         set_selection_mode(&ui_c, true);
         toggle_selected(&ui_c, &uid);
     });
     menu.section();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    menu.item("Add to Album…", move || {
+    menu.item(&gettext("Add to Album…"), move || {
         prompt_add_to_album(&ui_c, vec![uid.clone()])
     });
     let open_album = ui.gallery.album.borrow().clone();
     if let Some(album) = open_album.filter(|album| !album.shared) {
         let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-        menu.item("Remove from Album", move || {
+        menu.item(&gettext("Remove from Album"), move || {
             remove_from_album(&ui_c, &album, vec![uid.clone()])
         });
     }
     menu.section();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    menu.item("Move to Trash…", move || {
+    menu.item(&gettext("Move to Trash…"), move || {
         confirm_trash_photos(&ui_c, vec![uid.clone()])
     });
     menu.popup_at(anchor, x, y);
@@ -2494,20 +2525,20 @@ fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
                 repaint_gallery(&ui);
                 toast(
                     &ui,
-                    if favorite {
-                        "Added to Favorites"
+                    &if favorite {
+                        gettext("Added to Favorites")
                     } else {
-                        "Removed from Favorites"
+                        gettext("Removed from Favorites")
                     },
                 );
             }
             Ok(Ok(Response::Error { message, .. })) => {
-                toast_error(&ui, "Couldn't change the favorite", &message)
+                toast_error(&ui, &gettext("Couldn't change the favorite"), &message)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't change the favorite",
-                "The mount service didn't respond.",
+                &gettext("Couldn't change the favorite"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -2526,8 +2557,8 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         gallery_status(
             ui,
             "image-x-generic-symbolic",
-            "Loading photos…",
-            "Reading your Proton Drive timeline.",
+            &gettext("Loading photos…"),
+            &gettext("Reading your Proton Drive timeline."),
             false,
         );
         // Rebuild the date jump for the current kind, but only for a full-span
@@ -2584,8 +2615,8 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                     gallery_status(
                         &ui,
                         "image-missing-symbolic",
-                        "No photo library",
-                        "This Proton account doesn't have Photos enabled.",
+                        &gettext("No photo library"),
+                        &gettext("This Proton account doesn't have Photos enabled."),
                         false,
                     );
                     return;
@@ -2614,8 +2645,8 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         || ui.gallery.range.get().is_some();
                     let (title, description) = if ui.gallery.album.borrow().is_some() {
                         (
-                            "Empty album".to_string(),
-                            "This album has no photos in it.".to_string(),
+                            gettext("Empty album"),
+                            gettext("This album has no photos in it."),
                         )
                     } else {
                         let month = ui
@@ -2656,26 +2687,26 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
             // A failed *next* page keeps the photos already on screen — the failure
             // goes to a toast rather than wiping the timeline for a status page.
             Ok(Ok(Response::Error { message, .. })) if append => {
-                toast_error(&ui, "Couldn't load more photos", &message)
+                toast_error(&ui, &gettext("Couldn't load more photos"), &message)
             }
             Ok(Ok(Response::Error { message, .. })) => gallery_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't load photos",
+                &gettext("Couldn't load photos"),
                 &message,
                 false,
             ),
             Ok(Ok(_)) => gallery_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't load photos",
-                "Unexpected reply from the mount service.",
+                &gettext("Couldn't load photos"),
+                &gettext("Unexpected reply from the mount service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) if append => toast_error(
                 &ui,
-                "Couldn't load more photos",
-                "The mount service didn't respond.",
+                &gettext("Couldn't load more photos"),
+                &gettext("The mount service didn't respond."),
             ),
             Ok(Err(_)) | Err(_) => gallery_unreachable(&ui),
         }
@@ -2703,8 +2734,8 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
         gallery_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -2712,8 +2743,8 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
     gallery_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();

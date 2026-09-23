@@ -70,8 +70,11 @@ fn save_staged(ui: &Rc<Ui>) {
     }
 }
 
-const EMPTY_LIST_DESCRIPTION: &str = "Photos already in Proton Photos are matched by name and content and skipped, so \
-     re-running an interrupted import is safe.";
+fn empty_list_description() -> String {
+    gettext(
+        "Photos already in Proton Photos are matched by name and content and skipped, so re-running an interrupted import is safe.",
+    )
+}
 
 pub(crate) struct TakeoutState {
     /// Archives staged for this import, in the order they were added. Sent as
@@ -130,13 +133,15 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     // there and has no sidebar row of its own to navigate back with.
     let back_button = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to Photos")
+        .tooltip_text(gettext("Back to Photos"))
         .valign(gtk4::Align::Center)
         .build();
     back_button.add_css_class("flat");
 
     let subtitle = gtk4::Label::builder()
-        .label("Add a Google Takeout export to your Proton Photos timeline.")
+        .label(gettext(
+            "Add a Google Takeout export to your Proton Photos timeline.",
+        ))
         .halign(gtk4::Align::Start)
         .wrap(true)
         .xalign(0.0)
@@ -152,18 +157,18 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     drop_icon.set_pixel_size(48);
     drop_icon.add_css_class("dim-label");
     let drop_title = gtk4::Label::builder()
-        .label("Drop your Takeout .zip files here")
+        .label(gettext("Drop your Takeout .zip files here"))
         .build();
     drop_title.add_css_class("title-4");
     let drop_hint = gtk4::Label::builder()
-        .label("Add every part of the export at once — a photo and its metadata often sit in different parts.")
+        .label(gettext("Add every part of the export at once — a photo and its metadata often sit in different parts."))
         .wrap(true)
         .justify(gtk4::Justification::Center)
         .max_width_chars(48)
         .build();
     drop_hint.add_css_class("dim-label");
     let choose_button = gtk4::Button::builder()
-        .label("Choose files…")
+        .label(gettext("Choose files…"))
         .halign(gtk4::Align::Center)
         .build();
     choose_button.add_css_class("pill");
@@ -181,13 +186,13 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     // group carries a placeholder row while empty so it never renders as a bare
     // title.
     let list_group = adw::PreferencesGroup::builder()
-        .title("Archives to import")
-        .description(EMPTY_LIST_DESCRIPTION)
+        .title(gettext("Archives to import"))
+        .description(empty_list_description())
         .build();
 
     let clear_button = gtk4::Button::builder()
-        .label("Clear")
-        .tooltip_text("Remove every staged archive")
+        .label(gettext("Clear"))
+        .tooltip_text(gettext("Remove every staged archive"))
         .build();
     clear_button.add_css_class("flat");
 
@@ -195,16 +200,22 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     // what an import *would* do, without uploading a byte. It is offered first
     // because the import behind it is hours long and hard to take back.
     let scan_button = gtk4::Button::builder()
-        .label("Scan")
-        .tooltip_text("Check the archives and report what would be imported, without uploading")
+        .label(pgettext("verb", "Scan"))
+        .tooltip_text(gettext(
+            "Check the archives and report what would be imported, without uploading",
+        ))
         .build();
     scan_button.add_css_class("pill");
-    let import_button = gtk4::Button::builder().label("Import").build();
+    let import_button = gtk4::Button::builder()
+        .label(pgettext("verb", "Import"))
+        .build();
     import_button.add_css_class("pill");
     import_button.add_css_class("suggested-action");
     let cancel_button = gtk4::Button::builder()
-        .label("Stop import")
-        .tooltip_text("Finish the photo on the wire, file what was uploaded, then stop")
+        .label(gettext("Stop import"))
+        .tooltip_text(gettext(
+            "Finish the photo on the wire, file what was uploaded, then stop",
+        ))
         .build();
     cancel_button.add_css_class("pill");
     cancel_button.add_css_class("destructive-action");
@@ -224,7 +235,7 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     // Progress: the import's job from the transfer snapshot, so this page shows
     // the same numbers the Sync page's Transfers list does.
     let progress_group = adw::PreferencesGroup::builder()
-        .title("Import in progress")
+        .title(gettext("Import in progress"))
         .visible(false)
         .build();
     let progress_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -246,7 +257,7 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     // outlives the window being on this page, and "what happened" is the whole
     // reason to come back to it.
     let summary_group = adw::PreferencesGroup::builder()
-        .title("Last import")
+        .title(gettext("Last import"))
         .visible(false)
         .build();
 
@@ -273,7 +284,7 @@ pub(crate) fn build_takeout_page() -> (gtk4::Widget, TakeoutWidgets) {
     page.set_margin_end(18);
     page.append(&subtitle_clamp);
     page.append(&scroll);
-    let (frame, header, _) = page_frame("Import from Google Photos", &page);
+    let (frame, header, _) = page_frame(&gettext("Import from Google Photos"), &page);
     header.pack_start(&back_button);
 
     let widgets = TakeoutWidgets {
@@ -330,10 +341,10 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
     widgets.choose_button.connect_clicked(move |_| {
         // Multi-select on purpose: the whole export goes in one request.
         let dialog = gtk4::FileDialog::builder()
-            .title("Select your Google Takeout archives")
+            .title(gettext("Select your Google Takeout archives"))
             .build();
         let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Takeout archives"));
+        filter.set_name(Some(&gettext("Takeout archives")));
         filter.add_pattern("*.zip");
         let filters = gio::ListStore::new::<gtk4::FileFilter>();
         filters.append(&filter);
@@ -373,16 +384,16 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
         let count = ui_import.takeout.archives.borrow().len();
         let ui = ui_import.clone();
         let dialog = adw::AlertDialog::builder()
-            .heading("Import this export?")
-            .body(format!(
-                "{} will be uploaded to Proton Photos, creating albums as they appear in \
-                 the export. This can take hours; you can stop it at any point and what has \
-                 been uploaded stays. Photos you already have are skipped.",
-                count_noun(count, "archive", "archives")
+            .heading(gettext("Import this export?"))
+            .body(ngettext_f(
+                "{n} archive will be uploaded to Proton Photos, creating albums as they appear in the export. This can take hours; you can stop it at any point and what has been uploaded stays. Photos you already have are skipped.",
+                "{n} archives will be uploaded to Proton Photos, creating albums as they appear in the export. This can take hours; you can stop it at any point and what has been uploaded stays. Photos you already have are skipped.",
+                count as u64,
+                &[],
             ))
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("import", "Import");
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("import", &pgettext("verb", "Import"));
         dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -403,14 +414,14 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
             let result = rx.recv().await;
             ui.busy_end();
             match result {
-                Ok(Ok(Response::Ok { .. })) => toast(&ui, "Stopping the import…"),
+                Ok(Ok(Response::Ok { .. })) => toast(&ui, &gettext("Stopping the import…")),
                 Ok(Ok(Response::Error { message, kind })) => {
-                    toast_failure(&ui, "Couldn't stop the import", &message, kind);
+                    toast_failure(&ui, &gettext("Couldn't stop the import"), &message, kind);
                 }
                 _ => toast_error(
                     &ui,
-                    "Couldn't stop the import",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't stop the import"),
+                    &gettext("The mount service didn't respond."),
                 ),
             }
         });
@@ -460,12 +471,14 @@ pub(crate) fn add_archives(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
     if rejected > 0 {
         toast(
             ui,
-            "Only Takeout .zip files can be imported — extracted folders aren't supported.",
+            &gettext(
+                "Only Takeout .zip files can be imported — extracted folders aren't supported.",
+            ),
         );
     } else if added > 0 {
         toast(
             ui,
-            &format!("Added {}", count_noun(added, "archive", "archives")),
+            &ngettext_f("Added {n} archive", "Added {n} archives", added as u64, &[]),
         );
     }
 }
@@ -481,8 +494,8 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
     if staged.is_empty() {
         ui.takeout
             .list_group
-            .set_description(Some(EMPTY_LIST_DESCRIPTION));
-        let row = dim_row("No archives added yet.");
+            .set_description(Some(&empty_list_description()));
+        let row = dim_row(&gettext("No archives added yet."));
         ui.takeout.list_group.add(&row);
         rows.push(row.upcast());
     } else {
@@ -500,7 +513,7 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
                 .build();
             let remove = gtk4::Button::builder()
                 .icon_name("edit-delete-symbolic")
-                .tooltip_text("Remove from this import")
+                .tooltip_text(gettext("Remove from this import"))
                 .valign(gtk4::Align::Center)
                 .build();
             remove.add_css_class("flat");
@@ -518,10 +531,14 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
             ui.takeout.list_group.add(&row);
             rows.push(row.upcast());
         }
-        ui.takeout.list_group.set_description(Some(&format!(
-            "{}, {} in total. {EMPTY_LIST_DESCRIPTION}",
-            count_noun(staged.len(), "archive", "archives"),
-            human_bytes(total)
+        let size = human_bytes(total);
+        let note = empty_list_description();
+        // Translators: {size} is a file size such as "4.2 MB"; {note} is the sentence about skipped duplicates.
+        ui.takeout.list_group.set_description(Some(&ngettext_f(
+            "{n} archive, {size} in total. {note}",
+            "{n} archives, {size} in total. {note}",
+            staged.len() as u64,
+            &[("size", &size), ("note", &note)],
         )));
     }
     *ui.takeout.rows.borrow_mut() = rows;
@@ -575,28 +592,28 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
                 ui.takeout.summary_group.set_visible(false);
                 ui.takeout.progress_group.set_visible(true);
                 ui.takeout.progress_bar.set_fraction(0.0);
-                ui.takeout.progress_label.set_text(if dry_run {
-                    "Reading archives…"
+                ui.takeout.progress_label.set_text(&if dry_run {
+                    gettext("Reading archives…")
                 } else {
-                    "Starting import…"
+                    gettext("Starting import…")
                 });
                 sync_takeout_actions(&ui);
                 toast(
                     &ui,
-                    if dry_run {
-                        "Scanning the export…"
+                    &if dry_run {
+                        gettext("Scanning the export…")
                     } else {
-                        "Import started — you can leave this page, it keeps running."
+                        gettext("Import started — you can leave this page, it keeps running.")
                     },
                 );
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't start the import", &message, kind);
+                toast_failure(&ui, &gettext("Couldn't start the import"), &message, kind);
             }
             _ => toast_error(
                 &ui,
-                "Couldn't start the import",
-                "The mount service didn't respond.",
+                &gettext("Couldn't start the import"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -629,23 +646,35 @@ pub(crate) fn refresh_takeout(ui: &Rc<Ui>) {
             if was_running {
                 let dry = ui.takeout.dry_run.get();
                 let headline = if dry {
-                    "Scan finished"
+                    gettext("Scan finished")
                 } else {
-                    "Import finished"
+                    gettext("Import finished")
                 };
-                toast(&ui, headline);
+                toast(&ui, &headline);
                 if !dry {
                     let body = match &summary {
-                        Some(s) if s.failed > 0 => {
-                            format!("{} photos added, {} failed.", s.uploaded, s.failed)
-                        }
-                        Some(s) if s.cancelled => {
-                            format!("Stopped after {} photos.", s.uploaded)
-                        }
-                        Some(s) => format!("{} photos added to Proton Photos.", s.uploaded),
-                        None => "The Google Photos import has finished.".to_string(),
+                        // Translators: {n} is the number of photos uploaded, {failed} the number that failed.
+                        Some(s) if s.failed > 0 => ngettext_f(
+                            "{n} photo added, {failed} failed.",
+                            "{n} photos added, {failed} failed.",
+                            s.uploaded as u64,
+                            &[("failed", &s.failed.to_string())],
+                        ),
+                        Some(s) if s.cancelled => ngettext_f(
+                            "Stopped after {n} photo.",
+                            "Stopped after {n} photos.",
+                            s.uploaded as u64,
+                            &[],
+                        ),
+                        Some(s) => ngettext_f(
+                            "{n} photo added to Proton Photos.",
+                            "{n} photos added to Proton Photos.",
+                            s.uploaded as u64,
+                            &[],
+                        ),
+                        None => gettext("The Google Photos import has finished."),
                     };
-                    notify("takeout-import", headline, &body);
+                    notify("takeout-import", &headline, &body);
                 }
             }
         }
@@ -665,69 +694,72 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
         ui.takeout.summary_group.remove(&row);
     }
     let dry = ui.takeout.dry_run.get();
-    ui.takeout
-        .summary_group
-        .set_title(if dry { "Scan result" } else { "Last import" });
-    ui.takeout.summary_group.set_description(Some(if dry {
-        "Nothing was uploaded — this is what an import would do."
-    } else if summary.cancelled {
-        "Stopped early. Everything uploaded so far is in your timeline; run it again to \
-         continue where it left off."
+    ui.takeout.summary_group.set_title(&if dry {
+        gettext("Scan result")
     } else {
-        "Finished."
+        gettext("Last import")
+    });
+    ui.takeout.summary_group.set_description(Some(&if dry {
+        gettext("Nothing was uploaded — this is what an import would do.")
+    } else if summary.cancelled {
+        gettext("Stopped early. Everything uploaded so far is in your timeline; run it again to continue where it left off.")
+    } else {
+        gettext("Finished.")
     }));
 
     // Only lines that carry information: a run with no failures should not have
     // to show a "0 failed" row for the user to read past.
     let mut lines: Vec<(String, String)> = vec![
-        ("Photos in the export".into(), summary.found.to_string()),
+        (gettext("Photos in the export"), summary.found.to_string()),
         (
-            if dry { "Would upload" } else { "Uploaded" }.into(),
+            if dry {
+                gettext("Would upload")
+            } else {
+                gettext("Uploaded")
+            },
             summary.uploaded.to_string(),
         ),
     ];
     if summary.duplicates > 0 {
         lines.push((
-            "Already in Proton Photos".into(),
+            gettext("Already in Proton Photos"),
             summary.duplicates.to_string(),
         ));
     }
     if summary.albums_created > 0 {
         lines.push((
             if dry {
-                "Albums to create"
+                gettext("Albums to create")
             } else {
-                "Albums created"
-            }
-            .into(),
+                gettext("Albums created")
+            },
             summary.albums_created.to_string(),
         ));
     }
     if summary.album_links > 0 {
         lines.push((
-            "Photos filed into albums".into(),
+            gettext("Photos filed into albums"),
             summary.album_links.to_string(),
         ));
     }
     if summary.skipped_trashed > 0 {
         lines.push((
-            "Skipped (in Google's trash)".into(),
+            gettext("Skipped (in Google's trash)"),
             summary.skipped_trashed.to_string(),
         ));
     }
     if summary.bytes > 0 {
         lines.push((
             if dry {
-                "Data to upload"
+                gettext("Data to upload")
             } else {
-                "Data uploaded"
-            }
-            .into(),
+                gettext("Data uploaded")
+            },
             human_bytes(summary.bytes),
         ));
     }
     if summary.failed > 0 {
-        lines.push(("Failed".into(), summary.failed.to_string()));
+        lines.push((pgettext("state", "Failed"), summary.failed.to_string()));
     }
 
     let mut rows = Vec::new();
@@ -756,17 +788,22 @@ pub(crate) fn takeout_progress(ui: &Rc<Ui>, jobs: &[JobItem]) {
         ui.takeout
             .progress_bar
             .set_fraction((job.done as f64 / job.total as f64).min(1.0));
-        ui.takeout
-            .progress_label
-            .set_text(&format!("{} of {} — {}", job.done, job.total, job.detail));
+        let done = job.done.to_string();
+        let total = job.total.to_string();
+        // Translators: progress such as "120 of 4000 — IMG_0001.jpg"; {detail} is what is being worked on.
+        let text = gettext_f(
+            "{done} of {total} — {detail}",
+            &[("done", &done), ("total", &total), ("detail", &job.detail)],
+        );
+        ui.takeout.progress_label.set_text(&text);
     } else {
         ui.takeout.progress_bar.pulse();
         ui.takeout
             .progress_label
-            .set_text(if job.detail.is_empty() {
-                "Working…"
+            .set_text(&if job.detail.is_empty() {
+                gettext("Working…")
             } else {
-                &job.detail
+                job.detail.clone()
             });
     }
 }

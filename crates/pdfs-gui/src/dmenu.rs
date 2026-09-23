@@ -16,8 +16,8 @@ use pdfs_core::config::AppDirs;
 use pdfs_core::menu::{self, MenuChoice, MenuItem, PromptConfig};
 use pdfs_core::opener::OpenWith;
 
-use crate::Hit;
 use crate::query;
+use crate::{Hit, gettext, gettext_f};
 
 /// Guard against a launcher that keeps handing back text we cannot satisfy —
 /// without it a scripted (non-interactive) menu could spin forever.
@@ -90,8 +90,10 @@ pub(crate) fn run(options: Options) -> Result<(), String> {
 /// shows which round you are in.
 fn title(query: Option<&str>) -> String {
     match query {
-        Some(text) => format!("Drive: {text} › "),
-        None => "Search Drive › ".to_string(),
+        // Translators: the launcher prompt while refining a search; {query} is the text searched for. Keep the trailing space.
+        Some(text) => gettext_f("Drive: {query} › ", &[("query", text)]),
+        // Translators: the launcher prompt; keep the trailing space, the input follows it directly.
+        None => gettext("Search Drive › "),
     }
 }
 
@@ -107,8 +109,10 @@ fn title(query: Option<&str>) -> String {
 /// wording is parenthesised and avoids words that read like a filename query.
 fn placeholder(query: Option<&str>) -> String {
     match query {
-        Some(text) => format!("(no matches for “{text}”)"),
-        None => "(no pinned files — type to search)".to_string(),
+        // Translators: the only row of an empty launcher list; {query} is the text searched for. Keep the parentheses.
+        Some(text) => gettext_f("(no matches for “{query}”)", &[("query", text)]),
+        // Translators: the only row of an empty launcher list. Keep the parentheses, and avoid words that look like a file name.
+        None => gettext("(no pinned files — type to search)"),
     }
 }
 

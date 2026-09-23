@@ -55,7 +55,7 @@ pdfs-app            # the desktop app
 - [Prerequisites](#prerequisites) · [Building](#building-from-source) · [Packages](#installation--packages) · [Releases](#automated-releases-cicd)
 
 **Documentation:** [Architecture](docs/ARCHITECTURE.md) · [Testing](docs/TESTING.md) ·
-[Recovery](docs/RECOVERY.md) · [Development](docs/DEVELOPMENT.md) ·
+[Recovery](docs/RECOVERY.md) · [Development](docs/DEVELOPMENT.md) · [Translating](docs/TRANSLATING.md) ·
 [Known issues](docs/BUGS.md) · [Changelog](docs/CHANGELOG.md) ·
 [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
@@ -498,6 +498,10 @@ This project has a GitHub Actions CI workflow configured under `.github/workflow
 Bug reports, packaging fixes, and patches are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for
 the workflow and the quality gates CI enforces, and [SECURITY.md](SECURITY.md) for reporting a
 vulnerability privately.
+
+The app, tray and search prompt are available in English, German, Spanish, French, Italian, Dutch,
+Polish and Brazilian Portuguese. [docs/TRANSLATING.md](docs/TRANSLATING.md) explains how to improve
+a translation or add a language.
 
 ## License
 

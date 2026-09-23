@@ -56,13 +56,13 @@ impl ActivityFilter {
         ActivityFilter::Problems,
     ];
 
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            ActivityFilter::All => "All",
-            ActivityFilter::Transfers => "Transfers",
-            ActivityFilter::Changes => "Changes",
-            ActivityFilter::Sharing => "Sharing",
-            ActivityFilter::Problems => "Problems",
+            ActivityFilter::All => pgettext("activity filter", "All"),
+            ActivityFilter::Transfers => pgettext("activity filter", "Transfers"),
+            ActivityFilter::Changes => pgettext("activity filter", "Changes"),
+            ActivityFilter::Sharing => pgettext("activity filter", "Sharing"),
+            ActivityFilter::Problems => pgettext("activity filter", "Problems"),
         }
     }
 
@@ -95,7 +95,7 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     bar.set_halign(gtk4::Align::Start);
     let mut filters: Vec<(ActivityFilter, gtk4::ToggleButton)> = Vec::new();
     for filter in ActivityFilter::ALL {
-        let button = gtk4::ToggleButton::with_label(filter.label());
+        let button = gtk4::ToggleButton::with_label(&filter.label());
         if let Some((_, first)) = filters.first() {
             button.set_group(Some(first));
         } else {
@@ -106,7 +106,7 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     }
 
     let attention = adw::PreferencesGroup::builder()
-        .title("Needs attention")
+        .title(gettext("Needs attention"))
         .visible(false)
         .build();
     let days = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
@@ -131,7 +131,7 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
         .build();
 
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -150,7 +150,7 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     content.add_named(&scroll, Some("list"));
     content.add_named(&status, Some("status"));
 
-    let (frame, header, _) = page_frame("Activity", &content);
+    let (frame, header, _) = page_frame(&gettext("Activity"), &content);
     header.pack_end(&refresh);
 
     (
@@ -245,8 +245,8 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
     activity_status(
         ui,
         "document-open-recent-symbolic",
-        "Loading…",
-        "Reading recent activity.",
+        &gettext("Loading…"),
+        &gettext("Reading recent activity."),
         false,
     );
     ui.busy_begin();
@@ -264,15 +264,15 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
             Ok(Ok(Response::Error { message, .. })) => activity_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't read activity",
+                &gettext("Couldn't read activity"),
                 &message,
                 false,
             ),
             Ok(Ok(_)) => activity_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't read activity",
-                "Unexpected reply from the mount service.",
+                &gettext("Couldn't read activity"),
+                &gettext("Unexpected reply from the mount service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) => activity_unreachable(&ui),
@@ -286,8 +286,8 @@ pub(crate) fn activity_unreachable(ui: &Rc<Ui>) {
         activity_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -295,8 +295,8 @@ pub(crate) fn activity_unreachable(ui: &Rc<Ui>) {
     activity_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -416,19 +416,23 @@ pub(crate) fn collapse_feed(items: &[ActivityEntry]) -> Vec<FeedRow<'_>> {
 pub(crate) fn day_label(at: &glib::DateTime, now: &glib::DateTime) -> String {
     let today = now.ymd();
     if at.ymd() == today {
-        return "Today".to_string();
+        return gettext("Today");
     }
     if now.add_days(-1).is_ok_and(|y| y.ymd() == at.ymd()) {
-        return "Yesterday".to_string();
+        return gettext("Yesterday");
     }
     let format = if now.difference(at).as_seconds() < 6 * 86_400 {
-        "%A"
+        "%A".to_string()
     } else if at.year() == now.year() {
-        "%A, %B %-d"
+        // Translators: strftime format for a day heading in this year, such as "Wednesday, September 23".
+        gettext("%A, %B %-d")
     } else {
-        "%B %-d, %Y"
+        // Translators: strftime format for a day heading in an earlier year, such as "December 31, 2025".
+        gettext("%B %-d, %Y")
     };
-    at.format(format).map(|s| s.to_string()).unwrap_or_default()
+    at.format(&format)
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 /// Rebuild the page from the kept feed and conflict list, unless it already
@@ -447,8 +451,8 @@ pub(crate) fn paint_activity(ui: &Rc<Ui>) {
         activity_status(
             ui,
             "document-open-recent-symbolic",
-            "Nothing yet",
-            "Uploads, moves, shares and other changes appear here as they happen.",
+            &gettext("Nothing yet"),
+            &gettext("Uploads, moves, shares and other changes appear here as they happen."),
             false,
         );
         return;
@@ -461,12 +465,12 @@ pub(crate) fn paint_activity(ui: &Rc<Ui>) {
         state.attention.remove(&row);
     }
     state.attention.set_visible(!open.is_empty());
-    state.attention.set_description(Some(&match open.len() {
-        1 => "A file was changed in two places at once. Choose which version to keep.".to_string(),
-        n => {
-            format!("{n} files were changed in two places at once. Choose which versions to keep.")
-        }
-    }));
+    state.attention.set_description(Some(&ngettext_f(
+        "A file was changed in two places at once. Choose which version to keep.",
+        "{n} files were changed in two places at once. Choose which versions to keep.",
+        open.len() as u64,
+        &[],
+    )));
     let mut attention_rows = state.attention_rows.borrow_mut();
     for conflict in open {
         let row = conflict_row(ui, conflict);
@@ -485,8 +489,8 @@ pub(crate) fn paint_activity(ui: &Rc<Ui>) {
     if rows.is_empty() {
         let empty = adw::StatusPage::builder()
             .icon_name("edit-find-symbolic")
-            .title("No matching activity")
-            .description("Nothing in the recent log fits this filter.")
+            .title(gettext("No matching activity"))
+            .description(gettext("Nothing in the recent log fits this filter."))
             .build();
         empty.add_css_class("compact");
         state.days.append(&empty);
@@ -519,11 +523,7 @@ fn feed_row(
     open: &[ConflictInfo],
 ) -> adw::ActionRow {
     let a = row.entry;
-    let title = match a.kind {
-        // The target of an empty is a count, not a name to lead with a verb.
-        ActivityKind::EmptyTrash => format!("Emptied Trash ({})", a.target),
-        kind => format!("{} {}", activity_verb(kind), a.target),
-    };
+    let title = activity_title(a.kind, &a.target);
     // A logged conflict names the copy; it is still open while the daemon
     // still lists a copy by that name.
     let pending = (a.kind == ActivityKind::Conflict)
@@ -538,14 +538,17 @@ fn feed_row(
         subtitle.push(capitalize(&a.detail));
     }
     if row.count > 1 {
-        subtitle.push(format!(
-            "{} times since {}",
-            row.count,
-            activity_time(row.first)
+        let since = activity_time(row.first);
+        // Translators: {time} is a date and time such as "Sep 21, 14:05".
+        subtitle.push(ngettext_f(
+            "{n} time since {time}",
+            "{n} times since {time}",
+            row.count as u64,
+            &[("time", &since)],
         ));
     }
     if resolved {
-        subtitle.push("Resolved".to_string());
+        subtitle.push(pgettext("state", "Resolved"));
     }
     let widget = adw::ActionRow::builder()
         .title(title)
@@ -573,8 +576,10 @@ fn feed_row(
     }
     widget.add_prefix(&icon);
 
+    // Translators: strftime format for the time of day in the activity feed, such as "14:05".
+    let time_format = gettext("%H:%M");
     let time = gtk4::Label::new(Some(
-        &at.and_then(|at| at.format("%H:%M").ok())
+        &at.and_then(|at| at.format(&time_format).ok())
             .map(|s| s.to_string())
             .unwrap_or_default(),
     ));
@@ -587,7 +592,7 @@ fn feed_row(
 
     if let Some(conflict) = pending {
         let resolve = gtk4::Button::builder()
-            .label("Resolve…")
+            .label(gettext("Resolve…"))
             .valign(gtk4::Align::Center)
             .build();
         let ui = ui.clone();
@@ -598,23 +603,40 @@ fn feed_row(
     widget
 }
 
-/// A human verb for an activity kind, used as the row title's lead word.
-pub(crate) fn activity_verb(kind: ActivityKind) -> &'static str {
+/// The row title for an activity: what happened to `target`, as one sentence
+/// per kind so translators can place the name where their language needs it.
+pub(crate) fn activity_title(kind: ActivityKind, target: &str) -> String {
+    let args = [("name", target)];
     match kind {
-        ActivityKind::Upload => "Uploaded",
-        ActivityKind::Download => "Downloaded",
-        ActivityKind::Sync => "Synced",
-        ActivityKind::Rename => "Renamed",
-        ActivityKind::Move => "Moved",
-        ActivityKind::CreateFolder => "Created folder",
-        ActivityKind::Trash => "Trashed",
-        ActivityKind::Restore => "Restored",
-        ActivityKind::DeleteForever => "Deleted",
-        ActivityKind::EmptyTrash => "Emptied Trash",
-        ActivityKind::Share => "Shared",
-        ActivityKind::PublicLink => "Created a link to",
-        ActivityKind::Unshare => "Unshared",
-        ActivityKind::Conflict => "Conflict",
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Upload => gettext_f("Uploaded {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Download => gettext_f("Downloaded {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Sync => gettext_f("Synced {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Rename => gettext_f("Renamed {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Move => gettext_f("Moved {name}", &args),
+        // Translators: {name} is a folder name.
+        ActivityKind::CreateFolder => gettext_f("Created folder {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Trash => gettext_f("Trashed {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Restore => gettext_f("Restored {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::DeleteForever => gettext_f("Deleted {name}", &args),
+        // The target of an empty is a count, not a name to lead with a verb.
+        // Translators: {count} is the number of items removed from the Trash.
+        ActivityKind::EmptyTrash => gettext_f("Emptied Trash ({count})", &[("count", target)]),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Share => gettext_f("Shared {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::PublicLink => gettext_f("Created a link to {name}", &args),
+        // Translators: {name} is a file or folder name.
+        ActivityKind::Unshare => gettext_f("Unshared {name}", &args),
+        // Translators: {name} is the name of the conflict copy.
+        ActivityKind::Conflict => gettext_f("Conflict {name}", &args),
     }
 }
 
@@ -639,7 +661,8 @@ pub(crate) fn activity_icon(kind: ActivityKind) -> &'static str {
 /// Format an epoch-seconds timestamp for the Activity feed, in local time.
 pub(crate) fn activity_time(secs: i64) -> String {
     glib::DateTime::from_unix_local(secs)
-        .and_then(|dt| dt.format("%b %-d, %H:%M"))
+        // Translators: strftime format for a date and time in the activity feed, such as "Sep 23, 14:05".
+        .and_then(|dt| dt.format(&gettext("%b %-d, %H:%M")))
         .map(|s| s.to_string())
         .unwrap_or_default()
 }

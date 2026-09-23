@@ -14,6 +14,31 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 Schema: **31** (unchanged).
 
 ### Added
+- **Translations.** The desktop app, the tray and the search prompt are translated into German,
+  British English, Spanish, French, Italian, Dutch, Polish and Brazilian Portuguese, and follow the
+  system language. Counts use each language's plural rules, and dates use its own formats. The
+  desktop files carry translated descriptions and search keywords. The `pdfs` CLI and messages
+  from the daemon stay in English. [docs/TRANSLATING.md](TRANSLATING.md) describes how to improve a
+  translation or add a language. A few labels on the Photos page (the filter tabs, the gallery
+  subtitle and the empty timeline) are still in English.
+- **Language preference.** Preferences → General → Appearance → Language overrides the system
+  language for the app, the tray and the prompt, from their next start.
+
+### Changed
+- **Packages install translations.** The Arch, AUR, Debian and Fedora packages install the compiled
+  catalogs under `/usr/share/locale`, and the release tarball carries them in `locale/`. Building
+  the source packages now needs `gettext`.
+
+## [2.0.0] — 2026-09-23
+
+A redesign of the desktop app: a new shell with a Preferences dialog, keyboard-driven context
+menus, a docked details pane, a rewritten photo viewer with infinite scroll, album management,
+stop sharing and link expiry, a redesigned Shared with Me page, per-device restore, a tray that
+shows the sync state, and a new app icon.
+
+Schema: **31** (unchanged).
+
+### Added
 - **Pause and resume sync.** The Sync page, the tray and `pdfs sync pause [--for 1h]` /
   `pdfs sync resume` hold back queued uploads and mirror-folder reconciles. Reads through the mount
   keep working, writes keep being accepted and staged, and a timed pause ends by itself. The pause
@@ -970,6 +995,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.0.0
 [1.11.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.1
 [1.11.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.0
 [1.10.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.10.2

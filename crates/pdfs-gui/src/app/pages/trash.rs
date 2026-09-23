@@ -47,14 +47,14 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     let model = gio::ListStore::new::<BoxedAnyObject>();
 
     let empty = gtk4::Button::builder()
-        .label("Empty Trash…")
-        .tooltip_text("Permanently delete everything in the Trash")
+        .label(gettext("Empty Trash…"))
+        .tooltip_text(gettext("Permanently delete everything in the Trash"))
         .sensitive(false)
         .build();
     let refresh = refresh_button();
 
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -90,8 +90,8 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     inner.append(&content);
 
     let selection_label = gtk4::Label::new(None);
-    let restore_selected = gtk4::Button::with_label("Restore");
-    let delete_selected = gtk4::Button::with_label("Delete Permanently…");
+    let restore_selected = gtk4::Button::with_label(&pgettext("verb", "Restore"));
+    let delete_selected = gtk4::Button::with_label(&gettext("Delete Permanently…"));
     delete_selected.add_css_class("destructive-action");
     let bar = gtk4::ActionBar::new();
     bar.set_center_widget(Some(&selection_label));
@@ -103,7 +103,7 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
         .build();
     inner.append(&selection_bar);
 
-    let (frame, header, subtitle) = page_frame("Trash", &inner);
+    let (frame, header, subtitle) = page_frame(&gettext("Trash"), &inner);
     header.pack_start(&empty);
     header.pack_end(&refresh);
 
@@ -154,13 +154,13 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, widgets: &TrashWidgets) {
 
         let restore = gtk4::Button::builder()
             .icon_name("edit-undo-symbolic")
-            .tooltip_text("Restore to its original folder")
+            .tooltip_text(gettext("Restore to its original folder"))
             .valign(gtk4::Align::Center)
             .build();
         restore.add_css_class("flat");
         let purge = gtk4::Button::builder()
             .icon_name("edit-delete-symbolic")
-            .tooltip_text("Delete permanently")
+            .tooltip_text(gettext("Delete permanently"))
             .valign(gtk4::Align::Center)
             .build();
         purge.add_css_class("flat");
@@ -211,11 +211,17 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, widgets: &TrashWidgets) {
             }
             if let Some(meta) = text.last_child().and_downcast::<gtk4::Label>() {
                 let kind = if entry.is_dir {
-                    "Folder".to_string()
+                    gettext("Folder")
                 } else {
                     human_bytes(entry.size)
                 };
-                meta.set_label(&format!("{kind} · {}", format_modified(entry.modified)));
+                let modified = format_modified(entry.modified);
+                // Translators: {kind} is "Folder" or a file size; {modified} is a date.
+                let text = gettext_f(
+                    "{kind} · {modified}",
+                    &[("kind", &kind), ("modified", &modified)],
+                );
+                meta.set_label(&text);
             }
         }
     });
@@ -259,9 +265,12 @@ fn sync_trash_selection(ui: &Rc<Ui>) {
     let count = ui.trash.selection.selection().size() as usize;
     ui.trash.selection_bar.set_reveal_child(count > 0);
     if count > 0 {
-        ui.trash
-            .selection_label
-            .set_label(&format!("{} selected", count_noun(count, "item", "items")));
+        ui.trash.selection_label.set_label(&ngettext_f(
+            "{n} item selected",
+            "{n} items selected",
+            count as u64,
+            &[],
+        ));
     }
 }
 
@@ -284,8 +293,8 @@ pub(crate) fn load_trash(ui: &Rc<Ui>) {
     trash_status(
         ui,
         "user-trash-symbolic",
-        "Loading…",
-        "Reading the trash.",
+        &gettext("Loading…"),
+        &gettext("Reading the trash."),
         false,
     );
 
@@ -300,15 +309,15 @@ pub(crate) fn load_trash(ui: &Rc<Ui>) {
             Ok(Ok(Response::Error { message, .. })) => trash_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't read the trash",
+                &gettext("Couldn't read the trash"),
                 &message,
                 false,
             ),
             Ok(Ok(_)) => trash_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't read the trash",
-                "Unexpected reply from the mount service.",
+                &gettext("Couldn't read the trash"),
+                &gettext("Unexpected reply from the mount service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) => trash_unreachable(&ui),
@@ -323,8 +332,8 @@ pub(crate) fn trash_unreachable(ui: &Rc<Ui>) {
         trash_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -332,8 +341,8 @@ pub(crate) fn trash_unreachable(ui: &Rc<Ui>) {
     trash_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -364,16 +373,19 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
         trash_status(
             ui,
             "user-trash-symbolic",
-            "Trash is empty",
-            "Items you delete from Proton Drive show up here.",
+            &gettext("Trash is empty"),
+            &gettext("Items you delete from Proton Drive show up here."),
             false,
         );
         return;
     }
     ui.trash.content.set_visible_child_name("list");
-    ui.trash
-        .subtitle
-        .set_subtitle(&count_noun(entries.len(), "item", "items"));
+    ui.trash.subtitle.set_subtitle(&ngettext_f(
+        "{n} item",
+        "{n} items",
+        entries.len() as u64,
+        &[],
+    ));
 
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.modified));
@@ -394,30 +406,56 @@ pub(crate) fn restore_entries(ui: &Rc<Ui>, entries: &[DirEntry]) {
         Request::Restore {
             uids: entries.iter().map(|e| e.uid.clone()).collect(),
         },
-        format!("Restored {}", entries_label(entries)),
-        "Couldn't restore",
+        match entries {
+            // Translators: {name} is a file or folder name.
+            [one] => gettext_f("Restored “{name}”", &[("name", &one.name)]),
+            _ => ngettext_f(
+                "Restored {n} item",
+                "Restored {n} items",
+                entries.len() as u64,
+                &[],
+            ),
+        },
+        gettext_noop("Couldn't restore"),
     );
-}
-
-/// “name” for one entry, “3 items” for several.
-fn entries_label(entries: &[DirEntry]) -> String {
-    match entries {
-        [one] => format!("“{}”", one.name),
-        _ => count_noun(entries.len(), "item", "items"),
-    }
 }
 
 /// Confirm, then permanently delete trashed entries. Irreversible, so it asks.
 pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entries: &[DirEntry]) {
     let win = ui_window(ui);
     let uids: Vec<String> = entries.iter().map(|e| e.uid.clone()).collect();
-    let name = entries_label(entries);
+    let count = entries.len() as u64;
+    let (body, done) = match entries {
+        [one] => {
+            let args = [("name", one.name.as_str())];
+            (
+                // Translators: {name} is a file or folder name.
+                gettext_f("Permanently delete “{name}”? This cannot be undone.", &args),
+                // Translators: {name} is a file or folder name.
+                gettext_f("Deleted “{name}” permanently", &args),
+            )
+        }
+        _ => (
+            ngettext_f(
+                "Permanently delete {n} item? This cannot be undone.",
+                "Permanently delete {n} items? This cannot be undone.",
+                count,
+                &[],
+            ),
+            ngettext_f(
+                "Deleted {n} item permanently",
+                "Deleted {n} items permanently",
+                count,
+                &[],
+            ),
+        ),
+    };
     let dialog = adw::AlertDialog::builder()
-        .heading("Delete Permanently")
-        .body(format!("Permanently delete {name}? This cannot be undone."))
+        .heading(gettext("Delete Permanently"))
+        .body(body)
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Delete Permanently");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("delete", &gettext("Delete Permanently"));
     dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -428,8 +466,8 @@ pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entries: &[DirEntry]) {
             run_mutation(
                 &ui,
                 Request::DeleteForever { uids: uids.clone() },
-                format!("Deleted {name} permanently"),
-                "Couldn't delete",
+                done.clone(),
+                gettext_noop("Couldn't delete"),
             );
         }
     });
@@ -441,14 +479,16 @@ pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let count = ui.trash.model.n_items();
     let dialog = adw::AlertDialog::builder()
-        .heading("Empty Trash")
-        .body(format!(
-            "Permanently delete all {} in the trash? This cannot be undone.",
-            count_noun(count as usize, "item", "items")
+        .heading(gettext("Empty Trash"))
+        .body(ngettext_f(
+            "Permanently delete all {n} item in the trash? This cannot be undone.",
+            "Permanently delete all {n} items in the trash? This cannot be undone.",
+            count as u64,
+            &[],
         ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("empty", "Empty Trash");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("empty", &gettext("Empty Trash"));
     dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -459,8 +499,8 @@ pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
             run_mutation(
                 &ui,
                 Request::EmptyTrash,
-                "Trash emptied".to_string(),
-                "Couldn't empty the trash",
+                gettext("Trash emptied"),
+                gettext_noop("Couldn't empty the trash"),
             );
         }
     });

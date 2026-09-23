@@ -53,5 +53,9 @@ package() {
   install -Dm644 "$srcdir/proton-drive.service" \
     "$pkgdir/usr/lib/systemd/user/proton-drive.service"
 
+  # Translations ship precompiled in the release tarball.
+  install -dm755 "$pkgdir/usr/share"
+  cp -r --no-preserve=ownership "$srcdir/locale" "$pkgdir/usr/share/locale"
+
   install -Dm644 "$srcdir/LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

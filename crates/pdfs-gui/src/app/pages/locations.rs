@@ -86,22 +86,23 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
     let add_folder = gtk4::Button::builder()
         .child(
             &adw::ButtonContent::builder()
-                .label("Add Folder")
+                .label(gettext("Add Folder"))
                 .icon_name("list-add-symbolic")
                 .build(),
         )
-        .tooltip_text("Back a local folder up to this computer's Proton Drive device")
+        .tooltip_text(gettext(
+            "Back a local folder up to this computer's Proton Drive device",
+        ))
         .build();
     let refresh = refresh_button();
     let transfers_group = build_transfers_group();
     let (card, card_icon, card_row, pause) = build_sync_card();
     let (queue_group, retry_all) = build_queue_group();
     let conflicts_group = adw::PreferencesGroup::builder()
-        .title("Conflicts")
-        .description(
-            "Files changed in two places at once. Both versions were kept; choose which \
-             one stays.",
-        )
+        .title(gettext("Conflicts"))
+        .description(gettext(
+            "Files changed in two places at once. Both versions were kept; choose which one stays.",
+        ))
         .visible(false)
         .build();
 
@@ -109,12 +110,8 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
     // on-demand switch removes the local copy, which is not a thing to discover
     // after the fact.
     let group = adw::PreferencesGroup::builder()
-        .title("On this computer")
-        .description(
-            "Where Proton Drive lives on this machine. Synced folders keep a full copy on \
-             this disk; on-demand folders keep the files in Proton Drive only and fetch \
-             them as you open them.",
-        )
+        .title(gettext("On this computer"))
+        .description(gettext("Where Proton Drive lives on this machine. Synced folders keep a full copy on this disk; on-demand folders keep the files in Proton Drive only and fetch them as you open them."))
         .build();
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
@@ -134,7 +131,7 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .build();
 
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -142,7 +139,7 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
     retry.set_visible(false);
     let status = adw::StatusPage::builder()
         .icon_name("drive-harddisk-symbolic")
-        .title("Loading…")
+        .title(gettext("Loading…"))
         .child(&retry)
         .build();
     // A bare `StatusPage` asks for more width than a half-screen window has, and
@@ -165,7 +162,7 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
     page.set_margin_start(18);
     page.set_margin_end(18);
     page.append(&content);
-    let (frame, header, _) = page_frame("Sync", &page);
+    let (frame, header, _) = page_frame(&pgettext("page", "Sync"), &page);
     header.pack_start(&add_folder);
     header.pack_end(&refresh);
 
@@ -219,24 +216,29 @@ fn build_sync_card() -> (
         .build();
     icon.add_css_class("sidebar-status");
     let menu = gio::Menu::new();
-    menu.append(Some("Pause for 1 Hour"), Some("sync.pause-for(int64 3600)"));
     menu.append(
-        Some("Pause for 8 Hours"),
+        Some(&gettext("Pause for 1 Hour")),
+        Some("sync.pause-for(int64 3600)"),
+    );
+    menu.append(
+        Some(&gettext("Pause for 8 Hours")),
         Some("sync.pause-for(int64 28800)"),
     );
     menu.append(
-        Some("Pause for 24 Hours"),
+        Some(&gettext("Pause for 24 Hours")),
         Some("sync.pause-for(int64 86400)"),
     );
     let pause = adw::SplitButton::builder()
-        .label("Pause")
+        .label(pgettext("verb", "Pause"))
         .menu_model(&menu)
         .valign(gtk4::Align::Center)
-        .tooltip_text("Stop uploading until you resume. Files still open as usual.")
-        .dropdown_tooltip("Pause for a while")
+        .tooltip_text(gettext(
+            "Stop uploading until you resume. Files still open as usual.",
+        ))
+        .dropdown_tooltip(gettext("Pause for a while"))
         .build();
     let row = adw::ActionRow::builder()
-        .title("Checking…")
+        .title(gettext("Checking…"))
         .title_lines(1)
         .subtitle_lines(2)
         .build();
@@ -269,12 +271,15 @@ pub(crate) fn paint_sync_card(
     card.row.set_title(title);
     card.row.set_subtitle(detail.unwrap_or_default());
     card.paused.set(paused);
-    card.pause
-        .set_label(if paused { "Resume" } else { "Pause" });
-    card.pause.set_tooltip_text(Some(if paused {
-        "Upload everything that waited while sync was paused"
+    card.pause.set_label(&if paused {
+        pgettext("verb", "Resume")
     } else {
-        "Stop uploading until you resume. Files still open as usual."
+        pgettext("verb", "Pause")
+    });
+    card.pause.set_tooltip_text(Some(&if paused {
+        gettext("Upload everything that waited while sync was paused")
+    } else {
+        gettext("Stop uploading until you resume. Files still open as usual.")
     }));
     if paused {
         card.pause.add_css_class("suggested-action");
@@ -320,21 +325,21 @@ fn set_sync_paused(ui: &Rc<Ui>, paused: bool, until: Option<i64>) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let what = if paused {
-            "Couldn't pause sync"
+            gettext("Couldn't pause sync")
         } else {
-            "Couldn't resume sync"
+            gettext("Couldn't resume sync")
         };
         match rx.recv().await {
             Ok(Ok(Response::Ok { .. })) => toast(
                 &ui,
-                match (paused, until) {
-                    (false, _) => "Sync resumed",
-                    (true, None) => "Sync paused until you resume",
-                    (true, Some(_)) => "Sync paused",
+                &match (paused, until) {
+                    (false, _) => gettext("Sync resumed"),
+                    (true, None) => gettext("Sync paused until you resume"),
+                    (true, Some(_)) => gettext("Sync paused"),
                 },
             ),
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, what, &message, kind),
-            _ => toast_error(&ui, what, "The mount service didn't respond."),
+            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, &what, &message, kind),
+            _ => toast_error(&ui, &what, &gettext("The mount service didn't respond.")),
         }
         ui.locations.card.pause.set_sensitive(true);
         refresh_status(&ui);
@@ -344,15 +349,17 @@ fn set_sync_paused(ui: &Rc<Ui>, paused: bool, until: Option<i64>) {
 /// The queue list, hidden while nothing waits.
 fn build_queue_group() -> (adw::PreferencesGroup, gtk4::Button) {
     let retry_all = gtk4::Button::builder()
-        .label("Retry All")
+        .label(gettext("Retry All"))
         .valign(gtk4::Align::Center)
-        .tooltip_text("Try every failed change again now")
+        .tooltip_text(gettext("Try every failed change again now"))
         .visible(false)
         .build();
     retry_all.add_css_class("flat");
     let group = adw::PreferencesGroup::builder()
-        .title("Waiting to Upload")
-        .description("Changes made on this computer that are not on Proton Drive yet.")
+        .title(gettext("Waiting to Upload"))
+        .description(gettext(
+            "Changes made on this computer that are not on Proton Drive yet.",
+        ))
         .header_suffix(&retry_all)
         .visible(false)
         .build();
@@ -406,13 +413,11 @@ fn repaint_queue(ui: &Rc<Ui>, items: &[PendingOpInfo]) {
         .set_visible(items.iter().any(|op| op.attempts > 0 && !op.parked));
     let hidden = items.len().saturating_sub(QUEUE_ROWS_SHOWN);
     queue.group.set_description(Some(&if hidden > 0 {
-        format!(
-            "Changes made on this computer that are not on Proton Drive yet. \
-             Showing the first {QUEUE_ROWS_SHOWN} of {}.",
-            items.len()
-        )
+        let shown = QUEUE_ROWS_SHOWN.to_string();
+        // Translators: {shown} is how many rows are listed (50), {n} the total number of queued changes.
+        ngettext_f("Changes made on this computer that are not on Proton Drive yet. Showing the first {shown} of {n}.", "Changes made on this computer that are not on Proton Drive yet. Showing the first {shown} of {n}.", items.len() as u64, &[("shown", &shown)])
     } else {
-        "Changes made on this computer that are not on Proton Drive yet.".to_string()
+        gettext("Changes made on this computer that are not on Proton Drive yet.")
     }));
     let now = glib::DateTime::now_utc()
         .map(|now| now.to_unix())
@@ -427,26 +432,36 @@ fn repaint_queue(ui: &Rc<Ui>, items: &[PendingOpInfo]) {
 
 fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
     let (icon, action) = match op.kind.as_str() {
-        "revision" => ("pdfs-upload-symbolic", "Upload changes"),
-        "create" => ("pdfs-upload-symbolic", "Upload new file"),
-        "mkdir" => ("folder-new-symbolic", "Create folder"),
-        "rename" => ("document-edit-symbolic", "Rename or move"),
-        "trash" => ("user-trash-symbolic", "Move to trash"),
-        _ => ("emblem-synchronizing-symbolic", "Change"),
+        "revision" => ("pdfs-upload-symbolic", gettext("Upload changes")),
+        "create" => ("pdfs-upload-symbolic", gettext("Upload new file")),
+        "mkdir" => ("folder-new-symbolic", gettext("Create folder")),
+        "rename" => ("document-edit-symbolic", gettext("Rename or move")),
+        "trash" => ("user-trash-symbolic", gettext("Move to trash")),
+        // Translators: a queued change of an unknown kind.
+        _ => ("emblem-synchronizing-symbolic", pgettext("noun", "Change")),
     };
     let state = match (op.parked, op.next_attempt_at) {
-        (true, _) => "waiting for the app writing it to finish".to_string(),
+        (true, _) => gettext("waiting for the app writing it to finish"),
         (false, Some(at)) if at > now && op.attempts > 0 => {
-            format!("retrying {}", clock_time(at))
+            // Translators: {time} is when the next attempt happens, such as "14:30".
+            gettext_f("retrying {time}", &[("time", &clock_time(at))])
         }
-        (false, _) if ui.locations.card.paused.get() => "waiting for sync to resume".to_string(),
-        (false, _) => "up next".to_string(),
+        (false, _) if ui.locations.card.paused.get() => gettext("waiting for sync to resume"),
+        (false, _) => gettext("up next"),
     };
-    let mut subtitle = format!("{action} · {state}");
+    // Translators: a queued change's kind and its state, such as "Upload changes · up next".
+    let mut subtitle = gettext_f(
+        "{action} · {state}",
+        &[("action", &action), ("state", &state)],
+    );
     if let Some(error) = &op.last_error {
-        subtitle.push_str(&format!(
-            "\nFailed {}: {error}",
-            count_noun(op.attempts.max(0) as usize, "time", "times")
+        subtitle.push('\n');
+        // Translators: {n} is how many attempts failed, {error} the last error message.
+        subtitle.push_str(&ngettext_f(
+            "Failed {n} time: {error}",
+            "Failed {n} times: {error}",
+            op.attempts.max(0) as u64,
+            &[("error", error)],
         ));
     }
     let row = adw::ActionRow::builder()
@@ -469,7 +484,7 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
     if waiting {
         let retry = gtk4::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text("Retry now")
+            .tooltip_text(gettext("Retry now"))
             .valign(gtk4::Align::Center)
             .build();
         retry.add_css_class("flat");
@@ -488,14 +503,18 @@ fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
     glib::spawn_future_local(async move {
         match rx.recv().await {
             Ok(Ok(Response::Ok { .. })) => {
-                toast(&ui, "Retrying now…");
+                toast(&ui, &gettext("Retrying now…"));
                 ui.locations.queue.painted.borrow_mut().clear();
                 refresh_queue(&ui);
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't retry", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't retry"), &message, kind)
             }
-            _ => toast_error(&ui, "Couldn't retry", "The mount service didn't respond."),
+            _ => toast_error(
+                &ui,
+                &gettext("Couldn't retry"),
+                &gettext("The mount service didn't respond."),
+            ),
         }
     });
 }
@@ -565,20 +584,27 @@ fn repaint_conflicts(ui: &Rc<Ui>, items: &[ConflictInfo]) {
 
 /// "12.3 MB, changed at 14:30": one side of a conflict.
 fn conflict_side(size: u64, modified: i64) -> String {
-    format!(
-        "{}, changed {}",
-        glib::format_size(size),
-        clock_time(modified)
+    // Translators: one side of a conflict; {size} is a file size such as "12.3 MB", {time} when it was changed, such as "14:30".
+    gettext_f(
+        "{size}, changed {time}",
+        &[
+            ("size", &glib::format_size(size)),
+            ("time", &clock_time(modified)),
+        ],
     )
 }
 
 pub(crate) fn conflict_row(ui: &Rc<Ui>, conflict: &ConflictInfo) -> adw::ActionRow {
     let verdict = if !conflict.original_exists {
-        "The original is gone; only this copy is left".to_string()
+        gettext("The original is gone; only this copy is left")
     } else if conflict.identical {
-        "Same content as the original".to_string()
+        gettext("Same content as the original")
     } else {
-        format!("Differs from {}", file_name(&conflict.original_path))
+        // Translators: {name} is the original file's name.
+        gettext_f(
+            "Differs from {name}",
+            &[("name", file_name(&conflict.original_path))],
+        )
     };
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&conflict.path).as_str())
@@ -608,36 +634,45 @@ pub(crate) fn prompt_resolve_conflict(ui: &Rc<Ui>, conflict: &ConflictInfo) {
     let copy_name = file_name(&conflict.path).to_string();
     let original_name = file_name(&conflict.original_path).to_string();
     let body = match (conflict.original_size, conflict.original_modified) {
-        (Some(size), Some(modified)) if conflict.original_exists => format!(
-            "“{original_name}” was changed here and elsewhere at the same time.\n\n\
-             Original: {}\nCopy: {}\n\n\
-             Whatever is not kept goes to Trash, where it can be restored.",
-            conflict_side(size, modified),
-            conflict_side(conflict.size, conflict.modified),
-        ),
-        _ => format!(
-            "The original “{original_name}” no longer exists; only the copy is left \
-             ({}).\n\nKeep the copy to give it the original name back.",
-            conflict_side(conflict.size, conflict.modified),
-        ),
+        (Some(size), Some(modified)) if conflict.original_exists => {
+            let original = conflict_side(size, modified);
+            let copy = conflict_side(conflict.size, conflict.modified);
+            // Translators: {name} is the file name; {original} and {copy} each read like "12.3 MB, changed 14:30".
+            gettext_f(
+                "“{name}” was changed here and elsewhere at the same time.\n\nOriginal: {original}\nCopy: {copy}\n\nWhatever is not kept goes to Trash, where it can be restored.",
+                &[
+                    ("name", &original_name),
+                    ("original", &original),
+                    ("copy", &copy),
+                ],
+            )
+        }
+        _ => {
+            let copy = conflict_side(conflict.size, conflict.modified);
+            // Translators: {name} is the file name; {copy} reads like "12.3 MB, changed 14:30".
+            gettext_f(
+                "The original “{name}” no longer exists; only the copy is left ({copy}).\n\nKeep the copy to give it the original name back.",
+                &[("name", &original_name), ("copy", &copy)],
+            )
+        }
     };
     let dialog = adw::AlertDialog::builder()
-        .heading("Resolve conflict")
+        .heading(gettext("Resolve conflict"))
         .body(body)
         .build();
     let group = adw::PreferencesGroup::new();
     let name_row = adw::EntryRow::builder()
-        .title("Name for the copy, if keeping both")
+        .title(gettext("Name for the copy, if keeping both"))
         .build();
     name_row.set_text(&copy_name);
     group.add(&name_row);
     dialog.set_extra_child(Some(&group));
-    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("cancel", &gettext("Cancel"));
     if conflict.original_exists {
-        dialog.add_response("original", "Keep Original");
-        dialog.add_response("both", "Keep Both");
+        dialog.add_response("original", &gettext("Keep Original"));
+        dialog.add_response("both", &gettext("Keep Both"));
     }
-    dialog.add_response("copy", "Keep Copy");
+    dialog.add_response("copy", &gettext("Keep Copy"));
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     // Keeping both is a rename, so it needs a name that is neither side's.
@@ -692,13 +727,16 @@ fn resolve_conflict(ui: &Rc<Ui>, path: String, keep: ConflictKeep) {
                 refresh_conflicts(&ui, true);
                 refresh_activity_conflicts(&ui, true);
             }
-            Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't resolve the conflict", &message, kind)
-            }
+            Ok(Ok(Response::Error { message, kind })) => toast_failure(
+                &ui,
+                &gettext("Couldn't resolve the conflict"),
+                &message,
+                kind,
+            ),
             _ => toast_error(
                 &ui,
-                "Couldn't resolve the conflict",
-                "The mount service didn't respond.",
+                &gettext("Couldn't resolve the conflict"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -737,8 +775,8 @@ pub(crate) fn load_locations(ui: &Rc<Ui>) {
     locations_status(
         ui,
         "drive-harddisk-symbolic",
-        "Loading…",
-        "Reading this computer's Proton Drive locations.",
+        &gettext("Loading…"),
+        &gettext("Reading this computer's Proton Drive locations."),
         false,
     );
     ui.busy_begin();
@@ -759,7 +797,7 @@ pub(crate) fn load_locations(ui: &Rc<Ui>) {
                 locations_status(
                     &ui,
                     "dialog-warning-symbolic",
-                    "Unavailable",
+                    &gettext("Unavailable"),
                     &message,
                     true,
                 );
@@ -803,8 +841,8 @@ pub(crate) fn locations_unreachable(ui: &Rc<Ui>) {
         locations_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -812,8 +850,8 @@ pub(crate) fn locations_unreachable(ui: &Rc<Ui>) {
     locations_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -830,8 +868,10 @@ pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
     }
     if items.is_empty() {
         let row = adw::ActionRow::builder()
-            .title("No locations")
-            .subtitle("The mount service hasn't reported a mountpoint yet.")
+            .title(gettext("No locations"))
+            .subtitle(gettext(
+                "The mount service hasn't reported a mountpoint yet.",
+            ))
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name("drive-harddisk-symbolic"));
         ui.locations.group.add(&row);
@@ -855,7 +895,7 @@ pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
         // visible; saying so on the row is cheaper than letting the user find out
         // from a save dialog.
         if spec.access == MountAccess::Ro {
-            let badge = gtk4::Label::new(Some("Read-only"));
+            let badge = gtk4::Label::new(Some(&gettext("Read-only")));
             badge.add_css_class("dim-label");
             badge.add_css_class("caption");
             badge.set_valign(gtk4::Align::Center);
@@ -887,7 +927,7 @@ pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
 
         let open = gtk4::Button::builder()
             .icon_name("folder-open-symbolic")
-            .tooltip_text("Open this folder")
+            .tooltip_text(gettext("Open this folder"))
             .valign(gtk4::Align::Center)
             .build();
         open.add_css_class("flat");
@@ -906,8 +946,10 @@ pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
 /// [`prompt_mountpoint`] dialog.
 fn add_my_files_controls(ui: &Rc<Ui>, row: &adw::ActionRow) {
     let change = gtk4::Button::builder()
-        .label("Change")
-        .tooltip_text("Choose a different folder for the Proton Drive mount")
+        .label(pgettext("verb", "Change"))
+        .tooltip_text(gettext(
+            "Choose a different folder for the Proton Drive mount",
+        ))
         .valign(gtk4::Align::Center)
         .build();
     change.add_css_class("flat");
@@ -923,9 +965,12 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
         let (icon, tooltip) = match spec.paused {
             true => (
                 "media-playback-start-symbolic",
-                "Resume syncing this folder",
+                gettext("Resume syncing this folder"),
             ),
-            false => ("media-playback-pause-symbolic", "Pause syncing this folder"),
+            false => (
+                "media-playback-pause-symbolic",
+                gettext("Pause syncing this folder"),
+            ),
         };
         let pause = gtk4::Button::builder()
             .icon_name(icon)
@@ -942,7 +987,7 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
     if spec.mode != MountMode::OnDemand && !spec.paused {
         let sync_now = gtk4::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text("Sync this folder now")
+            .tooltip_text(gettext("Sync this folder now"))
             .valign(gtk4::Align::Center)
             .build();
         sync_now.add_css_class("flat");
@@ -957,11 +1002,7 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
     // a spurious request.
     let target = spec.pending_mode.unwrap_or(spec.mode);
     let ondemand = gtk4::Switch::builder()
-        .tooltip_text(
-            "On-demand: free this disk by keeping the files in Proton Drive only, \
-             fetching each as you open it. Turn off to download them back and keep a \
-             full local copy.",
-        )
+        .tooltip_text(gettext("On-demand: free this disk by keeping the files in Proton Drive only, fetching each as you open it. Turn off to download them back and keep a full local copy."))
         .valign(gtk4::Align::Center)
         .active(target == MountMode::OnDemand)
         // The daemon refuses a mode switch on a paused folder.
@@ -985,7 +1026,7 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
 
     let remove = gtk4::Button::builder()
         .icon_name("media-playback-stop-symbolic")
-        .tooltip_text("Stop syncing this folder")
+        .tooltip_text(gettext("Stop syncing this folder"))
         .valign(gtk4::Align::Center)
         .build();
     remove.add_css_class("flat");
@@ -1002,14 +1043,12 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
 /// space by removing the local copies, which is not something to do by accident.
 fn confirm_ondemand(ui: &Rc<Ui>, id: i64, path: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Make Folder On-Demand?")
-        .body(format!(
-            "Files in {path} will be removed from this computer and kept in Proton \
-             Drive only. Each file downloads again when you open it."
-        ))
+        .heading(gettext("Make Folder On-Demand?"))
+        // Translators: {path} is a local folder path.
+        .body(gettext_f("Files in {path} will be removed from this computer and kept in Proton Drive only. Each file downloads again when you open it.", &[("path", path)]))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("ondemand", "Make On-Demand");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("ondemand", &gettext("Make On-Demand"));
     dialog.set_response_appearance("ondemand", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -1034,19 +1073,21 @@ fn set_folder_paused(ui: &Rc<Ui>, id: i64, paused: bool) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let failed = match paused {
-            true => "Couldn't pause the folder",
-            false => "Couldn't resume the folder",
+            true => gettext("Couldn't pause the folder"),
+            false => gettext("Couldn't resume the folder"),
         };
         match rx.recv().await {
             Ok(Ok(Response::Ok { .. })) => toast(
                 &ui,
-                match paused {
-                    true => "Folder paused",
-                    false => "Folder resumed",
+                &match paused {
+                    true => gettext("Folder paused"),
+                    false => gettext("Folder resumed"),
                 },
             ),
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
-            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
         }
         refresh_locations(&ui);
     });
@@ -1058,11 +1099,15 @@ fn sync_folder_now(ui: &Rc<Ui>, id: i64) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
-            Ok(Ok(Response::Ok { .. })) => toast(&ui, "Syncing folder…"),
+            Ok(Ok(Response::Ok { .. })) => toast(&ui, &gettext("Syncing folder…")),
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't sync", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't sync"), &message, kind)
             }
-            _ => toast_error(&ui, "Couldn't sync", "The mount service didn't respond."),
+            _ => toast_error(
+                &ui,
+                &gettext("Couldn't sync"),
+                &gettext("The mount service didn't respond."),
+            ),
         }
     });
 }
@@ -1085,21 +1130,23 @@ pub(crate) fn location_icon(kind: &MountKind) -> &'static str {
 pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
     let mut parts: Vec<String> = Vec::new();
     match &spec.kind {
-        MountKind::MyFiles => parts.push("My files".to_string()),
-        MountKind::Shared { .. } => parts.push("Shared folder".to_string()),
+        MountKind::MyFiles => parts.push(gettext("My files")),
+        MountKind::Shared { .. } => parts.push(gettext("Shared folder")),
         MountKind::Device { .. } => match (spec.pending_mode, spec.mode) {
-            (Some(MountMode::OnDemand), _) => parts.push("Going on-demand".to_string()),
-            (Some(MountMode::Mirror), _) => parts.push("Switching to synced".to_string()),
+            (Some(MountMode::OnDemand), _) => parts.push(gettext("Going on-demand")),
+            (Some(MountMode::Mirror), _) => parts.push(gettext("Switching to synced")),
             (Some(MountMode::Unknown) | None, MountMode::OnDemand) => {
-                parts.push("On-demand".to_string())
+                // Translators: a folder mode: files are kept online and fetched when opened.
+                parts.push(pgettext("folder mode", "On-demand"))
             }
-            (Some(MountMode::Unknown) | None, _) => parts.push("Synced".to_string()),
+            // Translators: a folder mode: a full copy is kept on this computer.
+            (Some(MountMode::Unknown) | None, _) => parts.push(pgettext("folder mode", "Synced")),
         },
     }
     if matches!(spec.kind, MountKind::Device { .. }) {
         parts.push(match &spec.progress {
             Some(p) => sync_progress_label(p),
-            None if spec.paused => "paused".to_string(),
+            None if spec.paused => pgettext("state", "paused"),
             None => sync_state_label(&spec.state).to_string(),
         });
     }
@@ -1109,7 +1156,7 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
         || spec.mode == MountMode::OnDemand
         || spec.pending_mode == Some(MountMode::OnDemand);
     if expects_session && !spec.mounted {
-        parts.push("not mounted".to_string());
+        parts.push(gettext("not mounted"));
     }
     parts.join(" · ")
 }

@@ -35,7 +35,7 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
         .build();
 
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -60,7 +60,7 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
     inner.set_margin_start(18);
     inner.set_margin_end(18);
     inner.append(&content);
-    let (frame, header, _) = page_frame("Shared by Me", &inner);
+    let (frame, header, _) = page_frame(&gettext("Shared by Me"), &inner);
     header.pack_end(&refresh);
 
     (
@@ -109,8 +109,8 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
     shared_by_me_status(
         ui,
         "emblem-shared-symbolic",
-        "Loading…",
-        "Reading what you've shared.",
+        &gettext("Loading…"),
+        &gettext("Reading what you've shared."),
         false,
     );
     ui.busy_begin();
@@ -128,15 +128,15 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
             Ok(Ok(Response::Error { message, .. })) => shared_by_me_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't read your shares",
+                &gettext("Couldn't read your shares"),
                 &message,
                 false,
             ),
             Ok(Ok(_)) => shared_by_me_status(
                 &ui,
                 "dialog-warning-symbolic",
-                "Couldn't read your shares",
-                "Unexpected reply from the mount service.",
+                &gettext("Couldn't read your shares"),
+                &gettext("Unexpected reply from the mount service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) => {
@@ -153,8 +153,8 @@ pub(crate) fn shared_by_me_unreachable(ui: &Rc<Ui>) {
         shared_by_me_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -162,8 +162,8 @@ pub(crate) fn shared_by_me_unreachable(ui: &Rc<Ui>) {
     shared_by_me_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -183,8 +183,8 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
         shared_by_me_status(
             ui,
             "emblem-shared-symbolic",
-            "Nothing shared yet",
-            "Items you share with people or by link show up here.",
+            &gettext("Nothing shared yet"),
+            &gettext("Items you share with people or by link show up here."),
             false,
         );
         return;
@@ -212,14 +212,14 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
         if let Some(url) = url.clone() {
             let copy = gtk4::Button::builder()
                 .icon_name("edit-copy-symbolic")
-                .tooltip_text("Copy link")
+                .tooltip_text(gettext("Copy link"))
                 .valign(gtk4::Align::Center)
                 .build();
             copy.add_css_class("flat");
             let ui_copy = ui.clone();
             copy.connect_clicked(move |btn| {
                 btn.clipboard().set_text(&url);
-                toast(&ui_copy, "Link copied");
+                toast(&ui_copy, &gettext("Link copied"));
             });
             row.add_suffix(&copy);
         }
@@ -237,44 +237,48 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
 /// Manage access opens the per-node Share dialog, which addresses a pathless
 /// node by uid, so every shared item can be managed from here.
 fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry, url: Option<String>) -> gtk4::MenuButton {
-    let mut items: Vec<(&str, MenuAction)> = Vec::new();
+    let mut items: Vec<(String, MenuAction)> = Vec::new();
     if !entry.path.is_empty() {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        items.push(("Open", Box::new(move || open_shared_by_me(&ui_c, &entry_c))));
+        items.push((
+            pgettext("verb", "Open"),
+            Box::new(move || open_shared_by_me(&ui_c, &entry_c)),
+        ));
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
         items.push((
-            "Show in My Files",
+            gettext("Show in My Files"),
             Box::new(move || show_in_my_files(&ui_c, &entry_c)),
         ));
     }
     if let Some(url) = url {
-        items.push(("Open Link", Box::new(move || open_uri(&url))));
+        items.push((gettext("Open Link"), Box::new(move || open_uri(&url))));
     }
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     items.push((
-        "Manage Access…",
+        gettext("Manage Access…"),
         Box::new(move || open_share_dialog(&ui_c, &entry_c)),
     ));
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     items.push((
-        "Stop Sharing…",
+        gettext("Stop Sharing…"),
         Box::new(move || prompt_stop_sharing(&ui_c, &entry_c)),
     ));
-    more_menu_button(items)
+    let (labels, actions): (Vec<String>, Vec<MenuAction>) = items.into_iter().unzip();
+    more_menu_button(labels.iter().map(String::as_str).zip(actions).collect())
 }
 
 /// Confirm, then remove every member, invitation and the public link.
 pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entry: &DirEntry) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Stop sharing?")
-        .body(format!(
-            "Everyone you invited loses access to “{}”, pending invitations are \
-             withdrawn and its public link stops working.",
-            entry.name
+        .heading(gettext("Stop sharing?"))
+        // Translators: {name} is the shared item's name.
+        .body(gettext_f(
+            "Everyone you invited loses access to “{name}”, pending invitations are withdrawn and its public link stops working.",
+            &[("name", &entry.name)],
         ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("stop", "Stop Sharing");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("stop", &gettext("Stop Sharing"));
     dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -285,8 +289,9 @@ pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entry: &DirEntry) {
         run_mutation(
             &ui_c,
             Request::StopSharingByUid { uid: uid.clone() },
-            format!("Stopped sharing {name}"),
-            "Couldn't stop sharing",
+            // Translators: {name} is the item's name.
+            gettext_f("Stopped sharing {name}", &[("name", &name)]),
+            gettext_noop("Couldn't stop sharing"),
         );
     });
     dialog.present(ui_window(ui).as_ref());
@@ -319,24 +324,29 @@ pub(crate) fn show_in_my_files(ui: &Rc<Ui>, entry: &DirEntry) {
 pub(crate) fn shared_item_summary(item: &SharedItem) -> String {
     let mut parts = Vec::new();
     if item.member_count > 0 {
-        parts.push(format!(
-            "{} {}",
-            item.member_count,
-            if item.member_count == 1 {
-                "person"
-            } else {
-                "people"
-            }
+        // Translators: how many people have access to a shared item.
+        parts.push(ngettext_f(
+            "{n} person",
+            "{n} people",
+            item.member_count as u64,
+            &[],
         ));
     }
     if item.invite_count > 0 {
-        parts.push(format!("{} pending", item.invite_count));
+        // Translators: how many invitations to a shared item are not accepted yet.
+        parts.push(ngettext_f(
+            "{n} pending",
+            "{n} pending",
+            item.invite_count as u64,
+            &[],
+        ));
     }
     if item.link.is_some() {
-        parts.push("Public link".to_string());
+        parts.push(gettext("Public link"));
     }
     if parts.is_empty() {
-        "Shared".to_string()
+        // Translators: a shared item's summary when no people or link can be counted.
+        pgettext("state", "Shared")
     } else {
         parts.join(" · ")
     }

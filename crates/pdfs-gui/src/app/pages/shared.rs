@@ -48,7 +48,9 @@ pub(crate) struct SharedWidgets {
 pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     let add_bookmark = gtk4::Button::builder()
         .icon_name("bookmark-new-symbolic")
-        .tooltip_text("Add Bookmark — save a public link to open it from here")
+        .tooltip_text(gettext(
+            "Add Bookmark — save a public link to open it from here",
+        ))
         .build();
     let refresh = refresh_button();
 
@@ -57,13 +59,13 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     // "nothing here". Invitations come first: they are the one thing on the
     // page waiting for a decision.
     let invitations = adw::PreferencesGroup::builder()
-        .title("Invitations")
-        .description("Accept to add the item to your shared files.")
+        .title(gettext("Invitations"))
+        .description(gettext("Accept to add the item to your shared files."))
         .visible(false)
         .build();
     let shared_with_me = adw::PreferencesGroup::new();
     let bookmarks = adw::PreferencesGroup::builder()
-        .title("Bookmarks")
+        .title(gettext("Bookmarks"))
         .visible(false)
         .build();
 
@@ -78,7 +80,7 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
         .build();
 
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -106,10 +108,10 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
 
     let back = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Back")
+        .tooltip_text(gettext("Back"))
         .visible(false)
         .build();
-    let (frame, header, title) = page_frame("Shared with Me", &inner);
+    let (frame, header, title) = page_frame(&gettext("Shared with Me"), &inner);
     header.pack_start(&back);
     header.pack_end(&refresh);
     header.pack_end(&add_bookmark);
@@ -176,8 +178,8 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
     shared_status(
         ui,
         "emblem-shared-symbolic",
-        "Loading…",
-        "Reading your shared items.",
+        &gettext("Loading…"),
+        &gettext("Reading your shared items."),
         false,
     );
 
@@ -229,8 +231,8 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
     shared_status(
         ui,
         "folder-symbolic",
-        "Loading…",
-        "Reading this shared folder.",
+        &gettext("Loading…"),
+        &gettext("Reading this shared folder."),
         false,
     );
     ui.busy_begin();
@@ -249,7 +251,7 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
                 // The folder is gone or access was revoked: fall back to the top
                 // level rather than stranding the page on a dead uid.
                 ui.shared.nav.borrow_mut().pop();
-                toast_failure(&ui, "Couldn't open shared folder", &message, kind);
+                toast_failure(&ui, &gettext("Couldn't open shared folder"), &message, kind);
                 load_shared(&ui);
             }
             _ => {
@@ -272,9 +274,10 @@ pub(crate) fn shared_path(nav: &[(String, String)]) -> String {
 /// The Invitations heading, with the count once there is more than one.
 pub(crate) fn invitations_title(count: usize) -> String {
     if count > 1 {
-        format!("Invitations ({count})")
+        // Translators: the Invitations heading; {count} is the number of pending invitations (2 or more).
+        gettext_f("Invitations ({count})", &[("count", &count.to_string())])
     } else {
-        "Invitations".to_string()
+        gettext("Invitations")
     }
 }
 
@@ -299,7 +302,7 @@ fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
 
     if entries.is_empty() {
-        let row = dim_row("This folder is empty.");
+        let row = dim_row(&gettext("This folder is empty."));
         ui.shared.with_me_group.add(&row);
         rows.push((ui.shared.with_me_group.clone(), row.upcast()));
     } else {
@@ -340,7 +343,7 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> adw::Actio
         let warning = gtk4::Image::from_icon_name("dialog-warning-symbolic");
         warning.add_css_class("warning");
         warning.set_valign(gtk4::Align::Center);
-        warning.set_tooltip_text(Some(UNVERIFIED_INVITER_TOOLTIP));
+        warning.set_tooltip_text(Some(&gettext(UNVERIFIED_INVITER_TOOLTIP)));
         row.add_suffix(&warning);
     }
     row.add_prefix(&file_thumbnail(ui, entry, 40, 24, true));
@@ -370,7 +373,7 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> adw::Actio
 /// A shared row's ⋮ menu: open it, find it in My Files when the mount has
 /// interned it, and leave it (share roots only).
 fn shared_entry_menu(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> gtk4::MenuButton {
-    let mut items: Vec<(&str, MenuAction)> = Vec::new();
+    let mut items: Vec<(String, MenuAction)> = Vec::new();
     let (ui_open, uid, name, is_dir) = (
         ui.clone(),
         entry.uid.clone(),
@@ -378,7 +381,7 @@ fn shared_entry_menu(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> gtk4::Men
         entry.is_dir,
     );
     items.push((
-        "Open",
+        pgettext("verb", "Open"),
         Box::new(move || {
             if is_dir {
                 ui_open
@@ -395,25 +398,27 @@ fn shared_entry_menu(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> gtk4::Men
     if !entry.path.is_empty() {
         let (ui_show, entry_show) = (ui.clone(), entry.clone());
         items.push((
-            "Show in My Files",
+            gettext("Show in My Files"),
             Box::new(move || show_in_my_files(&ui_show, &entry_show)),
         ));
     }
     if leavable {
         let (ui_leave, uid, name) = (ui.clone(), entry.uid.clone(), entry.name.clone());
         items.push((
-            "Leave…",
+            gettext("Leave…"),
             Box::new(move || prompt_leave_shared(&ui_leave, &uid, &name)),
         ));
     }
-    let button = more_menu_button(items);
+    let (labels, actions): (Vec<String>, Vec<MenuAction>) = items.into_iter().unzip();
+    let button = more_menu_button(labels.iter().map(String::as_str).zip(actions).collect());
     button.set_valign(gtk4::Align::Center);
     button
 }
 
 /// Tooltip on the warning shown next to a share whose invitation did not verify.
-const UNVERIFIED_INVITER_TOOLTIP: &str = "The invitation's signature doesn't match the sender's keys. \
-     It may not really be from them.";
+const UNVERIFIED_INVITER_TOOLTIP: &str = gettext_noop(
+    "The invitation's signature doesn't match the sender's keys. It may not really be from them.",
+);
 
 /// A shared row's subtitle: who shared it and when (share roots only — that is
 /// where the invitation lives) and its size (files only). Where the share sits
@@ -437,33 +442,33 @@ pub(crate) fn shared_row_subtitle(entry: &DirEntry) -> String {
 /// owned content carries no role, and a role the API did not report is not
 /// guessed at (the SDK's `from_permissions_exact` returns `None` for an
 /// unrecognised mask rather than degrading it to viewer).
-pub(crate) fn role_label(role: &str) -> Option<&'static str> {
+pub(crate) fn role_label(role: &str) -> Option<String> {
     match role {
-        "viewer" => Some("Viewer"),
-        "editor" => Some("Editor"),
-        "admin" => Some("Admin"),
+        "viewer" => Some(pgettext("role", "Viewer")),
+        "editor" => Some(pgettext("role", "Editor")),
+        "admin" => Some(pgettext("role", "Admin")),
         _ => None,
     }
 }
 
 /// What a role lets me do, as a short phrase for the row's pill. A bare
 /// "Editor" beside a Leave button read like one more button.
-pub(crate) fn role_access(role: &str) -> Option<&'static str> {
+pub(crate) fn role_access(role: &str) -> Option<String> {
     match role {
-        "viewer" => Some("Can view"),
-        "editor" => Some("Can edit"),
-        "admin" => Some("Can manage"),
+        "viewer" => Some(gettext("Can view")),
+        "editor" => Some(gettext("Can edit")),
+        "admin" => Some(gettext("Can manage")),
         _ => None,
     }
 }
 
 /// A tinted, rounded pill saying what I may do with a share I did not create.
 pub(crate) fn role_pill(role: &str) -> Option<gtk4::Label> {
-    let pill = gtk4::Label::new(Some(role_access(role)?));
+    let pill = gtk4::Label::new(Some(&role_access(role)?));
     pill.add_css_class("role-pill");
     pill.add_css_class("caption");
     pill.set_valign(gtk4::Align::Center);
-    pill.set_tooltip_text(role_label(role));
+    pill.set_tooltip_text(role_label(role).as_deref());
     Some(pill)
 }
 
@@ -477,7 +482,8 @@ fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
         return;
     }
     ui.busy_begin();
-    toast(ui, &format!("Downloading “{name}”…"));
+    // Translators: {name} is a file name.
+    toast(ui, &gettext_f("Downloading “{name}”…", &[("name", name)]));
     let rx = spawn_request(
         ui.dirs.control_socket(),
         Request::OpenSharedFile {
@@ -496,12 +502,12 @@ fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
             // the shared node's name instead.
             Ok(Ok(Response::FilePath { path })) => open_named_path(&path, &name),
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't open file", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't open file"), &message, kind)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't open file",
-                "The mount service didn't respond.",
+                &gettext("Couldn't open file"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -514,8 +520,8 @@ pub(crate) fn shared_unreachable(ui: &Rc<Ui>) {
         shared_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -523,8 +529,8 @@ pub(crate) fn shared_unreachable(ui: &Rc<Ui>) {
     shared_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -554,9 +560,10 @@ pub(crate) fn repaint_shared(
         shared_status(
             ui,
             "emblem-shared-symbolic",
-            "Nothing Shared with You",
-            "Files and folders other people share with you appear here. Public links \
-             you bookmark are kept here too.",
+            &gettext("Nothing Shared with You"),
+            &gettext(
+                "Files and folders other people share with you appear here. Public links you bookmark are kept here too.",
+            ),
             false,
         );
         return;
@@ -570,10 +577,10 @@ pub(crate) fn repaint_shared(
     // The list only needs a heading when another section sits beside it.
     ui.shared
         .with_me_group
-        .set_title(if invitations.is_empty() && bookmarks.is_empty() {
-            ""
+        .set_title(&if invitations.is_empty() && bookmarks.is_empty() {
+            String::new()
         } else {
-            "Shared with you"
+            gettext("Shared with you")
         });
     ui.shared
         .invitations_group
@@ -588,13 +595,11 @@ pub(crate) fn repaint_shared(
 
     // Invitations: inviter + item, Accept / Reject.
     for inv in invitations {
-        let item = inv
-            .name
-            .clone()
-            .unwrap_or_else(|| "a shared item".to_string());
+        let item = inv.name.clone().unwrap_or_else(|| gettext("a shared item"));
         let row = adw::ActionRow::builder()
             .title(&item)
-            .subtitle(format!("From {}", inv.inviter_email))
+            // Translators: {email} is the address of the person who sent the invitation.
+            .subtitle(gettext_f("From {email}", &[("email", &inv.inviter_email)]))
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name(if inv.is_dir {
             "folder-symbolic"
@@ -603,12 +608,12 @@ pub(crate) fn repaint_shared(
         }));
         let reject = gtk4::Button::builder()
             .icon_name("window-close-symbolic")
-            .tooltip_text("Reject")
+            .tooltip_text(gettext("Reject"))
             .valign(gtk4::Align::Center)
             .build();
         reject.add_css_class("flat");
         let accept = gtk4::Button::builder()
-            .label("Accept")
+            .label(gettext("Accept"))
             .valign(gtk4::Align::Center)
             .build();
         accept.add_css_class("suggested-action");
@@ -620,15 +625,19 @@ pub(crate) fn repaint_shared(
         });
         let ui_rej = ui.clone();
         let id_rej = inv.id.clone();
-        let name_rej = inv.name.clone().unwrap_or_else(|| "this item".into());
+        let name_rej = inv.name.clone().unwrap_or_else(|| gettext("this item"));
         reject.connect_clicked(move |btn| {
             let ui = ui_rej.clone();
             let id = id_rej.clone();
             confirm_destructive(
                 btn,
-                "Reject Invitation?",
-                &format!("You won't have access to {name_rej} unless it is shared again."),
-                "Reject",
+                &gettext("Reject Invitation?"),
+                // Translators: {name} is the shared item's name, or "this item".
+                &gettext_f(
+                    "You won't have access to {name} unless it is shared again.",
+                    &[("name", &name_rej)],
+                ),
+                &gettext("Reject"),
                 move || respond_invitation(&ui, &id, false),
             );
         });
@@ -640,7 +649,7 @@ pub(crate) fn repaint_shared(
 
     // Bookmarks: name/URL, Open / Remove.
     for bm in bookmarks {
-        let title = bm.name.clone().unwrap_or_else(|| "Shared link".to_string());
+        let title = bm.name.clone().unwrap_or_else(|| gettext("Shared link"));
         let row = adw::ActionRow::builder()
             .title(&title)
             .subtitle(&bm.url)
@@ -648,13 +657,13 @@ pub(crate) fn repaint_shared(
         row.add_prefix(&gtk4::Image::from_icon_name("emblem-symbolic-link"));
         let remove = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove bookmark")
+            .tooltip_text(gettext("Remove bookmark"))
             .valign(gtk4::Align::Center)
             .build();
         remove.add_css_class("flat");
         let open = gtk4::Button::builder()
             .icon_name("external-link-symbolic")
-            .tooltip_text("Open in browser")
+            .tooltip_text(gettext("Open in browser"))
             .valign(gtk4::Align::Center)
             .build();
         open.add_css_class("flat");
@@ -681,24 +690,32 @@ pub(crate) fn respond_invitation(ui: &Rc<Ui>, id: &str, accept: bool) {
         Request::RejectInvitation { id: id.to_string() }
     };
     let (done, failed) = if accept {
-        ("Invitation accepted", "Couldn't accept the invitation")
+        (
+            gettext("Invitation accepted"),
+            gettext("Couldn't accept the invitation"),
+        )
     } else {
-        ("Invitation rejected", "Couldn't reject the invitation")
+        (
+            gettext("Invitation rejected"),
+            gettext("Couldn't reject the invitation"),
+        )
     };
-    run_shared_mutation(ui, req, done, failed);
+    run_shared_mutation(ui, req, &done, &failed);
 }
 
 /// Confirm, then leave a node shared with me.
 pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Leave shared item")
-        .body(format!(
-            "Leave “{name}”? You'll lose access until you're invited again."
+        .heading(gettext("Leave shared item"))
+        // Translators: {name} is the shared item's name.
+        .body(gettext_f(
+            "Leave “{name}”? You'll lose access until you're invited again.",
+            &[("name", name)],
         ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("leave", "Leave");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("leave", &pgettext("verb", "Leave"));
     dialog.set_response_appearance("leave", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -709,8 +726,8 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
             run_shared_mutation(
                 &ui,
                 Request::LeaveShared { uid: uid.clone() },
-                "Left shared item",
-                "Couldn't leave the shared item",
+                &gettext("Left shared item"),
+                &gettext("Couldn't leave the shared item"),
             );
         }
     });
@@ -721,11 +738,15 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
 pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Remove bookmark")
-        .body(format!("Remove the bookmark for “{name}”?"))
+        .heading(gettext("Remove bookmark"))
+        // Translators: {name} is the bookmark's name.
+        .body(gettext_f(
+            "Remove the bookmark for “{name}”?",
+            &[("name", name)],
+        ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("remove", "Remove");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("remove", &gettext("Remove"));
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -738,8 +759,8 @@ pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
                 Request::DeleteBookmark {
                     token: token.clone(),
                 },
-                "Bookmark removed",
-                "Couldn't remove the bookmark",
+                &gettext("Bookmark removed"),
+                &gettext("Couldn't remove the bookmark"),
             );
         }
     });
@@ -750,23 +771,23 @@ pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
 pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Add bookmark")
-        .body("Paste a Proton Drive public link to save it here.")
+        .heading(gettext("Add bookmark"))
+        .body(gettext("Paste a Proton Drive public link to save it here."))
         .build();
     let group = adw::PreferencesGroup::new();
     let url_row = adw::EntryRow::builder()
-        .title("Public link URL")
+        .title(gettext("Public link URL"))
         .activates_default(true)
         .build();
     let pw_row = adw::PasswordEntryRow::builder()
-        .title("Password (if the link has one)")
+        .title(gettext("Password (if the link has one)"))
         .activates_default(true)
         .build();
     group.add(&url_row);
     group.add(&pw_row);
     dialog.set_extra_child(Some(&group));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("add", "Add");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("add", &gettext("Add"));
     dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("add"));
     dialog.set_close_response("cancel");
@@ -777,7 +798,11 @@ pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
         }
         let url = url_row.text().trim().to_string();
         if url.is_empty() {
-            toast_error(&ui, "Couldn't add bookmark", "A URL is required.");
+            toast_error(
+                &ui,
+                &gettext("Couldn't add bookmark"),
+                &gettext("A URL is required."),
+            );
             return;
         }
         let pw = pw_row.text().to_string();
@@ -785,24 +810,20 @@ pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
         run_shared_mutation(
             &ui,
             Request::CreateBookmark { url, password },
-            "Bookmark saved",
-            "Couldn't add the bookmark",
+            &gettext("Bookmark saved"),
+            &gettext("Couldn't add the bookmark"),
         );
     });
     dialog.present(win.as_ref());
 }
 
 /// Run a mutation raised from the Shared page and reload the page on success.
-pub(crate) fn run_shared_mutation(
-    ui: &Rc<Ui>,
-    req: Request,
-    done: &'static str,
-    failed: &'static str,
-) {
+pub(crate) fn run_shared_mutation(ui: &Rc<Ui>, req: Request, done: &str, failed: &str) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();
     let done = done.to_string();
+    let failed = failed.to_string();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
@@ -811,8 +832,10 @@ pub(crate) fn run_shared_mutation(
                 load_shared(&ui);
                 toast(&ui, &done);
             }
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
-            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
         }
     });
 }
@@ -868,9 +891,9 @@ mod tests {
 
     #[test]
     fn a_role_pill_says_what_it_allows() {
-        assert_eq!(role_access("viewer"), Some("Can view"));
-        assert_eq!(role_access("editor"), Some("Can edit"));
-        assert_eq!(role_access("admin"), Some("Can manage"));
+        assert_eq!(role_access("viewer").as_deref(), Some("Can view"));
+        assert_eq!(role_access("editor").as_deref(), Some("Can edit"));
+        assert_eq!(role_access("admin").as_deref(), Some("Can manage"));
         assert_eq!(role_access(""), None);
     }
 

@@ -40,8 +40,8 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
         albums_status(
             ui,
             "view-grid-symbolic",
-            "Loading albums…",
-            "Reading your Proton Drive albums.",
+            &gettext("Loading albums…"),
+            &gettext("Reading your Proton Drive albums."),
         );
     }
 
@@ -56,33 +56,33 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
             })) => albums_status(
                 &ui,
                 "image-missing-symbolic",
-                "No photo library",
-                "This Proton account doesn't have Photos enabled.",
+                &gettext("No photo library"),
+                &gettext("This Proton account doesn't have Photos enabled."),
             ),
             Ok(Ok(Response::Albums { items, .. })) if items.is_empty() => albums_status(
                 &ui,
                 "view-grid-symbolic",
-                "No albums",
-                "Create one with New Album, or in Proton Photos.",
+                &gettext("No albums"),
+                &gettext("Create one with New Album, or in Proton Photos."),
             ),
             Ok(Ok(Response::Albums { items, .. })) => {
                 fill_albums(&ui, &items);
                 ui.gallery.albums_stack.set_visible_child_name("grid");
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't load albums", &message, kind);
+                toast_failure(&ui, &gettext("Couldn't load albums"), &message, kind);
                 albums_status(
                     &ui,
                     "dialog-warning-symbolic",
-                    "Couldn't load albums",
+                    &gettext("Couldn't load albums"),
                     &message,
                 );
             }
             Ok(Ok(_)) | Ok(Err(_)) | Err(_) => albums_status(
                 &ui,
                 "network-offline-symbolic",
-                "Not connected",
-                "The Proton Drive mount service didn't respond.",
+                &gettext("Not connected"),
+                &gettext("The Proton Drive mount service didn't respond."),
             ),
         }
     });
@@ -102,9 +102,12 @@ fn fill_albums(ui: &Rc<Ui>, albums: &[AlbumInfo]) {
     }
     *ui.gallery.album_list.borrow_mut() = albums.to_vec();
     if ui.gallery.album.borrow().is_none() {
-        ui.gallery
-            .title
-            .set_subtitle(&count_noun(albums.len(), "album", "albums"));
+        ui.gallery.title.set_subtitle(&ngettext_f(
+            "{n} album",
+            "{n} albums",
+            albums.len() as u64,
+            &[],
+        ));
     }
     for album in albums {
         ui.gallery.albums.append(&album_card(ui, album));
@@ -199,14 +202,18 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
 fn show_album_menu(ui: &Rc<Ui>, album: &AlbumInfo, anchor: &gtk4::Widget, x: f64, y: f64) {
     let mut menu = ActionMenu::new();
     let (ui_c, album_c) = (ui.clone(), album.clone());
-    menu.item("Open", move || open_album(&ui_c, album_c.clone()));
+    menu.item(&pgettext("verb", "Open"), move || {
+        open_album(&ui_c, album_c.clone())
+    });
     if !album.shared {
         menu.section();
         let (ui_c, album_c) = (ui.clone(), album.clone());
-        menu.item("Rename…", move || prompt_rename_album(&ui_c, &album_c));
+        menu.item(&gettext("Rename…"), move || {
+            prompt_rename_album(&ui_c, &album_c)
+        });
         menu.section();
         let (ui_c, album_c) = (ui.clone(), album.clone());
-        menu.item("Delete Album…", move || {
+        menu.item(&gettext("Delete Album…"), move || {
             confirm_delete_album(&ui_c, &album_c)
         });
     }
@@ -226,13 +233,13 @@ fn prompt_album_name(
     let dialog = adw::AlertDialog::builder().heading(heading).build();
     let group = adw::PreferencesGroup::new();
     let row = adw::EntryRow::builder()
-        .title("Album name")
+        .title(gettext("Album name"))
         .activates_default(true)
         .build();
     row.set_text(current);
     group.add(&row);
     dialog.set_extra_child(Some(&group));
-    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("cancel", &gettext("Cancel"));
     dialog.add_response("ok", action);
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
     dialog.set_response_enabled("ok", !current.trim().is_empty());
@@ -254,7 +261,8 @@ fn prompt_album_name(
 /// Ask for a name and create an album, then add `photos` to it, if any.
 pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
     let ui_c = ui.clone();
-    prompt_album_name(ui, "New Album", "Create", "", move |name| {
+    let (heading, action) = (gettext("New Album"), gettext("Create"));
+    prompt_album_name(ui, &heading, &action, "", move |name| {
         let rx = spawn_request(ui_c.dirs.control_socket(), Request::CreateAlbum { name });
         let ui = ui_c.clone();
         let photos = photos.clone();
@@ -265,19 +273,19 @@ pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
             match reply {
                 Ok(Ok(Response::AlbumCreated { uid })) => {
                     if photos.is_empty() {
-                        toast(&ui, "Album created");
+                        toast(&ui, &gettext("Album created"));
                         reload_album_grid(&ui);
                     } else {
                         add_to_album(&ui, uid, photos);
                     }
                 }
                 Ok(Ok(Response::Error { message, kind })) => {
-                    toast_failure(&ui, "Couldn't create the album", &message, kind)
+                    toast_failure(&ui, &gettext("Couldn't create the album"), &message, kind)
                 }
                 _ => toast_error(
                     &ui,
-                    "Couldn't create the album",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't create the album"),
+                    &gettext("The mount service didn't respond."),
                 ),
             }
         });
@@ -286,15 +294,16 @@ pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
 
 fn prompt_rename_album(ui: &Rc<Ui>, album: &AlbumInfo) {
     let (ui_c, uid) = (ui.clone(), album.uid.clone());
-    prompt_album_name(ui, "Rename Album", "Rename", &album.name, move |name| {
+    let (heading, action) = (gettext("Rename Album"), gettext("Rename"));
+    prompt_album_name(ui, &heading, &action, &album.name, move |name| {
         run_album_request(
             &ui_c,
             Request::RenameAlbum {
                 uid: uid.clone(),
                 name,
             },
-            "Album renamed",
-            "Couldn't rename the album",
+            gettext("Album renamed"),
+            gettext("Couldn't rename the album"),
         );
     });
 }
@@ -304,12 +313,13 @@ fn confirm_delete_album(ui: &Rc<Ui>, album: &AlbumInfo) {
     let (ui_c, uid) = (ui.clone(), album.uid.clone());
     confirm_destructive(
         &win,
-        "Delete Album?",
-        &format!(
-            "“{}” is deleted. Its photos stay in your timeline.",
-            album.name
+        &gettext("Delete Album?"),
+        // Translators: {name} is the album's name.
+        &gettext_f(
+            "“{name}” is deleted. Its photos stay in your timeline.",
+            &[("name", &album.name)],
         ),
-        "Delete",
+        &gettext("Delete"),
         move || {
             run_album_request(
                 &ui_c,
@@ -317,15 +327,15 @@ fn confirm_delete_album(ui: &Rc<Ui>, album: &AlbumInfo) {
                     uid: uid.clone(),
                     delete_photos: false,
                 },
-                "Album deleted",
-                "Couldn't delete the album",
+                gettext("Album deleted"),
+                gettext("Couldn't delete the album"),
             )
         },
     );
 }
 
 /// Send an album rename or delete and refresh the grid once it lands.
-fn run_album_request(ui: &Rc<Ui>, request: Request, done: &'static str, failed: &'static str) {
+fn run_album_request(ui: &Rc<Ui>, request: Request, done: String, failed: String) {
     let rx = spawn_request(ui.dirs.control_socket(), request);
     let ui = ui.clone();
     ui.busy_begin();
@@ -334,11 +344,13 @@ fn run_album_request(ui: &Rc<Ui>, request: Request, done: &'static str, failed: 
         ui.busy_end();
         match reply {
             Ok(Ok(Response::Ok { .. })) => {
-                toast(&ui, done);
+                toast(&ui, &done);
                 reload_album_grid(&ui);
             }
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
-            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
         }
     });
 }
@@ -360,14 +372,14 @@ pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
                 items.into_iter().filter(|album| !album.shared).collect()
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't load albums", &message, kind);
+                toast_failure(&ui, &gettext("Couldn't load albums"), &message, kind);
                 return;
             }
             _ => {
                 toast_error(
                     &ui,
-                    "Couldn't load albums",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't load albums"),
+                    &gettext("The mount service didn't respond."),
                 );
                 return;
             }
@@ -396,15 +408,20 @@ pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
             .child(&list)
             .build();
         let dialog = adw::AlertDialog::builder()
-            .heading("Add to Album")
+            .heading(gettext("Add to Album"))
             .body(match photos.len() {
-                1 => "Choose an album for this photo.".to_string(),
-                n => format!("Choose an album for {n} photos."),
+                1 => gettext("Choose an album for this photo."),
+                n => ngettext_f(
+                    "Choose an album for {n} photo.",
+                    "Choose an album for {n} photos.",
+                    n as u64,
+                    &[],
+                ),
             })
             .extra_child(&scroll)
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("new", "New Album…");
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("new", &gettext("New Album…"));
         dialog.set_close_response("cancel");
 
         let (ui_c, dialog_c, photos_c) = (ui.clone(), dialog.clone(), photos.clone());
@@ -435,25 +452,31 @@ fn add_to_album(ui: &Rc<Ui>, album: String, photos: Vec<String>) {
         match reply {
             Ok(Ok(Response::AlbumChanged { changed, failed })) => {
                 if let Some(failure) = failed.first() {
-                    toast_error(&ui, "Some photos couldn't be added", &failure.message);
+                    toast_error(
+                        &ui,
+                        &gettext("Some photos couldn't be added"),
+                        &failure.message,
+                    );
                 } else {
                     toast(
                         &ui,
-                        &format!(
-                            "Added {} to the album",
-                            count_noun(changed.len(), "photo", "photos")
+                        &ngettext_f(
+                            "Added {n} photo to the album",
+                            "Added {n} photos to the album",
+                            changed.len() as u64,
+                            &[],
                         ),
                     );
                 }
                 reload_album_grid(&ui);
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't add to the album", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't add to the album"), &message, kind)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't add to the album",
-                "The mount service didn't respond.",
+                &gettext("Couldn't add to the album"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -487,7 +510,7 @@ pub(crate) fn remove_from_album(ui: &Rc<Ui>, album: &AlbumInfo, photos: Vec<Stri
                     restore_photos(&ui, kept);
                     toast_error(
                         &ui,
-                        "Some photos couldn't be removed from the album",
+                        &gettext("Some photos couldn't be removed from the album"),
                         &failed[0].message,
                     );
                 }
@@ -503,22 +526,29 @@ pub(crate) fn remove_from_album(ui: &Rc<Ui>, album: &AlbumInfo, photos: Vec<Stri
                 drop(open);
                 toast(
                     &ui,
-                    &format!(
-                        "Removed {} from the album",
-                        count_noun(changed.len(), "photo", "photos")
+                    &ngettext_f(
+                        "Removed {n} photo from the album",
+                        "Removed {n} photos from the album",
+                        changed.len() as u64,
+                        &[],
                     ),
                 );
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 restore_photos(&ui, removed);
-                toast_failure(&ui, "Couldn't remove from the album", &message, kind)
+                toast_failure(
+                    &ui,
+                    &gettext("Couldn't remove from the album"),
+                    &message,
+                    kind,
+                )
             }
             _ => {
                 restore_photos(&ui, removed);
                 toast_error(
                     &ui,
-                    "Couldn't remove from the album",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't remove from the album"),
+                    &gettext("The mount service didn't respond."),
                 )
             }
         }
@@ -527,14 +557,16 @@ pub(crate) fn remove_from_album(ui: &Rc<Ui>, album: &AlbumInfo, photos: Vec<Stri
 
 /// "12 photos", plus where the album came from when it isn't ours.
 fn album_subtitle(album: &AlbumInfo) -> String {
-    let photos = match album.photo_count {
-        1 => "1 photo".to_string(),
-        n => format!("{n} photos"),
-    };
+    let count = album.photo_count as u64;
     if album.shared {
-        format!("{photos} · shared with me")
+        ngettext_f(
+            "{n} photo · shared with me",
+            "{n} photos · shared with me",
+            count,
+            &[],
+        )
     } else {
-        photos
+        ngettext_f("{n} photo", "{n} photos", count, &[])
     }
 }
 
@@ -588,7 +620,7 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
     if ui.gallery.album.borrow_mut().take().is_none() {
         return;
     }
-    ui.gallery.title.set_title("Photos");
+    ui.gallery.title.set_title(&gettext("Photos"));
     ui.gallery.view_switch.set_visible(true);
     ui.gallery.upload.set_visible(true);
     ui.gallery.back.set_visible(false);
@@ -638,9 +670,11 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
     ui.gallery.back.clone().connect_clicked(move |_| {
         show_album_grid(&ui_back);
         let count = ui_back.gallery.album_list.borrow().len();
-        ui_back
-            .gallery
-            .title
-            .set_subtitle(&count_noun(count, "album", "albums"));
+        ui_back.gallery.title.set_subtitle(&ngettext_f(
+            "{n} album",
+            "{n} albums",
+            count as u64,
+            &[],
+        ));
     });
 }

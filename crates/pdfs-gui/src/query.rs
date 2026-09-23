@@ -17,7 +17,7 @@ use pdfs_core::control::{
 use pdfs_core::opener::{self, OpenWith};
 
 use crate::activation::{DriveActivation, drive_activation, mounted_or_relative, mounted_target};
-use crate::{Hit, file_name, is_document, is_image, is_media, rank_hits};
+use crate::{Hit, file_name, gettext_f, is_document, is_image, is_media, rank_hits};
 
 /// Where the mount lives, for turning a Drive path into something an
 /// application can open. Falls back to the configured default so a momentarily
@@ -164,7 +164,13 @@ pub(crate) fn open(
 /// One control-socket round-trip, with the daemon-is-down case phrased for a
 /// terminal rather than a status page.
 pub(crate) fn request(socket: &Path, request: Request) -> Result<Response, String> {
-    send(socket, &request).map_err(|e| format!("cannot reach the Proton Drive daemon: {e}"))
+    send(socket, &request).map_err(|e| {
+        // Translators: shown as a row in the search list; {error} is a system error, in English.
+        gettext_f(
+            "cannot reach the Proton Drive daemon: {error}",
+            &[("error", &e.to_string())],
+        )
+    })
 }
 
 #[cfg(test)]

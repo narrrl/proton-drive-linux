@@ -1,5 +1,7 @@
 #[path = "../activation.rs"]
 pub(crate) mod activation;
+#[path = "../i18n.rs"]
+pub(crate) mod i18n;
 pub(crate) mod pages;
 pub(crate) mod widgets;
 
@@ -22,6 +24,8 @@ use widgets::menu::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
+
+pub(crate) use i18n::{gettext, gettext_f, gettext_noop, ngettext_f, pgettext};
 
 use std::cell::{Cell, RefCell};
 
@@ -52,8 +56,7 @@ use pdfs_core::control::{
     DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem,
     PhotoKind, PhotoMonth, PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder,
     RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo,
-    SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem,
-    pending_summary, send,
+    SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -195,6 +198,7 @@ fn main() -> glib::ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    i18n::init();
 
     // The tray launches the app with arguments ("--page locations",
     // "--confirm-stop"), which a running instance must receive too.
@@ -444,6 +448,7 @@ fn build_window(app: &adw::Application) {
             mountpoint_row: main_widgets.mountpoint_row.clone(),
             accent_row: main_widgets.accent_row.clone(),
             tray_row: main_widgets.tray_row.clone(),
+            language_row: main_widgets.language_row.clone(),
             settings_suppress: Cell::new(false),
             budget_source: RefCell::new(None),
             limit_source: RefCell::new(None),
@@ -819,14 +824,35 @@ fn build_window(app: &adw::Application) {
 /// come first; the rows from [`SIDEBAR_SYNC_SECTION`] on are about this computer's
 /// sync, set off by a separator.
 const DESTINATIONS: [(&str, &str, &str); 8] = [
-    ("browser", "My files", "folder-symbolic"),
-    ("gallery", "Photos", "image-x-generic-symbolic"),
-    ("shared", "Shared with me", "system-users-symbolic"),
-    ("sharedbyme", "Shared by me", "emblem-shared-symbolic"),
-    ("devices", "Computers", "computer-symbolic"),
-    ("trash", "Trash", "user-trash-symbolic"),
-    ("locations", "Sync", "emblem-synchronizing-symbolic"),
-    ("activity", "Activity", "document-open-recent-symbolic"),
+    ("browser", gettext_noop("My files"), "folder-symbolic"),
+    (
+        "gallery",
+        gettext_noop("Photos"),
+        "image-x-generic-symbolic",
+    ),
+    (
+        "shared",
+        gettext_noop("Shared with me"),
+        "system-users-symbolic",
+    ),
+    (
+        "sharedbyme",
+        gettext_noop("Shared by me"),
+        "emblem-shared-symbolic",
+    ),
+    ("devices", gettext_noop("Computers"), "computer-symbolic"),
+    ("trash", gettext_noop("Trash"), "user-trash-symbolic"),
+    // Translators: sidebar entry for the page listing this computer's synced folders.
+    (
+        "locations",
+        gettext_noop("Sync"),
+        "emblem-synchronizing-symbolic",
+    ),
+    (
+        "activity",
+        gettext_noop("Activity"),
+        "document-open-recent-symbolic",
+    ),
 ];
 
 /// Index of the first row in the sidebar's sync section.
@@ -842,7 +868,7 @@ fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
     for (_, label, icon) in DESTINATIONS {
         let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         row_box.append(&gtk4::Image::from_icon_name(icon));
-        row_box.append(&gtk4::Label::new(Some(label)));
+        row_box.append(&gtk4::Label::new(Some(&gettext(label))));
         let row = gtk4::ListBoxRow::builder().child(&row_box).build();
         list.append(&row);
     }
@@ -970,7 +996,7 @@ fn page_fresh(loaded_at: &Cell<Option<Instant>>) -> bool {
 fn refresh_button() -> gtk4::Button {
     let button = gtk4::Button::builder()
         .icon_name("view-refresh-symbolic")
-        .tooltip_text("Refresh (F5)")
+        .tooltip_text(gettext("Refresh (F5)"))
         .valign(gtk4::Align::Center)
         .build();
     button.add_css_class("flat");
@@ -1110,12 +1136,6 @@ fn sync_sidebar(ui: &Rc<Ui>) {
     }
 }
 
-/// "1 item" / "5 items": a count with the noun form that agrees with it, so
-/// no user-facing string has to fall back to "item(s)".
-fn count_noun(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
 /// Show a transient toast. Non-blocking by design: an action's outcome is
 /// reported without stealing focus or forcing a click, so the user can keep
 /// working while a slow upload lands.
@@ -1147,7 +1167,10 @@ fn toast_error(ui: &Rc<Ui>, what: &str, detail: &str) {
     let message = if detail.is_empty() {
         what.to_string()
     } else {
-        format!("{what}: {detail}")
+        // Translators: a failed action's toast. {what} says what failed, such as
+        // "Couldn't rename"; {detail} is the reason, usually untranslated text
+        // from the mount service.
+        gettext_f("{what}: {detail}", &[("what", what), ("detail", detail)])
     };
     tracing::warn!("{message}");
     let toast = adw::Toast::builder().title(&message).timeout(6).build();
@@ -1166,13 +1189,32 @@ fn toast_error(ui: &Rc<Ui>, what: &str, detail: &str) {
 /// used where the class carries no better wording than the caller already has.
 fn error_headline(kind: ErrorKind, fallback: &str) -> &str {
     match kind {
-        ErrorKind::Offline => "You're offline",
-        ErrorKind::NotFound => "That's not there any more",
-        ErrorKind::Denied => "You don't have access to that",
-        ErrorKind::Conflict => "Something changed this first",
-        ErrorKind::Quota => "Your Proton Drive is full",
+        ErrorKind::Offline => static_gettext(gettext_noop("You're offline")),
+        ErrorKind::NotFound => static_gettext(gettext_noop("That's not there any more")),
+        ErrorKind::Denied => static_gettext(gettext_noop("You don't have access to that")),
+        ErrorKind::Conflict => static_gettext(gettext_noop("Something changed this first")),
+        ErrorKind::Quota => static_gettext(gettext_noop("Your Proton Drive is full")),
         ErrorKind::Invalid | ErrorKind::Remote | ErrorKind::Internal => fallback,
     }
+}
+
+thread_local! {
+    /// Translations handed out by [`static_gettext`], one per msgid.
+    static STATIC_TRANSLATIONS: RefCell<HashMap<&'static str, &'static str>> =
+        RefCell::new(HashMap::new());
+}
+
+/// [`gettext`] for a helper that has to return `&'static str`. The language is
+/// fixed for the life of the process, so each msgid is translated once and the
+/// result kept; the set of msgids is a handful of literals, so the kept strings
+/// are bounded.
+fn static_gettext(msgid: &'static str) -> &'static str {
+    STATIC_TRANSLATIONS.with(|cache| {
+        *cache
+            .borrow_mut()
+            .entry(msgid)
+            .or_insert_with(|| Box::leak(gettext(msgid).into_boxed_str()))
+    })
 }
 
 /// Report a failed request, letting its class pick the wording.
@@ -1192,12 +1234,15 @@ fn toast_failure(ui: &Rc<Ui>, what: &str, message: &str, kind: ErrorKind) {
 /// belong on any one page.
 fn build_primary_menu() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
-    menu.append(Some("Preferences"), Some("win.preferences"));
-    menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
-    menu.append(Some("About Proton Drive for Linux"), Some("win.about"));
+    menu.append(Some(&gettext("Preferences")), Some("win.preferences"));
+    menu.append(Some(&gettext("Keyboard Shortcuts")), Some("win.shortcuts"));
+    menu.append(
+        Some(&gettext("About Proton Drive for Linux")),
+        Some("win.about"),
+    );
     gtk4::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .tooltip_text("Main menu")
+        .tooltip_text(gettext("Main menu"))
         .primary(true)
         .menu_model(&menu)
         .build()
@@ -1243,20 +1288,23 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     let ui_about = ui.clone();
     about.connect_activate(move |_, _| {
         let dialog = adw::AboutDialog::builder()
-            .application_name("Proton Drive for Linux")
+            .application_name(gettext("Proton Drive for Linux"))
             .application_icon("io.narl.proton-drive-linux")
             .version(pdfs_core::config::APP_VERSION)
             .developer_name("Nils Pukropp")
             .website("https://github.com/narrrl/proton-drive-linux")
             .issue_url("https://github.com/narrrl/proton-drive-linux/issues")
             .license_type(gtk4::License::MitX11)
-            .comments(
-                "Files-on-demand Proton Drive for the Linux desktop.\n\n\
-                 Unofficial client — not affiliated with, endorsed by, or supported by Proton AG.",
-            )
+            .comments(gettext("Files-on-demand Proton Drive for the Linux desktop.\n\nUnofficial client — not affiliated with, endorsed by, or supported by Proton AG."))
             .debug_info(debug_info(&ui_about))
             .debug_info_filename("proton-drive-linux-debug.txt")
             .build();
+        // Translators: replace with your name(s) and email address(es), one
+        // per line, to be credited in the About dialog.
+        let credits = gettext("translator-credits");
+        if credits != "translator-credits" {
+            dialog.set_translator_credits(&credits);
+        }
         dialog.present(Some(&win));
     });
     window.add_action(&about);
@@ -1284,14 +1332,11 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
     let ui_stop = ui.clone();
     confirm_stop.connect_activate(move |_, _| {
         let dialog = adw::AlertDialog::builder()
-            .heading("Stop Proton Drive?")
-            .body(
-                "The drive unmounts and nothing syncs until you connect again. \
-                 Proton Drive starts again at your next login.",
-            )
+            .heading(gettext("Stop Proton Drive?"))
+            .body(gettext("The drive unmounts and nothing syncs until you connect again. Proton Drive starts again at your next login."))
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("stop", "Stop");
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("stop", &pgettext("verb", "Stop"));
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -1308,8 +1353,8 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
                 } else {
                     toast_error(
                         &ui,
-                        "Couldn't stop Proton Drive",
-                        "The mount service did not stop.",
+                        &gettext("Couldn't stop Proton Drive"),
+                        &gettext("The mount service did not stop."),
                     );
                 }
             });
@@ -1345,53 +1390,55 @@ fn debug_info(ui: &Rc<Ui>) -> String {
 fn show_shortcuts(window: &adw::ApplicationWindow) {
     const GROUPS: [(&str, &[(&str, &str)]); 4] = [
         (
-            "General",
+            gettext_noop("General"),
             &[
-                ("<Control>f", "Search Drive"),
-                ("F5", "Refresh"),
-                ("<Control>comma", "Preferences"),
-                ("<Control>question", "Keyboard shortcuts"),
+                ("<Control>f", gettext_noop("Search Drive")),
+                ("F5", gettext_noop("Refresh")),
+                ("<Control>comma", gettext_noop("Preferences")),
+                ("<Control>question", gettext_noop("Keyboard shortcuts")),
             ],
         ),
         (
-            "Files",
+            gettext_noop("Files"),
             &[
-                ("<Control>n", "New folder"),
-                ("<Control>u", "Upload files"),
-                ("<Alt>Left <Alt>Right", "Back / forward"),
-                ("<Alt>Up", "Parent folder"),
-                ("<Control>1 <Control>2", "Grid / list"),
-                ("F2", "Rename"),
-                ("Delete", "Move to Trash"),
-                ("Escape", "Clear the selection"),
+                ("<Control>n", gettext_noop("New folder")),
+                ("<Control>u", gettext_noop("Upload files")),
+                ("<Alt>Left <Alt>Right", gettext_noop("Back / forward")),
+                ("<Alt>Up", gettext_noop("Parent folder")),
+                ("<Control>1 <Control>2", gettext_noop("Grid / list")),
+                ("F2", gettext_noop("Rename")),
+                ("Delete", gettext_noop("Move to Trash")),
+                ("Escape", gettext_noop("Clear the selection")),
             ],
         ),
         (
-            "Photos",
+            gettext_noop("Photos"),
             &[
-                ("<Control>plus", "Larger thumbnails"),
-                ("<Control>minus", "Smaller thumbnails"),
-                ("<Control>0", "Reset thumbnail size"),
-                ("<Control>a", "Select all"),
+                ("<Control>plus", gettext_noop("Larger thumbnails")),
+                ("<Control>minus", gettext_noop("Smaller thumbnails")),
+                ("<Control>0", gettext_noop("Reset thumbnail size")),
+                ("<Control>a", gettext_noop("Select all")),
             ],
         ),
         (
-            "Photo Viewer",
+            gettext_noop("Photo Viewer"),
             &[
-                ("Left Right", "Previous / next photo"),
-                ("Home End", "First / last photo"),
-                ("i", "Show details"),
-                ("f", "Fullscreen"),
-                ("Delete", "Move to Trash"),
-                ("Escape", "Close"),
+                ("Left Right", gettext_noop("Previous / next photo")),
+                ("Home End", gettext_noop("First / last photo")),
+                ("i", gettext_noop("Show details")),
+                ("f", gettext_noop("Fullscreen")),
+                ("Delete", gettext_noop("Move to Trash")),
+                ("Escape", gettext_noop("Close")),
             ],
         ),
     ];
     let page = adw::PreferencesPage::new();
     for (title, keys) in GROUPS {
-        let group = adw::PreferencesGroup::builder().title(title).build();
+        let group = adw::PreferencesGroup::builder()
+            .title(gettext(title))
+            .build();
         for (accel, action) in keys {
-            let row = adw::ActionRow::builder().title(*action).build();
+            let row = adw::ActionRow::builder().title(gettext(action)).build();
             row.add_suffix(
                 &gtk4::ShortcutLabel::builder()
                     .accelerator(*accel)
@@ -1404,7 +1451,7 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
     }
 
     let dialog = adw::Dialog::builder()
-        .title("Keyboard Shortcuts")
+        .title(gettext("Keyboard Shortcuts"))
         .content_width(460)
         .content_height(620)
         .child(&{
@@ -1484,7 +1531,7 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 // Renaming is one name at a time; saying so beats a key that
                 // silently does nothing with several items highlighted.
                 if selected_entries(&ui).len() > 1 {
-                    toast(&ui, "Select a single item to rename it");
+                    toast(&ui, &gettext("Select a single item to rename it"));
                 } else if let Some(entry) = selected_entry(&ui) {
                     prompt_rename(&ui, &entry);
                 }
@@ -1561,7 +1608,7 @@ fn confirm_destructive(
         .heading(heading)
         .body(body)
         .build();
-    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("cancel", &gettext("Cancel"));
     dialog.add_response("confirm", action);
     dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
@@ -1608,23 +1655,15 @@ pub(crate) fn open_named_path(path: &str, name: &str) {
     pdfs_core::opener::open_default_named(Path::new(path), name, false);
 }
 
-/// Format a byte count as a short binary-unit string (e.g. `1.2 GiB`).
+/// Format a byte count as a short binary-unit string (e.g. `1.2 GiB`, or
+/// `512 bytes` below one KiB).
+///
+/// GLib does the formatting, so the units, the plural of "bytes" and the
+/// decimal separator follow the user's language from GLib's own catalog. GLib
+/// separates number and unit with a no-break space; it is turned back into a
+/// plain space so the text matches what the rest of the UI builds around it.
 fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes == 0 {
-        return "0 B".into();
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    glib::format_size_full(bytes, glib::FormatSizeFlags::IEC_UNITS).replace('\u{a0}', " ")
 }
 
 #[cfg(test)]

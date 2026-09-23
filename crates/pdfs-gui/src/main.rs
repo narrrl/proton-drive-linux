@@ -21,10 +21,11 @@ use ksni::menu::StandardItem;
 use ksni::{MenuItem, Status, ToolTip, Tray};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{
-    JobItem, Request, Response, TransferDirection, TransferItem, pending_summary, send,
-};
+use pdfs_core::control::{JobItem, Request, Response, TransferDirection, TransferItem, send};
 use pdfs_core::service;
+
+mod i18n;
+use i18n::{gettext, gettext_f, ngettext_f};
 
 /// How often the tray re-polls the daemon to refresh its menu.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -89,7 +90,14 @@ struct DriveState {
 fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
     match items {
         [] => match jobs.first() {
-            Some(j) if j.total > 0 => format!("{} ({} of {})", j.title, j.done, j.total),
+            Some(j) if j.total > 0 => {
+                let (done, total) = (j.done.to_string(), j.total.to_string());
+                // Translators: {title} names a running job such as a scan; {done} and {total} are counts.
+                gettext_f(
+                    "{title} ({done} of {total})",
+                    &[("title", &j.title), ("done", &done), ("total", &total)],
+                )
+            }
             Some(j) => format!("{}…", j.title),
             None => String::new(),
         },
@@ -112,8 +120,10 @@ fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
                 .count();
             let up = items.len() - down;
             match (down, up) {
-                (d, 0) => format!("↓ {d} downloading"),
-                (0, u) => format!("↑ {u} uploading"),
+                // Translators: {n} files are downloading; keep the arrow.
+                (d, 0) => ngettext_f("↓ {n} downloading", "↓ {n} downloading", d as u64, &[]),
+                // Translators: {n} files are uploading; keep the arrow.
+                (0, u) => ngettext_f("↑ {n} uploading", "↑ {n} uploading", u as u64, &[]),
                 (d, u) => format!("↓ {d} · ↑ {u}"),
             }
         }
@@ -144,7 +154,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 Ok(Response::Transfers { items, jobs }) => sync_line(&items, &jobs),
                 _ => String::new(),
             };
-            let queued = pending_summary(pending_uploads, pending_changes);
+            let queued = i18n::pending_summary(pending_uploads, pending_changes);
             let phase = phase_of(
                 paused,
                 failing_ops,
@@ -153,15 +163,36 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             );
             DriveState {
                 line: match (online, queued) {
-                    _ if paused => "Sync paused".to_string(),
-                    _ if failing_ops > 0 => match failing_ops {
-                        1 => "1 change needs attention".to_string(),
-                        n => format!("{n} changes need attention"),
-                    },
-                    (true, None) => format!("Mounted at {mountpoint} ({pinned} pinned)"),
-                    (true, Some(q)) => format!("Syncing — {q} ({pinned} pinned)"),
-                    (false, None) => format!("Offline — cached files only ({pinned} pinned)"),
-                    (false, Some(q)) => format!("Offline — {q}"),
+                    _ if paused => gettext("Sync paused"),
+                    _ if failing_ops > 0 => ngettext_f(
+                        "{n} change needs attention",
+                        "{n} changes need attention",
+                        failing_ops,
+                        &[],
+                    ),
+                    // Translators: {mountpoint} is a folder path; {n} is the number of pinned items.
+                    (true, None) => ngettext_f(
+                        "Mounted at {mountpoint} ({n} pinned)",
+                        "Mounted at {mountpoint} ({n} pinned)",
+                        pinned as u64,
+                        &[("mountpoint", &mountpoint)],
+                    ),
+                    // Translators: {queued} is a queue summary such as "3 uploads queued"; {n} is the number of pinned items.
+                    (true, Some(q)) => ngettext_f(
+                        "Syncing — {queued} ({n} pinned)",
+                        "Syncing — {queued} ({n} pinned)",
+                        pinned as u64,
+                        &[("queued", &q)],
+                    ),
+                    // Translators: {n} is the number of pinned items.
+                    (false, None) => ngettext_f(
+                        "Offline — cached files only ({n} pinned)",
+                        "Offline — cached files only ({n} pinned)",
+                        pinned as u64,
+                        &[],
+                    ),
+                    // Translators: {queued} is a queue summary such as "3 uploads queued".
+                    (false, Some(q)) => gettext_f("Offline — {queued}", &[("queued", &q)]),
                 },
                 phase,
                 mounted: true,
@@ -173,7 +204,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
         }
         // Socket answered but with something unexpected — treat as up but odd.
         Ok(_) => DriveState {
-            line: "Mount: unexpected daemon response".into(),
+            line: gettext("Mount: unexpected daemon response"),
             phase: Phase::Attention,
             mounted: true,
             mountpoint: default_mountpoint.to_path_buf(),
@@ -185,11 +216,19 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
         Err(_) => {
             let (line, phase) = match auth::load() {
                 Ok(s) => (
-                    format!("Logged in as {} — not mounted", s.username),
+                    // Translators: {username} is the Proton account name.
+                    gettext_f(
+                        "Logged in as {username} — not mounted",
+                        &[("username", &s.username)],
+                    ),
                     Phase::Disconnected,
                 ),
-                Err(pdfs_core::Error::NotLoggedIn) => ("Not signed in".into(), Phase::SignedOut),
-                Err(e) => (format!("Error: {e}"), Phase::Attention),
+                Err(pdfs_core::Error::NotLoggedIn) => (gettext("Not signed in"), Phase::SignedOut),
+                Err(e) => (
+                    // Translators: {error} is an error message, in English.
+                    gettext_f("Error: {error}", &[("error", &e.to_string())]),
+                    Phase::Attention,
+                ),
             };
             DriveState {
                 line,
@@ -222,10 +261,8 @@ fn phase_of(paused: bool, failing: u64, online: bool, busy: bool) -> Phase {
 
 /// "3 issues — View": the menu item that opens the Sync page's queue.
 fn issues_label(failing: u64) -> String {
-    match failing {
-        1 => "1 issue — View".to_string(),
-        n => format!("{n} issues — View"),
-    }
+    // Translators: a menu item that opens the list of failing changes.
+    ngettext_f("{n} issue — View", "{n} issues — View", failing, &[])
 }
 
 fn open_folder(mountpoint: &Path) {
@@ -331,14 +368,14 @@ impl Tray for DriveTray {
         match self.state.phase {
             // Nothing to mount without a session; the app's sign-in page is the
             // way in.
-            Phase::SignedOut => items.push(item("Sign In…", |_| open_manager(&[]))),
-            _ => items.push(item("Open Proton Drive", |_| open_manager(&[]))),
+            Phase::SignedOut => items.push(item(&gettext("Sign In…"), |_| open_manager(&[]))),
+            _ => items.push(item(&gettext("Open Proton Drive"), |_| open_manager(&[]))),
         }
 
         if self.state.mounted {
             items.push(
                 StandardItem {
-                    label: "Open Folder".into(),
+                    label: gettext("Open Folder"),
                     activate: Box::new(move |_: &mut Self| open_folder(&open_mp)),
                     ..Default::default()
                 }
@@ -349,7 +386,11 @@ impl Tray for DriveTray {
             let paused = self.state.paused;
             items.push(
                 StandardItem {
-                    label: if paused { "Resume Sync" } else { "Pause Sync" }.into(),
+                    label: if paused {
+                        gettext("Resume Sync")
+                    } else {
+                        gettext("Pause Sync")
+                    },
                     activate: Box::new(move |this: &mut Self| {
                         let request = Request::SetSyncPaused {
                             paused: !paused,
@@ -367,22 +408,22 @@ impl Tray for DriveTray {
             );
         } else if self.state.phase == Phase::Disconnected {
             // Enable+start the service so it mounts now and on future logins.
-            items.push(item("Connect", |this| {
+            items.push(item(&gettext("Connect"), |this| {
                 service::enable_start();
-                this.state.line = "Connecting…".into();
+                this.state.line = gettext("Connecting…");
             }));
         }
 
         items.push(MenuItem::Separator);
-        items.push(item("Hide Tray Icon", |_| hide_tray()));
+        items.push(item(&gettext("Hide Tray Icon"), |_| hide_tray()));
         if self.state.mounted {
             // Stopping unmounts the drive, so the app asks first; the tray has no
             // GTK of its own to ask with.
-            items.push(item("Stop Proton Drive…", |_| {
+            items.push(item(&gettext("Stop Proton Drive…"), |_| {
                 open_manager(&["--confirm-stop"])
             }));
         } else {
-            items.push(item("Quit", |_| std::process::exit(0)));
+            items.push(item(&gettext("Quit"), |_| std::process::exit(0)));
         }
         items
     }
@@ -394,6 +435,7 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    i18n::init();
 
     let dirs = AppDirs::new().context("resolve app dirs")?;
     // Hidden from its own menu: the session's autostart still runs the tray, and

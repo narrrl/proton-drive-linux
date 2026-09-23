@@ -48,6 +48,9 @@ pub(crate) struct StatusState {
     pub(crate) accent_row: adw::SwitchRow,
     /// "Show tray icon" toggle. Guarded by [`Self::settings_suppress`].
     pub(crate) tray_row: adw::SwitchRow,
+    /// Language picker: "System Default", then [`i18n::LANGUAGES`]. Guarded by
+    /// [`Self::settings_suppress`].
+    pub(crate) language_row: adw::ComboRow,
     /// Set while a settings widget is being populated programmatically, so its
     /// change handler skips the IPC/systemd side effect.
     pub(crate) settings_suppress: Cell<bool>,
@@ -138,6 +141,7 @@ pub(crate) struct MainWidgets {
     pub(crate) mountpoint_button: gtk4::Button,
     pub(crate) accent_row: adw::SwitchRow,
     pub(crate) tray_row: adw::SwitchRow,
+    pub(crate) language_row: adw::ComboRow,
 }
 
 /// Build the two surfaces that replaced the old Settings page:
@@ -150,22 +154,30 @@ pub(crate) struct MainWidgets {
 /// the app version and user agent in About → Troubleshooting.
 pub(crate) fn build_main_page() -> MainWidgets {
     // ---- Preferences: General
-    let startup_group = adw::PreferencesGroup::builder().title("Startup").build();
+    let startup_group = adw::PreferencesGroup::builder()
+        .title(gettext("Startup"))
+        .build();
     let autostart_row = adw::SwitchRow::builder()
-        .title("Start on login")
-        .subtitle("Connect Proton Drive automatically when you log in")
+        .title(gettext("Start on login"))
+        .subtitle(gettext(
+            "Connect Proton Drive automatically when you log in",
+        ))
         .build();
     startup_group.add(&autostart_row);
 
-    let location_group = adw::PreferencesGroup::builder().title("Location").build();
+    let location_group = adw::PreferencesGroup::builder()
+        .title(gettext("Location"))
+        .build();
     let mountpoint_row = adw::ActionRow::builder()
-        .title("Proton Drive folder")
+        .title(gettext("Proton Drive folder"))
         .subtitle("—")
         .build();
     mountpoint_row.add_css_class("property");
     let mountpoint_button = gtk4::Button::builder()
-        .label("Change…")
-        .tooltip_text("Choose a different folder for the Proton Drive mount")
+        .label(gettext("Change…"))
+        .tooltip_text(gettext(
+            "Choose a different folder for the Proton Drive mount",
+        ))
         .valign(gtk4::Align::Center)
         .build();
     mountpoint_button.add_css_class("flat");
@@ -175,8 +187,10 @@ pub(crate) fn build_main_page() -> MainWidgets {
     // Bandwidth caps in MiB/s. 0 = unlimited; the smallest cap is one 0.5 step,
     // since anything slower would stall a single block for most of a minute.
     let network_group = adw::PreferencesGroup::builder()
-        .title("Network")
-        .description("Limit how fast files move, shared by every transfer. 0 means no limit.")
+        .title(gettext("Network"))
+        .description(gettext(
+            "Limit how fast files move, shared by every transfer. 0 means no limit.",
+        ))
         .build();
     let limit_row = |title: &str| {
         adw::SpinRow::builder()
@@ -185,25 +199,31 @@ pub(crate) fn build_main_page() -> MainWidgets {
             .digits(1)
             .build()
     };
-    let upload_limit_row = limit_row("Upload limit (MiB/s)");
-    let download_limit_row = limit_row("Download limit (MiB/s)");
+    let upload_limit_row = limit_row(&gettext("Upload limit (MiB/s)"));
+    let download_limit_row = limit_row(&gettext("Download limit (MiB/s)"));
     network_group.add(&upload_limit_row);
     network_group.add(&download_limit_row);
 
-    let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
+    let appearance_group = adw::PreferencesGroup::builder()
+        .title(gettext("Appearance"))
+        .build();
     let accent_row = adw::SwitchRow::builder()
-        .title("Proton purple accent")
-        .subtitle("Use the Proton brand color instead of the system accent color")
+        .title(gettext("Proton purple accent"))
+        .subtitle(gettext(
+            "Use the Proton brand color instead of the system accent color",
+        ))
         .build();
     appearance_group.add(&accent_row);
     let tray_row = adw::SwitchRow::builder()
-        .title("Show tray icon")
-        .subtitle("Sync status and quick actions in the panel")
+        .title(gettext("Show tray icon"))
+        .subtitle(gettext("Sync status and quick actions in the panel"))
         .build();
     appearance_group.add(&tray_row);
+    let language_row = build_language_row();
+    appearance_group.add(&language_row);
 
     let general = adw::PreferencesPage::builder()
-        .title("General")
+        .title(gettext("General"))
         .icon_name("preferences-system-symbolic")
         .build();
     general.add(&startup_group);
@@ -213,8 +233,10 @@ pub(crate) fn build_main_page() -> MainWidgets {
 
     // ---- Preferences: Storage
     let storage_group = adw::PreferencesGroup::builder()
-        .title("Cache")
-        .description("Pinned and recently opened files, kept on this computer.")
+        .title(gettext("Cache"))
+        .description(gettext(
+            "Pinned and recently opened files, kept on this computer.",
+        ))
         .build();
     let storage_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     storage_box.set_margin_top(12);
@@ -236,18 +258,20 @@ pub(crate) fn build_main_page() -> MainWidgets {
     // as "no eviction". Step in 0.5 GiB; the upper bound is generous.
     let budget_adj = gtk4::Adjustment::new(0.0, 0.0, 1024.0, 0.5, 1.0, 0.0);
     let budget_row = adw::SpinRow::builder()
-        .title("Cache size limit (GiB)")
-        .subtitle("Older files are removed past this size; 0 means no limit")
+        .title(gettext("Cache size limit (GiB)"))
+        .subtitle(gettext(
+            "Older files are removed past this size; 0 means no limit",
+        ))
         .adjustment(&budget_adj)
         .digits(1)
         .build();
     storage_group.add(&budget_row);
     let purge_row = adw::ActionRow::builder()
-        .title("Clear cache")
-        .subtitle("Remove cached copies. Files kept offline stay.")
+        .title(gettext("Clear cache"))
+        .subtitle(gettext("Remove cached copies. Files kept offline stay."))
         .build();
     let purge_button = gtk4::Button::builder()
-        .label("Clear…")
+        .label(gettext("Clear…"))
         .valign(gtk4::Align::Center)
         .build();
     purge_button.add_css_class("flat");
@@ -256,12 +280,14 @@ pub(crate) fn build_main_page() -> MainWidgets {
 
     // Pins group: filled in by refresh.
     let pins_group = adw::PreferencesGroup::builder()
-        .title("Available offline")
-        .description("Files kept on this computer, even without a connection.")
+        .title(gettext("Available offline"))
+        .description(gettext(
+            "Files kept on this computer, even without a connection.",
+        ))
         .build();
 
     let storage = adw::PreferencesPage::builder()
-        .title("Storage")
+        .title(gettext("Storage"))
         .icon_name("drive-harddisk-symbolic")
         .build();
     storage.add(&storage_group);
@@ -276,7 +302,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     // ---- Sidebar footer
     let status_icon = gtk4::Image::from_icon_name("content-loading-symbolic");
     let status_title = gtk4::Label::builder()
-        .label("Connecting…")
+        .label(gettext("Connecting…"))
         .halign(gtk4::Align::Start)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
@@ -297,7 +323,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     status_content.append(&status_text);
     let status_button = gtk4::Button::builder()
         .child(&status_content)
-        .tooltip_text("Show sync status")
+        .tooltip_text(gettext("Show sync status"))
         .build();
     status_button.add_css_class("flat");
     status_button.add_css_class("sidebar-status");
@@ -324,13 +350,13 @@ pub(crate) fn build_main_page() -> MainWidgets {
         .ellipsize(gtk4::pango::EllipsizeMode::Middle)
         .build();
     let account_menu = gio::Menu::new();
-    account_menu.append(Some("Preferences"), Some("win.preferences"));
+    account_menu.append(Some(&gettext("Preferences")), Some("win.preferences"));
     let sign_out = gio::Menu::new();
-    sign_out.append(Some("Sign Out…"), Some("win.sign-out"));
+    sign_out.append(Some(&gettext("Sign Out…")), Some("win.sign-out"));
     account_menu.append_section(None, &sign_out);
     let account_button = gtk4::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("Account")
+        .tooltip_text(gettext("Account"))
         .menu_model(&account_menu)
         .valign(gtk4::Align::Center)
         .build();
@@ -371,15 +397,44 @@ pub(crate) fn build_main_page() -> MainWidgets {
         mountpoint_button,
         accent_row,
         tray_row,
+        language_row,
     }
+}
+
+/// The Preferences language picker. Row 0 follows the system locale; the rest
+/// are [`i18n::LANGUAGES`] in order, under their own names.
+fn build_language_row() -> adw::ComboRow {
+    let names = gtk4::StringList::new(&[]);
+    names.append(&gettext("System Default"));
+    for (_, name) in i18n::LANGUAGES {
+        names.append(name);
+    }
+    adw::ComboRow::builder()
+        .title(gettext("Language"))
+        .subtitle(gettext("Takes effect the next time Proton Drive starts"))
+        .model(&names)
+        .build()
+}
+
+/// The picker row for a saved language code; unknown codes show as the system
+/// default, which is also how [`i18n::init`] treats them.
+pub(crate) fn language_index(code: Option<&str>) -> u32 {
+    code.and_then(|code| i18n::LANGUAGES.iter().position(|(known, _)| *known == code))
+        .map_or(0, |at| at as u32 + 1)
+}
+
+/// The language code a picker row stands for; `None` is the system default.
+pub(crate) fn language_at(index: u32) -> Option<&'static str> {
+    let at = usize::try_from(index).ok()?.checked_sub(1)?;
+    i18n::LANGUAGES.get(at).map(|(code, _)| *code)
 }
 
 /// The Sync page's live-transfers group, hidden until the refresh loop sees an
 /// in-flight transfer from [`Request::GetQueueStatus`].
 pub(crate) fn build_transfers_group() -> adw::PreferencesGroup {
     adw::PreferencesGroup::builder()
-        .title("Transfers")
-        .description("Files moving to and from Proton Drive.")
+        .title(gettext("Transfers"))
+        .description(gettext("Files moving to and from Proton Drive."))
         .visible(false)
         .build()
 }
@@ -430,6 +485,9 @@ pub(crate) fn wire_settings(
         .accent_row
         .set_active(config.proton_accent.unwrap_or(false));
     ui.status.tray_row.set_active(!config.tray_hidden);
+    ui.status
+        .language_row
+        .set_selected(language_index(config.language.as_deref()));
     ui.status.settings_suppress.set(false);
 
     // Cache budget: a user edit applies the new soft cap on the daemon (which
@@ -450,8 +508,8 @@ pub(crate) fn wire_settings(
             settings_request(
                 &ui_fire,
                 Request::SetCacheBudget { bytes },
-                "Cache budget updated",
-                "Couldn't set cache budget",
+                gettext("Cache budget updated"),
+                gettext("Couldn't set cache budget"),
             );
         });
         *ui_budget.status.budget_source.borrow_mut() = Some(src);
@@ -476,8 +534,8 @@ pub(crate) fn wire_settings(
                 settings_request(
                     &ui_fire,
                     Request::SetBandwidthLimits { upload, download },
-                    "Bandwidth limits updated",
-                    "Couldn't set bandwidth limits",
+                    gettext("Bandwidth limits updated"),
+                    gettext("Couldn't set bandwidth limits"),
                 );
             });
             *ui_limit.status.limit_source.borrow_mut() = Some(src);
@@ -489,14 +547,11 @@ pub(crate) fn wire_settings(
     purge_button.connect_clicked(move |_| {
         let ui = ui_purge.clone();
         let dialog = adw::AlertDialog::builder()
-            .heading("Clear Cache?")
-            .body(
-                "Cached copies are removed from this computer and download again when \
-                 you open them. Files kept available offline stay.",
-            )
+            .heading(gettext("Clear Cache?"))
+            .body(gettext("Cached copies are removed from this computer and download again when you open them. Files kept available offline stay."))
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("purge", "Clear Cache");
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("purge", &gettext("Clear Cache"));
         dialog.set_response_appearance("purge", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -505,8 +560,8 @@ pub(crate) fn wire_settings(
                 settings_request(
                     &ui,
                     Request::PurgeCache,
-                    "Cache cleared",
-                    "Couldn't clear the cache",
+                    gettext("Cache cleared"),
+                    gettext("Couldn't clear the cache"),
                 );
             }
         });
@@ -541,7 +596,11 @@ pub(crate) fn wire_settings(
         let mut config = ui_accent.dirs.load_config();
         config.proton_accent = Some(on);
         if let Err(e) = ui_accent.dirs.save_config(&config) {
-            toast_error(&ui_accent, "Couldn't save the accent color", &e.to_string());
+            toast_error(
+                &ui_accent,
+                &gettext("Couldn't save the accent color"),
+                &e.to_string(),
+            );
         }
     });
 
@@ -556,7 +615,11 @@ pub(crate) fn wire_settings(
         let mut config = ui_tray.dirs.load_config();
         config.tray_hidden = !show;
         if let Err(e) = ui_tray.dirs.save_config(&config) {
-            toast_error(&ui_tray, "Couldn't save the tray setting", &e.to_string());
+            toast_error(
+                &ui_tray,
+                &gettext("Couldn't save the tray setting"),
+                &e.to_string(),
+            );
             return;
         }
         if show {
@@ -565,18 +628,36 @@ pub(crate) fn wire_settings(
             pdfs_core::tray::quit(&ui_tray.dirs);
         }
     });
+
+    // Language: read once at start by the app, the tray and the prompt, so a
+    // change applies on the next launch.
+    let ui_language = ui.clone();
+    ui.status.language_row.connect_selected_notify(move |row| {
+        if ui_language.status.settings_suppress.get() {
+            return;
+        }
+        let mut config = ui_language.dirs.load_config();
+        config.language = language_at(row.selected()).map(str::to_string);
+        if let Err(e) = ui_language.dirs.save_config(&config) {
+            toast_error(
+                &ui_language,
+                &gettext("Couldn't save the language"),
+                &e.to_string(),
+            );
+            return;
+        }
+        toast(
+            &ui_language,
+            &gettext("Restart Proton Drive to use the new language"),
+        );
+    });
 }
 
 /// Run a settings control-socket round-trip (budget / purge) on a worker thread,
 /// confirming with `done` or reporting the daemon's error under `failed`. Unlike
 /// [`run_mutation`] there's no browser reload; the next refresh tick repaints the
 /// cache read-out.
-pub(crate) fn settings_request(
-    ui: &Rc<Ui>,
-    req: Request,
-    done: &'static str,
-    failed: &'static str,
-) {
+pub(crate) fn settings_request(ui: &Rc<Ui>, req: Request, done: String, failed: String) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();
@@ -584,9 +665,11 @@ pub(crate) fn settings_request(
         let result = rx.recv().await;
         ui.busy_end();
         match result {
-            Ok(Ok(Response::Ok { .. })) => toast(&ui, done),
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
-            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+            Ok(Ok(Response::Ok { .. })) => toast(&ui, &done),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
         }
     });
 }
@@ -596,7 +679,7 @@ pub(crate) fn settings_request(
 pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let dialog = gtk4::FileDialog::builder()
-        .title("Choose mountpoint folder")
+        .title(gettext("Choose mountpoint folder"))
         .build();
     let ui = ui.clone();
     dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
@@ -608,7 +691,7 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
         let mut config = ui.dirs.load_config();
         config.mountpoint = Some(path_str.clone());
         if let Err(e) = ui.dirs.save_config(&config) {
-            toast_error(&ui, "Couldn't save mountpoint", &e.to_string());
+            toast_error(&ui, &gettext("Couldn't save mountpoint"), &e.to_string());
             return;
         }
         ui.status.mountpoint_row.set_subtitle(&path_str);
@@ -621,13 +704,15 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
 
         // The daemon only reads the mountpoint at mount time, so offer a restart.
         let confirm = adw::AlertDialog::builder()
-            .heading("Restart to apply")
-            .body(format!(
-                "The mountpoint is now “{path_str}”. Restart the Drive mount to use it?"
+            .heading(gettext("Restart to apply"))
+            // Translators: {path} is the folder the drive is mounted at.
+            .body(gettext_f(
+                "The mountpoint is now “{path}”. Restart the Drive mount to use it?",
+                &[("path", &path_str)],
             ))
             .build();
-        confirm.add_response("later", "Later");
-        confirm.add_response("restart", "Restart now");
+        confirm.add_response("later", &gettext("Later"));
+        confirm.add_response("restart", &gettext("Restart now"));
         confirm.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
         confirm.set_default_response(Some("restart"));
         confirm.set_close_response("later");
@@ -778,17 +863,26 @@ fn paint_account_quota(ui: &Rc<Ui>, max_space: i64, used_space: i64) {
 fn quota_display(max_space: i64, used_space: i64) -> (f64, String) {
     let used = used_space.max(0) as u64;
     if max_space <= 0 {
-        return (0.0, format!("{} used", human_bytes(used)));
+        return (
+            0.0,
+            // Translators: {size} is an amount of storage, such as "1.2 GiB".
+            gettext_f("{size} used", &[("size", &human_bytes(used))]),
+        );
     }
     let total = max_space as u64;
     let fraction = (used as f64 / total as f64).clamp(0.0, 1.0);
     let pct = (fraction * 100.0).round() as u64;
     (
         fraction,
-        format!(
-            "{} of {} used ({pct}%)",
-            human_bytes(used),
-            human_bytes(total)
+        // Translators: account storage. {used} and {total} are sizes such as
+        // "1.2 GiB"; {percent} is a whole number, followed by the percent sign.
+        gettext_f(
+            "{used} of {total} used ({percent}%)",
+            &[
+                ("used", &human_bytes(used)),
+                ("total", &human_bytes(total)),
+                ("percent", &pct.to_string()),
+            ],
         ),
     )
 }
@@ -806,11 +900,17 @@ fn quota_status_display(max_space: i64, used_space: i64) -> Option<(f64, String,
     let pct = (fraction * 100.0).round() as u64;
     Some((
         fraction,
-        format!("{} free", human_bytes(free)),
-        format!(
-            "{} free out of {} ({pct}% used)",
-            human_bytes(free),
-            human_bytes(total)
+        // Translators: {size} is an amount of storage, such as "1.2 GiB".
+        gettext_f("{size} free", &[("size", &human_bytes(free))]),
+        // Translators: account storage. {free} and {total} are sizes such as
+        // "1.2 GiB"; {percent} is a whole number, followed by the percent sign.
+        gettext_f(
+            "{free} free out of {total} ({percent}% used)",
+            &[
+                ("free", &human_bytes(free)),
+                ("total", &human_bytes(total)),
+                ("percent", &pct.to_string()),
+            ],
         ),
     ))
 }
@@ -843,14 +943,14 @@ pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     if mounted {
         notify(
             "mount-state",
-            "Proton Drive connected",
-            "Your Drive is mounted and available.",
+            &gettext("Proton Drive connected"),
+            &gettext("Your Drive is mounted and available."),
         );
     } else {
         notify(
             "mount-state",
-            "Proton Drive disconnected",
-            "The mount service stopped. Files aren't available until it restarts.",
+            &gettext("Proton Drive disconnected"),
+            &gettext("The mount service stopped. Files aren't available until it restarts."),
         );
     }
 }
@@ -900,15 +1000,15 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
 
     let previous = ui.status.active_transfers.replace(items.len());
     if items.is_empty() && previous > 0 {
-        let files = if previous == 1 {
-            "1 file".to_string()
-        } else {
-            format!("{previous} files")
-        };
         notify(
             "sync-complete",
-            "Sync complete",
-            &format!("{files} finished transferring."),
+            &gettext("Sync complete"),
+            &ngettext_f(
+                "{n} file finished transferring.",
+                "{n} files finished transferring.",
+                previous as u64,
+                &[],
+            ),
         );
         // A just-finished batch may have added files (bulk upload) the current
         // listing doesn't show yet; refresh whichever listing is on screen.
@@ -966,11 +1066,26 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
 /// One Activity row for a daemon job: its title, plus whatever it can say about
 /// where it is — a count when it has one, else what it is currently chewing on.
 pub(crate) fn job_line(j: &JobItem) -> ActivityLine {
+    let done = j.done.to_string();
+    let total = j.total.to_string();
+    let args: [(&str, &str); 4] = [
+        ("title", &j.title),
+        ("detail", &j.detail),
+        ("done", &done),
+        ("total", &total),
+    ];
     let text = match (j.total > 0, j.detail.is_empty()) {
-        (true, true) => format!("{} — {} of {}", j.title, j.done, j.total),
-        (true, false) => format!("{} — {} ({} of {})", j.title, j.detail, j.done, j.total),
-        (false, true) => format!("{}…", j.title),
-        (false, false) => format!("{} — {}…", j.title, j.detail),
+        // Translators: a background job's progress. {title} is the job, such as
+        // "Scanning Photos"; {done} and {total} are counts.
+        (true, true) => gettext_f("{title} — {done} of {total}", &args),
+        // Translators: a background job's progress. {title} is the job, {detail}
+        // what it is working on; {done} and {total} are counts.
+        (true, false) => gettext_f("{title} — {detail} ({done} of {total})", &args),
+        // Translators: a background job still running. {title} is the job.
+        (false, true) => gettext_f("{title}…", &args),
+        // Translators: a background job still running. {title} is the job,
+        // {detail} what it is working on.
+        (false, false) => gettext_f("{title} — {detail}…", &args),
     };
     ActivityLine {
         text,
@@ -984,25 +1099,30 @@ pub(crate) fn transfer_line(t: &TransferItem) -> ActivityLine {
         TransferDirection::Download => "↓",
         TransferDirection::Upload => "↑",
     };
+    let done = human_bytes(t.bytes_completed);
+    let total = human_bytes(t.bytes_total);
+    let speed = human_bytes(t.speed_bytes_sec);
+    let args: [(&str, &str); 5] = [
+        ("arrow", arrow),
+        ("name", &t.name),
+        ("done", &done),
+        ("total", &total),
+        ("speed", &speed),
+    ];
     if t.bytes_total == 0 {
         ActivityLine {
-            text: format!(
-                "{arrow} {} — {} ({}/s)",
-                t.name,
-                human_bytes(t.bytes_completed),
-                human_bytes(t.speed_bytes_sec),
-            ),
+            // Translators: a file being transferred. {arrow} is ↑ or ↓, {name} the
+            // file name, {done} the size moved so far and {speed} a size such as
+            // "1.2 MiB"; "/s" means per second.
+            text: gettext_f("{arrow} {name} — {done} ({speed}/s)", &args),
             fraction: None,
         }
     } else {
         ActivityLine {
-            text: format!(
-                "{arrow} {} — {} of {} ({}/s)",
-                t.name,
-                human_bytes(t.bytes_completed),
-                human_bytes(t.bytes_total),
-                human_bytes(t.speed_bytes_sec),
-            ),
+            // Translators: a file being transferred. {arrow} is ↑ or ↓, {name} the
+            // file name, {done} and {total} sizes and {speed} a size such as
+            // "1.2 MiB"; "/s" means per second.
+            text: gettext_f("{arrow} {name} — {done} of {total} ({speed}/s)", &args),
             fraction: Some((t.bytes_completed as f64 / t.bytes_total as f64).min(1.0)),
         }
     }
@@ -1042,7 +1162,7 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 // The queue is the more useful thing to say when it has anything
                 // in it: it is why a file that looks saved is not on the remote
                 // yet, and offline is usually the reason it is still queued.
-                let queued = pending_summary(pending_uploads, pending_changes);
+                let queued = i18n::pending_summary(pending_uploads, pending_changes);
                 let state = if paused {
                     SyncState::Paused {
                         until: paused_until,
@@ -1131,47 +1251,55 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
         SyncState::Paused { until, queued } => (
             "media-playback-pause-symbolic",
             Some("warning"),
-            "Sync paused".to_string(),
+            gettext("Sync paused"),
             Some(match (until, queued) {
-                (Some(until), Some(queued)) => format!("{queued} · resumes {}", clock_time(until)),
-                (Some(until), None) => format!("Resumes {}", clock_time(until)),
+                // Translators: {queued} says what is waiting, such as "3 changes
+                // waiting"; {time} is when syncing resumes, such as "at 14:30".
+                (Some(until), Some(queued)) => gettext_f(
+                    "{queued} · resumes {time}",
+                    &[("queued", &queued), ("time", &clock_time(until))],
+                ),
+                // Translators: {time} is when syncing resumes, such as "at 14:30"
+                // or "Tue 09:00".
+                (Some(until), None) => gettext_f("Resumes {time}", &[("time", &clock_time(until))]),
                 (None, Some(queued)) => queued,
-                (None, None) => "Until you resume".to_string(),
+                (None, None) => gettext("Until you resume"),
             }),
         ),
         SyncState::Attention { count, error } => (
             "dialog-warning-symbolic",
             Some("error"),
-            format!(
-                "{} need{} attention",
-                count_noun(count as usize, "change", "changes"),
-                if count == 1 { "s" } else { "" }
+            ngettext_f(
+                "{n} change needs attention",
+                "{n} changes need attention",
+                count,
+                &[],
             ),
             error,
         ),
         SyncState::Offline { queued } => (
             "network-offline-symbolic",
             Some("warning"),
-            "Offline".to_string(),
-            Some(queued.unwrap_or_else(|| "Cached files only".to_string())),
+            pgettext("state", "Offline"),
+            Some(queued.unwrap_or_else(|| gettext("Cached files only"))),
         ),
         SyncState::Syncing { queued } => (
             "emblem-synchronizing-symbolic",
             None,
-            "Syncing".to_string(),
+            pgettext("state", "Syncing"),
             Some(queued),
         ),
         SyncState::UpToDate { mountpoint } => (
             "emblem-ok-symbolic",
             Some("success"),
-            "Up to date".to_string(),
+            gettext("Up to date"),
             Some(mountpoint),
         ),
         SyncState::Disconnected => (
             "network-offline-symbolic",
             Some("warning"),
-            "Not connected".to_string(),
-            Some("Proton Drive isn't running".to_string()),
+            gettext("Not connected"),
+            Some(gettext("Proton Drive isn't running")),
         ),
     };
     let image = &ui.status.status_icon;
@@ -1205,18 +1333,24 @@ pub(crate) fn clock_time(unix: i64) -> String {
         glib::DateTime::from_unix_local(unix),
         glib::DateTime::now_local(),
     ) else {
-        return "later".to_string();
+        // Translators: stands in for a time that could not be read, as in
+        // "Resumes later".
+        return gettext("later");
     };
     let format = if at.ymd() == now.ymd() {
-        "at %H:%M"
+        // Translators: strftime format for a time later today, such as "at 14:30".
+        gettext("at %H:%M")
     } else if at.difference(&now).as_seconds() < 6 * 86_400 {
-        "%a %H:%M"
+        // Translators: strftime format for a time within the next week, such as
+        // "Tue 09:00".
+        gettext("%a %H:%M")
     } else {
-        "%e %b"
+        // Translators: strftime format for a date further ahead, such as "23 Sep".
+        gettext("%e %b")
     };
-    at.format(format)
+    at.format(&format)
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "later".to_string())
+        .unwrap_or_else(|_| gettext("later"))
 }
 
 /// Render the pins group from `pins`, with the unpin buttons enabled only while a
@@ -1242,8 +1376,10 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
 
     if pins.is_empty() {
         let row = adw::ActionRow::builder()
-            .title("No files kept offline")
-            .subtitle("Right-click a file and choose “Make available offline”.")
+            .title(gettext("No files kept offline"))
+            .subtitle(gettext(
+                "Right-click a file and choose “Make available offline”.",
+            ))
             .build();
         ui.status.pins_group.add(&row);
         ui.status
@@ -1277,7 +1413,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         let unpin = gtk4::Button::builder()
             .icon_name("pdfs-online-only-symbolic")
             .valign(gtk4::Align::Center)
-            .tooltip_text("Make online only")
+            .tooltip_text(gettext("Make online only"))
             .sensitive(mounted)
             .build();
         unpin.add_css_class("flat");
@@ -1291,14 +1427,17 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             let ui = ui_btn.clone();
             glib::spawn_future_local(async move {
                 match rx.recv().await {
-                    Ok(Ok(Response::Error { message, kind })) => {
-                        toast_failure(&ui, "Couldn't make it online only", &message, kind)
-                    }
+                    Ok(Ok(Response::Error { message, kind })) => toast_failure(
+                        &ui,
+                        &gettext("Couldn't make it online only"),
+                        &message,
+                        kind,
+                    ),
                     Ok(Ok(_)) => refresh(&ui),
                     _ => toast_error(
                         &ui,
-                        "Couldn't make it online only",
-                        "The mount service didn't respond.",
+                        &gettext("Couldn't make it online only"),
+                        &gettext("The mount service didn't respond."),
                     ),
                 }
             });
@@ -1315,9 +1454,14 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
     if pins.len() > PINS_COLLAPSED {
         let row = adw::ActionRow::builder()
             .title(if expanded {
-                "Show fewer".to_string()
+                gettext("Show fewer")
             } else {
-                format!("Show all {}", count_noun(pins.len(), "file", "files"))
+                ngettext_f(
+                    "Show all {n} file",
+                    "Show all {n} files",
+                    pins.len() as u64,
+                    &[],
+                )
             })
             .activatable(true)
             .build();
@@ -1360,7 +1504,7 @@ mod tests {
 
     #[test]
     fn quota_display_clamps_bad_api_values() {
-        assert_eq!(quota_display(0, -1), (0.0, "0 B used".to_string()));
+        assert_eq!(quota_display(0, -1), (0.0, "0 bytes used".to_string()));
         assert_eq!(quota_display(100, 150).0, 1.0);
     }
 

@@ -52,23 +52,23 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     // themselves are local paths, so they live on the Sync page; keeping a
     // second copy of that list here would be two places to change the same mode.
     let sync_group = adw::PreferencesGroup::builder()
-        .title("This computer")
-        .description("The computer this machine backs up as.")
+        .title(gettext("This computer"))
+        .description(gettext("The computer this machine backs up as."))
         .build();
     // Rename control for *this* machine's device, in the section header. The
     // current device is filtered out of "Other computers", so this is the only
     // place it can be renamed; insensitive until the device list identifies it.
     let rename_this = gtk4::Button::builder()
         .icon_name("document-edit-symbolic")
-        .tooltip_text("Rename this computer")
+        .tooltip_text(gettext("Rename this computer"))
         .valign(gtk4::Align::Center)
         .sensitive(false)
         .build();
     rename_this.add_css_class("flat");
     sync_group.set_header_suffix(Some(&rename_this));
     let group = adw::PreferencesGroup::builder()
-        .title("Other computers")
-        .description("Other computers backing up to this account.")
+        .title(gettext("Other computers"))
+        .description(gettext("Other computers backing up to this account."))
         .build();
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
@@ -81,7 +81,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
         .build();
 
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -106,7 +106,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     inner.set_margin_start(18);
     inner.set_margin_end(18);
     inner.append(&content);
-    let (frame, header, _) = page_frame("Computers", &inner);
+    let (frame, header, _) = page_frame(&gettext("Computers"), &inner);
     header.pack_end(&refresh);
 
     (
@@ -158,8 +158,8 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
     devices_status(
         ui,
         "computer-symbolic",
-        "Loading…",
-        "Reading your computers.",
+        &gettext("Loading…"),
+        &gettext("Reading your computers."),
         false,
     );
     ui.busy_begin();
@@ -206,8 +206,8 @@ pub(crate) fn devices_unreachable(ui: &Rc<Ui>) {
         devices_status(
             ui,
             "network-offline-symbolic",
-            "Not connected",
-            "The Proton Drive mount service isn't running.",
+            &gettext("Not connected"),
+            &gettext("The Proton Drive mount service isn't running."),
             true,
         );
         return;
@@ -215,8 +215,8 @@ pub(crate) fn devices_unreachable(ui: &Rc<Ui>) {
     devices_status(
         ui,
         "folder-remote-symbolic",
-        "Connecting…",
-        "Waiting for the Proton Drive mount service to come up.",
+        &gettext("Connecting…"),
+        &gettext("Waiting for the Proton Drive mount service to come up."),
         false,
     );
     let ui = ui.clone();
@@ -249,11 +249,19 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
             *ui.devices.this_device.borrow_mut() = Some((me.uid.clone(), me.name.clone()));
             ui.devices
                 .sync_group
-                .set_description(Some(&format!("Backing up as “{}”.", me.name)));
+                // Translators: {name} is the name of this computer's device.
+                .set_description(Some(&gettext_f(
+                    "Backing up as “{name}”.",
+                    &[("name", &me.name)],
+                )));
             ui.devices.rename_this.set_sensitive(true);
             ui.devices
                 .rename_this
-                .set_tooltip_text(Some(&format!("Rename this computer ({})", me.name)));
+                // Translators: {name} is the name of this computer's device.
+                .set_tooltip_text(Some(&gettext_f(
+                    "Rename this computer ({name})",
+                    &[("name", &me.name)],
+                )));
         }
         None => {
             *ui.devices.this_device.borrow_mut() = None;
@@ -263,8 +271,8 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
     let others: Vec<&DeviceInfo> = devices.iter().filter(|d| !d.this_device).collect();
     if others.is_empty() {
         let row = adw::ActionRow::builder()
-            .title("No other computers")
-            .subtitle("Desktop apps syncing to this account appear here.")
+            .title(gettext("No other computers"))
+            .subtitle(gettext("Desktop apps syncing to this account appear here."))
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
         ui.devices.group.add(&row);
@@ -288,21 +296,21 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
         let (ui_rs, uid_rs, name_rs) = (ui.clone(), dev.uid.clone(), dev.name.clone());
         row.add_suffix(&more_menu_button(vec![
             (
-                "Restore to This Computer…",
+                &gettext("Restore to This Computer…"),
                 Box::new(move || {
                     prompt_restore_folders(&ui_rs, Some((uid_rs.clone(), name_rs.clone())))
                 }),
             ),
             (
-                "Rename…",
+                &gettext("Rename…"),
                 Box::new(move || prompt_rename_device(&ui_ren, &uid_ren, &name_ren)),
             ),
             (
-                "Use This Computer's Identity…",
+                &gettext("Use This Computer's Identity…"),
                 Box::new(move || prompt_adopt_device(&ui_ad, &uid_ad, &name_ad)),
             ),
             (
-                "Remove Computer…",
+                &gettext("Remove Computer…"),
                 Box::new(move || prompt_remove_device(&ui_rm, &uid_rm, &name_rm)),
             ),
         ]));
@@ -317,10 +325,19 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
 /// "never" is the fact that tells the user this computer isn't backing anything up.
 pub(crate) fn device_subtitle(dev: &DeviceInfo) -> String {
     match dev.last_sync {
-        Some(secs) if secs > 0 => {
-            format!("{} · last synced {}", dev.device_type, activity_time(secs))
-        }
-        _ => format!("{} · never synced", dev.device_type),
+        // Translators: {platform} is the device's platform (such as "Linux"), {time} a date and time.
+        Some(secs) if secs > 0 => gettext_f(
+            "{platform} · last synced {time}",
+            &[
+                ("platform", &dev.device_type),
+                ("time", &activity_time(secs)),
+            ],
+        ),
+        // Translators: {platform} is the device's platform, such as "Linux".
+        _ => gettext_f(
+            "{platform} · never synced",
+            &[("platform", &dev.device_type)],
+        ),
     }
 }
 
@@ -335,13 +352,13 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
         ui.devices.sync_group.remove(&row);
     }
     let row = adw::ActionRow::builder()
-        .title("This computer")
+        .title(gettext("This computer"))
         .subtitle(this_computer_subtitle(folders))
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
     let manage = gtk4::Button::builder()
-        .label("Open Sync")
-        .tooltip_text("Manage this computer's folders and mountpoint")
+        .label(gettext("Open Sync"))
+        .tooltip_text(gettext("Manage this computer's folders and mountpoint"))
         .valign(gtk4::Align::Center)
         .build();
     manage.add_css_class("flat");
@@ -350,7 +367,7 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
     row.add_suffix(&manage);
     let ui_rs = ui.clone();
     row.add_suffix(&more_menu_button(vec![(
-        "Restore Folders…",
+        &gettext("Restore Folders…"),
         Box::new(move || prompt_restore_folders(&ui_rs, None)),
     )]));
     ui.devices.sync_group.add(&row);
@@ -361,30 +378,41 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
 /// attention — the one fact worth surfacing away from the folder list itself.
 pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
     if folders.is_empty() {
-        return "No folders backed up yet — add one on the Sync page.".to_string();
+        return gettext("No folders backed up yet — add one on the Sync page.");
     }
-    let count = match folders.len() {
-        1 => "1 folder backed up".to_string(),
-        n => format!("{n} folders backed up"),
-    };
+    let count = ngettext_f(
+        "{n} folder backed up",
+        "{n} folders backed up",
+        folders.len() as u64,
+        &[],
+    );
     let attention = folders
         .iter()
         .filter(|f| f.state == "error" || f.state == "conflict")
         .count();
     match attention {
-        0 => format!("{count} · manage them on the Sync page"),
-        1 => format!("{count} · 1 needs attention"),
-        n => format!("{count} · {n} need attention"),
+        // Translators: {folders} is "N folders backed up".
+        0 => gettext_f(
+            "{folders} · manage them on the Sync page",
+            &[("folders", &count)],
+        ),
+        // Translators: {folders} is "N folders backed up"; {n} counts the folders with a problem.
+        n => ngettext_f(
+            "{folders} · {n} needs attention",
+            "{folders} · {n} need attention",
+            n as u64,
+            &[("folders", &count)],
+        ),
     }
 }
 
 /// Human label for a synced folder's `state` column.
-pub(crate) fn sync_state_label(state: &str) -> &str {
+pub(crate) fn sync_state_label(state: &str) -> String {
     match state {
-        "syncing" => "syncing…",
-        "error" => "sync error",
-        "conflict" => "needs attention",
-        _ => "up to date",
+        "syncing" => gettext("syncing…"),
+        "error" => gettext("sync error"),
+        "conflict" => gettext("needs attention"),
+        _ => gettext("up to date"),
     }
 }
 
@@ -396,18 +424,30 @@ pub(crate) fn sync_progress_label(p: &SyncProgress) -> String {
     match p.phase {
         // Before the first pass finishes there is no estimate, so the count would
         // be "checked 12 of 12" — worse than saying nothing.
-        SyncPhase::Scanning if p.total == 0 => "checking for changes…".to_string(),
-        SyncPhase::Scanning => format!(
-            "checking for changes — {} of {}",
-            p.done,
-            p.total.max(p.done)
+        SyncPhase::Scanning if p.total == 0 => gettext("checking for changes…"),
+        // Translators: {done} and {total} count folders and files checked so far.
+        SyncPhase::Scanning => gettext_f(
+            "checking for changes — {done} of {total}",
+            &[
+                ("done", &p.done.to_string()),
+                ("total", &p.total.max(p.done).to_string()),
+            ],
         ),
         SyncPhase::Applying => {
-            let count = format!("{} of {}", p.done + 1, p.total.max(p.done + 1));
+            let done = (p.done + 1).to_string();
+            let total = p.total.max(p.done + 1).to_string();
             if p.current.is_empty() {
-                format!("syncing {count}")
+                // Translators: {done} and {total} count the changes applied so far.
+                gettext_f(
+                    "syncing {done} of {total}",
+                    &[("done", &done), ("total", &total)],
+                )
             } else {
-                format!("syncing {} — {count}", p.current)
+                // Translators: {file} is the path being synced; {done} and {total} count the changes applied so far.
+                gettext_f(
+                    "syncing {file} — {done} of {total}",
+                    &[("file", &p.current), ("done", &done), ("total", &total)],
+                )
             }
         }
     }
@@ -417,7 +457,7 @@ pub(crate) fn sync_progress_label(p: &SyncProgress) -> String {
 pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let dialog = gtk4::FileDialog::builder()
-        .title("Add Folder to Sync")
+        .title(gettext("Add Folder to Sync"))
         .build();
     let ui = ui.clone();
     dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
@@ -441,15 +481,15 @@ pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
                     // or too late (row flashes in). Instead let the periodic
                     // `refresh_locations` tick pick the row up whenever it
                     // actually lands, which is what keeps a running pass live too.
-                    toast(&ui, "Syncing folder…");
+                    toast(&ui, &gettext("Syncing folder…"));
                 }
                 Ok(Ok(Response::Error { message, kind })) => {
-                    toast_failure(&ui, "Couldn't add folder", &message, kind)
+                    toast_failure(&ui, &gettext("Couldn't add folder"), &message, kind)
                 }
                 _ => toast_error(
                     &ui,
-                    "Couldn't add folder",
-                    "The mount service didn't respond.",
+                    &gettext("Couldn't add folder"),
+                    &gettext("The mount service didn't respond."),
                 ),
             }
         });
@@ -480,13 +520,16 @@ pub(crate) fn prompt_restore_folders(ui: &Rc<Ui>, device: Option<(String, String
             Ok(Ok(Response::RestorableFolders { items })) => {
                 show_restore_picker(&ui, items, device)
             }
-            Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't list folders to restore", &message, kind)
-            }
+            Ok(Ok(Response::Error { message, kind })) => toast_failure(
+                &ui,
+                &gettext("Couldn't list folders to restore"),
+                &message,
+                kind,
+            ),
             _ => toast_error(
                 &ui,
-                "Couldn't list folders to restore",
-                "The mount service didn't respond.",
+                &gettext("Couldn't list folders to restore"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -510,9 +553,9 @@ fn show_restore_picker(
     }
 
     let group = adw::PreferencesGroup::builder()
-        .description(
+        .description(gettext(
             "Tick the folders to sync to this machine, and adjust where each one should live.",
-        )
+        ))
         .build();
     // Held so the response handler can read back what the user ticked and typed.
     let mut controls: Vec<(String, String, gtk4::CheckButton, adw::EntryRow)> = Vec::new();
@@ -534,14 +577,14 @@ fn show_restore_picker(
         .child(&group)
         .build();
     let dialog = adw::AlertDialog::builder()
-        .heading("Restore folders")
+        .heading(gettext("Restore folders"))
         .body(restore_picker_body(
             device.as_ref().map(|(_, n)| n.as_str()),
         ))
         .extra_child(&scroll)
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("restore", "Restore");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("restore", &gettext("Restore"));
     dialog.set_response_appearance("restore", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("restore"));
     dialog.set_close_response("cancel");
@@ -574,8 +617,8 @@ fn show_restore_picker(
                 },
                 None => Request::RestoreSyncFolders { items },
             },
-            "Restoring folders…",
-            "Couldn't restore folders",
+            &gettext("Restoring folders…"),
+            &gettext("Couldn't restore folders"),
         );
     });
     dialog.present(win.as_ref());
@@ -584,19 +627,24 @@ fn show_restore_picker(
 /// The restore picker's body: whose backup the folders come from.
 pub(crate) fn restore_picker_body(device: Option<&str>) -> String {
     match device {
-        Some(name) => format!(
-            "These folders are backed up from “{name}”. Restored folders keep syncing with \
-             that computer's copy."
+        // Translators: {name} is the name of another computer.
+        Some(name) => gettext_f(
+            "These folders are backed up from “{name}”. Restored folders keep syncing with that computer's copy.",
+            &[("name", name)],
         ),
-        None => "These folders are backed up under this computer in Proton Drive.".to_string(),
+        None => gettext("These folders are backed up under this computer in Proton Drive."),
     }
 }
 
 /// The toast when every folder of a device is already synced here.
 pub(crate) fn nothing_to_restore(device: Option<&str>) -> String {
     match device {
-        Some(name) => format!("Nothing to restore — “{name}”'s folders are all synced here."),
-        None => "Nothing to restore — this computer's folders are all synced here.".to_string(),
+        // Translators: {name} is the name of another computer.
+        Some(name) => gettext_f(
+            "Nothing to restore — “{name}”'s folders are all synced here.",
+            &[("name", name)],
+        ),
+        None => gettext("Nothing to restore — this computer's folders are all synced here."),
     }
 }
 
@@ -619,19 +667,19 @@ pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &'static str) {
             // pass, hence "will".
             Ok(Ok(Response::Ok { .. })) => toast(
                 &ui,
-                if mode == "ondemand" {
-                    "Folder will switch to on-demand"
+                &if mode == "ondemand" {
+                    gettext("Folder will switch to on-demand")
                 } else {
-                    "Folder will download and stay synced"
+                    gettext("Folder will download and stay synced")
                 },
             ),
             Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't change mode", &message, kind)
+                toast_failure(&ui, &gettext("Couldn't change mode"), &message, kind)
             }
             _ => toast_error(
                 &ui,
-                "Couldn't change mode",
-                "The mount service didn't respond.",
+                &gettext("Couldn't change mode"),
+                &gettext("The mount service didn't respond."),
             ),
         }
         reload_sync_pages(&ui);
@@ -660,36 +708,36 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
     // nasty surprise if the dialog claimed the local files were safe, and is
     // recoverable only by turning On-demand off *first* and letting it download.
     let body = if ondemand {
-        format!(
-            "Stop syncing “{path}”?\n\nThis folder is on-demand: its files live in Proton \
-             Drive, not on this disk, so the folder will be empty once it is unmounted. To \
-             keep a local copy, cancel, turn off On-demand, and wait for the download to \
-             finish before removing it."
+        // Translators: {path} is a local folder path.
+        gettext_f(
+            "Stop syncing “{path}”?\n\nThis folder is on-demand: its files live in Proton Drive, not on this disk, so the folder will be empty once it is unmounted. To keep a local copy, cancel, turn off On-demand, and wait for the download to finish before removing it.",
+            &[("path", path)],
         )
     } else {
-        format!(
-            "Stop syncing “{path}”?\n\nThe local files stay on this disk and simply stop \
-             being synced. Choose whether to also delete the copy in Proton Drive."
+        // Translators: {path} is a local folder path.
+        gettext_f(
+            "Stop syncing “{path}”?\n\nThe local files stay on this disk and simply stop being synced. Choose whether to also delete the copy in Proton Drive.",
+            &[("path", path)],
         )
     };
     let dialog = adw::AlertDialog::builder()
-        .heading("Stop syncing folder")
+        .heading(gettext("Stop syncing folder"))
         .body(body)
         .build();
     let group = adw::PreferencesGroup::new();
     let delete_remote = adw::SwitchRow::builder()
-        .title("Also delete from Proton Drive")
+        .title(gettext("Also delete from Proton Drive"))
         .subtitle(if ondemand {
-            "Deletes the only copy of these files."
+            gettext("Deletes the only copy of these files.")
         } else {
-            "The local copy is unaffected."
+            gettext("The local copy is unaffected.")
         })
         .active(false)
         .build();
     group.add(&delete_remote);
     dialog.set_extra_child(Some(&group));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("remove", "Stop Syncing");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("remove", &gettext("Stop Syncing"));
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -702,8 +750,8 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
                     id,
                     delete_remote: delete_remote.is_active(),
                 },
-                "Stopped syncing folder",
-                "Couldn't stop syncing the folder",
+                &gettext("Stopped syncing folder"),
+                &gettext("Couldn't stop syncing the folder"),
             );
         }
     });
@@ -714,19 +762,20 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
 pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Rename Computer")
-        .body(format!("Rename “{current}”."))
+        .heading(gettext("Rename Computer"))
+        // Translators: {name} is the computer's current name.
+        .body(gettext_f("Rename “{name}”.", &[("name", current)]))
         .build();
     let group = adw::PreferencesGroup::new();
     let row = adw::EntryRow::builder()
-        .title("New name")
+        .title(gettext("New name"))
         .activates_default(true)
         .build();
     row.set_text(current);
     group.add(&row);
     dialog.set_extra_child(Some(&group));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("rename", "Rename");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("rename", &gettext("Rename"));
     dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("rename"));
     dialog.set_close_response("cancel");
@@ -738,7 +787,11 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
         }
         let name = row.text().trim().to_string();
         if name.is_empty() {
-            toast_error(&ui, "Couldn't rename the computer", "A name is required.");
+            toast_error(
+                &ui,
+                &gettext("Couldn't rename the computer"),
+                &gettext("A name is required."),
+            );
             return;
         }
         run_devices_mutation(
@@ -747,8 +800,8 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
                 uid: uid.clone(),
                 name,
             },
-            "Computer renamed",
-            "Couldn't rename the computer",
+            &gettext("Computer renamed"),
+            &gettext("Couldn't rename the computer"),
         );
     });
     dialog.present(win.as_ref());
@@ -759,21 +812,22 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
 pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let confirm = adw::EntryRow::builder()
-        .title(format!("Type “{name}” to confirm"))
+        // Translators: {name} is the computer's name, which the user must type.
+        .title(gettext_f("Type “{name}” to confirm", &[("name", name)]))
         .build();
     let group = adw::PreferencesGroup::new();
     group.add(&confirm);
     let dialog = adw::AlertDialog::builder()
-        .heading("Remove Computer")
-        .body(format!(
-            "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is \
-             deleted along with it. The files on that computer itself are not touched — but \
-             this cannot be undone from here."
+        .heading(gettext("Remove Computer"))
+        // Translators: {name} is the name of the computer being removed.
+        .body(gettext_f(
+            "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is deleted along with it. The files on that computer itself are not touched — but this cannot be undone from here.",
+            &[("name", name)],
         ))
         .extra_child(&group)
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("remove", "Remove");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("remove", &gettext("Remove"));
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_response_enabled("remove", false);
     dialog.set_default_response(Some("cancel"));
@@ -790,8 +844,8 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
             run_devices_mutation(
                 &ui,
                 Request::DeleteDevice { uid: uid.clone() },
-                "Computer removed",
-                "Couldn't remove the computer",
+                &gettext("Computer removed"),
+                &gettext("Couldn't remove the computer"),
             );
         }
     });
@@ -808,16 +862,15 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading("Use this computer's identity")
-        .body(format!(
-            "Treat this machine as “{name}”?\n\nNew synced folders are created under that \
-             computer in Proton Drive, and this machine keeps that identity even if its hostname \
-             changes. Folders already synced here are not moved.\n\nUse “Restore folders” \
-             afterwards to bring back what “{name}” was syncing."
+        .heading(gettext("Use this computer's identity"))
+        // Translators: {name} is the name of the other computer whose identity is adopted.
+        .body(gettext_f(
+            "Treat this machine as “{name}”?\n\nNew synced folders are created under that computer in Proton Drive, and this machine keeps that identity even if its hostname changes. Folders already synced here are not moved.\n\nUse “Restore folders” afterwards to bring back what “{name}” was syncing.",
+            &[("name", name)],
         ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("adopt", "Use identity");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("adopt", &gettext("Use identity"));
     dialog.set_response_appearance("adopt", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -830,8 +883,8 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
                 Request::AdoptDevice {
                     uid: Some(uid.clone()),
                 },
-                "Identity adopted",
-                "Couldn't adopt that computer",
+                &gettext("Identity adopted"),
+                &gettext("Couldn't adopt that computer"),
             );
         }
     });
@@ -839,16 +892,12 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 }
 
 /// Run a mutation raised from Computers or Locations and reload the page on success.
-pub(crate) fn run_devices_mutation(
-    ui: &Rc<Ui>,
-    req: Request,
-    done: &'static str,
-    failed: &'static str,
-) {
+pub(crate) fn run_devices_mutation(ui: &Rc<Ui>, req: Request, done: &str, failed: &str) {
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let ui = ui.clone();
     let done = done.to_string();
+    let failed = failed.to_string();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
@@ -857,8 +906,10 @@ pub(crate) fn run_devices_mutation(
                 reload_sync_pages(&ui);
                 toast(&ui, &done);
             }
-            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
-            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
         }
     });
 }

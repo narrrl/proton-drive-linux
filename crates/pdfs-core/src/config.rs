@@ -142,6 +142,11 @@ pub struct AppConfig {
     /// back on. Defaulted for configs predating the field.
     #[serde(default)]
     pub tray_hidden: bool,
+    /// Language for the desktop app, tray and search prompt, as a gettext code
+    /// such as `de` or `pt_BR`. `None` means "follow the system locale".
+    /// Defaulted for configs predating the field.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// The My Files page's view choices, remembered between runs.
@@ -214,6 +219,7 @@ impl Default for AppConfig {
             proton_accent: None,
             files_view: FilesView::default(),
             tray_hidden: false,
+            language: None,
         }
     }
 }
@@ -568,6 +574,7 @@ mod tests {
                 folders_first: false,
             },
             tray_hidden: true,
+            language: Some("de".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
@@ -575,6 +582,7 @@ mod tests {
         assert_eq!(decoded.user_agent, "test-agent/1.0");
         assert_eq!(decoded.proton_accent, Some(true));
         assert!(decoded.tray_hidden);
+        assert_eq!(decoded.language.as_deref(), Some("de"));
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
@@ -661,6 +669,10 @@ mod tests {
         let decoded: AppConfig = serde_json::from_str(json).unwrap();
         assert!(decoded.ignore_patterns.is_none());
         assert!(!decoded.tray_hidden, "an old config keeps the tray icon");
+        assert!(
+            decoded.language.is_none(),
+            "an old config follows the system"
+        );
         assert_eq!(
             decoded.resolved_ignore_patterns().len(),
             DEFAULT_IGNORE_PATTERNS.len(),

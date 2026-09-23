@@ -120,7 +120,8 @@ impl ActionMenu {
         let (menu, group) = self.finish();
         let button = gtk4::MenuButton::builder()
             .icon_name("view-more-symbolic")
-            .tooltip_text("More")
+            // Translators: tooltip of a button that opens a menu of further actions.
+            .tooltip_text(gettext("More"))
             .valign(gtk4::Align::Center)
             .menu_model(&menu)
             .build();

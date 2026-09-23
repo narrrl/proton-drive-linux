@@ -81,9 +81,10 @@ pub(crate) struct Viewer {
 /// label/value pairs for the details panel.
 #[derive(Default)]
 pub(crate) struct ExifInfo {
-    /// `("Camera", "Apple iPhone 15")` and friends; empty when the file has no
-    /// EXIF at all, which is normal for screenshots and re-encoded images.
-    pub(crate) fields: Vec<(&'static str, String)>,
+    /// `("Camera", "Apple iPhone 15")` and friends, the label already
+    /// translated; empty when the file has no EXIF at all, which is normal for
+    /// screenshots and re-encoded images.
+    pub(crate) fields: Vec<(String, String)>,
     /// Decimal degrees, if the photo is geotagged.
     pub(crate) coords: Option<(f64, f64)>,
 }
@@ -146,7 +147,7 @@ fn load_photo_group(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: &str) {
         if let Some(next) = next_group_member(&items, &uid) {
             viewer
                 .group_btn
-                .set_tooltip_text(Some(&format!("Show {}", member_label(next))));
+                .set_tooltip_text(Some(&member_tooltip(next)));
         }
         *viewer.group.borrow_mut() = items;
         viewer.group_btn.set_visible(true);
@@ -169,6 +170,21 @@ pub(crate) fn member_label(item: &PhotoItem) -> String {
             PhotoKind::Raw => "the raw file".to_string(),
             PhotoKind::Video => "the video".to_string(),
             PhotoKind::Photo => "the photo".to_string(),
+        },
+    }
+}
+
+/// The group switch's tooltip, naming the file it will show next.
+fn member_tooltip(item: &PhotoItem) -> String {
+    match item.name.as_deref() {
+        Some(name) if !name.is_empty() => {
+            // Translators: tooltip of the button that switches to another file of the same photo; {name} is a file name.
+            gettext_f("Show {name}", &[("name", &member_label(item))])
+        }
+        _ => match item.kind {
+            PhotoKind::Raw => gettext("Show the raw file"),
+            PhotoKind::Video => gettext("Show the video"),
+            PhotoKind::Photo => gettext("Show the photo"),
         },
     }
 }
@@ -269,12 +285,12 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
                 }
                 Err(e) => {
                     tracing::error!("Failed to load texture for {path}: {e}");
-                    fail("Couldn't render this photo.");
+                    fail(&gettext("Couldn't render this photo."));
                 }
             },
             Ok(Ok(Response::Error { message, .. })) => fail(&message),
-            Ok(Ok(_)) => fail("Unexpected reply from the mount service."),
-            Ok(Err(_)) | Err(_) => fail("Couldn't reach Proton Drive."),
+            Ok(Ok(_)) => fail(&gettext("Unexpected reply from the mount service.")),
+            Ok(Err(_)) | Err(_) => fail(&gettext("Couldn't reach Proton Drive.")),
         }
     });
 }
@@ -326,7 +342,7 @@ pub(crate) fn clear_info(viewer: &Rc<Viewer>) {
         viewer.info_rows.remove(&row);
     }
     let label = gtk4::Label::builder()
-        .label("Reading photo details…")
+        .label(gettext("Reading photo details…"))
         .halign(gtk4::Align::Start)
         .build();
     label.add_css_class("dim-label");
@@ -340,15 +356,16 @@ pub(crate) fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
         viewer.info_rows.remove(&row);
     }
 
-    let mut fields: Vec<(&str, String)> = Vec::new();
+    let mut fields: Vec<(String, String)> = Vec::new();
     if let Ok(meta) = std::fs::metadata(path) {
-        fields.push(("Size", human_bytes(meta.len())));
+        // Translators: label of a photo's file size in the details panel.
+        fields.push((pgettext("property", "Size"), human_bytes(meta.len())));
     }
-    fields.extend(info.fields.iter().map(|(k, v)| (*k, v.clone())));
+    fields.extend(info.fields);
 
     if fields.is_empty() {
         let label = gtk4::Label::builder()
-            .label("This photo carries no metadata.")
+            .label(gettext("This photo carries no metadata."))
             .halign(gtk4::Align::Start)
             .wrap(true)
             .build();
@@ -360,7 +377,7 @@ pub(crate) fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
         group.add_css_class("boxed-list");
         for (label, value) in fields {
             let row = adw::ActionRow::builder()
-                .title(label)
+                .title(label.as_str())
                 .subtitle(value)
                 .subtitle_selectable(true)
                 .build();
@@ -378,7 +395,7 @@ pub(crate) fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
 /// disk. Anything missing is simply left out — phone screenshots and re-encoded
 /// images legitimately carry no EXIF at all.
 pub(crate) fn read_exif(path: &str) -> ExifInfo {
-    let mut fields: Vec<(&'static str, String)> = Vec::new();
+    let mut fields: Vec<(String, String)> = Vec::new();
     let mut coords = None;
 
     let reader = match std::fs::File::open(path) {
@@ -405,12 +422,15 @@ pub(crate) fn read_exif(path: &str) -> ExifInfo {
 
     if let Some(size) = field(exif::Tag::PixelXDimension)
         .zip(field(exif::Tag::PixelYDimension))
-        .map(|(w, h)| format!("{w} × {h}"))
+        // Translators: a photo's pixel dimensions, such as "4032 × 3024".
+        .map(|(w, h)| gettext_f("{width} × {height}", &[("width", &w), ("height", &h)]))
     {
-        fields.push(("Dimensions", size));
+        // Translators: label of a photo's pixel dimensions in the details panel.
+        fields.push((gettext("Dimensions"), size));
     }
     if let Some(taken) = field(exif::Tag::DateTimeOriginal) {
-        fields.push(("Taken", taken));
+        // Translators: label of when a photo was taken, in the details panel.
+        fields.push((pgettext("photo property", "Taken"), taken));
     }
 
     let camera = [exif::Tag::Make, exif::Tag::Model]
@@ -419,10 +439,12 @@ pub(crate) fn read_exif(path: &str) -> ExifInfo {
         .collect::<Vec<_>>()
         .join(" ");
     if !camera.is_empty() {
-        fields.push(("Camera", camera));
+        // Translators: label of the camera model in a photo's details panel.
+        fields.push((gettext("Camera"), camera));
     }
     if let Some(lens) = field(exif::Tag::LensModel) {
-        fields.push(("Lens", lens));
+        // Translators: label of the lens model in a photo's details panel.
+        fields.push((gettext("Lens"), lens));
     }
 
     let exposure: Vec<String> = [
@@ -435,13 +457,22 @@ pub(crate) fn read_exif(path: &str) -> ExifInfo {
     .filter_map(|tag| field(*tag))
     .collect();
     if !exposure.is_empty() {
-        fields.push(("Exposure", exposure.join(" · ")));
+        // Translators: label of aperture, shutter speed, ISO and focal length in a photo's details panel.
+        fields.push((gettext("Exposure"), exposure.join(" · ")));
     }
 
     if let Some(lat) = gps_degrees(&reader, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef)
         && let Some(lon) = gps_degrees(&reader, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef)
     {
-        fields.push(("Location", format!("{lat:.5}, {lon:.5}")));
+        let (lat_text, lon_text) = (format!("{lat:.5}"), format!("{lon:.5}"));
+        // Translators: label of where a photo was taken, in the details panel.
+        let label = pgettext("photo property", "Location");
+        // Translators: GPS coordinates in decimal degrees, such as "52.52000, 13.40500".
+        let value = gettext_f(
+            "{latitude}, {longitude}",
+            &[("latitude", &lat_text), ("longitude", &lon_text)],
+        );
+        fields.push((label, value));
         coords = Some((lat, lon));
     }
 
@@ -605,7 +636,7 @@ fn hide_chrome(viewer: &Rc<Viewer>) {
 /// Copy the photo on screen to where the user picks, under its Drive name.
 pub(crate) fn save_photo_to_disk(ui: &Rc<Ui>, window: &gtk4::Window, source: &str, name: &str) {
     let dialog = gtk4::FileDialog::builder()
-        .title("Save a Copy")
+        .title(gettext("Save a Copy"))
         .initial_name(name)
         .build();
     let source = source.to_string();
@@ -625,10 +656,15 @@ pub(crate) fn save_photo_to_disk(ui: &Rc<Ui>, window: &gtk4::Window, source: &st
                         || dest.display().to_string(),
                         |name| name.to_string_lossy().into_owned(),
                     );
-                    toast(&ui, &format!("Saved “{saved}”"));
+                    // Translators: {name} is the saved file's name.
+                    toast(&ui, &gettext_f("Saved “{name}”", &[("name", &saved)]));
                 }
-                Ok(Err(e)) => toast_error(&ui, "Couldn't save the copy", &e.to_string()),
-                Err(_) => toast_error(&ui, "Couldn't save the copy", "The copy was interrupted."),
+                Ok(Err(e)) => toast_error(&ui, &gettext("Couldn't save the copy"), &e.to_string()),
+                Err(_) => toast_error(
+                    &ui,
+                    &gettext("Couldn't save the copy"),
+                    &gettext("The copy was interrupted."),
+                ),
             }
         });
     });
@@ -749,9 +785,21 @@ fn gallery_total(ui: &Rc<Ui>) -> Option<usize> {
 pub(crate) fn position_label(index: u32, loaded: u32, more: bool, total: Option<usize>) -> String {
     let (at, loaded) = (index as usize + 1, loaded as usize);
     match total {
-        _ if !more => format!("{} of {}", thousands(at), thousands(loaded)),
-        Some(total) if total > loaded => format!("{} of {}", thousands(at), thousands(total)),
-        _ => format!("{} of {}+", thousands(at), thousands(loaded)),
+        // Translators: the lightbox counter, such as "12 of 340"; {position} is the photo's place, {total} how many there are.
+        _ if !more => gettext_f(
+            "{position} of {total}",
+            &[("position", &thousands(at)), ("total", &thousands(loaded))],
+        ),
+        // Translators: the lightbox counter, such as "12 of 340"; {position} is the photo's place, {total} how many there are.
+        Some(total) if total > loaded => gettext_f(
+            "{position} of {total}",
+            &[("position", &thousands(at)), ("total", &thousands(total))],
+        ),
+        // Translators: the lightbox counter while more photos are still loading, such as "12 of 200+"; {loaded} is how many are loaded so far.
+        _ => gettext_f(
+            "{position} of {loaded}+",
+            &[("position", &thousands(at)), ("loaded", &thousands(loaded))],
+        ),
     }
 }
 
@@ -777,7 +825,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
 
     let window = gtk4::Window::builder()
-        .title("Photo")
+        .title(gettext("Photo"))
         .modal(true)
         .transient_for(&parent)
         .default_width(1100)
@@ -824,7 +872,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let prev_btn = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Previous (←)")
+        .tooltip_text(gettext("Previous (←)"))
         .build();
     prev_btn.add_css_class("circular");
     prev_btn.add_css_class("flat");
@@ -838,7 +886,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let next_btn = gtk4::Button::builder()
         .icon_name("go-next-symbolic")
-        .tooltip_text("Next (→)")
+        .tooltip_text(gettext("Next (→)"))
         .build();
     next_btn.add_css_class("circular");
     next_btn.add_css_class("flat");
@@ -876,7 +924,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let info_toggle = gtk4::ToggleButton::builder()
         .icon_name("info-outline-symbolic")
-        .tooltip_text("Details (i)")
+        .tooltip_text(gettext("Details (i)"))
         .valign(gtk4::Align::Center)
         .build();
     info_toggle.add_css_class("flat");
@@ -884,7 +932,8 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let favorite_btn = gtk4::ToggleButton::builder()
         .icon_name("non-starred-symbolic")
-        .tooltip_text("Favorite")
+        // Translators: tooltip of the star button that marks a photo as a favorite.
+        .tooltip_text(pgettext("verb", "Favorite"))
         .valign(gtk4::Align::Center)
         .build();
     favorite_btn.add_css_class("flat");
@@ -892,13 +941,13 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     // Only shown for a shot stored as more than one file; `load_photo_group`
     // decides that per photo.
-    let group_btn = action("view-paged-symbolic", "Other files of this photo");
+    let group_btn = action("view-paged-symbolic", &gettext("Other files of this photo"));
     group_btn.set_visible(false);
 
-    let download_btn = action("document-save-symbolic", "Save a Copy…");
-    let delete_btn = action("user-trash-symbolic", "Move to Trash (Delete)");
-    let open_ext_btn = action("document-open-symbolic", "Open With…");
-    let close_btn = action("window-close-symbolic", "Close (Esc)");
+    let download_btn = action("document-save-symbolic", &gettext("Save a Copy…"));
+    let delete_btn = action("user-trash-symbolic", &gettext("Move to Trash (Delete)"));
+    let open_ext_btn = action("document-open-symbolic", &gettext("Open With…"));
+    let close_btn = action("window-close-symbolic", &gettext("Close (Esc)"));
     close_btn.add_css_class("viewer-close-btn");
 
     let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -921,7 +970,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let info_map = gtk4::Button::builder()
         .child(
             &adw::ButtonContent::builder()
-                .label("Show on map")
+                .label(gettext("Show on map"))
                 .icon_name("map-symbolic")
                 .build(),
         )
@@ -931,7 +980,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     info_map.set_visible(false);
 
     let info_title = gtk4::Label::builder()
-        .label("Details")
+        .label(gettext("Details"))
         .halign(gtk4::Align::Start)
         .hexpand(true)
         .build();
@@ -939,7 +988,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let info_close = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
-        .tooltip_text("Hide details")
+        .tooltip_text(gettext("Hide details"))
         .build();
     info_close.add_css_class("flat");
     info_close.add_css_class("circular");
@@ -1193,10 +1242,14 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
                     None
                 }
                 Ok(Ok(Response::Error { message, .. })) => Some(message),
-                _ => Some("The mount service didn't respond.".to_string()),
+                _ => Some(gettext("The mount service didn't respond.")),
             };
             if let Some(detail) = failed {
-                toast_error(&ui_result, "Couldn't change the favorite", &detail);
+                toast_error(
+                    &ui_result,
+                    &gettext("Couldn't change the favorite"),
+                    &detail,
+                );
                 // The server refused, so the button must go back to describing
                 // what is actually stored — without firing this handler again.
                 if *viewer_result.uid.borrow() == uid {

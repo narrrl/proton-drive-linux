@@ -50,12 +50,12 @@ pub(crate) struct DetailsWidgets {
 pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     let toggle = gtk4::ToggleButton::builder()
         .icon_name("sidebar-show-right-symbolic")
-        .tooltip_text("Details (Alt+Enter)")
+        .tooltip_text(gettext("Details (Alt+Enter)"))
         .build();
 
     let close_button = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
-        .tooltip_text("Close details")
+        .tooltip_text(gettext("Close details"))
         .halign(gtk4::Align::End)
         .build();
     close_button.add_css_class("flat");
@@ -81,19 +81,21 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     head.append(&name);
     head.append(&kind);
 
-    let props = adw::PreferencesGroup::builder().title("Info").build();
+    let props = adw::PreferencesGroup::builder()
+        .title(gettext("Info"))
+        .build();
     let size_row = adw::ActionRow::builder()
-        .title("Size")
+        .title(pgettext("column", "Size"))
         .subtitle("—")
         .build();
     size_row.add_css_class("property");
     let modified_row = adw::ActionRow::builder()
-        .title("Modified")
+        .title(pgettext("column", "Modified"))
         .subtitle("—")
         .build();
     modified_row.add_css_class("property");
     let path_row = adw::ActionRow::builder()
-        .title("Location")
+        .title(gettext("Location"))
         .subtitle("—")
         .subtitle_lines(3)
         .build();
@@ -102,22 +104,28 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     props.add(&modified_row);
     props.add(&path_row);
 
-    let offline = adw::PreferencesGroup::builder().title("Offline").build();
+    let offline = adw::PreferencesGroup::builder()
+        .title(pgettext("state", "Offline"))
+        .build();
     let pin_row = adw::SwitchRow::builder()
-        .title("Available offline")
-        .subtitle("Keep a copy on this computer, even without a connection.")
+        .title(gettext("Available offline"))
+        .subtitle(gettext(
+            "Keep a copy on this computer, even without a connection.",
+        ))
         .build();
     offline.add(&pin_row);
 
-    let sharing = adw::PreferencesGroup::builder().title("Sharing").build();
+    let sharing = adw::PreferencesGroup::builder()
+        .title(gettext("Sharing"))
+        .build();
     let sharing_row = adw::ActionRow::builder()
-        .title("Access")
+        .title(gettext("Access"))
         .subtitle("—")
         .build();
     sharing_row.add_css_class("property");
     sharing.add(&sharing_row);
-    let share_button = gtk4::Button::builder().label("Share…").build();
-    let copy_link_button = gtk4::Button::builder().label("Copy Link").build();
+    let share_button = gtk4::Button::builder().label(gettext("Share…")).build();
+    let copy_link_button = gtk4::Button::builder().label(gettext("Copy Link")).build();
     let share_actions = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(6)
@@ -128,25 +136,31 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     share_actions.append(&copy_link_button);
     sharing.add(&share_actions);
 
-    let versions_group = adw::PreferencesGroup::builder().title("Versions").build();
+    let versions_group = adw::PreferencesGroup::builder()
+        .title(gettext("Versions"))
+        .build();
     let versions_row = adw::ActionRow::builder()
-        .title("History")
+        .title(gettext("History"))
         .subtitle("—")
         .build();
     versions_row.add_css_class("property");
     versions_group.add(&versions_row);
     let versions_button = gtk4::Button::builder()
-        .label("Versions…")
+        .label(gettext("Versions…"))
         .margin_top(6)
         .build();
     versions_group.add(&versions_button);
 
-    let open_button = gtk4::Button::builder().label("Open").build();
+    let open_button = gtk4::Button::builder()
+        .label(pgettext("verb", "Open"))
+        .build();
     open_button.add_css_class("suggested-action");
     open_button.add_css_class("pill");
-    let rename_button = gtk4::Button::builder().label("Rename").build();
+    let rename_button = gtk4::Button::builder().label(gettext("Rename")).build();
     rename_button.add_css_class("pill");
-    let trash_button = gtk4::Button::builder().label("Move to Trash").build();
+    let trash_button = gtk4::Button::builder()
+        .label(gettext("Move to Trash"))
+        .build();
     trash_button.add_css_class("destructive-action");
     trash_button.add_css_class("pill");
 
@@ -178,7 +192,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     // itself would move the files under the pointer.
     let empty_close = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
-        .tooltip_text("Close details")
+        .tooltip_text(gettext("Close details"))
         .halign(gtk4::Align::End)
         .margin_top(12)
         .margin_end(12)
@@ -189,8 +203,8 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     empty_close.connect_clicked(move |_| toggle_off.set_active(false));
     let empty_status = adw::StatusPage::builder()
         .icon_name("sidebar-show-right-symbolic")
-        .title("No item selected")
-        .description("Select a file or folder to see its details.")
+        .title(gettext("No item selected"))
+        .description(gettext("Select a file or folder to see its details."))
         .vexpand(true)
         .build();
     empty_status.add_css_class("compact");
@@ -347,8 +361,11 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     let d = &ui.details.details;
     d.icon.set_icon_name(Some(icon_base_for(entry)));
     d.name.set_label(&entry.name);
-    d.kind
-        .set_label(if entry.is_dir { "Folder" } else { "File" });
+    d.kind.set_label(&if entry.is_dir {
+        gettext("Folder")
+    } else {
+        gettext("File")
+    });
     d.size_row.set_subtitle(&if entry.is_dir {
         "—".to_string()
     } else {
@@ -362,18 +379,21 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
         Some(i) => &rel[..i],
         None => "",
     };
-    d.path_row.set_subtitle(if parent.is_empty() {
-        "Proton Drive"
+    d.path_row.set_subtitle(&if parent.is_empty() {
+        gettext("Proton Drive")
     } else {
-        parent
+        parent.to_string()
     });
     // Pinning is per file: the context menu and the selection bar offer it for
     // files only, so the pane must not offer it for folders either.
     d.pin_row.set_active(entry.pinned);
     d.pin_row.set_visible(!entry.is_dir);
     d.pin_row.set_sensitive(*ui.mounted.borrow());
-    d.open_button
-        .set_label(if entry.is_dir { "Open folder" } else { "Open" });
+    d.open_button.set_label(&if entry.is_dir {
+        gettext("Open folder")
+    } else {
+        pgettext("verb", "Open")
+    });
     // Only files have revisions, and only a connected daemon can fetch them.
     let mounted = *ui.mounted.borrow();
     d.versions_group.set_visible(!entry.is_dir);
@@ -414,7 +434,7 @@ fn load_details_extras(ui: &Rc<Ui>, entry: &DirEntry) {
             Ok(Ok(Response::Share { entries, link })) => {
                 sharing_summary(entries.len(), link.is_some())
             }
-            _ => "Couldn't load sharing".to_string(),
+            _ => gettext("Couldn't load sharing"),
         };
         if details_showing(&ui_c, &uid) {
             ui_c.details.details.sharing_row.set_subtitle(&text);
@@ -436,7 +456,7 @@ fn load_details_extras(ui: &Rc<Ui>, entry: &DirEntry) {
     glib::spawn_future_local(async move {
         let text = match rx.recv().await {
             Ok(Ok(Response::Revisions { items })) => versions_summary(&items),
-            _ => "Couldn't load versions".to_string(),
+            _ => gettext("Couldn't load versions"),
         };
         if details_showing(&ui_c, &uid) {
             ui_c.details.details.versions_row.set_subtitle(&text);
@@ -454,16 +474,17 @@ fn details_showing(ui: &Rc<Ui>, uid: &str) -> bool {
 
 /// "Only you", "3 people", "Public link" or both.
 pub(crate) fn sharing_summary(people: usize, link: bool) -> String {
-    let people = match people {
-        0 => None,
-        1 => Some("1 person".to_string()),
-        n => Some(format!("{n} people")),
-    };
+    let n = people as u64;
     match (people, link) {
-        (None, false) => "Only you".to_string(),
-        (None, true) => "Anyone with the link".to_string(),
-        (Some(p), false) => format!("Shared with {p}"),
-        (Some(p), true) => format!("Shared with {p} · Public link"),
+        (0, false) => gettext("Only you"),
+        (0, true) => gettext("Anyone with the link"),
+        (_, false) => ngettext_f("Shared with {n} person", "Shared with {n} people", n, &[]),
+        (_, true) => ngettext_f(
+            "Shared with {n} person · Public link",
+            "Shared with {n} people · Public link",
+            n,
+            &[],
+        ),
     }
 }
 
@@ -471,9 +492,16 @@ pub(crate) fn sharing_summary(people: usize, link: bool) -> String {
 pub(crate) fn versions_summary(items: &[RevisionInfo]) -> String {
     let latest = items.iter().map(|r| r.created).max();
     match (items.len(), latest) {
-        (0, _) | (_, None) => "No earlier versions".to_string(),
-        (1, Some(t)) => format!("1 version · {}", format_modified(t)),
-        (n, Some(t)) => format!("{n} versions · latest {}", format_modified(t)),
+        (0, _) | (_, None) => gettext("No earlier versions"),
+        // Translators: {date} is the date of the only version.
+        (1, Some(t)) => gettext_f("1 version · {date}", &[("date", &format_modified(t))]),
+        // Translators: {date} is the date of the newest version.
+        (n, Some(t)) => ngettext_f(
+            "{n} version · latest {date}",
+            "{n} versions · latest {date}",
+            n as u64,
+            &[("date", &format_modified(t))],
+        ),
     }
 }
 

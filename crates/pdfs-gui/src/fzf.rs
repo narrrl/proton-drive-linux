@@ -32,13 +32,14 @@ use pdfs_core::menu::{self, PromptConfig};
 use pdfs_core::opener::OpenWith;
 
 use crate::query;
-use crate::{Hit, SEARCH_DEBOUNCE};
+use crate::{Hit, SEARCH_DEBOUNCE, gettext, gettext_noop};
 
 /// Separates the visible half of a feed line from its payload.
 const FIELD: char = '\t';
 
 /// What the launcher prompt reads, matching the dmenu front end's wording.
-const PROMPT: &str = "Search Drive › ";
+// Translators: the launcher prompt; keep the trailing space, the input follows it directly.
+const PROMPT: &str = gettext_noop("Search Drive › ");
 
 pub(crate) struct Options {
     /// Search for this immediately instead of opening on the pinned files.
@@ -166,7 +167,8 @@ fn interactive(query: Option<String>) -> Result<(), String> {
 /// empty list with no explanation, so a failure becomes a visible row instead.
 pub(crate) fn feed(query: Option<&str>) {
     let Ok(dirs) = AppDirs::new() else {
-        println!("(cannot resolve app dirs)");
+        // Translators: shown as a row in the search list. Keep the parentheses.
+        println!("{}", gettext("(cannot resolve app dirs)"));
         return;
     };
     let limit = dirs.load_config().resolved_prompt().resolved_menu_limit();
@@ -219,7 +221,7 @@ fn fzf_argv(exe: &std::path::Path, query: Option<&str>) -> Vec<String> {
     .iter()
     .map(|arg| (*arg).to_string())
     .collect();
-    argv.push(format!("--prompt={PROMPT}"));
+    argv.push(format!("--prompt={}", gettext(PROMPT)));
     // `reload:` rather than `reload(…)`: the unparenthesised form runs to the
     // end of the argument, so an install path containing a bracket cannot
     // truncate the command fzf parses out of it.

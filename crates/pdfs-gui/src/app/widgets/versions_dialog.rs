@@ -85,11 +85,19 @@ pub(crate) struct VersionsDialog {
 /// Open the Versions dialog for a file.
 pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     if !*ui.mounted.borrow() {
-        toast_error(ui, "Can't load versions", "Proton Drive isn't connected.");
+        toast_error(
+            ui,
+            &gettext("Can't load versions"),
+            &gettext("Proton Drive isn't connected."),
+        );
         return;
     }
     if entry.is_dir {
-        toast_error(ui, "No versions", "Folders don't have versions.");
+        toast_error(
+            ui,
+            &gettext("No versions"),
+            &gettext("Folders don't have versions."),
+        );
         return;
     }
     let target = if entry.path.is_empty() {
@@ -100,12 +108,17 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Versions", &entry.name)));
+    header.set_title_widget(Some(&adw::WindowTitle::new(
+        &gettext("Versions"),
+        &entry.name,
+    )));
     toolbar.add_top_bar(&header);
 
     let group = adw::PreferencesGroup::builder()
-        .title("Version history")
-        .description("Proton Drive keeps earlier versions of a file until you delete them.")
+        .title(gettext("Version history"))
+        .description(gettext(
+            "Proton Drive keeps earlier versions of a file until you delete them.",
+        ))
         .build();
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
@@ -123,7 +136,7 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     toolbar.set_content(Some(&scroll));
 
     let dialog = adw::Dialog::builder()
-        .title("Versions")
+        .title(gettext("Versions"))
         .content_width(520)
         .content_height(520)
         .child(&toolbar)
@@ -149,12 +162,12 @@ pub(crate) fn versions_dialog_reload(state: &Rc<VersionsDialog>) {
         match rx.recv().await {
             Ok(Ok(Response::Revisions { items })) => repaint_versions(&state, &items),
             Ok(Ok(Response::Error { message, .. })) => {
-                toast_error(&state.ui, "Couldn't load versions", &message)
+                toast_error(&state.ui, &gettext("Couldn't load versions"), &message)
             }
             _ => toast_error(
                 &state.ui,
-                "Couldn't load versions",
-                "The mount service didn't respond.",
+                &gettext("Couldn't load versions"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -167,7 +180,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
     }
     let mut rows: Vec<gtk4::Widget> = Vec::new();
     if items.is_empty() {
-        let row = dim_row("No earlier versions.");
+        let row = dim_row(&gettext("No earlier versions."));
         state.group.add(&row);
         rows.push(row.upcast());
         *state.rows.borrow_mut() = rows;
@@ -186,8 +199,15 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
         // when they were saved instead.
         let (title, mut subtitle) = if item.is_active {
             (
-                "Current version".to_string(),
-                format!("{} · {}", activity_time(item.created), human_bytes(size)),
+                gettext("Current version"),
+                // Translators: {time} is when the version was saved, {size} its file size.
+                gettext_f(
+                    "{time} · {size}",
+                    &[
+                        ("time", &activity_time(item.created)),
+                        ("size", &human_bytes(size)),
+                    ],
+                ),
             )
         } else {
             (activity_time(item.created), human_bytes(size))
@@ -203,7 +223,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
 
         let save = gtk4::Button::builder()
             .icon_name("document-save-symbolic")
-            .tooltip_text("Save a copy…")
+            .tooltip_text(gettext("Save a copy…"))
             .valign(gtk4::Align::Center)
             .build();
         save.add_css_class("flat");
@@ -215,7 +235,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
         if !item.is_active {
             let restore = gtk4::Button::builder()
                 .icon_name("edit-undo-symbolic")
-                .tooltip_text("Restore this version")
+                .tooltip_text(gettext("Restore this version"))
                 .valign(gtk4::Align::Center)
                 .build();
             restore.add_css_class("flat");
@@ -226,7 +246,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
 
             let delete = gtk4::Button::builder()
                 .icon_name("user-trash-symbolic")
-                .tooltip_text("Delete this version permanently")
+                .tooltip_text(gettext("Delete this version permanently"))
                 .valign(gtk4::Align::Center)
                 .build();
             delete.add_css_class("flat");
@@ -246,14 +266,15 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
 /// every device on the account, not only this one.
 fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Restore version")
-        .body(format!(
-            "Make this version the current content of “{}”? The version it replaces stays in the history.",
-            state.name
+        .heading(gettext("Restore version"))
+        // Translators: {name} is a file name.
+        .body(gettext_f(
+            "Make this version the current content of “{name}”? The version it replaces stays in the history.",
+            &[("name", &state.name)],
         ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("restore", "Restore");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("restore", &pgettext("verb", "Restore"));
     dialog.set_response_appearance("restore", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -270,8 +291,8 @@ fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
             state.target.restore(revision_id.clone()),
             // The server applies the swap in the background, so the wording
             // promises the request, not the result.
-            "Restoring that version",
-            "Couldn't restore that version",
+            &gettext("Restoring that version"),
+            &gettext("Couldn't restore that version"),
         );
     });
     dialog.present(window.as_ref());
@@ -280,11 +301,13 @@ fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
 /// Confirm, then permanently delete one revision.
 fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Delete version")
-        .body("Delete this version permanently? Its content can't be recovered.")
+        .heading(gettext("Delete version"))
+        .body(gettext(
+            "Delete this version permanently? Its content can't be recovered.",
+        ))
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Delete");
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("delete", &pgettext("verb", "Delete"));
     dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -299,8 +322,8 @@ fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
         versions_dialog_op(
             &state,
             state.target.delete(revision_id.clone()),
-            "Version deleted",
-            "Couldn't delete that version",
+            &gettext("Version deleted"),
+            &gettext("Couldn't delete that version"),
         );
     });
     dialog.present(window.as_ref());
@@ -314,7 +337,7 @@ fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
 fn prompt_save_version(state: &Rc<VersionsDialog>, revision_id: &str) {
     let window = ui_window(&state.ui);
     let dialog = gtk4::FileDialog::builder()
-        .title("Save version")
+        .title(gettext("Save version"))
         .initial_name(&state.name)
         .build();
     let state = state.clone();
@@ -324,16 +347,16 @@ fn prompt_save_version(state: &Rc<VersionsDialog>, revision_id: &str) {
         let Some(dest) = file.path().and_then(|p| p.to_str().map(str::to_string)) else {
             toast_error(
                 &state.ui,
-                "Couldn't save that version",
-                "That location isn't a local file.",
+                &gettext("Couldn't save that version"),
+                &gettext("That location isn't a local file."),
             );
             return;
         };
         versions_dialog_op(
             &state,
             state.target.save_as(revision_id.clone(), dest),
-            "Version saved",
-            "Couldn't save that version",
+            &gettext("Version saved"),
+            &gettext("Couldn't save that version"),
         );
     });
 }
@@ -351,7 +374,11 @@ fn versions_dialog_op(state: &Rc<VersionsDialog>, request: Request, done: &str, 
                 versions_dialog_reload(&state);
             }
             Ok(Ok(Response::Error { message, .. })) => toast_error(&state.ui, &failed, &message),
-            _ => toast_error(&state.ui, &failed, "The mount service didn't respond."),
+            _ => toast_error(
+                &state.ui,
+                &failed,
+                &gettext("The mount service didn't respond."),
+            ),
         }
     });
 }

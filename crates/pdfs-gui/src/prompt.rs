@@ -23,6 +23,8 @@ use pdfs_core::menu::PromptMode;
 use pdfs_core::opener::{self, OpenWith};
 
 mod activation;
+mod i18n;
+use i18n::{gettext, gettext_f, gettext_noop, ngettext_f, pgettext};
 mod dmenu;
 mod fzf;
 mod query;
@@ -51,11 +53,13 @@ enum Filter {
 
 /// The chip row, in Tab-cycle order.
 const FILTERS: [(Filter, &str); 5] = [
-    (Filter::All, "All"),
-    (Filter::Folders, "Folders"),
-    (Filter::Documents, "Documents"),
-    (Filter::Images, "Images"),
-    (Filter::Media, "Media"),
+    // Translators: a filter chip that shows every kind of result.
+    (Filter::All, gettext_noop("All")),
+    (Filter::Folders, gettext_noop("Folders")),
+    (Filter::Documents, gettext_noop("Documents")),
+    (Filter::Images, gettext_noop("Images")),
+    // Translators: a filter chip for audio and video files.
+    (Filter::Media, gettext_noop("Media")),
 ];
 
 impl Filter {
@@ -162,9 +166,13 @@ impl Hit {
                 None => {
                     let parent = parent_of(&h.path);
                     if parent.is_empty() {
-                        "My files".to_string()
+                        gettext("My files")
                     } else {
-                        format!("My files / {}", parent.replace('/', " / "))
+                        // Translators: {path} is a folder path inside the user's Drive, such as "Work / Taxes".
+                        gettext_f(
+                            "My files / {path}",
+                            &[("path", &parent.replace('/', " / "))],
+                        )
                     }
                 }
             },
@@ -425,6 +433,7 @@ fn main() -> glib::ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    i18n::init();
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -506,7 +515,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Search Proton Drive")
+        .title(gettext("Search Proton Drive"))
         .default_width(720)
         .default_height(540)
         .resizable(false)
@@ -527,7 +536,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     search_bar.append(&search_icon);
 
     let entry = gtk4::Entry::builder()
-        .placeholder_text("Search in Drive and on this computer")
+        .placeholder_text(gettext("Search in Drive and on this computer"))
         .hexpand(true)
         .build();
     entry.add_css_class("search-entry");
@@ -537,7 +546,8 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     spinner.set_visible(false);
     search_bar.append(&spinner);
 
-    let esc = gtk4::Label::new(Some("Esc"));
+    // Translators: the Escape key, shown as a hint that it closes the window.
+    let esc = gtk4::Label::new(Some(&gettext("Esc")));
     esc.add_css_class("key-hint");
     search_bar.append(&esc);
     card.append(&search_bar);
@@ -551,9 +561,9 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     let results = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     results.add_css_class("results");
 
-    let search_section = Section::new("Best matches", "system-search-symbolic");
+    let search_section = Section::new(&gettext("Best matches"), "system-search-symbolic");
     let drive_section = Section::new("Proton Drive", "folder-remote-symbolic");
-    let local_section = Section::new("This computer", "drive-harddisk-symbolic");
+    let local_section = Section::new(&gettext("This computer"), "drive-harddisk-symbolic");
     search_section.attach(&results);
     drive_section.attach(&results);
     local_section.attach(&results);
@@ -567,7 +577,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
 
     let placeholder = adw::StatusPage::builder()
         .icon_name("system-search-symbolic")
-        .title("No results")
+        .title(gettext("No results"))
         .build();
     placeholder.add_css_class("compact");
 
@@ -575,12 +585,12 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     // is still usable for nothing else, so it owns the whole view.
     let offline = adw::StatusPage::builder()
         .icon_name("network-offline-symbolic")
-        .title("Proton Drive is not running")
-        .description("Start the mount daemon to search your Drive.")
+        .title(gettext("Proton Drive is not running"))
+        .description(gettext("Start the mount daemon to search your Drive."))
         .build();
     offline.add_css_class("compact");
     let retry = gtk4::Button::builder()
-        .label("Retry")
+        .label(gettext("Retry"))
         .halign(gtk4::Align::Center)
         .build();
     retry.add_css_class("pill");
@@ -601,14 +611,15 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     footer.add_css_class("footer");
     let hint = gtk4::Label::builder()
-        .label("Connecting…")
+        .label(gettext("Connecting…"))
         .xalign(0.0)
         .hexpand(true)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
     hint.add_css_class("footer-text");
     footer.append(&hint);
-    let keys = gtk4::Label::new(Some("↑↓ navigate · ↵ open · Tab filter"));
+    // Translators: keyboard hints in the footer; keep the arrow and Enter symbols.
+    let keys = gtk4::Label::new(Some(&gettext("↑↓ navigate · ↵ open · Tab filter")));
     keys.add_css_class("footer-text");
     footer.append(&keys);
     card.append(&footer);
@@ -646,7 +657,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
 
     for (filter, label) in FILTERS {
         let chip = gtk4::ToggleButton::builder()
-            .label(label)
+            .label(gettext(label))
             .active(filter == Filter::All)
             .build();
         chip.add_css_class("chip");
@@ -852,7 +863,7 @@ impl Ui {
     /// Ask the daemon for status and, if it answers, load the suggested (pinned)
     /// files. Runs off-thread: a dead daemon must not freeze the first frame.
     fn connect(self: &Rc<Self>) {
-        self.hint.set_label("Connecting…");
+        self.hint.set_label(&gettext("Connecting…"));
         let rx = spawn_request(self.socket.clone(), Request::Status);
         let ui = self.clone();
         glib::spawn_future_local(async move {
@@ -865,7 +876,7 @@ impl Ui {
                 }
                 _ => {
                     ui.entry.set_sensitive(false);
-                    ui.hint.set_label("Daemon offline");
+                    ui.hint.set_label(&gettext("Daemon offline"));
                     ui.stack.set_visible_child_name("offline");
                 }
             }
@@ -879,7 +890,7 @@ impl Ui {
         self.spinner.stop();
         self.spinner.set_visible(false);
         self.entry.set_sensitive(false);
-        self.hint.set_label("Daemon offline");
+        self.hint.set_label(&gettext("Daemon offline"));
         self.stack.set_visible_child_name("offline");
     }
 
@@ -1072,7 +1083,8 @@ impl Ui {
         visible.extend(local);
         if searching {
             rank_hits(&mut visible);
-            self.search_section.set_rows(&visible, Some("Best matches"));
+            self.search_section
+                .set_rows(&visible, Some(&gettext("Best matches")));
             self.drive_section.set_rows(&[], None);
             self.local_section.set_rows(&[], None);
         } else {
@@ -1081,8 +1093,10 @@ impl Ui {
                 .iter()
                 .take_while(|hit| matches!(hit, Hit::Drive(_)))
                 .count();
-            self.drive_section
-                .set_rows(&visible[..drive_count], Some("Pinned in Proton Drive"));
+            self.drive_section.set_rows(
+                &visible[..drive_count],
+                Some(&gettext("Pinned in Proton Drive")),
+            );
             self.local_section.set_rows(&visible[drive_count..], None);
         }
 
@@ -1093,18 +1107,20 @@ impl Ui {
         *self.rendered_query.borrow_mut() = query;
 
         if total == 0 {
-            self.placeholder.set_title(if searching {
-                "No results"
+            self.placeholder.set_title(&if searching {
+                gettext("No results")
             } else {
-                "Search your Drive"
+                gettext("Search your Drive")
             });
             self.placeholder
-                .set_description(Some(match (searching, self.indexing.get()) {
-                    (true, true) => {
-                        "Still indexing this computer — local results will fill in shortly."
-                    }
-                    (true, false) => "Try a different search, or another filter.",
-                    _ => "Start typing to search Proton Drive and the files on this computer.",
+                .set_description(Some(&match (searching, self.indexing.get()) {
+                    (true, true) => gettext(
+                        "Still indexing this computer — local results will fill in shortly.",
+                    ),
+                    (true, false) => gettext("Try a different search, or another filter."),
+                    _ => gettext(
+                        "Start typing to search Proton Drive and the files on this computer.",
+                    ),
                 }));
             self.stack.set_visible_child_name("empty");
             self.cursor.set(None);
@@ -1129,18 +1145,23 @@ impl Ui {
     fn status_text(&self, total: usize, searching: bool) -> String {
         if !searching {
             return match total {
-                0 => "No pinned files".to_string(),
-                1 => "1 pinned file".to_string(),
-                n => format!("{n} pinned files"),
+                0 => gettext("No pinned files"),
+                n => ngettext_f("{n} pinned file", "{n} pinned files", n as u64, &[]),
             };
         }
-        let drive = self.drive_count();
-        let local = total - drive;
-        let mut text = format!("{drive} in Drive · {local} on this computer");
+        let drive = self.drive_count().to_string();
+        let local = (total - self.drive_count()).to_string();
+        let args = [("drive", drive.as_str()), ("local", local.as_str())];
         if self.indexing.get() {
-            text.push_str(" · indexing…");
+            // Translators: result counts in the footer while this computer is still being indexed; {drive} and {local} are numbers.
+            gettext_f(
+                "{drive} in Drive · {local} on this computer · indexing…",
+                &args,
+            )
+        } else {
+            // Translators: result counts in the footer; {drive} and {local} are numbers.
+            gettext_f("{drive} in Drive · {local} on this computer", &args)
         }
-        text
     }
 
     /// Move the cursor by `delta` rows, wrapping at both ends.
@@ -1272,7 +1293,9 @@ impl Ui {
                 self.opening.set(true);
                 self.spinner.set_visible(true);
                 self.spinner.start();
-                self.hint.set_label(&format!("Opening {}…", drive.name));
+                // Translators: {name} is a file name.
+                let opening = gettext_f("Opening {name}…", &[("name", &drive.name)]);
+                self.hint.set_label(&opening);
 
                 let rx = spawn_request(
                     self.socket.clone(),
@@ -1293,9 +1316,13 @@ impl Ui {
                             ui.dismiss();
                         }
                         Ok(Ok(Response::Error { message, .. })) => {
-                            ui.hint.set_label(&format!("Could not open: {message}"));
+                            // Translators: {message} is an error from the daemon, in English.
+                            ui.hint.set_label(&gettext_f(
+                                "Could not open: {message}",
+                                &[("message", &message)],
+                            ));
                         }
-                        _ => ui.hint.set_label("Could not reach the daemon"),
+                        _ => ui.hint.set_label(&gettext("Could not reach the daemon")),
                     }
                 });
             }
@@ -1403,8 +1430,10 @@ fn home_relative(parent: &str) -> String {
             .ok()
             .map(|rel| rel.display().to_string())
     }) {
-        Some(rel) if rel.is_empty() => "Home".to_string(),
-        Some(rel) => format!("Home / {}", rel.replace('/', " / ")),
+        // Translators: the user's home folder, as the location of a result.
+        Some(rel) if rel.is_empty() => gettext("Home"),
+        // Translators: {path} is a folder path inside the home folder, folder names separated by " / ".
+        Some(rel) => gettext_f("Home / {path}", &[("path", &rel.replace('/', " / "))]),
         None => parent.to_string(),
     }
 }
@@ -1418,16 +1447,21 @@ fn parent_of(path: &str) -> String {
 
 fn format_size(bytes: u64) -> String {
     const UNITS: [(u64, &str); 3] = [
-        (1024 * 1024 * 1024, "GB"),
-        (1024 * 1024, "MB"),
-        (1024, "KB"),
+        // Translators: a file size in gigabytes; {size} is a number such as "4.2".
+        (1024 * 1024 * 1024, gettext_noop("{size} GB")),
+        // Translators: a file size in megabytes; {size} is a number such as "4.2".
+        (1024 * 1024, gettext_noop("{size} MB")),
+        // Translators: a file size in kilobytes; {size} is a number such as "4.2".
+        (1024, gettext_noop("{size} KB")),
     ];
     for (scale, unit) in UNITS {
         if bytes >= scale {
-            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+            let size = format!("{:.1}", bytes as f64 / scale as f64);
+            return gettext_f(unit, &[("size", &size)]);
         }
     }
-    format!("{bytes} B")
+    // Translators: a file size in bytes; {size} is a whole number.
+    gettext_f("{size} B", &[("size", &bytes.to_string())])
 }
 
 /// Coarse relative age, in the granularity a launcher row has room for.
@@ -1437,12 +1471,18 @@ fn format_age(epoch_secs: i64) -> String {
         .map_or(0, |d| d.as_secs() as i64);
     let diff = now - epoch_secs;
     match diff {
-        d if d < 60 => "now".to_string(),
-        d if d < 3600 => format!("{}m", d / 60),
-        d if d < 86_400 => format!("{}h", d / 3600),
-        d if d < 2_592_000 => format!("{}d", d / 86_400),
-        d if d < 31_536_000 => format!("{}mo", d / 2_592_000),
-        d => format!("{}y", d / 31_536_000),
+        // Translators: the age of a file modified under a minute ago.
+        d if d < 60 => pgettext("age", "now"),
+        // Translators: a compact file age; {count} is a number of minutes.
+        d if d < 3600 => gettext_f("{count}m", &[("count", &(d / 60).to_string())]),
+        // Translators: a compact file age; {count} is a number of hours.
+        d if d < 86_400 => gettext_f("{count}h", &[("count", &(d / 3600).to_string())]),
+        // Translators: a compact file age; {count} is a number of days.
+        d if d < 2_592_000 => gettext_f("{count}d", &[("count", &(d / 86_400).to_string())]),
+        // Translators: a compact file age; {count} is a number of months.
+        d if d < 31_536_000 => gettext_f("{count}mo", &[("count", &(d / 2_592_000).to_string())]),
+        // Translators: a compact file age; {count} is a number of years.
+        d => gettext_f("{count}y", &[("count", &(d / 31_536_000).to_string())]),
     }
 }
 

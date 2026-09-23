@@ -35,3 +35,5 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 async-channel = "2"
 exif = { version = "0.6", package = "kamadak-exif" }
 webkit6 = "0.6"
+# The system libintl (glibc) rather than a bundled gettext build.
+gettext-rs = { version = "0.7", features = ["gettext-system"] }

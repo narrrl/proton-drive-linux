@@ -54,7 +54,7 @@ pub(crate) fn prompt_human_verification(
         .build();
 
     let dialog = adw::Dialog::builder()
-        .title("Verification")
+        .title(gettext("Verification"))
         .content_width(420)
         .content_height(560)
         .build();

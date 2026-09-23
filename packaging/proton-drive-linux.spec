@@ -27,6 +27,7 @@ BuildRequires:  libsecret-devel
 BuildRequires:  dbus-devel
 BuildRequires:  glib2-devel
 BuildRequires:  webkitgtk6.0-devel
+BuildRequires:  gettext
 
 Requires:       fuse3
 Requires:       gtk4
@@ -80,6 +81,7 @@ install -D -m0644 %{git_dir}/packaging/io.narl.proton-drive-linux.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
 install -D -m0644 %{git_dir}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
+%{git_dir}/po/build.sh %{buildroot}%{_datadir}/locale
 
 %files
 %license LICENSE
@@ -91,6 +93,7 @@ install -D -m0644 %{git_dir}/packaging/proton-drive.service \
 %{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
 /usr/lib/systemd/user/proton-drive.service
+%{_datadir}/locale/*/LC_MESSAGES/pdfs.mo
 
 %changelog
 * Sun Jul 19 2026 Local Packager - 0.4.0-1

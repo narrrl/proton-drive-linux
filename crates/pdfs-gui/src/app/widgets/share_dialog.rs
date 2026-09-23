@@ -1,7 +1,19 @@
 use crate::*;
 
-/// The roles offered in the Share dialog's dropdowns, in index order.
-pub(crate) const SHARE_ROLES: [&str; 3] = ["Viewer", "Editor", "Admin"];
+/// The role labels offered in the Share dialog's dropdowns, in index order.
+pub(crate) fn share_roles() -> [String; 3] {
+    [
+        pgettext("role", "Viewer"),
+        pgettext("role", "Editor"),
+        pgettext("role", "Admin"),
+    ]
+}
+
+/// A dropdown model from translated labels.
+fn string_list(labels: &[String]) -> gtk4::StringList {
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    gtk4::StringList::new(&labels)
+}
 
 /// Map a role dropdown index to the wire role string.
 pub(crate) fn role_index_to_wire(idx: u32) -> &'static str {
@@ -24,10 +36,11 @@ pub(crate) fn role_wire_to_index(role: &str) -> u32 {
 /// The expiry choices offered when creating a public link, in dropdown order,
 /// with their lifetime in days (`None` never expires).
 pub(crate) const LINK_EXPIRY: [(&str, Option<i64>); 4] = [
-    ("Never", None),
-    ("1 day", Some(1)),
-    ("7 days", Some(7)),
-    ("30 days", Some(30)),
+    // Translators: a public link that never expires.
+    (gettext_noop("Never"), None),
+    (gettext_noop("1 day"), Some(1)),
+    (gettext_noop("7 days"), Some(7)),
+    (gettext_noop("30 days"), Some(30)),
 ];
 
 /// The Unix expiry for a [`LINK_EXPIRY`] choice, counted from `now`.
@@ -235,7 +248,11 @@ pub(crate) struct ShareDialog {
 /// access and their roles, and create/copy/remove a public link.
 pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     if !*ui.mounted.borrow() {
-        toast_error(ui, "Can't share", "Proton Drive isn't connected.");
+        toast_error(
+            ui,
+            &gettext("Can't share"),
+            &gettext("Proton Drive isn't connected."),
+        );
         return;
     }
     // A node with no path is not a bug here: Shared and Shared-with-me list
@@ -248,26 +265,35 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Share", &entry.name)));
+    header.set_title_widget(Some(&adw::WindowTitle::new(
+        &pgettext("verb", "Share"),
+        &entry.name,
+    )));
     toolbar.add_top_bar(&header);
 
     // Invite section: emails + role + optional message.
     let invite_group = adw::PreferencesGroup::builder()
-        .title("Invite people")
-        .description("Proton and non-Proton email addresses, separated by spaces or commas.")
+        .title(gettext("Invite people"))
+        .description(gettext(
+            "Proton and non-Proton email addresses, separated by spaces or commas.",
+        ))
         .build();
-    let email_row = adw::EntryRow::builder().title("Email addresses").build();
-    let role_model = gtk4::StringList::new(&SHARE_ROLES);
+    let email_row = adw::EntryRow::builder()
+        .title(gettext("Email addresses"))
+        .build();
+    let role_model = string_list(&share_roles());
     let role_drop = gtk4::DropDown::builder()
         .model(&role_model)
         .selected(0)
         .valign(gtk4::Align::Center)
         .build();
-    let role_wrap = adw::ActionRow::builder().title("Role").build();
+    let role_wrap = adw::ActionRow::builder().title(gettext("Role")).build();
     role_wrap.add_suffix(&role_drop);
-    let message_row = adw::EntryRow::builder().title("Message (optional)").build();
+    let message_row = adw::EntryRow::builder()
+        .title(gettext("Message (optional)"))
+        .build();
     let invite_btn = gtk4::Button::builder()
-        .label("Send Invitations")
+        .label(gettext("Send Invitations"))
         .halign(gtk4::Align::End)
         .margin_top(6)
         .build();
@@ -283,10 +309,10 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     invite_group.add(&invite_wrap);
 
     let people = adw::PreferencesGroup::builder()
-        .title("People with access")
+        .title(gettext("People with access"))
         .build();
     let link_group = adw::PreferencesGroup::builder()
-        .title("Public link")
+        .title(gettext("Public link"))
         .build();
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
@@ -306,7 +332,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     toolbar.set_content(Some(&scroll));
 
     let dialog = adw::Dialog::builder()
-        .title("Share")
+        .title(pgettext("verb", "Share"))
         .content_width(480)
         .content_height(560)
         .child(&toolbar)
@@ -330,7 +356,11 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         match &parsed {
             Err(bad) => {
                 row.add_css_class("error");
-                row.set_tooltip_text(Some(&format!("“{bad}” isn't an email address")));
+                // Translators: {text} is what the user typed in place of an email address.
+                row.set_tooltip_text(Some(&gettext_f(
+                    "“{text}” isn't an email address",
+                    &[("text", bad)],
+                )));
             }
             Ok(_) => {
                 row.remove_css_class("error");
@@ -367,8 +397,8 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         share_dialog_op(
             &state_inv,
             state_inv.target.invite(emails, role, message),
-            "Invitations sent",
-            "Couldn't send invitations",
+            &gettext("Invitations sent"),
+            &gettext("Couldn't send invitations"),
             Some(Busy::start(btn)),
             Some(Box::new(move || {
                 email_clear.set_text("");
@@ -392,12 +422,12 @@ pub(crate) fn share_dialog_reload(state: &Rc<ShareDialog>) {
                 repaint_share_link(&state, link.as_ref());
             }
             Ok(Ok(Response::Error { message, .. })) => {
-                toast_error(&state.ui, "Couldn't load sharing", &message)
+                toast_error(&state.ui, &gettext("Couldn't load sharing"), &message)
             }
             _ => toast_error(
                 &state.ui,
-                "Couldn't load sharing",
-                "The mount service didn't respond.",
+                &gettext("Couldn't load sharing"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -410,7 +440,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
     }
     let mut rows: Vec<gtk4::Widget> = Vec::new();
     if entries.is_empty() {
-        let row = dim_row("No one else has access yet.");
+        let row = dim_row(&gettext("No one else has access yet."));
         state.people.add(&row);
         rows.push(row.upcast());
         *state.people_rows.borrow_mut() = rows;
@@ -418,9 +448,9 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
     }
     for entry in entries {
         let subtitle = match entry.kind {
-            ShareEntryKind::Member => "Member".to_string(),
-            ShareEntryKind::ProtonInvite => "Invited (pending)".to_string(),
-            ShareEntryKind::ExternalInvite => "Invited (external, pending)".to_string(),
+            ShareEntryKind::Member => gettext("Member"),
+            ShareEntryKind::ProtonInvite => gettext("Invited (pending)"),
+            ShareEntryKind::ExternalInvite => gettext("Invited (external, pending)"),
         };
         let row = adw::ActionRow::builder()
             .title(&entry.email)
@@ -433,7 +463,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
             entry.kind,
             ShareEntryKind::Member | ShareEntryKind::ProtonInvite
         ) {
-            let model = gtk4::StringList::new(&SHARE_ROLES);
+            let model = string_list(&share_roles());
             let drop = gtk4::DropDown::builder()
                 .model(&model)
                 .selected(role_wire_to_index(&entry.role))
@@ -450,8 +480,8 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
                         kind,
                         role_index_to_wire(d.selected()).to_string(),
                     ),
-                    "Role updated",
-                    "Couldn't update the role",
+                    &gettext("Role updated"),
+                    &gettext("Couldn't update the role"),
                     None,
                     None,
                 );
@@ -459,7 +489,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
             row.add_suffix(&drop);
         } else {
             let label = gtk4::Label::builder()
-                .label(capitalize(&entry.role))
+                .label(role_label(&entry.role).unwrap_or_else(|| capitalize(&entry.role)))
                 .valign(gtk4::Align::Center)
                 .build();
             label.add_css_class("dim-label");
@@ -468,7 +498,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
 
         let remove = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove access")
+            .tooltip_text(gettext("Remove access"))
             .valign(gtk4::Align::Center)
             .build();
         remove.add_css_class("flat");
@@ -482,15 +512,19 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
             let button = btn.clone();
             confirm_destructive(
                 btn,
-                "Remove Access?",
-                &format!("{who} will no longer be able to open this item."),
-                "Remove",
+                &gettext("Remove Access?"),
+                // Translators: {email} is the address of the person losing access.
+                &gettext_f(
+                    "{email} will no longer be able to open this item.",
+                    &[("email", &who)],
+                ),
+                &gettext("Remove"),
                 move || {
                     share_dialog_op(
                         &state,
                         state.target.remove_entry(id.clone(), kind),
-                        "Access removed",
-                        "Couldn't remove access",
+                        &gettext("Access removed"),
+                        &gettext("Couldn't remove access"),
                         Some(Busy::start(&button)),
                         None,
                     );
@@ -516,16 +550,23 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
     match link {
         Some(link) => {
             let url = link.url.clone().unwrap_or_default();
-            let mut subtitle = format!("Anyone with the link ({})", capitalize(&link.role));
+            let role = role_label(&link.role).unwrap_or_else(|| capitalize(&link.role));
+            // Translators: {role} is the link's role, such as "Viewer".
+            let mut subtitle = gettext_f("Anyone with the link ({role})", &[("role", &role)]);
             if link.has_password {
-                subtitle.push_str(" · password-protected");
+                subtitle.push_str(" · ");
+                subtitle.push_str(&gettext("password-protected"));
             }
             if let Some(expires) = link.expires {
                 subtitle.push_str(" · ");
                 subtitle.push_str(&link_expiry_label(expires, glib::real_time() / 1_000_000));
             }
             let row = adw::ActionRow::builder()
-                .title(if url.is_empty() { "Public link" } else { &url })
+                .title(if url.is_empty() {
+                    gettext("Public link")
+                } else {
+                    url.clone()
+                })
                 .subtitle(&subtitle)
                 .build();
             row.add_css_class("property");
@@ -533,7 +574,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             if !url.is_empty() {
                 let copy = gtk4::Button::builder()
                     .icon_name("edit-copy-symbolic")
-                    .tooltip_text("Copy link")
+                    .tooltip_text(gettext("Copy link"))
                     .valign(gtk4::Align::Center)
                     .build();
                 copy.add_css_class("flat");
@@ -541,14 +582,14 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                 let url_copy = url.clone();
                 copy.connect_clicked(move |btn| {
                     btn.clipboard().set_text(&url_copy);
-                    toast(&state_copy.ui, "Link copied");
+                    toast(&state_copy.ui, &gettext("Link copied"));
                 });
                 row.add_suffix(&copy);
             }
 
             let remove = gtk4::Button::builder()
                 .icon_name("user-trash-symbolic")
-                .tooltip_text("Remove link")
+                .tooltip_text(gettext("Remove link"))
                 .valign(gtk4::Align::Center)
                 .build();
             remove.add_css_class("flat");
@@ -560,16 +601,15 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                 let button = btn.clone();
                 confirm_destructive(
                     btn,
-                    "Remove Public Link?",
-                    "The link stops working for everyone who has it. A new link will have \
-                     a different address.",
-                    "Remove Link",
+                    &gettext("Remove Public Link?"),
+                    &gettext("The link stops working for everyone who has it. A new link will have a different address."),
+                    &gettext("Remove Link"),
                     move || {
                         share_dialog_op(
                             &state,
                             state.target.remove_link(id.clone()),
-                            "Public link removed",
-                            "Couldn't remove the link",
+                            &gettext("Public link removed"),
+                            &gettext("Couldn't remove the link"),
                             Some(Busy::start(&button)),
                             None,
                         );
@@ -582,27 +622,30 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             rows.push(row.upcast());
         }
         None => {
-            let role_model = gtk4::StringList::new(&["Viewer", "Editor"]);
+            let role_model = string_list(&[pgettext("role", "Viewer"), pgettext("role", "Editor")]);
             let role_drop = gtk4::DropDown::builder()
                 .model(&role_model)
                 .selected(0)
                 .valign(gtk4::Align::Center)
                 .build();
-            let role_row = adw::ActionRow::builder().title("Link role").build();
+            let role_row = adw::ActionRow::builder()
+                .title(gettext("Link role"))
+                .build();
             role_row.add_suffix(&role_drop);
             let pw_row = adw::PasswordEntryRow::builder()
-                .title("Password (optional)")
+                .title(gettext("Password (optional)"))
                 .build();
-            let expiry_names: Vec<&str> = LINK_EXPIRY.iter().map(|(name, _)| *name).collect();
+            let expiry_names: Vec<String> =
+                LINK_EXPIRY.iter().map(|(name, _)| gettext(name)).collect();
             let expiry_drop = gtk4::DropDown::builder()
-                .model(&gtk4::StringList::new(&expiry_names))
+                .model(&string_list(&expiry_names))
                 .selected(0)
                 .valign(gtk4::Align::Center)
                 .build();
-            let expiry_row = adw::ActionRow::builder().title("Expires").build();
+            let expiry_row = adw::ActionRow::builder().title(gettext("Expires")).build();
             expiry_row.add_suffix(&expiry_drop);
             let create = gtk4::Button::builder()
-                .label("Create Public Link")
+                .label(gettext("Create Public Link"))
                 .halign(gtk4::Align::End)
                 .margin_top(6)
                 .build();
@@ -666,16 +709,16 @@ pub(crate) fn share_dialog_create_link(
         drop(busy);
         match reply {
             Ok(Ok(Response::PublicLink { .. })) => {
-                toast(&state.ui, "Public link created");
+                toast(&state.ui, &gettext("Public link created"));
                 share_dialog_reload(&state);
             }
             Ok(Ok(Response::Error { message, .. })) => {
-                toast_error(&state.ui, "Couldn't create the link", &message)
+                toast_error(&state.ui, &gettext("Couldn't create the link"), &message)
             }
             _ => toast_error(
                 &state.ui,
-                "Couldn't create the link",
-                "The mount service didn't respond.",
+                &gettext("Couldn't create the link"),
+                &gettext("The mount service didn't respond."),
             ),
         }
     });
@@ -687,13 +730,14 @@ pub(crate) fn share_dialog_create_link(
 pub(crate) fn share_dialog_op(
     state: &Rc<ShareDialog>,
     req: Request,
-    done: &'static str,
-    failed: &'static str,
+    done: &str,
+    failed: &str,
     busy: Option<Busy>,
     on_success: Option<Box<dyn Fn()>>,
 ) {
     let rx = spawn_request(state.ui.dirs.control_socket(), req);
     let state = state.clone();
+    let (done, failed) = (done.to_string(), failed.to_string());
     glib::spawn_future_local(async move {
         let reply = rx.recv().await;
         drop(busy);
@@ -702,14 +746,18 @@ pub(crate) fn share_dialog_op(
                 if let Some(cb) = on_success {
                     cb();
                 }
-                toast(&state.ui, done);
+                toast(&state.ui, &done);
                 share_dialog_reload(&state);
             }
-            Ok(Ok(Response::Error { message, .. })) => toast_error(&state.ui, failed, &message),
+            Ok(Ok(Response::Error { message, .. })) => toast_error(&state.ui, &failed, &message),
             _ => {
                 // A role dropdown that failed is now out of sync with the server;
                 // reload to snap it back.
-                toast_error(&state.ui, failed, "The mount service didn't respond.");
+                toast_error(
+                    &state.ui,
+                    &failed,
+                    &gettext("The mount service didn't respond."),
+                );
                 share_dialog_reload(&state);
             }
         }
@@ -720,14 +768,18 @@ pub(crate) fn share_dialog_op(
 /// working, or that it already has.
 pub(crate) fn link_expiry_label(expires: i64, now: i64) -> String {
     if expires <= now {
-        return "expired".to_string();
+        // Translators: a public link past its expiry date.
+        return gettext("expired");
     }
+    // Translators: strftime format for a link's expiry date; "%x" is the locale's date, such as "09/23/26".
+    let format = gettext("%x");
     let date = glib::DateTime::from_unix_local(expires)
         .ok()
-        .and_then(|at| at.format("%x").ok())
+        .and_then(|at| at.format(&format).ok())
         .map(|s| s.to_string())
         .unwrap_or_default();
-    format!("expires {date}")
+    // Translators: {date} is the date a public link stops working.
+    gettext_f("expires {date}", &[("date", &date)])
 }
 
 #[cfg(test)]
