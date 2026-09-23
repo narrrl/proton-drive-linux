@@ -111,6 +111,11 @@ Schema: **31** (unchanged).
 Schema: **31** (unchanged).
 
 ### Fixed
+- **Double-click opens folders reliably.** Selecting a file no longer slides the details pane in
+  by itself: the pane moved the files under the pointer between the two clicks of a double-click,
+  so the folder did not open. The pane now shows on request, from the header's Details toggle,
+  Alt+Enter or the item menu's Details, and then follows the selection. Closing it keeps the
+  selection.
 - **An upload parked behind a temp-file rename no longer stays parked forever.** A create for a
   name that looks like a writer's temporary file waits for the rename to the final name. If that
   rename never came — the writer crashed, the file was deleted, or the name was never temporary —

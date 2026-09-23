@@ -35,6 +35,10 @@ pub(crate) struct DetailsWidgets {
     pub(crate) versions_button: gtk4::Button,
     pub(crate) trash_button: gtk4::Button,
     pub(crate) close_button: gtk4::Button,
+    /// The header toggle that asks for the pane. Selecting an entry only
+    /// fills the pane; it is shown while this is on, so a click never moves
+    /// the files under the pointer halfway through a double-click.
+    pub(crate) toggle: gtk4::ToggleButton,
 }
 
 /// The details pane shown beside the file views: a big type icon over the entry's
@@ -42,6 +46,11 @@ pub(crate) struct DetailsWidgets {
 /// actions. Built empty; [`show_details`] fills it from the selected
 /// [`DirEntry`] and [`wire_details`] connects the buttons.
 pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
+    let toggle = gtk4::ToggleButton::builder()
+        .icon_name("sidebar-show-right-symbolic")
+        .tooltip_text("Details (Alt+Enter)")
+        .build();
+
     let close_button = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
         .tooltip_text("Close details")
@@ -186,6 +195,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
             versions_button,
             trash_button,
             close_button,
+            toggle,
         },
     )
 }
@@ -212,8 +222,13 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
 
     let ui_close = ui.clone();
     ui.details.details.close_button.connect_clicked(move |_| {
-        clear_selection(&ui_close);
-        hide_details(&ui_close);
+        ui_close.details.details.toggle.set_active(false);
+    });
+
+    let ui_toggle = ui.clone();
+    ui.details.details.toggle.connect_toggled(move |toggle| {
+        let show = toggle.is_active() && ui_toggle.details.details_entry.borrow().is_some();
+        ui_toggle.browser.split.set_show_sidebar(show);
     });
 
     let ui_open = ui.clone();
@@ -333,12 +348,17 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     if mounted {
         load_details_extras(ui, entry);
     }
-    // Reveal the pane on idle, not inline. This runs from `selection_changed`,
-    // which fires on the *first* press of a double-click; mutating the widget
-    // tree here cancels GtkGridView's multi-press tracking, so the second press
-    // restarts the count and `activate` never fires — the folder needs two
-    // double-clicks. Deferring lets the click gesture finish first. Guard on the
-    // entry still being present so a navigation that clears it wins the race.
+    // Only a pane the user asked for is revealed. This runs from
+    // `selection_changed`, which fires on the *first* press of a double-click:
+    // sliding the pane in there reflows the files, so the second press lands on
+    // a different spot (or item) and the folder never opens. With the pane
+    // already up, a new selection only repaints it. Deferred to idle all the
+    // same, since mutating the widget tree mid-gesture cancels GtkGridView's
+    // multi-press tracking; the guard lets a navigation that clears the entry
+    // win the race.
+    if !ui.details.details.toggle.is_active() {
+        return;
+    }
     let ui = ui.clone();
     glib::idle_add_local_once(move || {
         if ui.details.details_entry.borrow().is_some() {
@@ -431,6 +451,18 @@ pub(crate) fn versions_summary(items: &[RevisionInfo]) -> String {
 
 /// Hide the details pane and forget the entry it was showing, so a stale entry
 /// can't be acted on after the listing moves on.
+/// Show the pane for `entry`, turning the header toggle on.
+pub(crate) fn open_details(ui: &Rc<Ui>, entry: &DirEntry) {
+    ui.details.details.toggle.set_active(true);
+    show_details(ui, entry);
+}
+
+/// Alt+Enter: show or hide the pane for the selected entry.
+pub(crate) fn toggle_details(ui: &Rc<Ui>) {
+    let toggle = &ui.details.details.toggle;
+    toggle.set_active(!toggle.is_active());
+}
+
 pub(crate) fn hide_details(ui: &Rc<Ui>) {
     ui.browser.split.set_show_sidebar(false);
     *ui.details.details_entry.borrow_mut() = None;

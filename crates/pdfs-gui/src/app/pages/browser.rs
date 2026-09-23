@@ -140,7 +140,7 @@ pub(crate) struct BrowserWidgets {
     pub(crate) quota: gtk4::ProgressBar,
     pub(crate) quota_text: gtk4::Label,
     pub(crate) refresh: gtk4::Button,
-    /// Wraps the views + the details pane; the pane slides in on selection.
+    /// Wraps the views + the details pane; the pane shows the selection while its header toggle is on.
     pub(crate) split: adw::OverlaySplitView,
     pub(crate) details: DetailsWidgets,
     /// The selection shared by both views, so a selection change can drive the
@@ -362,8 +362,9 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     content.add_named(&view_stack, Some("views"));
     content.add_named(&status, Some("status"));
 
-    // The details pane slides in from the right when an entry is selected.
+    // The details pane slides in from the right while its header toggle is on.
     let (details_pane, details) = build_details_pane();
+    let details_toggle = details.toggle.clone();
     let split = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
         .collapsed(true)
@@ -507,6 +508,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     header.pack_start(&new_button);
     header.pack_end(&folder_button);
     header.pack_end(&refresh);
+    header.pack_end(&details_toggle);
     header.pack_end(&view_button);
     header.pack_end(&search);
     header.pack_end(&search_scope);
@@ -1178,6 +1180,8 @@ pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
         menu.item("Versions…", move || open_versions_dialog(&ui_c, &entry_c));
     }
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item("Details", move || open_details(&ui_c, &entry_c));
     menu.section();
 
     let (ui_c, entry_c) = (ui.clone(), entry.clone());

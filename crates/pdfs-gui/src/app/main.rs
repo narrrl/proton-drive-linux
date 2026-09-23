@@ -1338,6 +1338,9 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             }
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
             gtk4::gdk::Key::Menu if on_browser => popup_keyboard_context_menu(&ui),
+            gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter if alt && on_browser => {
+                toggle_details(&ui)
+            }
             gtk4::gdk::Key::F10
                 if on_browser && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) =>
             {
