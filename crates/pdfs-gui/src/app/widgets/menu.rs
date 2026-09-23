@@ -95,13 +95,19 @@ impl ActionMenu {
     /// item that closed it still finds its action.
     pub(crate) fn popup_at(self, anchor: &impl IsA<gtk4::Widget>, x: f64, y: f64) {
         let (menu, group) = self.finish();
+        let anchor = anchor.as_ref();
+        let host = popover_host(anchor);
+        let (x, y) = anchor
+            .compute_point(&host, &gtk4::graphene::Point::new(x as f32, y as f32))
+            .map(|p| (p.x() as f64, p.y() as f64))
+            .unwrap_or((x, y));
         let popover = gtk4::PopoverMenu::from_model(Some(&menu));
         popover.set_has_arrow(false);
         popover.set_position(gtk4::PositionType::Bottom);
         popover.set_halign(gtk4::Align::Start);
         popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.insert_action_group("menu", Some(&group));
-        popover.set_parent(anchor);
+        popover.set_parent(&host);
         popover.connect_closed(|p| {
             let p = p.clone();
             glib::idle_add_local_once(move || p.unparent());
@@ -122,6 +128,24 @@ impl ActionMenu {
         button.add_css_class("flat");
         button
     }
+}
+
+/// Where a menu opened over `anchor` should live in the widget tree: the
+/// outermost grid or list view around it, or `anchor` itself. CSS descendant
+/// selectors reach through a popover to its parent, and themes style the
+/// insides of list items (`gridview > child box { margin: 12px }` in
+/// Catppuccin); a menu parented to a tile picks those rules up and puts a wide
+/// margin around every section. Under the view itself it is no item's child.
+fn popover_host(anchor: &gtk4::Widget) -> gtk4::Widget {
+    let mut host = anchor.clone();
+    let mut widget = anchor.parent();
+    while let Some(w) = widget {
+        widget = w.parent();
+        if w.is::<gtk4::GridView>() || w.is::<gtk4::ListView>() || w.is::<gtk4::ColumnView>() {
+            host = w;
+        }
+    }
+    host
 }
 
 /// A flat ⋮ button whose menu lists `items` as (label, action).
