@@ -47,11 +47,11 @@ use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 
 use pdfs_core::control::{
-    ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind,
-    ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem, PhotoKind, PublicLinkInfo,
-    RefreshScope, Request, Response, RestorableFolder, RestoreItem, SearchHit, ShareEntry,
-    ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus,
-    TransferDirection, TransferItem, pending_summary, send,
+    ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
+    DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem,
+    PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder, RestoreItem,
+    SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase, SyncProgress,
+    ThumbnailBuildStatus, TransferDirection, TransferItem, pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -555,6 +555,13 @@ fn build_window(app: &adw::Application) {
                 painted: RefCell::new(Vec::new()),
                 inflight: Cell::new(false),
             },
+            conflicts: ConflictsState {
+                group: locations_widgets.conflicts_group.clone(),
+                rows: RefCell::new(Vec::new()),
+                painted: RefCell::new(Vec::new()),
+                inflight: Cell::new(false),
+                fetched_at: Cell::new(None),
+            },
         },
         activity: ActivityState {
             content: activity_widgets.content.clone(),
@@ -666,8 +673,12 @@ fn build_window(app: &adw::Application) {
             Some("shared") => load_shared(&ui_nav),
             Some("devices") if page_fresh(&ui_nav.devices.loaded_at) => {}
             Some("devices") => load_devices(&ui_nav),
-            Some("locations") if page_fresh(&ui_nav.locations.loaded_at) => {}
-            Some("locations") => load_locations(&ui_nav),
+            Some("locations") => {
+                refresh_conflicts(&ui_nav, true);
+                if !page_fresh(&ui_nav.locations.loaded_at) {
+                    load_locations(&ui_nav);
+                }
+            }
             // Activity is intentionally not TTL-cached: it changes out from under
             // the page as background uploads and edits complete, so it reloads on
             // every visit to stay live.

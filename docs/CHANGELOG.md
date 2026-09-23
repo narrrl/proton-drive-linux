@@ -21,6 +21,11 @@ Schema: **30** (unchanged).
 - **See what is waiting to upload.** The Sync page lists the queue with each item's last error and
   next retry, with Retry now per item and Retry All; `pdfs sync queue` and `pdfs sync retry [id]`
   do the same from the CLI. Nothing in the queue is ever dropped from here.
+- **Resolve sync conflicts.** `(sync-conflict …)` copies under My Files are listed on the Sync page
+  next to the file they conflict with, with sizes, times and whether the content differs. Keep the
+  original, keep the copy or keep both under a new name; whatever is not kept goes to Trash.
+  `pdfs conflicts` and `pdfs conflicts resolve <path> --keep original|copy|both` do the same from
+  the CLI. Files that are open or still uploading are refused until they settle.
 
 ### Changed
 - **New app shell.** Every page has its own header bar; the sidebar ends in a footer with sync

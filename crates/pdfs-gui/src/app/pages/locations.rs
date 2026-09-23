@@ -24,6 +24,7 @@ pub(crate) struct LocationsState {
     pub(crate) loaded_at: Cell<Option<Instant>>,
     pub(crate) card: SyncCard,
     pub(crate) queue: QueueState,
+    pub(crate) conflicts: ConflictsState,
 }
 
 /// The status card heading the Sync page: what sync is doing, and Pause/Resume.
@@ -49,6 +50,20 @@ pub(crate) struct QueueState {
     pub(crate) inflight: Cell<bool>,
 }
 
+/// What a conflict row shows that can change: path, both sizes, both times.
+pub(crate) type ConflictKey = (String, u64, i64, Option<u64>, Option<i64>);
+
+/// The "Conflicts" list: `(sync-conflict …)` copies waiting for a decision.
+pub(crate) struct ConflictsState {
+    pub(crate) group: adw::PreferencesGroup,
+    pub(crate) rows: RefCell<Vec<adw::ActionRow>>,
+    pub(crate) painted: RefCell<Vec<ConflictKey>>,
+    pub(crate) inflight: Cell<bool>,
+    /// When the list was last fetched. Listing walks every node the daemon
+    /// knows, so the tick asks far less often than it does for the queue.
+    pub(crate) fetched_at: Cell<Option<Instant>>,
+}
+
 /// Widgets the Locations page's load/repaint touch.
 pub(crate) struct LocationsWidgets {
     pub(crate) content: gtk4::Stack,
@@ -64,6 +79,7 @@ pub(crate) struct LocationsWidgets {
     pub(crate) pause: adw::SplitButton,
     pub(crate) queue_group: adw::PreferencesGroup,
     pub(crate) retry_all: gtk4::Button,
+    pub(crate) conflicts_group: adw::PreferencesGroup,
 }
 
 pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
@@ -80,6 +96,14 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
     let transfers_group = build_transfers_group();
     let (card, card_icon, card_row, pause) = build_sync_card();
     let (queue_group, retry_all) = build_queue_group();
+    let conflicts_group = adw::PreferencesGroup::builder()
+        .title("Conflicts")
+        .description(
+            "Files changed in two places at once. Both versions were kept; choose which \
+             one stays.",
+        )
+        .visible(false)
+        .build();
 
     // Same warning the Computers page carried, for the same reason: the
     // on-demand switch removes the local copy, which is not a thing to discover
@@ -95,6 +119,7 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
 
     let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
     groups.append(&card);
+    groups.append(&conflicts_group);
     groups.append(&queue_group);
     groups.append(&transfers_group);
     groups.append(&group);
@@ -157,6 +182,7 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         pause,
         queue_group,
         retry_all,
+        conflicts_group,
     };
     (frame.upcast(), widgets)
 }
@@ -472,6 +498,218 @@ fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
             _ => toast_error(&ui, "Couldn't retry", "The mount service didn't respond."),
         }
     });
+}
+
+/// How long a conflict listing stays fresh on the refresh tick.
+const CONFLICTS_TTL: Duration = Duration::from_secs(30);
+
+/// Poll the conflict list while the Sync page is on screen. `force` skips the
+/// TTL, for navigation and right after a resolution.
+pub(crate) fn refresh_conflicts(ui: &Rc<Ui>, force: bool) {
+    let conflicts = &ui.locations.conflicts;
+    if conflicts.inflight.get()
+        || (!force
+            && conflicts
+                .fetched_at
+                .get()
+                .is_some_and(|at| at.elapsed() < CONFLICTS_TTL))
+    {
+        return;
+    }
+    conflicts.inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListConflicts);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        let conflicts = &ui.locations.conflicts;
+        conflicts.inflight.set(false);
+        conflicts.fetched_at.set(Some(Instant::now()));
+        match result {
+            Ok(Ok(Response::Conflicts { items })) => repaint_conflicts(&ui, &items),
+            // Same as the queue: an older daemon, or none, shows nothing.
+            _ => repaint_conflicts(&ui, &[]),
+        }
+    });
+}
+
+fn repaint_conflicts(ui: &Rc<Ui>, items: &[ConflictInfo]) {
+    let conflicts = &ui.locations.conflicts;
+    let key: Vec<ConflictKey> = items
+        .iter()
+        .map(|c| {
+            (
+                c.path.clone(),
+                c.size,
+                c.modified,
+                c.original_size,
+                c.original_modified,
+            )
+        })
+        .collect();
+    if *conflicts.painted.borrow() == key {
+        return;
+    }
+    *conflicts.painted.borrow_mut() = key;
+
+    for row in conflicts.rows.borrow_mut().drain(..) {
+        conflicts.group.remove(&row);
+    }
+    conflicts.group.set_visible(!items.is_empty());
+    let mut rows = conflicts.rows.borrow_mut();
+    for conflict in items {
+        let row = conflict_row(ui, conflict);
+        conflicts.group.add(&row);
+        rows.push(row);
+    }
+}
+
+/// "12.3 MB, changed at 14:30": one side of a conflict.
+fn conflict_side(size: u64, modified: i64) -> String {
+    format!(
+        "{}, changed {}",
+        glib::format_size(size),
+        clock_time(modified)
+    )
+}
+
+fn conflict_row(ui: &Rc<Ui>, conflict: &ConflictInfo) -> adw::ActionRow {
+    let verdict = if !conflict.original_exists {
+        "The original is gone; only this copy is left".to_string()
+    } else if conflict.identical {
+        "Same content as the original".to_string()
+    } else {
+        format!("Differs from {}", file_name(&conflict.original_path))
+    };
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&conflict.path).as_str())
+        .subtitle(glib::markup_escape_text(&verdict).as_str())
+        .title_lines(1)
+        .tooltip_text(&conflict.path)
+        .activatable(true)
+        .build();
+    let image = gtk4::Image::from_icon_name("dialog-warning-symbolic");
+    image.add_css_class("warning");
+    row.add_prefix(&image);
+    row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    let ui = ui.clone();
+    let conflict = conflict.clone();
+    row.connect_activated(move |_| prompt_resolve_conflict(&ui, &conflict));
+    row
+}
+
+/// The last component of a mount-relative path.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Ask which version of a conflicted file to keep.
+fn prompt_resolve_conflict(ui: &Rc<Ui>, conflict: &ConflictInfo) {
+    let win = ui_window(ui);
+    let copy_name = file_name(&conflict.path).to_string();
+    let original_name = file_name(&conflict.original_path).to_string();
+    let body = match (conflict.original_size, conflict.original_modified) {
+        (Some(size), Some(modified)) if conflict.original_exists => format!(
+            "“{original_name}” was changed here and elsewhere at the same time.\n\n\
+             Original: {}\nCopy: {}\n\n\
+             Whatever is not kept goes to Trash, where it can be restored.",
+            conflict_side(size, modified),
+            conflict_side(conflict.size, conflict.modified),
+        ),
+        _ => format!(
+            "The original “{original_name}” no longer exists; only the copy is left \
+             ({}).\n\nKeep the copy to give it the original name back.",
+            conflict_side(conflict.size, conflict.modified),
+        ),
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading("Resolve conflict")
+        .body(body)
+        .build();
+    let group = adw::PreferencesGroup::new();
+    let name_row = adw::EntryRow::builder()
+        .title("Name for the copy, if keeping both")
+        .build();
+    name_row.set_text(&copy_name);
+    group.add(&name_row);
+    dialog.set_extra_child(Some(&group));
+    dialog.add_response("cancel", "Cancel");
+    if conflict.original_exists {
+        dialog.add_response("original", "Keep Original");
+        dialog.add_response("both", "Keep Both");
+    }
+    dialog.add_response("copy", "Keep Copy");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    // Keeping both is a rename, so it needs a name that is neither side's.
+    let update_both = {
+        let dialog = dialog.clone();
+        let copy_name = copy_name.clone();
+        move |row: &adw::EntryRow| {
+            let name = row.text();
+            let name = name.trim();
+            dialog.set_response_enabled(
+                "both",
+                !name.is_empty()
+                    && name != copy_name
+                    && name != original_name
+                    && !name.contains('/'),
+            );
+        }
+    };
+    if conflict.original_exists {
+        update_both(&name_row);
+        name_row.connect_changed(update_both);
+    }
+    let ui = ui.clone();
+    let path = conflict.path.clone();
+    dialog.connect_response(None, move |_, resp| {
+        let keep = match resp {
+            "original" => ConflictKeep::Original,
+            "copy" => ConflictKeep::Copy,
+            "both" => ConflictKeep::Both {
+                name: name_row.text().trim().to_string(),
+            },
+            _ => return,
+        };
+        resolve_conflict(&ui, path.clone(), keep);
+    });
+    dialog.present(win.as_ref());
+}
+
+fn resolve_conflict(ui: &Rc<Ui>, path: String, keep: ConflictKeep) {
+    ui.busy_begin();
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::ResolveConflict { path, keep },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        match result {
+            Ok(Ok(Response::Ok { message })) => {
+                toast(&ui, &capitalize(&message));
+                refresh_conflicts(&ui, true);
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, "Couldn't resolve the conflict", &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                "Couldn't resolve the conflict",
+                "The mount service didn't respond.",
+            ),
+        }
+    });
+}
+
+/// First letter upper-cased, for a daemon message used as a sentence.
+fn capitalize(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Show a status page in place of the locations list.

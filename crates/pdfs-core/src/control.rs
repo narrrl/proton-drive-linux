@@ -396,6 +396,13 @@ pub enum Request {
     /// Retry a backed-off queued op now instead of waiting out its backoff;
     /// every failed op when `id` is `None`. Replies with [`Response::Ok`].
     RetryPendingOp { id: Option<i64> },
+    /// List the `(sync-conflict …)` copies under My Files. Replies with
+    /// [`Response::Conflicts`].
+    ListConflicts,
+    /// Resolve one conflict copy (`path` mountpoint-relative or absolute).
+    /// Everything removed goes to the Proton trash. Replies with
+    /// [`Response::Ok`].
+    ResolveConflict { path: String, keep: ConflictKeep },
     /// List the folders under this machine's device that can be synced here,
     /// each with a proposed local path (features.md 5.2). Replies with
     /// [`Response::RestorableFolders`].
@@ -636,6 +643,36 @@ pub struct DeviceInfo {
     /// an adopted device survives a hostname change or a reinstall.
     #[serde(default)]
     pub adopted: bool,
+}
+
+/// One `(sync-conflict …)` copy and the file it is a copy of (in
+/// [`Response::Conflicts`]).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConflictInfo {
+    /// Mountpoint-relative path of the copy.
+    pub path: String,
+    /// Mountpoint-relative path of the file it is a copy of.
+    pub original_path: String,
+    /// False when the original is gone and only the copy is left.
+    pub original_exists: bool,
+    pub size: u64,
+    /// Unix seconds.
+    pub modified: i64,
+    pub original_size: Option<u64>,
+    pub original_modified: Option<i64>,
+    /// Same size and content hash as the original: keeping either loses nothing.
+    pub identical: bool,
+}
+
+/// Which side of a conflict to keep (in [`Request::ResolveConflict`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum ConflictKeep {
+    /// Keep the original; the copy goes to Trash.
+    Original,
+    /// Keep the copy under the original's name; the original goes to Trash.
+    Copy,
+    /// Keep both; the copy is renamed to `name`.
+    Both { name: String },
 }
 
 /// One queued upload or change (in [`Response::PendingOps`]).
@@ -1736,6 +1773,8 @@ pub enum Response {
     SyncFolders { items: Vec<SyncFolderInfo> },
     /// The upload/change queue (reply to [`Request::ListPendingOps`]).
     PendingOps { items: Vec<PendingOpInfo> },
+    /// Conflict copies (reply to [`Request::ListConflicts`]).
+    Conflicts { items: Vec<ConflictInfo> },
     /// Folders offered for restore (reply to [`Request::ListRestorableFolders`]).
     RestorableFolders { items: Vec<RestorableFolder> },
     /// A node's share: members + pending invitations, and its public link if any

@@ -80,6 +80,7 @@ use proton_drive_rs::{
 
 mod albums;
 mod background;
+mod conflicts;
 mod control;
 use control::run_control_socket;
 mod devices;

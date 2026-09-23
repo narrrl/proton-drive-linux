@@ -1003,6 +1003,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::ListConflicts) => match core.list_conflicts() {
+            Ok(items) => CtlResponse::Conflicts { items },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::ResolveConflict { path, keep }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.resolve_conflict(&rel, &keep) {
+                Ok(message) => CtlResponse::Ok { message },
+                Err(e) => CtlResponse::error(e),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::ListPendingOps) => match core.pending_op_infos() {
             Ok(items) => CtlResponse::PendingOps { items },
             Err(e) => CtlResponse::error(e),

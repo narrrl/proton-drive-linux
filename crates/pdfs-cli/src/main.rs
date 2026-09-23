@@ -13,8 +13,9 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ErrorKind, MountKind, RefreshScope, Request as CtlRequest, Response as CtlResponse,
-    RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase, pending_summary,
+    ConflictKeep, ErrorKind, MountKind, RefreshScope, Request as CtlRequest,
+    Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase,
+    pending_summary,
 };
 use pdfs_core::db::Db;
 use pdfs_core::service;
@@ -327,6 +328,11 @@ enum Command {
         #[command(subcommand)]
         action: SyncCmd,
     },
+    /// List `(sync-conflict …)` copies, or resolve one.
+    Conflicts {
+        #[command(subcommand)]
+        action: Option<ConflictCmd>,
+    },
     /// Share a file or folder with Proton and/or external email addresses.
     Share {
         /// File/folder path, inside the mountpoint or relative to it.
@@ -522,6 +528,22 @@ enum DeviceCmd {
 }
 
 #[derive(Subcommand)]
+enum ConflictCmd {
+    /// Decide which side of a conflict to keep. Whatever is removed goes to Trash.
+    Resolve {
+        /// The conflict copy, absolute or relative to the mountpoint.
+        path: PathBuf,
+        /// `original` trashes the copy; `copy` trashes the original and gives the
+        /// copy its name; `both` renames the copy to `--name`.
+        #[arg(long, value_parser = ["original", "copy", "both"])]
+        keep: String,
+        /// New name for the copy with `--keep both`.
+        #[arg(long, required_if_eq("keep", "both"))]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SyncCmd {
     /// Add a local folder to this machine's device and upload its contents.
     Add {
@@ -707,6 +729,7 @@ fn main() -> Result<()> {
         Command::Refresh { target, full } => cmd_refresh(target, full),
         Command::Devices { action } => cmd_devices(action),
         Command::Sync { action } => cmd_sync(action),
+        Command::Conflicts { action } => cmd_conflicts(action),
         Command::Share {
             path,
             emails,
@@ -867,6 +890,47 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
         }
         SyncCmd::Restore { yes } => return cmd_sync_restore(yes),
+    }
+    Ok(())
+}
+
+/// `pdfs conflicts`: list conflict copies, or resolve one.
+fn cmd_conflicts(action: Option<ConflictCmd>) -> Result<()> {
+    if let Some(ConflictCmd::Resolve { path, keep, name }) = action {
+        let keep = match keep.as_str() {
+            "original" => ConflictKeep::Original,
+            "copy" => ConflictKeep::Copy,
+            _ => ConflictKeep::Both {
+                name: name.unwrap_or_default(),
+            },
+        };
+        let path = path_arg(&path)?;
+        return ok_or_bail(control_request(CtlRequest::ResolveConflict { path, keep })?);
+    }
+    let response = control_request(CtlRequest::ListConflicts)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::Conflicts { items } if items.is_empty() => println!("No conflicts."),
+        CtlResponse::Conflicts { items } => {
+            for c in items {
+                println!("{}", c.path);
+                let verdict = match (c.original_exists, c.identical) {
+                    (false, _) => "original is gone".to_string(),
+                    (true, true) => format!("identical to {}", c.original_path),
+                    (true, false) => format!(
+                        "differs from {} ({} vs {})",
+                        c.original_path,
+                        human_bytes(c.size),
+                        human_bytes(c.original_size.unwrap_or_default()),
+                    ),
+                };
+                println!("      {verdict}");
+            }
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
 }

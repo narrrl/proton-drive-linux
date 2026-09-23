@@ -261,7 +261,7 @@ impl Core {
     /// is tracked in that fork's `State` — so consulting `self.state` alone
     /// answered "idle" for every such file and let the sweep delete one with a
     /// writer attached (`docs/BUGS.md` B74). Busy anywhere means busy.
-    fn is_busy(&self, uid: &NodeUid) -> bool {
+    pub(crate) fn is_busy(&self, uid: &NodeUid) -> bool {
         let mut busy = false;
         self.for_each_state(|st| {
             let Some(&ino) = st.by_uid.get(uid) else {

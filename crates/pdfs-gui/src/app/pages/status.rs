@@ -618,6 +618,7 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
         Some("locations") => {
             refresh_locations(ui);
             refresh_queue(ui);
+            refresh_conflicts(ui, false);
         }
         Some("activity") => refresh_activity(ui),
         _ => {}
