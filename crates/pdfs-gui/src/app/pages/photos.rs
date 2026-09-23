@@ -2238,20 +2238,20 @@ pub(crate) fn empty_timeline_text(
     let when = month.map(|m| format!(" in {m}")).unwrap_or_default();
     match (favorites, kind, month) {
         (false, None, None) => (
-            "No photos yet".to_string(),
-            "Photos you upload to Proton Drive appear here.".to_string(),
+            gettext("No photos yet"),
+            gettext("Photos you upload to Proton Drive appear here."),
         ),
         (true, None, None) => (
-            "No favorites yet".to_string(),
-            "Star a photo in the viewer or from its menu to find it here.".to_string(),
+            gettext("No favorites yet"),
+            gettext("Star a photo in the viewer or from its menu to find it here."),
         ),
         (true, _, _) => (
             format!("No favorite {what}{when}"),
-            "Turn off the favorites filter to see everything.".to_string(),
+            gettext("Turn off the favorites filter to see everything."),
         ),
         (false, _, _) => (
             format!("No {what}{when}"),
-            "Try another filter or month.".to_string(),
+            gettext("Try another filter or month."),
         ),
     }
 }

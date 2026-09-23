@@ -26,7 +26,7 @@ Schema: **31** (unchanged).
   desktop files carry translated descriptions and search keywords. The `pdfs` CLI and messages
   from the daemon stay in English. [docs/TRANSLATING.md](TRANSLATING.md) describes how to improve a
   translation or add a language. A few labels on the Photos page (the filter tabs, the gallery
-  subtitle and the empty timeline) are still in English.
+  subtitle and the heading shown when a filtered timeline is empty) are still in English.
 - **Language preference.** Preferences → General → Appearance → Language overrides the system
   language for the app, the tray and the prompt, from their next start.
 

@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-09-23 08:01+0200\n"
+"POT-Creation-Date: 2026-09-23 10:35+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Portuguese (Brazil)\n"
@@ -1418,7 +1418,7 @@ msgid "No files or folders match that search."
 msgstr "Nenhum arquivo ou pasta corresponde a essa pesquisa."
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:3139
-#: crates/pdfs-gui/src/i18n.rs:198
+#: crates/pdfs-gui/src/i18n.rs:216
 #, rust-format
 msgid "{n} file"
 msgid_plural "{n} files"
@@ -2663,6 +2663,30 @@ msgstr "%d/%m/%Y %H:%M:%S"
 #: crates/pdfs-gui/src/app/pages/photos.rs:2208
 msgid "Unknown Date"
 msgstr "Data desconhecida"
+
+#: crates/pdfs-gui/src/app/pages/photos.rs:2241
+msgid "No photos yet"
+msgstr "Nenhuma foto ainda"
+
+#: crates/pdfs-gui/src/app/pages/photos.rs:2242
+msgid "Photos you upload to Proton Drive appear here."
+msgstr "As fotos enviadas para o Proton Drive aparecem aqui."
+
+#: crates/pdfs-gui/src/app/pages/photos.rs:2245
+msgid "No favorites yet"
+msgstr "Nenhuma favorita ainda"
+
+#: crates/pdfs-gui/src/app/pages/photos.rs:2246
+msgid "Star a photo in the viewer or from its menu to find it here."
+msgstr "Marque uma foto como favorita no visualizador ou pelo menu dela para encontrá-la aqui."
+
+#: crates/pdfs-gui/src/app/pages/photos.rs:2250
+msgid "Turn off the favorites filter to see everything."
+msgstr "Desative o filtro de favoritas para ver tudo."
+
+#: crates/pdfs-gui/src/app/pages/photos.rs:2254
+msgid "Try another filter or month."
+msgstr "Tente outro filtro ou outro mês."
 
 #. Translators: a check item in a photo's menu, on while the photo is a favorite.
 #: crates/pdfs-gui/src/app/pages/photos.rs:2482
@@ -4325,40 +4349,40 @@ msgstr "(nenhum arquivo fixado — digite para pesquisar)"
 msgid "(cannot resolve app dirs)"
 msgstr "(não foi possível resolver os diretórios do aplicativo)"
 
-#: crates/pdfs-gui/src/i18n.rs:140
+#: crates/pdfs-gui/src/i18n.rs:158
 #, rust-format
 msgid "{n} upload queued"
 msgid_plural "{n} uploads queued"
 msgstr[0] "{n} envio na fila"
 msgstr[1] "{n} envios na fila"
 
-#: crates/pdfs-gui/src/i18n.rs:146
+#: crates/pdfs-gui/src/i18n.rs:164
 #, rust-format
 msgid "{n} change queued"
 msgid_plural "{n} changes queued"
 msgstr[0] "{n} alteração na fila"
 msgstr[1] "{n} alterações na fila"
 
-#: crates/pdfs-gui/src/i18n.rs:152
+#: crates/pdfs-gui/src/i18n.rs:170
 #, rust-format
 msgid "{n} upload"
 msgid_plural "{n} uploads"
 msgstr[0] "{n} envio"
 msgstr[1] "{n} envios"
 
-#: crates/pdfs-gui/src/i18n.rs:153
+#: crates/pdfs-gui/src/i18n.rs:171
 #, rust-format
 msgid "{n} change"
 msgid_plural "{n} changes"
 msgstr[0] "{n} alteração"
 msgstr[1] "{n} alterações"
 
-#: crates/pdfs-gui/src/i18n.rs:156
+#: crates/pdfs-gui/src/i18n.rs:174
 #, rust-format
 msgid "{uploads}, {changes} queued"
 msgstr "{uploads}, {changes} na fila"
 
-#: crates/pdfs-gui/src/i18n.rs:201
+#: crates/pdfs-gui/src/i18n.rs:219
 #, rust-format
 msgid "{n} file in {dir}"
 msgid_plural "{n} files in {dir}"
