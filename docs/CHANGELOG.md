@@ -11,6 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.1.1] — 2026-09-23
+
+Schema: **31** (unchanged).
+
+### Fixed
+- **Uploads no longer get stuck at 0 bytes.** When a file changed again while its previous
+  version was uploading, such as a browser download that is still growing, the old upload could
+  hang forever. It kept one background thread busy at full CPU and showed as "Uploading" in the
+  Transfers list until the daemon restarted.
+
 ## [2.1.0] — 2026-09-23
 
 The desktop app, the tray and the search prompt speak German, British English, Spanish, French,
