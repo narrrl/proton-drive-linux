@@ -21,6 +21,22 @@ built packages never reach the AUR.
 
 ## Releasing a new version
 
+`.github/workflows/aur.yml` does this automatically:
+
+- **On a release tag**, `release.yml` calls it after the GitHub release is
+  published. It runs `./update.sh <version>`, pushes all three packages with
+  `./push.sh`, and commits the updated recipes back to `main` as
+  `chore(aur): update packages to <version>`.
+- **On a push to `main` that changes `proton-drive-for-linux-git/`**, it
+  regenerates that package's `.SRCINFO` and pushes only the -git package.
+- **By hand**, run the workflow from the Actions tab. Give a version to publish
+  a release, or leave it empty to publish only the -git package.
+
+It needs the `AUR_SSH_PRIVATE_KEY` repository secret: a private key whose public
+half is registered with the AUR account.
+
+To do the same by hand:
+
 1. Tag and publish the upstream release, so the source tarball and the
    `proton-drive-linux-<version>-x86_64.tar.gz` release asset exist.
 2. Run `./update.sh <version>` — it rewrites `pkgver`, resets `pkgrel=1`,
@@ -32,7 +48,8 @@ built packages never reach the AUR.
    for a single package).
 
 `proton-drive-for-linux-git` carries a `pkgver()` function, so its `pkgver` is
-computed at build time; do not push a commit that only bumps it.
+computed at build time; do not push a commit that only bumps it. This is why new
+commits on `main` do not trigger an AUR push.
 
 ## Requirements for pushing
 

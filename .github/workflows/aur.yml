@@ -1,0 +1,101 @@
+name: AUR
+
+on:
+  # The -git package computes its pkgver from git at build time, so a new commit
+  # upstream needs no AUR push. Only a changed -git recipe is published.
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/aur/proton-drive-for-linux-git/**'
+  # Called by release.yml once the GitHub release and its assets exist.
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+    secrets:
+      AUR_SSH_PRIVATE_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release to publish, such as 2.1.0. Leave empty to publish only the -git package.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aur
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish AUR packages
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    env:
+      # makepkg refuses to run as root, so the packaging steps run as `builder`.
+      HOME: /home/builder
+      VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm --needed git openssh pacman-contrib
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # The updated recipes are committed back to main, not to the tag.
+          ref: main
+
+      - name: Create build user
+        run: |
+          useradd --create-home builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+
+      - name: Configure AUR access
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m700 -o builder -g builder "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$HOME/.ssh/aur"
+          cat > "$HOME/.ssh/config" <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+          # Pin the host key to the fingerprint published on aur.archlinux.org.
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$HOME/.ssh/known_hosts"
+          ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -q 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          chown -R builder: "$HOME/.ssh"
+          chmod 600 "$HOME/.ssh/aur"
+          runuser -u builder -- git config --global user.name 'Nils Pukropp'
+          runuser -u builder -- git config --global user.email 'contact@narl.io'
+
+      - name: Update release packages
+        if: env.VERSION != ''
+        run: runuser -u builder -- packaging/aur/update.sh "${VERSION#v}"
+
+      - name: Refresh the -git metadata
+        if: env.VERSION == ''
+        working-directory: packaging/aur/proton-drive-for-linux-git
+        run: runuser -u builder -- sh -c 'makepkg --printsrcinfo > .SRCINFO'
+
+      - name: Publish to the AUR
+        run: |
+          if [ -n "$VERSION" ]; then
+            runuser -u builder -- packaging/aur/push.sh
+          else
+            runuser -u builder -- packaging/aur/push.sh proton-drive-for-linux-git
+          fi
+
+      - name: Commit the updated recipes to main
+        if: env.VERSION != ''
+        run: |
+          runuser -u builder -- git add packaging/aur
+          if ! runuser -u builder -- git diff --cached --quiet; then
+            runuser -u builder -- git commit -m "chore(aur): update packages to ${VERSION#v}"
+            runuser -u builder -- git push origin HEAD:main
+          fi
