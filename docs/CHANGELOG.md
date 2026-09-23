@@ -78,6 +78,11 @@ Schema: **31** (unchanged).
   instead of covering them. It has Info, Offline, Sharing and Versions sections: who has access or
   whether there is a public link, how many versions there are, and Share…, Copy Link and
   Versions… buttons.
+- **Search in this folder.** Inside a folder, a folder button beside the search box limits the search
+  to that folder and everything below it. `pdfs search --in <folder>` does the same from the CLI.
+  In the list view a Location column shows which folder each hit is in. Pinned files listed by the
+  search prompt and `pdfs-query` show whether they are on disk, instead of always showing them as
+  not downloaded.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

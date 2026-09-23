@@ -355,6 +355,22 @@ impl Db {
     /// than [`TRIGRAM_MIN`] fall back to a `LIKE` scan since trigram indexes
     /// nothing below 3 chars.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        self.search_in(query, limit, None)
+    }
+
+    /// [`search`](Self::search) restricted to the subtree under the
+    /// mountpoint-relative folder `scope`. `None` or an empty scope searches
+    /// everything.
+    pub fn search_in(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        let scope = scope.map(|s| s.trim_matches('/')).filter(|s| !s.is_empty());
+        // Rows whose path is not persisted yet pass the SQL filter and are
+        // checked once their path is walked below.
+        let scope_pat = scope.map(|s| format!("{}/%", like_escape(s)));
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
@@ -365,9 +381,10 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT node_json, uid, path FROM nodes
                  WHERE name LIKE ?1 ESCAPE '\\' AND trashed = 0 AND node_json IS NOT NULL
+                   AND (?3 IS NULL OR path IS NULL OR path LIKE ?3 ESCAPE '\\')
                  ORDER BY name LIMIT ?2",
             )?;
-            collect_hits(stmt.query_map(params![pat, limit as i64], hit_row)?)?
+            collect_hits(stmt.query_map(params![pat, limit as i64, scope_pat], hit_row)?)?
         } else {
             // Escape double quotes and quote each term, then combine with AND so
             // all terms must match but can appear in any order or position.
@@ -380,9 +397,10 @@ impl Db {
                 "SELECT n.node_json, n.uid, n.path
                  FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
                  WHERE f.name MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
+                   AND (?3 IS NULL OR n.path IS NULL OR n.path LIKE ?3 ESCAPE '\\')
                  ORDER BY f.rank LIMIT ?2",
             )?;
-            collect_hits(stmt.query_map(params![phrase, limit as i64], hit_row)?)?
+            collect_hits(stmt.query_map(params![phrase, limit as i64, scope_pat], hit_row)?)?
         };
 
         let mut hits = Vec::with_capacity(rows.len());
@@ -392,6 +410,13 @@ impl Db {
                 Some(path) => path,
                 None => walk_path_of(&conn, &uid)?,
             };
+            if let Some(scope) = scope
+                && !path
+                    .strip_prefix(scope)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            {
+                continue;
+            }
             hits.push(SearchHit { node, path });
         }
         Ok(hits)

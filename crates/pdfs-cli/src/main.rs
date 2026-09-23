@@ -242,6 +242,9 @@ enum Command {
         /// Max hits to return.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Only search below this folder (under the mountpoint).
+        #[arg(long = "in", value_name = "FOLDER")]
+        scope: Option<PathBuf>,
     },
     /// Rename a file or folder via the running daemon.
     Rename {
@@ -730,7 +733,11 @@ fn main() -> Result<()> {
         Command::CancelImport => cmd_cancel_import(),
         Command::Album { uid, limit, offset } => cmd_album(uid, limit, offset),
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
-        Command::Search { query, limit } => cmd_search(query, limit),
+        Command::Search {
+            query,
+            limit,
+            scope,
+        } => cmd_search(query, limit, scope),
         Command::Rename { path, new_name } => cmd_rename(path, new_name),
         Command::Move { path, new_parent } => cmd_move(path, new_parent),
         Command::Rm { path } => cmd_rm(path),
@@ -2287,8 +2294,13 @@ fn cmd_open_photo(uid: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(query: String, limit: usize) -> Result<()> {
-    match control_request(CtlRequest::Search { query, limit })? {
+fn cmd_search(query: String, limit: usize, scope: Option<PathBuf>) -> Result<()> {
+    let scope = scope.map(|p| path_arg(&p)).transpose()?;
+    match control_request(CtlRequest::Search {
+        query,
+        limit,
+        scope,
+    })? {
         CtlResponse::SearchResults { hits } if hits.is_empty() => println!("(no matches)"),
         CtlResponse::SearchResults { hits } => {
             for h in hits {

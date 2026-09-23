@@ -298,6 +298,10 @@ pub struct Pin {
     /// which is why it is defaulted.
     #[serde(default)]
     pub is_dir: Option<bool>,
+    /// A pinned file whose content is on disk right now. The daemon fills it
+    /// in when it answers `ListPins`; folders and older daemons say `false`.
+    #[serde(default)]
+    pub cached: bool,
 }
 
 /// The legacy JSON pin registry, kept only to import a pre-P5 `pins.json` into
@@ -1854,6 +1858,7 @@ impl ContentCache {
                 path: row.path,
                 recursive: row.recursive,
                 is_dir: row.is_dir,
+                cached: false,
             })
             .collect()
     }

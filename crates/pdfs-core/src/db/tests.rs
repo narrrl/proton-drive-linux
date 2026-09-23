@@ -1084,6 +1084,40 @@ fn search_trigram_substring_and_path() {
 }
 
 #[test]
+fn search_in_scope_only_returns_hits_below_the_folder() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("work", Some("root"), "Work"))
+        .unwrap();
+    db.upsert_node(&folder("sub", Some("work"), "Old")).unwrap();
+    db.upsert_node(&folder("work2", Some("root"), "Work 2"))
+        .unwrap();
+    db.upsert_node(&file("f1", "work", "report.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f2", "sub", "report-2019.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f3", "work2", "report-copy.pdf", 1))
+        .unwrap();
+    db.upsert_node(&file("f4", "root", "report-top.pdf", 1))
+        .unwrap();
+
+    let mut paths: Vec<String> = db
+        .search_in("report", 10, Some("Work"))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    paths.sort();
+    // A sibling whose name starts with the scope is not inside it.
+    assert_eq!(paths, vec!["Work/Old/report-2019.pdf", "Work/report.pdf"]);
+    // Short queries take the LIKE path and scope the same way.
+    assert_eq!(db.search_in("re", 10, Some("Work/Old")).unwrap().len(), 1);
+    // No scope, or the root, is everywhere.
+    assert_eq!(db.search_in("report", 10, None).unwrap().len(), 4);
+    assert_eq!(db.search_in("report", 10, Some("")).unwrap().len(), 4);
+}
+
+#[test]
 fn search_excludes_trashed_and_respects_limit() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("root", None, "My Files")).unwrap();

@@ -45,7 +45,7 @@ pub(crate) fn pins(socket: &Path) -> Result<Vec<Hit>, String> {
                 size: 0,
                 modified: 0,
                 pinned: true,
-                cached: false,
+                cached: pin.cached,
                 uid: pin.uid,
                 mounted_path: None,
                 score: 0,

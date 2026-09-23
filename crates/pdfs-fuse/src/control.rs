@@ -284,7 +284,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListPins) => CtlResponse::Pins {
-            pins: core.cache.list_pins(),
+            pins: core.list_pins(),
         },
         Ok(CtlRequest::ListDir { path }) => match route_to_mount(core, mountpoint, &path) {
             Ok((core, rel)) => match core.list_dir(&rel) {
@@ -631,7 +631,11 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
-        Ok(CtlRequest::Search { query, limit }) => match core.search(&query, clamp_limit(limit)) {
+        Ok(CtlRequest::Search {
+            query,
+            limit,
+            scope,
+        }) => match core.search(&query, clamp_limit(limit), scope.as_deref()) {
             Ok(hits) => CtlResponse::SearchResults { hits },
             Err(e) => CtlResponse::error(e),
         },

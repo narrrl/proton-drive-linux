@@ -245,8 +245,15 @@ pub enum Request {
         uid: Option<String>,
     },
     /// Full-text search node names against the daemon's local metadata index.
-    /// `limit` caps the number of hits returned. Replies with [`Response::SearchResults`].
-    Search { query: String, limit: usize },
+    /// `limit` caps the number of hits returned. `scope`, a mountpoint-relative
+    /// folder, restricts hits to that subtree; older front-ends omit it and
+    /// search everything. Replies with [`Response::SearchResults`].
+    Search {
+        query: String,
+        limit: usize,
+        #[serde(default)]
+        scope: Option<String>,
+    },
     /// Search the daemon's index of *local* (non-Drive) files on this machine.
     /// Independent of [`Request::Search`] so a front-end can fire both at once and
     /// render whichever lands first. Replies with [`Response::LocalResults`].
@@ -2342,7 +2349,7 @@ mod tests {
             serde_json::from_str(r#"{"Search":{"query":"old","limit":20}}"#).unwrap();
         assert!(matches!(
             drive,
-            Request::Search { query, limit } if query == "old" && limit == 20
+            Request::Search { query, limit, scope: None } if query == "old" && limit == 20
         ));
 
         let local: Request =

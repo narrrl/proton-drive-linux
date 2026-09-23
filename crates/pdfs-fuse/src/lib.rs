@@ -3857,10 +3857,25 @@ impl Core {
     /// Full-text search node names against the local SQLite index, mapping each
     /// DB hit to the wire [`SearchHit`] (resolving live pin state from the cache,
     /// which the DB doesn't track). Pure local lookup — never hits the network.
-    fn search(&self, query: &str, limit: usize) -> CoreResult<Vec<SearchHit>> {
+    /// Every pin, with `cached` saying whether a pinned file's content is on
+    /// disk, so a front-end listing pins can badge them without a round-trip
+    /// per file.
+    fn list_pins(&self) -> Vec<pdfs_core::cache::Pin> {
+        let mut pins = self.cache.list_pins();
+        for pin in pins.iter_mut().filter(|pin| pin.is_dir == Some(false)) {
+            if let Ok(Some(node)) = self.db.node_by_uid(&pin.uid) {
+                pin.cached =
+                    self.cache
+                        .is_cached(&node.uid, node.modification_time, node_size(&node));
+            }
+        }
+        pins
+    }
+
+    fn search(&self, query: &str, limit: usize, scope: Option<&str>) -> CoreResult<Vec<SearchHit>> {
         let hits = self
             .db
-            .search(query, limit)
+            .search_in(query, limit, scope)
             .map_err(|e| CoreError::from_api(&e, "search"))?;
         let roots = self.search_roots();
         let pinned = self.pinned_set();

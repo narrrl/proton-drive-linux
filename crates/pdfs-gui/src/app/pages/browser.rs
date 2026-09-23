@@ -27,6 +27,9 @@ pub(crate) struct BrowserState {
     pub(crate) path: RefCell<String>,
     /// Debounced full-text search box in the browser header.
     pub(crate) search: gtk4::SearchEntry,
+    /// Beside the search box while a query is typed: on, hits are limited to
+    /// the folder being shown; off, the whole Drive is searched.
+    pub(crate) search_scope: gtk4::ToggleButton,
     /// The page's `files.*` actions: New and View menus, navigation, and the
     /// folder menu. The ones needing a daemon are disabled while the mount is
     /// down: without one they can only fail.
@@ -55,6 +58,8 @@ pub(crate) struct BrowserState {
     pub(crate) load_generation: Cell<u64>,
     /// The grid/list view stack, read to find out which view is on screen.
     pub(crate) views: gtk4::Stack,
+    /// The list view, whose Location column shows only for search hits.
+    pub(crate) column_view: gtk4::ColumnView,
     /// The bulk-action bar, revealed once more than one entry is selected.
     pub(crate) bulk: gtk4::Revealer,
     pub(crate) bulk_label: gtk4::Label,
@@ -122,6 +127,7 @@ pub(crate) struct BrowserWidgets {
     /// Sits in the status page; shown only when the mount service is down.
     pub(crate) retry: gtk4::Button,
     pub(crate) search: gtk4::SearchEntry,
+    pub(crate) search_scope: gtk4::ToggleButton,
     pub(crate) actions: gio::SimpleActionGroup,
     pub(crate) view_button: adw::SplitButton,
     pub(crate) build_thumbnails: gtk4::Button,
@@ -252,6 +258,15 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     search.set_width_chars(18);
+    // Hidden until there is a query to scope, and at the root, where "this
+    // folder" is everywhere.
+    let search_scope = gtk4::ToggleButton::builder()
+        .icon_name("folder-symbolic")
+        .tooltip_text("Search this folder only")
+        .valign(gtk4::Align::Center)
+        .visible(false)
+        .build();
+    search_scope.add_css_class("flat");
 
     let refresh = refresh_button();
 
@@ -494,6 +509,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     header.pack_end(&refresh);
     header.pack_end(&view_button);
     header.pack_end(&search);
+    header.pack_end(&search_scope);
     let actions = gio::SimpleActionGroup::new();
     frame.insert_action_group("files", Some(&actions));
 
@@ -508,6 +524,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             status,
             retry,
             search,
+            search_scope,
             actions,
             view_button,
             build_thumbnails,
@@ -914,6 +931,10 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
         }
     }));
     column_view.append_column(&text_column("Modified", |e| format_modified(e.modified)));
+    // Search hits come from anywhere in the Drive; this says where.
+    let location = text_column(LOCATION_COLUMN, |e| hit_location(&e.path));
+    location.set_visible(false);
+    column_view.append_column(&location);
 
     let ui_col = ui.clone();
     column_view.connect_activate(move |view, pos| {
@@ -992,6 +1013,28 @@ pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
     let column = gtk4::ColumnViewColumn::new(Some("Name"), Some(factory));
     column.set_expand(true);
     column
+}
+
+const LOCATION_COLUMN: &str = "Location";
+
+/// The folder holding a search hit, as a mountpoint-relative path.
+fn hit_location(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => parent.to_string(),
+        None => "My Files".to_string(),
+    }
+}
+
+/// Show the Location column only while the list holds search hits.
+fn show_location_column(ui: &Rc<Ui>, visible: bool) {
+    let columns = ui.browser.column_view.columns();
+    for column in (0..columns.n_items())
+        .filter_map(|i| columns.item(i).and_downcast::<gtk4::ColumnViewColumn>())
+    {
+        if column.title().as_deref() == Some(LOCATION_COLUMN) {
+            column.set_visible(visible);
+        }
+    }
 }
 
 /// Build a trailing text column whose cell text is derived from each [`DirEntry`]
@@ -2590,6 +2633,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     let path = ui.browser.path.borrow().clone();
     repaint_crumb(ui, &path);
     sync_history_actions(ui);
+    sync_search_scope(ui);
     ui.browser.summary.set_label("Loading…");
 
     // Drop the previous folder's rows up front: a slow reply must not leave stale
@@ -2683,6 +2727,7 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
 /// Repopulate the shared model — folders first, then case-insensitive by name —
 /// which refreshes both the grid and the column list.
 pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
+    show_location_column(ui, false);
     *ui.browser.listing.borrow_mut() = entries.to_vec();
     ui.browser.model.remove_all();
     ui.browser.summary.set_label(&listing_summary(
@@ -2720,6 +2765,7 @@ pub(crate) fn wire_search(ui: &Rc<Ui>) {
     let ui_s = ui.clone();
     ui.browser.search.connect_search_changed(move |_| {
         sync_history_actions(&ui_s);
+        sync_search_scope(&ui_s);
         // Replace any pending debounce so only the last keystroke's pause fires.
         if let Some(src) = ui_s.browser.search_source.borrow_mut().take() {
             src.remove();
@@ -2736,6 +2782,31 @@ pub(crate) fn wire_search(ui: &Rc<Ui>) {
         });
         *ui_s.browser.search_source.borrow_mut() = Some(src);
     });
+    let ui_s = ui.clone();
+    ui.browser.search_scope.connect_toggled(move |scope| {
+        scope.set_tooltip_text(Some(if scope.is_active() {
+            "Search everywhere"
+        } else {
+            "Search this folder only"
+        }));
+        let query = ui_s.browser.search.text().trim().to_string();
+        if !query.is_empty() {
+            run_search(&ui_s, &query);
+        }
+    });
+}
+
+/// Offer the scope toggle only while there is a query and a folder to scope it to.
+pub(crate) fn sync_search_scope(ui: &Rc<Ui>) {
+    let offered =
+        !ui.browser.search.text().trim().is_empty() && !ui.browser.path.borrow().is_empty();
+    ui.browser.search_scope.set_visible(offered);
+}
+
+/// The folder a search is limited to, or `None` to search everywhere.
+fn search_scope(ui: &Rc<Ui>) -> Option<String> {
+    let path = ui.browser.path.borrow();
+    (ui.browser.search_scope.is_active() && !path.is_empty()).then(|| path.clone())
 }
 
 /// Send a [`Request::Search`] to the daemon and render the hits in the browser
@@ -2762,6 +2833,7 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
         Request::Search {
             query: query.clone(),
             limit: SEARCH_LIMIT,
+            scope: search_scope(ui),
         },
     );
     let ui = ui.clone();
@@ -2793,6 +2865,7 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
 /// each [`SearchHit`] to a path-carrying [`DirEntry`] the existing renderers and
 /// handlers already understand.
 pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
+    show_location_column(ui, true);
     ui.browser.model.remove_all();
     let counts = listing_summary(
         hits.iter().filter(|hit| !hit.is_dir).count(),
@@ -2861,7 +2934,8 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        listing_summary, move_target_allowed, show_thumbnail_build_progress, sort_entries,
+        hit_location, listing_summary, move_target_allowed, show_thumbnail_build_progress,
+        sort_entries,
     };
     use pdfs_core::config::{FileSort, FilesView};
     use pdfs_core::control::{DirEntry, ThumbnailBuildStatus};
@@ -2885,6 +2959,12 @@ mod tests {
 
     fn names(entries: &[DirEntry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_search_hit_location_is_its_parent_folder() {
+        assert_eq!(hit_location("Work/Old/a.txt"), "Work/Old");
+        assert_eq!(hit_location("a.txt"), "My Files");
     }
 
     #[test]
