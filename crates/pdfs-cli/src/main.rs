@@ -569,11 +569,18 @@ enum SyncCmd {
     Pause {
         /// End the pause by itself after this long, e.g. `30m`, `1h`, `2d`.
         /// Omit to pause until `pdfs sync resume`.
-        #[arg(long = "for", value_parser = parse_pause_duration)]
+        #[arg(long = "for", value_parser = parse_pause_duration, conflicts_with = "folder")]
         duration: Option<u64>,
+        /// Pause only this mirror folder (id from `sync list`) until resumed.
+        #[arg(long)]
+        folder: Option<i64>,
     },
     /// Resume syncing after `pdfs sync pause`.
-    Resume,
+    Resume {
+        /// Resume only this folder, paused with `sync pause --folder`.
+        #[arg(long)]
+        folder: Option<i64>,
+    },
     /// List uploads and changes not yet on Proton Drive.
     Queue,
     /// Retry a queued operation now (by id from `sync queue`), or every failed one.
@@ -837,6 +844,10 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                             Some(pending) => format!("{} → {pending}", f.mode),
                             None => f.mode.clone(),
                         };
+                        let mode = match f.paused {
+                            true => format!("{mode}, paused"),
+                            false => mode,
+                        };
                         println!(
                             "[{}]  {}  ({mode}, {}, synced: {sync})",
                             f.id, f.local_path, f.state
@@ -873,7 +884,22 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Now { id } => ok_or_bail(control_request(CtlRequest::SyncNow { id })?)?,
-        SyncCmd::Pause { duration } => {
+        SyncCmd::Pause {
+            folder: Some(id), ..
+        } => ok_or_bail(control_request(CtlRequest::SetSyncFolderPaused {
+            id,
+            paused: true,
+        })?)?,
+        SyncCmd::Resume { folder: Some(id) } => {
+            ok_or_bail(control_request(CtlRequest::SetSyncFolderPaused {
+                id,
+                paused: false,
+            })?)?
+        }
+        SyncCmd::Pause {
+            duration,
+            folder: None,
+        } => {
             let until = duration.map(|secs| unix_now().saturating_add(secs as i64));
             ok_or_bail(control_request(CtlRequest::SetSyncPaused {
                 paused: true,
@@ -882,10 +908,12 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         }
         SyncCmd::Queue => return cmd_sync_queue(),
         SyncCmd::Retry { id } => ok_or_bail(control_request(CtlRequest::RetryPendingOp { id })?)?,
-        SyncCmd::Resume => ok_or_bail(control_request(CtlRequest::SetSyncPaused {
-            paused: false,
-            until: None,
-        })?)?,
+        SyncCmd::Resume { folder: None } => {
+            ok_or_bail(control_request(CtlRequest::SetSyncPaused {
+                paused: false,
+                until: None,
+            })?)?
+        }
         SyncCmd::Mode { id, mode } => {
             ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
         }

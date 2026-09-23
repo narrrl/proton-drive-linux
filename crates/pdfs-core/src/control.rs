@@ -381,6 +381,9 @@ pub enum Request {
     /// Switch a synced folder between `mirror` and `ondemand` (Phase 3). Replies
     /// with [`Response::Ok`].
     SetSyncFolderMode { id: i64, mode: String },
+    /// Pause or resume one mirror folder's reconcile, independent of the
+    /// global pause. Persisted until resumed. Replies with [`Response::Ok`].
+    SetSyncFolderPaused { id: i64, paused: bool },
     /// Force a reconcile pass: one folder by id, or all when `id` is `None`.
     /// Replies with [`Response::Ok`].
     SyncNow { id: Option<i64> },
@@ -724,6 +727,9 @@ pub struct SyncFolderInfo {
     /// running. Live daemon state, not a stored column.
     #[serde(default)]
     pub progress: Option<SyncProgress>,
+    /// The folder is paused on its own (see [`Request::SetSyncFolderPaused`]).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// A folder under this machine's device offered for restore (in
@@ -2409,6 +2415,10 @@ mod tests {
                 id: 3,
                 mode: "ondemand".into(),
             },
+            Request::SetSyncFolderPaused {
+                id: 3,
+                paused: true,
+            },
             Request::SyncNow { id: Some(3) },
             Request::AdoptDevice {
                 uid: Some("dev-1".into()),
@@ -2530,6 +2540,7 @@ mod tests {
                     pending_mode: None,
                     mounted: true,
                     progress: None,
+                    paused: false,
                 },
                 MountSpec {
                     id: 2,
@@ -2544,6 +2555,7 @@ mod tests {
                     pending_mode: Some(MountMode::OnDemand),
                     mounted: false,
                     progress: None,
+                    paused: false,
                 },
                 MountSpec {
                     id: 3,
@@ -2565,6 +2577,7 @@ mod tests {
                         total: 5,
                         current: "report.pdf".into(),
                     }),
+                    paused: true,
                 },
             ],
         };

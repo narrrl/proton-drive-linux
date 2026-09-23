@@ -5153,7 +5153,11 @@ fn evict_dir_contents(dir: &Path) -> std::io::Result<()> {
 
 /// Convert a stored synced folder into its wire form for the front-ends, with
 /// the live progress of its pass when one is running.
-fn sync_folder_info(f: StoredSyncFolder, progress: Option<SyncProgress>) -> SyncFolderInfo {
+fn sync_folder_info(
+    f: StoredSyncFolder,
+    progress: Option<SyncProgress>,
+    paused: bool,
+) -> SyncFolderInfo {
     SyncFolderInfo {
         id: f.id,
         local_path: f.local_path,
@@ -5163,6 +5167,7 @@ fn sync_folder_info(f: StoredSyncFolder, progress: Option<SyncProgress>) -> Sync
         state: f.state,
         last_sync: f.last_sync,
         progress,
+        paused,
     }
 }
 

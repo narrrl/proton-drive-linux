@@ -982,6 +982,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::SetSyncFolderPaused { id, paused }) => {
+            match core.set_sync_folder_paused(id, paused) {
+                Ok(()) => CtlResponse::Ok {
+                    message: match paused {
+                        true => format!("folder {id} paused"),
+                        false => format!("folder {id} resumed"),
+                    },
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::SyncNow { id }) => {
             core.sync_now(id);
             CtlResponse::Ok {

@@ -839,6 +839,7 @@ mod tests {
             last_sync: 0,
             pending_mode: None,
             progress: None,
+            paused: false,
         }
     }
 

@@ -82,6 +82,12 @@ impl Core {
     /// is guaranteed — a switch requested over the control socket cannot wait for a
     /// pass that may run for minutes.
     pub(crate) fn reconcile_folder(&self, folder: &StoredSyncFolder) {
+        // A paused folder skips the settle too: a queued switch to on-demand
+        // evicts the local tree, which is only safe after a pass uploaded it.
+        if self.sync_folder_paused(folder.id) {
+            debug!(id = folder.id, "sync: folder paused, skipping reconcile");
+            return;
+        }
         // `ondemand` folders are live FUSE mounts, not mirrored, so there is nothing
         // to reconcile — but one may still carry a queued switch back to `mirror`,
         // so the settle below is not skipped with it.

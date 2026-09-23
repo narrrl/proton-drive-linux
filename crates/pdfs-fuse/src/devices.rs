@@ -128,6 +128,7 @@ impl Core {
             location.mounted = self.states.is_mounted_at(Path::new(&location.local_path));
             if let MountKind::Device { sync_folder_id } = &location.kind {
                 location.progress = progress.get(sync_folder_id).cloned();
+                location.paused = self.sync_folder_paused(*sync_folder_id);
             }
         }
         Ok(locations)
@@ -448,7 +449,8 @@ impl Core {
             .into_iter()
             .map(|f| {
                 let live = progress.get(&f.id).cloned();
-                sync_folder_info(f, live)
+                let paused = self.sync_folder_paused(f.id);
+                sync_folder_info(f, live, paused)
             })
             .collect())
     }
@@ -561,6 +563,7 @@ impl Core {
             return Err(CoreError::invalid(format!("no synced folder with id {id}")));
         }
         drop(_guard);
+        self.clear_sync_folder_paused(id);
         // Stop watching the folder we just dropped.
         let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
         if delete_remote
@@ -625,6 +628,13 @@ impl Core {
             .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
         let current_mode = ApplicableMountMode::parse(&folder.mode)
             .map_err(|error| CoreError::invalid(format!("unsupported current mode: {error}")))?;
+        // A switch waits on the folder's reconcile, which a pause skips; refuse
+        // it up front rather than queue it indefinitely.
+        if current_mode != target_mode && self.sync_folder_paused(id) {
+            return Err(CoreError::invalid(
+                "this folder is paused; resume it before changing its mode",
+            ));
+        }
         if current_mode == target_mode {
             let mode_str = target_mode.as_str();
             let lock = self.sync_lock(id);

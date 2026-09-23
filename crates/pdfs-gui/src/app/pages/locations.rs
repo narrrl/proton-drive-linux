@@ -915,10 +915,30 @@ fn add_my_files_controls(ui: &Rc<Ui>, row: &adw::ActionRow) {
     row.add_suffix(&change);
 }
 
-/// Sync now (mirror only), the on-demand switch, and Stop syncing for one
-/// synced folder.
+/// Pause or resume and Sync now (mirror only), the on-demand switch, and Stop
+/// syncing for one synced folder.
 fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: i64) {
     if spec.mode != MountMode::OnDemand {
+        let (icon, tooltip) = match spec.paused {
+            true => (
+                "media-playback-start-symbolic",
+                "Resume syncing this folder",
+            ),
+            false => ("media-playback-pause-symbolic", "Pause syncing this folder"),
+        };
+        let pause = gtk4::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(tooltip)
+            .valign(gtk4::Align::Center)
+            .build();
+        pause.add_css_class("flat");
+        let ui_pause = ui.clone();
+        let paused = spec.paused;
+        pause.connect_clicked(move |_| set_folder_paused(&ui_pause, id, !paused));
+        row.add_suffix(&pause);
+    }
+    // A paused folder skips its passes, so Sync now would do nothing.
+    if spec.mode != MountMode::OnDemand && !spec.paused {
         let sync_now = gtk4::Button::builder()
             .icon_name("view-refresh-symbolic")
             .tooltip_text("Sync this folder now")
@@ -943,6 +963,8 @@ fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: 
         )
         .valign(gtk4::Align::Center)
         .active(target == MountMode::OnDemand)
+        // The daemon refuses a mode switch on a paused folder.
+        .sensitive(!spec.paused)
         .build();
     let ui_mode = ui.clone();
     let mode_path = spec.local_path.clone();
@@ -1002,6 +1024,33 @@ fn confirm_ondemand(ui: &Rc<Ui>, id: i64, path: &str) {
     dialog.present(win.as_ref());
 }
 
+/// Pause or resume one synced folder, then repaint so its row shows the result.
+fn set_folder_paused(ui: &Rc<Ui>, id: i64, paused: bool) {
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::SetSyncFolderPaused { id, paused },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let failed = match paused {
+            true => "Couldn't pause the folder",
+            false => "Couldn't resume the folder",
+        };
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => toast(
+                &ui,
+                match paused {
+                    true => "Folder paused",
+                    false => "Folder resumed",
+                },
+            ),
+            Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, failed, &message, kind),
+            _ => toast_error(&ui, failed, "The mount service didn't respond."),
+        }
+        refresh_locations(&ui);
+    });
+}
+
 /// Ask the daemon for an immediate pass over one folder.
 fn sync_folder_now(ui: &Rc<Ui>, id: i64) {
     let rx = spawn_request(ui.dirs.control_socket(), Request::SyncNow { id: Some(id) });
@@ -1049,6 +1098,7 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
     if matches!(spec.kind, MountKind::Device { .. }) {
         parts.push(match &spec.progress {
             Some(p) => sync_progress_label(p),
+            None if spec.paused => "paused".to_string(),
             None => sync_state_label(&spec.state).to_string(),
         });
     }
@@ -1081,6 +1131,7 @@ mod tests {
             pending_mode: None,
             mounted,
             progress: None,
+            paused: false,
         }
     }
 
@@ -1094,6 +1145,17 @@ mod tests {
             false,
         );
         assert_eq!(location_subtitle(&spec), "Synced · up to date");
+    }
+
+    #[test]
+    fn a_paused_folder_says_paused_instead_of_its_state() {
+        let mut spec = spec(
+            MountKind::Device { sync_folder_id: 7 },
+            MountMode::Mirror,
+            false,
+        );
+        spec.paused = true;
+        assert_eq!(location_subtitle(&spec), "Synced · paused");
     }
 
     #[test]

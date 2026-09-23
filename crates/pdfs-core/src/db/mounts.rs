@@ -171,6 +171,7 @@ impl Db {
                 pending_mode: pending_mode.as_deref().map(MountMode::from),
                 mounted: false,
                 progress: None,
+                paused: false,
             });
         }
         Ok(mounts)

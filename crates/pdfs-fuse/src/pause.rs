@@ -10,11 +10,43 @@
 //! it. A timed pause ends by itself; [`Core::set_sync_paused`] arms a timer for
 //! that, and [`Core::sync_paused`] compares against the clock anyway, so a
 //! deadline that passed while the daemon was down is already over on mount.
+//!
+//! A single mirror folder can be paused on its own as well: its reconcile is
+//! skipped, and with it any mode switch queued behind that reconcile, until the
+//! folder is resumed. On-demand folders cannot be paused alone — their writes
+//! go through the shared queue, which only the global pause holds back.
 
 use super::*;
 
 /// The `state` key holding the resume time, in Unix seconds.
 const PAUSED_UNTIL_KEY: &str = "sync_paused_until";
+
+/// The `state` key prefix marking one synced folder paused; its id follows.
+const FOLDER_PAUSED_PREFIX: &str = "sync_folder_paused:";
+
+fn folder_paused_key(id: i64) -> String {
+    format!("{FOLDER_PAUSED_PREFIX}{id}")
+}
+
+/// Whether synced folder `id` is paused on its own. A row that cannot be read
+/// counts as running, like the global pause.
+fn load_folder_paused(db: &Db, id: i64) -> bool {
+    match db.state_i64(&folder_paused_key(id)) {
+        Ok(value) => value.is_some_and(|v| v != 0),
+        Err(error) => {
+            warn!(id, %error, "reading a folder pause failed; treating it as running");
+            false
+        }
+    }
+}
+
+/// Persist synced folder `id`'s own pause, or clear it.
+fn store_folder_paused(db: &Db, id: i64, paused: bool) -> pdfs_core::Result<()> {
+    match paused {
+        true => db.set_state_i64(&folder_paused_key(id), 1),
+        false => db.clear_state(&folder_paused_key(id)),
+    }
+}
 
 /// A pause with no end time: it lasts until the user resumes.
 pub(crate) const PAUSED_INDEFINITELY: i64 = i64::MAX;
@@ -95,6 +127,48 @@ impl Core {
         Ok(())
     }
 
+    /// True while the user has this one synced folder paused. A row that cannot
+    /// be read counts as running, like the global pause.
+    pub(crate) fn sync_folder_paused(&self, id: i64) -> bool {
+        load_folder_paused(&self.db, id)
+    }
+
+    /// Pause or resume one mirror folder's reconcile. Resuming reconciles it
+    /// straight away to catch up on what the watcher saw meanwhile.
+    pub(crate) fn set_sync_folder_paused(&self, id: i64, paused: bool) -> Result<(), CoreError> {
+        let folder = self
+            .db
+            .sync_folder_get(id)
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
+            .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
+        if paused && folder.mode != "mirror" {
+            return Err(CoreError::invalid(
+                "only a mirrored folder can be paused on its own; an on-demand folder uploads \
+                 through the shared queue, so pause all sync instead",
+            ));
+        }
+        if let Err(error) = store_folder_paused(&self.db, id, paused) {
+            return Err(CoreError::internal(format!(
+                "saving the folder pause: {error}"
+            )));
+        }
+        if paused {
+            info!(id, path = %folder.local_path, "folder sync paused");
+        } else {
+            info!(id, path = %folder.local_path, "folder sync resumed");
+            self.sync_now(Some(id));
+        }
+        Ok(())
+    }
+
+    /// Forget a removed folder's pause, so a later folder reusing its id does
+    /// not start out paused.
+    pub(crate) fn clear_sync_folder_paused(&self, id: i64) {
+        if let Err(error) = store_folder_paused(&self.db, id, false) {
+            warn!(id, %error, "clearing a removed folder's pause failed");
+        }
+    }
+
     /// Wake everything a pause held back: the drain worker, and a full
     /// reconcile to pick up whatever the watcher saw meanwhile.
     fn resume_sync_work(&self) {
@@ -145,5 +219,17 @@ mod tests {
         assert!(!paused_at(200, 200));
         assert!(!paused_at(200, 300));
         assert!(paused_at(PAUSED_INDEFINITELY, i64::MAX - 1));
+    }
+
+    #[test]
+    fn a_folder_pause_is_kept_per_folder_until_cleared() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        assert!(!load_folder_paused(&db, 3));
+        store_folder_paused(&db, 3, true).unwrap();
+        assert!(load_folder_paused(&db, 3));
+        assert!(!load_folder_paused(&db, 4));
+        assert!(!load_folder_paused(&db, 33));
+        store_folder_paused(&db, 3, false).unwrap();
+        assert!(!load_folder_paused(&db, 3));
     }
 }

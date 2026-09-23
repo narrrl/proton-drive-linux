@@ -26,6 +26,11 @@ Schema: **30** (unchanged).
   original, keep the copy or keep both under a new name; whatever is not kept goes to Trash.
   `pdfs conflicts` and `pdfs conflicts resolve <path> --keep original|copy|both` do the same from
   the CLI. Files that are open or still uploading are refused until they settle.
+- **Pause one folder.** A mirrored folder on the Sync page has its own pause button; while paused
+  it is not reconciled in either direction and its mode cannot be switched, and resuming syncs it
+  straight away. `pdfs sync pause --folder <id>` / `pdfs sync resume --folder <id>` do the same, and
+  `pdfs sync list` marks paused folders. The pause is kept across restarts. On-demand folders
+  upload through the shared queue, so only the global pause holds them back.
 
 ### Changed
 - **New app shell.** Every page has its own header bar; the sidebar ends in a footer with sync

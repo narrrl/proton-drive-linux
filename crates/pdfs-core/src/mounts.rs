@@ -110,6 +110,9 @@ pub struct MountSpec {
     /// Live device sync progress, absent when no pass is running.
     #[serde(default)]
     pub progress: Option<SyncProgress>,
+    /// A synced folder paused on its own. Live daemon state, not a stored column.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[cfg(test)]
