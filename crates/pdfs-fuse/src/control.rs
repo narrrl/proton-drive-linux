@@ -29,6 +29,26 @@ use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
 
 const MAX_CONTROL_REQUEST_BYTES: u64 = 1024 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Answer a [`CtlRequest::StopSharing`]: log it, and turn a partial removal
+/// into an error that names what is still shared.
+fn stop_sharing_reply(
+    core: &Core,
+    target: &str,
+    result: CoreResult<super::sharing::StopSharingOutcome>,
+) -> CtlResponse {
+    match result.map(|outcome| outcome.into_result()) {
+        Ok(Ok(message)) => {
+            core.log_activity(ActivityKind::Unshare, target, "stopped sharing", true);
+            CtlResponse::Ok { message }
+        }
+        Ok(Err(left)) => {
+            core.log_activity(ActivityKind::Unshare, target, &left, false);
+            CtlResponse::error(CoreError::remote(left))
+        }
+        Err(e) => CtlResponse::error(e),
+    }
+}
+
 /// A client that connects, sends a request and then never reads its reply used
 /// to park a handler thread forever in `write_all`; 64 of those exhaust
 /// [`MAX_CONTROL_HANDLERS`] permanently. Generous enough for the largest
@@ -1309,6 +1329,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 Err(e) => CtlResponse::error(e),
             }
+        }
+        Ok(CtlRequest::StopSharing { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => stop_sharing_reply(core, &path, core.stop_sharing(&rel)),
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::StopSharingByUid { uid }) => {
+            stop_sharing_reply(core, &uid, core.stop_sharing_by_uid(&uid))
         }
         Ok(CtlRequest::ListRevisions { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.list_revisions(&rel) {

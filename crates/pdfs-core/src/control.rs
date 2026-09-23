@@ -518,6 +518,13 @@ pub enum Request {
     RemovePublicLink { path: String, id: String },
     /// The by-uid twin of [`Request::RemovePublicLink`].
     RemovePublicLinkByUid { uid: String, id: String },
+    /// Stop sharing the node at `path`: remove its public link, every pending
+    /// invitation and every member. Each removal is attempted even if an
+    /// earlier one fails. Replies with [`Response::Ok`], or an error naming
+    /// what is still shared.
+    StopSharing { path: String },
+    /// The by-uid twin of [`Request::StopSharing`].
+    StopSharingByUid { uid: String },
 
     // ---- revisions --------------------------------------------------------
     /// List the version history of the file at mountpoint-relative `path`,
@@ -2885,6 +2892,12 @@ mod tests {
                 },
                 "RemovePublicLinkByUid",
             ),
+            (
+                Request::StopSharingByUid {
+                    uid: "vol~link".into(),
+                },
+                "StopSharingByUid",
+            ),
         ];
 
         for (request, variant) in cases {
@@ -2903,7 +2916,8 @@ mod tests {
                 | Request::UpdateShareRoleByUid { uid, .. }
                 | Request::RemoveShareEntryByUid { uid, .. }
                 | Request::CreatePublicLinkByUid { uid, .. }
-                | Request::RemovePublicLinkByUid { uid, .. } => uid,
+                | Request::RemovePublicLinkByUid { uid, .. }
+                | Request::StopSharingByUid { uid } => uid,
                 other => panic!("decoded into the wrong dispatch variant: {other:?}"),
             };
             assert_eq!(decoded_uid, "vol~link");

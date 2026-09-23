@@ -21,6 +21,99 @@ pub(crate) fn role_wire_to_index(role: &str) -> u32 {
     }
 }
 
+/// The expiry choices offered when creating a public link, in dropdown order,
+/// with their lifetime in days (`None` never expires).
+pub(crate) const LINK_EXPIRY: [(&str, Option<i64>); 4] = [
+    ("Never", None),
+    ("1 day", Some(1)),
+    ("7 days", Some(7)),
+    ("30 days", Some(30)),
+];
+
+/// The Unix expiry for a [`LINK_EXPIRY`] choice, counted from `now`.
+pub(crate) fn link_expiry_at(idx: u32, now: i64) -> Option<i64> {
+    LINK_EXPIRY
+        .get(idx as usize)
+        .and_then(|(_, days)| *days)
+        .map(|days| now + days * 86_400)
+}
+
+/// A loose shape check for an email address: one `@` with something before
+/// it and a dotted domain after it. The server does the real validation; this
+/// only catches typos before the Invite button is pressed.
+pub(crate) fn looks_like_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.contains('@')
+        && !s.chars().any(char::is_whitespace)
+        && domain
+            .split_once('.')
+            .is_some_and(|(host, rest)| !host.is_empty() && !rest.is_empty())
+        && !domain.ends_with('.')
+}
+
+/// Split the invite field into addresses. Returns `Err` with the first entry
+/// that doesn't look like an email, and `Ok` with an empty list when the field
+/// is blank.
+pub(crate) fn parse_emails(raw: &str) -> Result<Vec<String>, String> {
+    raw.split([',', ' ', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if looks_like_email(s) {
+                Ok(s.to_string())
+            } else {
+                Err(s.to_string())
+            }
+        })
+        .collect()
+}
+
+/// A button showing a spinner while its request runs. It goes insensitive
+/// on [`Busy::start`] and gets its label or icon back when dropped, so moving
+/// the guard into the request's future ends the busy state on every path.
+pub(crate) struct Busy {
+    button: gtk4::Button,
+    label: Option<glib::GString>,
+    icon: Option<glib::GString>,
+}
+
+impl Busy {
+    pub(crate) fn start(button: &gtk4::Button) -> Self {
+        let label = button.label();
+        let icon = button.icon_name();
+        let spinner = gtk4::Spinner::builder().spinning(true).build();
+        match &label {
+            Some(text) => {
+                let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                content.append(&spinner);
+                content.append(&gtk4::Label::new(Some(text)));
+                button.set_child(Some(&content));
+            }
+            None => button.set_child(Some(&spinner)),
+        }
+        button.set_sensitive(false);
+        Self {
+            button: button.clone(),
+            label,
+            icon,
+        }
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if let Some(label) = &self.label {
+            self.button.set_label(label);
+        } else if let Some(icon) = &self.icon {
+            self.button.set_icon_name(icon);
+        }
+        self.button.set_sensitive(true);
+    }
+}
+
 /// How an open Share dialog addresses its node.
 ///
 /// A node the browser is showing has a mountpoint-relative path. A node reached
@@ -94,19 +187,19 @@ impl ShareTarget {
         }
     }
 
-    fn create_link(&self, role: String, password: Option<String>) -> Request {
+    fn create_link(&self, role: String, password: Option<String>, expires: Option<i64>) -> Request {
         match self {
             ShareTarget::Path(path) => Request::CreatePublicLink {
                 path: path.clone(),
                 role,
                 password,
-                expires: None,
+                expires,
             },
             ShareTarget::Uid(uid) => Request::CreatePublicLinkByUid {
                 uid: uid.clone(),
                 role,
                 password,
-                expires: None,
+                expires,
             },
         }
     }
@@ -179,6 +272,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .margin_top(6)
         .build();
     invite_btn.add_css_class("suggested-action");
+    invite_btn.set_sensitive(false);
     let invite_wrap = adw::PreferencesRow::builder()
         .activatable(false)
         .child(&invite_btn)
@@ -227,6 +321,25 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         link_rows: RefCell::new(Vec::new()),
     });
 
+    // Check the addresses as they are typed: a malformed one marks the row as
+    // an error and keeps the Invite button off, so a typo never reaches the
+    // server as a failed invitation.
+    let btn = invite_btn.clone();
+    email_row.connect_changed(move |row| {
+        let parsed = parse_emails(&row.text());
+        match &parsed {
+            Err(bad) => {
+                row.add_css_class("error");
+                row.set_tooltip_text(Some(&format!("“{bad}” isn't an email address")));
+            }
+            Ok(_) => {
+                row.remove_css_class("error");
+                row.set_tooltip_text(None);
+            }
+        }
+        btn.set_sensitive(parsed.is_ok_and(|emails| !emails.is_empty()));
+    });
+
     // Enter in either free-text field sends the invitations, no mouse needed.
     let btn = invite_btn.clone();
     email_row.connect_entry_activated(move |_| btn.emit_clicked());
@@ -235,16 +348,15 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
 
     // Invite button.
     let state_inv = state.clone();
-    invite_btn.connect_clicked(move |_| {
-        let raw = email_row.text();
-        let emails: Vec<String> = raw
-            .split([',', ' ', ';'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
+    invite_btn.connect_clicked(move |btn| {
+        // Enter in a field reaches here even while the button is off.
+        if !btn.is_sensitive() {
+            return;
+        }
+        let Ok(emails) = parse_emails(&email_row.text()) else {
+            return;
+        };
         if emails.is_empty() {
-            toast_error(&state_inv.ui, "Couldn't share", "Enter at least one email.");
             return;
         }
         let role = role_index_to_wire(role_drop.selected()).to_string();
@@ -257,6 +369,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
             state_inv.target.invite(emails, role, message),
             "Invitations sent",
             "Couldn't send invitations",
+            Some(Busy::start(btn)),
             Some(Box::new(move || {
                 email_clear.set_text("");
                 msg_clear.set_text("");
@@ -340,6 +453,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
                     "Role updated",
                     "Couldn't update the role",
                     None,
+                    None,
                 );
             });
             row.add_suffix(&drop);
@@ -365,6 +479,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
         remove.connect_clicked(move |btn| {
             let state = state_rm.clone();
             let id = id.clone();
+            let button = btn.clone();
             confirm_destructive(
                 btn,
                 "Remove Access?",
@@ -376,6 +491,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
                         state.target.remove_entry(id.clone(), kind),
                         "Access removed",
                         "Couldn't remove access",
+                        Some(Busy::start(&button)),
                         None,
                     );
                 },
@@ -400,14 +516,14 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
     match link {
         Some(link) => {
             let url = link.url.clone().unwrap_or_default();
-            let subtitle = if link.has_password {
-                format!(
-                    "Anyone with the link ({}) · password-protected",
-                    capitalize(&link.role)
-                )
-            } else {
-                format!("Anyone with the link ({})", capitalize(&link.role))
-            };
+            let mut subtitle = format!("Anyone with the link ({})", capitalize(&link.role));
+            if link.has_password {
+                subtitle.push_str(" · password-protected");
+            }
+            if let Some(expires) = link.expires {
+                subtitle.push_str(" · ");
+                subtitle.push_str(&link_expiry_label(expires, glib::real_time() / 1_000_000));
+            }
             let row = adw::ActionRow::builder()
                 .title(if url.is_empty() { "Public link" } else { &url })
                 .subtitle(&subtitle)
@@ -441,6 +557,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             remove.connect_clicked(move |btn| {
                 let state = state_rm.clone();
                 let id = id.clone();
+                let button = btn.clone();
                 confirm_destructive(
                     btn,
                     "Remove Public Link?",
@@ -453,6 +570,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                             state.target.remove_link(id.clone()),
                             "Public link removed",
                             "Couldn't remove the link",
+                            Some(Busy::start(&button)),
                             None,
                         );
                     },
@@ -475,6 +593,14 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             let pw_row = adw::PasswordEntryRow::builder()
                 .title("Password (optional)")
                 .build();
+            let expiry_names: Vec<&str> = LINK_EXPIRY.iter().map(|(name, _)| *name).collect();
+            let expiry_drop = gtk4::DropDown::builder()
+                .model(&gtk4::StringList::new(&expiry_names))
+                .selected(0)
+                .valign(gtk4::Align::Center)
+                .build();
+            let expiry_row = adw::ActionRow::builder().title("Expires").build();
+            expiry_row.add_suffix(&expiry_drop);
             let create = gtk4::Button::builder()
                 .label("Create Public Link")
                 .halign(gtk4::Align::End)
@@ -492,7 +618,10 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
 
             let state_c = state.clone();
             let pw_for = pw_row.clone();
-            create.connect_clicked(move |_| {
+            create.connect_clicked(move |btn| {
+                if !btn.is_sensitive() {
+                    return;
+                }
                 let role = if role_drop.selected() == 1 {
                     "editor"
                 } else {
@@ -501,14 +630,17 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                 .to_string();
                 let pw = pw_for.text().to_string();
                 let password = if pw.is_empty() { None } else { Some(pw) };
-                share_dialog_create_link(&state_c, role, password);
+                let expires = link_expiry_at(expiry_drop.selected(), glib::real_time() / 1_000_000);
+                share_dialog_create_link(&state_c, role, password, expires, Busy::start(btn));
             });
 
             state.link_group.add(&role_row);
             state.link_group.add(&pw_row);
+            state.link_group.add(&expiry_row);
             state.link_group.add(&create_wrap);
             rows.push(role_row.upcast());
             rows.push(pw_row.upcast());
+            rows.push(expiry_row.upcast());
             rows.push(create_wrap.upcast());
         }
     }
@@ -521,14 +653,18 @@ pub(crate) fn share_dialog_create_link(
     state: &Rc<ShareDialog>,
     role: String,
     password: Option<String>,
+    expires: Option<i64>,
+    busy: Busy,
 ) {
     let rx = spawn_request(
         state.ui.dirs.control_socket(),
-        state.target.create_link(role, password),
+        state.target.create_link(role, password, expires),
     );
     let state = state.clone();
     glib::spawn_future_local(async move {
-        match rx.recv().await {
+        let reply = rx.recv().await;
+        drop(busy);
+        match reply {
             Ok(Ok(Response::PublicLink { .. })) => {
                 toast(&state.ui, "Public link created");
                 share_dialog_reload(&state);
@@ -546,18 +682,22 @@ pub(crate) fn share_dialog_create_link(
 }
 
 /// Run a Share-dialog mutation, then reload the dialog on success. `on_success`
-/// runs an extra UI tweak (e.g. clearing the invite fields) before the reload.
+/// runs an extra UI tweak (e.g. clearing the invite fields) before the reload;
+/// `busy` keeps the button that started it spinning until the reply arrives.
 pub(crate) fn share_dialog_op(
     state: &Rc<ShareDialog>,
     req: Request,
     done: &'static str,
     failed: &'static str,
+    busy: Option<Busy>,
     on_success: Option<Box<dyn Fn()>>,
 ) {
     let rx = spawn_request(state.ui.dirs.control_socket(), req);
     let state = state.clone();
     glib::spawn_future_local(async move {
-        match rx.recv().await {
+        let reply = rx.recv().await;
+        drop(busy);
+        match reply {
             Ok(Ok(Response::Ok { .. })) => {
                 if let Some(cb) = on_success {
                     cb();
@@ -574,4 +714,62 @@ pub(crate) fn share_dialog_op(
             }
         }
     });
+}
+
+/// How an existing link's expiry reads in its subtitle: the date it stops
+/// working, or that it already has.
+pub(crate) fn link_expiry_label(expires: i64, now: i64) -> String {
+    if expires <= now {
+        return "expired".to_string();
+    }
+    let date = glib::DateTime::from_unix_local(expires)
+        .ok()
+        .and_then(|at| at.format("%x").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    format!("expires {date}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_check_accepts_plain_addresses() {
+        assert!(looks_like_email("a@b.co"));
+        assert!(looks_like_email("first.last+tag@mail.example.org"));
+    }
+
+    #[test]
+    fn email_check_rejects_typos() {
+        for bad in [
+            "a", "a@", "@b.co", "a@b", "a@b.", "a@.co", "a@@b.co", "a@b@c.co",
+        ] {
+            assert!(!looks_like_email(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_emails_splits_and_reports_first_bad_entry() {
+        assert_eq!(
+            parse_emails("a@b.co, c@d.org;e@f.net"),
+            Ok(vec!["a@b.co".into(), "c@d.org".into(), "e@f.net".into()])
+        );
+        assert_eq!(parse_emails("  ,  "), Ok(vec![]));
+        assert_eq!(parse_emails("a@b.co oops"), Err("oops".into()));
+    }
+
+    #[test]
+    fn link_expiry_counts_days_from_now() {
+        assert_eq!(link_expiry_at(0, 1_000), None);
+        assert_eq!(link_expiry_at(1, 1_000), Some(1_000 + 86_400));
+        assert_eq!(link_expiry_at(3, 0), Some(30 * 86_400));
+        assert_eq!(link_expiry_at(99, 0), None);
+    }
+
+    #[test]
+    fn past_expiry_reads_expired() {
+        assert_eq!(link_expiry_label(10, 20), "expired");
+        assert!(link_expiry_label(2_000_000_000, 0).starts_with("expires "));
+    }
 }

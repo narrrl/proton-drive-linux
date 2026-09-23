@@ -231,7 +231,8 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
     *ui.shared_by_me.rows.borrow_mut() = rows;
 }
 
-/// The ⋮ menu on a shared item: open it, the link, and the Share dialog.
+/// The ⋮ menu on a shared item: open it, the link, the Share dialog, and
+/// Stop Sharing.
 ///
 /// Manage access opens the per-node Share dialog, which addresses a pathless
 /// node by uid, so every shared item can be managed from here.
@@ -254,7 +255,41 @@ fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry, url: Option<String>) -> gtk4
         "Manage Access…",
         Box::new(move || open_share_dialog(&ui_c, &entry_c)),
     ));
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    items.push((
+        "Stop Sharing…",
+        Box::new(move || prompt_stop_sharing(&ui_c, &entry_c)),
+    ));
     more_menu_button(items)
+}
+
+/// Confirm, then remove every member, invitation and the public link.
+pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entry: &DirEntry) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Stop sharing?")
+        .body(format!(
+            "Everyone you invited loses access to “{}”, pending invitations are \
+             withdrawn and its public link stops working.",
+            entry.name
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("stop", "Stop Sharing");
+    dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui_c = ui.clone();
+    let uid = entry.uid.clone();
+    let name = entry.name.clone();
+    dialog.connect_response(Some("stop"), move |_, _| {
+        run_mutation(
+            &ui_c,
+            Request::StopSharingByUid { uid: uid.clone() },
+            format!("Stopped sharing {name}"),
+            "Couldn't stop sharing",
+        );
+    });
+    dialog.present(ui_window(ui).as_ref());
 }
 
 /// Open a shared item: a folder in My Files, a file the way My Files would.

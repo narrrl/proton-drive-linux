@@ -403,14 +403,18 @@ enum Command {
         /// New role: viewer, editor or admin.
         role: String,
     },
-    /// Remove a member or pending invitation from a node's share.
+    /// Stop sharing a node, or remove one member or pending invitation.
+    ///
+    /// With only a path, removes the public link, every invitation and every
+    /// member. With an id and kind (from `pdfs members`), removes that entry.
     Unshare {
         /// File/folder path, inside the mountpoint or relative to it.
         path: PathBuf,
         /// Entry id (membership or invitation id), from `pdfs members`.
-        id: String,
+        #[arg(requires = "kind")]
+        id: Option<String>,
         /// Entry kind: member, proton or external.
-        kind: ShareKindArg,
+        kind: Option<ShareKindArg>,
     },
     /// Inspect and restore a file's earlier versions.
     Versions {
@@ -1261,12 +1265,17 @@ fn cmd_share_role(path: PathBuf, id: String, kind: ShareKindArg, role: String) -
     })?)
 }
 
-fn cmd_unshare(path: PathBuf, id: String, kind: ShareKindArg) -> Result<()> {
-    ok_or_bail(control_request(CtlRequest::RemoveShareEntry {
-        path: path_arg(&path)?,
-        id,
-        kind: kind.to_kind(),
-    })?)
+fn cmd_unshare(path: PathBuf, id: Option<String>, kind: Option<ShareKindArg>) -> Result<()> {
+    let path = path_arg(&path)?;
+    let request = match (id, kind) {
+        (Some(id), Some(kind)) => CtlRequest::RemoveShareEntry {
+            path,
+            id,
+            kind: kind.to_kind(),
+        },
+        _ => CtlRequest::StopSharing { path },
+    };
+    ok_or_bail(control_request(request)?)
 }
 
 fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
@@ -3351,5 +3360,38 @@ mod login_wait_tests {
         );
         entry.shared_by_unverified = true;
         assert!(shared_by_line(&entry).unwrap().contains("WARNING"));
+    }
+}
+
+#[cfg(test)]
+mod unshare_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn unshare_with_only_a_path_stops_sharing() {
+        let cli = Cli::try_parse_from(["pdfs", "unshare", "docs/report.pdf"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Unshare {
+                id: None,
+                kind: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unshare_with_an_id_needs_its_kind() {
+        assert!(Cli::try_parse_from(["pdfs", "unshare", "docs", "abc"]).is_err());
+        let cli = Cli::try_parse_from(["pdfs", "unshare", "docs", "abc", "member"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Unshare {
+                id: Some(_),
+                kind: Some(_),
+                ..
+            }
+        ));
     }
 }

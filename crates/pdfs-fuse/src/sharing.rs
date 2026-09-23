@@ -388,6 +388,66 @@ impl Core {
             .map_err(|e| CoreError::from_api(&e, "remove public link"))
     }
 
+    /// Stop sharing the node at `rel`: remove its public link, then every
+    /// external invitation, Proton invitation and member. The SDK has no call
+    /// that deletes a share outright, so this composes the per-entry ones.
+    pub(crate) fn stop_sharing(&self, rel: &Path) -> CoreResult<StopSharingOutcome> {
+        let (_ino, uid) = self.resolve(rel)?;
+        self.stop_sharing_for_uid(&uid)
+    }
+
+    /// [`Core::stop_sharing`] for a node addressed through any daemon location.
+    pub(crate) fn stop_sharing_by_uid(&self, uid: &str) -> CoreResult<StopSharingOutcome> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.stop_sharing_for_uid(&uid)
+    }
+
+    /// Each step runs even when an earlier one failed, so a single stuck
+    /// member does not leave the public link up. The link goes first: it is the
+    /// widest exposure. Only a failure to list what is there fails the whole
+    /// request; a failed removal is counted in the outcome.
+    fn stop_sharing_for_uid(&self, uid: &NodeUid) -> CoreResult<StopSharingOutcome> {
+        let mut outcome = StopSharingOutcome::default();
+        let link = self
+            .rt
+            .block_on(self.client.get_public_link(uid))
+            .map_err(|e| CoreError::from_api(&e, "get public link"))?;
+        if let Some(link) = link {
+            let result = self.rt.block_on(self.client.remove_public_link(&link));
+            outcome.record("the public link", result);
+        }
+        let external = self
+            .rt
+            .block_on(self.client.list_external_invitations(uid))
+            .map_err(|e| CoreError::from_api(&e, "list external invitations"))?;
+        for ext in external {
+            let result = self
+                .rt
+                .block_on(self.client.delete_external_invitation(&ext));
+            outcome.record(&ext.invitee_email, result);
+        }
+        let invitations = self
+            .rt
+            .block_on(self.client.list_share_invitations(uid))
+            .map_err(|e| CoreError::from_api(&e, "list invitations"))?;
+        for inv in invitations {
+            let result = self.rt.block_on(self.client.delete_invitation(&inv));
+            outcome.record(&inv.invitee_email, result);
+        }
+        let members = self
+            .rt
+            .block_on(self.client.list_share_members(uid))
+            .map_err(|e| CoreError::from_api(&e, "list members"))?;
+        for member in members {
+            let result = self.rt.block_on(self.client.remove_member(&member));
+            outcome.record(&member.email, result);
+        }
+        if !outcome.failed.is_empty() {
+            debug!(%uid, failed = ?outcome.failed, "stop sharing: some entries remain");
+        }
+        Ok(outcome)
+    }
+
     // ---- shared with me ---------------------------------------------------
 
     /// List nodes shared with me that I have accepted.
@@ -657,6 +717,47 @@ impl Core {
     }
 }
 
+/// What [`Core::stop_sharing`] managed to remove.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StopSharingOutcome {
+    /// Entries removed (the link, invitations and members alike).
+    pub(crate) removed: usize,
+    /// What could not be removed, by email (or "the public link"), with why.
+    pub(crate) failed: Vec<(String, String)>,
+}
+
+impl StopSharingOutcome {
+    fn record<E: std::fmt::Display>(&mut self, what: &str, result: Result<(), E>) {
+        match result {
+            Ok(()) => self.removed += 1,
+            Err(e) => self.failed.push((what.to_string(), e.to_string())),
+        }
+    }
+
+    /// The reply for the control socket: a sentence for a full success, an
+    /// error naming what is left otherwise.
+    pub(crate) fn into_result(self) -> Result<String, String> {
+        if self.failed.is_empty() {
+            return Ok(match self.removed {
+                0 => "it was not shared".to_string(),
+                1 => "stopped sharing: removed 1 entry".to_string(),
+                n => format!("stopped sharing: removed {n} entries"),
+            });
+        }
+        let left = self
+            .failed
+            .iter()
+            .map(|(what, why)| format!("{what} ({why})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "removed {} of {}; still shared: {left}",
+            self.removed,
+            self.removed + self.failed.len()
+        ))
+    }
+}
+
 /// Walk one inode space from `uid` up to its root, building the path. `None` if
 /// that mount has never interned the node, or if the chain breaks partway —
 /// a broken chain is a missing path, never a partial one.
@@ -670,4 +771,38 @@ fn walk_to_root(st: &super::State, uid: &NodeUid) -> Option<String> {
     }
     parts.reverse();
     Some(parts.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_a_share_that_is_gone_says_so() {
+        let outcome = StopSharingOutcome::default();
+        assert_eq!(outcome.into_result().unwrap(), "it was not shared");
+    }
+
+    #[test]
+    fn a_failed_removal_names_what_is_still_shared() {
+        let mut outcome = StopSharingOutcome::default();
+        outcome.record::<String>("the public link", Ok(()));
+        outcome.record("bob@example.com", Err("forbidden"));
+        outcome.record::<String>("carol@example.com", Ok(()));
+        assert_eq!(
+            outcome.into_result().unwrap_err(),
+            "removed 2 of 3; still shared: bob@example.com (forbidden)"
+        );
+    }
+
+    #[test]
+    fn a_full_removal_counts_the_entries() {
+        let mut outcome = StopSharingOutcome::default();
+        outcome.record::<String>("the public link", Ok(()));
+        outcome.record::<String>("bob@example.com", Ok(()));
+        assert_eq!(
+            outcome.into_result().unwrap(),
+            "stopped sharing: removed 2 entries"
+        );
+    }
 }

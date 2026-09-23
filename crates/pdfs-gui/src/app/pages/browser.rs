@@ -2117,6 +2117,7 @@ pub(crate) fn reload_listing(ui: &Rc<Ui>) {
     match ui.stack.visible_child_name().as_deref() {
         Some("browser") => load_browser(ui),
         Some("trash") => load_trash(ui),
+        Some("sharedbyme") => load_shared_by_me(ui),
         _ => {}
     }
 }

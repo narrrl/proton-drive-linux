@@ -43,6 +43,11 @@ Schema: **31** (unchanged).
   → Show tray icon brings the icon back. "Stop Proton Drive…" asks for confirmation in the app,
   then stops the service and the tray. `pdfs-app` accepts `--page <name>` and `--confirm-stop`.
   A second launch raises the running window instead of opening another one.
+- **Stop sharing.** Shared by Me → item menu → "Stop Sharing…" and `pdfs unshare <path>` (with no
+  id) remove the public link, every invitation and every member in one go. Each step is tried even
+  if an earlier one fails, and a partial result names what is still shared.
+- **Public link expiry.** The Share dialog's create-link form has an "Expires" choice (Never,
+  1 day, 7 days, 30 days), and an existing link shows when it expires or that it has expired.
 
 ### Changed
 - **New app shell.** Every page has its own header bar; the sidebar ends in a footer with sync
@@ -116,6 +121,9 @@ Schema: **31** (unchanged).
   daemon logs again on every run now shows once, with a count. A "Needs attention" section on top
   lists the conflicts still waiting for a decision. Each logged conflict has a Resolve… button that
   opens the same dialog as the Sync page, and reads as resolved once the copy is gone.
+- **Share dialog.** The Invite button stays off until every address looks like an email; a
+  malformed one marks the field red and names the entry in a tooltip. Buttons show a spinner
+  while their request runs, so a slow invite or link removal can't be sent twice.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 
