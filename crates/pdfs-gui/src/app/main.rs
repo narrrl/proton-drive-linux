@@ -719,7 +719,7 @@ fn build_window(app: &adw::Application) {
     wire_trash(&ui, &trash_widgets);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
-    wire_devices(&ui, &devices_widgets.retry, &devices_widgets.restore);
+    wire_devices(&ui, &devices_widgets.retry);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
     wire_activity(&ui, &activity_widgets.retry, &activity_widgets.filters);
     wire_takeout(&ui, &takeout_widgets);

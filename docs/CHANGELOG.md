@@ -46,6 +46,11 @@ Schema: **31** (unchanged).
 - **Stop sharing.** Shared by Me → item menu → "Stop Sharing…" and `pdfs unshare <path>` (with no
   id) remove the public link, every invitation and every member in one go. Each step is tried even
   if an earlier one fails, and a partial result names what is still shared.
+- **Restore another computer's folders.** Every computer's menu on the Computers page has
+  "Restore to This Computer…", which syncs that computer's backed-up folders down to paths you
+  pick; they keep syncing with that computer's copy, and this machine keeps its own identity.
+  This computer's own restore moved from the header into its row's menu. `pdfs sync restore
+  --device <uid>` does the same from the CLI.
 - **Public link expiry.** The Share dialog's create-link form has an "Expires" choice (Never,
   1 day, 7 days, 30 days), and an existing link shows when it expires or that it has expired.
 

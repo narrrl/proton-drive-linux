@@ -655,6 +655,10 @@ enum SyncCmd {
         /// Accept every proposed local path without asking.
         #[arg(long)]
         yes: bool,
+        /// Restore another computer's folders instead, by device uid (from
+        /// `pdfs devices list`).
+        #[arg(long)]
+        device: Option<String>,
     },
 }
 
@@ -991,7 +995,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         SyncCmd::Mode { id, mode } => {
             ok_or_bail(control_request(CtlRequest::SetSyncFolderMode { id, mode })?)?
         }
-        SyncCmd::Restore { yes } => return cmd_sync_restore(yes),
+        SyncCmd::Restore { yes, device } => return cmd_sync_restore(yes, device),
     }
     Ok(())
 }
@@ -1075,8 +1079,13 @@ fn cmd_sync_queue() -> Result<()> {
 /// The daemon only ever *proposes* local paths — a path recorded by another
 /// machine may name a home directory that does not exist here — so the default
 /// flow is propose-and-confirm. `--yes` accepts the proposals for scripting.
-fn cmd_sync_restore(yes: bool) -> Result<()> {
-    let response = control_request(CtlRequest::ListRestorableFolders)?;
+fn cmd_sync_restore(yes: bool, device: Option<String>) -> Result<()> {
+    let response = control_request(match &device {
+        Some(device) => CtlRequest::ListDeviceRestorableFolders {
+            device: device.clone(),
+        },
+        None => CtlRequest::ListRestorableFolders,
+    })?;
     if emit_json(&response)? {
         return Ok(());
     }
@@ -1126,8 +1135,12 @@ fn cmd_sync_restore(yes: bool) -> Result<()> {
         println!("Nothing selected.");
         return Ok(());
     }
-    ok_or_bail(control_request(CtlRequest::RestoreSyncFolders {
-        items: chosen,
+    ok_or_bail(control_request(match device {
+        Some(device) => CtlRequest::RestoreDeviceFolders {
+            device,
+            items: chosen,
+        },
+        None => CtlRequest::RestoreSyncFolders { items: chosen },
     })?)
 }
 

@@ -227,6 +227,39 @@ impl Core {
         Ok(format!("adopted device {name}"))
     }
 
+    /// The device a restore reads from: this machine's own for `None`, else
+    /// the registered device with that uid.
+    ///
+    /// Another device is looked up without touching the cached device row —
+    /// restoring its folders here must not make this machine back up as it.
+    /// Its folders are then attached with that device's share id, so they sync
+    /// against the other computer's tree.
+    pub(crate) fn restore_source(&self, device: Option<&str>) -> CoreResult<StoredDevice> {
+        let Some(uid) = device else {
+            return self.ensure_device();
+        };
+        let remote = self
+            .rt
+            .block_on(self.client.enumerate_devices())
+            .map_err(|e| CoreError::from_api(&e, "enumerate devices"))?;
+        let d = remote
+            .into_iter()
+            .find(|d| d.uid.to_string() == uid)
+            .ok_or_else(|| CoreError::not_found(format!("no device {uid} in this account")))?;
+        Ok(StoredDevice {
+            uid: d.uid.to_string(),
+            share_id: d.share_id.to_string(),
+            root_uid: d.root_folder_uid.to_string(),
+            name: d
+                .name
+                .as_deref()
+                .ok()
+                .unwrap_or("(unnamed device)")
+                .to_string(),
+            created: d.creation_time,
+        })
+    }
+
     // ---- device folder sync (devices.md, Phase 1) -------------------------
 
     /// Auto-register (or recover) this machine as a Proton Drive Device, caching

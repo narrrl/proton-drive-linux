@@ -1144,22 +1144,38 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::ListRestorableFolders) => match core.list_restorable_folders() {
+        Ok(CtlRequest::ListRestorableFolders) => match core.list_restorable_folders(None) {
             Ok(items) => CtlResponse::RestorableFolders { items },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::RestoreSyncFolders { items }) => {
+        Ok(CtlRequest::ListDeviceRestorableFolders { device }) => {
+            match core.list_restorable_folders(Some(&device)) {
+                Ok(items) => CtlResponse::RestorableFolders { items },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(
+            request @ (CtlRequest::RestoreSyncFolders { .. }
+            | CtlRequest::RestoreDeviceFolders { .. }),
+        ) => {
+            let (device, items) = match request {
+                CtlRequest::RestoreDeviceFolders { device, items } => (Some(device), items),
+                CtlRequest::RestoreSyncFolders { items } => (None, items),
+                _ => unreachable!("matched above"),
+            };
             // Like AddSyncFolder: each restored folder downloads a whole tree,
             // which outlasts the socket timeout. Ack, then work.
             let core = core.clone();
-            std::thread::spawn(move || match core.restore_sync_folders(&items) {
-                Ok(message) => {
-                    core.touch_profile();
-                    core.log_activity(ActivityKind::Download, &message, "", true);
-                }
-                Err(e) => {
-                    warn!(error = %e, "restore failed");
-                    core.log_activity(ActivityKind::Download, "restore folders", &e, false);
+            std::thread::spawn(move || {
+                match core.restore_sync_folders(&items, device.as_deref()) {
+                    Ok(message) => {
+                        core.touch_profile();
+                        core.log_activity(ActivityKind::Download, &message, "", true);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "restore failed");
+                        core.log_activity(ActivityKind::Download, "restore folders", &e, false);
+                    }
                 }
             });
             CtlResponse::Ok {

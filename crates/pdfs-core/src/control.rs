@@ -443,6 +443,18 @@ pub enum Request {
     /// Attach the given remote device folders to local paths and sync them down.
     /// Replies with [`Response::Ok`].
     RestoreSyncFolders { items: Vec<RestoreItem> },
+    /// [`Request::ListRestorableFolders`] for another registered device, by
+    /// uid, so its folders can be synced down to this machine. Replies with
+    /// [`Response::RestorableFolders`].
+    ListDeviceRestorableFolders { device: String },
+    /// [`Request::RestoreSyncFolders`] for folders under another device. A
+    /// separate variant rather than an optional field: an older daemon that
+    /// ignored the field would attach the folders under this machine's device
+    /// share instead. Replies with [`Response::Ok`].
+    RestoreDeviceFolders {
+        device: String,
+        items: Vec<RestoreItem>,
+    },
 
     // ---- sharing a node ---------------------------------------------------
     /// Invite `emails` (Proton and/or external addresses, auto-detected) to the
@@ -2489,6 +2501,17 @@ mod tests {
                     remote_uid: "vol~link".into(),
                     local_path: "/home/me/Docs".into(),
                     mode: "mirror".into(),
+                }],
+            },
+            Request::ListDeviceRestorableFolders {
+                device: "dev-2".into(),
+            },
+            Request::RestoreDeviceFolders {
+                device: "dev-2".into(),
+                items: vec![RestoreItem {
+                    remote_uid: "vol~link".into(),
+                    local_path: "/home/me/Work".into(),
+                    mode: "ondemand".into(),
                 }],
             },
             Request::ShareNode {

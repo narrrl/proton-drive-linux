@@ -248,15 +248,19 @@ impl Core {
 
     // ---- restore (features.md 5.2) ----------------------------------------
 
-    /// The folders under this machine's device that could be synced here, each
-    /// carrying a proposed local path.
+    /// The folders under a device that could be synced here, each carrying a
+    /// proposed local path. `device` names another registered device by uid;
+    /// `None` is this machine's own.
     ///
     /// The proposal comes from the profile when one exists and its path is
     /// usable on this machine, and from `~/<name>` otherwise — a restored
     /// `/home/other-user/Documents` would be wrong on a machine where that user
     /// does not exist, and silently creating it would be worse.
-    pub(crate) fn list_restorable_folders(&self) -> CoreResult<Vec<RestorableFolder>> {
-        let device = self.ensure_device()?;
+    pub(crate) fn list_restorable_folders(
+        &self,
+        device: Option<&str>,
+    ) -> CoreResult<Vec<RestorableFolder>> {
+        let device = self.restore_source(device)?;
         let root_uid = parse_uid(&device.root_uid).ok_or_else(|| {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))
         })?;
@@ -334,11 +338,12 @@ impl Core {
     pub(crate) fn restore_sync_folders(
         &self,
         items: &[pdfs_core::control::RestoreItem],
+        device: Option<&str>,
     ) -> CoreResult<String> {
         if items.is_empty() {
             return Err(CoreError::invalid("nothing to restore"));
         }
-        let device = self.ensure_device()?;
+        let device = self.restore_source(device)?;
         let existing = self
             .db
             .sync_folder_list()
@@ -497,6 +502,19 @@ mod tests {
         );
         let add = function_source(include_str!("devices.rs"), "fn add_sync_folder(");
         assert_before(add, "PROFILE_DIR_NAME", "ensure_device()");
+    }
+
+    /// Restoring another computer's folders reads that device, but must not
+    /// rewrite the cached device row: this machine would then back up as the
+    /// other computer.
+    #[test]
+    fn restoring_from_another_device_keeps_this_machines_identity() {
+        let source = function_source(include_str!("devices.rs"), "fn restore_source(");
+        assert!(source.contains("ensure_device()"), "None is this machine");
+        assert!(
+            !source.contains("device_set"),
+            "the cached row is untouched"
+        );
     }
 
     fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {

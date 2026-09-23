@@ -36,9 +36,6 @@ pub(crate) struct DevicesWidgets {
     /// machine's own device is deliberately not among them; see
     /// [`repaint_devices`].
     pub(crate) group: adw::PreferencesGroup,
-    /// "Restore Folders" — re-attach this device's remote folders to local
-    /// directories after adopting it on a new machine.
-    pub(crate) restore: gtk4::Button,
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
 }
@@ -48,10 +45,6 @@ pub(crate) struct DevicesWidgets {
 /// listing the account's other registered devices. The synced folders
 /// themselves live on the Sync page.
 pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
-    let restore = gtk4::Button::builder()
-        .label("Restore Folders…")
-        .tooltip_text("Sync this computer's Drive folders back to local directories")
-        .build();
     let refresh = refresh_button();
 
     // This page is about device *identity* — which computer this is, which other
@@ -114,7 +107,6 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     inner.set_margin_end(18);
     inner.append(&content);
     let (frame, header, _) = page_frame("Computers", &inner);
-    header.pack_start(&restore);
     header.pack_end(&refresh);
 
     (
@@ -125,22 +117,19 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
             sync_group,
             rename_this,
             group,
-            restore,
             retry,
             refresh,
         },
     )
 }
 
-/// Install the Devices page's retry button and the "Restore Folders" action.
-pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button, restore: &gtk4::Button) {
+/// Install the Devices page's retry button and the Rename action.
+pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button) {
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
         service::restart();
         load_devices(&ui_retry);
     });
-    let ui_restore = ui.clone();
-    restore.connect_clicked(move |_| prompt_restore_folders(&ui_restore));
     let ui_ren = ui.clone();
     ui.devices.rename_this.connect_clicked(move |_| {
         if let Some((uid, name)) = ui_ren.devices.this_device.borrow().clone() {
@@ -296,7 +285,14 @@ pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
         let (ui_ren, uid_ren, name_ren) = (ui.clone(), dev.uid.clone(), dev.name.clone());
         let (ui_ad, uid_ad, name_ad) = (ui.clone(), dev.uid.clone(), dev.name.clone());
         let (ui_rm, uid_rm, name_rm) = (ui.clone(), dev.uid.clone(), dev.name.clone());
+        let (ui_rs, uid_rs, name_rs) = (ui.clone(), dev.uid.clone(), dev.name.clone());
         row.add_suffix(&more_menu_button(vec![
+            (
+                "Restore to This Computer…",
+                Box::new(move || {
+                    prompt_restore_folders(&ui_rs, Some((uid_rs.clone(), name_rs.clone())))
+                }),
+            ),
             (
                 "Rename…",
                 Box::new(move || prompt_rename_device(&ui_ren, &uid_ren, &name_ren)),
@@ -352,6 +348,11 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
     let ui_go = ui.clone();
     manage.connect_clicked(move |_| ui_go.stack.set_visible_child_name("locations"));
     row.add_suffix(&manage);
+    let ui_rs = ui.clone();
+    row.add_suffix(&more_menu_button(vec![(
+        "Restore Folders…",
+        Box::new(move || prompt_restore_folders(&ui_rs, None)),
+    )]));
     ui.devices.sync_group.add(&row);
     *ui.devices.sync_rows.borrow_mut() = vec![row.upcast()];
 }
@@ -455,21 +456,30 @@ pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
     });
 }
 
-/// Ask the daemon what this machine's device holds, then show a picker mapping
-/// each remote folder onto a local directory.
+/// Ask the daemon what a device holds, then show a picker mapping each remote
+/// folder onto a local directory. `device` is another computer as `(uid, name)`;
+/// `None` is this machine's own device.
 ///
 /// The daemon's paths are proposals — from the device's `profile.json` when it
 /// makes sense here, else `~/<name>` — so every one of them is editable and
 /// nothing is restored without being ticked.
-pub(crate) fn prompt_restore_folders(ui: &Rc<Ui>) {
+pub(crate) fn prompt_restore_folders(ui: &Rc<Ui>, device: Option<(String, String)>) {
     ui.busy_begin();
-    let rx = spawn_request(ui.dirs.control_socket(), Request::ListRestorableFolders);
+    let request = match &device {
+        Some((uid, _)) => Request::ListDeviceRestorableFolders {
+            device: uid.clone(),
+        },
+        None => Request::ListRestorableFolders,
+    };
+    let rx = spawn_request(ui.dirs.control_socket(), request);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
         match result {
-            Ok(Ok(Response::RestorableFolders { items })) => show_restore_picker(&ui, items),
+            Ok(Ok(Response::RestorableFolders { items })) => {
+                show_restore_picker(&ui, items, device)
+            }
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, "Couldn't list folders to restore", &message, kind)
             }
@@ -483,14 +493,18 @@ pub(crate) fn prompt_restore_folders(ui: &Rc<Ui>) {
 }
 
 /// The restore picker itself: one editable row per restorable folder.
-fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
+fn show_restore_picker(
+    ui: &Rc<Ui>,
+    items: Vec<RestorableFolder>,
+    device: Option<(String, String)>,
+) {
     let win = ui_window(ui);
     let candidates: Vec<RestorableFolder> =
         items.into_iter().filter(|f| !f.already_synced).collect();
     if candidates.is_empty() {
         toast(
             ui,
-            "Nothing to restore — this computer's folders are all synced here.",
+            &nothing_to_restore(device.as_ref().map(|(_, n)| n.as_str())),
         );
         return;
     }
@@ -521,7 +535,9 @@ fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
         .build();
     let dialog = adw::AlertDialog::builder()
         .heading("Restore folders")
-        .body("These folders are backed up under this computer in Proton Drive.")
+        .body(restore_picker_body(
+            device.as_ref().map(|(_, n)| n.as_str()),
+        ))
         .extra_child(&scroll)
         .build();
     dialog.add_response("cancel", "Cancel");
@@ -551,12 +567,37 @@ fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
         // rows appear as the periodic refresh picks them up.
         run_devices_mutation(
             &ui,
-            Request::RestoreSyncFolders { items },
+            match &device {
+                Some((uid, _)) => Request::RestoreDeviceFolders {
+                    device: uid.clone(),
+                    items,
+                },
+                None => Request::RestoreSyncFolders { items },
+            },
             "Restoring folders…",
             "Couldn't restore folders",
         );
     });
     dialog.present(win.as_ref());
+}
+
+/// The restore picker's body: whose backup the folders come from.
+pub(crate) fn restore_picker_body(device: Option<&str>) -> String {
+    match device {
+        Some(name) => format!(
+            "These folders are backed up from “{name}”. Restored folders keep syncing with \
+             that computer's copy."
+        ),
+        None => "These folders are backed up under this computer in Proton Drive.".to_string(),
+    }
+}
+
+/// The toast when every folder of a device is already synced here.
+pub(crate) fn nothing_to_restore(device: Option<&str>) -> String {
+    match device {
+        Some(name) => format!("Nothing to restore — “{name}”'s folders are all synced here."),
+        None => "Nothing to restore — this computer's folders are all synced here.".to_string(),
+    }
 }
 
 /// Flip a synced folder between `mirror` and `ondemand`. Reloads after so the
@@ -864,5 +905,12 @@ mod tests {
             this_computer_subtitle(&[folder("conflict"), folder("error")]),
             "2 folders backed up · 2 need attention"
         );
+    }
+
+    #[test]
+    fn the_restore_picker_names_the_computer_it_restores_from() {
+        assert!(restore_picker_body(Some("laptop")).contains("“laptop”"));
+        assert!(restore_picker_body(None).contains("this computer"));
+        assert!(nothing_to_restore(Some("laptop")).contains("“laptop”"));
     }
 }
