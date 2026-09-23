@@ -21,6 +21,7 @@ pub mod service;
 pub mod shell;
 pub mod syncignore;
 pub mod takeout;
+pub mod tray;
 
 pub use access::{Access, access_for, perm_bits};
 pub use error::{CoreError, CoreResult, Error, Result};

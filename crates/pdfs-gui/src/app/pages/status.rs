@@ -46,6 +46,8 @@ pub(crate) struct StatusState {
     pub(crate) mountpoint_row: adw::ActionRow,
     /// "Proton purple accent" toggle. Guarded by [`Self::settings_suppress`].
     pub(crate) accent_row: adw::SwitchRow,
+    /// "Show tray icon" toggle. Guarded by [`Self::settings_suppress`].
+    pub(crate) tray_row: adw::SwitchRow,
     /// Set while a settings widget is being populated programmatically, so its
     /// change handler skips the IPC/systemd side effect.
     pub(crate) settings_suppress: Cell<bool>,
@@ -135,6 +137,7 @@ pub(crate) struct MainWidgets {
     pub(crate) mountpoint_row: adw::ActionRow,
     pub(crate) mountpoint_button: gtk4::Button,
     pub(crate) accent_row: adw::SwitchRow,
+    pub(crate) tray_row: adw::SwitchRow,
 }
 
 /// Build the two surfaces that replaced the old Settings page:
@@ -193,6 +196,11 @@ pub(crate) fn build_main_page() -> MainWidgets {
         .subtitle("Use the Proton brand color instead of the system accent color")
         .build();
     appearance_group.add(&accent_row);
+    let tray_row = adw::SwitchRow::builder()
+        .title("Show tray icon")
+        .subtitle("Sync status and quick actions in the panel")
+        .build();
+    appearance_group.add(&tray_row);
 
     let general = adw::PreferencesPage::builder()
         .title("General")
@@ -362,6 +370,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
         mountpoint_row,
         mountpoint_button,
         accent_row,
+        tray_row,
     }
 }
 
@@ -420,6 +429,7 @@ pub(crate) fn wire_settings(
     ui.status
         .accent_row
         .set_active(config.proton_accent.unwrap_or(false));
+    ui.status.tray_row.set_active(!config.tray_hidden);
     ui.status.settings_suppress.set(false);
 
     // Cache budget: a user edit applies the new soft cap on the daemon (which
@@ -532,6 +542,27 @@ pub(crate) fn wire_settings(
         config.proton_accent = Some(on);
         if let Err(e) = ui_accent.dirs.save_config(&config) {
             toast_error(&ui_accent, "Couldn't save the accent color", &e.to_string());
+        }
+    });
+
+    // Tray icon: the tray reads the same flag at start, so hiding it here also
+    // keeps the login autostart from bringing it back.
+    let ui_tray = ui.clone();
+    ui.status.tray_row.connect_active_notify(move |row| {
+        if ui_tray.status.settings_suppress.get() {
+            return;
+        }
+        let show = row.is_active();
+        let mut config = ui_tray.dirs.load_config();
+        config.tray_hidden = !show;
+        if let Err(e) = ui_tray.dirs.save_config(&config) {
+            toast_error(&ui_tray, "Couldn't save the tray setting", &e.to_string());
+            return;
+        }
+        if show {
+            spawn_tray();
+        } else {
+            pdfs_core::tray::quit(&ui_tray.dirs);
         }
     });
 }

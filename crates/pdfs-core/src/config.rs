@@ -137,6 +137,11 @@ pub struct AppConfig {
     /// Defaulted for configs predating the field.
     #[serde(default)]
     pub files_view: FilesView,
+    /// The user hid the tray icon from its own menu. The tray exits at start
+    /// while this is set, and the app does not spawn it; Preferences turns it
+    /// back on. Defaulted for configs predating the field.
+    #[serde(default)]
+    pub tray_hidden: bool,
 }
 
 /// The My Files page's view choices, remembered between runs.
@@ -208,6 +213,7 @@ impl Default for AppConfig {
             prompt: None,
             proton_accent: None,
             files_view: FilesView::default(),
+            tray_hidden: false,
         }
     }
 }
@@ -561,12 +567,14 @@ mod tests {
                 descending: true,
                 folders_first: false,
             },
+            tray_hidden: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
         assert_eq!(decoded.user_agent, "test-agent/1.0");
         assert_eq!(decoded.proton_accent, Some(true));
+        assert!(decoded.tray_hidden);
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
@@ -652,6 +660,7 @@ mod tests {
         let json = r#"{"app_version":"v","user_agent":"u"}"#;
         let decoded: AppConfig = serde_json::from_str(json).unwrap();
         assert!(decoded.ignore_patterns.is_none());
+        assert!(!decoded.tray_hidden, "an old config keeps the tray icon");
         assert_eq!(
             decoded.resolved_ignore_patterns().len(),
             DEFAULT_IGNORE_PATTERNS.len(),

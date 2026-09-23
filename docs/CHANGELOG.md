@@ -35,6 +35,14 @@ Schema: **31** (unchanged).
   shared by every transfer and applied to running ones from their next block; downloads include
   reads through the mount. `pdfs sync limit --up 2M --down 0` does the same, and `pdfs sync limit`
   on its own prints the current caps. The caps are kept in `config.json` across restarts.
+- **Tray states and menu.** The tray icon shows whether the drive is synced, syncing, paused,
+  offline or needs attention. It asks the panel for attention while changes keep failing, and
+  its tooltip gives the same line as the menu. A left click opens the app. The menu gains
+  "N issues — View", which opens the Sync page, and "Sign In…" when signed out. "Hide Tray Icon"
+  is remembered across logins (`tray_hidden` in `config.json`), and Preferences → Appearance
+  → Show tray icon brings the icon back. "Stop Proton Drive…" asks for confirmation in the app,
+  then stops the service and the tray. `pdfs-app` accepts `--page <name>` and `--confirm-stop`.
+  A second launch raises the running window instead of opening another one.
 
 ### Changed
 - **New app shell.** Every page has its own header bar; the sidebar ends in a footer with sync

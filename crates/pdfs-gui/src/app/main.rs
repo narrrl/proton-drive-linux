@@ -196,7 +196,12 @@ fn main() -> glib::ExitCode {
         )
         .init();
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // The tray launches the app with arguments ("--page locations",
+    // "--confirm-stop"), which a running instance must receive too.
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
     app.connect_startup(|_| {
         load_proton_theme();
         if let Ok(dirs) = AppDirs::new() {
@@ -205,14 +210,70 @@ fn main() -> glib::ExitCode {
         // Refresh the file manager's right-click pin/unpin scripts, so they always
         // match the installed `pdfs`.
         pdfs_core::shell::install_file_manager_scripts();
-        spawn_tray();
+        if !AppDirs::new().is_ok_and(|dirs| dirs.load_config().tray_hidden) {
+            spawn_tray();
+        }
     });
-    app.connect_activate(build_window);
+    app.connect_activate(present_window);
+    app.connect_command_line(|app, command| {
+        let args: Vec<String> = command
+            .arguments()
+            .iter()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        app.activate();
+        match parse_launch(&args) {
+            Launch::Window => {}
+            Launch::Page(page) => app.activate_action("show-page", Some(&page.to_variant())),
+            Launch::ConfirmStop => app.activate_action("confirm-stop", None),
+        }
+        glib::ExitCode::SUCCESS
+    });
     app.run()
 }
 
+/// What a launch of `pdfs-app` asks for, beyond showing the window.
+#[derive(Debug, PartialEq, Eq)]
+enum Launch {
+    Window,
+    /// `--page <name>`: open on a stack page, such as "locations" for Sync.
+    Page(String),
+    /// `--confirm-stop`: ask whether to stop Proton Drive (from the tray).
+    ConfirmStop,
+}
+
+fn parse_launch(args: &[String]) -> Launch {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--confirm-stop" => return Launch::ConfirmStop,
+            "--page" => {
+                if let Some(page) = args.next() {
+                    return Launch::Page(page.clone());
+                }
+            }
+            other => {
+                if let Some(page) = other.strip_prefix("--page=") {
+                    return Launch::Page(page.to_string());
+                }
+            }
+        }
+    }
+    Launch::Window
+}
+
+/// Raise the window if there is one, else build it. A second launch reaches
+/// the running instance, which must not open a second window.
+fn present_window(app: &adw::Application) {
+    match app.windows().first() {
+        Some(window) => window.present(),
+        None => build_window(app),
+    }
+}
+
 /// Spawn the tray icon process in the background.
-fn spawn_tray() {
+pub(crate) fn spawn_tray() {
     match Command::new("pdfs-tray").spawn() {
         Ok(_) => tracing::info!("spawned `pdfs-tray`"),
         Err(e) => tracing::error!("failed to spawn `pdfs-tray`: {e}"),
@@ -382,6 +443,7 @@ fn build_window(app: &adw::Application) {
             download_limit_row: main_widgets.download_limit_row.clone(),
             mountpoint_row: main_widgets.mountpoint_row.clone(),
             accent_row: main_widgets.accent_row.clone(),
+            tray_row: main_widgets.tray_row.clone(),
             settings_suppress: Cell::new(false),
             budget_source: RefCell::new(None),
             limit_source: RefCell::new(None),
@@ -726,6 +788,7 @@ fn build_window(app: &adw::Application) {
     window.add_breakpoint(wide);
     install_shortcuts(&ui, &window);
     install_window_actions(&ui, &window);
+    install_launch_actions(&ui, app, &window);
     app.set_accels_for_action("win.preferences", &["<Control>comma"]);
     app.set_accels_for_action("win.shortcuts", &["<Control>question"]);
 
@@ -1196,6 +1259,63 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     window.add_action(&about);
 }
 
+/// Back the launch arguments (see [`Launch`]) with app actions, so a running
+/// instance can act on them.
+fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::ApplicationWindow) {
+    let show_page = gio::SimpleAction::new("show-page", Some(glib::VariantTy::STRING));
+    let ui_page = ui.clone();
+    show_page.connect_activate(move |_, param| {
+        let Some(page) = param.and_then(|p| p.str()) else {
+            return;
+        };
+        // Signed out, the login page owns the window; unknown names are ignored.
+        if ui_page.session.borrow().is_some() && ui_page.stack.child_by_name(page).is_some() {
+            ui_page.stack.set_visible_child_name(page);
+        }
+    });
+    app.add_action(&show_page);
+
+    let confirm_stop = gio::SimpleAction::new("confirm-stop", None);
+    let win = window.clone();
+    let app_stop = app.clone();
+    let ui_stop = ui.clone();
+    confirm_stop.connect_activate(move |_, _| {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Stop Proton Drive?")
+            .body(
+                "The drive unmounts and nothing syncs until you connect again. \
+                 Proton Drive starts again at your next login.",
+            )
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("stop", "Stop");
+        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let app = app_stop.clone();
+        let ui = ui_stop.clone();
+        dialog.connect_response(Some("stop"), move |_, _| {
+            let app = app.clone();
+            let ui = ui.clone();
+            glib::spawn_future_local(async move {
+                let stopped = gio::spawn_blocking(service::stop).await.unwrap_or(false);
+                if stopped {
+                    pdfs_core::tray::quit(&ui.dirs);
+                    app.quit();
+                } else {
+                    toast_error(
+                        &ui,
+                        "Couldn't stop Proton Drive",
+                        "The mount service did not stop.",
+                    );
+                }
+            });
+        });
+        dialog.present(Some(&win));
+    });
+    app.add_action(&confirm_stop);
+}
+
 /// The About dialog's Troubleshooting text: what a bug report needs and what
 /// used to sit in a "Developer" group on the Settings page.
 fn debug_info(ui: &Rc<Ui>) -> String {
@@ -1506,6 +1626,26 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tray_can_launch_the_app_on_a_page_or_at_the_stop_prompt() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_launch(&args(&[])), Launch::Window);
+        assert_eq!(
+            parse_launch(&args(&["--page", "locations"])),
+            Launch::Page("locations".into())
+        );
+        assert_eq!(
+            parse_launch(&args(&["--page=activity"])),
+            Launch::Page("activity".into())
+        );
+        assert_eq!(
+            parse_launch(&args(&["--confirm-stop"])),
+            Launch::ConfirmStop
+        );
+        // A trailing --page with no name is no request at all.
+        assert_eq!(parse_launch(&args(&["--page"])), Launch::Window);
+    }
 
     /// The full width a row occupies, gaps included.
     fn row_width(widths: &[i32]) -> i32 {
