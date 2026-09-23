@@ -815,6 +815,8 @@ pub(crate) fn browser_views(ui: &Rc<Ui>) {
 pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk4::ColumnView) {
     attach_background_menu(ui, grid);
     attach_background_menu(ui, column_view);
+    attach_background_deselect(ui, grid);
+    attach_background_deselect(ui, column_view);
     // Resize only realised grid cells. Rebuilding the whole model for every
     // slider step would repeatedly tear down selection state while the pointer
     // is still moving.
@@ -1100,6 +1102,48 @@ pub(crate) fn attach_background_menu(ui: &Rc<Ui>, view: &impl IsA<gtk4::Widget>)
         background_context_menu(&ui).popup_at(&target, x, y);
     });
     view.add_controller(gesture);
+}
+
+/// Clicking the empty space of a view drops the selection, as in a file
+/// manager. GTK's list views leave it alone, so a stray highlight otherwise
+/// sticks around until another item is clicked.
+pub(crate) fn attach_background_deselect(ui: &Rc<Ui>, view: &impl IsA<gtk4::Widget>) {
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    // Capture sees the press before an item's own gesture claims it; this only
+    // looks, so the item still gets its click.
+    gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let ui = ui.clone();
+    let target = view.clone().upcast::<gtk4::Widget>();
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        let modifiers = gesture.current_event_state();
+        if modifiers
+            .intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK)
+        {
+            return;
+        }
+        if !on_item(&target, x, y) {
+            clear_selection(&ui);
+            sync_bulk_bar(&ui);
+        }
+    });
+    view.add_controller(gesture);
+}
+
+/// Whether `(x, y)` in `view` lands on an item: a grid tile ("child"), a list
+/// row ("row"), or a column header ("header"), which has clicks of its own.
+fn on_item(view: &gtk4::Widget, x: f64, y: f64) -> bool {
+    let mut widget = view.pick(x, y, gtk4::PickFlags::DEFAULT);
+    while let Some(w) = widget {
+        if &w == view {
+            return false;
+        }
+        if matches!(w.css_name().as_str(), "child" | "row" | "header") {
+            return true;
+        }
+        widget = w.parent();
+    }
+    false
 }
 
 /// The Menu key or Shift+F10: the menu for the selection, or for the folder

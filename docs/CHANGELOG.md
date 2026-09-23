@@ -121,6 +121,8 @@ Schema: **31** (unchanged).
   so the folder did not open. The pane now shows on request, from the header's Details toggle,
   Alt+Enter or the item menu's Details, and then follows the selection. Closing it keeps the
   selection.
+- **My Files behaves more like a file manager.** A click on empty space between the files clears
+  the selection; Ctrl or Shift held keeps it. Backspace goes back while the focus is on the files.
 - **An upload parked behind a temp-file rename no longer stays parked forever.** A create for a
   name that looks like a writer's temporary file waits for the rename to the final name. If that
   rename never came — the writer crashed, the file was deleted, or the name was never temporary —

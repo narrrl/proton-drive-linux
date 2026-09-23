@@ -1342,6 +1342,11 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::gdk::Key::Up if alt && on_browser => {
                 ui.browser.actions.activate_action("up", None)
             }
+            // A focused text field takes Backspace first, so this only fires
+            // with the focus on the files, as in a file manager.
+            gtk4::gdk::Key::BackSpace if on_browser => {
+                ui.browser.actions.activate_action("back", None)
+            }
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
             gtk4::gdk::Key::Menu if on_browser => popup_keyboard_context_menu(&ui),
             gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter if alt && on_browser => {
