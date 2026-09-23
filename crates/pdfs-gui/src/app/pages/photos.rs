@@ -534,10 +534,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // control: exactly one is active, and flipping it reloads the timeline
     // filtered to that kind (wired in [`wire_gallery`]). Labels gain live counts
     // once a page lands.
-    let tab_labels = ["All", "Photos", "Videos", "Raw"];
     let tabs: [gtk4::ToggleButton; 4] = std::array::from_fn(|i| {
         gtk4::ToggleButton::builder()
-            .label(tab_labels[i])
+            .label(tab_label(i))
             .active(i == 0)
             .build()
     });
@@ -802,10 +801,21 @@ pub(crate) fn update_gallery_tabs(ui: &Rc<Ui>, counts: (usize, usize, usize)) {
     let (photos, videos, raw) = counts;
     let totals = [photos + videos + raw, photos, videos, raw];
     for (index, tab) in ui.gallery.tabs.iter().enumerate() {
-        let name = ["All", "Photos", "Videos", "Raw"][index];
         let n = totals[index];
-        tab.set_label(&format!("{name}  {}", thousands(n)));
+        tab.set_label(&format!("{}  {}", tab_label(index), thousands(n)));
         tab.set_sensitive(n > 0 || tab.is_active());
+    }
+}
+
+/// The name of filter tab `index`: All, Photos, Videos or Raw.
+fn tab_label(index: usize) -> String {
+    match index {
+        // Translators: a Photos filter tab that shows photos, videos and raw files together.
+        0 => pgettext("photo filter", "All"),
+        1 => pgettext("photo filter", "Photos"),
+        2 => pgettext("photo filter", "Videos"),
+        // Translators: a Photos filter tab for raw camera files.
+        _ => pgettext("photo filter", "Raw"),
     }
 }
 
@@ -2111,11 +2121,6 @@ pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     }
     // The noun tracks the active filter, so a Videos tab doesn't count "photos".
     let kind = ui.gallery.kind.get();
-    let (one, many) = match kind {
-        Some(PhotoKind::Video) => ("video", "videos"),
-        Some(PhotoKind::Raw) => ("raw photo", "raw photos"),
-        _ => ("photo", "photos"),
-    };
     // The whole library for this filter, not the page count — the subtitle sits
     // next to tabs carrying the same totals, and the two disagreeing reads as a
     // bug. A date jump is the exception: there the window is the subject.
@@ -2131,9 +2136,16 @@ pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     if loaded == 0 {
         return;
     }
-    ui.gallery.title.set_subtitle(&match total {
-        1 => format!("1 {one}"),
-        n => format!("{} {many}", thousands(n)),
+    let count = thousands(total);
+    let args = [("count", count.as_str())];
+    let n = total as u64;
+    ui.gallery.title.set_subtitle(&match kind {
+        // Translators: the Photos page subtitle, such as "12 videos".
+        Some(PhotoKind::Video) => ngettext_f("{count} video", "{count} videos", n, &args),
+        // Translators: the Photos page subtitle, such as "12 raw photos".
+        Some(PhotoKind::Raw) => ngettext_f("{count} raw photo", "{count} raw photos", n, &args),
+        // Translators: the Photos page subtitle, such as "1,204 photos".
+        _ => ngettext_f("{count} photo", "{count} photos", n, &args),
     });
 }
 
@@ -2229,13 +2241,9 @@ pub(crate) fn empty_timeline_text(
     favorites: bool,
     month: Option<&str>,
 ) -> (String, String) {
-    let what = match kind {
-        None => "photos",
-        Some(PhotoKind::Photo) => "photos",
-        Some(PhotoKind::Video) => "videos",
-        Some(PhotoKind::Raw) => "raw files",
-    };
-    let when = month.map(|m| format!(" in {m}")).unwrap_or_default();
+    let args = [("month", month.unwrap_or_default())];
+    let video = kind == Some(PhotoKind::Video);
+    let raw = kind == Some(PhotoKind::Raw);
     match (favorites, kind, month) {
         (false, None, None) => (
             gettext("No photos yet"),
@@ -2246,11 +2254,31 @@ pub(crate) fn empty_timeline_text(
             gettext("Star a photo in the viewer or from its menu to find it here."),
         ),
         (true, _, _) => (
-            format!("No favorite {what}{when}"),
+            match (video, raw, month.is_some()) {
+                // Translators: {month} is a month and year, such as "June 2024".
+                (true, _, true) => gettext_f("No favorite videos in {month}", &args),
+                (true, _, false) => gettext("No favorite videos"),
+                // Translators: {month} is a month and year, such as "June 2024".
+                (_, true, true) => gettext_f("No favorite raw files in {month}", &args),
+                (_, true, false) => gettext("No favorite raw files"),
+                // Translators: {month} is a month and year, such as "June 2024".
+                (_, _, true) => gettext_f("No favorite photos in {month}", &args),
+                (_, _, false) => gettext("No favorite photos"),
+            },
             gettext("Turn off the favorites filter to see everything."),
         ),
         (false, _, _) => (
-            format!("No {what}{when}"),
+            match (video, raw, month.is_some()) {
+                // Translators: {month} is a month and year, such as "June 2024".
+                (true, _, true) => gettext_f("No videos in {month}", &args),
+                (true, _, false) => gettext("No videos"),
+                // Translators: {month} is a month and year, such as "June 2024".
+                (_, true, true) => gettext_f("No raw files in {month}", &args),
+                (_, true, false) => gettext("No raw files"),
+                // Translators: {month} is a month and year, such as "June 2024".
+                (_, _, true) => gettext_f("No photos in {month}", &args),
+                (_, _, false) => gettext("No photos"),
+            },
             gettext("Try another filter or month."),
         ),
     }
