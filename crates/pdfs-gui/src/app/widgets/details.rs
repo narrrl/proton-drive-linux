@@ -9,10 +9,9 @@ pub(crate) struct DetailsState {
     /// Set while the details pane is being populated, so setting the offline
     /// switch programmatically doesn't fire a pin/unpin round-trip.
     pub(crate) details_suppress: Cell<bool>,
-    /// The grid's and list's selection models. Both wrap the one browser model, so
-    /// a selection in either drives the details pane.
-    pub(crate) grid_selection: gtk4::MultiSelection,
-    pub(crate) list_selection: gtk4::MultiSelection,
+    /// The one selection model behind both the grid and the list, so switching
+    /// views keeps what is selected; it drives the details pane.
+    pub(crate) selection: gtk4::MultiSelection,
 }
 
 /// The widgets in the browser's details pane that a selection repaints.
@@ -152,23 +151,21 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
 /// Connect the details pane: mirror the grid's and list's selection into it, and
 /// wire its buttons back onto the entry it's showing.
 pub(crate) fn wire_details(ui: &Rc<Ui>) {
-    // Both views share one model but have their own selection, so watch both.
-    for selection in [
-        ui.details.grid_selection.clone(),
-        ui.details.list_selection.clone(),
-    ] {
+    {
         let ui_sel = ui.clone();
-        selection.connect_selection_changed(move |_, _, _| {
-            // The details pane describes *one* entry. A batch is the bulk bar's
-            // business, so the pane steps aside rather than picking a member of
-            // the selection to speak for the rest.
-            let entries = selected_entries(&ui_sel);
-            match entries.as_slice() {
-                [entry] => show_details(&ui_sel, entry),
-                _ => hide_details(&ui_sel),
-            }
-            sync_bulk_bar(&ui_sel);
-        });
+        ui.details
+            .selection
+            .connect_selection_changed(move |_, _, _| {
+                // The details pane describes *one* entry. A batch is the bulk bar's
+                // business, so the pane steps aside rather than picking a member of
+                // the selection to speak for the rest.
+                let entries = selected_entries(&ui_sel);
+                match entries.as_slice() {
+                    [entry] => show_details(&ui_sel, entry),
+                    _ => hide_details(&ui_sel),
+                }
+                sync_bulk_bar(&ui_sel);
+            });
     }
 
     let ui_close = ui.clone();

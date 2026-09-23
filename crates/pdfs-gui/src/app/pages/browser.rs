@@ -53,8 +53,7 @@ pub(crate) struct BrowserState {
     /// requested repeatedly, so comparing their text alone cannot reject an
     /// older response that finishes after a manual refresh.
     pub(crate) load_generation: Cell<u64>,
-    /// The grid/list view stack, read to find out which of the two selections is
-    /// the one the user is actually working in.
+    /// The grid/list view stack, read to find out which view is on screen.
     pub(crate) views: gtk4::Stack,
     /// The bulk-action bar, revealed once more than one entry is selected.
     pub(crate) bulk: gtk4::Revealer,
@@ -138,11 +137,10 @@ pub(crate) struct BrowserWidgets {
     /// Wraps the views + the details pane; the pane slides in on selection.
     pub(crate) split: adw::OverlaySplitView,
     pub(crate) details: DetailsWidgets,
-    /// The two selection models, so a selection change can drive the details pane
-    /// and so an action can re-read the entries the user has highlighted.
-    pub(crate) grid_selection: gtk4::MultiSelection,
-    pub(crate) list_selection: gtk4::MultiSelection,
-    /// The grid/list stack, so the page can tell which selection is live.
+    /// The selection shared by both views, so a selection change can drive the
+    /// details pane and an action can re-read the entries the user highlighted.
+    pub(crate) selection: gtk4::MultiSelection,
+    /// The grid/list stack, so the page can tell which view is on screen.
     pub(crate) views: gtk4::Stack,
     pub(crate) bulk: gtk4::Revealer,
     pub(crate) bulk_label: gtk4::Label,
@@ -310,11 +308,14 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // Icon grid. Multi-select: acting on a batch is the common case for trashing
     // and for taking a folder's worth of files offline, and doing it one
     // confirmation dialog at a time is not a workflow.
-    let grid_selection = gtk4::MultiSelection::new(Some(model.clone()));
+    // One selection for both views: switching layout keeps what is selected.
+    // Rubberband drags a selection box from empty space, as a file manager does.
+    let selection = gtk4::MultiSelection::new(Some(model.clone()));
     let grid = gtk4::GridView::builder()
-        .model(&grid_selection)
+        .model(&selection)
         .min_columns(2)
         .max_columns(10)
+        .enable_rubberband(true)
         .build();
     grid.add_css_class("file-grid");
     let grid_scroll = gtk4::ScrolledWindow::builder()
@@ -322,9 +323,11 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .child(&grid)
         .build();
 
-    // Column list, with its own selection over the same model.
-    let list_selection = gtk4::MultiSelection::new(Some(model.clone()));
-    let column_view = gtk4::ColumnView::builder().model(&list_selection).build();
+    // Column list, over the same selection.
+    let column_view = gtk4::ColumnView::builder()
+        .model(&selection)
+        .enable_rubberband(true)
+        .build();
     column_view.add_css_class("data-table");
     let column_scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
@@ -519,8 +522,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             refresh,
             split,
             details,
-            grid_selection,
-            list_selection,
+            selection,
             views: view_stack,
             bulk,
             bulk_label,
@@ -550,15 +552,9 @@ pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     hide_details(ui);
 }
 
-/// The selection model of whichever view is on screen. The grid and the list
-/// each own one over the same model, so "what is selected" depends on which the
-/// user is looking at.
+/// The selection model shared by the grid and the list.
 pub(crate) fn active_selection(ui: &Rc<Ui>) -> gtk4::MultiSelection {
-    if ui.browser.views.visible_child_name().as_deref() == Some("list") {
-        ui.details.list_selection.clone()
-    } else {
-        ui.details.grid_selection.clone()
-    }
+    ui.details.selection.clone()
 }
 
 /// Every entry highlighted in the view on screen, in model order.
@@ -575,10 +571,9 @@ pub(crate) fn selected_entries(ui: &Rc<Ui>) -> Vec<DirEntry> {
         .collect()
 }
 
-/// Drop the selection in both views, which also retracts the bulk bar.
+/// Drop the selection, which also retracts the bulk bar.
 pub(crate) fn clear_selection(ui: &Rc<Ui>) {
-    ui.details.grid_selection.unselect_all();
-    ui.details.list_selection.unselect_all();
+    ui.details.selection.unselect_all();
 }
 
 /// Reflect the current selection in the bulk bar: how many are selected, and

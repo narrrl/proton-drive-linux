@@ -72,6 +72,8 @@ Schema: **31** (unchanged).
   Copy Link · Rename…, Move To…, Versions… · Move to Trash. Right-clicking empty space offers New
   Folder, the uploads, Select All, Refresh and Open in File Manager. Open With… asks which
   application to use.
+- **One selection in My Files.** The grid and the list share their selection, so switching views
+  keeps what is selected, and dragging across empty space draws a selection box in both.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

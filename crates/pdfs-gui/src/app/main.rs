@@ -435,8 +435,7 @@ fn build_window(app: &adw::Application) {
             details: browser_widgets.details,
             details_entry: RefCell::new(None),
             details_suppress: Cell::new(false),
-            grid_selection: browser_widgets.grid_selection.clone(),
-            list_selection: browser_widgets.list_selection.clone(),
+            selection: browser_widgets.selection.clone(),
         },
         trash: TrashState {
             model: trash_widgets.model.clone(),
