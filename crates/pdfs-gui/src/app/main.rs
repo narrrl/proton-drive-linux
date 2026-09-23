@@ -591,8 +591,6 @@ fn build_window(app: &adw::Application) {
             title: shared_widgets.title.clone(),
             back: shared_widgets.back.clone(),
             add_bookmark: shared_widgets.add_bookmark.clone(),
-            banner: shared_widgets.banner.clone(),
-            scroll: shared_widgets.scroll.clone(),
             nav: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
             inflight: Cell::new(false),

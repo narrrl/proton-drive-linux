@@ -304,7 +304,7 @@ fn open_shared_by_me(ui: &Rc<Ui>, entry: &DirEntry) {
 }
 
 /// Go to the folder holding a shared item in My Files.
-fn show_in_my_files(ui: &Rc<Ui>, entry: &DirEntry) {
+pub(crate) fn show_in_my_files(ui: &Rc<Ui>, entry: &DirEntry) {
     let parent = entry
         .path
         .rsplit_once('/')

@@ -132,9 +132,13 @@ Schema: **31** (unchanged).
 - **New app icon.** A white cloud with the download arrow cut out of it, on a rounded Proton
   purple tile with a darker lower edge, drawn to the GNOME app-icon grid. It stays legible down to
   16 px on light and dark panels.
-- **Shared with Me.** Inside a shared folder the header shows the path from the share down, and a
-  back button in the header replaces the Back row. Pending invitations are announced in a banner
-  at the top of the page; Review scrolls to them.
+- **Shared with Me redesign.** Only sections with something in them are shown, and a page
+  with nothing shared says so in one place. Pending invitations sit at the top, with an Accept
+  button beside each. A row reads as the name over who shared it, when, and its size; what the
+  share allows is a tinted pill ("Can view", "Can edit", "Can manage") rather than a bare
+  role word that looked like a button. Open, Show in My Files and Leave… are in the row's ⋮
+  menu, and folders show a chevron. Inside a shared folder the header shows the path from the
+  share down, with a back button. Add Bookmark is an icon in the header.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

@@ -15,9 +15,6 @@ pub(crate) struct SharedState {
     /// Header button that leaves the current shared folder.
     pub(crate) back: gtk4::Button,
     pub(crate) add_bookmark: gtk4::Button,
-    /// "N pending invitations" above the sections at the top level.
-    pub(crate) banner: adw::Banner,
-    pub(crate) scroll: gtk4::ScrolledWindow,
     /// Where in a shared folder the page currently is, as `(uid, name)` from the
     /// top level down. Empty = the top level. Shared subtrees have no path in the
     /// mount, so descending is uid-addressed and the stack *is* the breadcrumb.
@@ -42,8 +39,6 @@ pub(crate) struct SharedWidgets {
     pub(crate) refresh: gtk4::Button,
     pub(crate) title: adw::WindowTitle,
     pub(crate) back: gtk4::Button,
-    pub(crate) banner: adw::Banner,
-    pub(crate) scroll: gtk4::ScrolledWindow,
 }
 
 /// The Shared page: three stacked sections — items shared *with* me (each with a
@@ -52,27 +47,29 @@ pub(crate) struct SharedWidgets {
 /// so the page addresses them by uid/id/token and always re-lists from the daemon.
 pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     let add_bookmark = gtk4::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .label("Add Bookmark")
-                .icon_name("list-add-symbolic")
-                .build(),
-        )
-        .tooltip_text("Save a shared link to open it from here")
+        .icon_name("bookmark-new-symbolic")
+        .tooltip_text("Add Bookmark — save a public link to open it from here")
         .build();
     let refresh = refresh_button();
 
-    let shared_with_me = adw::PreferencesGroup::builder()
-        .title("Shared with me")
-        .build();
+    // Only sections with something in them are shown, so an account with one
+    // share reads as one list rather than three boxes, two of them saying
+    // "nothing here". Invitations come first: they are the one thing on the
+    // page waiting for a decision.
     let invitations = adw::PreferencesGroup::builder()
         .title("Invitations")
+        .description("Accept to add the item to your shared files.")
+        .visible(false)
         .build();
-    let bookmarks = adw::PreferencesGroup::builder().title("Bookmarks").build();
+    let shared_with_me = adw::PreferencesGroup::new();
+    let bookmarks = adw::PreferencesGroup::builder()
+        .title("Bookmarks")
+        .visible(false)
+        .build();
 
-    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
-    groups.append(&shared_with_me);
+    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
     groups.append(&invitations);
+    groups.append(&shared_with_me);
     groups.append(&bookmarks);
     let clamp = adw::Clamp::builder().child(&groups).build();
     let scroll = gtk4::ScrolledWindow::builder()
@@ -107,20 +104,15 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     inner.set_margin_end(18);
     inner.append(&content);
 
-    let banner = adw::Banner::builder().button_label("Review").build();
-    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    body.append(&banner);
-    body.append(&inner);
-
     let back = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
         .tooltip_text("Back")
         .visible(false)
         .build();
-    let (frame, header, title) = page_frame("Shared with Me", &body);
+    let (frame, header, title) = page_frame("Shared with Me", &inner);
     header.pack_start(&back);
-    header.pack_start(&add_bookmark);
     header.pack_end(&refresh);
+    header.pack_end(&add_bookmark);
 
     (
         frame.upcast(),
@@ -135,34 +127,16 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
             refresh,
             title,
             back,
-            banner,
-            scroll,
         },
     )
 }
 
-/// Install the Shared page's retry, back and Add-Bookmark buttons and the
-/// invitations banner.
+/// Install the Shared page's retry, back and Add-Bookmark buttons.
 pub(crate) fn wire_shared(ui: &Rc<Ui>, retry: &gtk4::Button, add_bookmark: &gtk4::Button) {
     let ui_back = ui.clone();
     ui.shared.back.connect_clicked(move |_| {
         ui_back.shared.nav.borrow_mut().pop();
         load_shared(&ui_back);
-    });
-    // Review scrolls the Invitations section into view; the page keeps it
-    // below the shares, where it is easy to miss on a long list.
-    let ui_review = ui.clone();
-    ui.shared.banner.connect_button_clicked(move |_| {
-        let shared = &ui_review.shared;
-        let Some(child) = shared.scroll.child() else {
-            return;
-        };
-        if let Some(bounds) = shared.invitations_group.compute_bounds(&child) {
-            shared.scroll.vadjustment().set_value(f64::from(bounds.y()));
-        }
-        shared
-            .invitations_group
-            .child_focus(gtk4::DirectionType::TabForward);
     });
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
@@ -295,12 +269,12 @@ pub(crate) fn shared_path(nav: &[(String, String)]) -> String {
         .join(" / ")
 }
 
-/// The invitations banner's text, or `None` when there are none to review.
-pub(crate) fn invitations_banner_title(count: usize) -> Option<String> {
-    match count {
-        0 => None,
-        1 => Some("1 pending invitation".to_string()),
-        n => Some(format!("{n} pending invitations")),
+/// The Invitations heading, with the count once there is more than one.
+pub(crate) fn invitations_title(count: usize) -> String {
+    if count > 1 {
+        format!("Invitations ({count})")
+    } else {
+        "Invitations".to_string()
     }
 }
 
@@ -314,15 +288,13 @@ fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ui.shared.content.set_visible_child_name("list");
     ui.shared.invitations_group.set_visible(false);
     ui.shared.bookmarks_group.set_visible(false);
-    ui.shared.banner.set_revealed(false);
     ui.shared.back.set_visible(true);
+    ui.shared.with_me_group.set_visible(true);
     ui.shared.add_bookmark.set_visible(false);
 
     let nav = ui.shared.nav.borrow().clone();
     ui.shared.title.set_subtitle(&shared_path(&nav));
-    ui.shared
-        .with_me_group
-        .set_title(nav.last().map_or("", |(_, name)| name.as_str()));
+    ui.shared.with_me_group.set_title("");
 
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
 
@@ -332,7 +304,7 @@ fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
         rows.push((ui.shared.with_me_group.clone(), row.upcast()));
     } else {
         for entry in entries {
-            let row = shared_entry_row(ui, entry);
+            let row = shared_entry_row(ui, entry, false);
             ui.shared.with_me_group.add(&row);
             rows.push((ui.shared.with_me_group.clone(), row.upcast()));
         }
@@ -342,7 +314,10 @@ fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
 
 /// A row for one node shared with me: folders descend into, files download and
 /// open with the user's default application.
-fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
+///
+/// `leavable` rows are share roots: only those carry a Leave action, since
+/// leaving a folder's child on its own is not a thing the API offers.
+fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(&entry.name)
         .activatable(true)
@@ -354,8 +329,8 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
     // What I am allowed to do with someone else's file is the thing this page
     // cannot leave implicit: a viewer share is browsable and unwritable, and
     // that is only visible if it is said.
-    if let Some(badge) = role_badge(&entry.role) {
-        row.add_suffix(&badge);
+    if let Some(pill) = role_pill(&entry.role) {
+        row.add_suffix(&pill);
     }
     // The "shared by" in the subtitle is what the invitation claims. When its
     // signature does not check out against that person's keys, the claim must
@@ -369,6 +344,10 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
         row.add_suffix(&warning);
     }
     row.add_prefix(&file_thumbnail(ui, entry, 40, 24, true));
+    row.add_suffix(&shared_entry_menu(ui, entry, leavable));
+    if entry.is_dir {
+        row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    }
     let ui_act = ui.clone();
     let uid = entry.uid.clone();
     let name = entry.name.clone();
@@ -388,34 +367,68 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
     row
 }
 
+/// A shared row's ⋮ menu: open it, find it in My Files when the mount has
+/// interned it, and leave it (share roots only).
+fn shared_entry_menu(ui: &Rc<Ui>, entry: &DirEntry, leavable: bool) -> gtk4::MenuButton {
+    let mut items: Vec<(&str, MenuAction)> = Vec::new();
+    let (ui_open, uid, name, is_dir) = (
+        ui.clone(),
+        entry.uid.clone(),
+        entry.name.clone(),
+        entry.is_dir,
+    );
+    items.push((
+        "Open",
+        Box::new(move || {
+            if is_dir {
+                ui_open
+                    .shared
+                    .nav
+                    .borrow_mut()
+                    .push((uid.clone(), name.clone()));
+                load_shared(&ui_open);
+            } else {
+                open_shared_file(&ui_open, &uid, &name);
+            }
+        }),
+    ));
+    if !entry.path.is_empty() {
+        let (ui_show, entry_show) = (ui.clone(), entry.clone());
+        items.push((
+            "Show in My Files",
+            Box::new(move || show_in_my_files(&ui_show, &entry_show)),
+        ));
+    }
+    if leavable {
+        let (ui_leave, uid, name) = (ui.clone(), entry.uid.clone(), entry.name.clone());
+        items.push((
+            "Leave…",
+            Box::new(move || prompt_leave_shared(&ui_leave, &uid, &name)),
+        ));
+    }
+    let button = more_menu_button(items);
+    button.set_valign(gtk4::Align::Center);
+    button
+}
+
 /// Tooltip on the warning shown next to a share whose invitation did not verify.
 const UNVERIFIED_INVITER_TOOLTIP: &str = "The invitation's signature doesn't match the sender's keys. \
      It may not really be from them.";
 
 /// A shared row's subtitle: who shared it and when (share roots only — that is
-/// where the invitation lives), its size (files only), and where it can be
-/// reached in the local mount once the synthetic `Shared with me/` directory has
-/// interned it. An unlisted share has no local path yet, and says nothing rather
-/// than pointing at a directory that is not there.
+/// where the invitation lives) and its size (files only). Where the share sits
+/// in the mount is one menu item away ("Show in My Files"), not spelled out on
+/// every row, where the long path wrapped the subtitle onto a second line.
 pub(crate) fn shared_row_subtitle(entry: &DirEntry) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !entry.shared_by.is_empty() {
-        let date = if entry.shared_at > 0 {
-            format_modified(entry.shared_at)
-        } else {
-            String::new()
-        };
-        parts.push(if date.is_empty() {
-            format!("Shared by {}", entry.shared_by)
-        } else {
-            format!("Shared by {} on {date}", entry.shared_by)
-        });
+        parts.push(entry.shared_by.clone());
+        if entry.shared_at > 0 {
+            parts.push(format_modified(entry.shared_at));
+        }
     }
     if !entry.is_dir {
         parts.push(human_bytes(entry.size));
-    }
-    if !entry.path.is_empty() {
-        parts.push(format!("in {}", entry.path));
     }
     parts.join(" · ")
 }
@@ -433,13 +446,25 @@ pub(crate) fn role_label(role: &str) -> Option<&'static str> {
     }
 }
 
-/// A dim role pill for a share I did not create.
-pub(crate) fn role_badge(role: &str) -> Option<gtk4::Label> {
-    let badge = gtk4::Label::new(Some(role_label(role)?));
-    badge.add_css_class("dim-label");
-    badge.add_css_class("caption");
-    badge.set_valign(gtk4::Align::Center);
-    Some(badge)
+/// What a role lets me do, as a short phrase for the row's pill. A bare
+/// "Editor" beside a Leave button read like one more button.
+pub(crate) fn role_access(role: &str) -> Option<&'static str> {
+    match role {
+        "viewer" => Some("Can view"),
+        "editor" => Some("Can edit"),
+        "admin" => Some("Can manage"),
+        _ => None,
+    }
+}
+
+/// A tinted, rounded pill saying what I may do with a share I did not create.
+pub(crate) fn role_pill(role: &str) -> Option<gtk4::Label> {
+    let pill = gtk4::Label::new(Some(role_access(role)?));
+    pill.add_css_class("role-pill");
+    pill.add_css_class("caption");
+    pill.set_valign(gtk4::Align::Center);
+    pill.set_tooltip_text(role_label(role));
+    Some(pill)
 }
 
 /// Download a file shared with me into the daemon's cache and hand it to the
@@ -522,138 +547,127 @@ pub(crate) fn repaint_shared(
     for (group, row) in ui.shared.rows.borrow_mut().drain(..) {
         group.remove(&row);
     }
-    ui.shared.content.set_visible_child_name("list");
-    ui.shared.invitations_group.set_visible(true);
-    ui.shared.bookmarks_group.set_visible(true);
-    ui.shared.with_me_group.set_title("Shared with me");
     ui.shared.title.set_subtitle("");
     ui.shared.back.set_visible(false);
     ui.shared.add_bookmark.set_visible(true);
-    match invitations_banner_title(invitations.len()) {
-        Some(text) => {
-            ui.shared.banner.set_title(&text);
-            ui.shared.banner.set_revealed(true);
-        }
-        None => ui.shared.banner.set_revealed(false),
+    if shared.is_empty() && invitations.is_empty() && bookmarks.is_empty() {
+        shared_status(
+            ui,
+            "emblem-shared-symbolic",
+            "Nothing Shared with You",
+            "Files and folders other people share with you appear here. Public links \
+             you bookmark are kept here too.",
+            false,
+        );
+        return;
     }
+    ui.shared.content.set_visible_child_name("list");
+    ui.shared
+        .invitations_group
+        .set_visible(!invitations.is_empty());
+    ui.shared.bookmarks_group.set_visible(!bookmarks.is_empty());
+    ui.shared.with_me_group.set_visible(!shared.is_empty());
+    // The list only needs a heading when another section sits beside it.
+    ui.shared
+        .with_me_group
+        .set_title(if invitations.is_empty() && bookmarks.is_empty() {
+            ""
+        } else {
+            "Shared with you"
+        });
+    ui.shared
+        .invitations_group
+        .set_title(&invitations_title(invitations.len()));
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
 
-    // Shared with me: name + Leave.
-    if shared.is_empty() {
-        let row = dim_row("Nothing is shared with you.");
+    for entry in shared {
+        let row = shared_entry_row(ui, entry, true);
         ui.shared.with_me_group.add(&row);
         rows.push((ui.shared.with_me_group.clone(), row.upcast()));
-    } else {
-        for entry in shared {
-            let row = shared_entry_row(ui, entry);
-            let leave = gtk4::Button::builder()
-                .label("Leave")
-                .valign(gtk4::Align::Center)
-                .build();
-            leave.add_css_class("flat");
-            let ui_leave = ui.clone();
-            let uid = entry.uid.clone();
-            let name = entry.name.clone();
-            leave.connect_clicked(move |_| prompt_leave_shared(&ui_leave, &uid, &name));
-            row.add_suffix(&leave);
-            ui.shared.with_me_group.add(&row);
-            rows.push((ui.shared.with_me_group.clone(), row.upcast()));
-        }
     }
 
     // Invitations: inviter + item, Accept / Reject.
-    if invitations.is_empty() {
-        let row = dim_row("No pending invitations.");
+    for inv in invitations {
+        let item = inv
+            .name
+            .clone()
+            .unwrap_or_else(|| "a shared item".to_string());
+        let row = adw::ActionRow::builder()
+            .title(&item)
+            .subtitle(format!("From {}", inv.inviter_email))
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name(if inv.is_dir {
+            "folder-symbolic"
+        } else {
+            "text-x-generic-symbolic"
+        }));
+        let reject = gtk4::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Reject")
+            .valign(gtk4::Align::Center)
+            .build();
+        reject.add_css_class("flat");
+        let accept = gtk4::Button::builder()
+            .label("Accept")
+            .valign(gtk4::Align::Center)
+            .build();
+        accept.add_css_class("suggested-action");
+        accept.add_css_class("pill");
+        let ui_acc = ui.clone();
+        let id_acc = inv.id.clone();
+        accept.connect_clicked(move |_| {
+            respond_invitation(&ui_acc, &id_acc, true);
+        });
+        let ui_rej = ui.clone();
+        let id_rej = inv.id.clone();
+        let name_rej = inv.name.clone().unwrap_or_else(|| "this item".into());
+        reject.connect_clicked(move |btn| {
+            let ui = ui_rej.clone();
+            let id = id_rej.clone();
+            confirm_destructive(
+                btn,
+                "Reject Invitation?",
+                &format!("You won't have access to {name_rej} unless it is shared again."),
+                "Reject",
+                move || respond_invitation(&ui, &id, false),
+            );
+        });
+        row.add_suffix(&accept);
+        row.add_suffix(&reject);
         ui.shared.invitations_group.add(&row);
         rows.push((ui.shared.invitations_group.clone(), row.upcast()));
-    } else {
-        for inv in invitations {
-            let item = inv
-                .name
-                .clone()
-                .unwrap_or_else(|| "a shared item".to_string());
-            let row = adw::ActionRow::builder()
-                .title(&item)
-                .subtitle(format!("from {}", inv.inviter_email))
-                .build();
-            row.add_prefix(&gtk4::Image::from_icon_name(if inv.is_dir {
-                "folder-symbolic"
-            } else {
-                "text-x-generic-symbolic"
-            }));
-            let reject = gtk4::Button::builder()
-                .icon_name("window-close-symbolic")
-                .tooltip_text("Reject")
-                .valign(gtk4::Align::Center)
-                .build();
-            reject.add_css_class("flat");
-            let accept = gtk4::Button::builder()
-                .label("Accept")
-                .valign(gtk4::Align::Center)
-                .build();
-            accept.add_css_class("suggested-action");
-            let ui_acc = ui.clone();
-            let id_acc = inv.id.clone();
-            accept.connect_clicked(move |_| {
-                respond_invitation(&ui_acc, &id_acc, true);
-            });
-            let ui_rej = ui.clone();
-            let id_rej = inv.id.clone();
-            let name_rej = inv.name.clone().unwrap_or_else(|| "this item".into());
-            reject.connect_clicked(move |btn| {
-                let ui = ui_rej.clone();
-                let id = id_rej.clone();
-                confirm_destructive(
-                    btn,
-                    "Reject Invitation?",
-                    &format!("You won't have access to {name_rej} unless it is shared again."),
-                    "Reject",
-                    move || respond_invitation(&ui, &id, false),
-                );
-            });
-            row.add_suffix(&accept);
-            row.add_suffix(&reject);
-            ui.shared.invitations_group.add(&row);
-            rows.push((ui.shared.invitations_group.clone(), row.upcast()));
-        }
     }
 
     // Bookmarks: name/URL, Open / Remove.
-    if bookmarks.is_empty() {
-        let row = dim_row("No saved bookmarks.");
+    for bm in bookmarks {
+        let title = bm.name.clone().unwrap_or_else(|| "Shared link".to_string());
+        let row = adw::ActionRow::builder()
+            .title(&title)
+            .subtitle(&bm.url)
+            .build();
+        row.add_prefix(&gtk4::Image::from_icon_name("emblem-symbolic-link"));
+        let remove = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove bookmark")
+            .valign(gtk4::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        let open = gtk4::Button::builder()
+            .icon_name("external-link-symbolic")
+            .tooltip_text("Open in browser")
+            .valign(gtk4::Align::Center)
+            .build();
+        open.add_css_class("flat");
+        let url_open = bm.url.clone();
+        open.connect_clicked(move |_| open_uri(&url_open));
+        let ui_rm = ui.clone();
+        let token = bm.token.clone();
+        let name_rm = title.clone();
+        remove.connect_clicked(move |_| prompt_remove_bookmark(&ui_rm, &token, &name_rm));
+        row.add_suffix(&open);
+        row.add_suffix(&remove);
         ui.shared.bookmarks_group.add(&row);
         rows.push((ui.shared.bookmarks_group.clone(), row.upcast()));
-    } else {
-        for bm in bookmarks {
-            let title = bm.name.clone().unwrap_or_else(|| "Shared link".to_string());
-            let row = adw::ActionRow::builder()
-                .title(&title)
-                .subtitle(&bm.url)
-                .build();
-            row.add_prefix(&gtk4::Image::from_icon_name("emblem-symbolic-link"));
-            let remove = gtk4::Button::builder()
-                .icon_name("user-trash-symbolic")
-                .tooltip_text("Remove bookmark")
-                .valign(gtk4::Align::Center)
-                .build();
-            remove.add_css_class("flat");
-            let open = gtk4::Button::builder()
-                .icon_name("external-link-symbolic")
-                .tooltip_text("Open in browser")
-                .valign(gtk4::Align::Center)
-                .build();
-            open.add_css_class("flat");
-            let url_open = bm.url.clone();
-            open.connect_clicked(move |_| open_uri(&url_open));
-            let ui_rm = ui.clone();
-            let token = bm.token.clone();
-            let name_rm = title.clone();
-            remove.connect_clicked(move |_| prompt_remove_bookmark(&ui_rm, &token, &name_rm));
-            row.add_suffix(&open);
-            row.add_suffix(&remove);
-            ui.shared.bookmarks_group.add(&row);
-            rows.push((ui.shared.bookmarks_group.clone(), row.upcast()));
-        }
     }
 
     *ui.shared.rows.borrow_mut() = rows;
@@ -828,13 +842,10 @@ mod tests {
     fn a_share_root_says_who_shared_it() {
         let mut root = entry(true, "", "viewer");
         root.shared_by = "alice@proton.me".into();
-        assert_eq!(shared_row_subtitle(&root), "Shared by alice@proton.me");
+        assert_eq!(shared_row_subtitle(&root), "alice@proton.me");
         root.shared_at = 1_700_000_000;
         let subtitle = shared_row_subtitle(&root);
-        assert!(
-            subtitle.starts_with("Shared by alice@proton.me on "),
-            "{subtitle}"
-        );
+        assert!(subtitle.starts_with("alice@proton.me · "), "{subtitle}");
     }
 
     #[test]
@@ -850,9 +861,23 @@ mod tests {
     }
 
     #[test]
-    fn a_resident_share_reports_where_it_can_be_reached() {
+    fn a_resident_share_keeps_its_path_out_of_the_subtitle() {
         let subtitle = shared_row_subtitle(&entry(true, "Shared with me/Team Budget", "editor"));
-        assert_eq!(subtitle, "in Shared with me/Team Budget");
+        assert_eq!(subtitle, "");
+    }
+
+    #[test]
+    fn a_role_pill_says_what_it_allows() {
+        assert_eq!(role_access("viewer"), Some("Can view"));
+        assert_eq!(role_access("editor"), Some("Can edit"));
+        assert_eq!(role_access("admin"), Some("Can manage"));
+        assert_eq!(role_access(""), None);
+    }
+
+    #[test]
+    fn the_invitations_heading_counts_only_several() {
+        assert_eq!(invitations_title(1), "Invitations");
+        assert_eq!(invitations_title(4), "Invitations (4)");
     }
 
     #[test]
@@ -875,18 +900,5 @@ mod tests {
             ("u2".to_string(), "Reports".to_string()),
         ];
         assert_eq!(shared_path(&nav), "Team / Reports");
-    }
-
-    #[test]
-    fn the_invitations_banner_counts_and_hides_at_zero() {
-        assert_eq!(invitations_banner_title(0), None);
-        assert_eq!(
-            invitations_banner_title(1).as_deref(),
-            Some("1 pending invitation")
-        );
-        assert_eq!(
-            invitations_banner_title(3).as_deref(),
-            Some("3 pending invitations")
-        );
     }
 }

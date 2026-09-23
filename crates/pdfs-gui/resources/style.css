@@ -80,3 +80,6 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 .album-card:hover .album-cover { box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5); }
 .album-card:hover .photo-thumb { transform: scale(1.05); }
 .view-switch button { padding-left: 18px; padding-right: 18px; }
+
+/* Shared with Me: what a share lets me do, as a tinted pill beside the name. */
+.role-pill { padding: 2px 10px; border-radius: 999px; font-weight: 600; color: var(--accent-color); background-color: color-mix(in srgb, var(--accent-bg-color) 16%, transparent); }
