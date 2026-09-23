@@ -1,26 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Proton Drive for Linux">
   <defs>
-    <linearGradient id="pdl-bg" x1="0" y1="0" x2="0" y2="128" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#8B72FF"/>
-      <stop offset="1" stop-color="#5A38E8"/>
+    <linearGradient id="pdl-face" x1="12" y1="12" x2="116" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A48BFF"/>
+      <stop offset="0.55" stop-color="#7552FF"/>
+      <stop offset="1" stop-color="#5B36F2"/>
     </linearGradient>
+    <linearGradient id="pdl-cloud" x1="0" y1="34" x2="0" y2="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#ECE6FF"/>
+    </linearGradient>
+    <!-- the cloud, with the arrow cut out of it as negative space -->
+    <mask id="pdl-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128">
+      <g fill="#FFFFFF">
+        <circle cx="66" cy="57" r="23"/>
+        <circle cx="42" cy="68" r="16"/>
+        <circle cx="88" cy="69" r="15"/>
+        <rect x="26" y="68" width="77" height="20" rx="10"/>
+      </g>
+      <g stroke="#000000" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M64 49v26"/>
+        <path d="M54.5 65.5l9.5 9.5 9.5-9.5"/>
+      </g>
+    </mask>
   </defs>
 
-  <rect width="128" height="128" rx="29" fill="url(#pdl-bg)"/>
+  <!-- base: a rounded tile with a darker lower edge for depth -->
+  <rect x="12" y="16" width="104" height="100" rx="26" fill="#4424C0"/>
+  <rect x="12" y="12" width="104" height="100" rx="26" fill="url(#pdl-face)"/>
+  <rect x="12.5" y="12.5" width="103" height="99" rx="25.5" stroke="#FFFFFF" stroke-opacity="0.2"/>
 
-  <!-- cloud: the remote drive (symmetric about x=64) -->
-  <g fill="#FFFFFF">
-    <circle cx="64" cy="42" r="20"/>
-    <circle cx="44" cy="52" r="14"/>
-    <circle cx="84" cy="52" r="14"/>
-    <rect x="32" y="50" width="64" height="16" rx="8"/>
-  </g>
-
-  <!-- pull: files arrive only when opened -->
-  <g stroke="#FFFFFF" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M64 75v17"/>
-    <path d="M53 84l11 11 11-11"/>
-    <path d="M45 108h38" stroke-opacity="0.55"/>
-  </g>
+  <!-- cloud shadow, then the cloud itself -->
+  <rect y="3" width="128" height="128" fill="#2E1596" fill-opacity="0.3" mask="url(#pdl-cut)"/>
+  <rect width="128" height="128" fill="url(#pdl-cloud)" mask="url(#pdl-cut)"/>
 </svg>

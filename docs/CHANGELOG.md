@@ -124,6 +124,9 @@ Schema: **31** (unchanged).
 - **Share dialog.** The Invite button stays off until every address looks like an email; a
   malformed one marks the field red and names the entry in a tooltip. Buttons show a spinner
   while their request runs, so a slow invite or link removal can't be sent twice.
+- **New app icon.** A white cloud with the download arrow cut out of it, on a rounded Proton
+  purple tile with a darker lower edge, drawn to the GNOME app-icon grid. It stays legible down to
+  16 px on light and dark panels.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 
