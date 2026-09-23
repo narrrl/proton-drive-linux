@@ -32,6 +32,15 @@ Schema: **30** (unchanged).
   state, storage and the account; the Settings page became a Preferences dialog (Ctrl+,), with
   transfers on the Sync page and developer details in About. The app follows the system accent
   colour; the Proton purple accent is a preference.
+- **My Files header.** New folder and both uploads sit in one **New** menu; the view button switches
+  grid and list, and its menu sorts by name, size or date, reversed or not, folders first or not.
+  The choice is remembered. Build Thumbnails and Open in File Manager moved to the folder menu.
+- **Browsing history.** Back and forward buttons (Alt+Left/Right, mouse back/forward) replace the
+  single Up button; Alt+Up goes to the parent folder. Back leaves a search first.
+- **Move to…** picks the destination from a folder browser instead of a typed path, and works on a
+  whole selection. Rename selects the name without its extension.
+- **Drop to upload.** Files and folders dropped on My Files upload into the folder on screen. The
+  upload toast links to the Sync page.
 
 ## [1.11.1] — 2026-09-19
 

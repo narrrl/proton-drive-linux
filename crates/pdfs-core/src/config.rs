@@ -124,6 +124,63 @@ pub struct AppConfig {
     /// predating the field.
     #[serde(default)]
     pub proton_accent: Option<bool>,
+    /// How the desktop app's My Files page lays out and orders a folder.
+    /// Defaulted for configs predating the field.
+    #[serde(default)]
+    pub files_view: FilesView,
+}
+
+/// The My Files page's view choices, remembered between runs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct FilesView {
+    /// Columns instead of the icon grid.
+    pub list: bool,
+    pub sort: FileSort,
+    pub descending: bool,
+    /// Folders ahead of files, whatever the sort.
+    pub folders_first: bool,
+}
+
+impl Default for FilesView {
+    fn default() -> Self {
+        Self {
+            list: false,
+            sort: FileSort::Name,
+            descending: false,
+            folders_first: true,
+        }
+    }
+}
+
+/// The key a My Files listing is ordered by.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FileSort {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+impl FileSort {
+    /// The name used in the desktop app's actions and the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileSort::Name => "name",
+            FileSort::Size => "size",
+            FileSort::Modified => "modified",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "name" => Some(FileSort::Name),
+            "size" => Some(FileSort::Size),
+            "modified" => Some(FileSort::Modified),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -139,6 +196,7 @@ impl Default for AppConfig {
             open_with: None,
             prompt: None,
             proton_accent: None,
+            files_view: FilesView::default(),
         }
     }
 }
@@ -484,12 +542,29 @@ mod tests {
             open_with: None,
             prompt: None,
             proton_accent: Some(true),
+            files_view: FilesView {
+                list: true,
+                sort: FileSort::Modified,
+                descending: true,
+                folders_first: false,
+            },
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
         assert_eq!(decoded.user_agent, "test-agent/1.0");
         assert_eq!(decoded.proton_accent, Some(true));
+        assert_eq!(decoded.files_view, config.files_view);
+    }
+
+    #[test]
+    fn a_config_without_a_files_view_gets_the_default() {
+        let decoded: AppConfig =
+            serde_json::from_str(r#"{"app_version":"a","user_agent":"b"}"#).unwrap();
+        assert_eq!(decoded.files_view, FilesView::default());
+        let partial: FilesView = serde_json::from_str(r#"{"sort":"size"}"#).unwrap();
+        assert_eq!(partial.sort, FileSort::Size);
+        assert!(partial.folders_first);
     }
 
     #[test]

@@ -5,7 +5,11 @@ pub(crate) struct BrowserState {
     // Files (browser) page.
     /// Shared model behind the grid and column views; repopulated per directory.
     pub(crate) model: gio::ListStore,
-    pub(crate) back: gtk4::Button,
+    /// Folders left by navigating, newest last, and folders left by going back:
+    /// the `files.back` and `files.forward` history. Up is Alt+Up or a
+    /// breadcrumb.
+    pub(crate) history: RefCell<Vec<String>>,
+    pub(crate) future: RefCell<Vec<String>>,
     /// Clickable breadcrumb trail (a button per path segment); rebuilt per load
     /// by [`repaint_crumb`] so each ancestor folder navigates on click.
     pub(crate) crumb: gtk4::Box,
@@ -23,12 +27,18 @@ pub(crate) struct BrowserState {
     pub(crate) path: RefCell<String>,
     /// Debounced full-text search box in the browser header.
     pub(crate) search: gtk4::SearchEntry,
-    /// The folder-level actions, insensitive while the mount is down: without a
-    /// daemon they can only fail, and a greyed button says so before the click.
-    pub(crate) new_folder: gtk4::Button,
-    pub(crate) upload: gtk4::Button,
-    pub(crate) upload_folder: gtk4::Button,
-    /// Starts a daemon-side recursive local-thumbnail build for [`Self::path`].
+    /// The page's `files.*` actions: New and View menus, navigation, and the
+    /// folder menu. The ones needing a daemon are disabled while the mount is
+    /// down: without one they can only fail.
+    pub(crate) actions: gio::SimpleActionGroup,
+    /// Toggles grid/list; its arrow holds the sort options.
+    pub(crate) view_button: adw::SplitButton,
+    /// Layout and order, as last chosen; saved to the config on change.
+    pub(crate) view: Cell<FilesView>,
+    /// The folder listing as the daemon sent it, so a new sort order repaints
+    /// without a round-trip.
+    pub(crate) listing: RefCell<Vec<DirEntry>>,
+    /// Cancels a running daemon-side thumbnail build; sits in the progress row.
     pub(crate) build_thumbnails: gtk4::Button,
     pub(crate) thumbnail_build_row: gtk4::Box,
     pub(crate) thumbnail_progress: gtk4::ProgressBar,
@@ -54,6 +64,7 @@ pub(crate) struct BrowserState {
     pub(crate) bulk_trash: gtk4::Button,
     pub(crate) bulk_pin: gtk4::Button,
     pub(crate) bulk_unpin: gtk4::Button,
+    pub(crate) bulk_move: gtk4::Button,
     /// Upload / New folder offered on the *empty folder* status page, so that
     /// state is a place to act rather than a dead end. Hidden on every other
     /// status (a load error is not the moment to offer an upload).
@@ -102,7 +113,6 @@ pub(crate) const GRID_THUMB_STEP: i32 = 8;
 /// rather than a stray line above a blank grid.
 pub(crate) struct BrowserWidgets {
     pub(crate) model: gio::ListStore,
-    pub(crate) back: gtk4::Button,
     pub(crate) crumb: gtk4::Box,
     pub(crate) grid: gtk4::GridView,
     pub(crate) column_view: gtk4::ColumnView,
@@ -113,9 +123,8 @@ pub(crate) struct BrowserWidgets {
     /// Sits in the status page; shown only when the mount service is down.
     pub(crate) retry: gtk4::Button,
     pub(crate) search: gtk4::SearchEntry,
-    pub(crate) new_folder: gtk4::Button,
-    pub(crate) upload: gtk4::Button,
-    pub(crate) upload_folder: gtk4::Button,
+    pub(crate) actions: gio::SimpleActionGroup,
+    pub(crate) view_button: adw::SplitButton,
     pub(crate) build_thumbnails: gtk4::Button,
     pub(crate) thumbnail_build_row: gtk4::Box,
     pub(crate) thumbnail_progress: gtk4::ProgressBar,
@@ -140,6 +149,7 @@ pub(crate) struct BrowserWidgets {
     pub(crate) bulk_trash: gtk4::Button,
     pub(crate) bulk_pin: gtk4::Button,
     pub(crate) bulk_unpin: gtk4::Button,
+    pub(crate) bulk_move: gtk4::Button,
     pub(crate) bulk_clear: gtk4::Button,
     pub(crate) empty_actions: gtk4::Box,
     pub(crate) empty_upload: gtk4::Button,
@@ -151,11 +161,22 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 
     let back = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Up one folder")
+        .tooltip_text("Back (Alt+Left)")
         .valign(gtk4::Align::Center)
-        .sensitive(false)
+        .action_name("files.back")
         .build();
     back.add_css_class("flat");
+    let forward = gtk4::Button::builder()
+        .icon_name("go-next-symbolic")
+        .tooltip_text("Forward (Alt+Right)")
+        .valign(gtk4::Align::Center)
+        .action_name("files.forward")
+        .build();
+    forward.add_css_class("flat");
+    let nav = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    nav.add_css_class("linked");
+    nav.append(&back);
+    nav.append(&forward);
     // Clickable breadcrumb trail; `repaint_crumb` fills it per load. Wrapped in a
     // horizontally-scrolling viewport so a deep path can't shove the search box
     // and view toggles off the right edge.
@@ -168,48 +189,65 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .child(&crumb)
         .build();
 
-    // Folder-level actions: create a subfolder / upload a file into the current
-    // directory. Wired in `wire_browser_actions`.
-    let new_folder = gtk4::Button::builder()
-        .icon_name("folder-new-symbolic")
-        .tooltip_text("New folder")
+    // Everything that makes something new here, in one menu: three bare icons
+    // side by side read as a toolbar puzzle.
+    let new_menu = gio::Menu::new();
+    new_menu.append(Some("New Folder"), Some("files.new-folder"));
+    let uploads = gio::Menu::new();
+    uploads.append(Some("Upload Files…"), Some("files.upload"));
+    uploads.append(Some("Upload Folder…"), Some("files.upload-folder"));
+    new_menu.append_section(None, &uploads);
+    let new_button = gtk4::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("New")
+        .menu_model(&new_menu)
         .valign(gtk4::Align::Center)
         .build();
-    new_folder.add_css_class("flat");
-    let upload = gtk4::Button::builder()
-        .icon_name("pdfs-upload-symbolic")
-        .tooltip_text("Upload files")
+    new_button.add_css_class("suggested-action");
+
+    // Grid or list on a click; the order lives in the arrow's menu.
+    let view_menu = gio::Menu::new();
+    let layouts = gio::Menu::new();
+    layouts.append(Some("Grid"), Some("files.view::grid"));
+    layouts.append(Some("List"), Some("files.view::list"));
+    view_menu.append_section(None, &layouts);
+    let sorts = gio::Menu::new();
+    sorts.append(Some("Name"), Some("files.sort::name"));
+    sorts.append(Some("Size"), Some("files.sort::size"));
+    sorts.append(Some("Last Modified"), Some("files.sort::modified"));
+    view_menu.append_section(Some("Sort By"), &sorts);
+    let order = gio::Menu::new();
+    order.append(Some("Reversed Order"), Some("files.descending"));
+    order.append(Some("Folders First"), Some("files.folders-first"));
+    view_menu.append_section(None, &order);
+    let view_button = adw::SplitButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Show as list (Ctrl+2)")
+        .dropdown_tooltip("Sort and view options")
+        .menu_model(&view_menu)
+        .valign(gtk4::Align::Center)
+        .action_name("files.toggle-view")
+        .build();
+
+    // What applies to the folder on screen rather than to a selection.
+    let folder_menu = gio::Menu::new();
+    folder_menu.append(Some("Open in File Manager"), Some("files.open-folder"));
+    folder_menu.append(Some("Build Thumbnails"), Some("files.build-thumbnails"));
+    let folder_button = gtk4::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("Folder actions")
+        .menu_model(&folder_menu)
         .valign(gtk4::Align::Center)
         .build();
-    upload.add_css_class("flat");
-    let upload_folder = gtk4::Button::builder()
-        .icon_name("pdfs-folder-upload-symbolic")
-        .tooltip_text("Upload folder")
-        .valign(gtk4::Align::Center)
-        .build();
-    upload_folder.add_css_class("flat");
+
+    // Cancels a running build; only visible in the progress row, which only
+    // shows while one runs.
     let build_thumbnails = gtk4::Button::builder()
-        .icon_name("pdfs-build-thumbnails-symbolic")
-        .tooltip_text("Build thumbnails in this folder and its subfolders")
+        .icon_name("process-stop-symbolic")
+        .tooltip_text("Cancel thumbnail build")
         .valign(gtk4::Align::Center)
         .build();
     build_thumbnails.add_css_class("flat");
-
-    // Linked grid/list toggle, top-right, Nautilus-style.
-    let grid_toggle = gtk4::ToggleButton::builder()
-        .icon_name("view-grid-symbolic")
-        .tooltip_text("Grid view")
-        .active(true)
-        .build();
-    let list_toggle = gtk4::ToggleButton::builder()
-        .icon_name("view-list-symbolic")
-        .tooltip_text("List view")
-        .build();
-    list_toggle.set_group(Some(&grid_toggle));
-    let toggles = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    toggles.add_css_class("linked");
-    toggles.append(&grid_toggle);
-    toggles.append(&list_toggle);
 
     let search = gtk4::SearchEntry::builder()
         .placeholder_text("Search Drive")
@@ -222,7 +260,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     // The path bar stays in the page, under the header bar: the header's title
     // slot carries the page name and the busy spinner.
     let path_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    path_bar.append(&back);
+    path_bar.append(&nav);
     path_bar.append(&crumb_scroll);
 
     let thumbnail_status = gtk4::Label::builder()
@@ -234,6 +272,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     let thumbnail_build_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
     thumbnail_build_row.append(&thumbnail_status);
     thumbnail_build_row.append(&thumbnail_progress);
+    thumbnail_build_row.append(&build_thumbnails);
     thumbnail_build_row.set_visible(false);
 
     // Empty / loading / error surface, shown in place of the views.
@@ -292,23 +331,11 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .child(&column_view)
         .build();
 
-    // Stack swapped by the toggle buttons.
+    // Stack swapped by the `files.view` action.
     let view_stack = gtk4::Stack::new();
     view_stack.set_vexpand(true);
     view_stack.add_named(&grid_scroll, Some("grid"));
     view_stack.add_named(&column_scroll, Some("list"));
-    let vs = view_stack.clone();
-    grid_toggle.connect_toggled(move |b| {
-        if b.is_active() {
-            vs.set_visible_child_name("grid");
-        }
-    });
-    let vs = view_stack.clone();
-    list_toggle.connect_toggled(move |b| {
-        if b.is_active() {
-            vs.set_visible_child_name("list");
-        }
-    });
 
     // Outer stack: the views, or the status page when there's nothing to show.
     let content = gtk4::Stack::new();
@@ -341,6 +368,11 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     bulk_unpin.add_css_class("flat");
+    let bulk_move = gtk4::Button::builder()
+        .label("Move to…")
+        .valign(gtk4::Align::Center)
+        .build();
+    bulk_move.add_css_class("flat");
     let bulk_trash = gtk4::Button::builder()
         .label("Move to Trash")
         .valign(gtk4::Align::Center)
@@ -359,6 +391,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     bulk_box.append(&bulk_label);
     bulk_box.append(&bulk_pin);
     bulk_box.append(&bulk_unpin);
+    bulk_box.append(&bulk_move);
     bulk_box.append(&bulk_trash);
     bulk_box.append(&bulk_clear);
     let bulk = gtk4::Revealer::builder()
@@ -453,19 +486,18 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     page.append(&status_bar);
 
     let (frame, header, _) = page_frame("My Files", &page);
-    header.pack_start(&upload);
-    header.pack_start(&upload_folder);
-    header.pack_start(&new_folder);
+    header.pack_start(&new_button);
+    header.pack_end(&folder_button);
     header.pack_end(&refresh);
-    header.pack_end(&toggles);
-    header.pack_end(&build_thumbnails);
+    header.pack_end(&view_button);
     header.pack_end(&search);
+    let actions = gio::SimpleActionGroup::new();
+    frame.insert_action_group("files", Some(&actions));
 
     (
         frame.upcast(),
         BrowserWidgets {
             model,
-            back,
             crumb,
             grid,
             column_view,
@@ -473,9 +505,8 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             status,
             retry,
             search,
-            new_folder,
-            upload,
-            upload_folder,
+            actions,
+            view_button,
             build_thumbnails,
             thumbnail_build_row,
             thumbnail_progress,
@@ -496,6 +527,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             bulk_trash,
             bulk_pin,
             bulk_unpin,
+            bulk_move,
             bulk_clear,
             empty_actions,
             empty_upload,
@@ -735,6 +767,10 @@ pub(crate) fn wire_bulk(
     ui.browser
         .bulk_unpin
         .connect_clicked(move |_| run_bulk_pin(&ui_unpin, selected_entries(&ui_unpin), false));
+    let ui_move = ui.clone();
+    ui.browser
+        .bulk_move
+        .connect_clicked(move |_| prompt_move(&ui_move, selected_entries(&ui_move)));
     let ui_clear = ui.clone();
     bulk_clear.connect_clicked(move |_| {
         clear_selection(&ui_clear);
@@ -763,19 +799,6 @@ pub(crate) fn browser_views(ui: &Rc<Ui>) {
 /// button. Split out from [`build_browser_page`] because every renderer needs
 /// the [`Ui`] handle to open entries and raise the context menu.
 pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk4::ColumnView) {
-    // Back: pop one path segment and reload.
-    let ui_back = ui.clone();
-    ui.browser.back.clone().connect_clicked(move |_| {
-        {
-            let mut path = ui_back.browser.path.borrow_mut();
-            *path = match path.rfind('/') {
-                Some(i) => path[..i].to_string(),
-                None => String::new(),
-            };
-        }
-        load_browser(&ui_back);
-    });
-
     // Resize only realised grid cells. Rebuilding the whole model for every
     // slider step would repeatedly tear down selection state while the pointer
     // is still moving.
@@ -1102,7 +1125,7 @@ pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Bo
     let pop = popover.clone();
     move_it.connect_clicked(move |_| {
         pop.popdown();
-        prompt_move(&ui_mv, &entry_mv);
+        prompt_move(&ui_mv, vec![entry_mv.clone()]);
     });
     menu.append(&move_it);
 
@@ -1264,8 +1287,7 @@ pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
         if !entry.path.is_empty() {
             ui.browser.search.set_text("");
         }
-        *ui.browser.path.borrow_mut() = rel;
-        load_browser(ui);
+        browse_to(ui, rel);
     } else if drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia {
         // Media streams rather than downloads: that is exactly the "play it,
         // don't fetch the whole thing" behaviour this is for.
@@ -1433,34 +1455,311 @@ pub(crate) fn crumb_node(ui: &Rc<Ui>, label: &str, target: &str, current: bool) 
     let target = target.to_string();
     button.connect_clicked(move |_| {
         ui.browser.search.set_text("");
-        *ui.browser.path.borrow_mut() = target.clone();
-        load_browser(&ui);
+        browse_to(&ui, target.clone());
     });
     button.upcast()
 }
 
-/// Wire the browser header's New-folder, Upload-files and Upload-folder buttons.
-pub(crate) fn wire_browser_actions(
-    ui: &Rc<Ui>,
-    new_folder: &gtk4::Button,
-    upload: &gtk4::Button,
-    upload_folder: &gtk4::Button,
-    build_thumbnails: &gtk4::Button,
-) {
-    let ui_nf = ui.clone();
-    new_folder.connect_clicked(move |_| prompt_new_folder(&ui_nf));
-    let ui_up = ui.clone();
-    upload.connect_clicked(move |_| prompt_upload(&ui_up));
-    let ui_uf = ui.clone();
-    upload_folder.connect_clicked(move |_| prompt_upload_folder(&ui_uf));
+/// The `files.*` actions behind the header menus, the navigation buttons and
+/// the keyboard shortcuts, plus the saved view applied on start.
+pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button) {
+    let actions = &ui.browser.actions;
+    let simple = |name: &str, run: fn(&Rc<Ui>)| {
+        let action = gio::SimpleAction::new(name, None);
+        let ui = ui.clone();
+        action.connect_activate(move |_, _| run(&ui));
+        actions.add_action(&action);
+    };
+    simple("new-folder", prompt_new_folder);
+    simple("upload", prompt_upload);
+    simple("upload-folder", prompt_upload_folder);
+    simple("build-thumbnails", start_thumbnail_build);
+    simple("open-folder", open_current_folder);
+    simple("back", browse_back);
+    simple("forward", browse_forward);
+    simple("up", browse_up);
+    simple("toggle-view", |ui| {
+        let mut view = ui.browser.view.get();
+        view.list = !view.list;
+        set_files_view(ui, view);
+    });
+
+    let view = ui.dirs.load_config().files_view;
+    ui.browser.view.set(view);
+    let layout = gio::SimpleAction::new_stateful(
+        "view",
+        Some(glib::VariantTy::STRING),
+        &layout_name(view).to_variant(),
+    );
+    let ui_layout = ui.clone();
+    layout.connect_change_state(move |_, value| {
+        let mut view = ui_layout.browser.view.get();
+        view.list = value.and_then(|v| v.str()) == Some("list");
+        set_files_view(&ui_layout, view);
+    });
+    actions.add_action(&layout);
+    let sort = gio::SimpleAction::new_stateful(
+        "sort",
+        Some(glib::VariantTy::STRING),
+        &view.sort.as_str().to_variant(),
+    );
+    let ui_sort = ui.clone();
+    sort.connect_change_state(move |_, value| {
+        let Some(key) = value.and_then(|v| v.str()).and_then(FileSort::parse) else {
+            return;
+        };
+        let mut view = ui_sort.browser.view.get();
+        view.sort = key;
+        set_files_view(&ui_sort, view);
+    });
+    actions.add_action(&sort);
+    let toggle = |name: &str, state: bool, flip: fn(&mut FilesView)| {
+        let action = gio::SimpleAction::new_stateful(name, None, &state.to_variant());
+        let ui = ui.clone();
+        action.connect_activate(move |_, _| {
+            let mut view = ui.browser.view.get();
+            flip(&mut view);
+            set_files_view(&ui, view);
+        });
+        actions.add_action(&action);
+    };
+    toggle("descending", view.descending, |view| {
+        view.descending = !view.descending
+    });
+    toggle("folders-first", view.folders_first, |view| {
+        view.folders_first = !view.folders_first
+    });
+    apply_files_view(ui, view);
+    sync_history_actions(ui);
+
     let ui_thumbs = ui.clone();
-    build_thumbnails.connect_clicked(move |_| {
-        if ui_thumbs.browser.thumbnail_build_running.get() {
-            cancel_thumbnail_build(&ui_thumbs);
+    build_thumbnails.connect_clicked(move |_| cancel_thumbnail_build(&ui_thumbs));
+
+    // The mouse's back and forward buttons, anywhere on the page.
+    let buttons = gtk4::GestureClick::builder().button(0).build();
+    let ui_buttons = ui.clone();
+    buttons.connect_pressed(move |gesture, _, _, _| match gesture.current_button() {
+        8 => browse_back(&ui_buttons),
+        9 => browse_forward(&ui_buttons),
+        _ => {}
+    });
+    ui.browser.content.add_controller(buttons);
+
+    // Files dropped in from a file manager upload into the folder on screen.
+    let drop = gtk4::DropTarget::new(
+        gtk4::gdk::FileList::static_type(),
+        gtk4::gdk::DragAction::COPY,
+    );
+    let ui_enter = ui.clone();
+    drop.connect_enter(move |_, _, _| {
+        ui_enter.browser.content.add_css_class("files-drop-active");
+        gtk4::gdk::DragAction::COPY
+    });
+    let ui_leave = ui.clone();
+    drop.connect_leave(move |_| {
+        ui_leave
+            .browser
+            .content
+            .remove_css_class("files-drop-active");
+    });
+    let ui_drop = ui.clone();
+    drop.connect_drop(move |_, value, _, _| {
+        ui_drop
+            .browser
+            .content
+            .remove_css_class("files-drop-active");
+        let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
+            return false;
+        };
+        let sources: Vec<String> = files
+            .files()
+            .iter()
+            .filter_map(|f| f.path())
+            .filter_map(|p| p.to_str().map(str::to_string))
+            .collect();
+        if sources.is_empty() || !ui_drop.browser.search.text().trim().is_empty() {
+            // Search results have no one folder to upload into.
+            return false;
+        }
+        start_upload(&ui_drop, sources);
+        true
+    });
+    ui.browser.content.add_controller(drop);
+}
+
+fn layout_name(view: FilesView) -> &'static str {
+    if view.list { "list" } else { "grid" }
+}
+
+/// Take a new view choice: show it, remember it, and repaint the listing in the
+/// new order.
+pub(crate) fn set_files_view(ui: &Rc<Ui>, view: FilesView) {
+    let old = ui.browser.view.replace(view);
+    if old == view {
+        return;
+    }
+    apply_files_view(ui, view);
+    let mut config = ui.dirs.load_config();
+    config.files_view = view;
+    if let Err(e) = ui.dirs.save_config(&config) {
+        toast_error(ui, "Couldn't save the view", &e.to_string());
+    }
+    if (old.sort, old.descending, old.folders_first)
+        != (view.sort, view.descending, view.folders_first)
+        && ui.browser.search.text().trim().is_empty()
+        && ui.browser.content.visible_child_name().as_deref() == Some("views")
+    {
+        let listing = ui.browser.listing.borrow().clone();
+        repaint_browser(ui, &listing);
+    }
+}
+
+/// Bring the view stack, the view button and the actions' check marks in line
+/// with `view`.
+fn apply_files_view(ui: &Rc<Ui>, view: FilesView) {
+    ui.browser.views.set_visible_child_name(layout_name(view));
+    // The button offers the other layout, the way a toggle reads.
+    ui.browser.view_button.set_icon_name(if view.list {
+        "view-grid-symbolic"
+    } else {
+        "view-list-symbolic"
+    });
+    ui.browser.view_button.set_tooltip_text(Some(if view.list {
+        "Show as grid (Ctrl+1)"
+    } else {
+        "Show as list (Ctrl+2)"
+    }));
+    let actions = &ui.browser.actions;
+    for (name, state) in [
+        ("view", layout_name(view).to_variant()),
+        ("sort", view.sort.as_str().to_variant()),
+        ("descending", view.descending.to_variant()),
+        ("folders-first", view.folders_first.to_variant()),
+    ] {
+        if let Some(action) = actions
+            .lookup_action(name)
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&state);
+        }
+    }
+}
+
+/// Order a listing the way `view` says. Names compare case-insensitively, and
+/// break ties in the other two orders, so equal sizes still read alphabetically.
+pub(crate) fn sort_entries(entries: &mut [DirEntry], view: FilesView) {
+    entries.sort_by(|a, b| {
+        let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+        let key = match view.sort {
+            FileSort::Name => by_name(),
+            FileSort::Size => a.size.cmp(&b.size).then_with(by_name),
+            FileSort::Modified => a.modified.cmp(&b.modified).then_with(by_name),
+        };
+        let key = if view.descending { key.reverse() } else { key };
+        if view.folders_first {
+            b.is_dir.cmp(&a.is_dir).then(key)
         } else {
-            start_thumbnail_build(&ui_thumbs);
+            key
         }
     });
+}
+
+/// Open the folder on screen in a new place, remembering where we were.
+pub(crate) fn browse_to(ui: &Rc<Ui>, target: String) {
+    let left = ui.browser.path.replace(target.clone());
+    if left != target {
+        ui.browser.history.borrow_mut().push(left);
+        ui.browser.future.borrow_mut().clear();
+    }
+    load_browser(ui);
+}
+
+/// Back: out of a search first, then to the previous folder.
+fn browse_back(ui: &Rc<Ui>) {
+    if !ui.browser.search.text().is_empty() {
+        ui.browser.search.set_text("");
+        return;
+    }
+    let Some(previous) = ui.browser.history.borrow_mut().pop() else {
+        return;
+    };
+    let left = ui.browser.path.replace(previous);
+    ui.browser.future.borrow_mut().push(left);
+    load_browser(ui);
+}
+
+fn browse_forward(ui: &Rc<Ui>) {
+    let Some(next) = ui.browser.future.borrow_mut().pop() else {
+        return;
+    };
+    ui.browser.search.set_text("");
+    let left = ui.browser.path.replace(next);
+    ui.browser.history.borrow_mut().push(left);
+    load_browser(ui);
+}
+
+fn browse_up(ui: &Rc<Ui>) {
+    let path = ui.browser.path.borrow().clone();
+    if path.is_empty() {
+        return;
+    }
+    ui.browser.search.set_text("");
+    let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or_default();
+    browse_to(ui, parent.to_string());
+}
+
+/// Enable Back, Forward and Up for where the browser is now.
+pub(crate) fn sync_history_actions(ui: &Rc<Ui>) {
+    let set = |name: &str, enabled: bool| {
+        if let Some(action) = ui
+            .browser
+            .actions
+            .lookup_action(name)
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_enabled(enabled);
+        }
+    };
+    set(
+        "back",
+        !ui.browser.history.borrow().is_empty() || !ui.browser.search.text().is_empty(),
+    );
+    set("forward", !ui.browser.future.borrow().is_empty());
+    set("up", !ui.browser.path.borrow().is_empty());
+}
+
+/// Enable the actions that need the daemon only while the mount is up.
+pub(crate) fn sync_mounted_actions(ui: &Rc<Ui>, mounted: bool) {
+    for name in [
+        "new-folder",
+        "upload",
+        "upload-folder",
+        "build-thumbnails",
+        "open-folder",
+    ] {
+        if let Some(action) = ui
+            .browser
+            .actions
+            .lookup_action(name)
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_enabled(
+                mounted
+                    && !(name == "build-thumbnails" && ui.browser.thumbnail_build_running.get()),
+            );
+        }
+    }
+}
+
+/// Show the folder on screen in the desktop's file manager, through the mount.
+fn open_current_folder(ui: &Rc<Ui>) {
+    let path = ui.browser.path.borrow().clone();
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    let dir = mounted_path(&mountpoint, &path);
+    let uri = gio::File::for_path(&dir).uri();
+    if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE) {
+        toast_error(ui, "Couldn't open the folder", &e.to_string());
+    }
 }
 
 const THUMBNAIL_BUILD_POLL: Duration = Duration::from_millis(500);
@@ -1657,21 +1956,10 @@ fn show_thumbnail_build_progress(status: &ThumbnailBuildStatus) -> bool {
 }
 
 fn repaint_thumbnail_build_action(ui: &Rc<Ui>, running: bool) {
-    ui.browser.build_thumbnails.set_icon_name(if running {
-        "process-stop-symbolic"
-    } else {
-        "pdfs-build-thumbnails-symbolic"
-    });
+    sync_mounted_actions(ui, *ui.mounted.borrow());
     ui.browser
         .build_thumbnails
-        .set_tooltip_text(Some(if running {
-            "Cancel thumbnail build"
-        } else {
-            "Build thumbnails in this folder and its subfolders"
-        }));
-    ui.browser.build_thumbnails.set_sensitive(
-        *ui.mounted.borrow() && (!running || !ui.browser.thumbnail_cancel_pending.get()),
-    );
+        .set_sensitive(running && !ui.browser.thumbnail_cancel_pending.get());
 }
 
 fn thumbnail_build_failed(ui: &Rc<Ui>) {
@@ -1728,10 +2016,7 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
     let parent = ui_window(ui);
     let rel = entry_rel(ui, entry);
     let original = entry.name.clone();
-    let dialog = adw::AlertDialog::builder()
-        .heading("Rename")
-        .body(format!("Rename “{original}”."))
-        .build();
+    let dialog = adw::AlertDialog::builder().heading("Rename").build();
     let group = adw::PreferencesGroup::new();
     let row = adw::EntryRow::builder()
         .title("New name")
@@ -1740,6 +2025,17 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
     row.set_text(&original);
     group.add(&row);
     dialog.set_extra_child(Some(&group));
+    // Select the name without its extension, the part a rename usually
+    // changes; a folder's whole name is the name.
+    let stem = match original.rfind('.') {
+        Some(dot) if dot > 0 && !entry.is_dir => original[..dot].chars().count(),
+        _ => original.chars().count(),
+    } as i32;
+    let row_focus = row.clone();
+    glib::idle_add_local_once(move || {
+        row_focus.grab_focus();
+        row_focus.select_region(0, stem);
+    });
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("confirm", "Rename");
     dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
@@ -1769,54 +2065,256 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
     dialog.present(parent.as_ref());
 }
 
-/// Prompt for a destination folder (mountpoint-relative, empty = Drive root) and
-/// move the entry there through the daemon.
-pub(crate) fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
-    let parent = ui_window(ui);
-    let rel = entry_rel(ui, entry);
-    let name = entry.name.clone();
+/// Pick a destination folder by browsing Drive's folders, and move `entries`
+/// there through the daemon.
+pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    let sources: Vec<String> = entries.iter().map(|e| entry_rel(ui, e)).collect();
+    let heading = match entries.as_slice() {
+        [one] => format!("Move “{}”", one.name),
+        many => format!("Move {}", count_noun(many.len(), "item", "items")),
+    };
     let dialog = adw::AlertDialog::builder()
-        .heading("Move")
-        .body(format!(
-            "Move “{}” into another folder. Enter its path from the Drive root \
-             (leave blank for the root).",
-            entry.name
-        ))
+        .heading(heading)
+        .body("Choose the folder to move into.")
         .build();
-    let group = adw::PreferencesGroup::new();
-    let row = adw::EntryRow::builder()
-        .title("Destination folder")
-        .activates_default(true)
+
+    let up = gtk4::Button::builder()
+        .icon_name("go-up-symbolic")
+        .tooltip_text("Parent folder")
         .build();
-    group.add(&row);
-    dialog.set_extra_child(Some(&group));
+    up.add_css_class("flat");
+    let location = gtk4::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::Start)
+        .build();
+    location.add_css_class("heading");
+    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    bar.append(&up);
+    bar.append(&location);
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_height(240)
+        .child(&list)
+        .build();
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    body.append(&bar);
+    body.append(&scroll);
+    dialog.set_extra_child(Some(&body));
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("confirm", "Move");
-    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("confirm"));
+    dialog.add_response("move", "Move Here");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("move"));
     dialog.set_close_response("cancel");
 
-    let ui = ui.clone();
-    dialog.connect_response(None, move |_, resp| {
-        if resp != "confirm" {
-            return;
-        }
-        let new_parent = row.text().trim().trim_matches('/').to_string();
-        let done = match new_parent.as_str() {
-            "" => format!("Moved “{name}” to Proton Drive"),
-            dest => format!("Moved “{name}” to “{dest}”"),
-        };
-        run_mutation(
-            &ui,
-            Request::Move {
-                path: rel.clone(),
-                new_parent,
-            },
-            done,
-            "Couldn't move",
-        );
+    let picker = Rc::new(MovePicker {
+        ui: ui.clone(),
+        dialog: dialog.clone(),
+        location,
+        list,
+        up: up.clone(),
+        sources: sources.clone(),
+        folder: RefCell::new(String::new()),
+        generation: Cell::new(0),
     });
-    dialog.present(parent.as_ref());
+    let picker_up = picker.clone();
+    up.connect_clicked(move |_| {
+        let folder = picker_up.folder.borrow().clone();
+        let parent = folder.rfind('/').map(|i| &folder[..i]).unwrap_or_default();
+        picker_up.open(parent.to_string());
+    });
+    // Start where the browser is: moving is most often one level up or down.
+    picker.open(ui.browser.path.borrow().clone());
+
+    let ui = ui.clone();
+    let picker_done = picker.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "move" {
+            run_bulk_move(&ui, sources.clone(), picker_done.folder.borrow().clone());
+        }
+    });
+    dialog.present(ui_window(&picker.ui).as_ref());
+}
+
+/// The Move dialog's folder browser.
+struct MovePicker {
+    ui: Rc<Ui>,
+    dialog: adw::AlertDialog,
+    location: gtk4::Label,
+    list: gtk4::ListBox,
+    up: gtk4::Button,
+    /// What is being moved, mountpoint-relative.
+    sources: Vec<String>,
+    /// The folder on show, and the destination if the user confirms now.
+    folder: RefCell<String>,
+    /// Drops a listing that arrives after the user went elsewhere.
+    generation: Cell<u64>,
+}
+
+impl MovePicker {
+    fn open(self: &Rc<Self>, folder: String) {
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        self.location.set_label(if folder.is_empty() {
+            "Proton Drive"
+        } else {
+            &folder
+        });
+        self.location.set_tooltip_text(Some(&folder));
+        self.up.set_sensitive(!folder.is_empty());
+        self.dialog
+            .set_response_enabled("move", move_target_allowed(&self.sources, &folder));
+        *self.folder.borrow_mut() = folder.clone();
+        while let Some(row) = self.list.first_child() {
+            self.list.remove(&row);
+        }
+        self.list.append(&picker_note("Loading…"));
+        let rx = spawn_request(
+            self.ui.dirs.control_socket(),
+            Request::ListDir {
+                path: folder.clone(),
+            },
+        );
+        let picker = self.clone();
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            if picker.generation.get() != generation {
+                return;
+            }
+            while let Some(row) = picker.list.first_child() {
+                picker.list.remove(&row);
+            }
+            let Ok(Ok(Response::Entries { entries })) = result else {
+                picker
+                    .list
+                    .append(&picker_note("Couldn't read this folder."));
+                return;
+            };
+            let mut folders: Vec<DirEntry> = entries.into_iter().filter(|e| e.is_dir).collect();
+            folders.sort_by_key(|e| e.name.to_lowercase());
+            let mut shown = 0;
+            for entry in folders {
+                let path = if folder.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{folder}/{}", entry.name)
+                };
+                // A folder cannot go inside itself, so do not offer to open it.
+                if picker.sources.contains(&path) {
+                    continue;
+                }
+                let row = adw::ActionRow::builder()
+                    .title(glib::markup_escape_text(&entry.name).as_str())
+                    .activatable(true)
+                    .build();
+                row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
+                row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+                let open = picker.clone();
+                row.connect_activated(move |_| open.open(path.clone()));
+                picker.list.append(&row);
+                shown += 1;
+            }
+            if shown == 0 {
+                picker.list.append(&picker_note("No folders here."));
+            }
+        });
+    }
+}
+
+fn picker_note(text: &str) -> gtk4::ListBoxRow {
+    let label = gtk4::Label::builder()
+        .label(text)
+        .margin_top(12)
+        .margin_bottom(12)
+        .build();
+    label.add_css_class("dim-label");
+    gtk4::ListBoxRow::builder()
+        .child(&label)
+        .activatable(false)
+        .selectable(false)
+        .build()
+}
+
+/// Whether `target` is somewhere `sources` can move to: not into one of
+/// themselves, and not the folder every one of them is already in.
+pub(crate) fn move_target_allowed(sources: &[String], target: &str) -> bool {
+    let parent = |path: &str| {
+        path.rfind('/')
+            .map(|i| path[..i].to_string())
+            .unwrap_or_default()
+    };
+    let inside = sources
+        .iter()
+        .any(|src| target == src || target.starts_with(&format!("{src}/")));
+    let all_here = sources.iter().all(|src| parent(src) == target);
+    !inside && !all_here
+}
+
+/// Move each of `sources` into `target`, one request at a time, then report
+/// once for the lot.
+pub(crate) fn run_bulk_move(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
+    if !*ui.mounted.borrow() {
+        toast_error(ui, "Couldn't move", "Proton Drive isn't connected.");
+        return;
+    }
+    let socket = ui.dirs.control_socket();
+    ui.busy_begin();
+    clear_selection(ui);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let mut done = 0usize;
+        let mut failure: Option<(String, ErrorKind)> = None;
+        for path in sources {
+            let rx = spawn_request(
+                socket.clone(),
+                Request::Move {
+                    path,
+                    new_parent: target.clone(),
+                },
+            );
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => done += 1,
+                Ok(Ok(Response::Error { message, kind })) => {
+                    failure.get_or_insert((message, kind));
+                }
+                _ => {
+                    failure.get_or_insert_with(|| {
+                        (
+                            "The mount service didn't respond.".to_string(),
+                            ErrorKind::Internal,
+                        )
+                    });
+                }
+            }
+        }
+        ui.busy_end();
+        reload_listing(&ui);
+        let place = match target.rsplit('/').next() {
+            Some(name) if !name.is_empty() => format!("“{name}”"),
+            _ => "Proton Drive".to_string(),
+        };
+        match (done, failure) {
+            (0, Some((message, kind))) => toast_failure(&ui, "Couldn't move", &message, kind),
+            (0, None) => {}
+            (n, Some((message, _))) => toast_error(
+                &ui,
+                &format!(
+                    "Moved {} to {place}, but not all",
+                    count_noun(n, "item", "items")
+                ),
+                &message,
+            ),
+            (1, None) => toast(&ui, &format!("Moved to {place}")),
+            (n, None) => toast(&ui, &format!("Moved {n} items to {place}")),
+        }
+    });
 }
 
 /// Move one entry to Trash, through the batch path so it gets the same Undo.
@@ -1930,7 +2428,10 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
                 } else {
                     format!("Uploading {n} items…")
                 };
-                toast(&ui, &what);
+                // Progress lives on the Sync page; say where.
+                toast_action(&ui, &what, "View", |ui| {
+                    ui.stack.set_visible_child_name("locations")
+                });
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, "Couldn't upload", &message, kind)
@@ -2072,7 +2573,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     ui.browser.load_generation.set(generation);
     let path = ui.browser.path.borrow().clone();
     repaint_crumb(ui, &path);
-    ui.browser.back.set_sensitive(!path.is_empty());
+    sync_history_actions(ui);
     ui.browser.summary.set_label("Loading…");
 
     // Drop the previous folder's rows up front: a slow reply must not leave stale
@@ -2166,6 +2667,7 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
 /// Repopulate the shared model — folders first, then case-insensitive by name —
 /// which refreshes both the grid and the column list.
 pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
+    *ui.browser.listing.borrow_mut() = entries.to_vec();
     ui.browser.model.remove_all();
     ui.browser.summary.set_label(&listing_summary(
         entries.iter().filter(|entry| !entry.is_dir).count(),
@@ -2181,7 +2683,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
             ui,
             "folder-open-symbolic",
             "This folder is empty",
-            "Upload a file or create a folder to get started.",
+            "Drop files here, or upload a file or create a folder to get started.",
             false,
         );
         ui.browser.empty_actions.set_visible(true);
@@ -2190,11 +2692,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     browser_views(ui);
 
     let mut sorted = entries.to_vec();
-    sorted.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    sort_entries(&mut sorted, ui.browser.view.get());
     for entry in sorted {
         ui.browser.model.append(&BoxedAnyObject::new(entry));
     }
@@ -2205,6 +2703,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
 pub(crate) fn wire_search(ui: &Rc<Ui>) {
     let ui_s = ui.clone();
     ui.browser.search.connect_search_changed(move |_| {
+        sync_history_actions(&ui_s);
         // Replace any pending debounce so only the last keystroke's pause fires.
         if let Some(src) = ui_s.browser.search_source.borrow_mut().take() {
             src.remove();
@@ -2289,7 +2788,11 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     );
     ui.browser
         .summary
-        .set_label(&format!("{counts} — search results"));
+        .set_label(&if hits.len() >= SEARCH_LIMIT {
+            format!("{counts} — showing the first {SEARCH_LIMIT} search results")
+        } else {
+            format!("{counts} — search results")
+        });
     if hits.is_empty() {
         browser_status(
             ui,
@@ -2319,11 +2822,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             shared_by_unverified: false,
         })
         .collect();
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    sort_entries(&mut entries, ui.browser.view.get());
     for entry in entries {
         ui.browser.model.append(&BoxedAnyObject::new(entry));
     }
@@ -2345,8 +2844,68 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{listing_summary, show_thumbnail_build_progress};
-    use pdfs_core::control::ThumbnailBuildStatus;
+    use super::{
+        listing_summary, move_target_allowed, show_thumbnail_build_progress, sort_entries,
+    };
+    use pdfs_core::config::{FileSort, FilesView};
+    use pdfs_core::control::{DirEntry, ThumbnailBuildStatus};
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: i64) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            is_dir,
+            size,
+            modified,
+            pinned: false,
+            cached: false,
+            uid: String::new(),
+            path: String::new(),
+            role: String::new(),
+            shared_by: String::new(),
+            shared_at: 0,
+            shared_by_unverified: false,
+        }
+    }
+
+    fn names(entries: &[DirEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn listing_sorts_by_the_chosen_key_with_folders_first() {
+        let mut entries = vec![
+            entry("b.txt", false, 10, 300),
+            entry("Docs", true, 0, 100),
+            entry("a.txt", false, 30, 200),
+            entry("c.txt", false, 10, 100),
+        ];
+        let mut view = FilesView::default();
+        sort_entries(&mut entries, view);
+        assert_eq!(names(&entries), ["Docs", "a.txt", "b.txt", "c.txt"]);
+
+        view.sort = FileSort::Size;
+        view.descending = true;
+        sort_entries(&mut entries, view);
+        assert_eq!(names(&entries), ["Docs", "a.txt", "c.txt", "b.txt"]);
+
+        view.sort = FileSort::Modified;
+        view.descending = false;
+        view.folders_first = false;
+        sort_entries(&mut entries, view);
+        assert_eq!(names(&entries), ["c.txt", "Docs", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn move_refuses_its_own_subtree_and_the_folder_it_is_in() {
+        let sources = ["Docs/Work".to_string()];
+        assert!(!move_target_allowed(&sources, "Docs/Work"));
+        assert!(!move_target_allowed(&sources, "Docs/Work/Old"));
+        assert!(!move_target_allowed(&sources, "Docs"));
+        assert!(move_target_allowed(&sources, ""));
+        assert!(move_target_allowed(&sources, "Docs/Workshop"));
+        let mixed = ["a.txt".to_string(), "Docs/b.txt".to_string()];
+        assert!(move_target_allowed(&mixed, ""));
+    }
 
     #[test]
     fn listing_summary_matches_dolphin_order_and_wording() {

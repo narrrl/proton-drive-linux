@@ -44,7 +44,7 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 
-use pdfs_core::config::AppDirs;
+use pdfs_core::config::{AppDirs, FileSort, FilesView};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
@@ -394,7 +394,8 @@ fn build_window(app: &adw::Application) {
         },
         browser: BrowserState {
             model: browser_widgets.model.clone(),
-            back: browser_widgets.back.clone(),
+            history: RefCell::new(Vec::new()),
+            future: RefCell::new(Vec::new()),
             crumb: browser_widgets.crumb.clone(),
             content: browser_widgets.content.clone(),
             status: browser_widgets.status.clone(),
@@ -402,9 +403,10 @@ fn build_window(app: &adw::Application) {
             split: browser_widgets.split.clone(),
             path: RefCell::new(String::new()),
             search: browser_widgets.search.clone(),
-            new_folder: browser_widgets.new_folder.clone(),
-            upload: browser_widgets.upload.clone(),
-            upload_folder: browser_widgets.upload_folder.clone(),
+            actions: browser_widgets.actions.clone(),
+            view_button: browser_widgets.view_button.clone(),
+            view: Cell::new(FilesView::default()),
+            listing: RefCell::new(Vec::new()),
             build_thumbnails: browser_widgets.build_thumbnails.clone(),
             thumbnail_build_row: browser_widgets.thumbnail_build_row.clone(),
             thumbnail_progress: browser_widgets.thumbnail_progress.clone(),
@@ -420,6 +422,7 @@ fn build_window(app: &adw::Application) {
             bulk_trash: browser_widgets.bulk_trash.clone(),
             bulk_pin: browser_widgets.bulk_pin.clone(),
             bulk_unpin: browser_widgets.bulk_unpin.clone(),
+            bulk_move: browser_widgets.bulk_move.clone(),
             empty_actions: browser_widgets.empty_actions.clone(),
             summary: browser_widgets.summary.clone(),
             zoom: browser_widgets.zoom.clone(),
@@ -609,13 +612,7 @@ fn build_window(app: &adw::Application) {
         &browser_widgets.empty_upload,
         &browser_widgets.empty_new_folder,
     );
-    wire_browser_actions(
-        &ui,
-        &browser_widgets.new_folder,
-        &browser_widgets.upload,
-        &browser_widgets.upload_folder,
-        &browser_widgets.build_thumbnails,
-    );
+    wire_browser_actions(&ui, &browser_widgets.build_thumbnails);
     wire_details(&ui);
     wire_search(&ui);
     wire_gallery(
@@ -1197,6 +1194,9 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
             &[
                 ("<Control>n", "New folder"),
                 ("<Control>u", "Upload files"),
+                ("<Alt>Left <Alt>Right", "Back / forward"),
+                ("<Alt>Up", "Parent folder"),
+                ("<Control>1 <Control>2", "Grid / list"),
                 ("F2", "Rename"),
                 ("Delete", "Move to Trash"),
                 ("Escape", "Clear the selection"),
@@ -1260,6 +1260,7 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     let ui = ui.clone();
     controller.connect_key_pressed(move |_, key, _, state| {
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+        let alt = state.contains(gtk4::gdk::ModifierType::ALT_MASK);
         let on_browser = ui.stack.visible_child_name().as_deref() == Some("browser");
         match key {
             // Refresh works on every page, so it is matched before the
@@ -1276,6 +1277,29 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 ui.browser.search.grab_focus();
             }
             gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
+            gtk4::gdk::Key::_1 if ctrl && on_browser => set_files_view(
+                &ui,
+                FilesView {
+                    list: false,
+                    ..ui.browser.view.get()
+                },
+            ),
+            gtk4::gdk::Key::_2 if ctrl && on_browser => set_files_view(
+                &ui,
+                FilesView {
+                    list: true,
+                    ..ui.browser.view.get()
+                },
+            ),
+            gtk4::gdk::Key::Left if alt && on_browser => {
+                ui.browser.actions.activate_action("back", None)
+            }
+            gtk4::gdk::Key::Right if alt && on_browser => {
+                ui.browser.actions.activate_action("forward", None)
+            }
+            gtk4::gdk::Key::Up if alt && on_browser => {
+                ui.browser.actions.activate_action("up", None)
+            }
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
             gtk4::gdk::Key::F2 if on_browser => {
                 // Renaming is one name at a time; saying so beats a key that

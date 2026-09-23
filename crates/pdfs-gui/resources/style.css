@@ -37,6 +37,7 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 .bulk-bar { padding: 6px 8px; border-radius: 12px; background: color-mix(in srgb, var(--accent-bg-color) 12%, transparent); }
 .dropzone { border: 2px dashed alpha(currentColor, 0.25); border-radius: 16px; padding: 28px 18px; transition: background 160ms ease, border-color 160ms ease; }
 .dropzone-active { border-color: var(--accent-bg-color); background: color-mix(in srgb, var(--accent-bg-color) 10%, transparent); }
+.files-drop-active { outline: 2px dashed var(--accent-bg-color); outline-offset: -4px; border-radius: 12px; background: color-mix(in srgb, var(--accent-bg-color) 6%, transparent); }
 
 /* Photo viewer: always light-on-dark, whatever the system style */
 .photo-viewer-window { background-color: #111014; }
