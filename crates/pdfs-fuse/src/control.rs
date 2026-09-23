@@ -899,6 +899,29 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 ))),
             }
         }
+        Ok(CtlRequest::SetBandwidthLimits { upload, download }) => {
+            core.transfers.set_limits(upload, download);
+            // Persisted like the cache budget: best-effort, the live caps are
+            // already applied.
+            match AppDirs::new().map(|dirs| {
+                let mut cfg = dirs.load_config();
+                cfg.upload_limit = Some(upload);
+                cfg.download_limit = Some(download);
+                dirs.save_config(&cfg)
+            }) {
+                Ok(Ok(())) => CtlResponse::Ok {
+                    message: format!(
+                        "bandwidth limits set to {upload} B/s up, {download} B/s down"
+                    ),
+                },
+                Ok(Err(e)) => CtlResponse::error(CoreError::internal(format!(
+                    "limits applied but config write failed: {e}"
+                ))),
+                Err(e) => CtlResponse::error(CoreError::internal(format!(
+                    "limits applied but config unavailable: {e}"
+                ))),
+            }
+        }
         Ok(CtlRequest::ListDevices) => match core.list_devices() {
             Ok(items) => CtlResponse::Devices { items },
             Err(e) => CtlResponse::error(e),

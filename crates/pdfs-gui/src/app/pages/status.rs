@@ -37,6 +37,11 @@ pub(crate) struct StatusState {
     /// Cache-budget editor (GiB). Populated once from config; user edits drive a
     /// `SetCacheBudget` round-trip. Guarded by [`Self::settings_suppress`].
     pub(crate) budget_row: adw::SpinRow,
+    /// Bandwidth caps (MiB/s, `0` = none). Populated once from config; an edit
+    /// to either sends both in one `SetBandwidthLimits`. Guarded by
+    /// [`Self::settings_suppress`].
+    pub(crate) upload_limit_row: adw::SpinRow,
+    pub(crate) download_limit_row: adw::SpinRow,
     /// Shows where the primary mount lives; its Change button picks a new one.
     pub(crate) mountpoint_row: adw::ActionRow,
     /// "Proton purple accent" toggle. Guarded by [`Self::settings_suppress`].
@@ -49,6 +54,8 @@ pub(crate) struct StatusState {
     /// stack of toasts and a series of caps the user never asked to apply — so
     /// only the value they settle on is sent.
     pub(crate) budget_source: RefCell<Option<glib::SourceId>>,
+    /// Pending debounce for the bandwidth editors, as for the cache budget.
+    pub(crate) limit_source: RefCell<Option<glib::SourceId>>,
     pub(crate) pins_group: adw::PreferencesGroup,
     /// Whether the pin list is showing every pin or only the first
     /// [`PINS_COLLAPSED`]. A long pin list would otherwise push everything below
@@ -119,6 +126,9 @@ pub(crate) struct MainWidgets {
     pub(crate) autostart_row: adw::SwitchRow,
     /// Cache soft-cap editor, in GiB; `0` = unlimited.
     pub(crate) budget_row: adw::SpinRow,
+    /// Upload and download caps, in MiB/s; `0` = unlimited.
+    pub(crate) upload_limit_row: adw::SpinRow,
+    pub(crate) download_limit_row: adw::SpinRow,
     /// Purges all unpinned cached content.
     pub(crate) purge_button: gtk4::Button,
     /// Shows the active mountpoint; its suffix button picks a new one.
@@ -159,6 +169,24 @@ pub(crate) fn build_main_page() -> MainWidgets {
     mountpoint_row.add_suffix(&mountpoint_button);
     location_group.add(&mountpoint_row);
 
+    // Bandwidth caps in MiB/s. 0 = unlimited; the smallest cap is one 0.5 step,
+    // since anything slower would stall a single block for most of a minute.
+    let network_group = adw::PreferencesGroup::builder()
+        .title("Network")
+        .description("Limit how fast files move, shared by every transfer. 0 means no limit.")
+        .build();
+    let limit_row = |title: &str| {
+        adw::SpinRow::builder()
+            .title(title)
+            .adjustment(&gtk4::Adjustment::new(0.0, 0.0, 1000.0, 0.5, 5.0, 0.0))
+            .digits(1)
+            .build()
+    };
+    let upload_limit_row = limit_row("Upload limit (MiB/s)");
+    let download_limit_row = limit_row("Download limit (MiB/s)");
+    network_group.add(&upload_limit_row);
+    network_group.add(&download_limit_row);
+
     let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
     let accent_row = adw::SwitchRow::builder()
         .title("Proton purple accent")
@@ -172,6 +200,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
         .build();
     general.add(&startup_group);
     general.add(&location_group);
+    general.add(&network_group);
     general.add(&appearance_group);
 
     // ---- Preferences: Storage
@@ -327,6 +356,8 @@ pub(crate) fn build_main_page() -> MainWidgets {
         pins_group,
         autostart_row,
         budget_row,
+        upload_limit_row,
+        download_limit_row,
         purge_button,
         mountpoint_row,
         mountpoint_button,
@@ -356,6 +387,9 @@ pub(crate) const BUDGET_DEBOUNCE: Duration = Duration::from_millis(600);
 /// Bytes per GiB, for the cache-budget editor's unit conversion.
 pub(crate) const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+/// Bytes per MiB, for the bandwidth editors' unit conversion.
+pub(crate) const MIB: f64 = 1024.0 * 1024.0;
+
 /// Wire the Preferences controls: the cache-budget editor, the purge button, the
 /// start-on-login switch, the mountpoint chooser and the accent toggle. Initial widget state is
 /// read once from config / systemd here (the refresh loop owns only the live
@@ -373,6 +407,12 @@ pub(crate) fn wire_settings(
     ui.status
         .budget_row
         .set_value(config.resolved_cache_budget() as f64 / GIB);
+    ui.status
+        .upload_limit_row
+        .set_value(config.upload_limit.unwrap_or(0) as f64 / MIB);
+    ui.status
+        .download_limit_row
+        .set_value(config.download_limit.unwrap_or(0) as f64 / MIB);
     ui.status
         .mountpoint_row
         .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
@@ -406,6 +446,33 @@ pub(crate) fn wire_settings(
         });
         *ui_budget.status.budget_source.borrow_mut() = Some(src);
     });
+
+    // Bandwidth: either editor sends both caps, since the daemon sets them as a
+    // pair. Debounced like the budget.
+    for row in [&ui.status.upload_limit_row, &ui.status.download_limit_row] {
+        let ui_limit = ui.clone();
+        row.connect_value_notify(move |_| {
+            if ui_limit.status.settings_suppress.get() {
+                return;
+            }
+            if let Some(src) = ui_limit.status.limit_source.borrow_mut().take() {
+                src.remove();
+            }
+            let ui_fire = ui_limit.clone();
+            let src = glib::timeout_add_local_once(BUDGET_DEBOUNCE, move || {
+                ui_fire.status.limit_source.borrow_mut().take();
+                let upload = (ui_fire.status.upload_limit_row.value() * MIB).round() as u64;
+                let download = (ui_fire.status.download_limit_row.value() * MIB).round() as u64;
+                settings_request(
+                    &ui_fire,
+                    Request::SetBandwidthLimits { upload, download },
+                    "Bandwidth limits updated",
+                    "Couldn't set bandwidth limits",
+                );
+            });
+            *ui_limit.status.limit_source.borrow_mut() = Some(src);
+        });
+    }
 
     // Purge: confirm, then drop all unpinned cached content via the daemon.
     let ui_purge = ui.clone();

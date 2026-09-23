@@ -299,6 +299,10 @@ pub enum Request {
     /// persist it to config so the next mount keeps it. Replies with
     /// [`Response::Ok`].
     SetCacheBudget { bytes: u64 },
+    /// Cap uploads and downloads at these bytes per second (`0` = no cap),
+    /// live for running transfers, and persist both to config so the next
+    /// mount keeps them. Replies with [`Response::Ok`].
+    SetBandwidthLimits { upload: u64, download: u64 },
     /// Report on the health of the metadata database and content cache: sizes,
     /// row counts, and — when `deep` — SQLite's own integrity check. Replies
     /// with [`Response::CacheReport`].
@@ -2418,6 +2422,10 @@ mod tests {
             Request::SetSyncFolderPaused {
                 id: 3,
                 paused: true,
+            },
+            Request::SetBandwidthLimits {
+                upload: 1_000_000,
+                download: 0,
             },
             Request::SyncNow { id: Some(3) },
             Request::AdoptDevice {

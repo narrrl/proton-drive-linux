@@ -13,6 +13,10 @@
 //! always reflects exactly what is in flight — even if the work fails partway
 //! and unwinds.
 //!
+//! The same per-block tick enforces the user's bandwidth limits: every byte a
+//! transfer moves is charged to its direction's [`RateLimit`], and the thread
+//! moving it sleeps off whatever the charge puts it over the cap.
+//!
 //! [`Request::GetQueueStatus`]: pdfs_core::control::Request::GetQueueStatus
 
 use parking_lot::Mutex;
@@ -20,7 +24,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pdfs_core::control::{JobItem, TransferDirection, TransferItem};
 
@@ -52,11 +56,78 @@ pub struct TransferRegistry {
     inner: Mutex<HashMap<u64, Arc<Entry>>>,
     jobs: Mutex<HashMap<u64, Arc<JobEntry>>>,
     next: AtomicU64,
+    upload_limit: RateLimit,
+    download_limit: RateLimit,
+}
+
+/// How far ahead of its cap a direction may run before it is made to wait, so a
+/// small file still goes out at full speed.
+const RATE_BURST: Duration = Duration::from_secs(1);
+
+/// A bytes-per-second cap shared by every transfer in one direction; `0` is no
+/// cap.
+///
+/// A virtual clock rather than a refilled bucket: each charge pushes
+/// `next_free` forward by the time its bytes take at the cap, so concurrent
+/// transfers split the cap between them instead of each getting all of it.
+#[derive(Default)]
+struct RateLimit {
+    rate: AtomicU64,
+    next_free: Mutex<Option<Instant>>,
+}
+
+impl RateLimit {
+    fn set(&self, rate: u64) {
+        self.rate.store(rate, Ordering::Relaxed);
+        // A new cap starts from now, not from the debt the old one ran up.
+        *self.next_free.lock() = None;
+    }
+
+    /// Charge `n` bytes moved at `now`, returning how long the mover must wait
+    /// to stay under the cap.
+    fn charge(&self, n: u64, now: Instant) -> Duration {
+        let rate = self.rate.load(Ordering::Relaxed);
+        if rate == 0 || n == 0 {
+            return Duration::ZERO;
+        }
+        let mut next_free = self.next_free.lock();
+        let start = next_free.filter(|t| *t > now).unwrap_or(now);
+        let done = start + Duration::from_secs_f64(n as f64 / rate as f64);
+        *next_free = Some(done);
+        done.saturating_duration_since(now + RATE_BURST)
+    }
+}
+
+/// Sleep off a rate-limit wait. The bulk uploader reads on tokio workers, so
+/// the sleep is announced to the runtime there rather than silently holding a
+/// worker other tasks — FUSE reads among them — may need.
+fn throttle(wait: Duration) {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| std::thread::sleep(wait))
+        }
+        _ => std::thread::sleep(wait),
+    }
 }
 
 impl TransferRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Cap uploads and downloads at these bytes per second; `0` lifts a cap.
+    /// Applies to transfers already running from their next block.
+    pub fn set_limits(&self, upload: u64, download: u64) {
+        self.upload_limit.set(upload);
+        self.download_limit.set(download);
+    }
+
+    fn limit(&self, direction: TransferDirection) -> &RateLimit {
+        match direction {
+            TransferDirection::Upload => &self.upload_limit,
+            TransferDirection::Download => &self.download_limit,
+        }
     }
 
     /// Register a new transfer of `total` bytes (`0` = unknown), returning a
@@ -169,9 +240,17 @@ pub struct TransferGuard {
 }
 
 impl TransferGuard {
-    /// Record `n` more bytes moved.
+    /// Record `n` more bytes moved, then wait if they put the direction over
+    /// its cap.
     pub fn add(&self, n: u64) {
         self.entry.done.fetch_add(n, Ordering::Relaxed);
+        let wait = self
+            .reg
+            .limit(self.entry.direction)
+            .charge(n, Instant::now());
+        if !wait.is_zero() {
+            throttle(wait);
+        }
     }
 }
 
@@ -319,5 +398,39 @@ impl<R: Read> Read for CountingReader<'_, R> {
         let n = self.inner.read(buf)?;
         self.guard.add(n as u64);
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_uncapped_direction_never_waits() {
+        let limit = RateLimit::default();
+        assert_eq!(limit.charge(u64::MAX / 2, Instant::now()), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_capped_direction_waits_once_past_its_burst() {
+        let limit = RateLimit::default();
+        limit.set(1000);
+        let now = Instant::now();
+        // One second of bytes is the burst: no wait yet.
+        assert_eq!(limit.charge(1000, now), Duration::ZERO);
+        // Two more seconds' worth at the same instant: wait out all but the burst.
+        assert_eq!(limit.charge(2000, now), Duration::from_secs(2));
+        // Lifting the cap drops the debt with it.
+        limit.set(0);
+        assert_eq!(limit.charge(5000, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn concurrent_transfers_share_one_cap() {
+        let limit = RateLimit::default();
+        limit.set(1000);
+        let now = Instant::now();
+        assert_eq!(limit.charge(1500, now), Duration::from_millis(500));
+        assert_eq!(limit.charge(1500, now), Duration::from_secs(2));
     }
 }

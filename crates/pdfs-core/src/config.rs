@@ -85,6 +85,15 @@ pub struct AppConfig {
     /// writes an explicit value here. Defaulted for configs predating the field.
     #[serde(default)]
     pub cache_budget: Option<u64>,
+    /// Upload cap in bytes per second shared by every upload. `None` or `0`
+    /// means no cap. Defaulted for configs predating the field.
+    #[serde(default)]
+    pub upload_limit: Option<u64>,
+    /// Download cap in bytes per second shared by every download, FUSE reads
+    /// included. `None` or `0` means no cap. Defaulted for configs predating
+    /// the field.
+    #[serde(default)]
+    pub download_limit: Option<u64>,
     /// Mountpoint the daemon mounts at. `None` means
     /// [`AppDirs::default_mountpoint`]; the Settings page writes an explicit
     /// path here. Defaulted for configs predating the field.
@@ -189,6 +198,8 @@ impl Default for AppConfig {
             app_version: APP_VERSION.to_string(),
             user_agent: USER_AGENT.to_string(),
             cache_budget: None,
+            upload_limit: None,
+            download_limit: None,
             mountpoint: None,
             ignore_patterns: None,
             device_uid: None,
@@ -535,6 +546,8 @@ mod tests {
             app_version: "external-drive-test-client@1.0.0".to_string(),
             user_agent: "test-agent/1.0".to_string(),
             cache_budget: Some(1234),
+            upload_limit: Some(500_000),
+            download_limit: None,
             mountpoint: Some("/tmp/x".to_string()),
             ignore_patterns: Some(vec!["build/".to_string()]),
             device_uid: Some("dev-uid".to_string()),
@@ -554,6 +567,8 @@ mod tests {
         assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
         assert_eq!(decoded.user_agent, "test-agent/1.0");
         assert_eq!(decoded.proton_accent, Some(true));
+        assert_eq!(decoded.upload_limit, Some(500_000));
+        assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
     }
 

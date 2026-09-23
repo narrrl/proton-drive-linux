@@ -241,6 +241,9 @@ pub struct MountOptions {
     pub username: String,
     /// What the background conflict sweep may do. See `docs/BUGS.md` B71.
     pub sweep_mode: SweepMode,
+    /// Upload and download caps in bytes per second (`0` = no cap).
+    pub upload_limit: u64,
+    pub download_limit: u64,
 }
 
 /// Spawn one FUSE session rooted at an arbitrary remote node.
@@ -340,6 +343,8 @@ pub fn mount(
     let MountOptions {
         username,
         sweep_mode,
+        upload_limit,
+        download_limit,
     } = options;
     // Start the uptime clock here rather than at the first `pdfs diagnostics`,
     // so the age it reports is the daemon's own.
@@ -419,6 +424,7 @@ pub fn mount(
     // Before anything can queue work against it: the drain thread below reaches
     // every mount's inode space through this registry, not through `core.state`.
     core.register_state(mountpoint);
+    core.transfers.set_limits(upload_limit, download_limit);
 
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.

@@ -581,6 +581,15 @@ enum SyncCmd {
         #[arg(long)]
         folder: Option<i64>,
     },
+    /// Cap upload and download speed, or show the caps with no options.
+    Limit {
+        /// Upload cap per second, e.g. `500K` or `2M`; `0` removes it.
+        #[arg(long, value_parser = parse_rate)]
+        up: Option<u64>,
+        /// Download cap per second, e.g. `500K` or `2M`; `0` removes it.
+        #[arg(long, value_parser = parse_rate)]
+        down: Option<u64>,
+    },
     /// List uploads and changes not yet on Proton Drive.
     Queue,
     /// Retry a queued operation now (by id from `sync queue`), or every failed one.
@@ -907,6 +916,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Queue => return cmd_sync_queue(),
+        SyncCmd::Limit { up, down } => return cmd_sync_limit(up, down),
         SyncCmd::Retry { id } => ok_or_bail(control_request(CtlRequest::RetryPendingOp { id })?)?,
         SyncCmd::Resume { folder: None } => {
             ok_or_bail(control_request(CtlRequest::SetSyncPaused {
@@ -1845,6 +1855,8 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         pdfs_fuse::MountOptions {
             username,
             sweep_mode: config.resolved_conflict_sweep(),
+            upload_limit: config.upload_limit.unwrap_or(0),
+            download_limit: config.download_limit.unwrap_or(0),
         },
     );
 
@@ -2565,6 +2577,47 @@ fn parse_pause_duration(text: &str) -> Result<u64, String> {
     }
 }
 
+/// Read a bytes-per-second rate: a whole number with an optional `K`, `M` or
+/// `G` suffix in the same binary units `human_bytes` prints.
+fn parse_rate(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, scale) = match text.char_indices().last() {
+        Some((at, 'K' | 'k')) => (&text[..at], 1024),
+        Some((at, 'M' | 'm')) => (&text[..at], 1_048_576),
+        Some((at, 'G' | 'g')) => (&text[..at], 1_073_741_824),
+        _ => (text, 1),
+    };
+    number
+        .parse::<u64>()
+        .map(|n| n.saturating_mul(scale))
+        .map_err(|_| "use a whole number with an optional K, M or G, e.g. 2M".to_string())
+}
+
+fn human_rate(rate: u64) -> String {
+    if rate == 0 {
+        "unlimited".to_string()
+    } else {
+        format!("{}/s", human_bytes(rate))
+    }
+}
+
+/// `pdfs sync limit`: set the bandwidth caps, keeping whichever one is not
+/// given, or print both when neither is.
+fn cmd_sync_limit(up: Option<u64>, down: Option<u64>) -> Result<()> {
+    let config = AppDirs::new()?.load_config();
+    let upload = up.or(config.upload_limit).unwrap_or(0);
+    let download = down.or(config.download_limit).unwrap_or(0);
+    if up.is_none() && down.is_none() {
+        println!("Upload     {}", human_rate(upload));
+        println!("Download   {}", human_rate(download));
+        return Ok(());
+    }
+    ok_or_bail(control_request(CtlRequest::SetBandwidthLimits {
+        upload,
+        download,
+    })?)
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3054,6 +3107,18 @@ mod pause_tests {
         assert!(parse_pause_duration("h").is_err());
         assert!(parse_pause_duration("-1h").is_err());
         assert!(parse_pause_duration("1ä").is_err());
+    }
+
+    #[test]
+    fn rates_read_plain_bytes_and_binary_suffixes() {
+        assert_eq!(parse_rate("0"), Ok(0));
+        assert_eq!(parse_rate("1500"), Ok(1500));
+        assert_eq!(parse_rate("500K"), Ok(512_000));
+        assert_eq!(parse_rate("2m"), Ok(2_097_152));
+        assert!(parse_rate("").is_err());
+        assert!(parse_rate("M").is_err());
+        assert!(parse_rate("1.5M").is_err());
+        assert!(parse_rate("2MB").is_err());
     }
 }
 

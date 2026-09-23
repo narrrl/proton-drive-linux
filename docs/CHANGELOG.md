@@ -31,6 +31,10 @@ Schema: **30** (unchanged).
   straight away. `pdfs sync pause --folder <id>` / `pdfs sync resume --folder <id>` do the same, and
   `pdfs sync list` marks paused folders. The pause is kept across restarts. On-demand folders
   upload through the shared queue, so only the global pause holds them back.
+- **Bandwidth limits.** Preferences → General → Network caps upload and download speed in MiB/s,
+  shared by every transfer and applied to running ones from their next block; downloads include
+  reads through the mount. `pdfs sync limit --up 2M --down 0` does the same, and `pdfs sync limit`
+  on its own prints the current caps. The caps are kept in `config.json` across restarts.
 
 ### Changed
 - **New app shell.** Every page has its own header bar; the sidebar ends in a footer with sync
