@@ -419,6 +419,21 @@ pub(crate) fn read_exif(path: &str) -> ExifInfo {
             .get_field(tag, exif::In::PRIMARY)
             .map(|f| f.display_value().with_unit(&reader).to_string())
     };
+    // Text tags, without the quotes `display_value` wraps each string in and
+    // the NUL padding some cameras leave behind.
+    let ascii = |tag: exif::Tag| {
+        let field = reader.get_field(tag, exif::In::PRIMARY)?;
+        let exif::Value::Ascii(parts) = &field.value else {
+            return None;
+        };
+        let text = parts
+            .iter()
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+        (!text.is_empty()).then(|| text.to_string())
+    };
 
     if let Some(size) = field(exif::Tag::PixelXDimension)
         .zip(field(exif::Tag::PixelYDimension))
@@ -428,33 +443,41 @@ pub(crate) fn read_exif(path: &str) -> ExifInfo {
         // Translators: label of a photo's pixel dimensions in the details panel.
         fields.push((gettext("Dimensions"), size));
     }
-    if let Some(taken) = field(exif::Tag::DateTimeOriginal) {
+    if let Some(taken) = ascii(exif::Tag::DateTimeOriginal) {
         // Translators: label of when a photo was taken, in the details panel.
         fields.push((pgettext("photo property", "Taken"), taken));
     }
 
-    let camera = [exif::Tag::Make, exif::Tag::Model]
-        .iter()
-        .filter_map(|tag| field(*tag))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !camera.is_empty() {
+    if let Some(camera) = camera_name(ascii(exif::Tag::Make), ascii(exif::Tag::Model)) {
         // Translators: label of the camera model in a photo's details panel.
         fields.push((gettext("Camera"), camera));
     }
-    if let Some(lens) = field(exif::Tag::LensModel) {
+    if let Some(lens) = ascii(exif::Tag::LensModel) {
         // Translators: label of the lens model in a photo's details panel.
         fields.push((gettext("Lens"), lens));
     }
 
+    let shutter = reader
+        .get_field(exif::Tag::ExposureTime, exif::In::PRIMARY)
+        .and_then(|f| match &f.value {
+            exif::Value::Rational(r) => r.first().map(|r| r.to_f64()),
+            _ => None,
+        })
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(format_shutter);
+    let iso = reader
+        .get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        // Translators: a photo's ISO sensitivity, such as "ISO 400".
+        .map(|n| gettext_f("ISO {value}", &[("value", &n.to_string())]));
     let exposure: Vec<String> = [
-        exif::Tag::FNumber,
-        exif::Tag::ExposureTime,
-        exif::Tag::PhotographicSensitivity,
-        exif::Tag::FocalLength,
+        field(exif::Tag::FNumber),
+        shutter,
+        iso,
+        field(exif::Tag::FocalLength),
     ]
-    .iter()
-    .filter_map(|tag| field(*tag))
+    .into_iter()
+    .flatten()
     .collect();
     if !exposure.is_empty() {
         // Translators: label of aperture, shutter speed, ISO and focal length in a photo's details panel.
@@ -477,6 +500,29 @@ pub(crate) fn read_exif(path: &str) -> ExifInfo {
     }
 
     ExifInfo { fields, coords }
+}
+
+/// "Google Pixel 6" from Make "Google" and Model "Pixel 6", but just "Canon EOS
+/// R5" where the model already names the maker.
+fn camera_name(make: Option<String>, model: Option<String>) -> Option<String> {
+    match (make, model) {
+        (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            Some(model)
+        }
+        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+        (make, model) => make.or(model),
+    }
+}
+
+/// A shutter speed the way cameras print it: "1/250 s" below a second, "2.5 s"
+/// from one up.
+fn format_shutter(seconds: f64) -> String {
+    if seconds >= 0.95 {
+        let text = format!("{seconds:.1}");
+        format!("{} s", text.strip_suffix(".0").unwrap_or(&text))
+    } else {
+        format!("1/{} s", (1.0 / seconds).round())
+    }
 }
 
 /// Convert one GPS coordinate from EXIF's degrees/minutes/seconds rationals to
@@ -1019,8 +1065,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     info_panel.set_width_request(320);
     info_panel.append(&info_scroll);
 
+    // Set explicitly: the title's hexpand would otherwise propagate up and have
+    // the revealer take half the window even while it is closed.
     let info_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
+        .hexpand(false)
         .child(&info_panel)
         .build();
 
@@ -1425,7 +1474,27 @@ pub(crate) fn over_photo(picture: &gtk4::Picture, x: f64, y: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{named_link, position_label};
+    use super::{camera_name, format_shutter, named_link, position_label};
+
+    #[test]
+    fn shutter_speeds_read_like_a_camera() {
+        assert_eq!(format_shutter(1.0 / 18.869_704_689_121_615), "1/19 s");
+        assert_eq!(format_shutter(0.001), "1/1000 s");
+        assert_eq!(format_shutter(2.5), "2.5 s");
+        assert_eq!(format_shutter(1.0), "1 s");
+    }
+
+    #[test]
+    fn camera_name_does_not_repeat_the_maker() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(camera_name(s("Google"), s("Pixel 6")), s("Google Pixel 6"));
+        assert_eq!(
+            camera_name(s("Canon"), s("Canon EOS R5")),
+            s("Canon EOS R5")
+        );
+        assert_eq!(camera_name(None, s("iPhone 15")), s("iPhone 15"));
+        assert_eq!(camera_name(None, None), None);
+    }
 
     #[test]
     fn the_counter_counts_the_library_while_pages_are_left() {

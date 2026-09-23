@@ -157,10 +157,12 @@ pub(crate) struct GalleryState {
     pub(crate) thumb_source: RefCell<Option<glib::SourceId>>,
     pub(crate) relayout_source: RefCell<Option<glib::SourceId>>,
     /// The rows currently realised by the ListView, as row index -> the uid of
-    /// its first photo (absent for a heading row). A resize or a zoom step
-    /// changes how many tiles fit per row, so the row model has to be rebuilt —
-    /// this is what lets the rebuild put the user back where they were.
-    pub(crate) bound: RefCell<BTreeMap<u32, Option<String>>>,
+    /// its first photo (absent for a heading row) and the row's widget. A
+    /// resize or a zoom step changes how many tiles fit per row, so the row
+    /// model has to be rebuilt — this is what lets the rebuild put the user
+    /// back where they were. The ListView realises rows beyond both edges of
+    /// the viewport, so the widget is what tells which of them is on screen.
+    pub(crate) bound: RefCell<BTreeMap<u32, (Option<String>, gtk4::Box)>>,
     /// The ListView itself, so a rebuild can scroll back to the row the user was
     /// looking at.
     pub(crate) list: gtk4::ListView,
@@ -434,7 +436,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .halign(gtk4::Align::End)
         .margin_top(12)
         .margin_bottom(12)
-        .margin_end(4)
+        // Clear of the overlay scrollbar, which widens under the pointer.
+        .margin_end(18)
         .tooltip_text(gettext("Jump to a month"))
         .visible(false)
         .build();
@@ -900,7 +903,7 @@ pub(crate) fn wire_gallery(
             .gallery
             .bound
             .borrow_mut()
-            .insert(item.position(), row.anchor());
+            .insert(item.position(), (row.anchor(), row_box.clone()));
     });
 
     // ListView recycles row widgets, so a scrolled-away row must give up its
@@ -2004,7 +2007,7 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
 /// rebuilt. What that would cost the user is their scroll position, so the
 /// topmost realised row's first photo is remembered and scrolled back to.
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
-    let anchor: Option<String> = ui.gallery.bound.borrow().values().flatten().next().cloned();
+    let anchor = top_anchor(ui);
     repaint_gallery(ui);
     let Some(anchor) = anchor else { return };
     let Some(row) = row_of_photo(&ui.gallery.groups, &anchor) else {
@@ -2013,6 +2016,30 @@ pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
     ui.gallery
         .list
         .scroll_to(row, gtk4::ListScrollFlags::empty(), None);
+}
+
+/// The first photo of the topmost photo row that reaches into the viewport.
+///
+/// Not simply the first bound row: the ListView keeps rows bound well outside
+/// the viewport (unmapped, with their last allocation), and scrolling one of
+/// those "back" to the top is a jump. Falls back to the first bound photo row
+/// while the list isn't on screen.
+fn top_anchor(ui: &Rc<Ui>) -> Option<String> {
+    let list = &ui.gallery.list;
+    let bound = ui.gallery.bound.borrow();
+    let mut photo_rows = bound
+        .values()
+        .filter_map(|(uid, row)| uid.as_ref().map(|uid| (uid, row)));
+    let first = photo_rows.clone().next().map(|(uid, _)| uid.clone());
+    photo_rows
+        .find(|(_, row)| {
+            row.is_mapped()
+                && row
+                    .compute_bounds(list)
+                    .is_some_and(|rect| rect.y() + rect.height() > 0.0)
+        })
+        .map(|(uid, _)| uid.clone())
+        .or(first)
 }
 
 /// Which row of the rendered model holds `uid`, if any.
@@ -2329,7 +2356,7 @@ fn sync_scrubber_position(ui: &Rc<Ui>) {
     if ui.gallery.scrubbing.get() || !ui.gallery.scrubber.is_visible() {
         return;
     }
-    let Some(uid) = ui.gallery.bound.borrow().values().flatten().next().cloned() else {
+    let Some(uid) = top_anchor(ui) else {
         return;
     };
     let Some(capture_time) = find_photo_index(&ui.gallery.model, &uid)
