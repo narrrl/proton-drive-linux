@@ -31,7 +31,21 @@ pub(crate) struct GalleryState {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
-    pub(crate) more: gtk4::Button,
+    /// Spins under the timeline while the next page is loading.
+    pub(crate) pager: gtk4::Spinner,
+    /// The month scrubber on the timeline's right edge, the months it spans
+    /// (newest first), and whether the pointer is on it — while it is, the
+    /// scroll position must not move the knob out from under the drag.
+    pub(crate) scrubber: gtk4::Scale,
+    pub(crate) months: RefCell<Vec<PhotoMonth>>,
+    pub(crate) scrubbing: Cell<bool>,
+    /// The pending jump the scrubber debounces to.
+    pub(crate) scrub_source: RefCell<Option<glib::SourceId>>,
+    /// A scrubber jump in progress: the end of the month it is headed for.
+    /// Pages keep loading until a photo older than this is in the model.
+    pub(crate) jump: Cell<Option<i64>>,
+    /// Makes the next page [`JUMP_PAGE`] long, for a jump that has far to go.
+    pub(crate) burst: Cell<bool>,
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
     pub(crate) upload: gtk4::Button,
@@ -166,6 +180,13 @@ pub(crate) struct GalleryState {
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
 pub(crate) const PHOTOS_PAGE: usize = 200;
 
+/// Page length while a scrubber jump is loading its way to a month — the
+/// daemon's cap on one reply.
+pub(crate) const JUMP_PAGE: usize = 1000;
+
+/// How long the scrubber has to rest on a month before the timeline jumps.
+const SCRUB_DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// Gallery row height in px: the zoom range, its default, and the step one
 /// Ctrl+scroll notch (or Ctrl+±) moves it by. A justified row is scaled to the
 /// content width once it is full, so this is the *target* a row lands near
@@ -297,7 +318,8 @@ pub(crate) struct GalleryWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) title: adw::WindowTitle,
-    pub(crate) more: gtk4::Button,
+    pub(crate) pager: gtk4::Spinner,
+    pub(crate) scrubber: gtk4::Scale,
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
     pub(crate) list: gtk4::ListView,
@@ -391,15 +413,30 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     status.add_css_class("compact");
 
-    // Kept as an explicit fallback: the timeline also pages itself in as the
-    // scroll nears the bottom (see [`wire_gallery`]), so reaching this button at
-    // all is unusual.
-    let more = gtk4::Button::builder()
-        .label("Load more")
+    // The timeline pages itself in as the scroll nears the bottom (see
+    // [`wire_gallery`]); this only says a page is on its way.
+    let pager = gtk4::Spinner::builder()
         .halign(gtk4::Align::Center)
+        .margin_bottom(6)
+        .visible(false)
         .build();
-    more.add_css_class("pill");
-    more.set_visible(false);
+
+    // Month scrubber: newest at the top, a mark per year. Dragging it jumps
+    // the timeline to the month under the knob (see [`wire_gallery`]).
+    let scrubber = gtk4::Scale::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .adjustment(&gtk4::Adjustment::new(0.0, 0.0, 1.0, 1.0, 1.0, 0.0))
+        .draw_value(false)
+        .value_pos(gtk4::PositionType::Left)
+        .round_digits(0)
+        .halign(gtk4::Align::End)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_end(4)
+        .tooltip_text("Jump to a month")
+        .visible(false)
+        .build();
+    scrubber.add_css_class("photo-scrubber");
 
     // Horizontal scrolling is never wanted: the grid is sized to the viewport
     // width, and a stray hscrollbar would fight the layout.
@@ -566,8 +603,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&select_bar);
-    timeline.append(&scroll);
-    timeline.append(&more);
+    let timeline_overlay = gtk4::Overlay::builder().child(&scroll).build();
+    timeline_overlay.add_overlay(&scrubber);
+    timeline.append(&timeline_overlay);
+    timeline.append(&pager);
 
     // The album grid: cover-first cards that flow to the width they are given.
     let albums = gtk4::FlowBox::builder()
@@ -644,7 +683,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             content,
             status,
             title,
-            more,
+            pager,
+            scrubber,
             import_banner,
             list,
             scroll,
@@ -731,6 +771,7 @@ pub(crate) fn refresh_photo_months(ui: &Rc<Ui>) {
         };
         let mut labels = vec!["All dates".to_string()];
         let mut ranges: Vec<Option<(i64, i64)>> = vec![None];
+        fill_scrubber(&ui, &months);
         for m in months {
             let name = MONTH_NAMES
                 .get((m.month - 1) as usize)
@@ -886,20 +927,21 @@ pub(crate) fn wire_gallery(
         }
     });
 
-    // Page the timeline in as the scroll nears the end, so "load more" is a
-    // fallback button rather than something the user has to hunt for.
+    // Page the timeline in while the user is still a screen and a half from the
+    // end, so scrolling at a normal pace never reaches it.
     let ui_scroll = ui.clone();
     scroll.vadjustment().connect_value_changed(move |adj| {
         let last = ui_scroll.gallery.scroll_offset.replace(adj.value());
         if (adj.value() - last).abs() > 1.0 {
             ui_scroll.gallery.scrolling_down.set(adj.value() > last);
         }
-        let near_end = adj.value() + adj.page_size() >= adj.upper() - adj.page_size() * 0.5;
-        if near_end && ui_scroll.gallery.more.is_visible() && ui_scroll.gallery.more.is_sensitive()
-        {
+        let near_end = adj.value() + adj.page_size() >= adj.upper() - adj.page_size() * 1.5;
+        if near_end && ui_scroll.gallery.has_more.get() {
             load_gallery(&ui_scroll, true);
         }
+        sync_scrubber_position(&ui_scroll);
     });
+    wire_scrubber(ui);
 
     // Ctrl+scroll zoom. Capture phase so the ScrolledWindow doesn't eat the event
     // and scroll the page out from under the gesture.
@@ -951,11 +993,6 @@ pub(crate) fn wire_gallery(
         glib::Propagation::Stop
     });
     list.add_controller(zoom_keys);
-
-    let ui_more = ui.clone();
-    ui.gallery.more.clone().connect_clicked(move |_| {
-        load_gallery(&ui_more, true);
-    });
 
     let ui_select = ui.clone();
     ui.gallery.select_btn.clone().connect_toggled(move |btn| {
@@ -2186,6 +2223,192 @@ pub(crate) fn empty_timeline_text(
     }
 }
 
+/// Point the scrubber at `months` (newest first): one step per month, with a
+/// mark and a year label where each year starts. Shown only for the whole,
+/// unfiltered timeline with more than one month to move between.
+fn fill_scrubber(ui: &Rc<Ui>, months: &[PhotoMonth]) {
+    let scrubber = &ui.gallery.scrubber;
+    scrubber.clear_marks();
+    *ui.gallery.months.borrow_mut() = months.to_vec();
+    scrubber.set_range(0.0, months.len().saturating_sub(1).max(1) as f64);
+    scrubber.set_value(0.0);
+    for (index, pair) in months.windows(2).enumerate() {
+        if pair[0].year != pair[1].year {
+            scrubber.add_mark(
+                (index + 1) as f64,
+                gtk4::PositionType::Left,
+                Some(&pair[1].year.to_string()),
+            );
+        }
+    }
+    sync_scrubber(ui);
+}
+
+/// Show the scrubber only where a month jump makes sense: the whole timeline,
+/// not an album, a date window or the favorites.
+pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
+    let whole = ui.gallery.album.borrow().is_none()
+        && ui.gallery.range.get().is_none()
+        && !ui.gallery.favorites.get();
+    ui.gallery
+        .scrubber
+        .set_visible(whole && ui.gallery.months.borrow().len() > 1);
+}
+
+/// "March 2024" for the scrubber's month `index`.
+fn scrubber_label(months: &[PhotoMonth], index: usize) -> String {
+    months.get(index).map_or_else(String::new, |m| {
+        let name = MONTH_NAMES
+            .get((m.month - 1) as usize)
+            .copied()
+            .unwrap_or("?");
+        format!("{name} {}", m.year)
+    })
+}
+
+/// Move the knob to the month at the top of the timeline, unless the user is
+/// holding it.
+fn sync_scrubber_position(ui: &Rc<Ui>) {
+    if ui.gallery.scrubbing.get() || !ui.gallery.scrubber.is_visible() {
+        return;
+    }
+    let Some(uid) = ui.gallery.bound.borrow().values().flatten().next().cloned() else {
+        return;
+    };
+    let Some(capture_time) = find_photo_index(&ui.gallery.model, &uid)
+        .and_then(|idx| ui.gallery.model.item(idx))
+        .and_downcast::<BoxedAnyObject>()
+        .map(|boxed| boxed.borrow::<PhotoItem>().capture_time)
+    else {
+        return;
+    };
+    let months = ui.gallery.months.borrow();
+    if let Some(index) = month_index(&months, capture_time) {
+        ui.gallery.scrubber.set_value(index as f64);
+    }
+}
+
+/// Which of `months` (newest first) `capture_time` falls in; the nearest one
+/// when it falls between them.
+pub(crate) fn month_index(months: &[PhotoMonth], capture_time: i64) -> Option<usize> {
+    let position = months
+        .iter()
+        .position(|m| month_range(m.year, m.month).is_some_and(|(from, _)| capture_time >= from));
+    match position {
+        Some(index) => Some(index),
+        None => months.len().checked_sub(1),
+    }
+}
+
+/// Wire the scrubber: its value label while the pointer is on it, and the
+/// jump once it rests on a month.
+fn wire_scrubber(ui: &Rc<Ui>) {
+    let scrubber = ui.gallery.scrubber.clone();
+    let ui_format = ui.clone();
+    scrubber.set_format_value_func(move |_, value| {
+        scrubber_label(&ui_format.gallery.months.borrow(), value.round() as usize)
+    });
+
+    let hover = gtk4::EventControllerMotion::new();
+    let ui_enter = ui.clone();
+    hover.connect_enter(move |_, _, _| {
+        ui_enter.gallery.scrubbing.set(true);
+        ui_enter.gallery.scrubber.set_draw_value(true);
+    });
+    let ui_leave = ui.clone();
+    hover.connect_leave(move |_| {
+        ui_leave.gallery.scrubbing.set(false);
+        ui_leave.gallery.scrubber.set_draw_value(false);
+    });
+    scrubber.add_controller(hover);
+
+    // `change-value` fires for the user's own moves only, not for the knob
+    // following the scroll.
+    let ui_change = ui.clone();
+    scrubber.connect_change_value(move |_, _, value| {
+        if let Some(source) = ui_change.gallery.scrub_source.borrow_mut().take() {
+            source.remove();
+        }
+        let index = value.round().max(0.0) as usize;
+        let ui_jump = ui_change.clone();
+        let source = glib::timeout_add_local_once(SCRUB_DEBOUNCE, move || {
+            ui_jump.gallery.scrub_source.borrow_mut().take();
+            jump_to_month(&ui_jump, index);
+        });
+        *ui_change.gallery.scrub_source.borrow_mut() = Some(source);
+        glib::Propagation::Proceed
+    });
+}
+
+/// Scroll the timeline to the scrubber's month `index`, loading pages until
+/// its first photo is in.
+fn jump_to_month(ui: &Rc<Ui>, index: usize) {
+    let end = {
+        let months = ui.gallery.months.borrow();
+        months
+            .get(index)
+            .and_then(|m| month_range(m.year, m.month))
+            .map(|(_, to)| to)
+    };
+    ui.gallery.jump.set(end);
+    continue_jump(ui);
+}
+
+/// One step of a scrubber jump: scroll there when the month is loaded, or load
+/// a long page and come back when it lands.
+fn continue_jump(ui: &Rc<Ui>) {
+    let Some(end) = ui.gallery.jump.get() else {
+        return;
+    };
+    let model = &ui.gallery.model;
+    // Newest first, so the month's first photo is the first one older than
+    // its end.
+    let landing = (0..model.n_items()).find(|idx| {
+        model
+            .item(*idx)
+            .and_downcast::<BoxedAnyObject>()
+            .is_some_and(|boxed| boxed.borrow::<PhotoItem>().capture_time < end)
+    });
+    if landing.is_none() && ui.gallery.has_more.get() {
+        let ui_page = ui.clone();
+        ui.gallery
+            .page_waiters
+            .borrow_mut()
+            .push(Box::new(move || continue_jump(&ui_page)));
+        ui.gallery.burst.set(true);
+        load_gallery(ui, true);
+        return;
+    }
+    ui.gallery.jump.set(None);
+    let target = landing.or_else(|| model.n_items().checked_sub(1));
+    let Some(uid) = target
+        .and_then(|idx| model.item(idx))
+        .and_downcast::<BoxedAnyObject>()
+        .map(|boxed| boxed.borrow::<PhotoItem>().uid.clone())
+    else {
+        return;
+    };
+    let Some(row) = row_of_photo(&ui.gallery.groups, &uid) else {
+        return;
+    };
+    // Land on the day heading above the photo when it opens a day.
+    let heading = row
+        .checked_sub(1)
+        .filter(|above| {
+            ui.gallery
+                .groups
+                .item(*above)
+                .and_downcast::<BoxedAnyObject>()
+                .is_some_and(|boxed| {
+                    matches!(*boxed.borrow::<GalleryRow>(), GalleryRow::Heading(_))
+                })
+        })
+        .unwrap_or(row);
+    ui.gallery
+        .list
+        .scroll_to(heading, gtk4::ListScrollFlags::empty(), None);
+}
+
 /// Load the next page when the timeline does not fill the window yet: with no
 /// scrollbar there is no scrolling to trigger it.
 fn fill_viewport(ui: &Rc<Ui>) {
@@ -2194,10 +2417,7 @@ fn fill_viewport(ui: &Rc<Ui>) {
         let Some(adj) = ui.gallery.list.vadjustment() else {
             return;
         };
-        if ui.gallery.more.is_visible()
-            && ui.gallery.more.is_sensitive()
-            && adj.upper() <= adj.page_size() + 1.0
-        {
+        if ui.gallery.has_more.get() && adj.upper() <= adj.page_size() + 1.0 {
             load_gallery(&ui, true);
         }
     });
@@ -2317,21 +2537,24 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         if album.is_none() && ui.gallery.range.get().is_none() {
             refresh_photo_months(ui);
         }
+        sync_scrubber(ui);
     }
     let offset = ui.gallery.model.n_items() as usize;
+    let limit = if ui.gallery.burst.replace(false) {
+        JUMP_PAGE
+    } else {
+        PHOTOS_PAGE
+    };
     ui.gallery.loading.set(true);
-    ui.gallery.more.set_sensitive(false);
+    ui.gallery.pager.set_visible(append);
+    ui.gallery.pager.set_spinning(append);
 
     ui.busy_begin();
     let request = match album {
-        Some(uid) => Request::AlbumPhotos {
-            uid,
-            offset,
-            limit: PHOTOS_PAGE,
-        },
+        Some(uid) => Request::AlbumPhotos { uid, offset, limit },
         None => Request::PhotosTimeline {
             offset,
-            limit: PHOTOS_PAGE,
+            limit,
             kind: ui.gallery.kind.get(),
             range: ui.gallery.range.get(),
             favorites: ui.gallery.favorites.get(),
@@ -2343,7 +2566,8 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         let result = rx.recv().await;
         ui.busy_end();
         ui.gallery.loading.set(false);
-        ui.gallery.more.set_sensitive(true);
+        ui.gallery.pager.set_visible(false);
+        ui.gallery.pager.set_spinning(false);
         // Whoever waited on this page runs once the reply below has put it in
         // the model, whichever way that goes.
         let waiters = std::mem::take(&mut *ui.gallery.page_waiters.borrow_mut());
@@ -2366,7 +2590,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                     );
                     return;
                 }
-                ui.gallery.has_more.set(items.len() == PHOTOS_PAGE);
+                ui.gallery.has_more.set(items.len() == limit);
                 // Label the filter tabs with live per-kind counts.
                 if let Some(counts) = counts {
                     update_gallery_tabs(&ui, counts);
@@ -2427,8 +2651,6 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                     return;
                 }
                 ui.gallery.content.set_visible_child_name("timeline");
-                // Offer "Load more" only when the page came back full.
-                ui.gallery.more.set_visible(items.len() == PHOTOS_PAGE);
                 fill_viewport(&ui);
             }
             // A failed *next* page keeps the photos already on screen — the failure
@@ -2470,7 +2692,7 @@ pub(crate) fn gallery_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     // Only the empty timeline offers a way to fill it; every other status turns
     // those buttons back off.
     ui.gallery.empty_actions.set_visible(false);
-    ui.gallery.more.set_visible(false);
+    ui.gallery.has_more.set(false);
     ui.gallery.content.set_visible_child_name("status");
 }
 
@@ -2515,8 +2737,23 @@ pub(crate) fn play_external(path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::empty_timeline_text;
-    use pdfs_core::control::PhotoKind;
+    use super::{empty_timeline_text, month_index, month_range};
+    use pdfs_core::control::{PhotoKind, PhotoMonth};
+
+    #[test]
+    fn the_scrubber_finds_the_month_a_photo_was_taken_in() {
+        let months = [(2026, 3), (2025, 12), (2025, 11)].map(|(year, month)| PhotoMonth {
+            year,
+            month,
+            count: 1,
+        });
+        let mid = |year, month| month_range(year, month).unwrap().0 + 86_400 * 10;
+        assert_eq!(month_index(&months, mid(2026, 3)), Some(0));
+        assert_eq!(month_index(&months, mid(2025, 12)), Some(1));
+        // A month with no photos of its own lands on the next older one.
+        assert_eq!(month_index(&months, mid(2026, 1)), Some(1));
+        assert_eq!(month_index(&months, mid(2020, 1)), Some(2));
+    }
 
     #[test]
     fn an_empty_filter_names_what_it_filtered() {

@@ -52,6 +52,8 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 .viewer-nav-btn { background-color: rgba(0, 0, 0, 0.45); color: white; margin: 20px; min-width: 44px; min-height: 44px; border-radius: 50%; opacity: 0.7; transition: opacity 150ms ease, background-color 150ms ease; }
 .viewer-nav-btn:hover { background-color: rgba(0, 0, 0, 0.85); color: white; opacity: 1; }
 .viewer-nav-btn:disabled { opacity: 0; }
+.photo-scrubber { min-width: 20px; padding: 0 2px; }
+.photo-scrubber value { font-weight: 600; background-color: var(--popover-bg-color); border-radius: 6px; padding: 2px 8px; }
 .viewer-spinner { color: white; }
 .viewer-status { color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }
 .viewer-info-panel { background-color: var(--window-bg-color); border-left: 1px solid alpha(currentColor, 0.12); }

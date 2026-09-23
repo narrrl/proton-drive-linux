@@ -50,9 +50,10 @@ use pdfs_core::config::{AppDirs, FileSort, FilesView};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
     DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem,
-    PhotoKind, PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder, RestoreItem,
-    RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncPhase,
-    SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem, pending_summary, send,
+    PhotoKind, PhotoMonth, PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder,
+    RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo,
+    SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem,
+    pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -461,7 +462,13 @@ fn build_window(app: &adw::Application) {
             content: gallery_widgets.content.clone(),
             status: gallery_widgets.status.clone(),
             retry: gallery_widgets.retry.clone(),
-            more: gallery_widgets.more.clone(),
+            pager: gallery_widgets.pager.clone(),
+            scrubber: gallery_widgets.scrubber.clone(),
+            months: RefCell::new(Vec::new()),
+            scrubbing: Cell::new(false),
+            scrub_source: RefCell::new(None),
+            jump: Cell::new(None),
+            burst: Cell::new(false),
             import_banner: gallery_widgets.import_banner.clone(),
             upload: gallery_widgets.upload.clone(),
             import: gallery_widgets.import.clone(),

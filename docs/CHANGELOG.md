@@ -99,6 +99,10 @@ Schema: **31** (unchanged).
   covering it. Stepping past the last loaded photo loads the next page, and the counter shows the
   library's total rather than the loaded count. A video plays inline. Save a Copy uses the photo's
   real name and reports failures, and Open With… offers the app chooser.
+- **Photos scroll without a Load More button.** The timeline loads the next page while you are
+  still a screen and a half from the end, with a spinner under it while a page is on its way. A
+  month scrubber on the right edge of the whole timeline, marked by year, jumps to the month you
+  drag it to and follows the scroll otherwise.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 
