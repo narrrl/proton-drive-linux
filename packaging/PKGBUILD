@@ -20,6 +20,7 @@ makedepends=('cargo' 'git' 'gettext')
 provides=('pdfs')
 # Files-on-demand mount + keyring need these at runtime.
 optdepends=('gnome-keyring: credential storage via Secret Service'
+            'ffmpeg: video thumbnails'
             'xdg-utils: "Open folder" action from the tray'
             'fzf: live search-as-you-type launcher (pdfs-prompt --fzf)'
             'foot: terminal for pdfs-prompt --fzf started from a keybinding')

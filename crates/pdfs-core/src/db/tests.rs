@@ -4236,6 +4236,48 @@ fn the_servers_photo_relation_groups_a_live_photo() {
 /// shows every photo — a row with no `group_key` is its own group, which is how
 /// the gallery behaved before the column.
 #[test]
+fn migration_v32_retries_videos_written_off_as_unthumbnailable() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v31-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.photos_replace(&[
+            TimelineRow {
+                name: Some("VID-20260804-WA0023.mp4".into()),
+                ..TimelineRow::new("video", 300)
+            },
+            TimelineRow {
+                name: Some("broken.jpg".into()),
+                ..TimelineRow::new("photo", 200)
+            },
+        ])
+        .unwrap();
+        db.photo_set_thumb("video", THUMB_NONE, None).unwrap();
+        db.photo_set_thumb("photo", THUMB_NONE, None).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("UPDATE sync_state SET value = '31' WHERE key = 'schema_version';")
+            .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let state = |uid: &str| db.photos_by_uid(&[uid.into()]).unwrap()[0].thumb_state;
+    assert_eq!(state("video"), THUMB_UNKNOWN, "the video is tried again");
+    assert_eq!(
+        state("photo"),
+        THUMB_NONE,
+        "an undecodable photo stays written off"
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn migration_v30_leaves_a_v29_timeline_intact() {
     let path = std::env::temp_dir().join(format!(
         "pdfs-db-v29-fixture-{}-{}.db",

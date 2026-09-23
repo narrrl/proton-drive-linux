@@ -1226,6 +1226,9 @@ impl Core {
         // Taken from the descriptor being streamed, so it names the content that
         // actually goes up rather than whatever is at the path when we finish.
         let streamed = LocalSig::from(&meta);
+        let thumbnails = self
+            .upload_thumbnails_async(path.clone(), name.to_string())
+            .await;
         // Count the bytes as they are read, so this upload shows up in
         // `GetQueueStatus` next to a manual one. The uid isn't known until the
         // draft is sealed, so the transfer registers without one.
@@ -1246,7 +1249,7 @@ impl Core {
                 crate::media_type_for(name),
                 reader,
                 meta.len() as i64,
-                Vec::new(),
+                thumbnails,
                 Some(mtime),
                 false,
             )
@@ -1274,6 +1277,9 @@ impl Core {
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
         let streamed = LocalSig::from(&meta);
+        let thumbnails = self
+            .upload_thumbnails_async(path.clone(), base_name(rel).to_string())
+            .await;
         let reader = OwnedCountingReader::new(
             file,
             self.transfers.begin(
@@ -1284,7 +1290,7 @@ impl Core {
             ),
         );
         self.client
-            .upload_new_revision_from(uid, reader, meta.len() as i64, Vec::new(), Some(mtime))
+            .upload_new_revision_from(uid, reader, meta.len() as i64, thumbnails, Some(mtime))
             .await
             .map_err(|e| format!("upload revision {rel}: {e}"))?;
         warn_if_torn(rel, &path, streamed);

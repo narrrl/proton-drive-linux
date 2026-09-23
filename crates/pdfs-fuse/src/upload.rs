@@ -69,6 +69,9 @@ async fn run_uploads(
                     format!("destination access denied: errno {}", error.code()),
                 ));
             }
+            let thumbnails = core
+                .upload_thumbnails_async(t.path.clone(), t.name.clone())
+                .await;
             match core
                 .client
                 .upload_file_from(
@@ -77,7 +80,7 @@ async fn run_uploads(
                     media_type_for(&t.name),
                     reader,
                     t.size as i64,
-                    Vec::new(),
+                    thumbnails,
                     mtime,
                     false,
                 )

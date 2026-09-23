@@ -12,8 +12,8 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -25,8 +25,8 @@ use pdfs_core::db::{self, StoredPhoto};
 use pdfs_core::{CoreError, CoreResult};
 
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{NodeKind, PhotoTag, PhotoTagsUpdate, ThumbnailType};
-use tracing::{info, warn};
+use proton_drive_rs::{NodeKind, PhotoTag, PhotoTagsUpdate, Thumbnail, ThumbnailType};
+use tracing::{debug, info, warn};
 
 use super::{
     Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, WriteAuthority,
@@ -55,6 +55,20 @@ const THUMB_CANCEL_POLL: Duration = Duration::from_millis(100);
 const EXIFTOOL_TIMEOUT: Duration = Duration::from_secs(20);
 static RAW_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static EXIFTOOL_MISSING_WARNING: Once = Once::new();
+static FFMPEG_MISSING_WARNING: Once = Once::new();
+/// Largest video downloaded whole to grab one frame for its thumbnail. The
+/// download lands in memory, so a long 4K recording is left without one.
+const VIDEO_THUMB_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// A single frame is seconds of work even for 4K; this only stops a wedged
+/// ffmpeg from holding a thumbnail permit.
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest thumbnail attached to an upload. Proton's own clients hold theirs to
+/// this, stepping the JPEG quality down until it fits.
+const UPLOAD_THUMB_MAX_BYTES: usize = 60 * 1024;
+/// JPEG qualities tried, in order, for an upload thumbnail over that size.
+const UPLOAD_THUMB_QUALITIES: [u8; 4] = [65, 50, 35, 20];
+/// Largest still image read whole to render the thumbnail its upload carries.
+const UPLOAD_IMAGE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The aspect ratio (w/h) of an encoded image, read from its header alone — no
 /// pixels are decoded. `None` when the format is unknown or the header is torn.
@@ -90,7 +104,8 @@ struct RawPreviewUnavailable;
 /// the photo will never have a thumbnail, and only that verdict is persisted.
 enum ThumbAttempt {
     Made(GeneratedThumb),
-    /// Decoded nothing — a format this build has no decoder for. Permanent.
+    /// Decoded nothing — a format this build has no decoder for, or a video
+    /// too large to fetch for one frame. Permanent.
     Undecodable,
     /// The photo couldn't be downloaded. Transient: try again next time.
     Unavailable,
@@ -196,6 +211,11 @@ fn scale_thumbnail_with_exiftool(
         }
         None => return ScaleAttempt::Undecodable,
     };
+    encode_thumb(&image)
+}
+
+/// Shrink a decoded image to a [`THUMB_EDGE`] JPEG, keeping its aspect ratio.
+fn encode_thumb(image: &image::DynamicImage) -> ScaleAttempt {
     let (width, height) = (image.width(), image.height());
     if width == 0 || height == 0 {
         return ScaleAttempt::Undecodable;
@@ -268,9 +288,69 @@ impl Drop for RawTempFile {
     }
 }
 
-/// Run one bounded exiftool JSON query while draining stdout concurrently. The
-/// latter matters for full-size `JpgFromRaw` fallbacks, whose base64 can exceed a
-/// pipe buffer long before the child exits.
+/// How a bounded helper run failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolError {
+    /// The helper isn't installed.
+    Missing,
+    /// It couldn't be started or read, or overran its budget and was killed.
+    Unavailable,
+    /// It ran and exited non-zero.
+    Failed,
+}
+
+/// Run a helper to completion within `timeout` and return its stdout, drained
+/// concurrently. The latter matters for exiftool's full-size `JpgFromRaw`
+/// fallbacks and for ffmpeg's frames, either of which can exceed a pipe buffer
+/// long before the child exits.
+fn run_bounded(mut command: Command, timeout: Duration) -> Result<Vec<u8>, ToolError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ToolError::Missing
+        } else {
+            ToolError::Unavailable
+        }
+    })?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ToolError::Unavailable);
+    };
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status.success()),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let output = reader
+        .join()
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(ToolError::Unavailable)?;
+    match status {
+        Some(true) => Ok(output),
+        Some(false) => Err(ToolError::Failed),
+        None => Err(ToolError::Unavailable),
+    }
+}
+
+/// Run one bounded exiftool JSON query.
 fn exiftool_query(
     exiftool: &OsStr,
     path: &Path,
@@ -280,56 +360,170 @@ fn exiftool_query(
     let mut command = Command::new(exiftool);
     command.args(["-j", "-b", "-n"]);
     command.args(tags);
-    command
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                EXIFTOOL_MISSING_WARNING.call_once(|| {
-                    warn!(
-                        "exiftool is not installed; camera RAW thumbnails are unavailable \
-                         (Debian/Ubuntu: libimage-exiftool-perl)"
-                    );
-                });
-            }
-            return Err(RawPreviewUnavailable);
+    command.arg(path);
+    let output = run_bounded(command, timeout).map_err(|error| {
+        if error == ToolError::Missing {
+            EXIFTOOL_MISSING_WARNING.call_once(|| {
+                warn!(
+                    "exiftool is not installed; camera RAW thumbnails are unavailable \
+                     (Debian/Ubuntu: libimage-exiftool-perl)"
+                );
+            });
         }
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(RawPreviewUnavailable);
-    };
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let started = Instant::now();
-    let success = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    let output = reader
-        .join()
-        .ok()
-        .and_then(Result::ok)
-        .ok_or(RawPreviewUnavailable)?;
-    if !success {
-        return Err(RawPreviewUnavailable);
-    }
+        RawPreviewUnavailable
+    })?;
     serde_json::from_slice(&output).map_err(|_| RawPreviewUnavailable)
+}
+
+/// Whether `name` is a video, whose thumbnail is a frame ffmpeg grabs rather
+/// than a picture the image decoder can scale.
+fn is_video_name(name: &str) -> bool {
+    PhotoKind::classify(Some(name), None) == PhotoKind::Video
+}
+
+/// Whether ffmpeg can be run at all. Asked once, before a video is downloaded:
+/// without ffmpeg every scroll past a video would fetch it whole for nothing.
+fn ffmpeg_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let mut command = Command::new("ffmpeg");
+        command.arg("-version");
+        let available = run_bounded(command, Duration::from_secs(5)).is_ok();
+        if !available {
+            warn_ffmpeg_missing();
+        }
+        available
+    })
+}
+
+fn warn_ffmpeg_missing() {
+    FFMPEG_MISSING_WARNING.call_once(|| {
+        warn!("ffmpeg is not installed; video thumbnails are unavailable");
+    });
+}
+
+/// A thumbnail from one frame of a downloaded video, which ffmpeg reads from a
+/// staging copy. See [`video_file_thumbnail`].
+fn video_thumbnail(
+    bytes: &[u8],
+    name: &str,
+    staging_dir: &Path,
+    ffmpeg: &OsStr,
+    timeout: Duration,
+) -> ScaleAttempt {
+    let Some(file) = RawTempFile::create_in(staging_dir, bytes, name) else {
+        return ScaleAttempt::Unavailable;
+    };
+    video_file_thumbnail(&file.0, ffmpeg, timeout)
+}
+
+/// A thumbnail from one frame of the video at `path`. A second in, past the
+/// black lead-in most clips open on, and the first frame for a clip shorter than
+/// that. ffmpeg applies the clip's rotation, so a portrait phone video comes out
+/// upright.
+///
+/// Missing or wedged ffmpeg is retryable; a file ffmpeg can take no frame from
+/// is the permanent verdict.
+fn video_file_thumbnail(path: &Path, ffmpeg: &OsStr, timeout: Duration) -> ScaleAttempt {
+    for seek in ["1", "0"] {
+        let mut command = Command::new(ffmpeg);
+        command.args(["-nostdin", "-loglevel", "error", "-ss", seek, "-i"]);
+        command.arg(path);
+        command.args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-"]);
+        match run_bounded(command, timeout) {
+            Ok(frame) if !frame.is_empty() => {
+                return match image::load_from_memory(&frame) {
+                    Ok(image) => encode_thumb(&image),
+                    Err(_) => ScaleAttempt::Undecodable,
+                };
+            }
+            // No frame that far in: try from the start.
+            Ok(_) | Err(ToolError::Failed) => continue,
+            Err(ToolError::Missing) => {
+                warn_ffmpeg_missing();
+                return ScaleAttempt::Unavailable;
+            }
+            Err(ToolError::Unavailable) => return ScaleAttempt::Unavailable,
+        }
+    }
+    ScaleAttempt::Undecodable
+}
+
+/// The thumbnail to attach to an upload of the local file at `path`, which is
+/// named `name` in Drive. Without one, Drive's own apps show a generic icon and
+/// the gallery has to download the whole file to make its own.
+///
+/// Best effort: a file that isn't an image or a video, is too large to read, or
+/// can't be decoded uploads without a thumbnail, as it always did. Blocking and
+/// CPU-bound, so async callers run it on the blocking pool.
+pub(crate) fn upload_thumbnails(path: &Path, name: &str, staging_dir: &Path) -> Vec<Thumbnail> {
+    if is_video_name(name) && !ffmpeg_available() {
+        return Vec::new();
+    }
+    upload_thumbnails_with(path, name, staging_dir, OsStr::new("ffmpeg"))
+}
+
+fn upload_thumbnails_with(
+    path: &Path,
+    name: &str,
+    staging_dir: &Path,
+    ffmpeg: &OsStr,
+) -> Vec<Thumbnail> {
+    let attempt = if is_video_name(name) {
+        if !is_video_file(path, name) {
+            return Vec::new();
+        }
+        video_file_thumbnail(path, ffmpeg, FFMPEG_TIMEOUT)
+    } else if is_thumbnail_image_name(name) {
+        let fits = std::fs::metadata(path).is_ok_and(|meta| meta.len() <= UPLOAD_IMAGE_MAX_BYTES);
+        let Some(bytes) = fits.then(|| std::fs::read(path).ok()).flatten() else {
+            return Vec::new();
+        };
+        scale_thumbnail(&bytes, name, staging_dir)
+    } else {
+        return Vec::new();
+    };
+    let ScaleAttempt::Made(thumb) = attempt else {
+        debug!(name, "uploading without a thumbnail; none could be made");
+        return Vec::new();
+    };
+    fit_upload_thumb(thumb.bytes)
+        .and_then(|bytes| Thumbnail::new(ThumbnailType::Thumbnail, bytes).ok())
+        .into_iter()
+        .collect()
+}
+
+/// `.ts` is TypeScript as often as it is an MPEG transport stream, so a source
+/// tree must not cost an ffmpeg run per file. A transport stream opens on its
+/// 0x47 sync byte; every other video extension is taken at its word.
+fn is_video_file(path: &Path, name: &str) -> bool {
+    if !name.to_ascii_lowercase().ends_with(".ts") {
+        return true;
+    }
+    let mut first = [0u8; 1];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut first))
+        .is_ok_and(|()| first[0] == 0x47)
+}
+
+/// Re-encode a thumbnail at falling quality until it fits
+/// [`UPLOAD_THUMB_MAX_BYTES`], and at half the size if even the lowest quality
+/// doesn't. `None` if nothing fits.
+fn fit_upload_thumb(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.len() <= UPLOAD_THUMB_MAX_BYTES {
+        return Some(bytes);
+    }
+    let image = image::load_from_memory(&bytes).ok()?;
+    let half = image.thumbnail(image.width() / 2, image.height() / 2);
+    [image.to_rgb8(), half.to_rgb8()].iter().find_map(|image| {
+        UPLOAD_THUMB_QUALITIES.iter().find_map(|&quality| {
+            let mut smaller = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut smaller, quality)
+                .encode_image(image)
+                .ok()?;
+            (smaller.len() <= UPLOAD_THUMB_MAX_BYTES).then_some(smaller)
+        })
+    })
 }
 
 fn exiftool_object(
@@ -418,6 +612,24 @@ struct PhotoMeta {
 }
 
 impl Core {
+    /// [`upload_thumbnails`] for a file about to upload, staging any RAW copy
+    /// under this cache. Blocking.
+    pub(crate) fn upload_thumbnails(&self, path: &Path, name: &str) -> Vec<Thumbnail> {
+        upload_thumbnails(path, name, self.cache.raw_thumbnail_staging_dir())
+    }
+
+    /// [`Core::upload_thumbnails`] on the blocking pool, for async callers.
+    pub(crate) async fn upload_thumbnails_async(
+        &self,
+        path: PathBuf,
+        name: String,
+    ) -> Vec<Thumbnail> {
+        let staging_dir = self.cache.raw_thumbnail_staging_dir().to_path_buf();
+        tokio::task::spawn_blocking(move || upload_thumbnails(&path, &name, &staging_dir))
+            .await
+            .unwrap_or_default()
+    }
+
     pub(crate) fn photos_timeline(
         &self,
         offset: usize,
@@ -973,6 +1185,10 @@ impl Core {
                         if !core.thumb_job_current(job) {
                             return (uid, ThumbAttempt::Cancelled);
                         }
+                        let video = is_video_name(&name);
+                        if video && !ffmpeg_available() {
+                            return (uid, ThumbAttempt::Unavailable);
+                        }
 
                         // One shared permit pool bounds all thumbnail batches,
                         // rather than multiplying the limit by every control
@@ -1017,6 +1233,19 @@ impl Core {
                         };
                         if !core.thumb_job_current(job) {
                             return (uid, ThumbAttempt::Cancelled);
+                        }
+
+                        // A video is downloaded whole for one frame, so a long
+                        // recording is not worth it — and would not fit in memory.
+                        if video {
+                            match core.photos().get_node(&uid).await {
+                                Ok(Some(node)) if node_size(&node) > VIDEO_THUMB_MAX_BYTES => {
+                                    info!(%uid, size = node_size(&node), "video too large for a local thumbnail");
+                                    return (uid, ThumbAttempt::Undecodable);
+                                }
+                                Ok(Some(_)) => {}
+                                Ok(None) | Err(_) => return (uid, ThumbAttempt::Unavailable),
+                            }
                         }
 
                         let download_uid = uid.clone();
@@ -1072,7 +1301,17 @@ impl Core {
                         // stall the runtime's worker; hand it to the blocking pool.
                         let staging_dir = core.cache.raw_thumbnail_staging_dir().to_path_buf();
                         let made = tokio::task::spawn_blocking(move || {
-                            scale_thumbnail(&bytes, &name, &staging_dir)
+                            if video {
+                                video_thumbnail(
+                                    &bytes,
+                                    &name,
+                                    &staging_dir,
+                                    OsStr::new("ffmpeg"),
+                                    FFMPEG_TIMEOUT,
+                                )
+                            } else {
+                                scale_thumbnail(&bytes, &name, &staging_dir)
+                            }
                         })
                         .await
                         .unwrap_or(ScaleAttempt::Unavailable);
@@ -1592,10 +1831,12 @@ impl Core {
 #[cfg(test)]
 mod thumb_tests {
     use super::{
-        RawTempFile, ScaleAttempt, THUMB_EDGE, exiftool_binary, ratio_of, scale_thumbnail,
-        scale_thumbnail_with_exiftool, thumbnail_build_may_start,
+        RawTempFile, ScaleAttempt, THUMB_EDGE, UPLOAD_THUMB_MAX_BYTES, exiftool_binary,
+        fit_upload_thumb, is_video_name, ratio_of, scale_thumbnail, scale_thumbnail_with_exiftool,
+        thumbnail_build_may_start, upload_thumbnails_with, video_thumbnail,
     };
     use pdfs_core::control::{ThumbnailBuildStatus, is_thumbnail_image_name};
+    use proton_drive_rs::ThumbnailType;
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -1758,6 +1999,103 @@ mod thumb_tests {
         assert!(matches!(attempt, ScaleAttempt::Unavailable));
     }
 
+    /// An executable shell script standing in for ffmpeg, in its own directory
+    /// under `tmp` so parallel tests never share one.
+    fn fake_ffmpeg(tmp: &std::path::Path, body: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(tmp).unwrap();
+        let path = tmp.join("ffmpeg");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn scratch(test: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pdfs-{test}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn a_video_frame_becomes_a_thumbnail() {
+        let tmp = scratch("video-frame");
+        let frame = tmp.join("frame.jpg");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&frame, jpeg(1080, 1920)).unwrap();
+        let ffmpeg = fake_ffmpeg(&tmp, &format!("cat '{}'", frame.display()));
+
+        let ScaleAttempt::Made(thumb) = video_thumbnail(
+            b"video bytes",
+            "clip.mp4",
+            &tmp,
+            ffmpeg.as_os_str(),
+            Duration::from_secs(10),
+        ) else {
+            panic!("a frame scales");
+        };
+        assert!((thumb.ratio - 1080.0 / 1920.0).abs() < 1e-6);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_video_ffmpeg_cannot_read_is_a_permanent_miss() {
+        let tmp = scratch("video-broken");
+        let ffmpeg = fake_ffmpeg(&tmp, "exit 1");
+        let attempt = video_thumbnail(
+            b"not a video",
+            "clip.mp4",
+            &tmp,
+            ffmpeg.as_os_str(),
+            Duration::from_secs(10),
+        );
+        assert!(matches!(attempt, ScaleAttempt::Undecodable));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn missing_ffmpeg_is_retryable() {
+        let attempt = video_thumbnail(
+            b"video bytes",
+            "clip.mp4",
+            &std::env::temp_dir(),
+            OsStr::new("pdfs-ffmpeg-deliberately-absent"),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(attempt, ScaleAttempt::Unavailable));
+    }
+
+    /// Optional real-ffmpeg check, like the RAW fixture harness above.
+    #[test]
+    #[ignore = "set PDFS_VIDEO_FIXTURE to a video file; needs ffmpeg"]
+    fn real_video_fixture_yields_a_frame() {
+        let path = std::env::var_os("PDFS_VIDEO_FIXTURE").expect("PDFS_VIDEO_FIXTURE");
+        let path = std::path::PathBuf::from(path);
+        let name = path.file_name().unwrap().to_string_lossy();
+        let bytes = std::fs::read(&path).unwrap();
+        let ScaleAttempt::Made(thumb) = video_thumbnail(
+            &bytes,
+            &name,
+            &std::env::temp_dir(),
+            OsStr::new("ffmpeg"),
+            Duration::from_secs(30),
+        ) else {
+            panic!("a frame from the video");
+        };
+        assert!(thumb.ratio > 0.0);
+    }
+
+    #[test]
+    fn videos_are_told_apart_by_name() {
+        for name in [
+            "VID-20260804-WA0023.mp4",
+            "PXL_1.TS.mp4",
+            "clip.MOV",
+            "a.webm",
+        ] {
+            assert!(is_video_name(name), "{name}");
+        }
+        for name in ["photo.jpg", "shot.NEF", "notes.txt", "mp4"] {
+            assert!(!is_video_name(name), "{name}");
+        }
+    }
+
     #[test]
     fn a_running_build_only_accepts_the_same_root() {
         let status = ThumbnailBuildStatus {
@@ -1770,5 +2108,93 @@ mod thumb_tests {
 
         let idle = ThumbnailBuildStatus::default();
         assert!(thumbnail_build_may_start(&idle, "pictures/second").unwrap());
+    }
+
+    #[test]
+    fn an_uploaded_photo_carries_its_thumbnail() {
+        let tmp = scratch("upload-photo");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let photo = tmp.join("staged-blob");
+        std::fs::write(&photo, jpeg(4000, 3000)).unwrap();
+
+        let thumbnails = upload_thumbnails_with(&photo, "IMG_0001.jpg", &tmp, OsStr::new("ffmpeg"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let [thumbnail] = thumbnails.as_slice() else {
+            panic!("one thumbnail, got {}", thumbnails.len());
+        };
+        assert!(matches!(thumbnail.thumbnail_type, ThumbnailType::Thumbnail));
+        assert!(thumbnail.content.len() <= UPLOAD_THUMB_MAX_BYTES);
+        assert_eq!(ratio_of(&thumbnail.content), Some(4.0 / 3.0));
+    }
+
+    #[test]
+    fn an_uploaded_video_carries_a_frame() {
+        let tmp = scratch("upload-video");
+        let frame = tmp.join("frame.jpg");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&frame, jpeg(1080, 1920)).unwrap();
+        std::fs::write(tmp.join("clip"), b"video bytes").unwrap();
+        let ffmpeg = fake_ffmpeg(&tmp, &format!("cat '{}'", frame.display()));
+
+        let thumbnails = upload_thumbnails_with(
+            &tmp.join("clip"),
+            "VID-WA0001.mp4",
+            &tmp,
+            ffmpeg.as_os_str(),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(thumbnails.len(), 1);
+        assert!(ratio_of(&thumbnails[0].content).is_some_and(|ratio| ratio < 1.0));
+    }
+
+    #[test]
+    fn other_files_upload_without_a_thumbnail() {
+        let tmp = scratch("upload-other");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("file"), b"export const answer = 42;\n").unwrap();
+        // An ffmpeg that would hand back a frame, to prove it is never asked.
+        std::fs::write(tmp.join("frame.jpg"), jpeg(64, 64)).unwrap();
+        let ffmpeg = fake_ffmpeg(&tmp, &format!("cat '{}'", tmp.join("frame.jpg").display()));
+
+        for name in ["notes.txt", "answer.ts", "broken.jpg"] {
+            assert!(
+                upload_thumbnails_with(&tmp.join("file"), name, &tmp, ffmpeg.as_os_str())
+                    .is_empty(),
+                "{name} uploads bare"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_oversized_thumbnail_is_squeezed_under_the_upload_limit() {
+        // Noise is the worst case for JPEG: at the gallery's quality a 512 px
+        // square of it lands far over the limit.
+        let mut seed = 0x2545_f491_u32;
+        let noise = image::RgbImage::from_fn(THUMB_EDGE, THUMB_EDGE, |_, _| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let [r, g, b, _] = seed.to_le_bytes();
+            image::Rgb([r, g, b])
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, super::THUMB_QUALITY)
+            .encode_image(&noise)
+            .unwrap();
+        assert!(
+            bytes.len() > UPLOAD_THUMB_MAX_BYTES,
+            "the fixture is oversized"
+        );
+
+        let fitted = fit_upload_thumb(bytes).expect("noise fits at half size");
+        assert!(fitted.len() <= UPLOAD_THUMB_MAX_BYTES);
+        assert_eq!(ratio_of(&fitted), Some(1.0), "shrinking keeps the shape");
+        let small = jpeg(64, 64);
+        assert_eq!(
+            fit_upload_thumb(small.clone()),
+            Some(small),
+            "a small one is untouched"
+        );
     }
 }

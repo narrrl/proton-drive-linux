@@ -945,6 +945,7 @@ impl Core {
         if !meta.complete {
             return Err("queued create holds an incomplete blob".into());
         }
+        let thumbnails = self.upload_thumbnails(Path::new(blob), name);
         let guard = self
             .transfers
             .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);
@@ -955,7 +956,7 @@ impl Core {
             media_type_for(name),
             reader,
             meta.len as i64,
-            Vec::new(),
+            thumbnails,
             None,
             false,
         ))?;
@@ -1145,6 +1146,7 @@ impl Core {
         }
 
         let alt = conflict_name(&name, now_secs());
+        let thumbnails = self.upload_thumbnails(blob, &alt);
         let guard =
             self.transfers
                 .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
@@ -1155,7 +1157,7 @@ impl Core {
             media_type_for(&alt),
             reader,
             meta.len as i64,
-            Vec::new(),
+            thumbnails,
             None,
             false,
         ))?;
@@ -1438,6 +1440,7 @@ impl Core {
         }
 
         let name = self.node_name(&uid);
+        let thumbnails = self.upload_thumbnails(&blob, &name);
         let guard =
             self.transfers
                 .begin(&name, meta.uid.clone(), TransferDirection::Upload, meta.len);
@@ -1451,7 +1454,7 @@ impl Core {
             &uid,
             reader,
             meta.len as i64,
-            Vec::new(),
+            thumbnails,
             None,
         ));
         let took = started.elapsed();

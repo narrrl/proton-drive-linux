@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 31;
+pub(super) const SCHEMA_VERSION: i64 = 32;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -268,6 +268,20 @@ impl Db {
             )? > 0;
             if has_photos && !has_column {
                 tx.execute_batch(MIGRATION_V31)?;
+            }
+        }
+        if current < 32 {
+            // Data only, so safe to repeat; each table is guarded for a very
+            // old fixture that never had it.
+            for table in ["photos", "album_photos"] {
+                let has_table: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )? > 0;
+                if has_table {
+                    tx.execute(&MIGRATION_V32.replace("{table}", table), [])?;
+                }
             }
         }
         tx.execute(
@@ -952,3 +966,10 @@ ALTER TABLE photos ADD COLUMN resolved_at INTEGER;
 CREATE INDEX IF NOT EXISTS idx_photos_unresolved ON photos(resolved_at);
 UPDATE photos SET resolved_at = strftime('%s','now') WHERE name IS NOT NULL;
 ";
+
+/// V32: give videos written off as un-thumbnailable another chance.
+///
+/// Before local video thumbnails, the fallback fed a video's bytes to the image
+/// decoder, which could only fail, and that failure was recorded as the
+/// permanent "no thumbnail" verdict. Run once per table in `{table}`.
+const MIGRATION_V32: &str = "UPDATE {table} SET thumb_state = 0 WHERE kind = 1 AND thumb_state = 2";
