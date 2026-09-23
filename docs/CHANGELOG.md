@@ -93,6 +93,12 @@ Schema: **31** (unchanged).
   counts albums. Back from an album returns to the grid where you left it instead of reloading it,
   and going from Albums back to Timeline keeps the timeline's scroll position unless an album was
   opened in between.
+- **Photo viewer rewrite.** The lightbox's controls fade out after two seconds without pointer
+  movement. Photos zoom with Ctrl+scroll, a pinch, `+`/`-`, `1` for 100 % and double-click, and
+  pan by dragging; `0` fits them again. The details panel docks beside the photo instead of
+  covering it. Stepping past the last loaded photo loads the next page, and the counter shows the
+  library's total rather than the loaded count. A video plays inline. Save a Copy uses the photo's
+  real name and reports failures, and Open With… offers the app chooser.
 - **US spelling throughout.** The app, the CLI and the docs say "Favorite" and "color", matching the
   `pdfs favorite` command.
 

@@ -100,6 +100,11 @@ pub(crate) struct GalleryState {
     /// True while a timeline page is in flight, so the scroll-to-the-end paging
     /// can't fire a second request for the page already coming.
     pub(crate) loading: Cell<bool>,
+    /// Whether the last page came back full, so there may be more to load.
+    pub(crate) has_more: Cell<bool>,
+    /// Run once the page in flight has landed in [`Self::model`] — how the
+    /// lightbox steps past the last loaded photo.
+    pub(crate) page_waiters: RefCell<Vec<Box<dyn FnOnce()>>>,
     /// Content width the grid is currently laid out to. Updated when the
     /// ListView is resized, which re-flows the visible sections.
     pub(crate) width: Cell<i32>,
@@ -1400,16 +1405,14 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     });
     button.add_controller(context);
 
-    // A still opens in the in-app lightbox; a video can't render there, so it
-    // downloads and hands off to an external player instead. In selection mode
-    // a tile picks instead of opening: the lightbox is one Escape away.
+    // A tile opens in the in-app lightbox, which plays a video in place. In
+    // selection mode a tile picks instead of opening: the lightbox is one
+    // Escape away.
     let ui_open = ui.clone();
     let uid = tile.photo.uid.clone();
     button.connect_clicked(move |_| {
         if ui_open.gallery.selecting.get() {
             toggle_selected(&ui_open, &uid);
-        } else if is_video {
-            play_video(&ui_open, uid.clone());
         } else {
             open_photo_viewer(&ui_open, uid.clone());
         }
@@ -2219,11 +2222,12 @@ pub(crate) fn select_all_photos(ui: &Rc<Ui>) {
 fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64, y: f64) {
     let mut menu = ActionMenu::new();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
-    if photo.kind == PhotoKind::Video {
-        menu.item("Play", move || play_video(&ui_c, uid.clone()));
+    let label = if photo.kind == PhotoKind::Video {
+        "Play"
     } else {
-        menu.item("Open", move || open_photo_viewer(&ui_c, uid.clone()));
-    }
+        "Open"
+    };
+    menu.item(label, move || open_photo_viewer(&ui_c, uid.clone()));
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     menu.toggle("Favorite", photo.favorite, move |favorite| {
         set_photo_favorite(&ui_c, uid.clone(), favorite)
@@ -2340,6 +2344,12 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         ui.busy_end();
         ui.gallery.loading.set(false);
         ui.gallery.more.set_sensitive(true);
+        // Whoever waited on this page runs once the reply below has put it in
+        // the model, whichever way that goes.
+        let waiters = std::mem::take(&mut *ui.gallery.page_waiters.borrow_mut());
+        if !waiters.is_empty() {
+            glib::idle_add_local_once(move || waiters.into_iter().for_each(|waiter| waiter()));
+        }
         match result {
             Ok(Ok(Response::Photos {
                 available,
@@ -2356,6 +2366,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                     );
                     return;
                 }
+                ui.gallery.has_more.set(items.len() == PHOTOS_PAGE);
                 // Label the filter tabs with live per-kind counts.
                 if let Some(counts) = counts {
                     update_gallery_tabs(&ui, counts);
@@ -2500,38 +2511,6 @@ pub(crate) fn play_external(path: &str) {
         return;
     }
     open_path(path);
-}
-
-/// Download a Photos-library video, then hand it to an external player. Unlike a
-/// still photo — which the in-app lightbox can render — a video needs a real
-/// player, and the photos volume isn't part of the FUSE mount, so there is no
-/// path to stream it from: [`Request::OpenPhoto`] fetches the whole file into the
-/// cache (served straight from there on a repeat) and we launch the player on it.
-///
-/// For large videos kept in an on-demand *drive* folder, streaming through the
-/// mount is the better route — that is the file-browser "Play" action, not this.
-pub(crate) fn play_video(ui: &Rc<Ui>, uid: String) {
-    toast(ui, "Preparing video…");
-    let rx = spawn_request(ui.dirs.control_socket(), Request::OpenPhoto { uid });
-    let ui = ui.clone();
-    glib::spawn_future_local(async move {
-        match rx.recv().await {
-            Ok(Ok(Response::FilePath { path })) => play_external(&path),
-            Ok(Ok(Response::Error { message, kind })) => {
-                toast_failure(&ui, "Couldn't open this video", &message, kind)
-            }
-            Ok(Ok(_)) => toast_error(
-                &ui,
-                "Couldn't open this video",
-                "Unexpected reply from the mount service.",
-            ),
-            Ok(Err(_)) | Err(_) => toast_error(
-                &ui,
-                "Couldn't open this video",
-                "Couldn't reach Proton Drive.",
-            ),
-        }
-    });
 }
 
 #[cfg(test)]

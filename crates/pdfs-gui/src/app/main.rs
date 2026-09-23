@@ -489,6 +489,8 @@ fn build_window(app: &adw::Application) {
             favorites: Cell::new(false),
             date_suppress: Cell::new(false),
             loading: Cell::new(false),
+            has_more: Cell::new(false),
+            page_waiters: RefCell::new(Vec::new()),
             width: Cell::new(0),
             photo_tex: RefCell::new(HashMap::new()),
             photo_tex_order: RefCell::new(VecDeque::new()),
