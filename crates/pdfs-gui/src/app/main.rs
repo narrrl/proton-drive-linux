@@ -1294,11 +1294,39 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             .developer_name("Nils Pukropp")
             .website("https://github.com/narrrl/proton-drive-linux")
             .issue_url("https://github.com/narrrl/proton-drive-linux/issues")
+            .copyright("© 2026 Nils Pukropp (contact@narl.io)")
             .license_type(gtk4::License::MitX11)
             .comments(gettext("Files-on-demand Proton Drive for the Linux desktop.\n\nUnofficial client — not affiliated with, endorsed by, or supported by Proton AG."))
             .debug_info(debug_info(&ui_about))
             .debug_info_filename("proton-drive-linux-debug.txt")
             .build();
+        dialog.add_link(
+            &gettext("Source Code"),
+            "https://github.com/narrrl/proton-drive-linux",
+        );
+        dialog.add_link(
+            &gettext("Proton Terms of Service"),
+            "https://proton.me/legal/terms",
+        );
+        dialog.add_link(
+            &gettext("Proton Privacy Policy"),
+            "https://proton.me/legal/privacy",
+        );
+        // The text is Pango markup: an ampersand must be written as "&amp;".
+        dialog.add_legal_section(
+            &gettext("Disclaimer"),
+            None,
+            gtk4::License::Custom,
+            Some(&gettext(
+                "This is an unofficial, community-built client. It is not affiliated with, endorsed by, or supported by Proton AG.\n\n“Proton” and “Proton Drive” are trademarks of Proton AG, used here only to describe the service this software connects to. Your use of Proton Drive is governed by Proton's own terms of service and privacy policy.\n\nThis software is provided “as is”, without warranty of any kind. Keep a copy of any data you cannot afford to lose.",
+            )),
+        );
+        dialog.add_legal_section(
+            "proton-sdk-rs",
+            Some("© 2026 Nils Pukropp (contact@narl.io)"),
+            gtk4::License::MitX11,
+            None,
+        );
         // Translators: replace with your name(s) and email address(es), one
         // per line, to be credited in the About dialog.
         let credits = gettext("translator-credits");

@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-09-23 20:16+0200\n"
+"POT-Creation-Date: 2026-09-24 19:33+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: German\n"
@@ -21,7 +21,7 @@ msgstr ""
 msgid "My files"
 msgstr "Meine Dateien"
 
-#: crates/pdfs-gui/src/app/main.rs:830 crates/pdfs-gui/src/app/main.rs:1415
+#: crates/pdfs-gui/src/app/main.rs:830 crates/pdfs-gui/src/app/main.rs:1443
 #: crates/pdfs-gui/src/app/pages/albums.rs:623
 #: crates/pdfs-gui/src/app/pages/photos.rs:677
 msgid "Photos"
@@ -86,12 +86,12 @@ msgstr "Etwas anderes hat dies zuerst geändert"
 msgid "Your Proton Drive is full"
 msgstr "Das Proton Drive ist voll"
 
-#: crates/pdfs-gui/src/app/main.rs:1237 crates/pdfs-gui/src/app/main.rs:1397
+#: crates/pdfs-gui/src/app/main.rs:1237 crates/pdfs-gui/src/app/main.rs:1425
 #: crates/pdfs-gui/src/app/pages/status.rs:353
 msgid "Preferences"
 msgstr "Einstellungen"
 
-#: crates/pdfs-gui/src/app/main.rs:1238 crates/pdfs-gui/src/app/main.rs:1454
+#: crates/pdfs-gui/src/app/main.rs:1238 crates/pdfs-gui/src/app/main.rs:1482
 msgid "Keyboard Shortcuts"
 msgstr "Tastenkürzel"
 
@@ -107,7 +107,7 @@ msgstr "Hauptmenü"
 msgid "Proton Drive for Linux"
 msgstr "Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1298
+#: crates/pdfs-gui/src/app/main.rs:1299
 msgid ""
 "Files-on-demand Proton Drive for the Linux desktop.\n"
 "\n"
@@ -119,17 +119,58 @@ msgstr ""
 "Inoffizieller Client – nicht mit Proton AG verbunden, von Proton AG "
 "unterstützt oder befürwortet."
 
+#: crates/pdfs-gui/src/app/main.rs:1304
+msgid "Source Code"
+msgstr "Quellcode"
+
+#: crates/pdfs-gui/src/app/main.rs:1308
+msgid "Proton Terms of Service"
+msgstr "Nutzungsbedingungen von Proton"
+
+#: crates/pdfs-gui/src/app/main.rs:1312
+msgid "Proton Privacy Policy"
+msgstr "Datenschutzerklärung von Proton"
+
+#: crates/pdfs-gui/src/app/main.rs:1317
+msgid "Disclaimer"
+msgstr "Haftungsausschluss"
+
+#: crates/pdfs-gui/src/app/main.rs:1321
+msgid ""
+"This is an unofficial, community-built client. It is not affiliated with, "
+"endorsed by, or supported by Proton AG.\n"
+"\n"
+"“Proton” and “Proton Drive” are trademarks of Proton AG, used here only to "
+"describe the service this software connects to. Your use of Proton Drive is "
+"governed by Proton's own terms of service and privacy policy.\n"
+"\n"
+"This software is provided “as is”, without warranty of any kind. Keep a copy "
+"of any data you cannot afford to lose."
+msgstr ""
+"Dies ist ein inoffizieller, von der Community entwickelter Client. Er ist "
+"nicht mit Proton AG verbunden und wird von Proton AG weder befürwortet noch "
+"unterstützt.\n"
+"\n"
+"„Proton“ und „Proton Drive“ sind Marken der Proton AG und werden hier nur "
+"verwendet, um den Dienst zu beschreiben, mit dem sich diese Software "
+"verbindet. Für die Nutzung von Proton Drive gelten die Nutzungsbedingungen "
+"und die Datenschutzerklärung von Proton.\n"
+"\n"
+"Diese Software wird „wie besehen“ und ohne jegliche Gewährleistung "
+"bereitgestellt. Daten, deren Verlust nicht hinnehmbar ist, sollten "
+"zusätzlich gesichert werden."
+
 #. Translators: replace with your name(s) and email address(es), one
 #. per line, to be credited in the About dialog.
-#: crates/pdfs-gui/src/app/main.rs:1304
+#: crates/pdfs-gui/src/app/main.rs:1332
 msgid "translator-credits"
 msgstr "Mitwirkende an Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1335
+#: crates/pdfs-gui/src/app/main.rs:1363
 msgid "Stop Proton Drive?"
 msgstr "Proton Drive beenden?"
 
-#: crates/pdfs-gui/src/app/main.rs:1336
+#: crates/pdfs-gui/src/app/main.rs:1364
 msgid ""
 "The drive unmounts and nothing syncs until you connect again. Proton Drive "
 "starts again at your next login."
@@ -138,7 +179,7 @@ msgstr ""
 "Verbindung hergestellt wird. Proton Drive startet bei der nächsten Anmeldung "
 "erneut."
 
-#: crates/pdfs-gui/src/app/main.rs:1338 crates/pdfs-gui/src/app/main.rs:1611
+#: crates/pdfs-gui/src/app/main.rs:1366 crates/pdfs-gui/src/app/main.rs:1639
 #: crates/pdfs-gui/src/app/pages/albums.rs:242
 #: crates/pdfs-gui/src/app/pages/albums.rs:423
 #: crates/pdfs-gui/src/app/pages/browser.rs:2273
@@ -166,67 +207,67 @@ msgstr ""
 msgid "Cancel"
 msgstr "Abbrechen"
 
-#: crates/pdfs-gui/src/app/main.rs:1339
+#: crates/pdfs-gui/src/app/main.rs:1367
 msgctxt "verb"
 msgid "Stop"
 msgstr "Beenden"
 
-#: crates/pdfs-gui/src/app/main.rs:1356
+#: crates/pdfs-gui/src/app/main.rs:1384
 msgid "Couldn't stop Proton Drive"
 msgstr "Proton Drive konnte nicht beendet werden"
 
-#: crates/pdfs-gui/src/app/main.rs:1357
+#: crates/pdfs-gui/src/app/main.rs:1385
 msgid "The mount service did not stop."
 msgstr "Der Einhängedienst wurde nicht beendet."
 
-#: crates/pdfs-gui/src/app/main.rs:1393
+#: crates/pdfs-gui/src/app/main.rs:1421
 #: crates/pdfs-gui/src/app/pages/status.rs:226
 msgid "General"
 msgstr "Allgemein"
 
-#: crates/pdfs-gui/src/app/main.rs:1395
+#: crates/pdfs-gui/src/app/main.rs:1423
 #: crates/pdfs-gui/src/app/pages/browser.rs:270
 msgid "Search Drive"
 msgstr "Drive durchsuchen"
 
-#: crates/pdfs-gui/src/app/main.rs:1396
+#: crates/pdfs-gui/src/app/main.rs:1424
 #: crates/pdfs-gui/src/app/pages/browser.rs:1363
 msgid "Refresh"
 msgstr "Aktualisieren"
 
-#: crates/pdfs-gui/src/app/main.rs:1398
+#: crates/pdfs-gui/src/app/main.rs:1426
 msgid "Keyboard shortcuts"
 msgstr "Tastenkürzel"
 
-#: crates/pdfs-gui/src/app/main.rs:1402
+#: crates/pdfs-gui/src/app/main.rs:1430
 msgid "Files"
 msgstr "Dateien"
 
-#: crates/pdfs-gui/src/app/main.rs:1404
+#: crates/pdfs-gui/src/app/main.rs:1432
 #: crates/pdfs-gui/src/app/pages/browser.rs:319
 #: crates/pdfs-gui/src/app/pages/browser.rs:2586
 msgid "New folder"
 msgstr "Neuer Ordner"
 
-#: crates/pdfs-gui/src/app/main.rs:1405
+#: crates/pdfs-gui/src/app/main.rs:1433
 #: crates/pdfs-gui/src/app/pages/browser.rs:315
 msgid "Upload files"
 msgstr "Dateien hochladen"
 
-#: crates/pdfs-gui/src/app/main.rs:1406
+#: crates/pdfs-gui/src/app/main.rs:1434
 msgid "Back / forward"
 msgstr "Zurück / Vor"
 
-#: crates/pdfs-gui/src/app/main.rs:1407
+#: crates/pdfs-gui/src/app/main.rs:1435
 #: crates/pdfs-gui/src/app/pages/browser.rs:2320
 msgid "Parent folder"
 msgstr "Übergeordneter Ordner"
 
-#: crates/pdfs-gui/src/app/main.rs:1408
+#: crates/pdfs-gui/src/app/main.rs:1436
 msgid "Grid / list"
 msgstr "Raster / Liste"
 
-#: crates/pdfs-gui/src/app/main.rs:1409
+#: crates/pdfs-gui/src/app/main.rs:1437
 #: crates/pdfs-gui/src/app/pages/albums.rs:297
 #: crates/pdfs-gui/src/app/pages/browser.rs:2252
 #: crates/pdfs-gui/src/app/pages/browser.rs:2274
@@ -235,7 +276,7 @@ msgstr "Raster / Liste"
 msgid "Rename"
 msgstr "Umbenennen"
 
-#: crates/pdfs-gui/src/app/main.rs:1410 crates/pdfs-gui/src/app/main.rs:1430
+#: crates/pdfs-gui/src/app/main.rs:1438 crates/pdfs-gui/src/app/main.rs:1458
 #: crates/pdfs-gui/src/app/pages/browser.rs:414
 #: crates/pdfs-gui/src/app/pages/browser.rs:1306
 #: crates/pdfs-gui/src/app/pages/browser.rs:1338
@@ -246,51 +287,51 @@ msgstr "Umbenennen"
 msgid "Move to Trash"
 msgstr "In den Papierkorb verschieben"
 
-#: crates/pdfs-gui/src/app/main.rs:1411
+#: crates/pdfs-gui/src/app/main.rs:1439
 msgid "Clear the selection"
 msgstr "Auswahl aufheben"
 
-#: crates/pdfs-gui/src/app/main.rs:1417
+#: crates/pdfs-gui/src/app/main.rs:1445
 msgid "Larger thumbnails"
 msgstr "Größere Vorschaubilder"
 
-#: crates/pdfs-gui/src/app/main.rs:1418
+#: crates/pdfs-gui/src/app/main.rs:1446
 msgid "Smaller thumbnails"
 msgstr "Kleinere Vorschaubilder"
 
-#: crates/pdfs-gui/src/app/main.rs:1419
+#: crates/pdfs-gui/src/app/main.rs:1447
 msgid "Reset thumbnail size"
 msgstr "Vorschaubildgröße zurücksetzen"
 
-#: crates/pdfs-gui/src/app/main.rs:1420
+#: crates/pdfs-gui/src/app/main.rs:1448
 msgid "Select all"
 msgstr "Alles auswählen"
 
-#: crates/pdfs-gui/src/app/main.rs:1424
+#: crates/pdfs-gui/src/app/main.rs:1452
 msgid "Photo Viewer"
 msgstr "Fotobetrachter"
 
-#: crates/pdfs-gui/src/app/main.rs:1426
+#: crates/pdfs-gui/src/app/main.rs:1454
 msgid "Previous / next photo"
 msgstr "Vorheriges / nächstes Foto"
 
-#: crates/pdfs-gui/src/app/main.rs:1427
+#: crates/pdfs-gui/src/app/main.rs:1455
 msgid "First / last photo"
 msgstr "Erstes / letztes Foto"
 
-#: crates/pdfs-gui/src/app/main.rs:1428
+#: crates/pdfs-gui/src/app/main.rs:1456
 msgid "Show details"
 msgstr "Details anzeigen"
 
-#: crates/pdfs-gui/src/app/main.rs:1429
+#: crates/pdfs-gui/src/app/main.rs:1457
 msgid "Fullscreen"
 msgstr "Vollbild"
 
-#: crates/pdfs-gui/src/app/main.rs:1431
+#: crates/pdfs-gui/src/app/main.rs:1459
 msgid "Close"
 msgstr "Schließen"
 
-#: crates/pdfs-gui/src/app/main.rs:1534
+#: crates/pdfs-gui/src/app/main.rs:1562
 msgid "Select a single item to rename it"
 msgstr "Zum Umbenennen genau ein Element auswählen"
 
