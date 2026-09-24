@@ -11,6 +11,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.2.1] — 2026-09-24
+
+Schema: **32** (unchanged).
+
+### Added
+- **Legal information in About.** The About dialog now links to the source code and to Proton's
+  terms of service and privacy policy, and its Legal page carries the full disclaimer: this client
+  is unofficial, not affiliated with or endorsed by Proton AG, and comes without warranty.
+
 ## [2.2.0] — 2026-09-23
 
 Schema: **32**. Videos that earlier got no thumbnail are tried again.
@@ -1029,6 +1038,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.1
 [2.1.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.1.0
 [2.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.0.0
 [1.11.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.11.1
