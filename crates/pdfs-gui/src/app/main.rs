@@ -301,10 +301,14 @@ fn load_proton_theme() {
     };
     let provider = gtk4::CssProvider::new();
     provider.load_from_resource("/de/nils/protondrivelinux/style.css");
+    // Above the user's own gtk.css, which often imports a whole theme: its
+    // `button { padding: 6px 10px; min-width: 16px }` would otherwise pad every
+    // photo tile and push the grid past the window. Every rule in the sheet is
+    // scoped to the app's own classes, so nothing else the user styled changes.
     gtk4::style_context_add_provider_for_display(
         &display,
         &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
     gtk4::IconTheme::for_display(&display).add_resource_path("/de/nils/protondrivelinux/icons");
 }
@@ -522,10 +526,8 @@ fn build_window(app: &adw::Application) {
             model: gallery_widgets.model.clone(),
             groups: gallery_widgets.groups.clone(),
             row_height: Cell::new(ROW_DEFAULT),
-            learned_ratios: RefCell::new(HashMap::new()),
             scrolling_down: Cell::new(true),
             scroll_offset: Cell::new(0.0),
-            assumed_ratios: RefCell::new(HashSet::new()),
             content: gallery_widgets.content.clone(),
             status: gallery_widgets.status.clone(),
             retry: gallery_widgets.retry.clone(),
@@ -1722,88 +1724,6 @@ mod tests {
     }
 
     /// The full width a row occupies, gaps included.
-    fn row_width(widths: &[i32]) -> i32 {
-        widths.iter().sum::<i32>() + TILE_GAP * (widths.len() as i32 - 1)
-    }
-
-    /// Ratios of a typical mixed day: landscape phone shots, a portrait, a
-    /// square crop.
-    fn mixed() -> Vec<f64> {
-        vec![
-            1.5, 1.5, 0.75, 1.0, 1.33, 1.5, 0.75, 1.78, 1.0, 1.5, 1.5, 1.33,
-        ]
-    }
-
-    #[test]
-    fn every_full_row_spans_the_content_width() {
-        // The point of justifying: no ragged right margin at any width, at any
-        // zoom, for any mix of shapes.
-        for width in [640, 900, 1000, 1440, 1920, 2560] {
-            let rows = plan_rows(&mixed(), width, ROW_DEFAULT);
-            // The last row is deliberately short, so it is not part of this.
-            for (_, widths) in rows.iter().take(rows.len() - 1) {
-                assert_eq!(row_width(widths), width, "row does not span {width}px");
-            }
-        }
-    }
-
-    #[test]
-    fn a_tile_keeps_its_photos_shape() {
-        // Each tile is its photo's ratio at the row's height, which is what
-        // makes cropping unnecessary.
-        let ratios = mixed();
-        let rows = plan_rows(&ratios, 1440, ROW_DEFAULT);
-        let (height, widths) = &rows[0];
-        for (width, ratio) in widths.iter().zip(&ratios).take(widths.len() - 1) {
-            let laid_out = *width as f64 / *height as f64;
-            assert!((laid_out - ratio).abs() < 0.02, "{laid_out} is not {ratio}");
-        }
-    }
-
-    #[test]
-    fn rows_land_near_the_target_height() {
-        // A row is closed as soon as it no longer fits at the target, so it is
-        // never taller than the target and never far below it.
-        for target in [ROW_MIN, ROW_DEFAULT, ROW_MAX] {
-            let rows = plan_rows(&mixed(), 1600, target);
-            for (height, _) in rows.iter().take(rows.len() - 1) {
-                assert!(
-                    *height <= target,
-                    "{height}px exceeds the {target}px target"
-                );
-                assert!(*height > target / 2, "{height}px is far under {target}px");
-            }
-        }
-    }
-
-    #[test]
-    fn a_short_day_is_not_stretched_across_the_window() {
-        // Two photos are two photos, not two half-window tiles.
-        let rows = plan_rows(&[1.5, 1.5], 1920, ROW_DEFAULT);
-        assert_eq!(rows.len(), 1);
-        let (height, widths) = &rows[0];
-        assert_eq!(*height, ROW_DEFAULT);
-        assert!(row_width(widths) < 1920 / 2);
-    }
-
-    #[test]
-    fn zooming_in_puts_fewer_photos_in_a_row() {
-        let small = plan_rows(&mixed(), 1200, ROW_MIN);
-        let big = plan_rows(&mixed(), 1200, ROW_MAX);
-        assert!(small[0].1.len() > big[0].1.len());
-    }
-
-    #[test]
-    fn every_photo_is_laid_out_exactly_once() {
-        let ratios = mixed();
-        let placed: usize = plan_rows(&ratios, 1000, ROW_DEFAULT)
-            .iter()
-            .map(|(_, widths)| widths.len())
-            .sum();
-        assert_eq!(placed, ratios.len());
-        assert!(plan_rows(&[], 1000, ROW_DEFAULT).is_empty());
-    }
-
     /// One file of a shot, for the group-switch tests.
     fn member(uid: &str, name: Option<&str>, kind: PhotoKind) -> PhotoItem {
         PhotoItem {
@@ -1855,15 +1775,5 @@ mod tests {
             member_label(&member("clip", Some(""), PhotoKind::Video)),
             "the video"
         );
-    }
-
-    #[test]
-    fn a_window_narrower_than_one_photo_still_lays_it_out() {
-        // A tile of at least one px, rather than a zero-width widget or a
-        // division by zero.
-        for width in [0, 40] {
-            let rows = plan_rows(&[1.5, 1.5, 1.5], width, ROW_DEFAULT);
-            assert!(rows.iter().all(|(h, w)| *h > 0 && w.iter().all(|w| *w > 0)));
-        }
     }
 }

@@ -17,15 +17,6 @@ pub(crate) struct GalleryState {
     /// ratios and then scaled to the content width, so this is the height a row
     /// lands near rather than the height it gets (see [`justify_rows`]).
     pub(crate) row_height: Cell<i32>,
-    /// Aspect ratios learned by decoding a thumbnail, for photos the daemon had
-    /// not recorded one for. Consulted by the layout ahead of
-    /// [`PhotoItem::ratio`]: a row laid out at the assumed 1.0 re-flows once the
-    /// real shape is known.
-    pub(crate) learned_ratios: RefCell<HashMap<String, f64>>,
-    /// Photos the layout had to guess a ratio for. Decoding one of these is what
-    /// makes a re-flow worth doing; decoding a photo whose ratio was already
-    /// known would re-flow the timeline for no visible change.
-    pub(crate) assumed_ratios: RefCell<HashSet<String>>,
     /// Swaps the Photos content area between the timeline, its status page, and
     /// the Albums grid.
     pub(crate) content: gtk4::Stack,
@@ -196,10 +187,10 @@ pub(crate) const JUMP_PAGE: usize = 1000;
 /// How long the scrubber has to rest on a month before the timeline jumps.
 const SCRUB_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Gallery row height in px: the zoom range, its default, and the step one
-/// Ctrl+scroll notch (or Ctrl+±) moves it by. A justified row is scaled to the
-/// content width once it is full, so this is the *target* a row lands near
-/// rather than the height it ends up with (see [`justify_rows`]).
+/// Gallery tile size in px: the zoom range, its default, and the step one
+/// Ctrl+scroll notch (or Ctrl+±) moves it by. The columns are stretched to
+/// span the content width, so this is the *target* a tile lands near rather
+/// than the size it ends up with (see [`plan_grid`]).
 pub(crate) const ROW_MIN: i32 = 60;
 
 pub(crate) const ROW_MAX: i32 = 340;
@@ -208,10 +199,11 @@ pub(crate) const ROW_DEFAULT: i32 = 180;
 
 pub(crate) const ROW_STEP: i32 = 30;
 
-/// Row heights at which the timeline stops heading each day and heads each
-/// month instead, then each year. Zoomed out, a library is a wall of small
-/// tiles, and a heading per day would take more room than the photos under it.
-pub(crate) const GROUP_BY_MONTH_BELOW: i32 = 150;
+/// Tile sizes at which the timeline stops heading each day and heads each
+/// month instead, then each year. Only big tiles get a heading per day: a day
+/// rarely holds a row of photos, and a heading plus a short row per day would
+/// leave most of a wide window empty.
+pub(crate) const GROUP_BY_MONTH_BELOW: i32 = 240;
 
 pub(crate) const GROUP_BY_YEAR_BELOW: i32 = 90;
 
@@ -224,7 +216,7 @@ pub(crate) enum Grouping {
     Year,
 }
 
-/// The grouping that suits a target row height.
+/// The grouping that suits a target tile size.
 pub(crate) fn grouping_for(row_height: i32) -> Grouping {
     if row_height < GROUP_BY_YEAR_BELOW {
         Grouping::Year
@@ -238,19 +230,6 @@ pub(crate) fn grouping_for(row_height: i32) -> Grouping {
 /// Gap between tiles, horizontally and vertically. Tight on purpose: the grid
 /// should read as a sheet of photographs, not as a deck of cards.
 pub(crate) const TILE_GAP: i32 = 2;
-
-/// The aspect ratios the layout will lay out. A 12:1 panorama laid out honestly
-/// is a row of one photo two hundred px tall, and a scan of a strip of film is
-/// worse; clamping keeps one odd frame from deciding what a whole row looks
-/// like, at the cost of cropping that frame's extremes in its tile.
-pub(crate) const RATIO_MIN: f64 = 0.4;
-
-pub(crate) const RATIO_MAX: f64 = 3.0;
-
-/// The ratio a photo gets before anything has seen its pixels. Square is the
-/// least wrong guess: it is between the two orientations, so the re-flow when
-/// the real ratio lands moves the row as little as possible.
-pub(crate) const RATIO_UNKNOWN: f64 = 1.0;
 
 /// How many thumbnails one on-demand [`Request::PhotoThumbs`] batch asks for.
 /// Small, so the first tiles on screen fill in quickly rather than the whole
@@ -481,18 +460,19 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .halign(gtk4::Align::End)
         .margin_top(12)
         .margin_bottom(12)
-        // Clear of the overlay scrollbar, which widens under the pointer.
-        .margin_end(18)
+        .margin_start(6)
         .tooltip_text(gettext("Jump to a month"))
         .visible(false)
         .build();
     scrubber.add_css_class("photo-scrubber");
 
     // Horizontal scrolling is never wanted: the grid is sized to the viewport
-    // width, and a stray hscrollbar would fight the layout.
+    // width. External rather than Never, which would make the widest row the
+    // window's minimum width, so a row laid out a pixel too wide would push the
+    // window wider, and the next layout wider still.
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .hscrollbar_policy(gtk4::PolicyType::External)
         .child(&list)
         .build();
 
@@ -662,9 +642,13 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&select_bar);
-    let timeline_overlay = gtk4::Overlay::builder().child(&scroll).build();
-    timeline_overlay.add_overlay(&scrubber);
-    timeline.append(&timeline_overlay);
+    // The scrubber sits beside the list rather than over it, so the grid is
+    // laid out to the width it really has and no tile hides under a year mark.
+    let timeline_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    scroll.set_hexpand(true);
+    timeline_row.append(&scroll);
+    timeline_row.append(&scrubber);
+    timeline.append(&timeline_row);
     timeline.append(&pager);
 
     // The album grid: cover-first cards that flow to the width they are given.
@@ -933,8 +917,8 @@ pub(crate) fn wire_gallery(
         }
         match &*row {
             GalleryRow::Heading(heading) => {
-                row_box.set_margin_top(10);
-                row_box.set_margin_bottom(4);
+                row_box.set_margin_top(8);
+                row_box.set_margin_bottom(0);
                 let label = gtk4::Label::builder()
                     .label(heading)
                     .halign(gtk4::Align::Start)
@@ -962,36 +946,55 @@ pub(crate) fn wire_gallery(
 
     // ListView recycles row widgets, so a scrolled-away row must give up its
     // claim on them — otherwise a thumbnail landing late would paint into a tile
-    // that now shows a different photo.
+    // that now shows a different photo. Only claims this row widget still
+    // holds are given up: after a re-flow, the same photo (and the same
+    // position) is often bound again in another row before this one unbinds.
     let ui_unbind = ui.clone();
     factory.connect_unbind(move |_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        ui_unbind
-            .gallery
-            .bound
-            .borrow_mut()
-            .remove(&item.position());
+        let Some(row_box) = item.child() else {
+            return;
+        };
+        {
+            let mut bound = ui_unbind.gallery.bound.borrow_mut();
+            if bound
+                .get(&item.position())
+                .is_some_and(|(_, row)| row.upcast_ref::<gtk4::Widget>() == &row_box)
+            {
+                bound.remove(&item.position());
+            }
+        }
         if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>()
             && let GalleryRow::Tiles { tiles, .. } = &*obj.borrow::<GalleryRow>()
         {
             let mut wanted = ui_unbind.gallery.thumb_wanted.borrow_mut();
             for tile in tiles {
-                wanted.remove(&tile.photo.uid);
+                if wanted
+                    .get(&tile.photo.uid)
+                    .is_some_and(|picture| picture.is_ancestor(&row_box))
+                {
+                    wanted.remove(&tile.photo.uid);
+                }
             }
         }
     });
     list.set_factory(Some(&factory));
 
     // The grid divides the content width, so a resize re-flows whatever is on
-    // screen (offscreen sections pick the new width up when they bind).
+    // screen (offscreen sections pick the new width up when they bind). The
+    // width is the viewport's, read from the horizontal adjustment's page
+    // size: the list's own width follows its widest row, so laying rows out to
+    // it would feed each layout's rounding into the next, wider one.
     let ui_width = ui.clone();
-    list.connect_notify_local(Some("width"), move |list, _| {
-        let width = list.width();
-        if width > 0 && width != ui_width.gallery.width.get() {
-            ui_width.gallery.width.set(width);
-            schedule_relayout(&ui_width);
-        }
-    });
+    scroll
+        .hadjustment()
+        .connect_page_size_notify(move |adjustment| {
+            let width = adjustment.page_size() as i32;
+            if width > 0 && width != ui_width.gallery.width.get() {
+                ui_width.gallery.width.set(width);
+                schedule_relayout(&ui_width);
+            }
+        });
 
     // Page the timeline in while the user is still a screen and a half from the
     // end, so scrolling at a normal pace never reaches it.
@@ -1256,119 +1259,50 @@ pub(crate) struct Tile {
     pub(crate) grouping: Grouping,
 }
 
-/// The aspect ratio to lay `photo` out at: what a decode has learned, else what
-/// the daemon remembered, else square.
-fn tile_ratio(ui: &Rc<Ui>, photo: &PhotoItem) -> f64 {
-    let known = ui
-        .gallery
-        .learned_ratios
-        .borrow()
-        .get(&photo.uid)
-        .copied()
-        .or(photo.ratio)
-        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    match known {
-        Some(ratio) => ratio.clamp(RATIO_MIN, RATIO_MAX),
-        None => {
-            ui.gallery
-                .assumed_ratios
-                .borrow_mut()
-                .insert(photo.uid.clone());
-            RATIO_UNKNOWN
-        }
-    }
-}
-
-/// Break one day's photos into justified rows spanning `width` — each photo at
-/// its own aspect ratio, each row scaled so it ends exactly on the right margin.
+/// Break one section's photos into rows of square tiles spanning `width`.
 ///
-/// This is what removes the black bars: a square tile had to either crop the
-/// photo or letterbox it, and with a box of the right shape there is nothing to
-/// do either way.
+/// Squares, because a wide window and a day of a few photos do not mix with
+/// rows justified to each photo's shape: a short row stays short, and portrait
+/// phone shots come out as thin slivers. Every tile of a square grid is the
+/// same size whatever it shows, and the thumbnail is cropped to fill it.
 pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec<Vec<Tile>> {
-    let ratios: Vec<f64> = photos.iter().map(|photo| tile_ratio(ui, photo)).collect();
     let selecting = ui.gallery.selecting.get();
     let selected = ui.gallery.selected.borrow();
-    let grouping = grouping_for(ui.gallery.row_height.get());
-    let mut photos = photos.iter();
-    plan_rows(&ratios, width, ui.gallery.row_height.get())
-        .into_iter()
-        .map(|(height, widths)| {
-            widths
-                .into_iter()
-                .filter_map(|width| {
-                    photos.next().map(|photo| Tile {
-                        selecting,
-                        selected: selecting && selected.contains(&photo.uid),
-                        grouping,
-                        photo: photo.clone(),
-                        width,
-                        height,
-                    })
+    let target = ui.gallery.row_height.get();
+    let grouping = grouping_for(target);
+    let (columns, size) = plan_grid(width, target);
+    photos
+        .chunks(columns)
+        .map(|row| {
+            row.iter()
+                .map(|photo| Tile {
+                    selecting,
+                    selected: selecting && selected.contains(&photo.uid),
+                    grouping,
+                    photo: photo.clone(),
+                    width: size,
+                    height: size,
                 })
                 .collect()
         })
         .collect()
 }
 
-/// The layout math, over aspect ratios alone: each row's height, and the width
-/// of every tile in it.
+/// The layout math: how many square tiles of about `target` px fit across
+/// `width`, and the size that makes them span it exactly, gaps included.
 ///
-/// Photos are taken in order until their summed ratio no longer leaves them
-/// `target` px tall, and that row is then scaled to land on `width` exactly. The
-/// *last* row of a day is left at the target height instead of being stretched:
-/// a day holding two photos would otherwise be two enormous tiles, which reads
-/// as a layout bug rather than as a short day.
-pub(crate) fn plan_rows(ratios: &[f64], width: i32, target: i32) -> Vec<(i32, Vec<i32>)> {
-    let width = width.max(ROW_MIN);
+/// The count is rounded to the nearest whole column, so a tile never ends up
+/// more than half a column off the zoom level asked for.
+pub(crate) fn plan_grid(width: i32, target: i32) -> (usize, i32) {
+    let width = width.max(1);
     let target = target.clamp(ROW_MIN, ROW_MAX);
-    let mut rows = Vec::new();
-    let mut start = 0;
-    let mut sum = 0.0;
-
-    for (index, ratio) in ratios.iter().enumerate() {
-        sum += ratio;
-        let count = (index + 1 - start) as i32;
-        // The gaps are fixed, so only the pixels left over from them scale.
-        let usable = (width - TILE_GAP * (count - 1)).max(1) as f64;
-        let height = usable / sum;
-        if height <= target as f64 {
-            let height = (height.round() as i32).max(1);
-            rows.push((height, fit_row(&ratios[start..=index], width, height)));
-            start = index + 1;
-            sum = 0.0;
-        }
-    }
-    if start < ratios.len() {
-        let tail = &ratios[start..];
-        let widths = tail
-            .iter()
-            .map(|ratio| ((ratio * target as f64).round() as i32).max(1))
-            .collect();
-        rows.push((target, widths));
-    }
-    rows
+    let columns = (f64::from(width + TILE_GAP) / f64::from(target + TILE_GAP)).round() as i32;
+    let columns = columns.max(1);
+    let size = ((width - TILE_GAP * (columns - 1)) / columns).max(1);
+    (columns as usize, size)
 }
 
-/// The tile widths of one full row at `height`, adjusted so the row spans
-/// `width` to the pixel.
-///
-/// Rounding each tile independently leaves a few px of slack, which at a tight
-/// gap is visible as a ragged right margin; the last tile absorbs it.
-pub(crate) fn fit_row(ratios: &[f64], width: i32, height: i32) -> Vec<i32> {
-    let mut widths: Vec<i32> = ratios
-        .iter()
-        .map(|ratio| ((ratio * height as f64).round() as i32).max(1))
-        .collect();
-    let gaps = TILE_GAP * (widths.len() as i32 - 1);
-    let used: i32 = widths.iter().sum::<i32>() + gaps;
-    if let Some(last) = widths.last_mut() {
-        *last = (*last + (width - used)).max(1);
-    }
-    widths
-}
-
-/// The width the grid is laid out to: the ListView's own width, less a couple of
+/// The width the grid is laid out to: the viewport's width, less a couple of
 /// px so a rounding error can't push a row into a horizontal overflow.
 /// Falls back to a sane guess before the first allocation.
 pub(crate) fn gallery_width(ui: &Rc<Ui>) -> i32 {
@@ -1388,12 +1322,10 @@ pub(crate) fn gallery_width(ui: &Rc<Ui>) -> i32 {
 /// one keeps an image glyph instead of an empty rectangle.
 pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     let picture = gtk4::Picture::builder()
-        // The tile is already the photo's shape, so Contain shows the whole
-        // frame with nothing cropped and nothing letterboxed. Cover would still
-        // crop here: a thumbnail's ratio is not exactly the ratio the row was
-        // laid out at, and the rounding is enough to shave an edge. The expands
-        // are what make the picture take the whole overlay.
-        .content_fit(gtk4::ContentFit::Contain)
+        // Every tile is square, so Cover crops the photo to fill it. Contain
+        // would letterbox it, and the bars would read as gaps in the sheet.
+        // The expands are what make the picture take the whole overlay.
+        .content_fit(gtk4::ContentFit::Cover)
         .can_shrink(true)
         .hexpand(true)
         .vexpand(true)
@@ -1435,23 +1367,30 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
 
     // A video reads as a video at a glance: a play glyph centred over the poster
     // thumbnail. Kept above the caption scrim so it stays legible on hover.
+    // Zoomed out, the glyph shrinks with the tile so it marks the video without
+    // covering it.
+    let small = tile.grouping != Grouping::Day;
     let is_video = tile.photo.kind == PhotoKind::Video;
     if is_video {
         let badge = gtk4::Image::builder()
             .icon_name("media-playback-start-symbolic")
-            .pixel_size(28)
+            .pixel_size(if small { 12 } else { 28 })
             .halign(gtk4::Align::Center)
             .valign(gtk4::Align::Center)
             .build();
         badge.add_css_class("photo-video-badge");
+        if small {
+            badge.add_css_class("photo-video-badge-small");
+        }
         overlay.add_overlay(&badge);
     }
 
     // A shot stored as more than one file says so, in the corner the caption
     // does not use. "RAW" is the useful word when one of the members is a raw
     // file — that is what the person wants to find — and a plain count covers
-    // the rest (a live photo, a burst).
-    if tile.photo.has_raw || tile.photo.group_size > 1 {
+    // the rest (a live photo, a burst). Zoomed out to years the badge would
+    // cover most of a tile, so it is left off there.
+    if (tile.photo.has_raw || tile.photo.group_size > 1) && tile.grouping != Grouping::Year {
         let badge = gtk4::Label::builder()
             .label(if tile.photo.has_raw {
                 // Translators: badge on a photo tile whose shot includes a raw camera file.
@@ -2234,11 +2173,6 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
                     continue;
                 }
             };
-            // A thumbnail is the first look anyone gets at the photo's shape.
-            // If the row was laid out without it, remember it and re-flow — the
-            // debounce means a batch of decodes costs one re-flow, not one
-            // each.
-            learn_ratio(&ui, &uid, &texture);
             ui.store_texture(&uid, texture.clone());
             if let Some(picture) = ui.gallery.thumb_wanted.borrow_mut().remove(&uid) {
                 picture.set_paintable(Some(&texture));
@@ -2251,25 +2185,6 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
         }
         glib::ControlFlow::Continue
     });
-}
-
-/// Record the aspect ratio a decoded thumbnail proves, and re-flow if the layout
-/// had been guessing.
-///
-/// Only a photo the layout had to guess about is worth a re-flow: re-recording
-/// what the daemon already told us would re-flow the timeline on every scroll.
-fn learn_ratio(ui: &Rc<Ui>, uid: &str, texture: &gtk4::gdk::Texture) {
-    let (width, height) = (texture.width(), texture.height());
-    if width <= 0 || height <= 0 {
-        return;
-    }
-    ui.gallery
-        .learned_ratios
-        .borrow_mut()
-        .insert(uid.to_string(), width as f64 / height as f64);
-    if ui.gallery.assumed_ratios.borrow_mut().remove(uid) {
-        schedule_relayout(ui);
-    }
 }
 
 /// Re-flow the sections on screen shortly. Debounced, because the triggers (a
@@ -2292,40 +2207,78 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
 /// A different column count means different rows, so unlike the old
 /// section-per-day model there is nothing to patch in place — the row model is
 /// rebuilt. What that would cost the user is their scroll position, so the
-/// topmost realised row's first photo is remembered and scrolled back to.
+/// topmost visible row's first photo is remembered, and the row that holds it
+/// afterwards is put back at the same height in the viewport.
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
     let anchor = top_anchor(ui);
     repaint_gallery(ui);
-    let Some(anchor) = anchor else { return };
+    let Some((anchor, offset)) = anchor else {
+        return;
+    };
     let Some(row) = row_of_photo(&ui.gallery.groups, &anchor) else {
         return;
     };
+    // Scrolling to a row only brings it into view, anywhere in it; the rows
+    // are laid out over the next frames, so the fine alignment follows them.
     ui.gallery
         .list
         .scroll_to(row, gtk4::ListScrollFlags::empty(), None);
+    align_row(ui, row, offset);
 }
 
-/// The first photo of the topmost photo row that reaches into the viewport.
+/// How many frames [`align_row`] keeps correcting for: rows above the anchor
+/// that the list only estimated get measured as they are realised.
+const ALIGN_FRAMES: u32 = 4;
+
+/// Scroll so the top of row `position` sits `offset` px below the top of the
+/// viewport, re-checking for a few frames while the rows around it settle.
+fn align_row(ui: &Rc<Ui>, position: u32, offset: f32) {
+    let ui = ui.clone();
+    let frames = Cell::new(0);
+    ui.gallery.list.clone().add_tick_callback(move |list, _| {
+        frames.set(frames.get() + 1);
+        let top = ui
+            .gallery
+            .bound
+            .borrow()
+            .get(&position)
+            .filter(|(_, row)| row.is_mapped())
+            .and_then(|(_, row)| row.compute_bounds(list))
+            .map(|rect| rect.y());
+        if let (Some(top), Some(adjustment)) = (top, list.vadjustment()) {
+            let delta = f64::from(top - offset);
+            if delta.abs() >= 1.0 {
+                adjustment.set_value(adjustment.value() + delta);
+            }
+        }
+        if frames.get() >= ALIGN_FRAMES {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// The first photo of the topmost photo row that reaches into the viewport,
+/// and how far below the top of the viewport that row starts (negative when it
+/// is partly scrolled off).
 ///
 /// Not simply the first bound row: the ListView keeps rows bound well outside
 /// the viewport (unmapped, with their last allocation), and scrolling one of
 /// those "back" to the top is a jump. Falls back to the first bound photo row
 /// while the list isn't on screen.
-fn top_anchor(ui: &Rc<Ui>) -> Option<String> {
+fn top_anchor(ui: &Rc<Ui>) -> Option<(String, f32)> {
     let list = &ui.gallery.list;
     let bound = ui.gallery.bound.borrow();
     let mut photo_rows = bound
         .values()
         .filter_map(|(uid, row)| uid.as_ref().map(|uid| (uid, row)));
-    let first = photo_rows.clone().next().map(|(uid, _)| uid.clone());
+    let first = photo_rows.clone().next().map(|(uid, _)| (uid.clone(), 0.0));
     photo_rows
-        .find(|(_, row)| {
-            row.is_mapped()
-                && row
-                    .compute_bounds(list)
-                    .is_some_and(|rect| rect.y() + rect.height() > 0.0)
+        .find_map(|(uid, row)| {
+            let rect = row.compute_bounds(list)?;
+            (row.is_mapped() && rect.y() + rect.height() > 0.0).then(|| (uid.clone(), rect.y()))
         })
-        .map(|(uid, _)| uid.clone())
         .or(first)
 }
 
@@ -2672,7 +2625,7 @@ fn sync_scrubber_position(ui: &Rc<Ui>) {
     if ui.gallery.scrubbing.get() || !ui.gallery.scrubber.is_visible() {
         return;
     }
-    let Some(uid) = top_anchor(ui) else {
+    let Some((uid, _)) = top_anchor(ui) else {
         return;
     };
     let Some(capture_time) = find_photo_index(&ui.gallery.model, &uid)
@@ -3143,8 +3096,8 @@ pub(crate) fn play_external(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, empty_timeline_text, grouping_for,
-        month_index, month_range, section_heading,
+        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, empty_timeline_text,
+        grouping_for, month_index, month_range, plan_grid, section_heading,
     };
     use pdfs_core::control::{PhotoKind, PhotoMonth};
 
@@ -3164,11 +3117,38 @@ mod tests {
     }
 
     #[test]
-    fn zooming_out_groups_by_month_then_year() {
-        assert_eq!(grouping_for(ROW_DEFAULT), Grouping::Day);
+    fn square_tiles_span_the_content_width() {
+        for width in [0, 40, 640, 900, 1440, 1920, 2560] {
+            for target in [ROW_MIN, ROW_DEFAULT, ROW_MAX] {
+                let (columns, size) = plan_grid(width, target);
+                let columns = columns as i32;
+                let row = columns * size + TILE_GAP * (columns - 1);
+                assert!(size > 0 && columns > 0);
+                assert!(
+                    width < target || row <= width,
+                    "{row}px overflows {width}px"
+                );
+                assert!(
+                    width < target || width - row < columns,
+                    "{row}px leaves a margin in {width}px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zooming_in_puts_fewer_tiles_in_a_row() {
+        assert!(plan_grid(1920, ROW_MIN).0 > plan_grid(1920, ROW_DEFAULT).0);
+        assert!(plan_grid(1920, ROW_DEFAULT).0 > plan_grid(1920, ROW_MAX).0);
+        let (_, size) = plan_grid(1920, ROW_DEFAULT);
+        assert!((size - ROW_DEFAULT).abs() < ROW_DEFAULT / 2);
+    }
+
+    #[test]
+    fn only_big_tiles_are_headed_by_day() {
         assert_eq!(grouping_for(ROW_MAX), Grouping::Day);
-        assert_eq!(grouping_for(ROW_DEFAULT - ROW_STEP), Grouping::Day);
-        assert_eq!(grouping_for(ROW_DEFAULT - 2 * ROW_STEP), Grouping::Month);
+        assert_eq!(grouping_for(ROW_DEFAULT + 2 * ROW_STEP), Grouping::Day);
+        assert_eq!(grouping_for(ROW_DEFAULT), Grouping::Month);
         assert_eq!(grouping_for(ROW_DEFAULT - 3 * ROW_STEP), Grouping::Month);
         assert_eq!(grouping_for(ROW_MIN), Grouping::Year);
     }

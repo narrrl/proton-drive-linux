@@ -58,8 +58,8 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 .viewer-info-panel { background-color: var(--window-bg-color); border-left: 1px solid alpha(currentColor, 0.12); }
 
 /* Photos grid */
-.gallery-day { font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 4px 2px 8px 2px; }
-.photo-tile { padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 6px; background: none; box-shadow: none; transition: box-shadow 180ms ease; }
+.gallery-day { font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 2px 2px 6px 2px; }
+.photo-tile { padding: 0; margin: 0; min-height: 0; min-width: 0; border: none; border-radius: 4px; background: none; box-shadow: none; transition: box-shadow 180ms ease; }
 .photo-tile:hover { box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45); }
 .photo-tile:focus { outline: 2px solid var(--accent-color); outline-offset: -2px; }
 .photo-thumb { transition: transform 220ms ease; }
@@ -71,6 +71,7 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 .photo-caption { font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 180ms ease; }
 .photo-tile:hover .photo-caption { opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }
 .photo-video-badge { color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }
+.photo-video-badge-small { padding: 3px; min-width: 0; min-height: 0; }
 .photo-tile:hover .photo-video-badge { background: color-mix(in srgb, var(--accent-bg-color) 85%, transparent); }
 .photo-group-badge { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; color: white; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 1px 5px; margin: 6px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }
 .album-card { padding: 0; border-radius: 16px; transition: background 180ms ease; }
