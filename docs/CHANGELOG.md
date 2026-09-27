@@ -11,6 +11,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.2.2] — 2026-09-27
+
+Schema: **32** (unchanged).
+
+### Fixed
+- **Conflicts in synced folders.** A conflict copy inside a synced folder is now listed under
+  Needs attention and can be resolved there or with `pdfs conflicts`. It used to be logged again
+  after every restart and marked "Resolved" while it was still on disk (B99).
+
 ## [2.2.1] — 2026-09-24
 
 Schema: **32** (unchanged).
@@ -1038,6 +1047,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.2.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.2
 [2.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.1
 [2.1.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.1.0
 [2.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.0.0
