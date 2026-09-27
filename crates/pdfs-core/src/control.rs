@@ -429,10 +429,12 @@ pub enum Request {
     /// Retry a backed-off queued op now instead of waiting out its backoff;
     /// every failed op when `id` is `None`. Replies with [`Response::Ok`].
     RetryPendingOp { id: Option<i64> },
-    /// List the `(sync-conflict …)` copies under My Files. Replies with
+    /// List the `(sync-conflict …)` copies under My Files and in synced
+    /// folders. Replies with
     /// [`Response::Conflicts`].
     ListConflicts,
-    /// Resolve one conflict copy (`path` mountpoint-relative or absolute).
+    /// Resolve one conflict copy (`path` mountpoint-relative, or absolute for a
+    /// copy in a synced folder).
     /// Everything removed goes to the Proton trash. Replies with
     /// [`Response::Ok`].
     ResolveConflict { path: String, keep: ConflictKeep },
@@ -701,9 +703,10 @@ pub struct DeviceInfo {
 /// [`Response::Conflicts`]).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConflictInfo {
-    /// Mountpoint-relative path of the copy.
+    /// Mountpoint-relative path of the copy, or its absolute local path when it
+    /// sits in a synced folder.
     pub path: String,
-    /// Mountpoint-relative path of the file it is a copy of.
+    /// Path of the file it is a copy of, in the same form as `path`.
     pub original_path: String,
     /// False when the original is gone and only the copy is left.
     pub original_exists: bool,

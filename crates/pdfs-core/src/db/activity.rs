@@ -29,6 +29,17 @@ impl Db {
         Ok(())
     }
 
+    /// Whether the kept log already holds an entry of `kind` for `target`. Lets
+    /// the daemon report something once across restarts rather than once per
+    /// run, without keeping a second table in step with the log.
+    pub fn activity_has(&self, kind: ActivityKind, target: &str) -> Result<bool> {
+        let kind = serde_json::to_string(&kind)?;
+        let conn = self.read();
+        let mut stmt =
+            conn.prepare("SELECT 1 FROM activity WHERE kind = ?1 AND target = ?2 LIMIT 1")?;
+        Ok(stmt.exists(params![kind, target])?)
+    }
+
     /// The most recent activity, newest first, capped at `limit` entries. Rows
     /// whose stored `kind` no longer parses (written by an older build) are
     /// skipped rather than failing the whole read.

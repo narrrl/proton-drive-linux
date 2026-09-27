@@ -12,6 +12,42 @@ Conventions:
 
 ---
 
+## B99 — Conflict copies in synced folders are logged again on every start and shown as "Resolved"
+
+**Status:** Fixed (unverified). No daemon carrying the change has been restarted against the
+affected copies yet.
+**Found:** 2026-09-27. The Activity page listed the same six conflict copies every day, e.g.
+`Conflict [EMBER] Oshi no Ko S2 - 12 (sync-conflict 1786815864).mkv` with `Differs from … · 24 times
+since Sep 20, 13:13 · Resolved`. `find` showed all six copies still on disk, in `~/Videos` and
+`~/Documents`. Both are on-demand sync folders. `pdfs conflicts` answered `No conflicts.`. The
+journal showed the daemon mounting at 17:29:33, and the entries were stamped 17:30. That is the
+sweep's 30-second warmup.
+
+**Where:** `crates/pdfs-fuse/src/sweep.rs` (`flag_conflict`, `sweep_conflicts_once`),
+`crates/pdfs-fuse/src/conflicts.rs` (`list_conflicts`), `crates/pdfs-fuse/src/control.rs`
+(`ResolveConflict`).
+
+**Cause.** There were two faults.
+
+- The sweep kept its "already flagged" set only in memory. Every daemon start forgot it, so the
+  first pass logged every open conflict again.
+- The sweep flags copies anywhere in the account's own tree. `list_conflicts` only reported copies
+  below My Files, and resolving only accepted paths under the primary mount. A copy in a synced
+  folder was logged but never listed, so the GUI read it as resolved. It also could not be
+  resolved from the GUI or the CLI.
+
+**Fix.** `Core::conflict_path` names a copy by its mountpoint-relative path under My Files, or
+by its absolute local path inside a synced folder. It reuses the roots that search already
+resolves hits through. The listing uses it, and the sweep flags only copies it can name. So the
+feed never holds a conflict the listing cannot answer for. `ResolveConflict` routes an absolute
+path to the on-demand mount that serves it. For a copy in a mirror folder, it says to edit the
+local file instead. Before logging, `flag_conflict` checks the activity log
+(`Db::activity_has`), so a restart does not log the same copy again. The copy's name carries its
+own timestamp, so the name identifies the copy. No schema change.
+Regression test: `activity_has_finds_only_matching_kind_and_target`.
+
+---
+
 ## B98 — A superseded upload spins its drain thread forever and shows as "Uploading" at 0 bytes
 
 **Status:** Fixed (unverified) — the daemon carrying the change has not been driven against a

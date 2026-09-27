@@ -109,6 +109,7 @@ impl Core {
             by_parent_name.insert((parent, node.name.as_str()), node);
         }
 
+        let roots = self.search_roots();
         let online = self.online.load(std::sync::atomic::Ordering::Relaxed);
         for node in &nodes {
             if node.trashed || node.is_folder() {
@@ -132,7 +133,16 @@ impl Core {
                         self.remove_conflict_copy(node, &base);
                     }
                 }
-                SweepAction::Flag(detail) => self.flag_conflict(&node.uid, &node.name, detail),
+                // Only flag what the conflict listing can show. Anything else
+                // would sit in the feed as "resolved" with no way to act on
+                // it (`docs/BUGS.md` B99).
+                SweepAction::Flag(detail) => {
+                    if self.conflict_path(&roots, &node.uid).is_some() {
+                        self.flag_conflict(&node.uid, &node.name, detail);
+                    } else {
+                        debug!(uid = %node.uid, name = %node.name, "conflict sweep: copy is outside every location; not flagged");
+                    }
+                }
             }
         }
     }
@@ -273,11 +283,20 @@ impl Core {
         busy
     }
 
-    /// Surface a conflict copy that needs the user's attention, at most once per
-    /// daemon run so the activity feed is not spammed each pass.
+    /// Surface a conflict copy that needs the user's attention, once. The
+    /// in-memory set spares the database each pass; the activity log itself is
+    /// what keeps a restart from logging the same copy again (`docs/BUGS.md`
+    /// B99). A copy's name carries its own timestamp, so the name identifies it.
     fn flag_conflict(&self, uid: &NodeUid, name: &str, detail: String) {
         if !self.conflict_notified.lock().insert(uid.clone()) {
             return;
+        }
+        match self.db.activity_has(ActivityKind::Conflict, name) {
+            Ok(false) => {}
+            Ok(true) => return,
+            // Cannot tell: a repeat entry is harmless, a missing one hides a
+            // conflict.
+            Err(e) => warn!(%uid, name, error = ?e, "conflict sweep: activity check failed"),
         }
         debug!(%uid, name, detail, "conflict sweep: flagged divergent conflict copy");
         self.log_activity(ActivityKind::Conflict, name, detail, false);

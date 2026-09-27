@@ -558,9 +558,10 @@ struct Core {
     /// instead of polling or blocking for the whole run. See
     /// [`Core::await_trash_refresh`].
     trash_progress: Arc<tokio::sync::Notify>,
-    /// Conflict copies the sweep has already flagged as needing attention this
-    /// run, so a divergent `(sync-conflict …)` file is logged once rather than
-    /// on every sweep pass. See [`Core::run_conflict_sweep_loop`].
+    /// Conflict copies the sweep has already checked against the activity log
+    /// this run, so each pass does not ask the database again. The log itself
+    /// is what keeps a copy from being flagged again after a restart. See
+    /// [`Core::run_conflict_sweep_loop`] and `docs/BUGS.md` B99.
     conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
     /// Whether the conflict sweep may actually trash the duplicates it finds, or
     /// only report them. Resolved once at mount from config + environment

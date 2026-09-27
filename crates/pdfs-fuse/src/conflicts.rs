@@ -14,15 +14,38 @@
 //! that is open, being written, or still owed an upload, for the same reason the
 //! sweep does: the node is about to change under the decision.
 //!
-//! Only copies under My Files are handled here. A copy inside a mirror folder is
-//! a local file first; the sync engine owns it.
+//! Copies under My Files are named by their mountpoint-relative path. Copies
+//! inside a synced folder are named by their absolute local path, so a resolve
+//! request routes to the on-demand mount that serves them. A copy inside a
+//! mirror folder is listed too, but it is a local file first: the sync engine
+//! owns it, so it is resolved by editing the folder, not through here.
 
 use super::*;
 use pdfs_core::control::{ConflictInfo, ConflictKeep};
 use sweep::conflict_base_name;
 
 impl Core {
-    /// Every conflict copy under My Files, with the file it is a copy of.
+    /// Where the user finds a conflict copy: its mountpoint-relative path under
+    /// My Files, or its absolute local path inside a synced folder. `None` for a
+    /// node no location of this machine shows, such as one in another
+    /// computer's device tree.
+    ///
+    /// The sweep only flags what this can name, and the listing uses it too. A
+    /// flagged copy the listing cannot see reads as resolved in the activity
+    /// feed while it still sits in the folder (`docs/BUGS.md` B99).
+    pub(crate) fn conflict_path(&self, roots: &SearchRoots, uid: &NodeUid) -> Option<String> {
+        let uid = uid.to_string();
+        if let Ok(Some(path)) = self
+            .db
+            .path_relative_to(&self.primary_root_uid.to_string(), &uid)
+        {
+            return Some(path);
+        }
+        let drive_path = self.db.node_path(&uid).ok().flatten()?;
+        roots.resolve(&drive_path)
+    }
+
+    /// Every conflict copy this machine shows, with the file it is a copy of.
     pub(crate) fn list_conflicts(&self) -> CoreResult<Vec<ConflictInfo>> {
         let stored = self
             .db
@@ -37,13 +60,13 @@ impl Core {
         for node in &nodes {
             by_parent_name.insert((node.parent_uid.as_ref(), node.name.as_str()), node);
         }
-        let root = self.primary_root_uid.to_string();
+        let roots = self.search_roots();
         let mut items = Vec::new();
         for node in &nodes {
             let Some(base) = conflict_base_name(&node.name) else {
                 continue;
             };
-            let Ok(Some(path)) = self.db.path_relative_to(&root, &node.uid.to_string()) else {
+            let Some(path) = self.conflict_path(&roots, &node.uid) else {
                 continue;
             };
             let original = by_parent_name

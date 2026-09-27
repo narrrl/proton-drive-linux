@@ -1415,6 +1415,29 @@ fn activity_reads_back_newest_first() {
 }
 
 #[test]
+fn activity_has_finds_only_matching_kind_and_target() {
+    let db = Db::open_in_memory().unwrap();
+    db.activity_add(&activity(
+        "a (sync-conflict 1).txt",
+        ActivityKind::Conflict,
+        false,
+    ))
+    .unwrap();
+    db.activity_add(&activity("b.txt", ActivityKind::Upload, true))
+        .unwrap();
+
+    assert!(
+        db.activity_has(ActivityKind::Conflict, "a (sync-conflict 1).txt")
+            .unwrap()
+    );
+    assert!(
+        !db.activity_has(ActivityKind::Upload, "a (sync-conflict 1).txt")
+            .unwrap()
+    );
+    assert!(!db.activity_has(ActivityKind::Conflict, "b.txt").unwrap());
+}
+
+#[test]
 fn activity_prunes_to_the_keep_limit() {
     let db = Db::open_in_memory().unwrap();
     for i in 0..(ACTIVITY_KEEP + 10) {

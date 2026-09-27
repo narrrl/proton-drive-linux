@@ -185,6 +185,38 @@ fn route_to_mount(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Cor
     rel_to_mount(mountpoint, path).map(|rel| (core.clone(), rel))
 }
 
+/// [`route_to_mount`] for a conflict copy. The listing names a copy inside a
+/// synced folder by its absolute local path (`docs/BUGS.md` B99), so the
+/// resolve has to run against the on-demand mount serving it. A mirror folder
+/// has no mount to run against: its copy is an ordinary local file.
+fn route_conflict(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
+    let routed = route_to_mount(core, mountpoint, path).map_err(|e| {
+        let p = Path::new(path);
+        let mirrored = core
+            .db
+            .sync_folder_list()
+            .unwrap_or_default()
+            .iter()
+            .any(|folder| folder.mode == "mirror" && p.starts_with(&folder.local_path));
+        if mirrored {
+            CoreError::invalid(format!(
+                "{path} is in a mirrored folder; rename or delete the local file there"
+            ))
+        } else {
+            e
+        }
+    })?;
+    if routed
+        .1
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        Ok(routed)
+    } else {
+        Err(CoreError::invalid(format!("{path} escapes the mountpoint")))
+    }
+}
+
 /// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
 /// must live under `mountpoint`; a relative path is taken as already relative to
 /// the mount root.
@@ -1123,13 +1155,15 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(items) => CtlResponse::Conflicts { items },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::ResolveConflict { path, keep }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.resolve_conflict(&rel, &keep) {
-                Ok(message) => CtlResponse::Ok { message },
+        Ok(CtlRequest::ResolveConflict { path, keep }) => {
+            match route_conflict(core, mountpoint, &path) {
+                Ok((core, rel)) => match core.resolve_conflict(&rel, &keep) {
+                    Ok(message) => CtlResponse::Ok { message },
+                    Err(e) => CtlResponse::error(e),
+                },
                 Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
+            }
+        }
         Ok(CtlRequest::ListPendingOps) => match core.pending_op_infos() {
             Ok(items) => CtlResponse::PendingOps { items },
             Err(e) => CtlResponse::error(e),
