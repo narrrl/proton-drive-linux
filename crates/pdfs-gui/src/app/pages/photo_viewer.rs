@@ -9,6 +9,12 @@ const ZOOM_STEP: f64 = 1.25;
 /// The furthest the lightbox zooms in, as a multiple of the image's own pixels.
 const MAX_ZOOM: f64 = 8.0;
 
+/// How long a slideshow shows each photo. A video plays to its end instead.
+const SLIDESHOW_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often a slideshow checks whether the video on screen has finished.
+const SLIDESHOW_VIDEO_POLL: Duration = Duration::from_millis(500);
+
 /// How close to the end of the loaded photos stepping forward starts paging the
 /// next batch in, so reaching the end rarely means waiting for it.
 const PAGE_AHEAD: u32 = 10;
@@ -75,6 +81,12 @@ pub(crate) struct Viewer {
     pub(crate) chrome: Vec<gtk4::Revealer>,
     pub(crate) chrome_hover: Cell<bool>,
     pub(crate) chrome_source: RefCell<Option<glib::SourceId>>,
+    /// The slideshow toggle; the timer that moves it on; and whether it put
+    /// the window in fullscreen, so stopping it only leaves a fullscreen it
+    /// entered itself.
+    pub(crate) slideshow: gtk4::ToggleButton,
+    pub(crate) slide_source: RefCell<Option<glib::SourceId>>,
+    pub(crate) slide_fullscreened: Cell<bool>,
 }
 
 /// Camera/exposure/location facts pulled from a photo's own EXIF tags, as
@@ -220,6 +232,8 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     stop_video(viewer);
     viewer.media.set_visible_child_name("photo");
     reset_zoom(viewer);
+    // A slideshow waits for this photo to land before it starts counting.
+    disarm_slide(viewer);
 
     // Looked up before the group is refetched, which empties it.
     let item = viewer_item(ui, viewer, &uid);
@@ -244,6 +258,7 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
         Request::OpenPhoto { uid: uid.clone() },
     );
     let viewer = viewer.clone();
+    let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         // The user may have moved on while this was in flight; that photo's own
@@ -254,6 +269,9 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
         viewer.spinner.stop();
         viewer.spinner.set_visible(false);
         viewer.loading.set(false);
+        // Armed whether or not the photo rendered: a slideshow steps past a
+        // photo it could not show rather than stalling on it.
+        arm_slide(&ui, &viewer);
 
         let fail = |message: &str| {
             viewer.status.set_label(message);
@@ -293,6 +311,92 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
             Ok(Err(_)) | Err(_) => fail(&gettext("Couldn't reach Proton Drive.")),
         }
     });
+}
+
+/// Start the slideshow: fullscreen, controls out of the way, and the photo on
+/// screen counted down once it has loaded.
+fn start_slideshow(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    if !viewer.window.is_fullscreen() {
+        viewer.window.fullscreen();
+        viewer.slide_fullscreened.set(true);
+    }
+    viewer
+        .slideshow
+        .set_icon_name("media-playback-pause-symbolic");
+    hide_chrome(viewer);
+    if !viewer.loading.get() {
+        arm_slide(ui, viewer);
+    }
+}
+
+/// Stop the slideshow, leaving fullscreen only if the slideshow entered it.
+fn stop_slideshow(viewer: &Rc<Viewer>) {
+    disarm_slide(viewer);
+    if viewer.slide_fullscreened.replace(false) {
+        viewer.window.unfullscreen();
+    }
+    viewer
+        .slideshow
+        .set_icon_name("media-playback-start-symbolic");
+    if viewer.slideshow.is_active() {
+        viewer.slideshow.set_active(false);
+    }
+}
+
+/// Move a running slideshow on from the photo on screen: after
+/// [`SLIDESHOW_INTERVAL`] for a still, once it has played through for a video.
+fn arm_slide(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    disarm_slide(viewer);
+    if !viewer.slideshow.is_active() {
+        return;
+    }
+    let playing_video = viewer.media.visible_child_name().as_deref() == Some("video");
+    let (ui, weak) = (ui.clone(), Rc::downgrade(viewer));
+    let source = if playing_video {
+        glib::timeout_add_local(SLIDESHOW_VIDEO_POLL, move || {
+            let Some(viewer) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let ended = viewer
+                .video
+                .media_stream()
+                .is_some_and(|stream| stream.is_ended());
+            if !ended {
+                return glib::ControlFlow::Continue;
+            }
+            // This timer is finishing, so its id must not be removed again.
+            viewer.slide_source.borrow_mut().take();
+            next_slide(&ui, &viewer);
+            glib::ControlFlow::Break
+        })
+    } else {
+        glib::timeout_add_local_once(SLIDESHOW_INTERVAL, move || {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            viewer.slide_source.borrow_mut().take();
+            next_slide(&ui, &viewer);
+        })
+    };
+    *viewer.slide_source.borrow_mut() = Some(source);
+}
+
+fn disarm_slide(viewer: &Rc<Viewer>) {
+    if let Some(source) = viewer.slide_source.borrow_mut().take() {
+        source.remove();
+    }
+}
+
+/// Step the slideshow forward, or end it at the last photo there is.
+fn next_slide(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    let model = &ui.gallery.model;
+    let last = find_photo_index(model, &viewer.uid.borrow())
+        .is_some_and(|index| index + 1 >= model.n_items());
+    if last && !ui.gallery.has_more.get() {
+        stop_slideshow(viewer);
+        return;
+    }
+    navigate_photo(ui, viewer, 1);
 }
 
 /// Stop whatever the player was playing, so stepping off a video (or closing
@@ -988,6 +1092,14 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     favorite_btn.add_css_class("flat");
     favorite_btn.add_css_class("viewer-action-btn");
 
+    let slideshow_btn = gtk4::ToggleButton::builder()
+        .icon_name("media-playback-start-symbolic")
+        .tooltip_text(gettext("Slideshow (F5)"))
+        .valign(gtk4::Align::Center)
+        .build();
+    slideshow_btn.add_css_class("flat");
+    slideshow_btn.add_css_class("viewer-action-btn");
+
     // Only shown for a shot stored as more than one file; `load_photo_group`
     // decides that per photo.
     let group_btn = action("view-paged-symbolic", &gettext("Other files of this photo"));
@@ -1005,6 +1117,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     top_bar.append(&group_btn);
     top_bar.append(&favorite_btn);
     top_bar.append(&info_toggle);
+    top_bar.append(&slideshow_btn);
     top_bar.append(&download_btn);
     top_bar.append(&delete_btn);
     top_bar.append(&open_ext_btn);
@@ -1131,6 +1244,9 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         chrome: vec![top_reveal.clone(), prev_reveal.clone(), next_reveal.clone()],
         chrome_hover: Cell::new(false),
         chrome_source: RefCell::new(None),
+        slideshow: slideshow_btn.clone(),
+        slide_source: RefCell::new(None),
+        slide_fullscreened: Cell::new(false),
     });
 
     let initial_idx = find_photo_index(&ui.gallery.model, &initial_uid).unwrap_or(0);
@@ -1244,6 +1360,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let viewer_closing = viewer.clone();
     window.connect_close_request(move |_| {
         stop_video(&viewer_closing);
+        disarm_slide(&viewer_closing);
         if let Some(source) = viewer_closing.chrome_source.borrow_mut().take() {
             source.remove();
         }
@@ -1255,6 +1372,16 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         viewer_info
             .info_revealer
             .set_reveal_child(toggle.is_active());
+    });
+
+    let ui_slides = ui.clone();
+    let viewer_slides = viewer.clone();
+    slideshow_btn.connect_toggled(move |toggle| {
+        if toggle.is_active() {
+            start_slideshow(&ui_slides, &viewer_slides);
+        } else {
+            stop_slideshow(&viewer_slides);
+        }
     });
 
     let toggle_off = info_toggle.clone();
@@ -1426,6 +1553,13 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
             Some("minus" | "KP_Subtract") => zoom_by(&viewer_key, 1.0 / ZOOM_STEP),
             Some("0" | "KP_0") => reset_zoom(&viewer_key),
             Some("1" | "KP_1") => zoom_to(&viewer_key, Some(1.0), None),
+            Some("F5") => viewer_key
+                .slideshow
+                .set_active(!viewer_key.slideshow.is_active()),
+            // Escape ends a slideshow before it closes anything.
+            Some("Escape") if viewer_key.slideshow.is_active() => {
+                viewer_key.slideshow.set_active(false)
+            }
             Some("i") => viewer_key
                 .info_toggle
                 .set_active(!viewer_key.info_toggle.is_active()),

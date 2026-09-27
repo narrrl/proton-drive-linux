@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-09-28 00:13+0200\n"
+"POT-Creation-Date: 2026-09-28 00:14+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Portuguese (Brazil)\n"
@@ -399,7 +399,7 @@ msgstr "Não foi possível ler a atividade"
 #: crates/pdfs-gui/src/app/pages/activity.rs:275
 #: crates/pdfs-gui/src/app/pages/browser.rs:2880
 #: crates/pdfs-gui/src/app/pages/browser.rs:3066
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:292
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:310
 #: crates/pdfs-gui/src/app/pages/photos.rs:3077
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:139
 #: crates/pdfs-gui/src/app/pages/trash.rs:320
@@ -730,7 +730,7 @@ msgstr "Não foi possível criar o álbum"
 #: crates/pdfs-gui/src/app/pages/locations.rs:739
 #: crates/pdfs-gui/src/app/pages/locations.rs:1090
 #: crates/pdfs-gui/src/app/pages/locations.rs:1109
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1297
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1424
 #: crates/pdfs-gui/src/app/pages/photos.rs:1234
 #: crates/pdfs-gui/src/app/pages/photos.rs:1947
 #: crates/pdfs-gui/src/app/pages/photos.rs:2912
@@ -1085,7 +1085,7 @@ msgid "Location"
 msgstr "Local"
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:1256
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:998
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1110
 msgid "Open With…"
 msgstr "Abrir com…"
 
@@ -1123,7 +1123,7 @@ msgid "Versions…"
 msgstr "Versões…"
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:1302
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1032
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1145
 msgid "Details"
 msgstr "Detalhes"
 
@@ -2378,171 +2378,175 @@ msgid "Sign Out"
 msgstr "Sair"
 
 #. Translators: tooltip of the button that switches to another file of the same photo; {name} is a file name.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:182
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:194
 #, rust-format
 msgid "Show {name}"
 msgstr "Mostrar {name}"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:185
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:197
 msgid "Show the raw file"
 msgstr "Mostrar o arquivo RAW"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:186
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:198
 msgid "Show the video"
 msgstr "Mostrar o vídeo"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:187
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:199
 msgid "Show the photo"
 msgstr "Mostrar a foto"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:288
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:306
 msgid "Couldn't render this photo."
 msgstr "Não foi possível renderizar esta foto."
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:293
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:311
 msgid "Couldn't reach Proton Drive."
 msgstr "Não foi possível acessar o Proton Drive."
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:345
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:449
 msgid "Reading photo details…"
 msgstr "Lendo os detalhes da foto…"
 
 #. Translators: label of a photo's file size in the details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:362
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:466
 msgctxt "property"
 msgid "Size"
 msgstr "Tamanho"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:368
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:472
 msgid "This photo carries no metadata."
 msgstr "Esta foto não contém metadados."
 
 #. Translators: a photo's pixel dimensions, such as "4032 × 3024".
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:441
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:545
 #, rust-format
 msgid "{width} × {height}"
 msgstr "{width} × {height}"
 
 #. Translators: label of a photo's pixel dimensions in the details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:444
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:548
 msgid "Dimensions"
 msgstr "Dimensões"
 
 #. Translators: label of when a photo was taken, in the details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:448
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:552
 msgctxt "photo property"
 msgid "Taken"
 msgstr "Tirada em"
 
 #. Translators: label of the camera model in a photo's details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:453
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:557
 msgid "Camera"
 msgstr "Câmera"
 
 #. Translators: label of the lens model in a photo's details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:457
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:561
 msgid "Lens"
 msgstr "Lente"
 
 #. Translators: a photo's ISO sensitivity, such as "ISO 400".
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:472
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:576
 #, rust-format
 msgid "ISO {value}"
 msgstr "ISO {value}"
 
 #. Translators: label of aperture, shutter speed, ISO and focal length in a photo's details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:484
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:588
 msgid "Exposure"
 msgstr "Exposição"
 
 #. Translators: label of where a photo was taken, in the details panel.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:492
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:596
 msgctxt "photo property"
 msgid "Location"
 msgstr "Local"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:495
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:599
 #, rust-format
 msgid "{latitude}, {longitude}"
 msgstr "{latitude}, {longitude}"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:685
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:789
 msgid "Save a Copy"
 msgstr "Salvar uma cópia"
 
 #. Translators: {name} is the saved file's name.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:706
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:810
 #, rust-format
 msgid "Saved “{name}”"
 msgstr "“{name}” salvo"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:708
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:711
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:812
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:815
 msgid "Couldn't save the copy"
 msgstr "Não foi possível salvar a cópia"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:712
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:816
 msgid "The copy was interrupted."
 msgstr "A cópia foi interrompida."
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:839
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:844
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:943
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:948
 #, rust-format
 msgid "{position} of {total}"
 msgstr "{position} de {total}"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:849
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:953
 #, rust-format
 msgid "{position} of {loaded}+"
 msgstr "{position} de {loaded}+"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:877
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:981
 msgid "Photo"
 msgstr "Foto"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:924
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1028
 msgid "Previous (←)"
 msgstr "Anterior (←)"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:938
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1042
 msgid "Next (→)"
 msgstr "Próxima (→)"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:976
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1080
 msgid "Details (i)"
 msgstr "Detalhes (i)"
 
 #. Translators: tooltip of the star button that marks a photo as a favorite.
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:985
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1089
 msgctxt "verb"
 msgid "Favorite"
 msgstr "Favoritar"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:993
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1097
+msgid "Slideshow (F5)"
+msgstr "Apresentação de slides (F5)"
+
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1105
 msgid "Other files of this photo"
 msgstr "Outros arquivos desta foto"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:996
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1108
 msgid "Save a Copy…"
 msgstr "Salvar uma cópia…"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:997
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1109
 msgid "Move to Trash (Delete)"
 msgstr "Mover para a lixeira (Delete)"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:999
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1111
 msgid "Close (Esc)"
 msgstr "Fechar (Esc)"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1022
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1135
 msgid "Show on map"
 msgstr "Mostrar no mapa"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1040
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1153
 msgid "Hide details"
 msgstr "Ocultar detalhes"
 
-#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1302
+#: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1429
 #: crates/pdfs-gui/src/app/pages/photos.rs:2907
 #: crates/pdfs-gui/src/app/pages/photos.rs:2911
 msgid "Couldn't change the favorite"
