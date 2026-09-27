@@ -561,6 +561,8 @@ fn build_window(app: &adw::Application) {
             range: Cell::new(None),
             favorites_btn: gallery_widgets.favorites_btn.clone(),
             favorites: Cell::new(false),
+            not_in_album_btn: gallery_widgets.not_in_album_btn.clone(),
+            not_in_album: Cell::new(false),
             date_suppress: Cell::new(false),
             loading: Cell::new(false),
             has_more: Cell::new(false),

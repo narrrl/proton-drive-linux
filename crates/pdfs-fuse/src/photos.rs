@@ -637,6 +637,7 @@ impl Core {
         kind: Option<PhotoKind>,
         range: Option<(i64, i64)>,
         favorites: bool,
+        not_in_album: bool,
     ) -> CoreResult<Option<Vec<PhotoItem>>> {
         let count = self.db.photos_count().map_err(CoreError::from)?;
         if count == 0 {
@@ -653,10 +654,16 @@ impl Core {
         } else if self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
             self.spawn_timeline_refresh();
         }
+        // The filter is only as good as the album contents on disk, and those
+        // are fetched lazily, per album opened. Fill in the missing ones before
+        // the first page; later pages reuse what that fetch stored.
+        if not_in_album && offset == 0 {
+            self.ensure_album_contents()?;
+        }
 
         let page = self
             .db
-            .photos_page(offset, limit, kind, range, favorites)
+            .photos_page(offset, limit, kind, range, favorites, not_in_album)
             .map_err(CoreError::from)?;
         Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }

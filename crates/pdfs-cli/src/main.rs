@@ -2074,6 +2074,7 @@ fn cmd_photos(limit: usize, offset: usize, favorites: bool) -> Result<()> {
         kind: None,
         range: None,
         favorites,
+        not_in_album: false,
     })? {
         CtlResponse::Photos {
             available: false, ..

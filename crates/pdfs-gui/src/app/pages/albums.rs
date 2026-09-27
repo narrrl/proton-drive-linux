@@ -468,6 +468,16 @@ fn add_to_album(ui: &Rc<Ui>, album: String, photos: Vec<String>) {
                         ),
                     );
                 }
+                // Filed photos no longer belong in a timeline of unfiled ones.
+                // The daemon's filter drops them too, so the paging offset stays
+                // in step with what is left.
+                if ui.gallery.not_in_album.get() && ui.gallery.album.borrow().is_none() {
+                    ui.gallery
+                        .selected
+                        .borrow_mut()
+                        .retain(|uid| !changed.contains(uid));
+                    remove_photos(&ui, &changed);
+                }
                 reload_album_grid(&ui);
             }
             Ok(Ok(Response::Error { message, kind })) => {

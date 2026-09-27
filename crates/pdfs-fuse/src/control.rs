@@ -440,7 +440,15 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             kind,
             range,
             favorites,
-        }) => match core.photos_timeline(offset, clamp_limit(limit), kind, range, favorites) {
+            not_in_album,
+        }) => match core.photos_timeline(
+            offset,
+            clamp_limit(limit),
+            kind,
+            range,
+            favorites,
+            not_in_album,
+        ) {
             Ok(Some(items)) => CtlResponse::Photos {
                 available: true,
                 items,

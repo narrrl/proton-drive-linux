@@ -455,7 +455,8 @@ impl Db {
     /// restricts the page to one tab (Photos / Videos / Raw); `range`, when set,
     /// restricts it to a `[from, to)` capture-time window (epoch seconds) — the
     /// date scrubber's jump. `offset` is relative to whatever the filters leave.
-    /// `favorites` restricts the page to favorited photos.
+    /// `favorites` restricts the page to favorited photos, and `not_in_album`
+    /// to the shots no album holds any file of.
     ///
     /// The page holds one row per *group*: the RAW and the JPEG of one shot are
     /// one tile. The Raw tab is the exception and lists every raw file, because
@@ -467,6 +468,7 @@ impl Db {
         kind: Option<crate::control::PhotoKind>,
         range: Option<(i64, i64)>,
         favorites: bool,
+        not_in_album: bool,
     ) -> Result<Vec<StoredPhoto>> {
         let conn = self.read();
         // Built up so any combination of the optional filters is one indexed
@@ -489,6 +491,15 @@ impl Db {
         }
         if favorites {
             conds.push("p.favorite = 1".to_string());
+        }
+        // By group, not by file: a shot filed as its JPEG is filed, even though
+        // its RAW was never added anywhere.
+        if not_in_album {
+            conds.push(
+                "NOT EXISTS (SELECT 1 FROM album_photos a JOIN photos m ON m.uid = a.uid \
+                 WHERE COALESCE(m.group_key, m.uid) = COALESCE(p.group_key, p.uid))"
+                    .to_string(),
+            );
         }
         if !conds.is_empty() {
             sql.push_str(" WHERE ");

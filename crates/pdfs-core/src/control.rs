@@ -67,6 +67,10 @@ pub enum Request {
         /// get the whole timeline, as before.
         #[serde(default)]
         favorites: bool,
+        /// Restrict the page to photos no album of ours holds — what is left to
+        /// file. Older front-ends omit it and get the whole timeline, as before.
+        #[serde(default)]
+        not_in_album: bool,
     },
     /// Every photo of one photo's group — the JPEG and the RAW of one shot, a
     /// live photo and its clip. Replies with [`Response::Photos`], holding one
@@ -2790,6 +2794,7 @@ mod tests {
             decoded,
             Request::PhotosTimeline {
                 favorites: false,
+                not_in_album: false,
                 kind: None,
                 range: None,
                 ..

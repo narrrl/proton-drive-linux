@@ -813,7 +813,10 @@ fn gallery_total(ui: &Rc<Ui>) -> Option<usize> {
     if let Some(album) = ui.gallery.album.borrow().as_ref() {
         return Some(album.photo_count);
     }
-    if ui.gallery.range.get().is_some() || ui.gallery.favorites.get() {
+    if ui.gallery.range.get().is_some()
+        || ui.gallery.favorites.get()
+        || ui.gallery.not_in_album.get()
+    {
         return None;
     }
     let (photos, videos, raw) = ui.gallery.counts.get()?;

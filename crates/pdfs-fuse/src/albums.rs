@@ -175,6 +175,40 @@ impl Core {
         Ok(page.into_iter().map(|p| self.photo_item(p)).collect())
     }
 
+    /// Make sure every album of ours has its contents on disk, for a filter
+    /// that asks which photos no album holds. Contents are otherwise fetched
+    /// the first time an album is opened, so an album never opened would read
+    /// as empty and its photos as unfiled.
+    ///
+    /// Shared-with-me albums are skipped: their photos live on the sharer's
+    /// volume and are never in our timeline. The freshness stamps are no guide
+    /// here — any album change clears all of them — so only an album whose
+    /// server count disagrees with an empty local copy is waited for.
+    pub(crate) fn ensure_album_contents(&self) -> CoreResult<()> {
+        if self.db.albums_count().map_err(CoreError::from)? == 0
+            && !self.rt.block_on(self.refresh_albums())?
+        {
+            return Ok(());
+        }
+        let albums = self.db.albums_list().map_err(CoreError::from)?;
+        for album in albums.iter().filter(|a| !a.shared && a.photo_count > 0) {
+            let stored = self
+                .db
+                .album_photos_count(&album.uid)
+                .map_err(CoreError::from)?;
+            if stored > 0 {
+                continue;
+            }
+            let Some(uid) = parse_uid(&album.uid) else {
+                continue;
+            };
+            if let Err(error) = self.rt.block_on(self.refresh_album(&uid)) {
+                warn!(album = %album.uid, %error, "fetching an album's contents failed");
+            }
+        }
+        Ok(())
+    }
+
     /// Re-enumerate one album's photos and replace its persisted contents.
     pub(crate) async fn refresh_album(&self, album: &NodeUid) -> CoreResult<()> {
         let photos = self.photos();

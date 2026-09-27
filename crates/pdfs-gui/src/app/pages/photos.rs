@@ -108,6 +108,10 @@ pub(crate) struct GalleryState {
     /// restricted to photos carrying Proton's `Favorite` tag.
     pub(crate) favorites_btn: gtk4::ToggleButton,
     pub(crate) favorites: Cell<bool>,
+    /// The album filter toggle, and whether it is on. When on, the timeline is
+    /// restricted to photos no album of ours holds yet.
+    pub(crate) not_in_album_btn: gtk4::ToggleButton,
+    pub(crate) not_in_album: Cell<bool>,
     /// Set while the date dropdown is being repopulated, so resetting its model
     /// doesn't fire the selection handler and kick off a spurious reload.
     pub(crate) date_suppress: Cell<bool>,
@@ -355,6 +359,7 @@ pub(crate) struct GalleryWidgets {
     /// to [`kind_for_tab`]).
     pub(crate) tabs: [gtk4::ToggleButton; 4],
     pub(crate) favorites_btn: gtk4::ToggleButton,
+    pub(crate) not_in_album_btn: gtk4::ToggleButton,
     /// The date-jump dropdown, populated with the timeline's months.
     pub(crate) dates: gtk4::DropDown,
 }
@@ -564,6 +569,13 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     favorites_btn.add_css_class("pill");
 
+    // Not in an album: a filter like favorites, for filing what is left.
+    let not_in_album_btn = gtk4::ToggleButton::builder()
+        .icon_name("view-grid-symbolic")
+        .tooltip_text(gettext("Show only photos not in an album"))
+        .build();
+    not_in_album_btn.add_css_class("pill");
+
     // Date jump: "All dates" plus a row per month, filled in once the timeline's
     // months are known (see [`refresh_photo_months`]). Pushed to the far end of
     // the filter row, opposite the kind toggles.
@@ -577,6 +589,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     filters.set_hexpand(true);
     filters.append(&tab_group);
     filters.append(&favorites_btn);
+    filters.append(&not_in_album_btn);
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     filters.append(&spacer);
@@ -709,6 +722,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             select_done,
             tabs,
             favorites_btn,
+            not_in_album_btn,
             dates,
             albums,
             albums_stack,
@@ -1057,6 +1071,17 @@ pub(crate) fn wire_gallery(
         }
         ui_fav.gallery.favorites.set(on);
         load_gallery(&ui_fav, false);
+    });
+
+    // Not in an album: the same kind of filter, and just as independent.
+    let ui_unfiled = ui.clone();
+    ui.gallery.not_in_album_btn.connect_toggled(move |btn| {
+        let on = btn.is_active();
+        if ui_unfiled.gallery.not_in_album.get() == on {
+            return;
+        }
+        ui_unfiled.gallery.not_in_album.set(on);
+        load_gallery(&ui_unfiled, false);
     });
 
     // Date jump: selecting a month loads that window; "All dates" (row 0) clears
@@ -2150,9 +2175,13 @@ pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     let kind = ui.gallery.kind.get();
     // The whole library for this filter, not the page count — the subtitle sits
     // next to tabs carrying the same totals, and the two disagreeing reads as a
-    // bug. A date jump is the exception: there the window is the subject.
-    let total = match (ui.gallery.range.get(), ui.gallery.counts.get()) {
-        (None, Some((photos, videos, raw))) => match kind {
+    // bug. A date jump or a filter is the exception: the counts are the
+    // library's, not the filter's, so there the loaded count is the honest one.
+    let narrowed = ui.gallery.range.get().is_some()
+        || ui.gallery.favorites.get()
+        || ui.gallery.not_in_album.get();
+    let total = match (narrowed, ui.gallery.counts.get()) {
+        (false, Some((photos, videos, raw))) => match kind {
             Some(PhotoKind::Photo) => photos,
             Some(PhotoKind::Video) => videos,
             Some(PhotoKind::Raw) => raw,
@@ -2261,16 +2290,23 @@ pub(crate) fn short_capture_time(secs: i64) -> String {
 
 /// Fetch a timeline page from the daemon. When `append` is false the model is
 /// cleared first (fresh load); otherwise the next page is tacked on.
-/// The empty state for a timeline filtered to `kind`, favorites and/or a
-/// `month`: what is missing, in the filter's own words.
+/// The empty state for a timeline filtered to `kind`, favorites, the photos
+/// in no album and/or a `month`: what is missing, in the filter's own words.
 pub(crate) fn empty_timeline_text(
     kind: Option<PhotoKind>,
     favorites: bool,
+    not_in_album: bool,
     month: Option<&str>,
 ) -> (String, String) {
     let args = [("month", month.unwrap_or_default())];
     let video = kind == Some(PhotoKind::Video);
     let raw = kind == Some(PhotoKind::Raw);
+    if not_in_album && !favorites && kind.is_none() && month.is_none() {
+        return (
+            gettext("Every photo is in an album"),
+            gettext("Turn off the album filter to see everything."),
+        );
+    }
     match (favorites, kind, month) {
         (false, None, None) => (
             gettext("No photos yet"),
@@ -2333,11 +2369,12 @@ fn fill_scrubber(ui: &Rc<Ui>, months: &[PhotoMonth]) {
 }
 
 /// Show the scrubber only where a month jump makes sense: the whole timeline,
-/// not an album, a date window or the favorites.
+/// not an album, a date window, the favorites or the unfiled photos.
 pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
     let whole = ui.gallery.album.borrow().is_none()
         && ui.gallery.range.get().is_none()
-        && !ui.gallery.favorites.get();
+        && !ui.gallery.favorites.get()
+        && !ui.gallery.not_in_album.get();
     ui.gallery
         .scrubber
         .set_visible(whole && ui.gallery.months.borrow().len() > 1);
@@ -2644,6 +2681,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
             kind: ui.gallery.kind.get(),
             range: ui.gallery.range.get(),
             favorites: ui.gallery.favorites.get(),
+            not_in_album: ui.gallery.not_in_album.get(),
         },
     };
     let rx = spawn_request(ui.dirs.control_socket(), request);
@@ -2697,6 +2735,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 if ui.gallery.model.n_items() == 0 {
                     let filtered = ui.gallery.kind.get().is_some()
                         || ui.gallery.favorites.get()
+                        || ui.gallery.not_in_album.get()
                         || ui.gallery.range.get().is_some();
                     let (title, description) = if ui.gallery.album.borrow().is_some() {
                         (
@@ -2714,6 +2753,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         empty_timeline_text(
                             ui.gallery.kind.get(),
                             ui.gallery.favorites.get(),
+                            ui.gallery.not_in_album.get(),
                             month.as_deref(),
                         )
                     };
@@ -2843,15 +2883,25 @@ mod tests {
 
     #[test]
     fn an_empty_filter_names_what_it_filtered() {
-        assert_eq!(empty_timeline_text(None, false, None).0, "No photos yet");
-        assert_eq!(empty_timeline_text(None, true, None).0, "No favorites yet");
         assert_eq!(
-            empty_timeline_text(Some(PhotoKind::Video), false, Some("June 2024")).0,
+            empty_timeline_text(None, false, false, None).0,
+            "No photos yet"
+        );
+        assert_eq!(
+            empty_timeline_text(None, true, false, None).0,
+            "No favorites yet"
+        );
+        assert_eq!(
+            empty_timeline_text(Some(PhotoKind::Video), false, false, Some("June 2024")).0,
             "No videos in June 2024"
         );
         assert_eq!(
-            empty_timeline_text(Some(PhotoKind::Raw), true, None).0,
+            empty_timeline_text(Some(PhotoKind::Raw), true, false, None).0,
             "No favorite raw files"
+        );
+        assert_eq!(
+            empty_timeline_text(None, false, true, None).0,
+            "Every photo is in an album"
         );
     }
 }

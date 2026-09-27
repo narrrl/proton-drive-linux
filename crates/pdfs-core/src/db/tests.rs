@@ -140,7 +140,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     ])
     .unwrap();
 
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p0", "p1", "p2"],
@@ -163,7 +163,14 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     // The counts break down by tab, and a filtered page returns only its tab.
     assert_eq!(db.photos_counts().unwrap(), (2, 1, 0));
     let videos = db
-        .photos_page(0, 10, Some(crate::control::PhotoKind::Video), None, false)
+        .photos_page(
+            0,
+            10,
+            Some(crate::control::PhotoKind::Video),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     assert_eq!(
         videos.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
@@ -176,7 +183,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     // A date-range page keeps only the window's photos: [150, 350) is p1+p2,
     // not p0 at 400. Combined with a kind filter both conditions apply.
     let ranged = db
-        .photos_page(0, 10, None, Some((150, 350)), false)
+        .photos_page(0, 10, None, Some((150, 350)), false, false)
         .unwrap();
     assert_eq!(
         ranged.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
@@ -188,6 +195,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
             10,
             Some(crate::control::PhotoKind::Video),
             Some((150, 350)),
+            false,
             false,
         )
         .unwrap();
@@ -218,7 +226,7 @@ fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
         },
     ])
     .unwrap();
-    let favorites = db.photos_page(0, 10, None, None, true).unwrap();
+    let favorites = db.photos_page(0, 10, None, None, true, false).unwrap();
     assert_eq!(
         favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p1"],
@@ -236,13 +244,64 @@ fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
         TimelineRow::new("p2", 200),
     ])
     .unwrap();
-    let favorites = db.photos_page(0, 10, None, None, true).unwrap();
+    let favorites = db.photos_page(0, 10, None, None, true, false).unwrap();
     assert_eq!(
         favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p2"],
         "the server's answer wins where it has one; the local flag holds where it doesn't"
     );
     assert!(db.photos_by_uid(&["p2".into()]).unwrap()[0].favorite);
+}
+
+#[test]
+fn not_in_album_hides_photos_any_album_holds() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow::new("p1", 300),
+        TimelineRow::new("p2", 200),
+        TimelineRow::new("p3", 100),
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("p1".into(), 300, None, None)])
+        .unwrap();
+    db.album_photos_replace("a2", &[("p3".into(), 100, None, None)])
+        .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, true).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p2"]
+    );
+}
+
+/// Filing the JPEG of a RAW+JPEG shot files the shot: the grid shows it as
+/// one tile, and that tile is in an album.
+#[test]
+fn not_in_album_counts_a_raw_pair_as_filed() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow {
+            name: Some("IMG_1234.JPG".into()),
+            ..TimelineRow::new("jpeg", 300)
+        },
+        TimelineRow {
+            name: Some("img_1234.cr2".into()),
+            ..TimelineRow::new("raw", 300)
+        },
+        TimelineRow {
+            name: Some("IMG_9999.JPG".into()),
+            ..TimelineRow::new("alone", 200)
+        },
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("raw".into(), 300, None, None)])
+        .unwrap();
+
+    let page = db.photos_page(0, 10, None, None, false, true).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["alone"]
+    );
 }
 
 #[test]
@@ -253,12 +312,16 @@ fn photos_page_slices_the_timeline_in_order() {
         .collect();
     db.photos_replace(&items).unwrap();
 
-    let page = db.photos_page(2, 2, None, None, false).unwrap();
+    let page = db.photos_page(2, 2, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p2", "p3"]
     );
-    assert!(db.photos_page(9, 2, None, None, false).unwrap().is_empty());
+    assert!(
+        db.photos_page(9, 2, None, None, false, false)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -4077,7 +4140,7 @@ fn photos_delete_removes_the_photo_and_its_album_membership() {
 
     assert_eq!(db.photos_delete(&["p2".into()]).unwrap(), 1);
 
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p1", "p3"],
@@ -4117,7 +4180,7 @@ fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
     ])
     .unwrap();
 
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["jpeg", "alone"],
@@ -4130,7 +4193,14 @@ fn a_raw_and_its_jpeg_are_one_entry_in_the_grid() {
 
     // The Raw tab answers "which raws do I have", so it lists files.
     let raws = db
-        .photos_page(0, 10, Some(crate::control::PhotoKind::Raw), None, false)
+        .photos_page(
+            0,
+            10,
+            Some(crate::control::PhotoKind::Raw),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     assert_eq!(
         raws.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
@@ -4175,7 +4245,7 @@ fn a_pixel_raw_capture_groups_with_its_cover_jpeg() {
     ])
     .unwrap();
 
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["cover", "notes", "other"],
@@ -4214,7 +4284,7 @@ fn a_shared_name_alone_does_not_group_photos() {
     ])
     .unwrap();
 
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(page.len(), 3, "three shots, three tiles");
     assert!(page.iter().all(|p| p.group_size == 1));
 }
@@ -4237,7 +4307,7 @@ fn the_servers_photo_relation_groups_a_live_photo() {
     ])
     .unwrap();
 
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["main"]
@@ -4339,7 +4409,7 @@ fn migration_v30_leaves_a_v29_timeline_intact() {
     }
 
     let db = Db::open(&path).unwrap();
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["jpeg", "raw"],
@@ -4360,7 +4430,7 @@ fn migration_v30_leaves_a_v29_timeline_intact() {
         },
     ])
     .unwrap();
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].uid, "jpeg");
 
@@ -4389,14 +4459,14 @@ fn photos_replace_keeps_a_skipped_photos_name() {
         },
     ])
     .unwrap();
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(page.len(), 1, "one shot, two files");
     assert!(page[0].has_raw);
 
     // The next refresh resolves neither, because both are already resolved.
     db.photos_replace(&[TimelineRow::new("jpeg", 300), TimelineRow::new("raw", 300)])
         .unwrap();
-    let page = db.photos_page(0, 10, None, None, false).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
     assert_eq!(page.len(), 1, "the group survives a skipped refresh");
     assert_eq!(page[0].name.as_deref(), Some("IMG_1234.JPG"));
     assert!(page[0].has_raw, "the raw file is still a raw file");
