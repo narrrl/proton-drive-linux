@@ -175,6 +175,9 @@ pub(crate) struct GalleryState {
     pub(crate) selecting: Cell<bool>,
     /// The photos picked so far, by uid.
     pub(crate) selected: RefCell<HashSet<String>>,
+    /// The photo last picked or unpicked by a click, which a Shift+click
+    /// selects a range from.
+    pub(crate) select_anchor: RefCell<Option<String>>,
     /// The Select toggle, the bar it reveals, and the bar's own widgets.
     pub(crate) select_btn: gtk4::ToggleButton,
     pub(crate) select_bar: gtk4::Revealer,
@@ -197,13 +200,40 @@ const SCRUB_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Ctrl+scroll notch (or Ctrl+±) moves it by. A justified row is scaled to the
 /// content width once it is full, so this is the *target* a row lands near
 /// rather than the height it ends up with (see [`justify_rows`]).
-pub(crate) const ROW_MIN: i32 = 90;
+pub(crate) const ROW_MIN: i32 = 60;
 
 pub(crate) const ROW_MAX: i32 = 340;
 
 pub(crate) const ROW_DEFAULT: i32 = 180;
 
 pub(crate) const ROW_STEP: i32 = 30;
+
+/// Row heights at which the timeline stops heading each day and heads each
+/// month instead, then each year. Zoomed out, a library is a wall of small
+/// tiles, and a heading per day would take more room than the photos under it.
+pub(crate) const GROUP_BY_MONTH_BELOW: i32 = 150;
+
+pub(crate) const GROUP_BY_YEAR_BELOW: i32 = 90;
+
+/// How the timeline sections its photos, set by the zoom level (see
+/// [`grouping_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Grouping {
+    Day,
+    Month,
+    Year,
+}
+
+/// The grouping that suits a target row height.
+pub(crate) fn grouping_for(row_height: i32) -> Grouping {
+    if row_height < GROUP_BY_YEAR_BELOW {
+        Grouping::Year
+    } else if row_height < GROUP_BY_MONTH_BELOW {
+        Grouping::Month
+    } else {
+        Grouping::Day
+    }
+}
 
 /// Gap between tiles, horizontally and vertically. Tight on purpose: the grid
 /// should read as a sheet of photographs, not as a deck of cards.
@@ -246,11 +276,20 @@ pub(crate) const TEXTURE_CACHE_MAX: usize = 1500;
 /// is decoded before it is scrolled onto rather than after.
 pub(crate) const THUMB_PREFETCH: usize = 32;
 
+/// How close to the top or bottom edge a drag-select has to come before the
+/// timeline scrolls under it, how far one tick scrolls at the very edge, and
+/// how often it ticks.
+const DRAG_EDGE: f64 = 48.0;
+
+const DRAG_SCROLL_STEP: f64 = 24.0;
+
+const DRAG_SCROLL_TICK: Duration = Duration::from_millis(16);
+
 /// Pause after a resize/zoom before the visible sections are re-flowed.
 pub(crate) const RELAYOUT_DEBOUNCE: Duration = Duration::from_millis(80);
 
-/// One day-section of the photos timeline: a heading plus the photos captured
-/// that day, in timeline order. Built from the flat [`Ui::gallery_model`] by
+/// One section of the photos timeline: a heading plus the photos captured that
+/// day (or month, or year — see [`Grouping`]), in timeline order. Built from the flat [`Ui::gallery_model`] by
 /// [`group_photos`], then flattened into [`GalleryRow`]s for rendering.
 pub(crate) struct PhotoGroup {
     /// "Today", "Yesterday", or e.g. "3 June 2026".
@@ -305,6 +344,7 @@ impl GalleryRow {
                             && x.height == y.height
                             && x.selecting == y.selecting
                             && x.selected == y.selected
+                            && x.grouping == y.grouping
                     })
             }
             _ => false,
@@ -968,6 +1008,7 @@ pub(crate) fn wire_gallery(
         sync_scrubber_position(&ui_scroll);
     });
     wire_scrubber(ui);
+    wire_drag_select(ui);
 
     // Ctrl+scroll zoom. Capture phase so the ScrolledWindow doesn't eat the event
     // and scroll the page out from under the gesture.
@@ -1211,6 +1252,8 @@ pub(crate) struct Tile {
     /// [`repaint_gallery`] sees a selection change and rebuilds that row.
     pub(crate) selecting: bool,
     pub(crate) selected: bool,
+    /// How the timeline is sectioned, which decides what the caption says.
+    pub(crate) grouping: Grouping,
 }
 
 /// The aspect ratio to lay `photo` out at: what a decode has learned, else what
@@ -1246,6 +1289,7 @@ pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec
     let ratios: Vec<f64> = photos.iter().map(|photo| tile_ratio(ui, photo)).collect();
     let selecting = ui.gallery.selecting.get();
     let selected = ui.gallery.selected.borrow();
+    let grouping = grouping_for(ui.gallery.row_height.get());
     let mut photos = photos.iter();
     plan_rows(&ratios, width, ui.gallery.row_height.get())
         .into_iter()
@@ -1256,6 +1300,7 @@ pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec
                     photos.next().map(|photo| Tile {
                         selecting,
                         selected: selecting && selected.contains(&photo.uid),
+                        grouping,
                         photo: photo.clone(),
                         width,
                         height,
@@ -1365,14 +1410,20 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     placeholder.add_css_class("photo-placeholder");
 
     // The capture time, on a gradient that only exists while the pointer is over
-    // the tile — legible over any photo, invisible the rest of the time.
+    // the tile — legible over any photo, invisible the rest of the time. Under a
+    // day heading the clock time is enough; under a month or a year the day is
+    // what the heading no longer says.
+    let caption_text = match tile.grouping {
+        Grouping::Day => short_capture_time(tile.photo.capture_time),
+        Grouping::Month | Grouping::Year => short_capture_date(tile.photo.capture_time),
+    };
     let caption = gtk4::Label::builder()
         // Fill horizontally so the scrim spans the tile; the text itself stays
         // left-aligned inside it.
         .halign(gtk4::Align::Fill)
         .valign(gtk4::Align::End)
         .xalign(0.0)
-        .label(short_capture_time(tile.photo.capture_time))
+        .label(caption_text)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
     caption.add_css_class("photo-caption");
@@ -1455,22 +1506,29 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
 
     // Ctrl or Shift on a plain click starts a selection — the gesture people
     // already use for picking things, without having to find the Select button
-    // first. Claimed in the capture phase so the click never also opens the
-    // photo it was picking.
+    // first. Ctrl picks one photo; Shift picks everything from the last photo
+    // clicked to this one, as in a file manager. Claimed in the capture phase so
+    // the click never also opens the photo it was picking.
     let modifier = gtk4::GestureClick::new();
     modifier.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let ui_modifier = ui.clone();
     let modifier_uid = tile.photo.uid.clone();
     modifier.connect_pressed(move |gesture, _, _, _| {
-        let state = gesture.current_event_state().intersects(
-            gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK,
-        );
-        if !state || ui_modifier.gallery.selecting.get() {
+        let state = gesture.current_event_state();
+        let shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+        if !shift && !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
             return;
         }
         gesture.set_state(gtk4::EventSequenceState::Claimed);
         set_selection_mode(&ui_modifier, true);
-        toggle_selected(&ui_modifier, &modifier_uid);
+        let anchor = ui_modifier.gallery.select_anchor.borrow().clone();
+        match anchor {
+            Some(anchor) if shift => {
+                let base = ui_modifier.gallery.selected.borrow().clone();
+                select_range(&ui_modifier, &anchor, &modifier_uid, &base);
+            }
+            _ => toggle_selected(&ui_modifier, &modifier_uid),
+        }
     });
     button.add_controller(modifier);
 
@@ -1510,6 +1568,7 @@ pub(crate) fn set_selection_mode(ui: &Rc<Ui>, selecting: bool) {
     ui.gallery.selecting.set(selecting);
     if !selecting {
         ui.gallery.selected.borrow_mut().clear();
+        ui.gallery.select_anchor.borrow_mut().take();
     }
     if ui.gallery.select_btn.is_active() != selecting {
         ui.gallery.select_btn.set_active(selecting);
@@ -1526,8 +1585,211 @@ fn toggle_selected(ui: &Rc<Ui>, uid: &str) {
             selected.insert(uid.to_string());
         }
     }
+    *ui.gallery.select_anchor.borrow_mut() = Some(uid.to_string());
     sync_selection_bar(ui);
     repaint_gallery(ui);
+}
+
+/// Make the selection `base` plus every loaded photo from `from` to `to`, in
+/// either direction. `base` rather than the live selection, so a drag that
+/// sweeps back over photos it picked gives them up again.
+fn select_range(ui: &Rc<Ui>, from: &str, to: &str, base: &HashSet<String>) {
+    let model = &ui.gallery.model;
+    let (Some(a), Some(b)) = (find_photo_index(model, from), find_photo_index(model, to)) else {
+        return;
+    };
+    let mut selected = base.clone();
+    for index in a.min(b)..=a.max(b) {
+        if let Some(boxed) = model.item(index).and_downcast::<BoxedAnyObject>() {
+            selected.insert(boxed.borrow::<PhotoItem>().uid.clone());
+        }
+    }
+    if *ui.gallery.selected.borrow() == selected {
+        return;
+    }
+    *ui.gallery.selected.borrow_mut() = selected;
+    sync_selection_bar(ui);
+    repaint_gallery(ui);
+}
+
+/// A drag-select in progress (see [`wire_drag_select`]).
+#[derive(Default)]
+struct DragSelect {
+    /// Whether the drag has moved far enough to be selecting. Until then it
+    /// may still turn out to be a click on a tile.
+    active: bool,
+    /// The selection as it was when the drag began.
+    base: HashSet<String>,
+    /// The photo the drag started on, or the first one it crossed.
+    anchor: Option<String>,
+    /// Where the drag started and where the pointer is now, in the list's
+    /// coordinates.
+    start: (f64, f64),
+    pointer: (f64, f64),
+    /// The edge autoscroll, while the pointer is near the top or bottom.
+    scroll: Option<glib::SourceId>,
+}
+
+/// Dragging across the timeline selects every photo from where the drag
+/// started to where the pointer is, scrolling when the pointer nears an edge.
+///
+/// The gesture sits on the list in the capture phase and only claims the
+/// pointer once it has moved past the drag threshold, so a plain click still
+/// reaches the tile and opens the photo.
+fn wire_drag_select(ui: &Rc<Ui>) {
+    let drag = gtk4::GestureDrag::builder()
+        .button(gtk4::gdk::BUTTON_PRIMARY)
+        .propagation_phase(gtk4::PropagationPhase::Capture)
+        .build();
+    let state = Rc::new(RefCell::new(DragSelect::default()));
+
+    let state_begin = state.clone();
+    drag.connect_drag_begin(move |_, x, y| {
+        let mut drag = state_begin.borrow_mut();
+        if let Some(source) = drag.scroll.take() {
+            source.remove();
+        }
+        *drag = DragSelect {
+            start: (x, y),
+            pointer: (x, y),
+            ..DragSelect::default()
+        };
+    });
+
+    let ui_update = ui.clone();
+    let state_update = state.clone();
+    drag.connect_drag_update(move |gesture, dx, dy| {
+        let (sx, sy) = state_update.borrow().start;
+        state_update.borrow_mut().pointer = (sx + dx, sy + dy);
+        if !state_update.borrow().active {
+            let threshold = gtk4::Settings::default()
+                .map_or(8, |settings| settings.gtk_dnd_drag_threshold())
+                as f64;
+            if dx.hypot(dy) < threshold {
+                return;
+            }
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            let anchor = tile_at(&ui_update, sx, sy);
+            set_selection_mode(&ui_update, true);
+            let mut drag = state_update.borrow_mut();
+            drag.active = true;
+            drag.base = ui_update.gallery.selected.borrow().clone();
+            drag.anchor = anchor;
+        }
+        sweep_drag(&ui_update, &state_update);
+        autoscroll_drag(&ui_update, &state_update);
+    });
+
+    let ui_end = ui.clone();
+    let state_end = state;
+    drag.connect_drag_end(move |_, _, _| {
+        let mut drag = state_end.borrow_mut();
+        if let Some(source) = drag.scroll.take() {
+            source.remove();
+        }
+        if drag.active
+            && let Some(anchor) = drag.anchor.take()
+        {
+            *ui_end.gallery.select_anchor.borrow_mut() = Some(anchor);
+        }
+        drag.active = false;
+    });
+    ui.gallery.list.add_controller(drag);
+}
+
+/// Select from the drag's anchor to the photo under the pointer.
+fn sweep_drag(ui: &Rc<Ui>, state: &Rc<RefCell<DragSelect>>) {
+    let (x, y) = state.borrow().pointer;
+    // Past an edge, the pointer is over the row at that edge: that row is
+    // what is scrolling into view under it.
+    let height = f64::from(ui.gallery.list.height());
+    let Some(current) = tile_at(ui, x, y.clamp(0.0, (height - 1.0).max(0.0))) else {
+        return;
+    };
+    let (anchor, base) = {
+        let mut drag = state.borrow_mut();
+        let anchor = drag.anchor.get_or_insert_with(|| current.clone()).clone();
+        (anchor, std::mem::take(&mut drag.base))
+    };
+    select_range(ui, &anchor, &current, &base);
+    state.borrow_mut().base = base;
+}
+
+/// Scroll while a drag-select's pointer is near the top or bottom edge, faster
+/// the closer it gets, re-sweeping as rows move under it.
+fn autoscroll_drag(ui: &Rc<Ui>, state: &Rc<RefCell<DragSelect>>) {
+    if state.borrow().scroll.is_some() {
+        return;
+    }
+    if drag_scroll_speed(ui, state.borrow().pointer.1) == 0.0 {
+        return;
+    }
+    let ui_tick = ui.clone();
+    let state_tick = state.clone();
+    let source = glib::timeout_add_local(DRAG_SCROLL_TICK, move || {
+        let speed = drag_scroll_speed(&ui_tick, state_tick.borrow().pointer.1);
+        let adjustment = ui_tick.gallery.list.vadjustment();
+        let (Some(adjustment), true) = (adjustment, speed != 0.0) else {
+            state_tick.borrow_mut().scroll.take();
+            return glib::ControlFlow::Break;
+        };
+        let top = adjustment.upper() - adjustment.page_size();
+        adjustment.set_value((adjustment.value() + speed).clamp(adjustment.lower(), top));
+        sweep_drag(&ui_tick, &state_tick);
+        glib::ControlFlow::Continue
+    });
+    state.borrow_mut().scroll = Some(source);
+}
+
+/// Pixels per tick a drag at height `y` scrolls the timeline by: negative near
+/// the top, positive near the bottom, zero in between.
+fn drag_scroll_speed(ui: &Rc<Ui>, y: f64) -> f64 {
+    let height = f64::from(ui.gallery.list.height());
+    let depth = if y < DRAG_EDGE {
+        y - DRAG_EDGE
+    } else if y > height - DRAG_EDGE {
+        y - (height - DRAG_EDGE)
+    } else {
+        return 0.0;
+    };
+    (depth / DRAG_EDGE).clamp(-1.0, 1.0) * DRAG_SCROLL_STEP
+}
+
+/// The photo under `(x, y)`, in the list's coordinates: the tile of the row at
+/// that height whose left edge is the last one at or before `x`. `None` over
+/// a heading or a gap between rows.
+fn tile_at(ui: &Rc<Ui>, x: f64, y: f64) -> Option<String> {
+    let list = &ui.gallery.list;
+    let (position, row) =
+        ui.gallery
+            .bound
+            .borrow()
+            .iter()
+            .find_map(|(position, (anchor, row))| {
+                anchor.as_ref()?;
+                let rect = row.compute_bounds(list)?;
+                let (top, bottom) = (f64::from(rect.y()), f64::from(rect.y() + rect.height()));
+                (row.is_mapped() && y >= top && y < bottom).then(|| (*position, row.clone()))
+            })?;
+    let mut index = 0;
+    let mut child = row.first_child();
+    let mut i = 0;
+    while let Some(tile) = child {
+        if tile
+            .compute_bounds(list)
+            .is_some_and(|rect| x >= f64::from(rect.x()))
+        {
+            index = i;
+        }
+        i += 1;
+        child = tile.next_sibling();
+    }
+    let item = ui.gallery.groups.item(position)?;
+    let boxed = item.downcast_ref::<BoxedAnyObject>()?;
+    match &*boxed.borrow::<GalleryRow>() {
+        GalleryRow::Tiles { tiles, .. } => tiles.get(index).map(|tile| tile.photo.uid.clone()),
+        GalleryRow::Heading(_) => None,
+    }
 }
 
 /// Reflect the selection in the bar above the grid.
@@ -2136,7 +2398,8 @@ pub(crate) fn repaint_gallery(ui: &Rc<Ui>) {
 fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
     let width = gallery_width(ui);
     let mut rows = Vec::new();
-    for group in group_photos(&ui.gallery.model) {
+    let grouping = grouping_for(ui.gallery.row_height.get());
+    for group in group_photos(&ui.gallery.model, grouping) {
         rows.push(GalleryRow::Heading(group.heading));
         let grid = justify_rows(ui, &group.photos, width);
         let last_index = grid.len().saturating_sub(1);
@@ -2205,7 +2468,7 @@ pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     });
 }
 
-pub(crate) fn group_photos(model: &gio::ListStore) -> Vec<PhotoGroup> {
+pub(crate) fn group_photos(model: &gio::ListStore, grouping: Grouping) -> Vec<PhotoGroup> {
     let mut groups: Vec<PhotoGroup> = Vec::new();
     for i in 0..model.n_items() {
         let Some(obj) = model.item(i) else { continue };
@@ -2213,7 +2476,7 @@ pub(crate) fn group_photos(model: &gio::ListStore) -> Vec<PhotoGroup> {
             continue;
         };
         let photo = boxed.borrow::<PhotoItem>().clone();
-        let heading = day_heading(photo.capture_time);
+        let heading = section_heading(photo.capture_time, grouping);
         match groups.last_mut() {
             Some(group) if group.heading == heading => group.photos.push(photo),
             _ => groups.push(PhotoGroup {
@@ -2225,11 +2488,17 @@ pub(crate) fn group_photos(model: &gio::ListStore) -> Vec<PhotoGroup> {
     groups
 }
 
-/// Section heading for a capture time: "Today", "Yesterday", or the local date.
-pub(crate) fn day_heading(secs: i64) -> String {
+/// Section heading for a capture time: "Today", "Yesterday", or the local date
+/// when grouping by day; "June 2026" by month; "2026" by year.
+pub(crate) fn section_heading(secs: i64, grouping: Grouping) -> String {
     let Ok(date) = glib::DateTime::from_unix_local(secs) else {
         return gettext("Unknown date");
     };
+    match grouping {
+        Grouping::Day => {}
+        Grouping::Month => return month_label(date.year(), date.month()),
+        Grouping::Year => return date.year().to_string(),
+    }
     let same_day = |other: &glib::DateTime| {
         other.year() == date.year()
             && other.month() == date.month()
@@ -2282,6 +2551,16 @@ pub(crate) fn format_capture_time(secs: i64) -> String {
 pub(crate) fn short_capture_time(secs: i64) -> String {
     // Translators: strftime format for the time a photo was taken, shown on its tile, such as "14:05".
     let format = gettext("%H:%M");
+    glib::DateTime::from_unix_local(secs)
+        .and_then(|d| d.format(&format))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// The capture date as a tile caption, for a timeline headed by month or year.
+pub(crate) fn short_capture_date(secs: i64) -> String {
+    // Translators: strftime format for the day a photo was taken, shown on its tile when the timeline is grouped by month or year, such as "3 Jun".
+    let format = gettext("%-d %b");
     glib::DateTime::from_unix_local(secs)
         .and_then(|d| d.format(&format))
         .map(|s| s.to_string())
@@ -2863,7 +3142,10 @@ pub(crate) fn play_external(path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_timeline_text, month_index, month_range};
+    use super::{
+        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, empty_timeline_text, grouping_for,
+        month_index, month_range, section_heading,
+    };
     use pdfs_core::control::{PhotoKind, PhotoMonth};
 
     #[test]
@@ -2879,6 +3161,34 @@ mod tests {
         // A month with no photos of its own lands on the next older one.
         assert_eq!(month_index(&months, mid(2026, 1)), Some(1));
         assert_eq!(month_index(&months, mid(2020, 1)), Some(2));
+    }
+
+    #[test]
+    fn zooming_out_groups_by_month_then_year() {
+        assert_eq!(grouping_for(ROW_DEFAULT), Grouping::Day);
+        assert_eq!(grouping_for(ROW_MAX), Grouping::Day);
+        assert_eq!(grouping_for(ROW_DEFAULT - ROW_STEP), Grouping::Day);
+        assert_eq!(grouping_for(ROW_DEFAULT - 2 * ROW_STEP), Grouping::Month);
+        assert_eq!(grouping_for(ROW_DEFAULT - 3 * ROW_STEP), Grouping::Month);
+        assert_eq!(grouping_for(ROW_MIN), Grouping::Year);
+    }
+
+    #[test]
+    fn month_and_year_sections_are_headed_by_the_month_and_the_year() {
+        let Some((from, _)) = month_range(2024, 6) else {
+            panic!("June 2024 is a month");
+        };
+        let noon = from + 14 * 86_400 + 12 * 3_600;
+        assert_eq!(section_heading(noon, Grouping::Year), "2024");
+        assert_eq!(
+            section_heading(noon, Grouping::Month),
+            section_heading(from, Grouping::Month),
+            "every day of a month shares its heading"
+        );
+        assert_ne!(
+            section_heading(noon, Grouping::Day),
+            section_heading(from, Grouping::Day)
+        );
     }
 
     #[test]

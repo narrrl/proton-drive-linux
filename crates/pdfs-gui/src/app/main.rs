@@ -582,6 +582,7 @@ fn build_window(app: &adw::Application) {
             list: gallery_widgets.list.clone(),
             selecting: Cell::new(false),
             selected: RefCell::new(HashSet::new()),
+            select_anchor: RefCell::new(None),
             select_btn: gallery_widgets.select_btn.clone(),
             select_bar: gallery_widgets.select_bar.clone(),
             select_label: gallery_widgets.select_label.clone(),
