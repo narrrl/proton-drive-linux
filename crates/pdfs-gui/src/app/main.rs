@@ -884,8 +884,8 @@ fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
     });
 
     let brand = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    let icon = gtk4::Image::from_icon_name("folder-remote-symbolic");
-    icon.add_css_class("brand-icon");
+    let icon = gtk4::Image::from_icon_name(APP_ID);
+    icon.set_pixel_size(24);
     brand.append(&icon);
     let name = gtk4::Label::new(Some("Proton Drive"));
     name.add_css_class("heading");

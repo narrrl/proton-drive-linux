@@ -52,9 +52,8 @@ pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
     login_status.add_css_class("dim-label");
 
     let header = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    let logo = gtk4::Image::from_icon_name("folder-remote-symbolic");
-    logo.set_pixel_size(64);
-    logo.add_css_class("brand-icon");
+    let logo = gtk4::Image::from_icon_name(APP_ID);
+    logo.set_pixel_size(96);
     let title = gtk4::Label::new(Some("Proton Drive"));
     title.add_css_class("brand-title");
     header.append(&logo);

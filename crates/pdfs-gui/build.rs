@@ -26,4 +26,5 @@ fn main() {
     println!("cargo:rerun-if-changed=resources/pdfs.gresource.xml");
     println!("cargo:rerun-if-changed=resources/icons");
     println!("cargo:rerun-if-changed=resources/style.css");
+    println!("cargo:rerun-if-changed=../../packaging/io.narl.proton-drive-linux.svg");
 }
