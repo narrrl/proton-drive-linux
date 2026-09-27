@@ -2,6 +2,7 @@ pub(crate) mod activity;
 pub(crate) mod albums;
 pub(crate) mod browser;
 pub(crate) mod devices;
+pub(crate) mod duplicates;
 pub(crate) mod locations;
 pub(crate) mod login;
 pub(crate) mod photo_viewer;

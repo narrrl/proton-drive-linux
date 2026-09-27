@@ -88,6 +88,9 @@ pub enum Request {
     /// `limit` of them — the "On this day" strip above the timeline. Replies
     /// with [`Response::Photos`]; a front-end groups them by year itself.
     PhotosOnThisDay { limit: usize },
+    /// Sets of photos that are byte-identical copies of each other, going by
+    /// the server's content hash. Replies with [`Response::PhotoDuplicates`].
+    PhotoDuplicates,
     /// List the account's photo albums, newest activity first, including the
     /// albums other people share with us. Metadata only — an album's cover
     /// thumbnail is fetched with [`Request::PhotoThumbs`] like any other photo.
@@ -134,8 +137,14 @@ pub enum Request {
     ///
     /// A photo that belongs to a group takes the whole group with it: trashing
     /// the JPEG of a shot and leaving its RAW behind is not what anyone means by
-    /// deleting that photo.
-    TrashNodes { uids: Vec<String> },
+    /// deleting that photo. With `files_only` set, exactly the listed files
+    /// go and their groups stay: the duplicate finder removes one copy of a
+    /// shot, not the shot. Older front-ends omit it and trash whole groups.
+    TrashNodes {
+        uids: Vec<String>,
+        #[serde(default)]
+        files_only: bool,
+    },
     /// Fetch thumbnails for ordinary Drive image files shown outside the Photos
     /// timeline. The modification time is the cache validity tag, so replacing
     /// an image can never reuse its previous revision's thumbnail.
@@ -1784,6 +1793,9 @@ pub enum Response {
     /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
     /// newest first.
     PhotoMonths { months: Vec<PhotoMonth> },
+    /// The duplicate sets (reply to [`Request::PhotoDuplicates`]), newest
+    /// first. Each set lists the copy worth keeping first.
+    PhotoDuplicates { sets: Vec<Vec<PhotoItem>> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
     /// Per-node outcome of a [`Request::TrashNodes`] batch. Reported per uid
@@ -2180,7 +2192,17 @@ mod tests {
     fn trash_requests_and_outcomes_roundtrip() {
         let request = Request::TrashNodes {
             uids: vec!["volume~first".into(), "volume~second".into()],
+            files_only: false,
         };
+        // An older front-end's request trashes whole groups.
+        let old: Request = serde_json::from_str(r#"{"TrashNodes":{"uids":["v~a"]}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Request::TrashNodes {
+                files_only: false,
+                ..
+            }
+        ));
         let line = serde_json::to_string(&request).unwrap();
         assert!(!line.contains('\n'), "wire form must be a single line");
         let decoded: Request = serde_json::from_str(&line).unwrap();

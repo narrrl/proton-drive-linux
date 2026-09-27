@@ -729,6 +729,16 @@ impl Core {
         Ok(())
     }
 
+    /// The timeline's duplicate sets, as wire items (see
+    /// [`db::Db::photo_duplicates`]).
+    pub(crate) fn photo_duplicates(&self) -> CoreResult<Vec<Vec<PhotoItem>>> {
+        let sets = self.db.photo_duplicates().map_err(CoreError::from)?;
+        Ok(sets
+            .into_iter()
+            .map(|set| set.into_iter().map(|p| self.photo_item(p)).collect())
+            .collect())
+    }
+
     /// Photos taken on today's date in earlier years, as wire items. Served
     /// from the stored timeline only: the strip is a nicety, not worth a wait
     /// on the network, and the timeline's own load keeps that store fresh.
@@ -822,12 +832,23 @@ impl Core {
     /// A photo that is one file of a group takes its whole group with it. The
     /// gallery shows a RAW+JPEG shot as one tile, so deleting that tile has to
     /// delete the shot — leaving the RAW behind would put the photo back on the
-    /// Raw tab and nowhere else.
-    pub(crate) fn trash_photos(&self, uids: &[NodeUid]) -> CoreResult<TrashOutcome> {
+    /// Raw tab and nowhere else. `files_only` turns that off, for removing
+    /// one copy of a shot that is stored twice.
+    pub(crate) fn trash_photos(
+        &self,
+        uids: &[NodeUid],
+        files_only: bool,
+    ) -> CoreResult<TrashOutcome> {
         if uids.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        let uids = &self.expand_photo_groups(uids);
+        let expanded;
+        let uids = if files_only {
+            uids
+        } else {
+            expanded = self.expand_photo_groups(uids);
+            &expanded
+        };
         for uid in uids {
             self.require_photo_writable(uid)
                 .map_err(|errno| self.errno_error(errno, "trash access"))?;

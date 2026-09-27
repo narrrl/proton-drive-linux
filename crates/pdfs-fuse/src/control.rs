@@ -461,6 +461,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::PhotoDuplicates) => match core.photo_duplicates() {
+            Ok(sets) => CtlResponse::PhotoDuplicates { sets },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::PhotosOnThisDay { limit }) => {
             match core.photos_on_this_day(clamp_limit(limit)) {
                 Ok(items) => CtlResponse::Photos {
@@ -564,8 +568,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 items: core.photo_thumbs(&parsed),
             }
         }
-        Ok(CtlRequest::TrashNodes { uids }) => match Core::parse_uids(&uids) {
-            Ok(parsed) => match core.trash_photos(&parsed) {
+        Ok(CtlRequest::TrashNodes { uids, files_only }) => match Core::parse_uids(&uids) {
+            Ok(parsed) => match core.trash_photos(&parsed, files_only) {
                 Ok((trashed, failed)) => CtlResponse::Trashed {
                     trashed,
                     failed: failed

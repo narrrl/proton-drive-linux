@@ -4,6 +4,7 @@ crates/pdfs-gui/src/app/pages/activity.rs
 crates/pdfs-gui/src/app/pages/albums.rs
 crates/pdfs-gui/src/app/pages/browser.rs
 crates/pdfs-gui/src/app/pages/devices.rs
+crates/pdfs-gui/src/app/pages/duplicates.rs
 crates/pdfs-gui/src/app/pages/locations.rs
 crates/pdfs-gui/src/app/pages/login.rs
 crates/pdfs-gui/src/app/pages/photo_viewer.rs

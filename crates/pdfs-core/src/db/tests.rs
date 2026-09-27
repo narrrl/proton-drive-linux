@@ -285,6 +285,64 @@ fn on_this_day_finds_the_same_date_in_earlier_years() {
     );
 }
 
+fn hashed(uid: &str, capture_time: i64, name: &str, hash: &str) -> TimelineRow {
+    TimelineRow {
+        name: Some(name.into()),
+        content_hash: Some(hash.into()),
+        ..TimelineRow::new(uid, capture_time)
+    }
+}
+
+/// A copy an album holds is the one kept; the files of one RAW+JPEG shot are
+/// never copies of each other; a hash only one file carries is no set.
+#[test]
+fn duplicates_list_the_copy_to_keep_first() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        hashed("copy", 500, "IMG_2.JPG", "h2"),
+        hashed("filed", 400, "IMG_2(1).JPG", "h2"),
+        hashed("jpeg", 300, "IMG_1.JPG", "h1"),
+        hashed("raw", 300, "IMG_1.CR2", "h1"),
+        hashed("stray", 200, "IMG_1(1).CR2", "h1"),
+        hashed("alone", 100, "IMG_3.JPG", "h3"),
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("filed".into(), 400, None, None)])
+        .unwrap();
+
+    let sets = db.photo_duplicates().unwrap();
+    let uids: Vec<Vec<&str>> = sets
+        .iter()
+        .map(|set| set.iter().map(|p| p.uid.as_str()).collect())
+        .collect();
+    assert_eq!(uids, [vec!["filed", "copy"], vec!["jpeg", "stray"]]);
+}
+
+/// Trashing the file a group is shown as leaves the rest of the group on the
+/// timeline instead of pointing at a photo that is gone.
+#[test]
+fn deleting_a_group_representative_keeps_its_other_files() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        hashed("jpeg", 300, "IMG_1.JPG", "h1"),
+        hashed("raw", 300, "IMG_1.CR2", "h2"),
+    ])
+    .unwrap();
+    assert_eq!(
+        db.photos_page(0, 10, None, None, false, false)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    db.photos_delete(&["jpeg".into()]).unwrap();
+    let page = db.photos_page(0, 10, None, None, false, false).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["raw"]
+    );
+}
+
 #[test]
 fn not_in_album_hides_photos_any_album_holds() {
     let db = Db::open_in_memory().unwrap();

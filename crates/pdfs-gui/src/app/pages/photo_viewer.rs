@@ -1447,7 +1447,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     delete_btn.connect_clicked(move |_| {
         let uid = viewer_delete.uid.borrow().clone();
         w_delete.close();
-        trash_photos(&ui_delete, vec![uid]);
+        trash_photos(&ui_delete, vec![uid], false);
     });
 
     let ui_group = ui.clone();
@@ -1573,7 +1573,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
             Some("Delete" | "KP_Delete") => {
                 let uid = viewer_key.uid.borrow().clone();
                 w_key.close();
-                trash_photos(&ui_key, vec![uid]);
+                trash_photos(&ui_key, vec![uid], false);
             }
             Some("Escape" | "q") => w_key.close(),
             Some("w") if ctrl => w_key.close(),

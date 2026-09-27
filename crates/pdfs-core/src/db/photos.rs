@@ -3,7 +3,7 @@
 
 use rusqlite::params;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Db;
 use crate::Result;
@@ -447,6 +447,14 @@ impl Db {
                 albums.execute([uid])?;
             }
         }
+        // A group whose representative went is left pointing at nothing, which
+        // drops its other files off every page. Make them stand alone until the
+        // next refresh groups them again.
+        tx.execute(
+            "UPDATE photos SET group_key = NULL WHERE group_key IS NOT NULL \
+             AND group_key NOT IN (SELECT uid FROM photos)",
+            [],
+        )?;
         tx.commit()?;
         Ok(removed)
     }
@@ -607,6 +615,57 @@ impl Db {
             .query_map(params![today, limit as i64], stored_photo)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Sets of photos with the same content hash, each set ordered with the
+    /// copy worth keeping first, and the sets newest first.
+    ///
+    /// The copy to keep is the one in the most albums, then the one that is part
+    /// of a larger group (the JPEG's RAW is filed with it, a stray re-upload is
+    /// not), then the earliest in server order. At most one file per group is
+    /// listed: the files of one RAW+JPEG shot are not copies of each other, and a
+    /// set left with one member is no set.
+    pub fn photo_duplicates(&self) -> Result<Vec<Vec<StoredPhoto>>> {
+        let rows: Vec<(String, String, String)> = {
+            let conn = self.read();
+            let mut stmt = conn.prepare(
+                "SELECT p.uid, p.content_hash, COALESCE(p.group_key, p.uid) AS k FROM photos p \
+                 WHERE p.content_hash IN (SELECT content_hash FROM photos \
+                     WHERE content_hash IS NOT NULL GROUP BY content_hash HAVING COUNT(*) > 1) \
+                 ORDER BY p.content_hash, \
+                     (SELECT COUNT(*) FROM album_photos a WHERE a.uid = p.uid) DESC, \
+                     (SELECT COUNT(*) FROM photos m WHERE COALESCE(m.group_key, m.uid) = COALESCE(p.group_key, p.uid)) DESC, \
+                     p.seq",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let uids: Vec<String> = rows.iter().map(|(uid, _, _)| uid.clone()).collect();
+        let mut stored: HashMap<String, StoredPhoto> = self
+            .photos_by_uid(&uids)?
+            .into_iter()
+            .map(|photo| (photo.uid.clone(), photo))
+            .collect();
+
+        let mut sets: Vec<Vec<StoredPhoto>> = Vec::new();
+        let mut hash_of_set: Option<&str> = None;
+        let mut groups_in_set: HashSet<&str> = HashSet::new();
+        for (uid, hash, group) in &rows {
+            if hash_of_set != Some(hash.as_str()) {
+                hash_of_set = Some(hash);
+                groups_in_set.clear();
+                sets.push(Vec::new());
+            }
+            if !groups_in_set.insert(group) {
+                continue;
+            }
+            if let (Some(set), Some(photo)) = (sets.last_mut(), stored.remove(uid)) {
+                set.push(photo);
+            }
+        }
+        sets.retain(|set| set.len() > 1);
+        sets.sort_by_key(|set| std::cmp::Reverse(set.iter().map(|p| p.capture_time).max()));
+        Ok(sets)
     }
 
     /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.

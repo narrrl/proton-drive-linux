@@ -9,6 +9,7 @@ use pages::activity::*;
 use pages::albums::*;
 use pages::browser::*;
 use pages::devices::*;
+use pages::duplicates::*;
 use pages::locations::*;
 use pages::login::*;
 use pages::photo_viewer::*;
@@ -726,6 +727,10 @@ fn build_window(app: &adw::Application) {
         &gallery_widgets.empty_upload,
         &gallery_widgets.empty_import,
     );
+    let ui_duplicates = ui.clone();
+    gallery_widgets
+        .duplicates
+        .connect_clicked(move |_| show_duplicates(&ui_duplicates));
     wire_albums(&ui);
     wire_trash(&ui, &trash_widgets);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);

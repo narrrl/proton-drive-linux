@@ -361,6 +361,7 @@ pub(crate) struct GalleryWidgets {
     pub(crate) empty_upload: gtk4::Button,
     pub(crate) empty_import: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
+    pub(crate) duplicates: gtk4::Button,
     /// The Select toggle and the bar it reveals.
     pub(crate) select_btn: gtk4::ToggleButton,
     pub(crate) select_bar: gtk4::Revealer,
@@ -519,6 +520,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     import.add_css_class("flat");
     import.add_css_class("circular");
     let refresh = refresh_button();
+
+    // The duplicate finder opens over the page: a review, not a view of it.
+    let duplicates = gtk4::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text(gettext("Find duplicates"))
+        .valign(gtk4::Align::Center)
+        .build();
+    duplicates.add_css_class("flat");
+    duplicates.add_css_class("circular");
 
     // Picking photos is a mode, so its control is a toggle rather than a button.
     let select_btn = gtk4::ToggleButton::builder()
@@ -749,6 +759,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     header.pack_end(&refresh);
     header.pack_end(&select_btn);
     header.pack_end(&import);
+    header.pack_end(&duplicates);
 
     (
         frame.upcast(),
@@ -770,6 +781,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             empty_upload,
             empty_import,
             refresh,
+            duplicates,
             select_btn,
             select_bar,
             select_label,
@@ -1849,7 +1861,7 @@ pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
     let ui = ui.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "trash" {
-            trash_photos(&ui, uids.clone());
+            trash_photos(&ui, uids.clone(), false);
         }
     });
     dialog.present(win.as_ref());
@@ -1861,13 +1873,19 @@ pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
 /// photos the user just deleted until a refresh lands — reads as a failure. What
 /// the server refuses comes back, so the grid still ends up telling the truth,
 /// and what succeeded is one Undo away for as long as the toast is up.
-pub(crate) fn trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
+///
+/// `files_only` trashes exactly `uids` and leaves the rest of their groups, for
+/// the duplicate finder; otherwise each photo takes its whole group along.
+pub(crate) fn trash_photos(ui: &Rc<Ui>, uids: Vec<String>, files_only: bool) {
     let removed = remove_photos(ui, &uids);
     set_selection_mode(ui, false);
     ui.busy_begin();
     let rx = spawn_request(
         ui.dirs.control_socket(),
-        Request::TrashNodes { uids: uids.clone() },
+        Request::TrashNodes {
+            uids: uids.clone(),
+            files_only,
+        },
     );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
