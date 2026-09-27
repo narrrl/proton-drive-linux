@@ -121,9 +121,10 @@ pub(crate) struct GalleryState {
     /// restricted to photos no album of ours holds yet.
     pub(crate) not_in_album_row: adw::SwitchRow,
     pub(crate) not_in_album: Cell<bool>,
-    /// The "On this day" strip above the timeline, the box holding its cards,
-    /// and whether there is anything to show in it.
-    pub(crate) memories: gtk4::Revealer,
+    /// The "On this day" strip, the box holding its cards, and whether there
+    /// is anything to show in it. The strip is the timeline's first row (see
+    /// [`GalleryRow::Memories`]), so it scrolls away with the grid.
+    pub(crate) memories: gtk4::Box,
     pub(crate) memory_cards: gtk4::Box,
     pub(crate) has_memories: Cell<bool>,
     /// Set while the date dropdown is being repopulated, so resetting its model
@@ -317,6 +318,11 @@ pub(crate) struct PhotoGroup {
 /// be shown. Splitting the day into its grid rows keeps a bind to a handful of
 /// widgets no matter how big the day is.
 pub(crate) enum GalleryRow {
+    /// The "On this day" strip, as the first row of the whole, unfiltered
+    /// timeline. A row rather than a strip above the list: hiding a strip
+    /// outside the list as the user scrolled resized the viewport under them,
+    /// and the list shook between the two heights near the top.
+    Memories,
     /// A day heading: "Today", "3 June 2026".
     Heading(String),
     /// One row of a day's grid, already justified to the current width and zoom.
@@ -333,7 +339,7 @@ impl GalleryRow {
     /// relayout scrolls back to.
     fn anchor(&self) -> Option<String> {
         match self {
-            GalleryRow::Heading(_) => None,
+            GalleryRow::Memories | GalleryRow::Heading(_) => None,
             GalleryRow::Tiles { tiles, .. } => tiles.first().map(|t| t.photo.uid.clone()),
         }
     }
@@ -343,6 +349,7 @@ impl GalleryRow {
     /// the rows that actually changed.
     fn same_as(&self, other: &GalleryRow) -> bool {
         match (self, other) {
+            (GalleryRow::Memories, GalleryRow::Memories) => true,
             (GalleryRow::Heading(a), GalleryRow::Heading(b)) => a == b,
             (
                 GalleryRow::Tiles { tiles: a, last: al },
@@ -418,7 +425,7 @@ pub(crate) struct GalleryWidgets {
     pub(crate) favorites_row: adw::SwitchRow,
     pub(crate) not_in_album_row: adw::SwitchRow,
     /// The "On this day" strip and the box its cards go into.
-    pub(crate) memories: gtk4::Revealer,
+    pub(crate) memories: gtk4::Box,
     pub(crate) memory_cards: gtk4::Box,
     /// The month row of the Filters popover, populated with the timeline's months.
     pub(crate) dates: adw::ComboRow,
@@ -719,8 +726,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     filter_bar.append(&filters);
 
     // "On this day": a card per earlier year that has photos from today's
-    // date. Revealed only at the top of the unfiltered timeline (see
-    // [`sync_memories`]), so it gives the grid its room back once you scroll.
+    // date. Shown as the first row of the unfiltered timeline (see
+    // [`sync_memories`]), so it scrolls away with the grid.
     let memories_title = gtk4::Label::builder()
         .label(gettext("On this day"))
         .xalign(0.0)
@@ -733,18 +740,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .propagate_natural_height(true)
         .child(&memory_cards)
         .build();
-    let memories_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    memories_box.append(&memories_title);
-    memories_box.append(&memory_scroll);
-    let memories = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideDown)
-        .child(&memories_box)
-        .build();
+    let memories = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    memories.set_hexpand(true);
+    memories.set_margin_bottom(4);
+    memories.append(&memories_title);
+    memories.append(&memory_scroll);
 
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&select_bar);
-    timeline.append(&memories);
     // The scrubber sits beside the list rather than over it, so the grid is
     // laid out to the width it really has and no tile hides under a year mark.
     let timeline_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -1083,7 +1087,19 @@ pub(crate) fn wire_gallery(
         while let Some(child) = row_box.first_child() {
             row_box.remove(&child);
         }
+        row_box.set_halign(gtk4::Align::Start);
         match &*row {
+            GalleryRow::Memories => {
+                // One strip widget, moved into whichever row box shows it.
+                let strip = &ui_bind.gallery.memories;
+                if let Some(parent) = strip.parent().and_downcast::<gtk4::Box>() {
+                    parent.remove(strip);
+                }
+                row_box.set_halign(gtk4::Align::Fill);
+                row_box.set_margin_top(8);
+                row_box.set_margin_bottom(0);
+                row_box.append(strip);
+            }
             GalleryRow::Heading(heading) => {
                 row_box.set_margin_top(8);
                 row_box.set_margin_bottom(0);
@@ -1177,7 +1193,6 @@ pub(crate) fn wire_gallery(
             load_gallery(&ui_scroll, true);
         }
         sync_scrubber_position(&ui_scroll);
-        sync_memories(&ui_scroll);
     });
     wire_scrubber(ui);
     wire_drag_select(ui);
@@ -1917,7 +1932,7 @@ fn tile_at(ui: &Rc<Ui>, x: f64, y: f64) -> Option<String> {
     let boxed = item.downcast_ref::<BoxedAnyObject>()?;
     match &*boxed.borrow::<GalleryRow>() {
         GalleryRow::Tiles { tiles, .. } => tiles.get(index).map(|tile| tile.photo.uid.clone()),
-        GalleryRow::Heading(_) => None,
+        GalleryRow::Memories | GalleryRow::Heading(_) => None,
     }
 }
 
@@ -2492,7 +2507,7 @@ fn row_of_photo(store: &gio::ListStore, uid: &str) -> Option<u32> {
             .item(*i)
             .and_downcast::<BoxedAnyObject>()
             .is_some_and(|obj| match &*obj.borrow::<GalleryRow>() {
-                GalleryRow::Heading(_) => false,
+                GalleryRow::Memories | GalleryRow::Heading(_) => false,
                 GalleryRow::Tiles { tiles, .. } => tiles.iter().any(|t| t.photo.uid == uid),
             })
     })
@@ -2555,6 +2570,9 @@ fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
     let width = gallery_width(ui);
     let mut rows = Vec::new();
     let grouping = grouping_for(ui.gallery.row_height.get());
+    if shows_memories(ui) {
+        rows.push(GalleryRow::Memories);
+    }
     for group in group_photos(&ui.gallery.model, grouping) {
         rows.push(GalleryRow::Heading(group.heading));
         let grid = justify_rows(ui, &group.photos, width);
@@ -2571,6 +2589,7 @@ fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
 
 fn clone_row(row: &GalleryRow) -> GalleryRow {
     match row {
+        GalleryRow::Memories => GalleryRow::Memories,
         GalleryRow::Heading(heading) => GalleryRow::Heading(heading.clone()),
         GalleryRow::Tiles { tiles, last } => GalleryRow::Tiles {
             tiles: tiles.clone(),
@@ -2938,22 +2957,30 @@ fn memory_card(ui: &Rc<Ui>, years_ago: u32, photos: Vec<PhotoItem>) -> gtk4::But
     card
 }
 
-/// Show the "On this day" strip only where it belongs: at the top of the whole,
-/// unfiltered timeline, and only when it has cards.
-fn sync_memories(ui: &Rc<Ui>) {
-    let at_top = ui
-        .gallery
-        .list
-        .vadjustment()
-        .is_none_or(|adj| adj.value() < 1.0);
+/// Whether the "On this day" strip belongs in the timeline: only atop the
+/// whole, unfiltered timeline, and only when it has cards.
+fn shows_memories(ui: &Rc<Ui>) -> bool {
     let whole = !ui.gallery.in_collection()
         && ui.gallery.kind.get().is_none()
         && ui.gallery.range.get().is_none()
         && !ui.gallery.favorites.get()
         && !ui.gallery.not_in_album.get();
-    ui.gallery
-        .memories
-        .set_reveal_child(whole && at_top && ui.gallery.has_memories.get());
+    whole && ui.gallery.has_memories.get() && ui.gallery.model.n_items() > 0
+}
+
+/// Add or drop the "On this day" row at the head of the timeline. Only that
+/// one row changes, so the rest of the list keeps its widgets and position.
+fn sync_memories(ui: &Rc<Ui>) {
+    let store = &ui.gallery.groups;
+    let shown = store
+        .item(0)
+        .and_downcast::<BoxedAnyObject>()
+        .is_some_and(|obj| matches!(*obj.borrow::<GalleryRow>(), GalleryRow::Memories));
+    match (shown, shows_memories(ui)) {
+        (false, true) => store.insert(0, &BoxedAnyObject::new(GalleryRow::Memories)),
+        (true, false) => store.remove(0),
+        _ => {}
+    }
 }
 
 /// "March 2024" for the scrubber's month `index`.
