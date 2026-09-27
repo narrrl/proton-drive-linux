@@ -39,6 +39,7 @@ Requires:       xdg-utils
 
 # DE-specific; do not Require a single desktop environment.
 Recommends:     gnome-keyring
+Recommends:     iso-codes
 Recommends:     gnome-shell-extension-appindicator
 Recommends:     kwallet
 

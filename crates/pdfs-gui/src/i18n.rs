@@ -64,8 +64,28 @@ pub(crate) fn init() {
         tracing::warn!("bindtextdomain failed: {e}");
     }
     let _ = gettextrs::bind_textdomain_codeset(DOMAIN, "UTF-8");
+    // Country names come translated from the iso-codes catalogs, which live in
+    // the system's own locale directory.
+    let _ = gettextrs::bind_textdomain_codeset(ISO_3166_DOMAIN, "UTF-8");
     if let Err(e) = gettextrs::textdomain(DOMAIN) {
         tracing::warn!("textdomain failed: {e}");
+    }
+}
+
+/// The iso-codes text domain that translates ISO 3166-1 country names.
+const ISO_3166_DOMAIN: &str = "iso_3166-1";
+
+/// The name of the country with ISO 3166-1 code `code`, in the user's language.
+/// The English names are the iso-codes project's own, so that project's
+/// catalogs translate them; Kosovo has no ISO code of its own and is
+/// translated here. An unknown code is shown as it is.
+pub(crate) fn country_name(code: &str) -> String {
+    if code == "XK" {
+        return gettext("Kosovo");
+    }
+    match pdfs_core::places::country_name(code) {
+        Some(name) => gettextrs::dgettext(ISO_3166_DOMAIN, name),
+        None => code.to_string(),
     }
 }
 

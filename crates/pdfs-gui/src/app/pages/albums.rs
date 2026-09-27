@@ -24,6 +24,7 @@ pub(crate) fn show_albums(ui: &Rc<Ui>) {
 /// position. The timeline's filters do not apply to albums, so they go.
 fn show_album_grid(ui: &Rc<Ui>) {
     close_album(ui);
+    close_place(ui);
     ui.gallery.filters.set_visible(false);
     ui.gallery.content.set_visible_child_name("albums");
 }
@@ -582,7 +583,7 @@ fn album_subtitle(album: &AlbumInfo) -> String {
 
 /// Queue an album cover for the gallery's own thumbnail machinery: same batching,
 /// same texture cache, same decode pacing as a timeline tile.
-fn want_cover(ui: &Rc<Ui>, uid: String, picture: &gtk4::Picture) {
+pub(crate) fn want_cover(ui: &Rc<Ui>, uid: String, picture: &gtk4::Picture) {
     if let Some(texture) = ui.gallery.photo_tex.borrow().get(&uid) {
         picture.set_paintable(Some(texture));
         return;
@@ -662,6 +663,7 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
             return;
         }
         close_album(&ui_photos);
+        close_place(&ui_photos);
         ui_photos.gallery.filters.set_visible(true);
         ui_photos.gallery.content.set_visible_child_name("timeline");
         // The timeline comes back as it was left unless an album took over the
@@ -674,10 +676,14 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
         }
     });
 
-    // Back returns to the grid the album was opened from, scrolled where it
-    // was, instead of reloading it.
+    // Back returns to the grid the album or place was opened from, scrolled
+    // where it was, instead of reloading it.
     let ui_back = ui.clone();
     ui.gallery.back.clone().connect_clicked(move |_| {
+        if ui_back.gallery.place.borrow().is_some() {
+            show_place_grid(&ui_back);
+            return;
+        }
         show_album_grid(&ui_back);
         let count = ui_back.gallery.album_list.borrow().len();
         ui_back.gallery.title.set_subtitle(&ngettext_f(

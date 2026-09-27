@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 32;
+pub(super) const SCHEMA_VERSION: i64 = 33;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -282,6 +282,22 @@ impl Db {
                 if has_table {
                     tx.execute(&MIGRATION_V32.replace("{table}", table), [])?;
                 }
+            }
+        }
+        if current < 33 {
+            // Same guards as V26-V31.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('photos') WHERE name = 'place_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_photos: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'photos'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_photos && !has_column {
+                tx.execute_batch(MIGRATION_V33)?;
             }
         }
         tx.execute(
@@ -973,3 +989,20 @@ UPDATE photos SET resolved_at = strftime('%s','now') WHERE name IS NOT NULL;
 /// decoder, which could only fail, and that failure was recorded as the
 /// permanent "no thumbnail" verdict. Run once per table in `{table}`.
 const MIGRATION_V32: &str = "UPDATE {table} SET thumb_state = 0 WHERE kind = 1 AND thumb_state = 2";
+
+/// Schema v33: where each photo was taken.
+///
+/// `latitude` and `longitude` come from the location other clients write into
+/// a photo's extended attributes; `place_id` is the GeoNames id of the nearest
+/// town (see `crate::places`), so the Places view is a plain `GROUP BY`.
+///
+/// Every photo is marked unresolved, so the next refresh reads the location of
+/// the whole library once. That is the backfill: the metadata is on the node
+/// the refresh reads anyway, and nothing has to be downloaded.
+const MIGRATION_V33: &str = "
+ALTER TABLE photos ADD COLUMN latitude REAL;
+ALTER TABLE photos ADD COLUMN longitude REAL;
+ALTER TABLE photos ADD COLUMN place_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_id);
+UPDATE photos SET resolved_at = NULL;
+";

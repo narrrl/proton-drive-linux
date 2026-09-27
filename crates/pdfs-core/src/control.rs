@@ -91,6 +91,18 @@ pub enum Request {
     /// Sets of photos that are byte-identical copies of each other, going by
     /// the server's content hash. Replies with [`Response::PhotoDuplicates`].
     PhotoDuplicates,
+    /// The towns the photos were taken in, the one with the most photos first.
+    /// Only photos whose uploader recorded a location count. Replies with
+    /// [`Response::Places`].
+    PhotoPlaces,
+    /// Fetch a page of the photos taken in one town, newest first. `id` is the
+    /// town's id from [`Request::PhotoPlaces`]. Replies with
+    /// [`Response::Photos`], like an album page.
+    PlacePhotos {
+        id: u32,
+        offset: usize,
+        limit: usize,
+    },
     /// List the account's photo albums, newest activity first, including the
     /// albums other people share with us. Metadata only — an album's cover
     /// thumbnail is fetched with [`Request::PhotoThumbs`] like any other photo.
@@ -1435,6 +1447,21 @@ pub struct AlbumInfo {
     pub shared: bool,
 }
 
+/// One town in a [`Response::Places`] listing.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PlaceInfo {
+    /// The town's GeoNames id — what [`Request::PlacePhotos`] takes.
+    pub id: u32,
+    /// The town's name, as the town itself spells it.
+    pub name: String,
+    /// ISO 3166-1 alpha-2 code of the town's country.
+    pub country: String,
+    /// How many photos were taken there, counting a RAW+JPEG shot once.
+    pub photo_count: usize,
+    /// The newest photo taken there, shown as the place's cover.
+    pub cover: PhotoItem,
+}
+
 /// One photo in a [`Request::PhotosTimeline`] page.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoItem {
@@ -1796,6 +1823,8 @@ pub enum Response {
     /// The duplicate sets (reply to [`Request::PhotoDuplicates`]), newest
     /// first. Each set lists the copy worth keeping first.
     PhotoDuplicates { sets: Vec<Vec<PhotoItem>> },
+    /// The towns the photos were taken in (reply to [`Request::PhotoPlaces`]).
+    Places { items: Vec<PlaceInfo> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
     /// Per-node outcome of a [`Request::TrashNodes`] batch. Reported per uid
@@ -2487,6 +2516,33 @@ mod tests {
             let back: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(line, serde_json::to_string(&back).unwrap());
         }
+    }
+
+    /// A place listing and a place page cross the wire intact: a mangled id
+    /// would open the wrong town.
+    #[test]
+    fn places_requests_and_reply_roundtrip() {
+        for req in [
+            Request::PhotoPlaces,
+            Request::PlacePhotos {
+                id: 2950159,
+                offset: 60,
+                limit: 30,
+            },
+        ] {
+            let line = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(line, serde_json::to_string(&back).unwrap());
+        }
+
+        let line = r#"{"Places":{"items":[{"id":2950159,"name":"Berlin","country":"DE","photo_count":2,
+            "cover":{"uid":"vol~b2","capture_time":1700000000,"thumb_path":null,"name":"b2.jpg","ratio":null,"no_thumb":false}}]}}"#;
+        let Response::Places { items } = serde_json::from_str(line).unwrap() else {
+            panic!("not a place listing");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].id, items[0].country.as_str()), (2950159, "DE"));
+        assert_eq!(items[0].cover.uid, "vol~b2");
     }
 
     /// The sharing and devices requests must survive the same line-delimited JSON

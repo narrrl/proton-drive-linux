@@ -14,6 +14,7 @@ pub mod localindex;
 pub mod menu;
 pub mod mounts;
 pub mod opener;
+pub mod places;
 pub mod profile;
 pub mod sdkcache;
 pub mod search;

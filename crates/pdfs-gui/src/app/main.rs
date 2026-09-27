@@ -14,6 +14,7 @@ use pages::locations::*;
 use pages::login::*;
 use pages::photo_viewer::*;
 use pages::photos::*;
+use pages::places::*;
 use pages::shared::*;
 use pages::shared_by_me::*;
 use pages::status::*;
@@ -26,7 +27,7 @@ use widgets::share_dialog::*;
 use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
 
-pub(crate) use i18n::{gettext, gettext_f, gettext_noop, ngettext_f, pgettext};
+pub(crate) use i18n::{country_name, gettext, gettext_f, gettext_noop, ngettext_f, pgettext};
 
 use std::cell::{Cell, RefCell};
 
@@ -55,9 +56,10 @@ use pdfs_core::config::{AppDirs, FileSort, FilesView};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
     DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem,
-    PhotoKind, PhotoMonth, PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder,
-    RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo,
-    SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem, send,
+    PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope, Request, Response,
+    RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
+    SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem,
+    send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -551,6 +553,13 @@ fn build_window(app: &adw::Application) {
             albums_btn: gallery_widgets.albums_btn.clone(),
             view_switch: gallery_widgets.view_switch.clone(),
             albums_loading: Cell::new(false),
+            places: gallery_widgets.places.clone(),
+            places_stack: gallery_widgets.places_stack.clone(),
+            places_status: gallery_widgets.places_status.clone(),
+            places_btn: gallery_widgets.places_btn.clone(),
+            places_loading: Cell::new(false),
+            place_count: Cell::new(0),
+            place: RefCell::new(None),
             album: RefCell::new(None),
             timeline_stale: Cell::new(false),
             album_list: RefCell::new(Vec::new()),
@@ -736,6 +745,7 @@ fn build_window(app: &adw::Application) {
         .duplicates
         .connect_clicked(move |_| show_duplicates(&ui_duplicates));
     wire_albums(&ui);
+    wire_places(&ui);
     wire_trash(&ui, &trash_widgets);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
@@ -1044,12 +1054,12 @@ fn reload_current_page(ui: &Rc<Ui>) {
             refresh_then(ui, RefreshScope::Dir { path }, load_browser);
         }
         // One scope covers the whole photos view, so Refresh reloads whichever of
-        // the two — album grid or timeline/album — is actually on screen.
+        // the views — a grid, or the timeline, an album or a place — is on screen.
         Some("gallery") => refresh_then(ui, RefreshScope::Photos { full: false }, |ui| {
-            if ui.gallery.content.visible_child_name().as_deref() == Some("albums") {
-                load_albums(ui);
-            } else {
-                load_gallery(ui, false);
+            match ui.gallery.content.visible_child_name().as_deref() {
+                Some("albums") => load_albums(ui),
+                Some("places") => load_places(ui),
+                _ => load_gallery(ui, false),
             }
         }),
         Some("trash") => refresh_then(ui, RefreshScope::Trash, load_trash),
@@ -1336,6 +1346,14 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::License::Custom,
             Some(&gettext(
                 "This is an unofficial, community-built client. It is not affiliated with, endorsed by, or supported by Proton AG.\n\n“Proton” and “Proton Drive” are trademarks of Proton AG, used here only to describe the service this software connects to. Your use of Proton Drive is governed by Proton's own terms of service and privacy policy.\n\nThis software is provided “as is”, without warranty of any kind. Keep a copy of any data you cannot afford to lose.",
+            )),
+        );
+        dialog.add_legal_section(
+            "GeoNames",
+            None,
+            gtk4::License::Custom,
+            Some(&gettext(
+                "Places are named with data from <a href=\"https://www.geonames.org/\">GeoNames</a>, licensed under <a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>.",
             )),
         );
         dialog.add_legal_section(

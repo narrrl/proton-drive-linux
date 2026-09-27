@@ -465,6 +465,20 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(sets) => CtlResponse::PhotoDuplicates { sets },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::PhotoPlaces) => match core.photo_places() {
+            Ok(items) => CtlResponse::Places { items },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::PlacePhotos { id, offset, limit }) => {
+            match core.place_photos(id, offset, clamp_limit(limit)) {
+                Ok(items) => CtlResponse::Photos {
+                    available: true,
+                    items,
+                    counts: None,
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::PhotosOnThisDay { limit }) => {
             match core.photos_on_this_day(clamp_limit(limit)) {
                 Ok(items) => CtlResponse::Photos {

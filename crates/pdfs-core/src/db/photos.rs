@@ -42,6 +42,15 @@ pub struct StoredPhoto {
     pub has_raw: bool,
 }
 
+/// A town photos were taken in: its GeoNames id (see [`crate::places`]), how
+/// many photos it holds, and the newest of them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredPlace {
+    pub id: u32,
+    pub count: usize,
+    pub cover: StoredPhoto,
+}
+
 /// One row of a timeline replacement. Everything but the uid and the capture
 /// time is "what this refresh learned": a `None` keeps whatever is already
 /// stored rather than clearing it, because the timeline DTO carries only the uid
@@ -58,6 +67,8 @@ pub struct TimelineRow {
     /// The main photo this one is *related* to (a live-photo video, a burst
     /// sibling), when the server says it belongs to one.
     pub main_uid: Option<String>,
+    /// Where the photo was taken, as `(latitude, longitude)` in decimal degrees.
+    pub location: Option<(f64, f64)>,
     /// When this refresh resolved the photo's node, if it did at all. `Some`
     /// makes every other field authoritative — including a `None` that means
     /// "the server no longer reports one" — while `None` means the refresh
@@ -86,6 +97,7 @@ struct Learned {
     favorite: bool,
     content_hash: Option<String>,
     main_uid: Option<String>,
+    location: Option<(f64, f64)>,
     /// When this photo's node was last resolved, kept so a refresh that skips it
     /// does not make it look unresolved again.
     resolved_at: Option<i64>,
@@ -281,7 +293,7 @@ impl Db {
         let learned: HashMap<String, Learned> = {
             let mut stmt = tx.prepare(
                 "SELECT uid, name, ratio, thumb_state, media_type, favorite, content_hash, \
-                 main_uid, resolved_at FROM photos",
+                 main_uid, resolved_at, latitude, longitude FROM photos",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -295,6 +307,9 @@ impl Db {
                         content_hash: r.get(6)?,
                         main_uid: r.get(7)?,
                         resolved_at: r.get(8)?,
+                        location: r
+                            .get::<_, Option<f64>>(9)?
+                            .zip(r.get::<_, Option<f64>>(10)?),
                     },
                 ))
             })?;
@@ -319,12 +334,14 @@ impl Db {
                     carried.favorite = row.favorite.unwrap_or(false);
                     carried.content_hash = row.content_hash.clone();
                     carried.main_uid = row.main_uid.clone();
+                    carried.location = row.location;
                 } else {
                     carried.name = row.name.clone().or(carried.name);
                     carried.media_type = row.media_type.clone().or(carried.media_type);
                     carried.favorite = row.favorite.unwrap_or(carried.favorite);
                     carried.content_hash = row.content_hash.clone().or(carried.content_hash);
                     carried.main_uid = row.main_uid.clone().or(carried.main_uid);
+                    carried.location = row.location.or(carried.location);
                 }
                 carried.resolved_at = row.resolved_at.or(carried.resolved_at);
                 // The tab this photo lands in is derived here, once, so a page or
@@ -355,8 +372,10 @@ impl Db {
             let mut stmt = tx.prepare(
                 "INSERT INTO photos
                    (uid, capture_time, name, ratio, thumb_state, seq, media_type, kind, favorite,
-                    content_hash, main_uid, group_key, resolved_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    content_hash, main_uid, group_key, resolved_at, latitude, longitude,
+                    place_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16)",
             )?;
             for (seq, ((row, carried, kind), group_key)) in
                 resolved.iter().zip(group_keys.iter()).enumerate()
@@ -375,6 +394,12 @@ impl Db {
                     carried.main_uid,
                     group_key,
                     carried.resolved_at,
+                    carried.location.map(|(lat, _)| lat),
+                    carried.location.map(|(_, lon)| lon),
+                    carried
+                        .location
+                        .and_then(|(lat, lon)| crate::places::nearest(lat, lon))
+                        .map(|city| city.id),
                 ])?;
             }
         }
@@ -613,6 +638,61 @@ impl Db {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![today, limit as i64], stored_photo)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Every town photos were taken in, with how many and the newest one as its
+    /// cover, most photographed first. Counted per group, like the timeline;
+    /// photos without a location, or taken far from any town, are in none.
+    pub fn photo_places(&self) -> Result<Vec<StoredPlace>> {
+        let rows: Vec<(u32, usize, String)> = {
+            let conn = self.read();
+            // SQLite fills the bare `uid` from the row `MIN(seq)` picked, which
+            // is the newest photo of the place.
+            let mut stmt = conn.prepare(
+                "SELECT place_id, COUNT(*), uid, MIN(seq) FROM photos \
+                 WHERE uid = COALESCE(group_key, uid) AND place_id IS NOT NULL \
+                 GROUP BY place_id ORDER BY COUNT(*) DESC, MIN(seq)",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as usize, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let uids: Vec<String> = rows.iter().map(|(_, _, uid)| uid.clone()).collect();
+        let mut covers: HashMap<String, StoredPhoto> = self
+            .photos_by_uid(&uids)?
+            .into_iter()
+            .map(|photo| (photo.uid.clone(), photo))
+            .collect();
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, count, uid)| {
+                Some(StoredPlace {
+                    id,
+                    count,
+                    cover: covers.remove(&uid)?,
+                })
+            })
+            .collect())
+    }
+
+    /// One page of the photos taken in a town, newest first, one per group.
+    pub fn photos_at_place(
+        &self,
+        id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<StoredPhoto>> {
+        let conn = self.read();
+        let sql = format!(
+            "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) AND p.place_id = ?1 \
+             ORDER BY p.seq LIMIT ?2 OFFSET ?3"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![id, limit as i64, offset as i64], stored_photo)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }

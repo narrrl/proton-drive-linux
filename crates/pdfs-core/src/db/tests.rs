@@ -293,6 +293,70 @@ fn hashed(uid: &str, capture_time: i64, name: &str, hash: &str) -> TimelineRow {
     }
 }
 
+fn located(uid: &str, capture_time: i64, name: &str, at: (f64, f64)) -> TimelineRow {
+    TimelineRow {
+        name: Some(name.into()),
+        location: Some(at),
+        resolved_at: Some(1),
+        ..TimelineRow::new(uid, capture_time)
+    }
+}
+
+const BERLIN: (f64, f64) = (52.52, 13.405);
+const PARIS: (f64, f64) = (48.857, 2.352);
+
+/// Places count shots, not files, lead with the most photographed town, and
+/// leave out photos with no location or taken far from any town.
+#[test]
+fn places_group_photos_by_the_nearest_town() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        located("b2", 500, "IMG_5.JPG", BERLIN),
+        located("p1", 400, "IMG_4.JPG", PARIS),
+        located("b1-jpeg", 300, "IMG_3.JPG", BERLIN),
+        located("b1-raw", 300, "IMG_3.CR2", BERLIN),
+        located("sea", 200, "IMG_2.JPG", (0.0, -30.0)),
+        TimelineRow::new("nowhere", 100),
+    ])
+    .unwrap();
+
+    let places = db.photo_places().unwrap();
+    let summary: Vec<(&str, usize, &str)> = places
+        .iter()
+        .map(|place| {
+            let city = crate::places::city(place.id).expect("a known town");
+            (city.name, place.count, place.cover.uid.as_str())
+        })
+        .collect();
+    assert_eq!(summary, [("Berlin", 2, "b2"), ("Paris", 1, "p1")]);
+
+    let berlin: Vec<String> = db
+        .photos_at_place(places[0].id, 0, 10)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.uid)
+        .collect();
+    assert_eq!(berlin, ["b2", "b1-jpeg"]);
+}
+
+/// A refresh that skips an already-resolved photo keeps where it was taken; one
+/// that reads the node again takes what the node now says.
+#[test]
+fn a_skipped_refresh_keeps_a_photos_location() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[located("a", 100, "IMG_1.JPG", BERLIN)])
+        .unwrap();
+    db.photos_replace(&[TimelineRow::new("a", 100)]).unwrap();
+    assert_eq!(db.photo_places().unwrap().len(), 1);
+
+    db.photos_replace(&[TimelineRow {
+        resolved_at: Some(2),
+        ..TimelineRow::new("a", 100)
+    }])
+    .unwrap();
+    assert!(db.photo_places().unwrap().is_empty());
+}
+
 /// A copy an album holds is the one kept; the files of one RAW+JPEG shot are
 /// never copies of each other; a hash only one file carries is no set.
 #[test]

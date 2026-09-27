@@ -61,6 +61,18 @@ pub(crate) struct GalleryState {
     /// True while the album listing is in flight, so a re-entry into the Albums
     /// view can't stack requests.
     pub(crate) albums_loading: Cell<bool>,
+    /// The Places grid and its own status page, like the album grid's, and the
+    /// switcher's Places toggle.
+    pub(crate) places: gtk4::FlowBox,
+    pub(crate) places_stack: gtk4::Stack,
+    pub(crate) places_status: adw::StatusPage,
+    pub(crate) places_btn: gtk4::ToggleButton,
+    /// True while the place listing is in flight.
+    pub(crate) places_loading: Cell<bool>,
+    /// How many places the grid shows, for the subtitle when back returns there.
+    pub(crate) place_count: Cell<usize>,
+    /// The place currently open, paged by [`load_gallery`] like an album.
+    pub(crate) place: RefCell<Option<PlaceInfo>>,
     /// The album currently open, or `None` when the timeline is showing. Set by
     /// [`open_album`]; read by [`load_gallery`], which pages that album instead
     /// of the timeline while it is set.
@@ -188,6 +200,14 @@ pub(crate) struct GalleryState {
     pub(crate) select_label: gtk4::Label,
     pub(crate) select_trash: gtk4::Button,
     pub(crate) select_album: gtk4::Button,
+}
+
+impl GalleryState {
+    /// Whether the gallery shows an album or a place rather than the timeline.
+    /// Neither is filtered or dated, so the timeline's extras stay away.
+    pub(crate) fn in_collection(&self) -> bool {
+        self.album.borrow().is_some() || self.place.borrow().is_some()
+    }
 }
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
@@ -385,6 +405,10 @@ pub(crate) struct GalleryWidgets {
     pub(crate) photos_btn: gtk4::ToggleButton,
     pub(crate) albums_btn: gtk4::ToggleButton,
     pub(crate) view_switch: gtk4::Box,
+    pub(crate) places: gtk4::FlowBox,
+    pub(crate) places_stack: gtk4::Stack,
+    pub(crate) places_status: adw::StatusPage,
+    pub(crate) places_btn: gtk4::ToggleButton,
     pub(crate) back: gtk4::Button,
     /// The kind toggles and date jump, as one box so an album view can hide them.
     pub(crate) filters: gtk4::Box,
@@ -678,11 +702,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .label(gettext("Albums"))
         .build();
     albums_btn.set_group(Some(&photos_btn));
+    let places_btn = gtk4::ToggleButton::builder()
+        .label(gettext("Places"))
+        .build();
+    places_btn.set_group(Some(&photos_btn));
     let view_switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     view_switch.add_css_class("linked");
     view_switch.add_css_class("view-switch");
     view_switch.set_halign(gtk4::Align::Start);
-    for btn in [&photos_btn, &albums_btn] {
+    for btn in [&photos_btn, &albums_btn, &places_btn] {
         btn.add_css_class("pill");
         view_switch.append(btn);
     }
@@ -761,12 +789,38 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     albums_page.append(&new_album);
     albums_page.append(&albums_stack);
 
+    // The place grid: the same cards, one per town the photos were taken in.
+    let places = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .homogeneous(true)
+        .row_spacing(TILE_GAP as u32 * 2)
+        .column_spacing(TILE_GAP as u32 * 2)
+        .min_children_per_line(2)
+        .max_children_per_line(8)
+        .valign(gtk4::Align::Start)
+        .build();
+    let places_scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&places)
+        .build();
+    let places_status = adw::StatusPage::builder()
+        .icon_name("mark-location-symbolic")
+        .vexpand(true)
+        .build();
+    places_status.add_css_class("compact");
+    let places_stack = gtk4::Stack::new();
+    places_stack.set_vexpand(true);
+    places_stack.add_named(&places_scroll, Some("grid"));
+    places_stack.add_named(&places_status, Some("status"));
+
     let content = gtk4::Stack::new();
     content.set_vexpand(true);
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
     content.add_named(&timeline, Some("timeline"));
     content.add_named(&status, Some("status"));
     content.add_named(&albums_page, Some("albums"));
+    content.add_named(&places_stack, Some("places"));
 
     let import_banner = adw::Banner::builder()
         .title(gettext("Importing from Google Photos…"))
@@ -836,6 +890,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             photos_btn,
             albums_btn,
             view_switch,
+            places,
+            places_stack,
+            places_status,
+            places_btn,
             back,
             filters,
         },
@@ -2527,9 +2585,9 @@ pub(crate) fn update_gallery_subtitle(ui: &Rc<Ui>) {
     if loaded == 0 {
         ui.gallery.title.set_subtitle("");
     }
-    // An album counts what the server says it holds, not how much of it has been
+    // An album or a place counts what it holds, not how much of it has been
     // paged in — the subtitle would otherwise climb as the user scrolls.
-    if ui.gallery.album.borrow().is_some() {
+    if ui.gallery.in_collection() {
         return;
     }
     // The noun tracks the active filter, so a Videos tab doesn't count "photos".
@@ -2748,7 +2806,7 @@ fn fill_scrubber(ui: &Rc<Ui>, months: &[PhotoMonth]) {
 /// Show the scrubber only where a month jump makes sense: the whole timeline,
 /// not an album, a date window, the favorites or the unfiled photos.
 pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
-    let whole = ui.gallery.album.borrow().is_none()
+    let whole = !ui.gallery.in_collection()
         && ui.gallery.range.get().is_none()
         && !ui.gallery.favorites.get()
         && !ui.gallery.not_in_album.get();
@@ -2888,7 +2946,7 @@ fn sync_memories(ui: &Rc<Ui>) {
         .list
         .vadjustment()
         .is_none_or(|adj| adj.value() < 1.0);
-    let whole = ui.gallery.album.borrow().is_none()
+    let whole = !ui.gallery.in_collection()
         && ui.gallery.kind.get().is_none()
         && ui.gallery.range.get().is_none()
         && !ui.gallery.favorites.get()
@@ -3164,9 +3222,12 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         }
         return;
     }
-    // An open album pages itself instead of the timeline; everything downstream —
-    // the model, the sections, the thumbnails, the lightbox — is the same.
+    // An open album or place pages itself instead of the timeline; everything
+    // downstream — the model, the sections, the thumbnails, the lightbox — is
+    // the same.
     let album = ui.gallery.album.borrow().as_ref().map(|a| a.uid.clone());
+    let place = ui.gallery.place.borrow().as_ref().map(|p| p.id);
+    let collection = album.is_some() || place.is_some();
     if !append {
         // Fresh load: clear the timeline and show Loading until the first page lands.
         ui.gallery.model.remove_all();
@@ -3181,11 +3242,11 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         // load — a jump *to* a month sets a range and reloads, and refreshing the
         // dropdown then would fight the selection the user just made. An album
         // has no date jump at all.
-        if album.is_none() && ui.gallery.range.get().is_none() {
+        if !collection && ui.gallery.range.get().is_none() {
             refresh_photo_months(ui);
         }
         sync_scrubber(ui);
-        if album.is_none() {
+        if !collection {
             refresh_memories(ui);
         }
         sync_memories(ui);
@@ -3201,9 +3262,10 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     ui.gallery.pager.set_spinning(append);
 
     ui.busy_begin();
-    let request = match album {
-        Some(uid) => Request::AlbumPhotos { uid, offset, limit },
-        None => Request::PhotosTimeline {
+    let request = match (album, place) {
+        (Some(uid), _) => Request::AlbumPhotos { uid, offset, limit },
+        (None, Some(id)) => Request::PlacePhotos { id, offset, limit },
+        (None, None) => Request::PhotosTimeline {
             offset,
             limit,
             kind: ui.gallery.kind.get(),
@@ -3305,7 +3367,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                     // and an empty filter is not a library that needs photos.
                     ui.gallery
                         .empty_actions
-                        .set_visible(ui.gallery.album.borrow().is_none() && !filtered);
+                        .set_visible(!ui.gallery.in_collection() && !filtered);
                     return;
                 }
                 ui.gallery.content.set_visible_child_name("timeline");

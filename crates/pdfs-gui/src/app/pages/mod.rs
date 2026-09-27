@@ -7,6 +7,7 @@ pub(crate) mod locations;
 pub(crate) mod login;
 pub(crate) mod photo_viewer;
 pub(crate) mod photos;
+pub(crate) mod places;
 pub(crate) mod shared;
 pub(crate) mod shared_by_me;
 pub(crate) mod status;

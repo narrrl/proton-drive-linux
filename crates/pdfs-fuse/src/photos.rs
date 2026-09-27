@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use pdfs_core::control::{
-    FileThumbRequest, PhotoItem, PhotoKind, PhotoThumb, ThumbnailBuildStatus, is_raw_image_name,
-    is_thumbnail_image_name,
+    FileThumbRequest, PhotoItem, PhotoKind, PhotoThumb, PlaceInfo, ThumbnailBuildStatus,
+    is_raw_image_name, is_thumbnail_image_name,
 };
 use pdfs_core::db::{self, StoredPhoto};
 use pdfs_core::{CoreError, CoreResult};
@@ -609,6 +609,8 @@ struct PhotoMeta {
     media_type: Option<String>,
     favorite: bool,
     content_hash: Option<String>,
+    /// Where the photo was taken, as its uploader recorded it.
+    location: Option<(f64, f64)>,
 }
 
 impl Core {
@@ -737,6 +739,40 @@ impl Core {
             .into_iter()
             .map(|set| set.into_iter().map(|p| self.photo_item(p)).collect())
             .collect())
+    }
+
+    /// The towns the photos were taken in, as wire items. A town the bundled
+    /// table no longer knows (the stored id came from an older table) is left
+    /// out rather than shown without a name.
+    pub(crate) fn photo_places(&self) -> CoreResult<Vec<PlaceInfo>> {
+        let places = self.db.photo_places().map_err(CoreError::from)?;
+        Ok(places
+            .into_iter()
+            .filter_map(|place| {
+                let city = pdfs_core::places::city(place.id)?;
+                Some(PlaceInfo {
+                    id: place.id,
+                    name: city.name.to_string(),
+                    country: city.country.to_string(),
+                    photo_count: place.count,
+                    cover: self.photo_item(place.cover),
+                })
+            })
+            .collect())
+    }
+
+    /// A page of the photos taken in town `id`, as wire items.
+    pub(crate) fn place_photos(
+        &self,
+        id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> CoreResult<Vec<PhotoItem>> {
+        let photos = self
+            .db
+            .photos_at_place(id, offset, limit)
+            .map_err(CoreError::from)?;
+        Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
     }
 
     /// Photos taken on today's date in earlier years, as wire items. Served
@@ -1759,6 +1795,11 @@ impl Core {
                             .is_some_and(|p| p.tags.contains(&PhotoTag::Favorite));
                         let key = node.uid.to_string();
                         let content_hash = node.photo.as_ref().and_then(|p| p.content_hash.clone());
+                        let location = node
+                            .photo
+                            .as_ref()
+                            .and_then(|p| p.location)
+                            .map(|l| (l.latitude, l.longitude));
                         if let Some(photo) = node.photo.as_ref() {
                             if let Some(main) = photo.main_photo_uid.as_ref() {
                                 main_of.insert(key.clone(), main.to_string());
@@ -1774,6 +1815,7 @@ impl Core {
                                 media_type,
                                 favorite,
                                 content_hash,
+                                location,
                             },
                         );
                     }
@@ -1795,6 +1837,7 @@ impl Core {
                         media_type: m.media_type,
                         favorite: Some(m.favorite),
                         content_hash: m.content_hash,
+                        location: m.location,
                         main_uid,
                         resolved_at: Some(resolved_at),
                         ..db::TimelineRow::new(key, it.capture_time)

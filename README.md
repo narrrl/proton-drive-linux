@@ -75,6 +75,7 @@ pdfs-app            # the desktop app
 - **File Version History**: Every revision Proton Drive still holds for a file, from the browser's details pane (**Versions**) or `pdfs versions list|restore|save|rm`. Restoring is server-side — no re-upload — and an old version can be written out to a local file without touching the live one.
 - **Photo Favourites**: Star a photo in the lightbox, filter the gallery to favourites, or use `pdfs favorite <uid>` / `pdfs photos --favorites`.
 - **Photo Albums**: Browse your albums — including the ones shared with you — from the Albums view of the Photos page, or with `pdfs albums` / `pdfs album <uid>`. Album contents open in the same gallery as the timeline.
+- **Places**: The Places view of the Photos page groups photos by the town they were taken in, using the location stored with each photo. Towns are looked up offline in [GeoNames](https://www.geonames.org/) data (CC BY 4.0); install `iso-codes` for country names in your language.
 - **Human Verification (CAPTCHA) Recovery**: Detects sign-in gates (VPN/new IP challenges) and launches an embedded `WebKitWebView` dialog to safely complete the challenge, transparently retrying authentication with the earned token.
 - **Selective Sync (`.pdfsignore`)**: Keep build trees, dependency directories, and editor leftovers out of synced folders using gitignore-style rules.
 - **Data-Safe Offline Writes**: Durable scratch/staging files and a transactional pending queue preserve acknowledged writes across network failures and restarts.
