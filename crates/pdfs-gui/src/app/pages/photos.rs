@@ -87,21 +87,27 @@ pub(crate) struct GalleryState {
     /// carried them, so the subtitle can say how big the library *is* rather
     /// than how much of it has been paged in.
     pub(crate) counts: Cell<Option<(usize, usize, usize)>>,
-    /// The date-jump dropdown ("All dates" then a month per timeline entry), and
-    /// the `[from, to)` window each of its rows selects (index-aligned; `None` is
-    /// "All dates"). Selecting a row loads that month via [`load_gallery`].
-    pub(crate) dates: gtk4::DropDown,
+    /// The Filters button, the count badge on it, and the popover's "Clear
+    /// filters" button.
+    pub(crate) filter_btn: gtk4::MenuButton,
+    pub(crate) filter_count: gtk4::Label,
+    pub(crate) clear_filters: gtk4::Button,
+    /// The month row of the Filters popover ("All dates" then a month per
+    /// timeline entry), and the `[from, to)` window each of its rows selects
+    /// (index-aligned; `None` is "All dates"). Selecting a row loads that month
+    /// via [`load_gallery`].
+    pub(crate) dates: adw::ComboRow,
     pub(crate) date_ranges: RefCell<Vec<Option<(i64, i64)>>>,
     /// The capture-time window the timeline is currently filtered to, or `None`
     /// for the whole span. Read by [`load_gallery`], set by the date dropdown.
     pub(crate) range: Cell<Option<(i64, i64)>>,
-    /// The favorites toggle, and whether it is on. When on, the timeline is
+    /// The favorites switch, and whether it is on. When on, the timeline is
     /// restricted to photos carrying Proton's `Favorite` tag.
-    pub(crate) favorites_btn: gtk4::ToggleButton,
+    pub(crate) favorites_row: adw::SwitchRow,
     pub(crate) favorites: Cell<bool>,
-    /// The album filter toggle, and whether it is on. When on, the timeline is
+    /// The album filter switch, and whether it is on. When on, the timeline is
     /// restricted to photos no album of ours holds yet.
-    pub(crate) not_in_album_btn: gtk4::ToggleButton,
+    pub(crate) not_in_album_row: adw::SwitchRow,
     pub(crate) not_in_album: Cell<bool>,
     /// The "On this day" strip above the timeline, the box holding its cards,
     /// and whether there is anything to show in it.
@@ -111,6 +117,8 @@ pub(crate) struct GalleryState {
     /// Set while the date dropdown is being repopulated, so resetting its model
     /// doesn't fire the selection handler and kick off a spurious reload.
     pub(crate) date_suppress: Cell<bool>,
+    /// A fresh load was asked for while a page was still loading.
+    pub(crate) reload_pending: Cell<bool>,
     /// True while a timeline page is in flight, so the scroll-to-the-end paging
     /// can't fire a second request for the page already coming.
     pub(crate) loading: Cell<bool>,
@@ -383,13 +391,16 @@ pub(crate) struct GalleryWidgets {
     /// The All / Photos / Videos / Raw filter toggles, in that order (index maps
     /// to [`kind_for_tab`]).
     pub(crate) tabs: [gtk4::ToggleButton; 4],
-    pub(crate) favorites_btn: gtk4::ToggleButton,
-    pub(crate) not_in_album_btn: gtk4::ToggleButton,
+    pub(crate) favorites_row: adw::SwitchRow,
+    pub(crate) not_in_album_row: adw::SwitchRow,
     /// The "On this day" strip and the box its cards go into.
     pub(crate) memories: gtk4::Revealer,
     pub(crate) memory_cards: gtk4::Box,
-    /// The date-jump dropdown, populated with the timeline's months.
-    pub(crate) dates: gtk4::DropDown,
+    /// The month row of the Filters popover, populated with the timeline's months.
+    pub(crate) dates: adw::ComboRow,
+    pub(crate) filter_btn: gtk4::MenuButton,
+    pub(crate) filter_count: gtk4::Label,
+    pub(crate) clear_filters: gtk4::Button,
 }
 
 /// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over
@@ -598,40 +609,62 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         tab_group.append(btn);
     }
 
-    // Favorites: a filter, not a tab — it cuts across Photos / Videos / Raw, so
-    // it stays outside the segmented control rather than becoming a fifth option
-    // that would silently drop the kind the user picked.
-    let favorites_btn = gtk4::ToggleButton::builder()
-        .icon_name("starred-symbolic")
-        .tooltip_text(gettext("Show only favorites"))
+    // Favorites, "not in an album" and the month: the filters that cut across
+    // the kind tabs, together in one popover so the row stays short. The tabs
+    // stay out in the open because their counts are worth a glance.
+    let favorites_row = adw::SwitchRow::builder()
+        .title(gettext("Only favorites"))
         .build();
-    favorites_btn.add_css_class("pill");
-
-    // Not in an album: a filter like favorites, for filing what is left.
-    let not_in_album_btn = gtk4::ToggleButton::builder()
-        .icon_name("view-grid-symbolic")
-        .tooltip_text(gettext("Show only photos not in an album"))
+    let not_in_album_row = adw::SwitchRow::builder()
+        .title(gettext("Only photos not in an album"))
         .build();
-    not_in_album_btn.add_css_class("pill");
+    // "All dates" plus a row per month, filled in once the timeline's months are
+    // known (see [`refresh_photo_months`]).
+    let dates = adw::ComboRow::builder()
+        .title(gettext("Month"))
+        .model(&gtk4::StringList::new(&[gettext("All dates").as_str()]))
+        .build();
+    let filter_list = gtk4::ListBox::new();
+    filter_list.set_selection_mode(gtk4::SelectionMode::None);
+    filter_list.add_css_class("boxed-list");
+    filter_list.append(&favorites_row);
+    filter_list.append(&not_in_album_row);
+    filter_list.append(&dates);
+    let clear_filters = gtk4::Button::builder()
+        .label(gettext("Clear filters"))
+        .halign(gtk4::Align::End)
+        .sensitive(false)
+        .build();
+    clear_filters.add_css_class("flat");
+    let filter_panel = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    filter_panel.set_width_request(340);
+    filter_panel.append(&filter_list);
+    filter_panel.append(&clear_filters);
+    let filter_popover = gtk4::Popover::builder().child(&filter_panel).build();
 
-    // Date jump: "All dates" plus a row per month, filled in once the timeline's
-    // months are known (see [`refresh_photo_months`]). Pushed to the far end of
-    // the filter row, opposite the kind toggles.
-    let dates = gtk4::DropDown::from_strings(&[gettext("All dates").as_str()]);
-    dates.add_css_class("pill");
-    dates.set_tooltip_text(Some(&gettext("Jump to a month")));
+    // The Filters button, with a badge counting the active filters, kind
+    // included, so a filtered timeline is never mistaken for the whole one.
+    let filter_count = gtk4::Label::builder().visible(false).build();
+    filter_count.add_css_class("filter-count");
+    let filter_face = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    filter_face.append(&gtk4::Image::from_icon_name("pdfs-filter-symbolic"));
+    filter_face.append(&gtk4::Label::new(Some(&gettext("Filters"))));
+    filter_face.append(&filter_count);
+    let filter_btn = gtk4::MenuButton::builder()
+        .child(&filter_face)
+        .popover(&filter_popover)
+        .build();
+    filter_btn.add_css_class("pill");
 
-    // The kind toggles and the date jump travel together: they filter the
+    // The kind toggles and the Filters button travel together: they filter the
     // timeline, and neither applies to the album grid or to an open album.
     let filters = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filters.set_hexpand(true);
     filters.append(&tab_group);
-    filters.append(&favorites_btn);
-    filters.append(&not_in_album_btn);
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     filters.append(&spacer);
-    filters.append(&dates);
+    filters.append(&filter_btn);
 
     // The page's two views, as one segmented control under the title: the
     // timeline, and the albums. This is navigation, not a filter — which is why
@@ -789,11 +822,14 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             select_album,
             select_done,
             tabs,
-            favorites_btn,
-            not_in_album_btn,
+            favorites_row,
+            not_in_album_row,
             memories,
             memory_cards,
             dates,
+            filter_btn,
+            filter_count,
+            clear_filters,
             albums,
             albums_stack,
             albums_status,
@@ -835,6 +871,34 @@ pub(crate) fn month_label(year: i32, month: i32) -> String {
         .and_then(|date| date.format(&format))
         .map(|label| label.to_string())
         .unwrap_or_else(|_| format!("{year}-{month:02}"))
+}
+
+/// How many timeline filters are on: the kind, favorites, "not in an album"
+/// and the month each count once.
+pub(crate) fn active_filters(
+    kind: Option<PhotoKind>,
+    favorites: bool,
+    not_in_album: bool,
+    range: Option<(i64, i64)>,
+) -> usize {
+    [kind.is_some(), favorites, not_in_album, range.is_some()]
+        .into_iter()
+        .filter(|on| *on)
+        .count()
+}
+
+/// Show the active filter count on the Filters button, and offer "Clear
+/// filters" only when there is something to clear.
+fn sync_filter_badge(ui: &Rc<Ui>) {
+    let n = active_filters(
+        ui.gallery.kind.get(),
+        ui.gallery.favorites.get(),
+        ui.gallery.not_in_album.get(),
+        ui.gallery.range.get(),
+    );
+    ui.gallery.filter_count.set_label(&n.to_string());
+    ui.gallery.filter_count.set_visible(n > 0);
+    ui.gallery.clear_filters.set_sensitive(n > 0);
 }
 
 /// Rebuild the date-jump dropdown for the active kind: ask the daemon which
@@ -1155,8 +1219,8 @@ pub(crate) fn wire_gallery(
     // Independent of the kind tabs and the date jump, both of which keep their
     // current value across the toggle.
     let ui_fav = ui.clone();
-    ui.gallery.favorites_btn.connect_toggled(move |btn| {
-        let on = btn.is_active();
+    ui.gallery.favorites_row.connect_active_notify(move |row| {
+        let on = row.is_active();
         if ui_fav.gallery.favorites.get() == on {
             return;
         }
@@ -1166,13 +1230,34 @@ pub(crate) fn wire_gallery(
 
     // Not in an album: the same kind of filter, and just as independent.
     let ui_unfiled = ui.clone();
-    ui.gallery.not_in_album_btn.connect_toggled(move |btn| {
-        let on = btn.is_active();
-        if ui_unfiled.gallery.not_in_album.get() == on {
-            return;
-        }
-        ui_unfiled.gallery.not_in_album.set(on);
-        load_gallery(&ui_unfiled, false);
+    ui.gallery
+        .not_in_album_row
+        .connect_active_notify(move |row| {
+            let on = row.is_active();
+            if ui_unfiled.gallery.not_in_album.get() == on {
+                return;
+            }
+            ui_unfiled.gallery.not_in_album.set(on);
+            load_gallery(&ui_unfiled, false);
+        });
+
+    // Clear filters: back to the whole timeline in one reload. The state goes
+    // first, so each widget's handler finds nothing to change and stays quiet.
+    let ui_clear = ui.clone();
+    ui.gallery.clear_filters.connect_clicked(move |_| {
+        let gallery = &ui_clear.gallery;
+        gallery.kind.set(None);
+        gallery.favorites.set(false);
+        gallery.not_in_album.set(false);
+        gallery.range.set(None);
+        gallery.tabs[0].set_active(true);
+        gallery.favorites_row.set_active(false);
+        gallery.not_in_album_row.set_active(false);
+        gallery.date_suppress.set(true);
+        gallery.dates.set_selected(0);
+        gallery.date_suppress.set(false);
+        gallery.filter_btn.popdown();
+        load_gallery(&ui_clear, false);
     });
 
     // Date jump: selecting a month loads that window; "All dates" (row 0) clears
@@ -3070,7 +3155,13 @@ fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
 }
 
 pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
+    sync_filter_badge(ui);
     if ui.gallery.loading.get() {
+        // A filter flipped while a page is on its way: that page answers the
+        // old question, so fetch again once it lands. More pages can wait.
+        if !append {
+            ui.gallery.reload_pending.set(true);
+        }
         return;
     }
     // An open album pages itself instead of the timeline; everything downstream —
@@ -3129,6 +3220,10 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         ui.gallery.loading.set(false);
         ui.gallery.pager.set_visible(false);
         ui.gallery.pager.set_spinning(false);
+        if ui.gallery.reload_pending.take() {
+            load_gallery(&ui, false);
+            return;
+        }
         // Whoever waited on this page runs once the reply below has put it in
         // the model, whichever way that goes.
         let waiters = std::mem::take(&mut *ui.gallery.page_waiters.borrow_mut());
@@ -3301,8 +3396,9 @@ pub(crate) fn play_external(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, empty_timeline_text,
-        grouping_for, memory_years, month_index, month_range, plan_grid, section_heading,
+        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, active_filters,
+        empty_timeline_text, grouping_for, memory_years, month_index, month_range, plan_grid,
+        section_heading,
     };
     use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
 
@@ -3373,6 +3469,16 @@ mod tests {
         assert_ne!(
             section_heading(noon, Grouping::Day),
             section_heading(from, Grouping::Day)
+        );
+    }
+
+    #[test]
+    fn the_filter_badge_counts_each_active_filter_once() {
+        assert_eq!(active_filters(None, false, false, None), 0);
+        assert_eq!(active_filters(Some(PhotoKind::Raw), false, false, None), 1);
+        assert_eq!(
+            active_filters(Some(PhotoKind::Video), true, true, Some((0, 1))),
+            4
         );
     }
 

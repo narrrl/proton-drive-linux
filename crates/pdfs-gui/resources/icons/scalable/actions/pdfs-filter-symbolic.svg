@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- "Filters": a funnel, wide at the top and narrowing to a short spout.
+       No stock icon theme ships one under a standard name. -->
+  <path fill="#222222" d="M 1.5,2 H 14.5 L 9.5,8.5 V 13.5 L 6.5,15 V 8.5 Z"/>
+</svg>
