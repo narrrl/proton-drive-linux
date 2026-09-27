@@ -55,8 +55,8 @@ use pdfs_core::config::{AppDirs, FileSort, FilesView};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
-    DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, PendingOpInfo, PhotoItem,
-    PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope, Request, Response,
+    DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, MappingProgress, PendingOpInfo,
+    PhotoItem, PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope, Request, Response,
     RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
     SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem,
     send,
@@ -558,6 +558,10 @@ fn build_window(app: &adw::Application) {
             places_status: gallery_widgets.places_status.clone(),
             places_btn: gallery_widgets.places_btn.clone(),
             places_loading: Cell::new(false),
+            places_mapping: gallery_widgets.places_mapping.clone(),
+            places_mapping_label: gallery_widgets.places_mapping_label.clone(),
+            places_mapping_bar: gallery_widgets.places_mapping_bar.clone(),
+            places_poll: RefCell::new(None),
             place_count: Cell::new(0),
             place: RefCell::new(None),
             album: RefCell::new(None),

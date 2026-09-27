@@ -69,6 +69,13 @@ pub(crate) struct GalleryState {
     pub(crate) places_btn: gtk4::ToggleButton,
     /// True while the place listing is in flight.
     pub(crate) places_loading: Cell<bool>,
+    /// The row above the place grid saying how far the daemon has got reading
+    /// photo locations, its label and bar, and the timer that asks again while
+    /// it is reading.
+    pub(crate) places_mapping: gtk4::Box,
+    pub(crate) places_mapping_label: gtk4::Label,
+    pub(crate) places_mapping_bar: gtk4::ProgressBar,
+    pub(crate) places_poll: RefCell<Option<glib::SourceId>>,
     /// How many places the grid shows, for the subtitle when back returns there.
     pub(crate) place_count: Cell<usize>,
     /// The place currently open, paged by [`load_gallery`] like an album.
@@ -416,6 +423,9 @@ pub(crate) struct GalleryWidgets {
     pub(crate) places_stack: gtk4::Stack,
     pub(crate) places_status: adw::StatusPage,
     pub(crate) places_btn: gtk4::ToggleButton,
+    pub(crate) places_mapping: gtk4::Box,
+    pub(crate) places_mapping_label: gtk4::Label,
+    pub(crate) places_mapping_bar: gtk4::ProgressBar,
     pub(crate) back: gtk4::Button,
     /// The kind toggles and date jump, as one box so an album view can hide them.
     pub(crate) filters: gtk4::Box,
@@ -817,6 +827,21 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     places_stack.set_vexpand(true);
     places_stack.add_named(&places_scroll, Some("grid"));
     places_stack.add_named(&places_status, Some("status"));
+    // While a refresh reads the library's locations (the first one after an
+    // update reads all of them), a bar says how far it has got.
+    let places_mapping_label = gtk4::Label::new(None);
+    places_mapping_label.add_css_class("dim-label");
+    let places_mapping_bar = gtk4::ProgressBar::builder()
+        .hexpand(true)
+        .valign(gtk4::Align::Center)
+        .build();
+    let places_mapping = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    places_mapping.append(&places_mapping_label);
+    places_mapping.append(&places_mapping_bar);
+    places_mapping.set_visible(false);
+    let places_page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    places_page.append(&places_mapping);
+    places_page.append(&places_stack);
 
     let content = gtk4::Stack::new();
     content.set_vexpand(true);
@@ -824,7 +849,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     content.add_named(&timeline, Some("timeline"));
     content.add_named(&status, Some("status"));
     content.add_named(&albums_page, Some("albums"));
-    content.add_named(&places_stack, Some("places"));
+    content.add_named(&places_page, Some("places"));
 
     let import_banner = adw::Banner::builder()
         .title(gettext("Importing from Google Photos…"))
@@ -898,6 +923,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             places_stack,
             places_status,
             places_btn,
+            places_mapping,
+            places_mapping_label,
+            places_mapping_bar,
             back,
             filters,
         },

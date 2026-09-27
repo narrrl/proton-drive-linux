@@ -10,6 +10,9 @@ use crate::*;
 /// Edge length in px of a place's cover, the same as an album's.
 const COVER_EDGE: i32 = 200;
 
+/// How often the listing is asked for again while photo locations are read.
+const MAPPING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Show the Places grid and (re)load it. Called when the Places toggle goes on.
 pub(crate) fn show_places(ui: &Rc<Ui>) {
     show_place_grid(ui);
@@ -49,8 +52,22 @@ pub(crate) fn load_places(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.gallery.places_loading.set(false);
+        let mapping = match &result {
+            Ok(Ok(Response::Places { mapping, .. })) => *mapping,
+            _ => None,
+        };
+        sync_mapping(&ui, mapping);
         match result {
-            Ok(Ok(Response::Places { items })) if items.is_empty() => {
+            Ok(Ok(Response::Places { items, .. })) if items.is_empty() && mapping.is_some() => {
+                ui.gallery.place_count.set(0);
+                places_status(
+                    &ui,
+                    "mark-location-symbolic",
+                    &gettext("Mapping your photos…"),
+                    &gettext("Places show up here once the locations of your photos are read."),
+                )
+            }
+            Ok(Ok(Response::Places { items, .. })) if items.is_empty() => {
                 ui.gallery.place_count.set(0);
                 if ui.gallery.place.borrow().is_none() {
                     ui.gallery.title.set_subtitle("");
@@ -64,7 +81,7 @@ pub(crate) fn load_places(ui: &Rc<Ui>) {
                     ),
                 )
             }
-            Ok(Ok(Response::Places { items })) => {
+            Ok(Ok(Response::Places { items, .. })) => {
                 fill_places(&ui, &items);
                 ui.gallery.places_stack.set_visible_child_name("grid");
             }
@@ -85,6 +102,37 @@ pub(crate) fn load_places(ui: &Rc<Ui>) {
             ),
         }
     });
+}
+
+/// Show how far the daemon has got reading photo locations, and ask again in a
+/// moment while it is still reading — the new places land once it is done.
+fn sync_mapping(ui: &Rc<Ui>, mapping: Option<MappingProgress>) {
+    if let Some(source) = ui.gallery.places_poll.take() {
+        source.remove();
+    }
+    ui.gallery.places_mapping.set_visible(mapping.is_some());
+    let Some(MappingProgress { done, total }) = mapping else {
+        return;
+    };
+    ui.gallery.places_mapping_label.set_label(&gettext_f(
+        // Translators: {done} and {total} are numbers of photos.
+        "Mapping photos: {done} of {total}",
+        &[("done", &thousands(done)), ("total", &thousands(total))],
+    ));
+    ui.gallery.places_mapping_bar.set_fraction(if total == 0 {
+        0.0
+    } else {
+        done as f64 / total as f64
+    });
+    let ui_poll = ui.clone();
+    let source = glib::timeout_add_local_once(MAPPING_POLL, move || {
+        ui_poll.gallery.places_poll.take();
+        let on_places = ui_poll.gallery.content.visible_child_name().as_deref() == Some("places");
+        if on_places && ui_poll.gallery.place.borrow().is_none() {
+            load_places(&ui_poll);
+        }
+    });
+    ui.gallery.places_poll.replace(Some(source));
 }
 
 /// Replace the grid's cards with `places`, the one with the most photos first.

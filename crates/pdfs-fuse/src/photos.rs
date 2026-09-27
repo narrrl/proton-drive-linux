@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use pdfs_core::control::{
-    FileThumbRequest, PhotoItem, PhotoKind, PhotoThumb, PlaceInfo, ThumbnailBuildStatus,
-    is_raw_image_name, is_thumbnail_image_name,
+    FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoThumb, PlaceInfo,
+    ThumbnailBuildStatus, is_raw_image_name, is_thumbnail_image_name,
 };
 use pdfs_core::db::{self, StoredPhoto};
 use pdfs_core::{CoreError, CoreResult};
@@ -601,6 +601,16 @@ fn extract_raw_preview(
 pub(crate) type TrashOutcome = (Vec<String>, Vec<(String, String)>);
 
 /// Formats supported by the local thumbnail decoder and exposed by the GUI.
+/// Clears the timeline refresh's progress when dropped, so an error or a
+/// cancelled refresh doesn't leave a bar standing.
+struct ProgressGuard<'a>(&'a parking_lot::Mutex<Option<(usize, usize)>>);
+
+impl Drop for ProgressGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock() = None;
+    }
+}
+
 /// What a timeline enrichment pass resolves for one photo, beyond what the
 /// timeline listing already carries.
 #[derive(Clone, Debug)]
@@ -1768,7 +1778,14 @@ impl Core {
         // can land in different chunks, and one of them may not resolve at all.
         let mut main_of: HashMap<String, String> = HashMap::new();
         let mut stopped = false;
-        for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
+        // Photos read before count as done, so the bar picks up where an
+        // interrupted pass left off. Cleared however the pass ends.
+        let skipped = items.len() - uids.len();
+        let progress = ProgressGuard(&self.timeline_progress);
+        if !uids.is_empty() {
+            *progress.0.lock() = Some((skipped, items.len()));
+        }
+        for (index, chunk) in uids.chunks(TIMELINE_ENRICH_CHUNK).enumerate() {
             // Teardown cancels the runtime under this loop, and every chunk
             // still in flight then fails its decrypt task — a burst of
             // "skipping undecryptable photo ... task was cancelled" warnings
@@ -1822,7 +1839,10 @@ impl Core {
                 }
                 Err(e) => warn!(error = %e, "resolving photo metadata for a timeline chunk failed"),
             }
+            let done = (skipped + (index + 1) * TIMELINE_ENRICH_CHUNK).min(items.len());
+            *progress.0.lock() = Some((done, items.len()));
         }
+        drop(progress);
 
         let rows: Vec<db::TimelineRow> = items
             .iter()
@@ -1882,6 +1902,14 @@ impl Core {
             }
             core.timeline_refreshing.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// How far the running timeline refresh has got reading photo metadata, or
+    /// `None` when no refresh is reading any.
+    pub(crate) fn timeline_progress(&self) -> Option<MappingProgress> {
+        self.timeline_progress
+            .lock()
+            .map(|(done, total)| MappingProgress { done, total })
     }
 
     /// Whether a timeline refresh is running. A front-end that asked for one

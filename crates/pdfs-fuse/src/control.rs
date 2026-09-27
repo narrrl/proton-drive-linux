@@ -466,7 +466,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::PhotoPlaces) => match core.photo_places() {
-            Ok(items) => CtlResponse::Places { items },
+            Ok(items) => CtlResponse::Places {
+                items,
+                mapping: core.timeline_progress(),
+            },
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::PlacePhotos { id, offset, limit }) => {

@@ -1462,6 +1462,14 @@ pub struct PlaceInfo {
     pub cover: PhotoItem,
 }
 
+/// How many of the timeline's photos a running refresh has read the metadata
+/// (and so the location) of, out of how many. Part of [`Response::Places`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappingProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
 /// One photo in a [`Request::PhotosTimeline`] page.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoItem {
@@ -1823,8 +1831,14 @@ pub enum Response {
     /// The duplicate sets (reply to [`Request::PhotoDuplicates`]), newest
     /// first. Each set lists the copy worth keeping first.
     PhotoDuplicates { sets: Vec<Vec<PhotoItem>> },
-    /// The towns the photos were taken in (reply to [`Request::PhotoPlaces`]).
-    Places { items: Vec<PlaceInfo> },
+    /// The towns the photos were taken in (reply to [`Request::PhotoPlaces`]),
+    /// and how far a running timeline refresh has got reading photo locations
+    /// — `None` when none is reading any.
+    Places {
+        items: Vec<PlaceInfo>,
+        #[serde(default)]
+        mapping: Option<MappingProgress>,
+    },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
     /// Per-node outcome of a [`Request::TrashNodes`] batch. Reported per uid
@@ -2537,12 +2551,33 @@ mod tests {
 
         let line = r#"{"Places":{"items":[{"id":2950159,"name":"Berlin","country":"DE","photo_count":2,
             "cover":{"uid":"vol~b2","capture_time":1700000000,"thumb_path":null,"name":"b2.jpg","ratio":null,"no_thumb":false}}]}}"#;
-        let Response::Places { items } = serde_json::from_str(line).unwrap() else {
+        let Response::Places { items, mapping } = serde_json::from_str(line).unwrap() else {
             panic!("not a place listing");
         };
         assert_eq!(items.len(), 1);
         assert_eq!((items[0].id, items[0].country.as_str()), (2950159, "DE"));
         assert_eq!(items[0].cover.uid, "vol~b2");
+        // A daemon from before the progress field still parses: no mapping.
+        assert_eq!(mapping, None);
+
+        let reply = Response::Places {
+            items: Vec::new(),
+            mapping: Some(MappingProgress {
+                done: 120,
+                total: 480,
+            }),
+        };
+        let line = serde_json::to_string(&reply).unwrap();
+        let Response::Places { mapping, .. } = serde_json::from_str(&line).unwrap() else {
+            panic!("not a place listing");
+        };
+        assert_eq!(
+            mapping,
+            Some(MappingProgress {
+                done: 120,
+                total: 480
+            })
+        );
     }
 
     /// The sharing and devices requests must survive the same line-delimited JSON

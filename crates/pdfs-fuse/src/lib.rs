@@ -550,6 +550,10 @@ struct Core {
     /// already running, so a burst of page requests against a stale listing kicks
     /// off one refresh rather than one per request.
     timeline_refreshing: Arc<AtomicBool>,
+    /// How far the running timeline refresh has got resolving photo metadata,
+    /// as `(done, total)` photos; `None` when no refresh is resolving any. The
+    /// Places view shows it while a library's locations are first read.
+    timeline_progress: Arc<Mutex<Option<(usize, usize)>>>,
     /// The same, for the album listing.
     albums_refreshing: Arc<AtomicBool>,
     trash_refreshing: Arc<AtomicBool>,
