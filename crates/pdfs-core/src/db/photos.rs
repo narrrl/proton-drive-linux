@@ -588,6 +588,27 @@ impl Db {
         Ok(rows)
     }
 
+    /// Photos taken on `today`'s calendar day in earlier years, newest first —
+    /// the "On this day" strip. `today` is epoch seconds: its local month and day
+    /// pick the date, and its own year is left out, because today's photos are
+    /// what the timeline already opens on. One row per group, like the timeline.
+    pub fn photos_on_this_day(&self, today: i64, limit: usize) -> Result<Vec<StoredPhoto>> {
+        let conn = self.read();
+        let sql = format!(
+            "{PHOTO_SELECT} WHERE p.uid = COALESCE(p.group_key, p.uid) \
+             AND strftime('%m-%d', p.capture_time, 'unixepoch', 'localtime') \
+                 = strftime('%m-%d', ?1, 'unixepoch', 'localtime') \
+             AND strftime('%Y', p.capture_time, 'unixepoch', 'localtime') \
+                 < strftime('%Y', ?1, 'unixepoch', 'localtime') \
+             ORDER BY p.seq LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![today, limit as i64], stored_photo)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.
     pub fn photos_counts(&self) -> Result<(usize, usize, usize)> {
         use crate::control::PhotoKind;

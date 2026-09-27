@@ -565,6 +565,9 @@ fn build_window(app: &adw::Application) {
             favorites: Cell::new(false),
             not_in_album_btn: gallery_widgets.not_in_album_btn.clone(),
             not_in_album: Cell::new(false),
+            memories: gallery_widgets.memories.clone(),
+            memory_cards: gallery_widgets.memory_cards.clone(),
+            has_memories: Cell::new(false),
             date_suppress: Cell::new(false),
             loading: Cell::new(false),
             has_more: Cell::new(false),
@@ -1723,7 +1726,6 @@ mod tests {
         assert_eq!(parse_launch(&args(&["--page"])), Launch::Window);
     }
 
-    /// The full width a row occupies, gaps included.
     /// One file of a shot, for the group-switch tests.
     fn member(uid: &str, name: Option<&str>, kind: PhotoKind) -> PhotoItem {
         PhotoItem {

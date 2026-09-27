@@ -103,6 +103,11 @@ pub(crate) struct GalleryState {
     /// restricted to photos no album of ours holds yet.
     pub(crate) not_in_album_btn: gtk4::ToggleButton,
     pub(crate) not_in_album: Cell<bool>,
+    /// The "On this day" strip above the timeline, the box holding its cards,
+    /// and whether there is anything to show in it.
+    pub(crate) memories: gtk4::Revealer,
+    pub(crate) memory_cards: gtk4::Box,
+    pub(crate) has_memories: Cell<bool>,
     /// Set while the date dropdown is being repopulated, so resetting its model
     /// doesn't fire the selection handler and kick off a spurious reload.
     pub(crate) date_suppress: Cell<bool>,
@@ -379,6 +384,9 @@ pub(crate) struct GalleryWidgets {
     pub(crate) tabs: [gtk4::ToggleButton; 4],
     pub(crate) favorites_btn: gtk4::ToggleButton,
     pub(crate) not_in_album_btn: gtk4::ToggleButton,
+    /// The "On this day" strip and the box its cards go into.
+    pub(crate) memories: gtk4::Revealer,
+    pub(crate) memory_cards: gtk4::Box,
     /// The date-jump dropdown, populated with the timeline's months.
     pub(crate) dates: gtk4::DropDown,
 }
@@ -639,9 +647,33 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let filter_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filter_bar.append(&filters);
 
+    // "On this day": a card per earlier year that has photos from today's
+    // date. Revealed only at the top of the unfiltered timeline (see
+    // [`sync_memories`]), so it gives the grid its room back once you scroll.
+    let memories_title = gtk4::Label::builder()
+        .label(gettext("On this day"))
+        .xalign(0.0)
+        .build();
+    memories_title.add_css_class("heading");
+    let memory_cards = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let memory_scroll = gtk4::ScrolledWindow::builder()
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .hscrollbar_policy(gtk4::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .child(&memory_cards)
+        .build();
+    let memories_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    memories_box.append(&memories_title);
+    memories_box.append(&memory_scroll);
+    let memories = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideDown)
+        .child(&memories_box)
+        .build();
+
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&select_bar);
+    timeline.append(&memories);
     // The scrubber sits beside the list rather than over it, so the grid is
     // laid out to the width it really has and no tile hides under a year mark.
     let timeline_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -747,6 +779,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             tabs,
             favorites_btn,
             not_in_album_btn,
+            memories,
+            memory_cards,
             dates,
             albums,
             albums_stack,
@@ -1009,6 +1043,7 @@ pub(crate) fn wire_gallery(
             load_gallery(&ui_scroll, true);
         }
         sync_scrubber_position(&ui_scroll);
+        sync_memories(&ui_scroll);
     });
     wire_scrubber(ui);
     wire_drag_select(ui);
@@ -2619,6 +2654,147 @@ pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
         .set_visible(whole && ui.gallery.months.borrow().len() > 1);
 }
 
+/// How many photos the "On this day" strip asks for. Enough for a card per year
+/// of a big library; the cards only need one cover each.
+const MEMORIES_LIMIT: usize = 200;
+
+/// Size of an "On this day" card's cover, in px.
+const MEMORY_CARD_WIDTH: i32 = 180;
+const MEMORY_CARD_HEIGHT: i32 = 120;
+
+/// Ask the daemon for photos taken on today's date in earlier years, and fill
+/// the "On this day" strip with a card per year. A failure leaves the strip
+/// hidden: it is a nicety, not worth a toast.
+fn refresh_memories(ui: &Rc<Ui>) {
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::PhotosOnThisDay {
+            limit: MEMORIES_LIMIT,
+        },
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let items = match rx.recv().await {
+            Ok(Ok(Response::Photos { items, .. })) => items,
+            _ => Vec::new(),
+        };
+        let this_year = glib::DateTime::now_local().map_or(0, |now| now.year());
+        let cards = &ui.gallery.memory_cards;
+        while let Some(child) = cards.first_child() {
+            cards.remove(&child);
+        }
+        let years = memory_years(&items, this_year);
+        ui.gallery.has_memories.set(!years.is_empty());
+        for (years_ago, photos) in years {
+            cards.append(&memory_card(&ui, years_ago, photos));
+        }
+        schedule_thumbs(&ui);
+        sync_memories(&ui);
+    });
+}
+
+/// Group "On this day" photos (newest first) by how many years ago they were
+/// taken, nearest year first. Each group keeps the newest-first order, so its
+/// first photo is the card's cover.
+pub(crate) fn memory_years(items: &[PhotoItem], this_year: i32) -> Vec<(u32, Vec<PhotoItem>)> {
+    let mut years: Vec<(u32, Vec<PhotoItem>)> = Vec::new();
+    for item in items {
+        let Ok(date) = glib::DateTime::from_unix_local(item.capture_time) else {
+            continue;
+        };
+        let Ok(years_ago) = u32::try_from(this_year - date.year()) else {
+            continue;
+        };
+        if years_ago == 0 {
+            continue;
+        }
+        match years.iter_mut().find(|(y, _)| *y == years_ago) {
+            Some((_, photos)) => photos.push(item.clone()),
+            None => years.push((years_ago, vec![item.clone()])),
+        }
+    }
+    years.sort_by_key(|(years_ago, _)| *years_ago);
+    years
+}
+
+/// One "On this day" card: the year's newest photo as the cover, labelled with
+/// how long ago it was. Clicking it scrolls the timeline to that day.
+fn memory_card(ui: &Rc<Ui>, years_ago: u32, photos: Vec<PhotoItem>) -> gtk4::Button {
+    let cover = photos[0].clone();
+    let picture = gtk4::Picture::builder()
+        .content_fit(gtk4::ContentFit::Cover)
+        .can_shrink(true)
+        .build();
+    let placeholder = gtk4::Image::builder()
+        .icon_name("image-x-generic-symbolic")
+        .pixel_size(24)
+        .build();
+    placeholder.add_css_class("photo-placeholder");
+    let label = gtk4::Label::builder()
+        .label(ngettext_f(
+            "{n} year ago",
+            "{n} years ago",
+            u64::from(years_ago),
+            &[],
+        ))
+        .halign(gtk4::Align::Fill)
+        .valign(gtk4::Align::End)
+        .xalign(0.0)
+        .build();
+    label.add_css_class("memory-label");
+
+    // Sized here rather than on the picture: an overlay takes its size from
+    // its main child, which is the placeholder glyph.
+    let overlay = gtk4::Overlay::new();
+    overlay.set_size_request(MEMORY_CARD_WIDTH, MEMORY_CARD_HEIGHT);
+    overlay.set_child(Some(&placeholder));
+    overlay.add_overlay(&picture);
+    overlay.add_overlay(&label);
+    overlay.set_overflow(gtk4::Overflow::Hidden);
+    overlay.add_css_class("memory-cover");
+
+    let day = section_heading(cover.capture_time, Grouping::Day);
+    let card = gtk4::Button::builder()
+        .child(&overlay)
+        .tooltip_text(ngettext_f(
+            "{date}, {n} photo",
+            "{date}, {n} photos",
+            photos.len() as u64,
+            &[("date", &day)],
+        ))
+        .build();
+    card.add_css_class("flat");
+    card.add_css_class("memory-card");
+
+    want_thumb(ui, &cover, &picture);
+    let ui_click = ui.clone();
+    card.connect_clicked(move |_| {
+        // The timeline is newest first, so the day's newest photo is the first
+        // one older than a second past it.
+        ui_click.gallery.jump.set(Some(cover.capture_time + 1));
+        continue_jump(&ui_click);
+    });
+    card
+}
+
+/// Show the "On this day" strip only where it belongs: at the top of the whole,
+/// unfiltered timeline, and only when it has cards.
+fn sync_memories(ui: &Rc<Ui>) {
+    let at_top = ui
+        .gallery
+        .list
+        .vadjustment()
+        .is_none_or(|adj| adj.value() < 1.0);
+    let whole = ui.gallery.album.borrow().is_none()
+        && ui.gallery.kind.get().is_none()
+        && ui.gallery.range.get().is_none()
+        && !ui.gallery.favorites.get()
+        && !ui.gallery.not_in_album.get();
+    ui.gallery
+        .memories
+        .set_reveal_child(whole && at_top && ui.gallery.has_memories.get());
+}
+
 /// "March 2024" for the scrubber's month `index`.
 fn scrubber_label(months: &[PhotoMonth], index: usize) -> String {
     months
@@ -2900,6 +3076,10 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
             refresh_photo_months(ui);
         }
         sync_scrubber(ui);
+        if album.is_none() {
+            refresh_memories(ui);
+        }
+        sync_memories(ui);
     }
     let offset = ui.gallery.model.n_items() as usize;
     let limit = if ui.gallery.burst.replace(false) {
@@ -3104,9 +3284,9 @@ pub(crate) fn play_external(path: &str) {
 mod tests {
     use super::{
         Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, empty_timeline_text,
-        grouping_for, month_index, month_range, plan_grid, section_heading,
+        grouping_for, memory_years, month_index, month_range, plan_grid, section_heading,
     };
-    use pdfs_core::control::{PhotoKind, PhotoMonth};
+    use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
 
     #[test]
     fn the_scrubber_finds_the_month_a_photo_was_taken_in() {
@@ -3176,6 +3356,42 @@ mod tests {
             section_heading(noon, Grouping::Day),
             section_heading(from, Grouping::Day)
         );
+    }
+
+    /// The strip shows the nearest year first, with each year's newest photo
+    /// as its cover, and never this year's own photos.
+    #[test]
+    fn on_this_day_cards_go_nearest_year_first() {
+        let photo = |uid: &str, year: i32, hour: i32| {
+            let Some((from, _)) = month_range(year, 6) else {
+                panic!("June {year} is a month");
+            };
+            PhotoItem {
+                uid: uid.into(),
+                capture_time: from + 14 * 86_400 + i64::from(hour) * 3_600,
+                thumb_path: None,
+                name: None,
+                ratio: None,
+                no_thumb: false,
+                kind: PhotoKind::Photo,
+                favorite: false,
+                group_size: 1,
+                has_raw: false,
+            }
+        };
+        // Newest first, the way the daemon sends them.
+        let items = [
+            photo("today", 2026, 9),
+            photo("late", 2025, 18),
+            photo("early", 2025, 8),
+            photo("old", 2021, 12),
+        ];
+        let years = memory_years(&items, 2026);
+        let summary: Vec<(u32, Vec<&str>)> = years
+            .iter()
+            .map(|(ago, photos)| (*ago, photos.iter().map(|p| p.uid.as_str()).collect()))
+            .collect();
+        assert_eq!(summary, [(1, vec!["late", "early"]), (5, vec!["old"])]);
     }
 
     #[test]

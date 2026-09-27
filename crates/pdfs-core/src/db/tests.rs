@@ -253,6 +253,38 @@ fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
     assert!(db.photos_by_uid(&["p2".into()]).unwrap()[0].favorite);
 }
 
+/// The strip shows the same calendar day in earlier years only: not today's
+/// own photos, not the day before, and one tile per RAW+JPEG shot.
+#[test]
+fn on_this_day_finds_the_same_date_in_earlier_years() {
+    const DAY: i64 = 86_400;
+    // Noon UTC, so the local date is the same in every common time zone.
+    let today = 1_781_524_800; // 2026-06-15 12:00 UTC
+    let year_ago = today - 365 * DAY; // 2025-06-15
+    let three_years_ago = today - (365 * 3 + 1) * DAY; // 2023-06-15, past a 29 February
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        TimelineRow::new("today", today),
+        TimelineRow {
+            name: Some("IMG_1.JPG".into()),
+            ..TimelineRow::new("jpeg", year_ago)
+        },
+        TimelineRow {
+            name: Some("IMG_1.CR2".into()),
+            ..TimelineRow::new("raw", year_ago)
+        },
+        TimelineRow::new("day-before", year_ago - DAY),
+        TimelineRow::new("older", three_years_ago),
+    ])
+    .unwrap();
+
+    let found = db.photos_on_this_day(today, 10).unwrap();
+    assert_eq!(
+        found.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["jpeg", "older"]
+    );
+}
+
 #[test]
 fn not_in_album_hides_photos_any_album_holds() {
     let db = Db::open_in_memory().unwrap();

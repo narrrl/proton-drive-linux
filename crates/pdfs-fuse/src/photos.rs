@@ -729,6 +729,20 @@ impl Core {
         Ok(())
     }
 
+    /// Photos taken on today's date in earlier years, as wire items. Served
+    /// from the stored timeline only: the strip is a nicety, not worth a wait
+    /// on the network, and the timeline's own load keeps that store fresh.
+    pub(crate) fn photos_on_this_day(&self, limit: usize) -> CoreResult<Vec<PhotoItem>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let photos = self
+            .db
+            .photos_on_this_day(now, limit)
+            .map_err(CoreError::from)?;
+        Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
+    }
+
     /// Every file of one photo's group, in server order, as wire items. A photo
     /// the timeline does not hold comes back empty, which the lightbox reads as
     /// "nothing to switch between".

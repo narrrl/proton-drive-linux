@@ -461,6 +461,16 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::PhotosOnThisDay { limit }) => {
+            match core.photos_on_this_day(clamp_limit(limit)) {
+                Ok(items) => CtlResponse::Photos {
+                    available: true,
+                    items,
+                    counts: None,
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::PhotoGroup { uid }) => match core.photo_group(&uid) {
             Ok(items) => CtlResponse::Photos {
                 available: true,

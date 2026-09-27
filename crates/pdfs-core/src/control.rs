@@ -84,6 +84,10 @@ pub enum Request {
         #[serde(default)]
         kind: Option<PhotoKind>,
     },
+    /// Photos taken on today's date in earlier years, newest first, at most
+    /// `limit` of them — the "On this day" strip above the timeline. Replies
+    /// with [`Response::Photos`]; a front-end groups them by year itself.
+    PhotosOnThisDay { limit: usize },
     /// List the account's photo albums, newest activity first, including the
     /// albums other people share with us. Metadata only — an album's cover
     /// thumbnail is fetched with [`Request::PhotoThumbs`] like any other photo.

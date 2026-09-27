@@ -74,6 +74,9 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 .photo-video-badge-small { padding: 3px; min-width: 0; min-height: 0; }
 .photo-tile:hover .photo-video-badge { background: color-mix(in srgb, var(--accent-bg-color) 85%, transparent); }
 .photo-group-badge { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; color: white; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 1px 5px; margin: 6px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }
+.memory-card { padding: 0; border-radius: 12px; }
+.memory-cover { border-radius: 12px; background: alpha(currentColor, 0.06); }
+.memory-label { font-weight: 700; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; background: linear-gradient(to top, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0)); }
 .album-card { padding: 0; border-radius: 16px; transition: background 180ms ease; }
 .album-card:hover { background: alpha(currentColor, 0.07); }
 .album-cover { border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }
