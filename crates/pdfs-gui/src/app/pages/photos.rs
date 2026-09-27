@@ -2210,7 +2210,14 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
 /// topmost visible row's first photo is remembered, and the row that holds it
 /// afterwards is put back at the same height in the viewport.
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
-    let anchor = top_anchor(ui);
+    // At the very top there is nothing to hold on to: the first photo row sits
+    // under a heading, and anchoring on it would scroll that heading away.
+    let at_top = ui
+        .gallery
+        .list
+        .vadjustment()
+        .is_none_or(|adj| adj.value() < 1.0);
+    let anchor = if at_top { None } else { top_anchor(ui) };
     repaint_gallery(ui);
     let Some((anchor, offset)) = anchor else {
         return;
