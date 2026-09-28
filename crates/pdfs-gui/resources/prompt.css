@@ -1,0 +1,224 @@
+/* The search launcher (pdfs-prompt). Colours come from the libadwaita
+   palette, so the launcher follows the system accent, light/dark and high
+   contrast like the app; the opt-in Proton theme recolours both alike. */
+
+window.launcher-window {
+  background: transparent;
+}
+
+.launcher-card {
+  background-color: var(--view-bg-color);
+  color: var(--view-fg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  box-shadow: 0 16px 48px rgb(0 0 0 / 35%);
+}
+
+.search-bar {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.search-icon {
+  -gtk-icon-size: 20px;
+  color: color-mix(in srgb, currentColor 55%, transparent);
+}
+
+.search-entry {
+  background: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  padding: 2px 0;
+  font-size: 1.15rem;
+}
+
+.key-hint {
+  padding: 2px 8px;
+  border-radius: 6px;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+  font-size: 0.75rem;
+  opacity: 0.55;
+}
+
+.chip-row {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.chip {
+  padding: 4px 14px;
+  min-height: 0;
+  border-radius: 999px;
+  background: none;
+  border: 1px solid var(--border-color);
+  box-shadow: none;
+  font-size: 0.86rem;
+  font-weight: 500;
+}
+
+.chip:hover {
+  background-color: color-mix(in srgb, currentColor 6%, transparent);
+}
+
+.chip:checked {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+  border-color: var(--accent-bg-color);
+}
+
+/* --- results ------------------------------------------------------------ */
+
+.results {
+  padding: 2px 8px 10px 8px;
+}
+
+.section-header {
+  padding: 12px 10px 6px 10px;
+}
+
+.section-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+.section-icon {
+  -gtk-icon-size: 14px;
+  opacity: 0.55;
+}
+
+.result-list {
+  background: none;
+}
+
+.result-row {
+  padding: 6px 10px;
+  border-radius: 10px;
+}
+
+.result-row:hover {
+  background-color: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+/* A soft tint rather than a solid accent bar: the text keeps its colour, so
+   the highlighted match stays readable on the selected row. */
+.result-row:selected,
+.result-row:selected:hover {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 18%, transparent);
+  color: inherit;
+}
+
+.result-name {
+  font-weight: 500;
+}
+
+.result-location,
+.result-meta {
+  font-size: 0.8rem;
+  opacity: 0.55;
+}
+
+.result-row:selected .result-location,
+.result-row:selected .result-meta {
+  opacity: 0.7;
+}
+
+.thumb {
+  border-radius: 6px;
+}
+
+.result-badge,
+.preview-badge {
+  -gtk-icon-size: 14px;
+}
+
+.badge-pinned {
+  color: var(--success-color);
+}
+
+.badge-cached {
+  color: var(--accent-color);
+}
+
+.badge-cloud,
+.badge-local {
+  opacity: 0.55;
+}
+
+/* --- preview ------------------------------------------------------------ */
+
+.preview {
+  padding: 16px;
+  background-color: color-mix(in srgb, currentColor 3%, transparent);
+}
+
+.preview-thumb {
+  margin-bottom: 12px;
+}
+
+.preview-thumb .thumb {
+  border-radius: 10px;
+}
+
+.preview-name {
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+
+.preview-kind {
+  font-size: 0.85rem;
+  opacity: 0.6;
+  margin-bottom: 12px;
+}
+
+.preview-key {
+  font-size: 0.8rem;
+  opacity: 0.55;
+}
+
+.preview-value {
+  font-size: 0.85rem;
+}
+
+.preview-actions {
+  margin-top: 12px;
+}
+
+.preview-action {
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.preview-shortcut {
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+.preview-feedback {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  color: var(--accent-color);
+}
+
+.preview-empty {
+  opacity: 0.2;
+}
+
+/* --- footer ------------------------------------------------------------- */
+
+.footer {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.footer-text {
+  font-size: 0.78rem;
+  opacity: 0.5;
+}
+
+statuspage.compact > scrolledwindow > viewport > box {
+  margin: 24px 12px;
+}

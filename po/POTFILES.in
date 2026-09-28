@@ -28,6 +28,8 @@ crates/pdfs-gui/src/app/widgets/thumbnails.rs
 crates/pdfs-gui/src/app/widgets/versions_dialog.rs
 crates/pdfs-gui/src/dmenu.rs
 crates/pdfs-gui/src/fzf.rs
+crates/pdfs-gui/src/hud/mod.rs
+crates/pdfs-gui/src/hud/preview.rs
 crates/pdfs-gui/src/i18n.rs
 crates/pdfs-gui/src/main.rs
 crates/pdfs-gui/src/prompt.rs

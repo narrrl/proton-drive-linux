@@ -33,5 +33,7 @@
   <gresource prefix="/de/nils/protondrivelinux">
     <file>style.css</file>
     <file>proton-theme.css</file>
+    <!-- The search launcher's own sheet, over the same palette. -->
+    <file>prompt.css</file>
   </gresource>
 </gresources>
