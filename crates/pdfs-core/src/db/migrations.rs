@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 33;
+pub(super) const SCHEMA_VERSION: i64 = 34;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -298,6 +298,22 @@ impl Db {
             )? > 0;
             if has_photos && !has_column {
                 tx.execute_batch(MIGRATION_V33)?;
+            }
+        }
+        if current < 34 {
+            // Same guards as V26-V33.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('photos') WHERE name = 'similar_hash'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_photos: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'photos'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_photos && !has_column {
+                tx.execute_batch(MIGRATION_V34)?;
             }
         }
         tx.execute(
@@ -1005,4 +1021,15 @@ ALTER TABLE photos ADD COLUMN longitude REAL;
 ALTER TABLE photos ADD COLUMN place_id INTEGER;
 CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_id);
 UPDATE photos SET resolved_at = NULL;
+";
+
+/// Schema v34: what each photo looks like, for finding similar ones.
+///
+/// `similar_hash` is a 64-bit difference hash of the photo's thumbnail (see
+/// `crate::similar`): resized and re-encoded copies of one picture land a few
+/// bits apart, where the server's `content_hash` only matches byte-identical
+/// files. `NULL` until the daemon has hashed the thumbnail, which it does as
+/// thumbnails arrive and when the similar-photo finder asks for the rest.
+const MIGRATION_V34: &str = "
+ALTER TABLE photos ADD COLUMN similar_hash INTEGER;
 ";

@@ -406,6 +406,76 @@ fn duplicates_list_the_copy_to_keep_first() {
     assert_eq!(uids, [vec!["filed", "copy"], vec!["jpeg", "stray"]]);
 }
 
+/// Shots that look alike form a set, one photo per shot, while a set of
+/// byte-identical copies is left to the duplicate finder.
+#[test]
+fn similar_photos_group_by_look_and_skip_exact_copies() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        hashed("big", 500, "IMG_1.JPG", "h1"),
+        hashed("small", 400, "IMG_1-small.JPG", "h2"),
+        hashed("copy", 300, "IMG_2.JPG", "h3"),
+        hashed("copy2", 200, "IMG_2(1).JPG", "h3"),
+        hashed("other", 100, "IMG_3.JPG", "h4"),
+        hashed("flat", 50, "IMG_4.JPG", "h5"),
+    ])
+    .unwrap();
+    let look = 0x0f0f_3c3c_5a5a_9696_u64;
+    db.photo_set_similar_hash("big", look).unwrap();
+    db.photo_set_similar_hash("small", look ^ 0b101).unwrap();
+    db.photo_set_similar_hash("copy", !look).unwrap();
+    db.photo_set_similar_hash("copy2", !look).unwrap();
+    db.photo_set_similar_hash("other", look ^ 0xffff_ffff)
+        .unwrap();
+    db.photo_set_similar_hash("flat", crate::similar::NO_HASH)
+        .unwrap();
+
+    let sets = db.photo_similar().unwrap();
+    let uids: Vec<Vec<&str>> = sets
+        .iter()
+        .map(|set| set.iter().map(|p| p.uid.as_str()).collect())
+        .collect();
+    assert_eq!(uids, [vec!["small", "big"]]);
+    assert_eq!(db.similar_progress().unwrap(), (6, 6));
+}
+
+/// What is left to hash skips videos and hashed shots, and a hash survives a
+/// refresh unless the photo's bytes changed.
+#[test]
+fn similar_hashes_are_kept_until_the_photo_changes() {
+    let db = Db::open_in_memory().unwrap();
+    let resolved = |uid: &str, hash: &str| TimelineRow {
+        resolved_at: Some(1),
+        ..hashed(uid, 100, &format!("{uid}.JPG"), hash)
+    };
+    db.photos_replace(&[
+        resolved("a", "h1"),
+        resolved("b", "h2"),
+        hashed("clip", 50, "clip.mp4", "h3"),
+    ])
+    .unwrap();
+    db.photo_set_similar_hash("a", 7).unwrap();
+    db.photo_set_similar_hash("b", 9).unwrap();
+    let left = |db: &Db| -> Vec<String> {
+        db.photos_unhashed(10)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.uid)
+            .collect()
+    };
+    assert!(left(&db).is_empty());
+    assert_eq!(db.similar_progress().unwrap(), (2, 2));
+
+    db.photos_replace(&[
+        resolved("a", "h1"),
+        resolved("b", "h2-edited"),
+        hashed("clip", 50, "clip.mp4", "h3"),
+    ])
+    .unwrap();
+    assert_eq!(left(&db), ["b"]);
+    assert_eq!(db.similar_progress().unwrap(), (1, 2));
+}
+
 /// Trashing the file a group is shown as leaves the rest of the group on the
 /// timeline instead of pointing at a photo that is gone.
 #[test]

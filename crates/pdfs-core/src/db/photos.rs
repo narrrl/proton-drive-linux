@@ -98,6 +98,8 @@ struct Learned {
     content_hash: Option<String>,
     main_uid: Option<String>,
     location: Option<(f64, f64)>,
+    /// What its thumbnail looks like (see [`crate::similar`]).
+    similar_hash: Option<i64>,
     /// When this photo's node was last resolved, kept so a refresh that skips it
     /// does not make it look unresolved again.
     resolved_at: Option<i64>,
@@ -293,7 +295,7 @@ impl Db {
         let learned: HashMap<String, Learned> = {
             let mut stmt = tx.prepare(
                 "SELECT uid, name, ratio, thumb_state, media_type, favorite, content_hash, \
-                 main_uid, resolved_at, latitude, longitude FROM photos",
+                 main_uid, resolved_at, latitude, longitude, similar_hash FROM photos",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -310,6 +312,7 @@ impl Db {
                         location: r
                             .get::<_, Option<f64>>(9)?
                             .zip(r.get::<_, Option<f64>>(10)?),
+                        similar_hash: r.get(11)?,
                     },
                 ))
             })?;
@@ -332,6 +335,10 @@ impl Db {
                     carried.name = row.name.clone();
                     carried.media_type = row.media_type.clone();
                     carried.favorite = row.favorite.unwrap_or(false);
+                    // New bytes may show another picture: hash it again.
+                    if row.content_hash != carried.content_hash {
+                        carried.similar_hash = None;
+                    }
                     carried.content_hash = row.content_hash.clone();
                     carried.main_uid = row.main_uid.clone();
                     carried.location = row.location;
@@ -373,9 +380,9 @@ impl Db {
                 "INSERT INTO photos
                    (uid, capture_time, name, ratio, thumb_state, seq, media_type, kind, favorite,
                     content_hash, main_uid, group_key, resolved_at, latitude, longitude,
-                    place_id)
+                    place_id, similar_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16)",
+                         ?16, ?17)",
             )?;
             for (seq, ((row, carried, kind), group_key)) in
                 resolved.iter().zip(group_keys.iter()).enumerate()
@@ -400,6 +407,7 @@ impl Db {
                         .location
                         .and_then(|(lat, lon)| crate::places::nearest(lat, lon))
                         .map(|city| city.id),
+                    carried.similar_hash,
                 ])?;
             }
         }
@@ -767,6 +775,106 @@ impl Db {
             }
         }
         sets.retain(|set| set.len() > 1);
+        sets.sort_by_key(|set| std::cmp::Reverse(set.iter().map(|p| p.capture_time).max()));
+        Ok(sets)
+    }
+
+    /// Shots whose look hasn't been hashed yet, by the uid of the photo the
+    /// grid shows for each, newest first, at most `limit`. Videos, and photos
+    /// with no thumbnail to hash, are left out. A shot counts as hashed once
+    /// any of its files is, since they all show one picture.
+    pub fn photos_unhashed(&self, limit: usize) -> Result<Vec<StoredPhoto>> {
+        let uids: Vec<String> = {
+            let conn = self.read();
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(group_key, uid) AS k FROM photos \
+                 GROUP BY k \
+                 HAVING MAX(similar_hash) IS NULL \
+                    AND MAX(kind != ?1 AND thumb_state != ?2) \
+                 ORDER BY MAX(capture_time) DESC LIMIT ?3",
+            )?;
+            stmt.query_map(
+                params![
+                    crate::control::PhotoKind::Video.as_i64(),
+                    THUMB_NONE,
+                    limit as i64
+                ],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        self.photos_by_uid(&uids)
+    }
+
+    /// Record the look of photo `uid`: its difference hash, or
+    /// [`crate::similar::NO_HASH`] when its thumbnail gave none.
+    pub fn photo_set_similar_hash(&self, uid: &str, hash: u64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE photos SET similar_hash = ?2 WHERE uid = ?1",
+            params![uid, hash as i64],
+        )?;
+        Ok(())
+    }
+
+    /// How many shots have been hashed, out of how many could be.
+    pub fn similar_progress(&self) -> Result<(usize, usize)> {
+        let conn = self.read();
+        let (hashed, total): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*) FILTER (WHERE hashed), COUNT(*) FROM \
+               (SELECT MAX(similar_hash) IS NOT NULL AS hashed FROM photos \
+                GROUP BY COALESCE(group_key, uid) \
+                HAVING MAX(similar_hash) IS NOT NULL \
+                    OR MAX(kind != ?1 AND thumb_state != ?2))",
+            params![crate::control::PhotoKind::Video.as_i64(), THUMB_NONE],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((hashed.max(0) as usize, total.max(0) as usize))
+    }
+
+    /// Sets of shots that look alike (see [`crate::similar`]), one photo per
+    /// shot in capture order, and the sets newest first. A set whose photos
+    /// are all byte-identical copies is left to [`Self::photo_duplicates`].
+    pub fn photo_similar(&self) -> Result<Vec<Vec<StoredPhoto>>> {
+        let rows: Vec<(String, u64, Option<String>)> = {
+            let conn = self.read();
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(group_key, uid) AS k, MAX(similar_hash), \
+                        MAX(content_hash) FILTER (WHERE uid = COALESCE(group_key, uid)) \
+                 FROM photos GROUP BY k \
+                 HAVING MAX(similar_hash) IS NOT NULL AND MAX(similar_hash) != ?1",
+            )?;
+            stmt.query_map(params![crate::similar::NO_HASH as i64], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let hashes: Vec<u64> = rows.iter().map(|(_, hash, _)| *hash).collect();
+        let found: Vec<Vec<usize>> = crate::similar::sets(&hashes)
+            .into_iter()
+            .filter(|set| {
+                let first = &rows[set[0]].2;
+                first.is_none() || set.iter().any(|&i| rows[i].2 != *first)
+            })
+            .collect();
+        let uids: Vec<String> = found.iter().flatten().map(|&i| rows[i].0.clone()).collect();
+        let mut stored: HashMap<String, StoredPhoto> = self
+            .photos_by_uid(&uids)?
+            .into_iter()
+            .map(|photo| (photo.uid.clone(), photo))
+            .collect();
+        let mut sets: Vec<Vec<StoredPhoto>> = found
+            .iter()
+            .map(|set| {
+                let mut photos: Vec<StoredPhoto> = set
+                    .iter()
+                    .filter_map(|&i| stored.remove(&rows[i].0))
+                    .collect();
+                photos.sort_by_key(|p| p.capture_time);
+                photos
+            })
+            .filter(|set| set.len() > 1)
+            .collect();
         sets.sort_by_key(|set| std::cmp::Reverse(set.iter().map(|p| p.capture_time).max()));
         Ok(sets)
     }

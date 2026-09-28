@@ -11,6 +11,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+Schema: **34**. Photos gain a `similar_hash` column for the coming similar-photo finder. It
+stays empty until the daemon hashes thumbnails, so updating reads and downloads nothing.
+
 ## [2.3.0] — 2026-09-28
 
 Schema: **33**. Photos gain their location; the first timeline refresh after updating reads

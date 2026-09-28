@@ -20,6 +20,7 @@ pub mod sdkcache;
 pub mod search;
 pub mod service;
 pub mod shell;
+pub mod similar;
 pub mod syncignore;
 pub mod takeout;
 pub mod tray;
