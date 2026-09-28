@@ -26,7 +26,6 @@ pub(crate) struct LocationsState {
     /// Shows the loading state if a full load is slow; the rows stay up
     /// until then.
     pub(crate) loader: Rc<Loader>,
-    pub(crate) loaded_at: Cell<Option<Instant>>,
     pub(crate) card: SyncCard,
     pub(crate) queue: QueueState,
     pub(crate) conflicts: ConflictsState,
@@ -94,9 +93,6 @@ pub(crate) struct ConflictsState {
     pub(crate) rows: RefCell<Vec<adw::ActionRow>>,
     pub(crate) painted: RefCell<Vec<ConflictKey>>,
     pub(crate) inflight: Cell<bool>,
-    /// When the list was last fetched. Listing walks every node the daemon
-    /// knows, so the tick asks far less often than it does for the queue.
-    pub(crate) fetched_at: Cell<Option<Instant>>,
 }
 
 /// Widgets the Locations page's load/repaint touch.
@@ -105,7 +101,6 @@ pub(crate) struct LocationsWidgets {
     pub(crate) status: adw::StatusPage,
     pub(crate) group: adw::PreferencesGroup,
     pub(crate) retry: gtk4::Button,
-    pub(crate) refresh: gtk4::Button,
     pub(crate) add_folder: gtk4::Button,
     /// Live transfers, on the Overview; painted by the refresh loop.
     pub(crate) transfers_group: adw::PreferencesGroup,
@@ -137,7 +132,6 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         .valign(gtk4::Align::Center)
         .build();
     add_folder.add_css_class("flat");
-    let refresh = refresh_button();
     let transfers_group = build_transfers_group();
     let (card, card_icon, card_title, card_detail) = build_sync_card();
     let pause = build_pause_button();
@@ -247,14 +241,12 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         .build();
     let (frame, header) = page_frame_with(&switcher, &column);
     header.pack_start(&pause);
-    header.pack_end(&refresh);
 
     let widgets = LocationsWidgets {
         content: content.clone(),
         status: status.clone(),
         group: group.clone(),
         retry: retry.clone(),
-        refresh,
         add_folder,
         transfers_group,
         card_icon,
@@ -290,7 +282,6 @@ fn scrolled_column(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
 pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk4::Button) {
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
-        ui_retry.locations.loaded_at.set(None);
         load_locations(&ui_retry);
     });
     let ui_add = ui.clone();
@@ -323,32 +314,37 @@ pub(crate) fn load_sync_view(ui: &Rc<Ui>) {
         // edits complete, so it reloads on every visit.
         Some("history") => load_activity(ui),
         _ => {
-            refresh_conflicts(ui, true);
-            if !page_fresh(&ui.locations.loaded_at) {
-                load_locations(ui);
-            }
+            refresh_conflicts(ui);
+            load_locations(ui);
         }
     }
 }
 
-/// Reload the Sync page's current view, for Refresh.
+/// Reload the Sync page's current view, for F5.
 pub(crate) fn reload_sync_view(ui: &Rc<Ui>) {
     if ui.locations.views.visible_child_name().as_deref() == Some("history") {
         load_activity(ui);
     } else {
-        refresh_conflicts(ui, true);
+        refresh_conflicts(ui);
         load_locations(ui);
     }
 }
 
-/// Follow the refresh tick on the Sync page's current view.
-pub(crate) fn tick_sync_view(ui: &Rc<Ui>) {
-    if ui.locations.views.visible_child_name().as_deref() == Some("history") {
-        refresh_activity(ui);
+/// Bring the Sync page's current view up to date with what the daemon says
+/// changed. Conflicts are left to the caller: they badge the sidebar, so they
+/// are followed on every page.
+pub(crate) fn follow_sync_view(ui: &Rc<Ui>, topics: &[Topic]) {
+    if activity_visible(ui) {
+        if topics.contains(&Topic::Activity) {
+            refresh_activity(ui);
+        }
     } else {
-        refresh_locations(ui);
-        refresh_queue(ui);
-        refresh_conflicts(ui, false);
+        if topics.contains(&Topic::Locations) {
+            refresh_locations(ui);
+        }
+        if topics.contains(&Topic::Queue) {
+            refresh_queue(ui);
+        }
     }
 }
 
@@ -715,33 +711,16 @@ fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
     });
 }
 
-/// How long a conflict listing stays fresh on the refresh tick.
+/// How long the activity feed's conflict listing stays fresh while the feed
+/// follows new activity. Conflicts come with their own event, so this only
+/// saves reading them twice.
 pub(crate) const CONFLICTS_TTL: Duration = Duration::from_secs(30);
 
-/// How long a conflict listing stays fresh for the sidebar badge while the
-/// Sync page is not on screen.
-const CONFLICTS_BADGE_TTL: Duration = Duration::from_secs(300);
-
-/// Poll the conflict list while the Sync page is on screen. `force` skips the
-/// TTL, for navigation and right after a resolution.
-pub(crate) fn refresh_conflicts(ui: &Rc<Ui>, force: bool) {
-    fetch_conflicts(ui, if force { Duration::ZERO } else { CONFLICTS_TTL });
-}
-
-/// Poll the conflict list now and then from anywhere, for the sidebar badge.
-pub(crate) fn refresh_conflicts_badge(ui: &Rc<Ui>) {
-    fetch_conflicts(ui, CONFLICTS_BADGE_TTL);
-}
-
-/// Ask for the conflict list unless the last one is younger than `ttl`.
-fn fetch_conflicts(ui: &Rc<Ui>, ttl: Duration) {
+/// Read the conflict list again, for the Sync page and the sidebar badge: on
+/// navigation, after a resolution, and when the daemon says it changed.
+pub(crate) fn refresh_conflicts(ui: &Rc<Ui>) {
     let conflicts = &ui.locations.conflicts;
-    if conflicts.inflight.get()
-        || conflicts
-            .fetched_at
-            .get()
-            .is_some_and(|at| !ttl.is_zero() && at.elapsed() < ttl)
-    {
+    if conflicts.inflight.get() {
         return;
     }
     conflicts.inflight.set(true);
@@ -751,7 +730,6 @@ fn fetch_conflicts(ui: &Rc<Ui>, ttl: Duration) {
         let result = rx.recv().await;
         let conflicts = &ui.locations.conflicts;
         conflicts.inflight.set(false);
-        conflicts.fetched_at.set(Some(Instant::now()));
         match result {
             Ok(Ok(Response::Conflicts { items })) => repaint_conflicts(&ui, &items),
             // Same as the queue: an older daemon, or none, shows nothing.
@@ -934,7 +912,7 @@ fn resolve_conflict(ui: &Rc<Ui>, path: String, keep: ConflictKeep) {
         match result {
             Ok(Ok(Response::Ok { message })) => {
                 toast(&ui, &capitalize(&message));
-                refresh_conflicts(&ui, true);
+                refresh_conflicts(&ui);
                 refresh_activity_conflicts(&ui, true);
             }
             Ok(Ok(Response::Error { message, kind })) => toast_failure(
@@ -1004,10 +982,8 @@ pub(crate) fn load_locations(ui: &Rc<Ui>) {
             Ok(Ok(Response::Locations { items })) => {
                 ui.locations.content.set_visible_child_name("list");
                 repaint_locations(&ui, &items);
-                ui.locations.loaded_at.set(Some(Instant::now()));
             }
             Ok(Ok(Response::Error { message, .. })) => {
-                ui.locations.loaded_at.set(None);
                 locations_status(
                     &ui,
                     "dialog-warning-symbolic",
@@ -1017,7 +993,6 @@ pub(crate) fn load_locations(ui: &Rc<Ui>) {
                 );
             }
             _ => {
-                ui.locations.loaded_at.set(None);
                 locations_unreachable(&ui);
             }
         }

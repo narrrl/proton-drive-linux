@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ActivityKind, PhotoMonth, RefreshScope, Request as CtlRequest, Response as CtlResponse,
-    TransferDirection, TrashFailure,
+    ActivityKind, Event, HEARTBEAT, PhotoMonth, RefreshScope, Request as CtlRequest,
+    Response as CtlResponse, Topic, TransferDirection, TrashFailure,
 };
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -286,6 +286,155 @@ impl Drop for RefreshGuard {
     }
 }
 
+/// The reply to [`CtlRequest::Status`], which subscriptions are also sent
+/// whenever it changes.
+pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) -> CtlResponse {
+    let pins = core.cache.list_pins();
+    let queued = core.db.pending_op_counts().unwrap_or_default();
+    let staging = core.cache.staging_usage();
+    CtlResponse::Status {
+        parked_uploads: queued.parked.max(0) as u64,
+        failing_ops: queued.failing.max(0) as u64,
+        failing_error: queued.last_error.clone(),
+        staged_bytes: staging.bytes,
+        staged_oldest_secs: staging.oldest_secs,
+        paused: core.sync_pause().is_some(),
+        paused_until: core.sync_pause().flatten(),
+        username: username.to_string(),
+        mountpoint: mountpoint.display().to_string(),
+        pinned: pins.len(),
+        used: core.cache.usage(),
+        budget: core.cache.budget(),
+        pins,
+        online: core.online.load(Ordering::Relaxed),
+        pending_uploads: queued.uploads.max(0) as u64,
+        pending_changes: queued.changes.max(0) as u64,
+    }
+}
+
+/// What a front-end shows that `request` changes when it succeeds. Requests
+/// from the CLI publish the same way as the app's, so an open window follows
+/// a change made in a terminal.
+fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
+    use CtlRequest as R;
+    match request {
+        R::Pin { .. } | R::Unpin { .. } => &[Topic::Files],
+        R::CreateAlbum { .. }
+        | R::RenameAlbum { .. }
+        | R::DeleteAlbum { .. }
+        | R::AddToAlbum { .. }
+        | R::RemoveFromAlbum { .. }
+        | R::SetPhotoFavorite { .. }
+        | R::UploadPhoto { .. } => &[Topic::Photos],
+        R::TrashNodes { .. } => &[Topic::Files, Topic::Photos, Topic::Trash, Topic::Conflicts],
+        R::Rename { .. } | R::Move { .. } | R::CreateFolder { .. } | R::UploadPaths { .. } => {
+            &[Topic::Files, Topic::Conflicts]
+        }
+        R::Delete { .. } => &[Topic::Files, Topic::Trash, Topic::Conflicts],
+        R::Restore { .. } | R::DeleteForever { .. } | R::EmptyTrash => {
+            &[Topic::Files, Topic::Photos, Topic::Trash, Topic::Conflicts]
+        }
+        R::Refresh { scope } => match scope {
+            RefreshScope::Dir { .. } => &[Topic::Files],
+            RefreshScope::Trash => &[Topic::Trash],
+            // A photos refresh answers once it has started; the timeline
+            // publishes again when it lands.
+            RefreshScope::Photos { .. } => &[],
+        },
+        R::RenameDevice { .. } | R::DeleteDevice { .. } => &[Topic::Devices],
+        R::AdoptDevice { .. } => &[Topic::Devices, Topic::Locations],
+        R::AddSyncFolder { .. }
+        | R::RemoveSyncFolder { .. }
+        | R::SetSyncFolderMode { .. }
+        | R::SetSyncFolderPaused { .. }
+        | R::RestoreSyncFolders { .. }
+        | R::RestoreDeviceFolders { .. } => &[Topic::Locations, Topic::Devices],
+        R::RetryPendingOp { .. } => &[Topic::Queue],
+        R::ResolveConflict { .. } => &[Topic::Files, Topic::Trash, Topic::Conflicts],
+        R::ShareNode { .. }
+        | R::ShareNodeByUid { .. }
+        | R::UpdateShareRole { .. }
+        | R::UpdateShareRoleByUid { .. }
+        | R::RemoveShareEntry { .. }
+        | R::RemoveShareEntryByUid { .. }
+        | R::CreatePublicLink { .. }
+        | R::CreatePublicLinkByUid { .. }
+        | R::RemovePublicLink { .. }
+        | R::RemovePublicLinkByUid { .. }
+        | R::StopSharing { .. }
+        | R::StopSharingByUid { .. } => &[Topic::Shares, Topic::Files],
+        R::LeaveShared { .. }
+        | R::AcceptInvitation { .. }
+        | R::RejectInvitation { .. }
+        | R::CreateBookmark { .. }
+        | R::DeleteBookmark { .. } => &[Topic::Shares],
+        R::RestoreRevision { .. }
+        | R::RestoreRevisionByUid { .. }
+        | R::SaveRevisionAs { .. }
+        | R::SaveRevisionAsByUid { .. } => &[Topic::Files],
+        _ => &[],
+    }
+}
+
+/// How long a subscription's writes may block. A client that stops reading
+/// is dropped after this rather than holding its handler forever.
+const SUBSCRIPTION_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serve a [`CtlRequest::Subscribe`]: send the current status and transfers
+/// and say every topic changed, so the client catches up, then send whatever
+/// the [`EventHub`](super::events::EventHub) collects, with a heartbeat when
+/// nothing does. Ends when the client goes away or the daemon stops.
+fn serve_subscription(core: &Core, username: &str, mountpoint: &Path, mut stream: UnixStream) {
+    let Some(mailbox) = core.events.subscribe() else {
+        warn!("control: refusing a subscription at the limit");
+        if let Ok(mut out) = serde_json::to_vec(&CtlResponse::error(CoreError::remote(
+            "too many subscriptions",
+        ))) {
+            out.push(b'\n');
+            let _ = stream.write_all(&out);
+        }
+        return;
+    };
+    struct Unsubscribe<'a>(&'a Core, std::sync::Arc<super::events::Mailbox>);
+    impl Drop for Unsubscribe<'_> {
+        fn drop(&mut self) {
+            self.0.events.unsubscribe(&self.1);
+        }
+    }
+    let _unsubscribe = Unsubscribe(core, mailbox.clone());
+    if let Err(e) = stream.set_write_timeout(Some(SUBSCRIPTION_WRITE_TIMEOUT)) {
+        warn!(error = %e, "control: could not set subscription timeout");
+        return;
+    }
+    let heartbeat = super::events::event_line(&Event::Heartbeat);
+    let mut lines: Vec<_> = [
+        super::events::event_line(&Event::Status(Box::new(status_response(
+            core, username, mountpoint,
+        )))),
+        super::events::transfers_line(core.transfers.snapshot(), core.jobs_snapshot()),
+        super::events::event_line(&Event::Changed {
+            topics: Topic::ALL.to_vec(),
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    loop {
+        for line in &lines {
+            if stream.write_all(line.as_bytes()).is_err() {
+                return;
+            }
+        }
+        if core.shutdown.is_stopping() {
+            return;
+        }
+        lines = mailbox.take(HEARTBEAT);
+        if lines.is_empty() {
+            lines.extend(heartbeat.clone());
+        }
+    }
+}
+
 fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: UnixStream) {
     if let Err(e) = stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)) {
         warn!(error = %e, "control: could not set request timeout");
@@ -310,32 +459,21 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             return;
         }
     };
+    let request = serde_json::from_str::<CtlRequest>(line.trim());
+    // A subscription lasts as long as its client, so it is not a request in
+    // flight and stays out of the diagnostics' list of them.
+    if let Ok(CtlRequest::Subscribe) = request {
+        serve_subscription(core, username, mountpoint, stream);
+        return;
+    }
+    let touched = request.as_ref().map_or(&[][..], touched_topics);
     // Registered before the request is even parsed, so a handler that wedges
     // inside the daemon shows up by name in `pdfs diagnostics`.
     let _inflight = super::diagnostics::InflightGuard::new(super::diagnostics::request_kind(&line));
-    let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
-        Ok(CtlRequest::Status) => {
-            let pins = core.cache.list_pins();
-            let queued = core.db.pending_op_counts().unwrap_or_default();
-            let staging = core.cache.staging_usage();
-            CtlResponse::Status {
-                parked_uploads: queued.parked.max(0) as u64,
-                failing_ops: queued.failing.max(0) as u64,
-                failing_error: queued.last_error.clone(),
-                staged_bytes: staging.bytes,
-                staged_oldest_secs: staging.oldest_secs,
-                paused: core.sync_pause().is_some(),
-                paused_until: core.sync_pause().flatten(),
-                username: username.to_string(),
-                mountpoint: mountpoint.display().to_string(),
-                pinned: pins.len(),
-                used: core.cache.usage(),
-                budget: core.cache.budget(),
-                pins,
-                online: core.online.load(Ordering::Relaxed),
-                pending_uploads: queued.uploads.max(0) as u64,
-                pending_changes: queued.changes.max(0) as u64,
-            }
+    let response = match request {
+        Ok(CtlRequest::Status) => status_response(core, username, mountpoint),
+        Ok(CtlRequest::Subscribe) => {
+            CtlResponse::error(CoreError::invalid("a subscription is served on its own"))
         }
         Ok(CtlRequest::Pin { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.pin(&rel) {
@@ -1584,6 +1722,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         // The request did not parse: the caller sent something malformed.
         Err(e) => CtlResponse::error(CoreError::invalid(format!("bad request: {e}"))),
     };
+    if !touched.is_empty() && !matches!(response, CtlResponse::Error { .. }) {
+        core.events.publish(touched);
+    }
     let mut out = match serde_json::to_vec(&response) {
         Ok(v) => v,
         Err(e) => {

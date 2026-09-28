@@ -618,7 +618,7 @@ pub(crate) fn open_album(ui: &Rc<Ui>, album: AlbumInfo) {
     // would silently do something else. The Photos/Albums switcher goes too: an
     // album is a level below it, and back is the way out.
     ui.gallery.filters.set_visible(false);
-    ui.gallery.view_switch.set_visible(false);
+    ui.gallery.view_switch.widget().set_visible(false);
     ui.gallery.upload.set_visible(false);
     ui.gallery.back.set_visible(true);
     // A stale kind/date filter would otherwise be sent with the album request.
@@ -636,7 +636,7 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
         return;
     }
     ui.gallery.title.set_title(&gettext("Photos"));
-    ui.gallery.view_switch.set_visible(true);
+    ui.gallery.view_switch.widget().set_visible(true);
     ui.gallery.upload.set_visible(true);
     ui.gallery.back.set_visible(false);
 }
@@ -653,17 +653,15 @@ fn albums_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str) {
 /// whole content area; back leaves an open album for the grid it came from.
 pub(crate) fn wire_albums(ui: &Rc<Ui>) {
     let ui_albums = ui.clone();
-    ui.gallery.albums_btn.clone().connect_toggled(move |btn| {
-        if btn.is_active() {
+    ui.gallery.view_switch.connect_changed(move |view| {
+        if view == VIEW_ALBUMS {
             show_albums(&ui_albums);
         }
     });
 
-    // Only the button being switched *on* acts: the group fires `toggled` for
-    // the one going off too, and acting on both would load twice.
     let ui_photos = ui.clone();
-    ui.gallery.photos_btn.clone().connect_toggled(move |btn| {
-        if !btn.is_active() {
+    ui.gallery.view_switch.connect_changed(move |view| {
+        if view != VIEW_TIMELINE {
             return;
         }
         close_album(&ui_photos);

@@ -23,13 +23,11 @@ pub(crate) struct GalleryState {
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     /// Spins under the timeline while the next page is loading.
-    pub(crate) pager: gtk4::Spinner,
-    /// The month scrubber on the timeline's right edge, the months it spans
-    /// (newest first), and whether the pointer is on it — while it is, the
-    /// scroll position must not move the knob out from under the drag.
-    pub(crate) scrubber: gtk4::Scale,
+    pub(crate) pager: Spinner,
+    /// The month scrubber over the timeline's right edge, and the months it
+    /// spans (newest first).
+    pub(crate) scrubber: Scrubber,
     pub(crate) months: RefCell<Vec<PhotoMonth>>,
-    pub(crate) scrubbing: Cell<bool>,
     /// The pending jump the scrubber debounces to.
     pub(crate) scrub_source: RefCell<Option<glib::SourceId>>,
     /// A scrubber jump in progress: the end of the month it is headed for.
@@ -39,7 +37,7 @@ pub(crate) struct GalleryState {
     pub(crate) burst: Cell<bool>,
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
-    pub(crate) upload: gtk4::Button,
+    pub(crate) upload: adw::SplitButton,
     /// Upload / Import offered on the *empty timeline* status page, so a fresh
     /// account is a place to start rather than a dead end. Hidden on every other
     /// status: a load error is not the moment to offer an upload.
@@ -51,20 +49,17 @@ pub(crate) struct GalleryState {
     pub(crate) albums: gtk4::FlowBox,
     pub(crate) albums_stack: gtk4::Stack,
     pub(crate) albums_status: adw::StatusPage,
-    /// The Photos/Albums switcher, and the box holding it — hidden while an
-    /// album is open, where the back button leads instead.
-    pub(crate) photos_btn: gtk4::ToggleButton,
-    pub(crate) albums_btn: gtk4::ToggleButton,
-    pub(crate) view_switch: gtk4::Box,
+    /// The Timeline/Albums/Places switcher (see [`VIEW_TIMELINE`] and its
+    /// siblings) — hidden while an album is open, where the back button leads
+    /// instead.
+    pub(crate) view_switch: ToggleGroup,
     /// True while the album listing is in flight, so a re-entry into the Albums
     /// view can't stack requests.
     pub(crate) albums_loading: Cell<bool>,
-    /// The Places grid and its own status page, like the album grid's, and the
-    /// switcher's Places toggle.
+    /// The Places grid and its own status page, like the album grid's.
     pub(crate) places: gtk4::FlowBox,
     pub(crate) places_stack: gtk4::Stack,
     pub(crate) places_status: adw::StatusPage,
-    pub(crate) places_btn: gtk4::ToggleButton,
     /// True while the place listing is in flight.
     pub(crate) places_loading: Cell<bool>,
     /// The row above the place grid saying how far the daemon has got reading
@@ -74,9 +69,9 @@ pub(crate) struct GalleryState {
     pub(crate) places_mapping_label: gtk4::Label,
     pub(crate) places_mapping_bar: gtk4::ProgressBar,
     pub(crate) places_poll: RefCell<Option<glib::SourceId>>,
-    /// The place map, and the Grid/Map toggle's Map half.
+    /// The place map, and the Grid/Map toggle (see [`PLACES_MAP`]).
     pub(crate) places_map: Rc<PlacesMap>,
-    pub(crate) places_map_btn: gtk4::ToggleButton,
+    pub(crate) places_layout: ToggleGroup,
     /// How many places the grid shows, for the subtitle when back returns there.
     pub(crate) place_count: Cell<usize>,
     /// The place currently open, paged by [`load_gallery`] like an album.
@@ -102,7 +97,7 @@ pub(crate) struct GalleryState {
     pub(crate) kind: Cell<Option<PhotoKind>>,
     /// The filter toggles, index-aligned with [`kind_for_tab`], kept so their
     /// labels can carry live per-kind counts.
-    pub(crate) tabs: [gtk4::ToggleButton; 4],
+    pub(crate) tabs: ToggleGroup,
     /// Whole-timeline `(photos, videos, raw)` counts from the last page that
     /// carried them, so the subtitle can say how big the library *is* rather
     /// than how much of it has been paged in.
@@ -192,6 +187,9 @@ pub(crate) struct GalleryState {
     /// back where they were. The ListView realises rows beyond both edges of
     /// the viewport, so the widget is what tells which of them is on screen.
     pub(crate) bound: RefCell<BTreeMap<u32, (Option<String>, gtk4::Box)>>,
+    /// The tile widgets each row box has built, rebound to new photos as the
+    /// ListView recycles the row rather than built afresh on every bind.
+    pub(crate) tile_pools: RefCell<HashMap<gtk4::Box, Vec<TileWidget>>>,
     /// The ListView itself, so a rebuild can scroll back to the row the user was
     /// looking at.
     pub(crate) list: gtk4::ListView,
@@ -391,18 +389,17 @@ pub(crate) struct GalleryWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) title: adw::WindowTitle,
-    pub(crate) pager: gtk4::Spinner,
-    pub(crate) scrubber: gtk4::Scale,
+    pub(crate) pager: Spinner,
+    pub(crate) scrubber: Scrubber,
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
     pub(crate) list: gtk4::ListView,
     pub(crate) scroll: gtk4::ScrolledWindow,
     pub(crate) retry: gtk4::Button,
-    pub(crate) upload: gtk4::Button,
+    pub(crate) upload: adw::SplitButton,
     pub(crate) empty_actions: gtk4::Box,
     pub(crate) empty_upload: gtk4::Button,
     pub(crate) empty_import: gtk4::Button,
-    pub(crate) refresh: gtk4::Button,
     /// The Select toggle and the bar it reveals.
     pub(crate) select_btn: gtk4::ToggleButton,
     pub(crate) select_bar: gtk4::Revealer,
@@ -415,24 +412,21 @@ pub(crate) struct GalleryWidgets {
     pub(crate) albums: gtk4::FlowBox,
     pub(crate) albums_stack: gtk4::Stack,
     pub(crate) albums_status: adw::StatusPage,
-    pub(crate) photos_btn: gtk4::ToggleButton,
-    pub(crate) albums_btn: gtk4::ToggleButton,
-    pub(crate) view_switch: gtk4::Box,
+    pub(crate) view_switch: ToggleGroup,
     pub(crate) places: gtk4::FlowBox,
     pub(crate) places_stack: gtk4::Stack,
     pub(crate) places_status: adw::StatusPage,
-    pub(crate) places_btn: gtk4::ToggleButton,
     pub(crate) places_mapping: gtk4::Box,
     pub(crate) places_mapping_label: gtk4::Label,
     pub(crate) places_mapping_bar: gtk4::ProgressBar,
     pub(crate) places_map: Rc<PlacesMap>,
-    pub(crate) places_map_btn: gtk4::ToggleButton,
+    pub(crate) places_layout: ToggleGroup,
     pub(crate) back: gtk4::Button,
     /// The kind toggles and date jump, as one box so an album view can hide them.
     pub(crate) filters: gtk4::Box,
     /// The All / Photos / Videos / Raw filter toggles, in that order (index maps
     /// to [`kind_for_tab`]).
-    pub(crate) tabs: [gtk4::ToggleButton; 4],
+    pub(crate) tabs: ToggleGroup,
     pub(crate) favorites_row: adw::SwitchRow,
     pub(crate) not_in_album_row: adw::SwitchRow,
     /// The "On this day" strip and the box its cards go into.
@@ -505,28 +499,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     // The timeline pages itself in as the scroll nears the bottom (see
     // [`wire_gallery`]); this only says a page is on its way.
-    let pager = gtk4::Spinner::builder()
-        .halign(gtk4::Align::Center)
-        .margin_bottom(6)
-        .visible(false)
-        .build();
-
-    // Month scrubber: newest at the top, a mark per year. Dragging it jumps
-    // the timeline to the month under the knob (see [`wire_gallery`]).
-    let scrubber = gtk4::Scale::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .adjustment(&gtk4::Adjustment::new(0.0, 0.0, 1.0, 1.0, 1.0, 0.0))
-        .draw_value(false)
-        .value_pos(gtk4::PositionType::Left)
-        .round_digits(0)
-        .halign(gtk4::Align::End)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(6)
-        .tooltip_text(gettext("Jump to a month"))
-        .visible(false)
-        .build();
-    scrubber.add_css_class("photo-scrubber");
+    let pager = spinner();
+    pager.set_halign(gtk4::Align::Center);
+    pager.set_margin_bottom(6);
+    pager.set_visible(false);
 
     // Horizontal scrolling is never wanted: the grid is sized to the viewport
     // width. External rather than Never, which would make the widest row the
@@ -549,30 +525,32 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     back.add_css_class("flat");
     back.add_css_class("circular");
 
-    // `label` and `icon_name` both replace a button's child, so the pair needs
-    // an `adw::ButtonContent` to show together.
-    let upload = gtk4::Button::builder()
+    // Importing a Google Photos export is another way of adding photos, so it
+    // sits in the Upload button's own menu. `label` and `icon_name` both
+    // replace a button's child, so the pair needs an `adw::ButtonContent` to
+    // show together.
+    let upload_menu = gio::Menu::new();
+    upload_menu.append(
+        Some(&gettext("Import from Google Photos…")),
+        Some("win.show-import"),
+    );
+    let upload = adw::SplitButton::builder()
         .child(
             &adw::ButtonContent::builder()
                 .label(pgettext("verb", "Upload"))
                 .icon_name("list-add-symbolic")
                 .build(),
         )
+        .menu_model(&upload_menu)
         .tooltip_text(gettext("Upload photos"))
+        .dropdown_tooltip(gettext("More ways to add photos"))
         .valign(gtk4::Align::Center)
         .build();
     upload.add_css_class("suggested-action");
 
-    let refresh = refresh_button();
-
-    // Importing an export and hunting for duplicates are rarer, heavier jobs
-    // than adding one photo, so they wait in the page menu rather than taking
-    // a header button each.
+    // Hunting for duplicates is a rarer, heavier job than adding one photo, so
+    // it waits in the page menu rather than taking a header button.
     let page_menu = gio::Menu::new();
-    page_menu.append(
-        Some(&gettext("Import from Google Photos…")),
-        Some("win.show-import"),
-    );
     page_menu.append(
         Some(&gettext("Find Duplicates…")),
         Some("win.find-duplicates"),
@@ -635,23 +613,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // control: exactly one is active, and flipping it reloads the timeline
     // filtered to that kind (wired in [`wire_gallery`]). Labels gain live counts
     // once a page lands.
-    let tabs: [gtk4::ToggleButton; 4] = std::array::from_fn(|i| {
-        gtk4::ToggleButton::builder()
-            .label(tab_label(i))
-            .active(i == 0)
-            .build()
-    });
-    // Group the toggles so they behave as a radio set: chaining each to the first
-    // is what GTK turns into mutual exclusion.
-    for btn in &tabs[1..] {
-        btn.set_group(Some(&tabs[0]));
-    }
-    let tab_group = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    tab_group.add_css_class("linked");
-    for btn in &tabs {
-        btn.add_css_class("pill");
-        tab_group.append(btn);
-    }
+    let labels: [String; 4] = std::array::from_fn(tab_label);
+    let tabs = ToggleGroup::new(&labels.each_ref().map(|label| (label.as_str(), None)));
+    tabs.set_round();
 
     // Favorites, "not in an album" and the month: the filters that cut across
     // the kind tabs, together in one popover so the row stays short. The tabs
@@ -704,7 +668,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // timeline, and neither applies to the album grid or to an open album.
     let filters = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filters.set_hexpand(true);
-    filters.append(&tab_group);
+    filters.append(&tabs.widget());
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     filters.append(&spacer);
@@ -714,26 +678,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // timeline, and the albums. This is navigation, not a filter — which is why
     // it sits above the filter row rather than beside the kind toggles.
     // "Timeline", not "Photos": the kind filter below has a Photos tab too.
-    let photos_btn = gtk4::ToggleButton::builder()
-        .label(gettext("Timeline"))
-        .active(true)
-        .build();
-    let albums_btn = gtk4::ToggleButton::builder()
-        .label(gettext("Albums"))
-        .build();
-    albums_btn.set_group(Some(&photos_btn));
-    let places_btn = gtk4::ToggleButton::builder()
-        .label(gettext("Places"))
-        .build();
-    places_btn.set_group(Some(&photos_btn));
-    let view_switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    view_switch.add_css_class("linked");
-    view_switch.add_css_class("view-switch");
-    view_switch.set_halign(gtk4::Align::Start);
-    for btn in [&photos_btn, &albums_btn, &places_btn] {
-        btn.add_css_class("pill");
-        view_switch.append(btn);
-    }
+    let view_switch = ToggleGroup::new(&[
+        (&gettext("Timeline"), None),
+        (&gettext("Albums"), None),
+        (&gettext("Places"), None),
+    ]);
+    view_switch.set_round();
+    let view_switch_widget = view_switch.widget();
+    view_switch_widget.add_css_class("view-switch");
+    view_switch_widget.set_halign(gtk4::Align::Start);
 
     let filter_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filter_bar.append(&filters);
@@ -762,13 +715,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&select_bar);
-    // The scrubber sits beside the list rather than over it, so the grid is
-    // laid out to the width it really has and no tile hides under a year mark.
-    let timeline_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    scroll.set_hexpand(true);
-    timeline_row.append(&scroll);
-    timeline_row.append(&scrubber);
-    timeline.append(&timeline_row);
+    // The scrubber lies over the grid's right edge and only shows when wanted,
+    // so the grid keeps its full width.
+    let timeline_view = gtk4::Overlay::new();
+    timeline_view.set_child(Some(&scroll));
+    let scrubber = Scrubber::new(&timeline_view);
+    timeline.append(&timeline_view);
     timeline.append(&pager);
 
     // The album grid: cover-first cards that flow to the width they are given.
@@ -837,18 +789,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let places_map = PlacesMap::new();
     places_stack.add_named(places_map.widget(), Some("map"));
     // The places as cards or on the map.
-    let places_grid_btn = gtk4::ToggleButton::builder()
-        .label(pgettext("layout", "Grid"))
-        .active(true)
-        .build();
-    let places_map_btn = gtk4::ToggleButton::builder()
-        .label(pgettext("layout", "Map"))
-        .group(&places_grid_btn)
-        .build();
-    let places_switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    places_switch.add_css_class("linked");
-    places_switch.append(&places_grid_btn);
-    places_switch.append(&places_map_btn);
+    let places_layout = ToggleGroup::new(&[
+        (&pgettext("layout", "Grid"), None),
+        (&pgettext("layout", "Map"), None),
+    ]);
     // While a refresh reads the library's locations (the first one after an
     // update reads all of them), a bar says how far it has got.
     let places_mapping_label = gtk4::Label::new(None);
@@ -863,7 +807,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     places_mapping.append(&places_mapping_bar);
     places_mapping.set_visible(false);
     let places_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-    places_bar.append(&places_switch);
+    places_bar.append(&places_layout.widget());
     places_bar.append(&places_mapping);
     let places_page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     places_page.append(&places_bar);
@@ -888,7 +832,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.set_margin_bottom(12);
     inner.set_margin_start(12);
     inner.set_margin_end(12);
-    inner.append(&view_switch);
+    inner.append(&view_switch_widget);
     inner.append(&filter_bar);
     inner.append(&content);
 
@@ -899,7 +843,6 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     header.pack_start(&back);
     header.pack_start(&upload);
     header.pack_end(&more);
-    header.pack_end(&refresh);
     header.pack_end(&select_btn);
 
     (
@@ -920,7 +863,6 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             empty_actions,
             empty_upload,
             empty_import,
-            refresh,
             select_btn,
             select_bar,
             select_label,
@@ -939,18 +881,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             albums,
             albums_stack,
             albums_status,
-            photos_btn,
-            albums_btn,
             view_switch,
             places,
             places_stack,
             places_status,
-            places_btn,
             places_mapping,
             places_mapping_label,
             places_mapping_bar,
             places_map,
-            places_map_btn,
+            places_layout,
             back,
             filters,
         },
@@ -1066,12 +1005,25 @@ pub(crate) fn update_gallery_tabs(ui: &Rc<Ui>, counts: (usize, usize, usize)) {
     ui.gallery.counts.set(Some(counts));
     let (photos, videos, raw) = counts;
     let totals = [photos + videos + raw, photos, videos, raw];
-    for (index, tab) in ui.gallery.tabs.iter().enumerate() {
-        let n = totals[index];
-        tab.set_label(&format!("{}  {}", tab_label(index), thousands(n)));
-        tab.set_sensitive(n > 0 || tab.is_active());
+    let active = ui.gallery.tabs.active() as usize;
+    for (index, n) in totals.into_iter().enumerate() {
+        let tabs = &ui.gallery.tabs;
+        tabs.set_label(
+            index as u32,
+            &format!("{}  {}", tab_label(index), thousands(n)),
+        );
+        tabs.set_enabled(index as u32, n > 0 || index == active);
     }
 }
+
+/// The Photos page's views, as indexes into its view switcher.
+pub(crate) const VIEW_TIMELINE: u32 = 0;
+pub(crate) const VIEW_ALBUMS: u32 = 1;
+pub(crate) const VIEW_PLACES: u32 = 2;
+
+/// The Places view's Map layout, as an index into its Grid/Map toggle; the
+/// grid is the other one.
+pub(crate) const PLACES_MAP: u32 = 1;
 
 /// The name of filter tab `index`: All, Photos, Videos or Raw.
 fn tab_label(index: usize) -> String {
@@ -1121,9 +1073,8 @@ pub(crate) fn wire_gallery(
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
         // One container for both row kinds: the bind fills it with either a
-        // heading label or a strip of tiles. The alternative — two factories, or
-        // a Stack per row — buys nothing, since a row's children are rebuilt on
-        // bind either way.
+        // heading label or a strip of tiles from the row's pool (see
+        // [`TileWidget`]).
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, TILE_GAP);
         row.set_halign(gtk4::Align::Start);
         item.set_child(Some(&row));
@@ -1168,9 +1119,19 @@ pub(crate) fn wire_gallery(
                 row_box.set_margin_top(0);
                 // The last row of a day carries the gap to the next heading.
                 row_box.set_margin_bottom(if *last { 4 } else { TILE_GAP });
-                for tile in tiles {
-                    row_box.append(&photo_tile(&ui_bind, tile.clone()));
+                let mut pools = ui_bind.gallery.tile_pools.borrow_mut();
+                let pool = pools.entry(row_box.clone()).or_default();
+                for widget in pool.iter() {
+                    widget.release(&ui_bind);
                 }
+                while pool.len() < tiles.len() {
+                    pool.push(TileWidget::new(&ui_bind));
+                }
+                for (widget, tile) in pool.iter().zip(tiles) {
+                    widget.bind(&ui_bind, tile);
+                    row_box.append(&widget.button);
+                }
+                drop(pools);
                 schedule_thumbs(&ui_bind);
             }
         }
@@ -1215,6 +1176,13 @@ pub(crate) fn wire_gallery(
             }
         }
     });
+    let ui_teardown = ui.clone();
+    factory.connect_teardown(move |_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        if let Some(row_box) = item.child().and_downcast::<gtk4::Box>() {
+            ui_teardown.gallery.tile_pools.borrow_mut().remove(&row_box);
+        }
+    });
     list.set_factory(Some(&factory));
 
     // The grid divides the content width, so a resize re-flows whatever is on
@@ -1246,6 +1214,7 @@ pub(crate) fn wire_gallery(
             load_gallery(&ui_scroll, true);
         }
         sync_scrubber_position(&ui_scroll);
+        ui_scroll.gallery.scrubber.flash();
     });
     wire_scrubber(ui);
     wire_drag_select(ui);
@@ -1320,55 +1289,19 @@ pub(crate) fn wire_gallery(
         .connect_clicked(move |_| set_selection_mode(&ui_done, false));
 
     // Filter toggles: flipping to a tab reloads the timeline filtered to that
-    // kind. Only the button being switched *on* acts — the group also fires a
-    // `toggled` for the one switching off, which this skips — and a redundant
-    // toggle to the already-current kind is a no-op.
-    for (index, tab) in ui.gallery.tabs.iter().enumerate() {
-        let ui_tab = ui.clone();
-        tab.connect_toggled(move |btn| {
-            if !btn.is_active() {
-                return;
-            }
-            let kind = kind_for_tab(index);
-            if ui_tab.gallery.kind.get() == kind {
-                return;
-            }
-            ui_tab.gallery.kind.set(kind);
-            // A different kind has a different set of months; clearing the active
-            // window makes the reload rebuild the date jump for the new kind.
-            ui_tab.gallery.range.set(None);
-            load_gallery(&ui_tab, false);
-        });
-    }
-
-    // Favorites: reload the timeline restricted to favorites (or back to all).
-    // Independent of the kind tabs and the date jump, both of which keep their
-    // current value across the toggle.
-    let ui_fav = ui.clone();
-    ui.gallery.favorites_row.connect_active_notify(move |row| {
-        let on = row.is_active();
-        if ui_fav.gallery.favorites.get() == on {
+    // kind. A redundant toggle to the already-current kind is a no-op.
+    let ui_tab = ui.clone();
+    ui.gallery.tabs.connect_changed(move |index| {
+        let kind = kind_for_tab(index as usize);
+        if ui_tab.gallery.kind.get() == kind {
             return;
         }
-        ui_fav.gallery.favorites.set(on);
-        load_gallery(&ui_fav, false);
+        ui_tab.gallery.kind.set(kind);
+        // A different kind has a different set of months; clearing the active
+        // window makes the reload rebuild the date jump for the new kind.
+        ui_tab.gallery.range.set(None);
+        load_gallery(&ui_tab, false);
     });
-
-    // Not in an album: the same kind of filter, and just as independent.
-    let ui_unfiled = ui.clone();
-    ui.gallery
-        .not_in_album_row
-        .connect_active_notify(move |row| {
-            let on = row.is_active();
-            if ui_unfiled.gallery.not_in_album.get() == on {
-                return;
-            }
-            ui_unfiled.gallery.not_in_album.set(on);
-            load_gallery(&ui_unfiled, false);
-        });
-
-    // Clear filters: back to the whole timeline in one reload. The state goes
-    // first, so each widget's handler finds nothing to change and stays quiet.
     let ui_clear = ui.clone();
     ui.gallery.clear_filters.connect_clicked(move |_| {
         let gallery = &ui_clear.gallery;
@@ -1376,7 +1309,7 @@ pub(crate) fn wire_gallery(
         gallery.favorites.set(false);
         gallery.not_in_album.set(false);
         gallery.range.set(None);
-        gallery.tabs[0].set_active(true);
+        gallery.tabs.set_active(0);
         gallery.favorites_row.set_active(false);
         gallery.not_in_album_row.set_active(false);
         gallery.date_suppress.set(true);
@@ -1570,101 +1503,75 @@ pub(crate) fn gallery_width(ui: &Rc<Ui>) -> i32 {
 /// The picture sits in an overlay over a placeholder, so a tile is never a hole:
 /// until the thumbnail lands it shows a dim card, and a photo that can never have
 /// one keeps an image glyph instead of an empty rectangle.
-pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
-    let picture = gtk4::Picture::builder()
-        // Every tile is square, so Cover crops the photo to fill it. Contain
-        // would letterbox it, and the bars would read as gaps in the sheet.
-        // The expands are what make the picture take the whole overlay.
-        .content_fit(gtk4::ContentFit::Cover)
-        .can_shrink(true)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    // Zoomed on hover by the stylesheet; the tile clips the overflow.
-    picture.add_css_class("photo-thumb");
+///
+/// A fast scroll binds hundreds of rows, so a tile is built once and then
+/// rebound to whichever photo its row shows next: [`TileWidget::bind`] only
+/// swaps what it shows, and its handlers read the photo it shows now.
+pub(crate) struct TileWidget {
+    pub(crate) button: gtk4::Button,
+    picture: gtk4::Picture,
+    caption: gtk4::Label,
+    video: gtk4::Image,
+    group: gtk4::Label,
+    check: gtk4::Image,
+    photo: Rc<RefCell<Option<PhotoItem>>>,
+}
 
-    let placeholder = gtk4::Image::builder()
-        .icon_name("image-x-generic-symbolic")
-        .pixel_size(24)
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .build();
-    placeholder.add_css_class("photo-placeholder");
+impl TileWidget {
+    pub(crate) fn new(ui: &Rc<Ui>) -> Self {
+        let picture = gtk4::Picture::builder()
+            // Every tile is square, so Cover crops the photo to fill it.
+            // Contain would letterbox it, and the bars would read as gaps in
+            // the sheet. The expands are what make the picture take the whole
+            // overlay.
+            .content_fit(gtk4::ContentFit::Cover)
+            .can_shrink(true)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        // Zoomed on hover by the stylesheet; the tile clips the overflow.
+        picture.add_css_class("photo-thumb");
 
-    // The capture time, on a gradient that only exists while the pointer is over
-    // the tile — legible over any photo, invisible the rest of the time. Under a
-    // day heading the clock time is enough; under a month or a year the day is
-    // what the heading no longer says.
-    let caption_text = match tile.grouping {
-        Grouping::Day => short_capture_time(tile.photo.capture_time),
-        Grouping::Month | Grouping::Year => short_capture_date(tile.photo.capture_time),
-    };
-    let caption = gtk4::Label::builder()
-        // Fill horizontally so the scrim spans the tile; the text itself stays
-        // left-aligned inside it.
-        .halign(gtk4::Align::Fill)
-        .valign(gtk4::Align::End)
-        .xalign(0.0)
-        .label(caption_text)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .build();
-    caption.add_css_class("photo-caption");
-
-    let overlay = gtk4::Overlay::new();
-    overlay.set_child(Some(&placeholder));
-    overlay.add_overlay(&picture);
-    overlay.add_overlay(&caption);
-
-    // A video reads as a video at a glance: a play glyph centred over the poster
-    // thumbnail. Kept above the caption scrim so it stays legible on hover.
-    // Zoomed out, the glyph shrinks with the tile so it marks the video without
-    // covering it.
-    let small = tile.grouping != Grouping::Day;
-    let is_video = tile.photo.kind == PhotoKind::Video;
-    if is_video {
-        let badge = gtk4::Image::builder()
-            .icon_name("media-playback-start-symbolic")
-            .pixel_size(if small { 12 } else { 28 })
+        let placeholder = gtk4::Image::builder()
+            .icon_name("image-x-generic-symbolic")
+            .pixel_size(24)
             .halign(gtk4::Align::Center)
             .valign(gtk4::Align::Center)
             .build();
-        badge.add_css_class("photo-video-badge");
-        if small {
-            badge.add_css_class("photo-video-badge-small");
-        }
-        overlay.add_overlay(&badge);
-    }
+        placeholder.add_css_class("photo-placeholder");
 
-    // A shot stored as more than one file says so, in the corner the caption
-    // does not use. "RAW" is the useful word when one of the members is a raw
-    // file — that is what the person wants to find — and a plain count covers
-    // the rest (a live photo, a burst). Only the Day zoom shows it: on the
-    // smaller Month and Year tiles a badge on every raw+JPEG shot turns the
-    // grid into noise.
-    if (tile.photo.has_raw || tile.photo.group_size > 1) && tile.grouping == Grouping::Day {
-        let badge = gtk4::Label::builder()
-            .label(if tile.photo.has_raw {
-                // Translators: badge on a photo tile whose shot includes a raw camera file.
-                gettext("RAW")
-            } else {
-                format!("{}", tile.photo.group_size)
-            })
+        // The capture time, on a gradient that only exists while the pointer
+        // is over the tile — legible over any photo, invisible the rest of the
+        // time.
+        let caption = gtk4::Label::builder()
+            // Fill horizontally so the scrim spans the tile; the text itself
+            // stays left-aligned inside it.
+            .halign(gtk4::Align::Fill)
+            .valign(gtk4::Align::End)
+            .xalign(0.0)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .build();
+        caption.add_css_class("photo-caption");
+
+        // A video reads as a video at a glance: a play glyph centred over the
+        // poster thumbnail. Kept above the caption scrim so it stays legible
+        // on hover.
+        let video = gtk4::Image::builder()
+            .icon_name("media-playback-start-symbolic")
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .build();
+        video.add_css_class("photo-video-badge");
+
+        // A shot stored as more than one file says so, in the corner the
+        // caption does not use.
+        let group = gtk4::Label::builder()
             .halign(gtk4::Align::End)
             .valign(gtk4::Align::Start)
             .build();
-        badge.add_css_class("photo-group-badge");
-        overlay.add_overlay(&badge);
-    }
+        group.add_css_class("photo-group-badge");
 
-    // Selection mode marks every tile, picked or not: a check that only appears
-    // once a photo is chosen leaves the user guessing what else is clickable.
-    if tile.selecting {
         let check = gtk4::Image::builder()
-            .icon_name(if tile.selected {
-                "checkbox-checked-symbolic"
-            } else {
-                "checkbox-symbolic"
-            })
             .pixel_size(16)
             .halign(gtk4::Align::Start)
             .valign(gtk4::Align::Start)
@@ -1672,80 +1579,170 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
             .margin_top(6)
             .build();
         check.add_css_class("photo-check");
-        if tile.selected {
-            check.add_css_class("photo-check-on");
-        }
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&placeholder));
+        overlay.add_overlay(&picture);
+        overlay.add_overlay(&caption);
+        overlay.add_overlay(&video);
+        overlay.add_overlay(&group);
         overlay.add_overlay(&check);
-    }
 
-    let button = gtk4::Button::builder()
-        .child(&overlay)
-        .width_request(tile.width)
-        .height_request(tile.height)
-        .tooltip_text(format_capture_time(tile.photo.capture_time))
-        .build();
-    button.add_css_class("photo-tile");
-    button.add_css_class("flat");
-    if tile.selected {
-        button.add_css_class("photo-tile-selected");
-    }
-    // Clip the thumbnail to the tile's rounded corners.
-    button.set_overflow(gtk4::Overflow::Hidden);
+        let button = gtk4::Button::builder().child(&overlay).build();
+        button.add_css_class("photo-tile");
+        button.add_css_class("flat");
+        // Clip the thumbnail to the tile's rounded corners.
+        button.set_overflow(gtk4::Overflow::Hidden);
 
-    want_thumb(ui, &tile.photo, &picture);
+        let photo: Rc<RefCell<Option<PhotoItem>>> = Rc::default();
+        let uid = {
+            let photo = photo.clone();
+            move || photo.borrow().as_ref().map(|p| p.uid.clone())
+        };
 
-    // Ctrl or Shift on a plain click starts a selection — the gesture people
-    // already use for picking things, without having to find the Select button
-    // first. Ctrl picks one photo; Shift picks everything from the last photo
-    // clicked to this one, as in a file manager. Claimed in the capture phase so
-    // the click never also opens the photo it was picking.
-    let modifier = gtk4::GestureClick::new();
-    modifier.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let ui_modifier = ui.clone();
-    let modifier_uid = tile.photo.uid.clone();
-    modifier.connect_pressed(move |gesture, _, _, _| {
-        let state = gesture.current_event_state();
-        let shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-        if !shift && !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-            return;
-        }
-        gesture.set_state(gtk4::EventSequenceState::Claimed);
-        set_selection_mode(&ui_modifier, true);
-        let anchor = ui_modifier.gallery.select_anchor.borrow().clone();
-        match anchor {
-            Some(anchor) if shift => {
-                let base = ui_modifier.gallery.selected.borrow().clone();
-                select_range(&ui_modifier, &anchor, &modifier_uid, &base);
+        // Ctrl or Shift on a plain click starts a selection — the gesture
+        // people already use for picking things, without having to find the
+        // Select button first. Ctrl picks one photo; Shift picks everything
+        // from the last photo clicked to this one, as in a file manager.
+        // Claimed in the capture phase so the click never also opens the photo
+        // it was picking.
+        let modifier = gtk4::GestureClick::new();
+        modifier.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let ui_modifier = ui.clone();
+        let modifier_uid = uid.clone();
+        modifier.connect_pressed(move |gesture, _, _, _| {
+            let state = gesture.current_event_state();
+            let shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+            if !shift && !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                return;
             }
-            _ => toggle_selected(&ui_modifier, &modifier_uid),
-        }
-    });
-    button.add_controller(modifier);
+            let Some(uid) = modifier_uid() else {
+                return;
+            };
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            set_selection_mode(&ui_modifier, true);
+            let anchor = ui_modifier.gallery.select_anchor.borrow().clone();
+            match anchor {
+                Some(anchor) if shift => {
+                    let base = ui_modifier.gallery.selected.borrow().clone();
+                    select_range(&ui_modifier, &anchor, &uid, &base);
+                }
+                _ => toggle_selected(&ui_modifier, &uid),
+            }
+        });
+        button.add_controller(modifier);
 
-    let context = gtk4::GestureClick::builder().button(3).build();
-    let ui_context = ui.clone();
-    let photo = tile.photo.clone();
-    context.connect_pressed(move |gesture, _, x, y| {
-        gesture.set_state(gtk4::EventSequenceState::Claimed);
-        if let Some(anchor) = gesture.widget().and_downcast::<gtk4::Button>() {
-            show_photo_menu(&ui_context, &photo, &anchor, x, y);
-        }
-    });
-    button.add_controller(context);
+        let context = gtk4::GestureClick::builder().button(3).build();
+        let ui_context = ui.clone();
+        let context_photo = photo.clone();
+        context.connect_pressed(move |gesture, _, x, y| {
+            let Some(photo) = context_photo.borrow().clone() else {
+                return;
+            };
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(anchor) = gesture.widget().and_downcast::<gtk4::Button>() {
+                show_photo_menu(&ui_context, &photo, &anchor, x, y);
+            }
+        });
+        button.add_controller(context);
 
-    // A tile opens in the in-app lightbox, which plays a video in place. In
-    // selection mode a tile picks instead of opening: the lightbox is one
-    // Escape away.
-    let ui_open = ui.clone();
-    let uid = tile.photo.uid.clone();
-    button.connect_clicked(move |_| {
-        if ui_open.gallery.selecting.get() {
-            toggle_selected(&ui_open, &uid);
+        // A tile opens in the in-app lightbox, which plays a video in place.
+        // In selection mode a tile picks instead of opening: the lightbox is
+        // one Escape away.
+        let ui_open = ui.clone();
+        button.connect_clicked(move |_| {
+            let Some(uid) = uid() else {
+                return;
+            };
+            if ui_open.gallery.selecting.get() {
+                toggle_selected(&ui_open, &uid);
+            } else {
+                open_photo_viewer(&ui_open, uid);
+            }
+        });
+
+        Self {
+            button,
+            picture,
+            caption,
+            video,
+            group,
+            check,
+            photo,
+        }
+    }
+
+    /// Show `tile` in place of whatever the widget showed before.
+    pub(crate) fn bind(&self, ui: &Rc<Ui>, tile: &Tile) {
+        self.button.set_size_request(tile.width, tile.height);
+        self.picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+
+        // Under a day heading the clock time is enough; under a month or a
+        // year the day is what the heading no longer says.
+        self.caption.set_label(&match tile.grouping {
+            Grouping::Day => short_capture_time(tile.photo.capture_time),
+            Grouping::Month | Grouping::Year => short_capture_date(tile.photo.capture_time),
+        });
+
+        // Zoomed out, the play glyph shrinks with the tile so it marks the
+        // video without covering it.
+        let small = tile.grouping != Grouping::Day;
+        self.video.set_visible(tile.photo.kind == PhotoKind::Video);
+        self.video.set_pixel_size(if small { 12 } else { 28 });
+        set_css_class(&self.video, "photo-video-badge-small", small);
+
+        // "RAW" is the useful word when one of the shot's files is a raw file
+        // — that is what the person wants to find — and a plain count covers
+        // the rest (a live photo, a burst). Only the Day zoom shows it: on the
+        // smaller Month and Year tiles a badge on every raw+JPEG shot turns
+        // the grid into noise.
+        let grouped = tile.photo.has_raw || tile.photo.group_size > 1;
+        self.group
+            .set_visible(grouped && tile.grouping == Grouping::Day);
+        if tile.photo.has_raw {
+            // Translators: badge on a photo tile whose shot includes a raw camera file.
+            self.group.set_label(&gettext("RAW"));
         } else {
-            open_photo_viewer(&ui_open, uid.clone());
+            self.group.set_label(&tile.photo.group_size.to_string());
         }
-    });
-    button
+
+        // Selection mode marks every tile, picked or not: a check that only
+        // appears once a photo is chosen leaves the user guessing what else is
+        // clickable.
+        self.check.set_visible(tile.selecting);
+        self.check.set_icon_name(Some(if tile.selected {
+            "checkbox-checked-symbolic"
+        } else {
+            "checkbox-symbolic"
+        }));
+        set_css_class(&self.check, "photo-check-on", tile.selected);
+        set_css_class(&self.button, "photo-tile-selected", tile.selected);
+
+        *self.photo.borrow_mut() = Some(tile.photo.clone());
+        want_thumb(ui, &tile.photo, &self.picture);
+    }
+
+    /// Give up the claim on the thumbnail of the photo shown last, so it
+    /// cannot land in this widget once it shows another one.
+    pub(crate) fn release(&self, ui: &Rc<Ui>) {
+        let Some(photo) = self.photo.borrow_mut().take() else {
+            return;
+        };
+        let mut wanted = ui.gallery.thumb_wanted.borrow_mut();
+        if wanted.get(&photo.uid) == Some(&self.picture) {
+            wanted.remove(&photo.uid);
+        }
+    }
+}
+
+/// Add or remove one CSS class, for widgets that are rebound rather than
+/// rebuilt.
+fn set_css_class(widget: &impl IsA<gtk4::Widget>, class: &str, on: bool) {
+    if on {
+        widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
+    }
 }
 
 /// Enter or leave selection mode, repainting the tiles so their checkboxes
@@ -2851,20 +2848,14 @@ pub(crate) fn empty_timeline_text(
 /// mark and a year label where each year starts. Shown only for the whole,
 /// unfiltered timeline with more than one month to move between.
 fn fill_scrubber(ui: &Rc<Ui>, months: &[PhotoMonth]) {
-    let scrubber = &ui.gallery.scrubber;
-    scrubber.clear_marks();
     *ui.gallery.months.borrow_mut() = months.to_vec();
-    scrubber.set_range(0.0, months.len().saturating_sub(1).max(1) as f64);
-    scrubber.set_value(0.0);
-    for (index, pair) in months.windows(2).enumerate() {
-        if pair[0].year != pair[1].year {
-            scrubber.add_mark(
-                (index + 1) as f64,
-                gtk4::PositionType::Left,
-                Some(&pair[1].year.to_string()),
-            );
-        }
-    }
+    let years = months
+        .iter()
+        .enumerate()
+        .filter(|&(index, month)| index == 0 || months[index - 1].year != month.year)
+        .map(|(index, month)| (index, month.year.to_string()))
+        .collect();
+    ui.gallery.scrubber.set_months(months.len(), years);
     sync_scrubber(ui);
 }
 
@@ -2877,7 +2868,7 @@ pub(crate) fn sync_scrubber(ui: &Rc<Ui>) {
         && !ui.gallery.not_in_album.get();
     ui.gallery
         .scrubber
-        .set_visible(whole && ui.gallery.months.borrow().len() > 1);
+        .set_available(whole && ui.gallery.months.borrow().len() > 1);
 }
 
 /// How many photos the "On this day" strip asks for. Enough for a card per year
@@ -3036,10 +3027,10 @@ fn scrubber_label(months: &[PhotoMonth], index: usize) -> String {
         .map_or_else(String::new, |m| month_label(m.year, m.month))
 }
 
-/// Move the knob to the month at the top of the timeline, unless the user is
-/// holding it.
+/// Move the knob to the month at the top of the timeline. The scrubber itself
+/// ignores this while the user has it in hand.
 fn sync_scrubber_position(ui: &Rc<Ui>) {
-    if ui.gallery.scrubbing.get() || !ui.gallery.scrubber.is_visible() {
+    if !ui.gallery.scrubber.is_available() {
         return;
     }
     let Some((uid, _)) = top_anchor(ui) else {
@@ -3054,7 +3045,7 @@ fn sync_scrubber_position(ui: &Rc<Ui>) {
     };
     let months = ui.gallery.months.borrow();
     if let Some(index) = month_index(&months, capture_time) {
-        ui.gallery.scrubber.set_value(index as f64);
+        ui.gallery.scrubber.set_value(index);
     }
 }
 
@@ -3070,43 +3061,24 @@ pub(crate) fn month_index(months: &[PhotoMonth], capture_time: i64) -> Option<us
     }
 }
 
-/// Wire the scrubber: its value label while the pointer is on it, and the
-/// jump once it rests on a month.
+/// Wire the scrubber: the month names in its bubble, and the jump once it
+/// rests on a month.
 fn wire_scrubber(ui: &Rc<Ui>) {
-    let scrubber = ui.gallery.scrubber.clone();
-    let ui_format = ui.clone();
-    scrubber.set_format_value_func(move |_, value| {
-        scrubber_label(&ui_format.gallery.months.borrow(), value.round() as usize)
-    });
-
-    let hover = gtk4::EventControllerMotion::new();
-    let ui_enter = ui.clone();
-    hover.connect_enter(move |_, _, _| {
-        ui_enter.gallery.scrubbing.set(true);
-        ui_enter.gallery.scrubber.set_draw_value(true);
-    });
-    let ui_leave = ui.clone();
-    hover.connect_leave(move |_| {
-        ui_leave.gallery.scrubbing.set(false);
-        ui_leave.gallery.scrubber.set_draw_value(false);
-    });
-    scrubber.add_controller(hover);
-
-    // `change-value` fires for the user's own moves only, not for the knob
-    // following the scroll.
-    let ui_change = ui.clone();
-    scrubber.connect_change_value(move |_, _, value| {
-        if let Some(source) = ui_change.gallery.scrub_source.borrow_mut().take() {
+    let ui_label = ui.clone();
+    ui.gallery
+        .scrubber
+        .set_label_func(move |index| scrubber_label(&ui_label.gallery.months.borrow(), index));
+    let ui_pick = ui.clone();
+    ui.gallery.scrubber.connect_pick(move |index| {
+        if let Some(source) = ui_pick.gallery.scrub_source.borrow_mut().take() {
             source.remove();
         }
-        let index = value.round().max(0.0) as usize;
-        let ui_jump = ui_change.clone();
+        let ui_jump = ui_pick.clone();
         let source = glib::timeout_add_local_once(SCRUB_DEBOUNCE, move || {
             ui_jump.gallery.scrub_source.borrow_mut().take();
             jump_to_month(&ui_jump, index);
         });
-        *ui_change.gallery.scrub_source.borrow_mut() = Some(source);
-        glib::Propagation::Proceed
+        *ui_pick.gallery.scrub_source.borrow_mut() = Some(source);
     });
 }
 
@@ -3332,7 +3304,6 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     };
     ui.gallery.loading.set(true);
     ui.gallery.pager.set_visible(append);
-    ui.gallery.pager.set_spinning(append);
 
     ui.busy_begin();
     let request = match (album, place) {
@@ -3354,7 +3325,6 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         ui.busy_end();
         ui.gallery.loading.set(false);
         ui.gallery.pager.set_visible(false);
-        ui.gallery.pager.set_spinning(false);
         if ui.gallery.reload_pending.take() {
             load_gallery(&ui, false);
             return;

@@ -1184,6 +1184,10 @@ impl Core {
             format!("{reason}; local changes uploaded as {alt}"),
             false,
         );
+        self.events.publish(&[
+            pdfs_core::control::Topic::Files,
+            pdfs_core::control::Topic::Conflicts,
+        ]);
         info!(%uid, name, alt, "queued write landed as a conflict copy");
         Ok(())
     }

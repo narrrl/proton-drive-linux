@@ -20,7 +20,7 @@ pub(crate) struct StatusState {
     /// systemd user service, not by the user — so this only reports.
     pub(crate) status_icon: gtk4::Image,
     /// Stands in for [`Self::status_icon`] until the first status arrives.
-    pub(crate) status_spinner: gtk4::Spinner,
+    pub(crate) status_spinner: Spinner,
     pub(crate) status_title: gtk4::Label,
     pub(crate) status_detail: gtk4::Label,
     pub(crate) cache_bar: gtk4::ProgressBar,
@@ -106,7 +106,7 @@ const SYNC_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(30);
 /// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
 /// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
 pub(crate) struct PinRow {
-    pub(crate) row: adw::ActionRow,
+    pub(crate) row: gtk4::ListBoxRow,
     /// The unpin button, absent on the placeholder row.
     pub(crate) unpin: Option<gtk4::Button>,
 }
@@ -140,7 +140,7 @@ pub(crate) struct MainWidgets {
     pub(crate) account_name: gtk4::Label,
     pub(crate) avatar: adw::Avatar,
     pub(crate) status_icon: gtk4::Image,
-    pub(crate) status_spinner: gtk4::Spinner,
+    pub(crate) status_spinner: Spinner,
     pub(crate) status_title: gtk4::Label,
     pub(crate) status_detail: gtk4::Label,
     pub(crate) quota_box: gtk4::Box,
@@ -331,7 +331,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     // Until the first status arrives there is no state to show, only that the
     // app is still asking.
     let status_icon = gtk4::Image::builder().visible(false).build();
-    let status_spinner = gtk4::Spinner::builder().spinning(true).build();
+    let status_spinner = spinner();
     let status_title = gtk4::Label::builder()
         .label(gettext("Connecting…"))
         .halign(gtk4::Align::Start)
@@ -774,9 +774,8 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
             return;
         }
         ui.status.mountpoint_row.set_subtitle(&path_str);
-        // The Locations page shows the same path as a row title; its cached rows
-        // are now stale whether or not it is the visible page.
-        ui.locations.loaded_at.set(None);
+        // The Locations page shows the same path as a row title. Any other page
+        // reads it again on the next visit.
         if ui.stack.visible_child_name().as_deref() == Some("locations") {
             load_locations(&ui);
         }
@@ -826,10 +825,11 @@ pub(crate) fn wire_retry(ui: &Rc<Ui>) {
         .connect_clicked(move |_| restart_service_then(&ui_trash, load_trash));
 }
 
-/// Repaint the window from the cached login identity, then kick an async mount-
-/// status fetch. Runs on the 2s tick: the identity check is instant (no keyring),
-/// and the status round-trip is offloaded to a worker so the main loop never
-/// blocks on a slow or wedged daemon.
+/// Repaint the window from the cached login identity, then ask the daemon for
+/// its status and transfers. Runs at startup, after a login and after a service
+/// restart; the daemon's event feed keeps both current in between. The identity
+/// check is instant (no keyring), and the round-trips run on workers so the
+/// main loop never blocks on a slow or wedged daemon.
 pub(crate) fn refresh(ui: &Rc<Ui>) {
     // Login identity decides which page is shown. Read the cached session — set
     // at startup and on login/logout — never the keyring.
@@ -862,32 +862,10 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
 
     refresh_status(ui);
     refresh_transfers(ui);
-    // Both of these pages show work as it happens, so they follow the tick while
-    // they are on screen. Every other page loads on navigation only.
-    // A Takeout import outlives the page that started it, so it is polled
-    // wherever the user has navigated to — otherwise leaving the page means
-    // never being told it finished.
-    ui.gallery
-        .import_banner
-        .set_revealed(ui.takeout.running.get());
-    if ui.stack.visible_child_name().as_deref() == Some("takeout") || ui.takeout.running.get() {
-        refresh_takeout(ui);
-    }
-    // The quota sits in the sidebar footer, visible on every page; its TTL
-    // keeps this from asking more than once a minute.
-    refresh_quota(ui);
-    if ui.stack.visible_child_name().as_deref() == Some("locations") {
-        tick_sync_view(ui);
-    } else {
-        // The sidebar badges count conflicts and invitations wherever the
-        // user is; both lists are costly enough to ask for rarely.
-        refresh_conflicts_badge(ui);
-    }
-    refresh_invitations_badge(ui);
 }
 
-/// How long a quota reading stays fresh. Account storage barely moves, so the
-/// active-page tick refetches it only this often rather than every 2s.
+/// How long a quota reading stays fresh. Account storage barely moves, so a
+/// status change reads it again only this often.
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 
 /// Fetch the account quota (if the last reading is stale) and paint the
@@ -992,9 +970,9 @@ pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     }
 }
 
-/// Poll the daemon's in-flight transfers on a worker thread and repaint the
+/// Ask the daemon for its in-flight transfers on a worker thread and repaint the
 /// Activity group. Independently inflight-guarded from [`refresh_status`] so the
-/// two cheap polls on the 2s tick don't gate each other. The group hides itself
+/// two requests don't gate each other; the event feed pushes later snapshots. The group hides itself
 /// when nothing is moving, so an idle account shows no Activity section.
 pub(crate) fn refresh_transfers(ui: &Rc<Ui>) {
     if ui.status.transfers_inflight.get() {
@@ -1187,7 +1165,10 @@ pub(crate) fn transfer_line(t: &TransferItem) -> ActivityLine {
 /// the mount line, cache bar and pin list on the reply. The daemon owns the cache
 /// stats now (`used`/`budget`/`pins` ride along on [`Response::Status`]), so the
 /// GUI never opens the on-disk cache itself. Skipped while a fetch is in flight so
-/// the tick can't stack threads on a stalled daemon.
+/// a stalled daemon can't pile up threads.
+///
+/// The event feed pushes every later change through [`paint_status`]; this asks
+/// only when the feed (re)connects or loses the daemon.
 pub(crate) fn refresh_status(ui: &Rc<Ui>) {
     if ui.status.status_inflight.get() {
         return;
@@ -1199,90 +1180,100 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
         let result = rx.recv().await;
         ui.status.status_inflight.set(false);
         match result {
-            Ok(Ok(Response::Status {
-                mountpoint,
-                used,
-                budget,
-                pins,
-                online,
-                pending_uploads,
-                pending_changes,
-                failing_ops,
-                failing_error,
-                paused,
-                paused_until,
-                ..
-            })) => {
-                set_mounted(&ui, true);
-                // The queue is the more useful thing to say when it has anything
-                // in it: it is why a file that looks saved is not on the remote
-                // yet, and offline is usually the reason it is still queued.
-                let queued = i18n::pending_summary(pending_uploads, pending_changes);
-                let state = if paused {
-                    SyncState::Paused {
-                        until: paused_until,
-                        queued,
-                    }
-                } else if failing_ops > 0 {
-                    SyncState::Attention {
-                        count: failing_ops,
-                        error: failing_error,
-                    }
-                } else if !online {
-                    SyncState::Offline { queued }
-                } else if let Some(queued) = queued {
-                    SyncState::Syncing { queued }
-                } else {
-                    SyncState::UpToDate { mountpoint }
-                };
-                paint_sync_status(&ui, state);
-                ui.locations.failing.set(failing_ops);
-                paint_sync_banner(&ui);
-                let fraction = if budget == 0 {
-                    0.0
-                } else {
-                    (used as f64 / budget as f64).min(1.0)
-                };
-                ui.status.cache_bar.set_fraction(fraction);
-                // A 0 budget means *unlimited*, not a zero-byte cap — "of 0 B
-                // used" reads as a broken read-out, and there is no fraction to
-                // draw against no limit.
-                ui.status.cache_label.set_text(&if budget == 0 {
-                    // Translators: {used} is a size such as "1.2 GiB".
-                    gettext_f(
-                        "{used} cached — no limit set",
-                        &[("used", &human_bytes(used))],
-                    )
-                } else {
-                    // Translators: {used} and {limit} are sizes such as "1.2 GiB".
-                    gettext_f(
-                        "{used} of {limit} used",
-                        &[
-                            ("used", &human_bytes(used)),
-                            ("limit", &human_bytes(budget)),
-                        ],
-                    )
-                });
-                repaint_pins(&ui, &pins, true);
-            }
+            Ok(Ok(status @ Response::Status { .. })) => paint_status(&ui, status),
             // The daemon is up but stuck. Say so, and keep the mount state:
             // announcing "disconnected" for a slow reply would be wrong, and
-            // the next tick asks again.
+            // the feed asks again when it reconnects.
             Ok(Err(e)) if e.is_timeout() => paint_sync_status(&ui, SyncState::NotResponding),
-            // Daemon unreachable (still starting, or down): report not-mounted and
-            // grey out the unpin buttons in place, but leave the last-known pin
-            // rows and cache read-out so the page doesn't flicker on a blip.
-            _ => {
-                set_mounted(&ui, false);
-                paint_sync_status(&ui, SyncState::Disconnected);
-                for r in ui.status.pin_rows.borrow().iter() {
-                    if let Some(b) = &r.unpin {
-                        b.set_sensitive(false);
-                    }
-                }
-            }
+            _ => paint_disconnected(&ui),
         }
     });
+}
+
+/// Paint a [`Response::Status`], fetched or pushed: the mount state, the sync
+/// status, the cache bar and the pin list.
+pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
+    let Response::Status {
+        mountpoint,
+        used,
+        budget,
+        pins,
+        online,
+        pending_uploads,
+        pending_changes,
+        failing_ops,
+        failing_error,
+        paused,
+        paused_until,
+        ..
+    } = status
+    else {
+        return;
+    };
+    set_mounted(ui, true);
+    // The queue is the more useful thing to say when it has anything
+    // in it: it is why a file that looks saved is not on the remote
+    // yet, and offline is usually the reason it is still queued.
+    let queued = i18n::pending_summary(pending_uploads, pending_changes);
+    let state = if paused {
+        SyncState::Paused {
+            until: paused_until,
+            queued,
+        }
+    } else if failing_ops > 0 {
+        SyncState::Attention {
+            count: failing_ops,
+            error: failing_error,
+        }
+    } else if !online {
+        SyncState::Offline { queued }
+    } else if let Some(queued) = queued {
+        SyncState::Syncing { queued }
+    } else {
+        SyncState::UpToDate { mountpoint }
+    };
+    paint_sync_status(ui, state);
+    ui.locations.failing.set(failing_ops);
+    paint_sync_banner(ui);
+    let fraction = if budget == 0 {
+        0.0
+    } else {
+        (used as f64 / budget as f64).min(1.0)
+    };
+    ui.status.cache_bar.set_fraction(fraction);
+    // A 0 budget means *unlimited*, not a zero-byte cap — "of 0 B
+    // used" reads as a broken read-out, and there is no fraction to
+    // draw against no limit.
+    ui.status.cache_label.set_text(&if budget == 0 {
+        // Translators: {used} is a size such as "1.2 GiB".
+        gettext_f(
+            "{used} cached — no limit set",
+            &[("used", &human_bytes(used))],
+        )
+    } else {
+        // Translators: {used} and {limit} are sizes such as "1.2 GiB".
+        gettext_f(
+            "{used} of {limit} used",
+            &[
+                ("used", &human_bytes(used)),
+                ("limit", &human_bytes(budget)),
+            ],
+        )
+    });
+    repaint_pins(ui, &pins, true);
+}
+
+/// Daemon unreachable (still starting, or down): report not-mounted and grey
+/// out the unpin buttons in place, but leave the last-known pin rows and cache
+/// read-out so the page doesn't flicker on a blip.
+pub(crate) fn paint_disconnected(ui: &Rc<Ui>) {
+    set_mounted(ui, false);
+    paint_sync_status(ui, SyncState::Disconnected);
+    for r in ui.status.pin_rows.borrow().iter() {
+        if let Some(b) = &r.unpin {
+            b.set_sensitive(false);
+        }
+    }
 }
 
 /// What the sidebar's status strip reports, most urgent first.
@@ -1386,7 +1377,6 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     image.set_icon_name(Some(icon));
     image.set_visible(true);
     ui.status.status_spinner.set_visible(false);
-    ui.status.status_spinner.set_spinning(false);
     for c in ["success", "warning", "error"] {
         image.remove_css_class(c);
     }
@@ -1465,10 +1455,10 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             ))
             .build();
         ui.status.pins_group.add(&row);
-        ui.status
-            .pin_rows
-            .borrow_mut()
-            .push(PinRow { row, unpin: None });
+        ui.status.pin_rows.borrow_mut().push(PinRow {
+            row: row.upcast(),
+            unpin: None,
+        });
         return;
     }
 
@@ -1529,32 +1519,29 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
 
         ui.status.pins_group.add(&row);
         ui.status.pin_rows.borrow_mut().push(PinRow {
-            row,
+            row: row.upcast(),
             unpin: Some(unpin),
         });
     }
 
     if pins.len() > PINS_COLLAPSED {
-        let row = adw::ActionRow::builder()
-            .title(if expanded {
-                gettext("Show fewer")
-            } else {
-                ngettext_f(
-                    "Show all {n} file",
-                    "Show all {n} files",
-                    pins.len() as u64,
-                    &[],
-                )
-            })
-            .activatable(true)
-            .build();
-        row.add_suffix(&gtk4::Image::from_icon_name(if expanded {
+        let title = if expanded {
+            gettext("Show fewer")
+        } else {
+            ngettext_f(
+                "Show all {n} file",
+                "Show all {n} files",
+                pins.len() as u64,
+                &[],
+            )
+        };
+        let icon = if expanded {
             "go-up-symbolic"
         } else {
             "go-down-symbolic"
-        }));
+        };
         let ui_more = ui.clone();
-        row.connect_activated(move |_| {
+        let row = button_row(&title, icon, move || {
             ui_more
                 .status
                 .pins_expanded

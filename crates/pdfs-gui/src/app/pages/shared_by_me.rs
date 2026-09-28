@@ -17,9 +17,6 @@ pub(crate) struct SharedByMeState {
     pub(crate) items: Rc<RefCell<Vec<SharedItem>>>,
     /// Runs the loads; the rows stay up while one runs.
     pub(crate) loader: Rc<Loader>,
-    /// When the page last painted good data. `None` = never / invalidated,
-    /// forcing a fetch on next visit. See [`PAGE_TTL`].
-    pub(crate) loaded_at: Cell<Option<Instant>>,
 }
 
 impl SharedByMeState {
@@ -33,7 +30,6 @@ impl SharedByMeState {
             filter: widgets.filter.clone(),
             items: Rc::new(RefCell::new(Vec::new())),
             loader: Loader::new(&widgets.content),
-            loaded_at: Cell::new(None),
         }
     }
 }
@@ -44,7 +40,6 @@ pub(crate) struct SharedByMeWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
-    pub(crate) refresh: gtk4::Button,
     pub(crate) subtitle: adw::WindowTitle,
     pub(crate) filter: gtk4::DropDown,
 }
@@ -82,7 +77,6 @@ fn share_filter_label(filter: ShareFilter) -> String {
 /// Activating one opens its Share dialog, since managing access is what this
 /// page is for; opening the item itself is in the menu.
 pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
-    let refresh = refresh_button();
     let files = FileList::new();
     files.show_list(true);
     let layout = layout_button(&files);
@@ -125,7 +119,6 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
 
     let (frame, header, subtitle) = page_frame(&gettext("Shared by me"), &inner);
     header.pack_start(&filter);
-    header.pack_end(&refresh);
     header.pack_end(&layout);
 
     (
@@ -135,7 +128,6 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
             content,
             status,
             retry,
-            refresh,
             subtitle,
             filter,
         },
@@ -375,7 +367,6 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
                 *ui.shared_by_me.items.borrow_mut() = items.clone();
                 repaint_shared_by_me(&ui, &items);
                 rebind_rows(&ui, &changed);
-                ui.shared_by_me.loaded_at.set(Some(Instant::now()));
             }
             Ok(Ok(Response::Error { message, .. })) => shared_by_me_status(
                 &ui,
@@ -392,7 +383,6 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
                 false,
             ),
             Ok(Err(_)) | Err(_) => {
-                ui.shared_by_me.loaded_at.set(None);
                 shared_by_me_unreachable(&ui);
             }
         }
@@ -582,7 +572,6 @@ pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entries: &[DirEntry]) {
                 .collect(),
             gettext_noop("Couldn't stop sharing"),
             move |ui| {
-                ui.shared_by_me.loaded_at.set(None);
                 reload_listing(ui);
                 toast(ui, &done);
             },

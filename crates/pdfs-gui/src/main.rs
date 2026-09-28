@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ksni::blocking::TrayMethods;
@@ -21,14 +21,17 @@ use ksni::menu::StandardItem;
 use ksni::{MenuItem, Status, ToolTip, Tray};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
-use pdfs_core::control::{JobItem, Request, Response, TransferDirection, TransferItem, send};
+use pdfs_core::control::{
+    Event, Feed, JobItem, Request, Response, TransferDirection, TransferItem, follow, send,
+};
 use pdfs_core::service;
 
 mod i18n;
 use i18n::{gettext, gettext_f, ngettext_f};
 
-/// How often the tray re-polls the daemon to refresh its menu.
-const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// How long the tray lets a burst of events arrive before it repaints. Progress
+/// moves several times a second, which is more than a tray menu can show.
+const COALESCE: Duration = Duration::from_secs(1);
 
 /// The one word the icon says about the drive, derived from each poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,79 +142,16 @@ struct DriveTray {
 /// menu can still say "Logged in …" / "Not logged in" when no mount is running.
 fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
     match send(socket, &Request::Status) {
-        Ok(Response::Status {
-            mountpoint,
-            pinned,
-            online,
-            pending_uploads,
-            pending_changes,
-            failing_ops,
-            paused,
-            ..
-        }) => {
-            // Same daemon is up, so a cheap follow-up poll gives the sync line.
+        Ok(status @ Response::Status { .. }) => {
+            // Same daemon is up, so a cheap follow-up request gives the sync line.
             let sync = match send(socket, &Request::GetQueueStatus) {
                 Ok(Response::Transfers { items, jobs }) => sync_line(&items, &jobs),
                 _ => String::new(),
             };
-            let queued = i18n::pending_summary(pending_uploads, pending_changes);
-            let phase = phase_of(
-                paused,
-                failing_ops,
-                online,
-                queued.is_some() || !sync.is_empty(),
-            );
-            DriveState {
-                line: match (online, queued) {
-                    _ if paused => gettext("Sync paused"),
-                    _ if failing_ops > 0 => ngettext_f(
-                        "{n} change needs attention",
-                        "{n} changes need attention",
-                        failing_ops,
-                        &[],
-                    ),
-                    // Translators: {mountpoint} is a folder path; {n} is the number of pinned items.
-                    (true, None) => ngettext_f(
-                        "Up to date in {mountpoint} ({n} pinned)",
-                        "Up to date in {mountpoint} ({n} pinned)",
-                        pinned as u64,
-                        &[("mountpoint", &mountpoint)],
-                    ),
-                    // Translators: {queued} is a queue summary such as "3 uploads queued"; {n} is the number of pinned items.
-                    (true, Some(q)) => ngettext_f(
-                        "Syncing — {queued} ({n} pinned)",
-                        "Syncing — {queued} ({n} pinned)",
-                        pinned as u64,
-                        &[("queued", &q)],
-                    ),
-                    // Translators: {n} is the number of pinned items.
-                    (false, None) => ngettext_f(
-                        "Offline — cached files only ({n} pinned)",
-                        "Offline — cached files only ({n} pinned)",
-                        pinned as u64,
-                        &[],
-                    ),
-                    // Translators: {queued} is a queue summary such as "3 uploads queued".
-                    (false, Some(q)) => gettext_f("Offline — {queued}", &[("queued", &q)]),
-                },
-                phase,
-                mounted: true,
-                paused,
-                mountpoint: PathBuf::from(mountpoint),
-                sync,
-                failing: failing_ops,
-            }
+            status_state(&status, sync, default_mountpoint)
         }
         // Socket answered but with something unexpected — treat as up but odd.
-        Ok(_) => DriveState {
-            line: gettext("Proton Drive sent an unexpected reply"),
-            phase: Phase::Attention,
-            mounted: true,
-            mountpoint: default_mountpoint.to_path_buf(),
-            sync: String::new(),
-            paused: false,
-            failing: 0,
-        },
+        Ok(_) => unexpected_reply(default_mountpoint),
         // The daemon is up but stuck: say so rather than "not connected", and
         // keep the mount actions, which still work on the folder itself.
         Err(e) if e.is_timeout() => DriveState {
@@ -251,6 +191,86 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 failing: 0,
             }
         }
+    }
+}
+
+/// What the tray says when the daemon answers with something it did not ask
+/// for: up, but odd.
+fn unexpected_reply(default_mountpoint: &Path) -> DriveState {
+    DriveState {
+        line: gettext("Proton Drive sent an unexpected reply"),
+        phase: Phase::Attention,
+        mounted: true,
+        mountpoint: default_mountpoint.to_path_buf(),
+        sync: String::new(),
+        paused: false,
+        failing: 0,
+    }
+}
+
+/// The state a running daemon's [`Response::Status`] describes, with `sync`
+/// saying what it is moving right now.
+fn status_state(status: &Response, sync: String, default_mountpoint: &Path) -> DriveState {
+    let Response::Status {
+        mountpoint,
+        pinned,
+        online,
+        pending_uploads,
+        pending_changes,
+        failing_ops,
+        paused,
+        ..
+    } = status
+    else {
+        return unexpected_reply(default_mountpoint);
+    };
+    let (pinned, online, failing_ops, paused) = (*pinned, *online, *failing_ops, *paused);
+    let queued = i18n::pending_summary(*pending_uploads, *pending_changes);
+    let phase = phase_of(
+        paused,
+        failing_ops,
+        online,
+        queued.is_some() || !sync.is_empty(),
+    );
+    DriveState {
+        line: match (online, queued) {
+            _ if paused => gettext("Sync paused"),
+            _ if failing_ops > 0 => ngettext_f(
+                "{n} change needs attention",
+                "{n} changes need attention",
+                failing_ops,
+                &[],
+            ),
+            // Translators: {mountpoint} is a folder path; {n} is the number of pinned items.
+            (true, None) => ngettext_f(
+                "Up to date in {mountpoint} ({n} pinned)",
+                "Up to date in {mountpoint} ({n} pinned)",
+                pinned as u64,
+                &[("mountpoint", mountpoint)],
+            ),
+            // Translators: {queued} is a queue summary such as "3 uploads queued"; {n} is the number of pinned items.
+            (true, Some(q)) => ngettext_f(
+                "Syncing — {queued} ({n} pinned)",
+                "Syncing — {queued} ({n} pinned)",
+                pinned as u64,
+                &[("queued", &q)],
+            ),
+            // Translators: {n} is the number of pinned items.
+            (false, None) => ngettext_f(
+                "Offline — cached files only ({n} pinned)",
+                "Offline — cached files only ({n} pinned)",
+                pinned as u64,
+                &[],
+            ),
+            // Translators: {queued} is a queue summary such as "3 uploads queued".
+            (false, Some(q)) => gettext_f("Offline — {queued}", &[("queued", &q)]),
+        },
+        phase,
+        mounted: true,
+        paused,
+        mountpoint: PathBuf::from(mountpoint),
+        sync,
+        failing: failing_ops,
     }
 }
 
@@ -501,12 +521,52 @@ fn main() -> Result<()> {
         .spawn()
         .context("start tray service")?;
 
-    // Poll the daemon forever, pushing each fresh snapshot into the tray so the
+    // Follow the daemon forever, pushing each fresh state into the tray so the
     // menu reflects mount/login changes made elsewhere (e.g. via the CLI).
-    loop {
-        std::thread::sleep(POLL_INTERVAL);
-        let st = poll_state(&socket, &default_mountpoint);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let feed_socket = socket.clone();
+    std::thread::spawn(move || follow(&feed_socket, |feed| tx.send(feed).is_ok()));
+    let mut heard = Heard::default();
+    while let Ok(feed) = rx.recv() {
+        heard.take(feed);
+        let until = Instant::now() + COALESCE;
+        while let Ok(feed) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            heard.take(feed);
+        }
+        let st = match &heard.status {
+            Some(status) => status_state(
+                status,
+                sync_line(&heard.items, &heard.jobs),
+                &default_mountpoint,
+            ),
+            // Lost the daemon: ask once, which describes the sign-in instead.
+            None => poll_state(&socket, &default_mountpoint),
+        };
         handle.update(move |t: &mut DriveTray| t.state = st);
+    }
+    Ok(())
+}
+
+/// What the tray has heard from the daemon's event feed.
+#[derive(Default)]
+struct Heard {
+    /// The last status, or `None` once the daemon has gone.
+    status: Option<Response>,
+    items: Vec<TransferItem>,
+    jobs: Vec<JobItem>,
+}
+
+impl Heard {
+    fn take(&mut self, feed: Feed) {
+        match feed {
+            Feed::Event(Event::Status(status)) => self.status = Some(*status),
+            Feed::Event(Event::Transfers { items, jobs }) => {
+                self.items = items;
+                self.jobs = jobs;
+            }
+            Feed::Disconnected => *self = Self::default(),
+            Feed::Connected | Feed::Event(Event::Changed { .. } | Event::Heartbeat) => {}
+        }
     }
 }
 

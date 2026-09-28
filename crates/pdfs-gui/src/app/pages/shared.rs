@@ -42,9 +42,6 @@ pub(crate) struct SharedState {
     /// The [`SharedState::nav`] the files on screen were painted for, or `None`
     /// before the first paint.
     pub(crate) listed: RefCell<Option<Vec<(String, String)>>>,
-    /// When the Shared page last painted good data. `None` = never / invalidated,
-    /// forcing a fetch on next visit. See [`PAGE_TTL`].
-    pub(crate) loaded_at: Cell<Option<Instant>>,
 }
 
 impl SharedState {
@@ -69,7 +66,6 @@ impl SharedState {
             nav: RefCell::new(Vec::new()),
             loader: Loader::new(&widgets.content),
             listed: RefCell::new(None),
-            loaded_at: Cell::new(None),
         }
     }
 }
@@ -88,7 +84,6 @@ pub(crate) struct SharedWidgets {
     pub(crate) invitations_banner: adw::Banner,
     pub(crate) links_content: gtk4::Stack,
     pub(crate) links_group: adw::PreferencesGroup,
-    pub(crate) refresh: gtk4::Button,
     pub(crate) layout: gtk4::Button,
     pub(crate) add_link: gtk4::Button,
     pub(crate) add_link_empty: gtk4::Button,
@@ -98,7 +93,6 @@ pub(crate) struct SharedWidgets {
 /// in the same list and grid as My files, and a second view of the public
 /// links I saved. Pending invitations wait in a banner above both.
 pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
-    let refresh = refresh_button();
     let add_link = gtk4::Button::builder()
         .label(gettext("Save Link…"))
         .tooltip_text(gettext("Save a public link to open it from here"))
@@ -220,7 +214,6 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     // Under the header, above both views: an invitation is waiting for a
     // decision whichever view is open.
     frame.add_top_bar(&invitations_banner);
-    header.pack_end(&refresh);
     header.pack_end(&layout);
     header.pack_end(&add_link);
 
@@ -239,7 +232,6 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
             invitations_banner,
             links_content,
             links_group,
-            refresh,
             layout,
             add_link,
             add_link_empty,
@@ -362,7 +354,6 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
             || matches!(invites, Ok(Err(_)) | Err(_))
             || matches!(bookmarks, Ok(Err(_)) | Err(_))
         {
-            ui.shared.loaded_at.set(None);
             shared_unreachable(&ui);
             return;
         }
@@ -382,7 +373,6 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
         repaint_invitations(&ui, invitations);
         repaint_links(&ui, &bookmark_items);
         repaint_shared_files(&ui, &shared_items);
-        ui.shared.loaded_at.set(Some(Instant::now()));
     });
 }
 
@@ -407,7 +397,6 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
         match result {
             Ok(Ok(Response::Entries { entries })) => {
                 repaint_shared_files(&ui, &entries);
-                ui.shared.loaded_at.set(Some(Instant::now()));
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 // The folder is gone or access was revoked: fall back to the top
@@ -417,7 +406,6 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
                 load_shared(&ui);
             }
             _ => {
-                ui.shared.loaded_at.set(None);
                 shared_unreachable(&ui);
             }
         }
@@ -721,18 +709,15 @@ pub(crate) fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
     });
 }
 
-/// How often the sidebar badge asks for invitations away from the page.
-const INVITATIONS_TTL: Duration = Duration::from_secs(300);
-
-/// Poll the invitations now and then from anywhere, so the sidebar's Shared
-/// with me row can say that some wait.
-pub(crate) fn refresh_invitations_badge(ui: &Rc<Ui>) {
+/// Read the invitations from anywhere unless the last reading is younger than
+/// `max_age`, so the sidebar's Shared with me row can say that some wait.
+pub(crate) fn refresh_invitations_badge(ui: &Rc<Ui>, max_age: Duration) {
     let state = &ui.shared;
     if state.invitations_inflight.get()
         || state
             .invitations_at
             .get()
-            .is_some_and(|at| at.elapsed() < INVITATIONS_TTL)
+            .is_some_and(|at| at.elapsed() < max_age)
     {
         return;
     }
@@ -744,7 +729,7 @@ pub(crate) fn refresh_invitations_badge(ui: &Rc<Ui>) {
         ui.shared.invitations_inflight.set(false);
         match result {
             Ok(Ok(Response::Invitations { items })) => repaint_invitations(&ui, items),
-            // Try again at the next interval rather than on every tick.
+            // Wait out `max_age` before asking a failing daemon again.
             _ => ui.shared.invitations_at.set(Some(Instant::now())),
         }
     });

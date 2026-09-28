@@ -28,7 +28,6 @@ pub(crate) struct DevicesState {
     pub(crate) listed: RefCell<Option<Vec<(String, String)>>>,
     /// Runs the loads; the rows stay up while one runs.
     pub(crate) loader: Rc<Loader>,
-    pub(crate) loaded_at: Cell<Option<Instant>>,
 }
 
 impl DevicesState {
@@ -46,7 +45,6 @@ impl DevicesState {
             nav: RefCell::new(Vec::new()),
             listed: RefCell::new(None),
             loader: Loader::new(&widgets.content),
-            loaded_at: Cell::new(None),
         }
     }
 }
@@ -64,15 +62,12 @@ pub(crate) struct DevicesWidgets {
     pub(crate) crumb: gtk4::Box,
     pub(crate) layout: gtk4::Button,
     pub(crate) retry: gtk4::Button,
-    pub(crate) refresh: gtk4::Button,
 }
 
 /// The Computers page: every computer backing up to the account, with this one
 /// first. This computer's row leads to its folders on the Sync page; another
 /// computer's row opens its backup read-only, in the same list as My files.
 pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
-    let refresh = refresh_button();
-
     let group = adw::PreferencesGroup::new();
     let clamp = adw::Clamp::builder().child(&group).build();
     let scroll = gtk4::ScrolledWindow::builder()
@@ -143,7 +138,6 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     inner.set_margin_end(18);
     inner.append(&content);
     let (frame, header, _) = page_frame(&gettext("Computers"), &inner);
-    header.pack_end(&refresh);
     header.pack_end(&layout);
 
     (
@@ -158,7 +152,6 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
             crumb,
             layout,
             retry,
-            refresh,
         },
     )
 }
@@ -247,7 +240,6 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
             // on to the devices list rather than failing the whole page.
             Ok(Ok(_)) => Vec::new(),
             Ok(Err(_)) | Err(_) => {
-                ui.devices.loaded_at.set(None);
                 devices_unreachable(&ui);
                 return;
             }
@@ -260,7 +252,6 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
         repaint_devices(&ui, &devices, &folders);
         repaint_device_crumb(&ui, &[]);
         *ui.devices.listed.borrow_mut() = Some(Vec::new());
-        ui.devices.loaded_at.set(Some(Instant::now()));
     });
 }
 
@@ -298,7 +289,6 @@ fn load_device_folder(ui: &Rc<Ui>, nav: &[(String, String)]) {
                 return;
             }
             _ => {
-                ui.devices.loaded_at.set(None);
                 devices_unreachable(&ui);
                 return;
             }
@@ -313,7 +303,6 @@ fn load_device_folder(ui: &Rc<Ui>, nav: &[(String, String)]) {
             ui.devices.files_content.set_visible_child_name("list");
             replace_items(&ui.devices.files.model, &entries);
         }
-        ui.devices.loaded_at.set(Some(Instant::now()));
     });
 }
 

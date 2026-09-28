@@ -422,7 +422,7 @@ fn open_place(ui: &Rc<Ui>, place: PlaceInfo) {
 
     // As in an album: no filters, no Upload, no view switch — back leads out.
     ui.gallery.filters.set_visible(false);
-    ui.gallery.view_switch.set_visible(false);
+    ui.gallery.view_switch.widget().set_visible(false);
     ui.gallery.upload.set_visible(false);
     ui.gallery.back.set_visible(true);
     ui.gallery.kind.set(None);
@@ -439,7 +439,7 @@ pub(crate) fn close_place(ui: &Rc<Ui>) {
         return;
     }
     ui.gallery.title.set_title(&gettext("Photos"));
-    ui.gallery.view_switch.set_visible(true);
+    ui.gallery.view_switch.widget().set_visible(true);
     ui.gallery.upload.set_visible(true);
     ui.gallery.back.set_visible(false);
 }
@@ -455,14 +455,14 @@ fn places_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str) {
 /// Wire the Places toggle of the view switcher.
 pub(crate) fn wire_places(ui: &Rc<Ui>) {
     let ui_places = ui.clone();
-    ui.gallery.places_btn.clone().connect_toggled(move |btn| {
-        if btn.is_active() {
+    ui.gallery.view_switch.connect_changed(move |view| {
+        if view == VIEW_PLACES {
             show_places(&ui_places);
         }
     });
 
     let ui_layout = ui.clone();
-    ui.gallery.places_map_btn.connect_toggled(move |_| {
+    ui.gallery.places_layout.connect_changed(move |_| {
         // A status page (loading, empty, an error) stays until a listing
         // replaces it; only the grid and the map swap.
         if ui_layout
@@ -493,19 +493,19 @@ pub(crate) fn wire_places(ui: &Rc<Ui>) {
 /// Switch to the Places map and zoom in on `(latitude, longitude)`, where a
 /// photo in the viewer was taken.
 pub(crate) fn show_on_map(ui: &Rc<Ui>, latitude: f64, longitude: f64) {
-    ui.gallery.places_map_btn.set_active(true);
-    if ui.gallery.places_btn.is_active() {
+    ui.gallery.places_layout.set_active(PLACES_MAP);
+    if ui.gallery.view_switch.active() == VIEW_PLACES {
         // Already in Places, perhaps inside a town: back out to the listing.
         show_places(ui);
     } else {
-        ui.gallery.places_btn.set_active(true);
+        ui.gallery.view_switch.set_active(VIEW_PLACES);
     }
     ui.gallery.places_map.show_spot(latitude, longitude);
 }
 
 /// Show the places as cards or on the map, as the Grid/Map toggle says.
 fn show_places_layout(ui: &Rc<Ui>) {
-    let layout = if ui.gallery.places_map_btn.is_active() {
+    let layout = if ui.gallery.places_layout.active() == PLACES_MAP {
         "map"
     } else {
         "grid"

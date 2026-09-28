@@ -23,7 +23,9 @@ use pdfs_core::menu::PromptMode;
 use pdfs_core::opener::{self, OpenWith};
 
 mod activation;
+mod compat;
 mod i18n;
+use compat::{Spinner, spinner};
 use i18n::{gettext, gettext_f, gettext_noop, human_bytes, ngettext_f, pgettext};
 mod dmenu;
 mod fzf;
@@ -235,7 +237,7 @@ struct Ui {
     opener: OpenWith,
 
     entry: gtk4::Entry,
-    spinner: gtk4::Spinner,
+    spinner: Spinner,
     stack: gtk4::Stack,
     scroller: gtk4::ScrolledWindow,
     results: gtk4::Box,
@@ -542,7 +544,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     entry.add_css_class("search-entry");
     search_bar.append(&entry);
 
-    let spinner = gtk4::Spinner::new();
+    let spinner = spinner();
     spinner.set_visible(false);
     search_bar.append(&spinner);
 
@@ -824,7 +826,6 @@ impl Ui {
             self.query_id.set(self.query_id.get() + 1);
             self.pending.set(0);
             self.open_pending.set(false);
-            self.spinner.stop();
             self.spinner.set_visible(false);
             self.suppress_entry_change.set(true);
             self.entry.set_text("");
@@ -887,7 +888,6 @@ impl Ui {
     /// the offline page and lock the entry; the retry button re-runs `connect`.
     fn go_offline(self: &Rc<Self>) {
         self.pending.set(0);
-        self.spinner.stop();
         self.spinner.set_visible(false);
         self.entry.set_sensitive(false);
         self.hint.set_label(&gettext("Proton Drive isn't running"));
@@ -990,7 +990,6 @@ impl Ui {
         self.query_id.set(id);
         self.pending.set(requests);
         self.spinner.set_visible(true);
-        self.spinner.start();
         id
     }
 
@@ -1003,7 +1002,6 @@ impl Ui {
         let left = self.pending.get().saturating_sub(1);
         self.pending.set(left);
         if left == 0 {
-            self.spinner.stop();
             self.spinner.set_visible(false);
         }
         true
@@ -1292,7 +1290,6 @@ impl Ui {
 
                 self.opening.set(true);
                 self.spinner.set_visible(true);
-                self.spinner.start();
                 // Translators: {name} is a file name.
                 let opening = gettext_f("Opening {name}…", &[("name", &drive.name)]);
                 self.hint.set_label(&opening);
@@ -1307,7 +1304,6 @@ impl Ui {
                 let ui = self.clone();
                 glib::spawn_future_local(async move {
                     let reply = rx.recv().await;
-                    ui.spinner.stop();
                     ui.spinner.set_visible(false);
                     ui.opening.set(false);
                     match reply {

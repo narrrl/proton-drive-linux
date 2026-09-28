@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
-use pdfs_core::control::{AlbumInfo, PhotoItem};
+use pdfs_core::control::{AlbumInfo, PhotoItem, Topic};
 use pdfs_core::db::StoredAlbum;
 use pdfs_core::{CoreError, CoreResult};
 
@@ -137,10 +137,12 @@ impl Core {
         }
         let core = self.clone();
         self.rt.spawn(async move {
-            if let Err(e) = core.refresh_albums().await {
-                warn!(error = %e, "background album refresh failed");
-            }
+            let refreshed = core.refresh_albums().await;
             core.albums_refreshing.store(false, Ordering::SeqCst);
+            match refreshed {
+                Ok(_) => core.events.publish(&[Topic::Photos]),
+                Err(e) => warn!(error = %e, "background album refresh failed"),
+            }
         });
     }
 

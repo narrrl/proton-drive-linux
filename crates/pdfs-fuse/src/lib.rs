@@ -60,7 +60,7 @@ use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
-    ThumbnailBuildStatus, TransferDirection,
+    ThumbnailBuildStatus, Topic, TransferDirection,
 };
 use pdfs_core::db::{
     Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
@@ -86,6 +86,7 @@ use control::run_control_socket;
 mod devices;
 mod diagnostics;
 mod drain;
+mod events;
 mod filesystem;
 pub use filesystem::ProtonFs;
 mod mount;
@@ -665,6 +666,9 @@ struct Core {
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
+    /// Open [`Request::Subscribe`](pdfs_core::control::Request::Subscribe)
+    /// connections, which every change a front-end shows is published to.
+    events: Arc<events::EventHub>,
     /// True while the background scanner is rebuilding the local-file index, so
     /// `SearchLocal` can tell a front-end "still indexing" apart from "no match".
     indexing: Arc<AtomicBool>,
@@ -4533,10 +4537,12 @@ impl Core {
         }
         let core = self.clone();
         self.rt.spawn(async move {
-            if let Err(e) = core.refresh_trash().await {
-                warn!(error = %e, "background trash refresh failed");
-            }
+            let refreshed = core.refresh_trash().await;
             core.trash_refreshing.store(false, Ordering::SeqCst);
+            match refreshed {
+                Ok(_) => core.events.publish(&[Topic::Trash]),
+                Err(e) => warn!(error = %e, "background trash refresh failed"),
+            }
             // After the flag, so a waiter that wakes on this sees it cleared.
             core.trash_progress.notify_waiters();
         });
@@ -4827,6 +4833,14 @@ impl Core {
         };
         if let Err(e) = self.db.activity_add(&entry) {
             warn!(error = ?e, "could not record activity");
+            return;
+        }
+        // A sync pass is how a conflict copy reaches the listing, and the sweep
+        // reports the ones it finds as conflicts.
+        if matches!(entry.kind, ActivityKind::Conflict | ActivityKind::Sync) {
+            self.events.publish(&[Topic::Activity, Topic::Conflicts]);
+        } else {
+            self.events.publish(&[Topic::Activity]);
         }
     }
 

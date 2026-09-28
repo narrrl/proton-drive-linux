@@ -1,12 +1,17 @@
 #[path = "../activation.rs"]
 pub(crate) mod activation;
+#[path = "../compat.rs"]
+pub(crate) mod compat;
 pub(crate) mod dates;
+pub(crate) mod events;
 #[path = "../i18n.rs"]
 pub(crate) mod i18n;
 pub(crate) mod pages;
 pub(crate) mod reload;
 pub(crate) mod widgets;
 
+use compat::*;
+use events::*;
 use pages::activity::*;
 use pages::albums::*;
 use pages::browser::*;
@@ -25,9 +30,11 @@ use pages::takeout::*;
 use pages::trash::*;
 use pages::verify::*;
 use reload::{LoadTicket, Loader, replace_items};
+use widgets::compat::*;
 use widgets::details::*;
 use widgets::file_list::*;
 use widgets::menu::*;
+use widgets::scrubber::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
@@ -65,8 +72,8 @@ use pdfs_core::control::{
     DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, MappingProgress, PendingOpInfo,
     PhotoItem, PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope, Request, Response,
     RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
-    SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem,
-    send,
+    SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, Topic, TransferDirection,
+    TransferItem, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -75,24 +82,9 @@ use pdfs_core::service;
 
 const APP_ID: &str = "io.narl.proton-drive-linux";
 
-/// How often the window re-reads mount status, cache usage and the pin list.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-
-/// While the window is open but not focused, only every this-many ticks
-/// refreshes (every 10 s). A minimised or hidden window skips them all, and
-/// focusing the window refreshes at once.
-const BACKGROUND_REFRESH_EVERY: u32 = 5;
-
 /// Backoff between auto-retries of a Files/Photos load while the mount service
 /// is still coming up (see [`load_browser`] / [`load_gallery`]).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-
-/// How long a network-backed page (Shared, Shared-by-me, Devices, Activity) is
-/// considered fresh. Re-navigating to it within this window reuses the rows
-/// already on screen instead of re-fetching and flashing the "Loading…"
-/// placeholder. The Retry button and every mutation still force an immediate
-/// reload by clearing the page's timestamp.
-const PAGE_TTL: Duration = Duration::from_secs(30);
 
 /// How often the gallery asks whether the timeline refresh it started has
 /// finished.
@@ -627,7 +619,6 @@ fn build_window(app: &adw::Application) {
             pager: gallery_widgets.pager.clone(),
             scrubber: gallery_widgets.scrubber.clone(),
             months: RefCell::new(Vec::new()),
-            scrubbing: Cell::new(false),
             scrub_source: RefCell::new(None),
             jump: Cell::new(None),
             burst: Cell::new(false),
@@ -638,21 +629,18 @@ fn build_window(app: &adw::Application) {
             albums: gallery_widgets.albums.clone(),
             albums_stack: gallery_widgets.albums_stack.clone(),
             albums_status: gallery_widgets.albums_status.clone(),
-            photos_btn: gallery_widgets.photos_btn.clone(),
-            albums_btn: gallery_widgets.albums_btn.clone(),
             view_switch: gallery_widgets.view_switch.clone(),
             albums_loading: Cell::new(false),
             places: gallery_widgets.places.clone(),
             places_stack: gallery_widgets.places_stack.clone(),
             places_status: gallery_widgets.places_status.clone(),
-            places_btn: gallery_widgets.places_btn.clone(),
             places_loading: Cell::new(false),
             places_mapping: gallery_widgets.places_mapping.clone(),
             places_mapping_label: gallery_widgets.places_mapping_label.clone(),
             places_mapping_bar: gallery_widgets.places_mapping_bar.clone(),
             places_poll: RefCell::new(None),
             places_map: gallery_widgets.places_map.clone(),
-            places_map_btn: gallery_widgets.places_map_btn.clone(),
+            places_layout: gallery_widgets.places_layout.clone(),
             place_count: Cell::new(0),
             place: RefCell::new(None),
             album: RefCell::new(None),
@@ -693,6 +681,7 @@ fn build_window(app: &adw::Application) {
             thumb_source: RefCell::new(None),
             relayout_source: RefCell::new(None),
             bound: RefCell::new(BTreeMap::new()),
+            tile_pools: RefCell::new(HashMap::new()),
             list: gallery_widgets.list.clone(),
             selecting: Cell::new(false),
             selected: RefCell::new(HashSet::new()),
@@ -714,7 +703,6 @@ fn build_window(app: &adw::Application) {
             rows: RefCell::new(Vec::new()),
             inflight: Cell::new(false),
             loader: Loader::new(&locations_widgets.content),
-            loaded_at: Cell::new(None),
             card: SyncCard {
                 icon: locations_widgets.card_icon.clone(),
                 title: locations_widgets.card_title.clone(),
@@ -734,7 +722,6 @@ fn build_window(app: &adw::Application) {
                 rows: RefCell::new(Vec::new()),
                 painted: RefCell::new(Vec::new()),
                 inflight: Cell::new(false),
-                fetched_at: Cell::new(None),
             },
             views: locations_widgets.views.clone(),
             banner: locations_widgets.banner.clone(),
@@ -816,18 +803,6 @@ fn build_window(app: &adw::Application) {
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
     wire_activity(&ui, &activity_widgets);
     wire_takeout(&ui, &takeout_widgets);
-    wire_refresh(
-        &ui,
-        &[
-            &browser_widgets.refresh,
-            &gallery_widgets.refresh,
-            &trash_widgets.refresh,
-            &shared_widgets.refresh,
-            &shared_by_me_widgets.refresh,
-            &devices_widgets.refresh,
-            &locations_widgets.refresh,
-        ],
-    );
     wire_retry(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
@@ -842,14 +817,10 @@ fn build_window(app: &adw::Application) {
         match st.visible_child_name().as_deref() {
             Some("browser") => load_browser(&ui_nav),
             Some("gallery") => load_gallery(&ui_nav, false),
-            // Network-backed pages skip the fetch (and the "Loading…" flash) when
-            // the rows on screen are still fresh; the Retry button and mutations
-            // invalidate the timestamp to force a reload.
-            Some("sharedbyme") if page_fresh(&ui_nav.shared_by_me.loaded_at) => {}
+            // Every visit reads the page again. The rows already on screen stay
+            // up while it does, so arriving costs no "Loading…" flash.
             Some("sharedbyme") => load_shared_by_me(&ui_nav),
-            Some("shared") if page_fresh(&ui_nav.shared.loaded_at) => {}
             Some("shared") => load_shared(&ui_nav),
-            Some("devices") if page_fresh(&ui_nav.devices.loaded_at) => {}
             Some("devices") => load_devices(&ui_nav),
             Some("locations") => load_sync_view(&ui_nav),
             Some("trash") => load_trash(&ui_nav),
@@ -881,41 +852,8 @@ fn build_window(app: &adw::Application) {
     app.set_accels_for_action("win.shortcuts", &["<Control>question"]);
 
     refresh(&ui);
-    // Periodic refresh while the window lives. The closure holds a strong `Rc`;
-    // it is dropped when the source is removed on window close. A window in the
-    // background refreshes less often, and one nobody can see not at all.
-    let ui_tick = ui.clone();
-    let window_tick = window.downgrade();
-    let skipped = Cell::new(0u32);
-    let source = glib::timeout_add_local(REFRESH_INTERVAL, move || {
-        let Some(window) = window_tick.upgrade() else {
-            return glib::ControlFlow::Continue;
-        };
-        if window_hidden(&window) {
-            return glib::ControlFlow::Continue;
-        }
-        if !window.is_active() && skipped.get() + 1 < BACKGROUND_REFRESH_EVERY {
-            skipped.set(skipped.get() + 1);
-            return glib::ControlFlow::Continue;
-        }
-        skipped.set(0);
-        refresh(&ui_tick);
-        glib::ControlFlow::Continue
-    });
-    // Catch up as soon as the user comes back to the window.
-    let ui_focus = ui.clone();
-    window.connect_is_active_notify(move |window| {
-        if window.is_active() {
-            refresh(&ui_focus);
-        }
-    });
-    let cell = RefCell::new(Some(source));
-    window.connect_close_request(move |_| {
-        if let Some(id) = cell.borrow_mut().take() {
-            id.remove();
-        }
-        glib::Propagation::Proceed
-    });
+    // From here on the daemon says when something changed; nothing polls.
+    follow_daemon(&ui, &window);
 
     window.present();
 }
@@ -1037,14 +975,13 @@ thread_local! {
     /// Every page header's busy spinner. There is one per page because each
     /// page has its own header bar; [`Ui::busy_begin`] shows them all, so the one
     /// on screen is always the right one.
-    static BUSY_SPINNERS: RefCell<Vec<gtk4::Spinner>> = const { RefCell::new(Vec::new()) };
+    static BUSY_SPINNERS: RefCell<Vec<Spinner>> = const { RefCell::new(Vec::new()) };
 }
 
 fn set_busy_spinners(visible: bool) {
     BUSY_SPINNERS.with(|spinners| {
         for spinner in spinners.borrow().iter() {
             spinner.set_visible(visible);
-            spinner.set_spinning(visible);
         }
     });
 }
@@ -1068,7 +1005,7 @@ fn page_frame_with(
     title: &impl IsA<gtk4::Widget>,
     content: &impl IsA<gtk4::Widget>,
 ) -> (adw::ToolbarView, adw::HeaderBar) {
-    let spinner = gtk4::Spinner::new();
+    let spinner = spinner();
     spinner.set_visible(false);
     BUSY_SPINNERS.with(|spinners| spinners.borrow_mut().push(spinner.clone()));
     let title_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -1114,43 +1051,15 @@ fn wire_sidebar(ui: &Rc<Ui>) {
     });
 }
 
-/// Whether a network-backed page painted good data within [`PAGE_TTL`] and so
-/// can be reused without re-fetching. A `None` timestamp (never loaded, or
-/// invalidated by a mutation) is always stale.
-fn page_fresh(loaded_at: &Cell<Option<Instant>>) -> bool {
-    loaded_at.get().is_some_and(|t| t.elapsed() < PAGE_TTL)
-}
-
-/// A page header's Refresh button. Every page that can show stale rows carries
-/// one, so the user never has to guess whether what they're looking at is
-/// current or wait out a TTL they can't see.
-fn refresh_button() -> gtk4::Button {
-    let button = gtk4::Button::builder()
-        .icon_name("view-refresh-symbolic")
-        .tooltip_text(gettext("Refresh (F5)"))
-        .valign(gtk4::Align::Center)
-        .build();
-    button.add_css_class("flat");
-    button
-}
-
-/// Point every page's Refresh button at the current page. One handler for all of
-/// them: the button acts on whatever is on screen, so it can't refresh a page the
-/// user has since navigated away from.
-fn wire_refresh(ui: &Rc<Ui>, buttons: &[&gtk4::Button]) {
-    for button in buttons {
-        let ui = ui.clone();
-        button.connect_clicked(move |_| reload_current_page(&ui));
-    }
-}
-
 /// Re-fetch the visible page from the server, bypassing every layer of cache
 /// between it and the account.
 ///
-/// The two layers are separate: the daemon's own persisted listings (folders,
-/// trash, photos) are dropped with [`Request::Refresh`] before re-asking, while
-/// the pages the daemon always fetches live (sharing, devices, activity) only
-/// need this front-end's [`PAGE_TTL`] stamp cleared.
+/// The daemon keeps persisted listings (folders, trash, photos), and those are
+/// dropped with [`Request::Refresh`] before re-asking. The pages the daemon
+/// always fetches live (sharing, devices, activity) are simply loaded again.
+///
+/// The daemon's events keep every page current on their own. This is for F5,
+/// when the account changed somewhere the daemon has not heard about yet.
 fn reload_current_page(ui: &Rc<Ui>) {
     match ui.stack.visible_child_name().as_deref() {
         Some("browser") => {
@@ -1167,22 +1076,10 @@ fn reload_current_page(ui: &Rc<Ui>) {
             }
         }),
         Some("trash") => refresh_then(ui, RefreshScope::Trash, load_trash),
-        Some("shared") => {
-            ui.shared.loaded_at.set(None);
-            load_shared(ui);
-        }
-        Some("sharedbyme") => {
-            ui.shared_by_me.loaded_at.set(None);
-            load_shared_by_me(ui);
-        }
-        Some("devices") => {
-            ui.devices.loaded_at.set(None);
-            load_devices(ui);
-        }
-        Some("locations") => {
-            ui.locations.loaded_at.set(None);
-            reload_sync_view(ui);
-        }
+        Some("shared") => load_shared(ui),
+        Some("sharedbyme") => load_shared_by_me(ui),
+        Some("devices") => load_devices(ui),
+        Some("locations") => reload_sync_view(ui),
         _ => {}
     }
 }
@@ -1649,36 +1546,17 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
             ],
         ),
     ];
-    let page = adw::PreferencesPage::new();
-    for (title, keys) in GROUPS {
-        let group = adw::PreferencesGroup::builder()
-            .title(gettext(title))
-            .build();
-        for (accel, action) in keys {
-            let row = adw::ActionRow::builder().title(gettext(action)).build();
-            row.add_suffix(
-                &gtk4::ShortcutLabel::builder()
-                    .accelerator(*accel)
-                    .valign(gtk4::Align::Center)
-                    .build(),
-            );
-            group.add(&row);
-        }
-        page.add(&group);
-    }
-
-    let dialog = adw::Dialog::builder()
-        .title(gettext("Keyboard Shortcuts"))
-        .content_width(460)
-        .content_height(620)
-        .child(&{
-            let toolbar = adw::ToolbarView::new();
-            toolbar.add_top_bar(&adw::HeaderBar::new());
-            toolbar.set_content(Some(&page));
-            toolbar
+    let groups: Vec<_> = GROUPS
+        .iter()
+        .map(|(title, keys)| {
+            let keys = keys
+                .iter()
+                .map(|(accel, action)| (*accel, gettext(action)))
+                .collect();
+            (gettext(title), keys)
         })
-        .build();
-    dialog.present(Some(window));
+        .collect();
+    present_shortcuts(window, &groups);
 }
 
 /// Window-level keyboard shortcuts, so the browser is usable without the mouse:

@@ -124,7 +124,6 @@ pub(crate) struct BrowserWidgets {
     pub(crate) thumbnail_status: gtk4::Label,
     pub(crate) summary: gtk4::Label,
     pub(crate) zoom: gtk4::Scale,
-    pub(crate) refresh: gtk4::Button,
     /// Wraps the views + the details pane; the pane shows the selection while its header toggle is on.
     pub(crate) split: adw::OverlaySplitView,
     pub(crate) details: DetailsWidgets,
@@ -258,8 +257,6 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .visible(false)
         .build();
     search_scope.add_css_class("flat");
-
-    let refresh = refresh_button();
 
     // The path bar stays in the page, under the header bar: the header's title
     // slot carries the page name and the busy spinner.
@@ -457,7 +454,6 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     let (frame, header, _) = page_frame(&gettext("My files"), &page);
     header.pack_start(&new_button);
     header.pack_end(&folder_button);
-    header.pack_end(&refresh);
     header.pack_end(&details_toggle);
     header.pack_end(&view_button);
     header.pack_end(&search);
@@ -483,7 +479,6 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             thumbnail_status,
             summary,
             zoom,
-            refresh,
             split,
             details,
             bulk,

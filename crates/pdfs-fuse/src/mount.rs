@@ -416,6 +416,7 @@ pub fn mount(
         notifier: Arc::new(OnceLock::new()),
         session_live: Arc::new(AtomicBool::new(false)),
         transfers: TransferRegistry::new(),
+        events: Arc::new(Default::default()),
         indexing: Arc::new(AtomicBool::new(false)),
         sync_progress: Arc::new(Mutex::new(HashMap::new())),
         sync_tx,
@@ -566,6 +567,22 @@ pub fn mount(
                 let _ = std::fs::remove_file(control_socket);
                 return Err(error);
             }
+        }
+    }
+    // Publishes what changes without one place to publish it from (status,
+    // transfers, sync progress) to the front-ends subscribed on that socket.
+    {
+        let sampler_core = core.clone();
+        let username = username.clone();
+        let mountpoint = mountpoint.to_path_buf();
+        match std::thread::Builder::new()
+            .name("pdfs-events".into())
+            .spawn(move || events::run_event_sampler(sampler_core, username, mountpoint))
+        {
+            Ok(handle) => workers.push(handle),
+            // Not fatal: front-ends still get every published change, only
+            // not the sampled ones.
+            Err(error) => warn!(error = %error, "could not start the event sampler"),
         }
     }
     // The supervisor watches the pool and answers the systemd watchdog. Started

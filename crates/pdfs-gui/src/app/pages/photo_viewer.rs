@@ -31,7 +31,7 @@ pub(crate) struct Viewer {
     pub(crate) scroller: gtk4::ScrolledWindow,
     pub(crate) picture: gtk4::Picture,
     pub(crate) video: gtk4::Video,
-    pub(crate) spinner: gtk4::Spinner,
+    pub(crate) spinner: Spinner,
     pub(crate) status: gtk4::Label,
     pub(crate) title: gtk4::Label,
     pub(crate) counter: gtk4::Label,
@@ -224,7 +224,6 @@ fn viewer_item(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: &str) -> Option<PhotoItem>
 /// plays in place once its file is down.
 pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     viewer.spinner.set_visible(true);
-    viewer.spinner.start();
     viewer.status.set_visible(false);
     viewer.loading.set(true);
     *viewer.path.borrow_mut() = None;
@@ -266,7 +265,6 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
         if *viewer.uid.borrow() != uid {
             return;
         }
-        viewer.spinner.stop();
         viewer.spinner.set_visible(false);
         viewer.loading.set(false);
         // Armed whether or not the photo rendered: a slideshow steps past a
@@ -1192,12 +1190,10 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         .child(&info_panel)
         .build();
 
-    let spinner = gtk4::Spinner::builder()
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .width_request(48)
-        .height_request(48)
-        .build();
+    let spinner = spinner();
+    spinner.set_halign(gtk4::Align::Center);
+    spinner.set_valign(gtk4::Align::Center);
+    spinner.set_size_request(48, 48);
     spinner.add_css_class("viewer-spinner");
     overlay.add_overlay(&spinner);
 

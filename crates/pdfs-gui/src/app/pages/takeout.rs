@@ -15,16 +15,16 @@
 //! Import — staging is local, so a mis-drop costs nothing.
 //!
 //! The daemon owns the run itself ([`Request::ImportTakeout`]): this page only
-//! stages paths, launches, polls [`Request::ImportStatus`] for the final report,
+//! stages paths, launches, asks [`Request::ImportStatus`] for the final report,
 //! and reads live progress off the import's job in the transfer snapshot the
-//! status tick already fetches (see [`takeout_progress`]).
+//! daemon already pushes (see [`takeout_progress`]).
 
 use crate::*;
 
 /// The title the daemon gives the import's job in [`Request::GetQueueStatus`].
-/// Matching on it is how this page borrows the progress the status tick is
-/// already polling instead of adding a second poll of its own.
-const IMPORT_JOB: &str = "Importing Google Photos";
+/// Matching on it is how this page borrows the progress the daemon already
+/// pushes instead of asking for it separately.
+pub(crate) const IMPORT_JOB: &str = "Importing Google Photos";
 
 /// What the archive list says before anything is staged. `repaint_archives`
 /// swaps in the count and total once there is something to report, and swaps
@@ -589,6 +589,7 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
         match result {
             Ok(Ok(Response::Ok { .. })) => {
                 ui.takeout.running.set(true);
+                ui.gallery.import_banner.set_revealed(true);
                 ui.takeout.summary_group.set_visible(false);
                 ui.takeout.progress_group.set_visible(true);
                 ui.takeout.progress_bar.set_fraction(0.0);
@@ -619,9 +620,9 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
     });
 }
 
-/// Poll the daemon for the import's state while the page is on screen, and paint
-/// the report once a run has finished. Cheap and inflight-guarded, like the other
-/// tick polls.
+/// Ask the daemon for the import's state, and paint the report once a run has
+/// finished. Asked on arrival and while import progress keeps arriving. Cheap
+/// and inflight-guarded.
 pub(crate) fn refresh_takeout(ui: &Rc<Ui>) {
     if ui.takeout.inflight.get() {
         return;
@@ -636,6 +637,7 @@ pub(crate) fn refresh_takeout(ui: &Rc<Ui>) {
             return;
         };
         let was_running = ui.takeout.running.replace(running);
+        ui.gallery.import_banner.set_revealed(running);
         if running {
             ui.takeout.progress_group.set_visible(true);
         } else {
@@ -776,8 +778,8 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
     ui.takeout.summary_group.set_visible(true);
 }
 
-/// Paint the import's progress from the transfer snapshot the status tick
-/// already fetched, so this page costs no extra poll. A job with no known total
+/// Paint the import's progress from the transfer snapshot the daemon pushed,
+/// so this page costs no extra request. A job with no known total
 /// pulses instead of showing a fraction, the same as the Activity list.
 pub(crate) fn takeout_progress(ui: &Rc<Ui>, jobs: &[JobItem]) {
     let Some(job) = jobs.iter().find(|job| job.title == IMPORT_JOB) else {

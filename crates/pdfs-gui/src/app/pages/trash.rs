@@ -25,7 +25,6 @@ pub(crate) struct TrashWidgets {
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     pub(crate) empty: gtk4::Button,
-    pub(crate) refresh: gtk4::Button,
     pub(crate) subtitle: adw::WindowTitle,
     pub(crate) selection_bar: gtk4::Revealer,
     pub(crate) selection_label: gtk4::Label,
@@ -49,7 +48,6 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
         .tooltip_text(gettext("Permanently delete everything in the Trash"))
         .visible(false)
         .build();
-    let refresh = refresh_button();
 
     let retry = gtk4::Button::builder()
         .label(gettext("Retry"))
@@ -102,7 +100,6 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
 
     let (frame, header, subtitle) = page_frame(&gettext("Trash"), &inner);
     header.pack_start(&empty);
-    header.pack_end(&refresh);
     header.pack_end(&layout);
 
     (
@@ -113,7 +110,6 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
             status,
             retry,
             empty,
-            refresh,
             subtitle,
             selection_bar,
             selection_label,

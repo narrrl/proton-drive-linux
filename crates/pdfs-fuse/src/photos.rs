@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use pdfs_core::control::{
     FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoLocation, PhotoThumb, PlaceInfo,
-    ThumbnailBuildStatus, is_raw_image_name, is_thumbnail_image_name,
+    ThumbnailBuildStatus, Topic, is_raw_image_name, is_thumbnail_image_name,
 };
 use pdfs_core::db::{self, StoredPhoto};
 use pdfs_core::{CoreError, CoreResult};
@@ -2041,10 +2041,14 @@ impl Core {
         }
         let core = self.clone();
         self.rt.spawn(async move {
-            if let Err(e) = core.refresh_timeline().await {
-                warn!(error = %e, "background timeline refresh failed");
-            }
+            let refreshed = core.refresh_timeline().await;
             core.timeline_refreshing.store(false, Ordering::SeqCst);
+            // Only a refresh that landed: a front-end re-reading after a failed
+            // one would find the timeline still stale and start another.
+            match refreshed {
+                Ok(_) => core.events.publish(&[Topic::Photos]),
+                Err(e) => warn!(error = %e, "background timeline refresh failed"),
+            }
         });
     }
 

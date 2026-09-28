@@ -7,7 +7,7 @@ pub(crate) struct LoginState {
     pub(crate) password: adw::PasswordEntryRow,
     pub(crate) login_button: gtk4::Button,
     /// Spins inside the Sign in button while a sign-in is running.
-    pub(crate) login_spinner: gtk4::Spinner,
+    pub(crate) login_spinner: Spinner,
     pub(crate) login_status: gtk4::Label,
 }
 
@@ -34,7 +34,8 @@ pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
     group.add(&email);
     group.add(&password);
 
-    let login_spinner = gtk4::Spinner::builder().visible(false).build();
+    let login_spinner = spinner();
+    login_spinner.set_visible(false);
     let button_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     button_content.append(&login_spinner);
     button_content.append(&gtk4::Label::new(Some(&gettext("Sign in"))));
@@ -185,7 +186,6 @@ fn set_signing_in(ui: &Rc<Ui>, running: bool) {
     ui.login.email.set_sensitive(!running);
     ui.login.password.set_sensitive(!running);
     ui.login.login_spinner.set_visible(running);
-    ui.login.login_spinner.set_spinning(running);
 }
 
 /// What to tell the person when sign-in fails. Proton's own API messages are

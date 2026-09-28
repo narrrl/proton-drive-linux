@@ -56,7 +56,8 @@ pub(crate) struct ActivityWidgets {
     pub(crate) model: gio::ListStore,
     pub(crate) list: gtk4::ListView,
     pub(crate) feed: gtk4::Stack,
-    pub(crate) filters: Vec<(ActivityFilter, gtk4::ToggleButton)>,
+    /// One option per [`ActivityFilter::ALL`], in that order.
+    pub(crate) filters: ToggleGroup,
     /// Holds the ⋮ menu, which needs the [`Ui`] and so is built when wiring.
     pub(crate) options: gtk4::Box,
     pub(crate) retry: gtk4::Button,
@@ -115,20 +116,11 @@ impl ActivityFilter {
 pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     // Filter chips: a linked row of radio toggles. They sit above the list,
     // not in it, so they stay in reach however far the feed is scrolled.
-    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    bar.add_css_class("linked");
+    let labels = ActivityFilter::ALL.map(|filter| filter.label());
+    let options: Vec<_> = labels.iter().map(|label| (label.as_str(), None)).collect();
+    let filters = ToggleGroup::new(&options);
+    let bar = filters.widget();
     bar.set_halign(gtk4::Align::Start);
-    let mut filters: Vec<(ActivityFilter, gtk4::ToggleButton)> = Vec::new();
-    for filter in ActivityFilter::ALL {
-        let button = gtk4::ToggleButton::with_label(&filter.label());
-        if let Some((_, first)) = filters.first() {
-            button.set_group(Some(first));
-        } else {
-            button.set_active(true);
-        }
-        bar.append(&button);
-        filters.push((filter, button));
-    }
     bar.set_hexpand(true);
     let options = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -282,16 +274,13 @@ pub(crate) fn wire_activity(ui: &Rc<Ui>, widgets: &ActivityWidgets) {
     widgets
         .retry
         .connect_clicked(move |_| restart_service_then(&ui_retry, load_activity));
-    for (filter, button) in &widgets.filters {
-        let ui = ui.clone();
-        let filter = *filter;
-        button.connect_toggled(move |button| {
-            if button.is_active() {
-                ui.activity.filter.set(filter);
-                paint_activity(&ui);
-            }
-        });
-    }
+    let ui_filter = ui.clone();
+    widgets.filters.connect_changed(move |index| {
+        if let Some(&filter) = ActivityFilter::ALL.get(index as usize) {
+            ui_filter.activity.filter.set(filter);
+            paint_activity(&ui_filter);
+        }
+    });
     let mut menu = ActionMenu::new();
     menu.toggle(&gettext("Show Temporary Files"), false, {
         let ui = ui.clone();

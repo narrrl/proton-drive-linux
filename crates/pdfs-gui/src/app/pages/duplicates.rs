@@ -75,22 +75,19 @@ pub(crate) fn show_duplicates(ui: &Rc<Ui>) {
     bottom.set_halign(gtk4::Align::End);
     bottom.append(&trash);
 
-    let exact = gtk4::ToggleButton::builder()
-        .label(pgettext("duplicates", "Exact"))
-        .tooltip_text(gettext("Photos stored more than once"))
-        .active(true)
-        .build();
-    let similar = gtk4::ToggleButton::builder()
-        .label(pgettext("duplicates", "Similar"))
-        .tooltip_text(gettext("Photos that look alike"))
-        .group(&exact)
-        .build();
-    let switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    switch.add_css_class("linked");
-    switch.append(&exact);
-    switch.append(&similar);
+    // Exact first, then Similar: the index is the finder.
+    let switch = ToggleGroup::new(&[
+        (
+            &pgettext("duplicates", "Exact"),
+            Some(&gettext("Photos stored more than once")),
+        ),
+        (
+            &pgettext("duplicates", "Similar"),
+            Some(&gettext("Photos that look alike")),
+        ),
+    ]);
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&switch));
+    header.set_title_widget(Some(&switch.widget()));
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -124,8 +121,8 @@ pub(crate) fn show_duplicates(ui: &Rc<Ui>) {
             .set(view_closed.generation.get().wrapping_add(1));
     });
     let view_switch = view.clone();
-    similar.connect_toggled(move |similar| {
-        let finder = if similar.is_active() {
+    switch.connect_changed(move |index| {
+        let finder = if index == 1 {
             Finder::Similar
         } else {
             Finder::Exact

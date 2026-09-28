@@ -679,7 +679,87 @@ pub enum Request {
     /// passes, …), so a front-end can show a running "what happened" feed
     /// without re-deriving it from anywhere.
     ListActivity { limit: usize },
+
+    // ---- push -------------------------------------------------------------
+    /// Keep the connection open and stream [`Event`] lines instead of one
+    /// [`Response`]. See [`subscribe`] for the client side.
+    Subscribe,
 }
+
+/// Something a front-end shows that the daemon can say has changed, so the
+/// front-end reads it again. Carried by [`Event::Changed`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Topic {
+    /// Folder listings in the mount: something was created, renamed, moved,
+    /// trashed or pinned, here or on another device.
+    Files,
+    /// The photos timeline or albums.
+    Photos,
+    Trash,
+    /// Shares, links, invitations and saved links, in either direction.
+    Shares,
+    /// The account's computers.
+    Devices,
+    /// Synced folders, their mode and their live progress.
+    Locations,
+    /// The pending-op queue ([`Request::ListPendingOps`]).
+    Queue,
+    Conflicts,
+    /// The activity log gained entries.
+    Activity,
+    /// A topic from a newer daemon, which this front-end cannot act on.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Topic {
+    /// Every topic a front-end can act on. A new subscription is told all of
+    /// them have changed, so it catches up on whatever happened while it was
+    /// not connected.
+    pub const ALL: [Topic; 9] = [
+        Topic::Files,
+        Topic::Photos,
+        Topic::Trash,
+        Topic::Shares,
+        Topic::Devices,
+        Topic::Locations,
+        Topic::Queue,
+        Topic::Conflicts,
+        Topic::Activity,
+    ];
+}
+
+/// One line on a [`Request::Subscribe`] connection.
+///
+/// The two things front ends show continuously, status and transfers, come
+/// with their contents, so following them costs no requests. Everything else is
+/// a [`Topic`] to re-read.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Event {
+    /// A fresh [`Response::Status`]. Sent when a subscription starts and
+    /// whenever any of its fields changes.
+    Status(Box<Response>),
+    /// A fresh [`Response::Transfers`] snapshot. Sent when a subscription
+    /// starts and whenever the snapshot changes, which is continuously while
+    /// something moves.
+    Transfers {
+        items: Vec<TransferItem>,
+        jobs: Vec<JobItem>,
+    },
+    /// These topics changed. Changes close together arrive as one event.
+    Changed { topics: Vec<Topic> },
+    /// Nothing happened. Sent every [`HEARTBEAT`] so a client can tell a quiet
+    /// daemon from a stuck one.
+    Heartbeat,
+}
+
+/// How often a quiet subscription sends [`Event::Heartbeat`].
+pub const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// How long [`Subscription::next_event`] waits for a line before it gives the
+/// daemon up as stuck: a few missed heartbeats.
+const SUBSCRIBE_READ_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Which kind of share entry a [`ShareEntry`] is, and which collection an
 /// [`Request::UpdateShareRole`]/[`Request::RemoveShareEntry`] targets.
@@ -2116,6 +2196,145 @@ pub fn send(socket: &Path, req: &Request) -> Result<Response> {
     Ok(serde_json::from_str(resp.trim())?)
 }
 
+/// An open [`Request::Subscribe`] connection. See [`subscribe`].
+pub struct Subscription {
+    reader: BufReader<UnixStream>,
+    line: String,
+}
+
+/// Start following the daemon listening on `socket`. Fails if no daemon is
+/// listening. A daemon too old to know [`Request::Subscribe`] answers it with an
+/// error, which the first [`Subscription::next_event`] returns as
+/// [`crate::Error::Other`].
+pub fn subscribe(socket: &Path) -> Result<Subscription> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(SUBSCRIBE_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let mut line = serde_json::to_vec(&Request::Subscribe)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()?;
+    Ok(Subscription {
+        reader: BufReader::new(stream),
+        line: String::new(),
+    })
+}
+
+impl Subscription {
+    /// Wait for the next event. `Ok(None)` means the daemon closed the
+    /// connection; a timeout means it went [`SUBSCRIBE_READ_TIMEOUT`] without
+    /// even a heartbeat. A line from a newer daemon that this client cannot
+    /// read is skipped rather than ending the subscription.
+    pub fn next_event(&mut self) -> Result<Option<Event>> {
+        loop {
+            self.line.clear();
+            if self.reader.read_line(&mut self.line)? == 0 {
+                return Ok(None);
+            }
+            let line = self.line.trim();
+            if let Ok(event) = serde_json::from_str::<Event>(line) {
+                return Ok(Some(event));
+            }
+            if let Ok(Response::Error { message, .. }) = serde_json::from_str::<Response>(line) {
+                return Err(crate::Error::Other(message));
+            }
+        }
+    }
+}
+
+/// What [`follow`] reports.
+#[derive(Debug)]
+pub enum Feed {
+    /// A subscription started. The events after it describe the daemon's
+    /// current state, so a front-end catches up from them.
+    Connected,
+    Event(Event),
+    /// The subscription ended: the daemon stopped, or stopped answering.
+    Disconnected,
+}
+
+/// How often [`follow`] polls a daemon that cannot push events.
+const LEGACY_POLL: Duration = Duration::from_secs(3);
+
+/// The longest [`follow`] waits between attempts to reach a daemon.
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
+/// Follow the daemon on `socket` for as long as `on` returns true, across
+/// daemon restarts. Blocks, so run it on a thread of its own.
+///
+/// A daemon that predates [`Request::Subscribe`] (still running after an
+/// upgrade, until its service restarts) is polled for its status and transfers
+/// instead, so a front-end sees the same events either way, only later.
+pub fn follow(socket: &Path, mut on: impl FnMut(Feed) -> bool) {
+    let mut connected = false;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let ended = match subscribe(socket) {
+            Ok(mut subscription) => {
+                let mut first = true;
+                loop {
+                    match subscription.next_event() {
+                        Ok(Some(event)) => {
+                            if first {
+                                first = false;
+                                connected = true;
+                                backoff = Duration::from_secs(1);
+                                if !on(Feed::Connected) {
+                                    return;
+                                }
+                            }
+                            if !on(Feed::Event(event)) {
+                                return;
+                            }
+                        }
+                        Ok(None) => break Ok(()),
+                        Err(e) => break Err(e),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(crate::Error::Other(_)) = ended {
+            if !connected {
+                connected = true;
+                if !on(Feed::Connected) {
+                    return;
+                }
+            }
+            if !poll_legacy(socket, &mut on) {
+                return;
+            }
+            std::thread::sleep(LEGACY_POLL);
+            continue;
+        }
+        if connected {
+            connected = false;
+            if !on(Feed::Disconnected) {
+                return;
+            }
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
+/// One round of [`follow`]'s fallback: the status and transfers a subscription
+/// would have pushed. Returns what `on` returned.
+fn poll_legacy(socket: &Path, on: &mut impl FnMut(Feed) -> bool) -> bool {
+    match send(socket, &Request::Status) {
+        Ok(status @ Response::Status { .. }) => {
+            if !on(Feed::Event(Event::Status(Box::new(status)))) {
+                return false;
+            }
+        }
+        _ => return true,
+    }
+    if let Ok(Response::Transfers { items, jobs }) = send(socket, &Request::GetQueueStatus) {
+        return on(Feed::Event(Event::Transfers { items, jobs }));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2135,6 +2354,59 @@ mod tests {
             .read_timeout(),
             READ_TIMEOUT
         );
+    }
+
+    /// A daemon on a fresh socket that reads the subscription request and
+    /// answers with `lines`, then hangs up.
+    fn fake_daemon(name: &str, lines: &'static str) -> std::path::PathBuf {
+        let socket = std::env::temp_dir().join(format!("pdfs-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(request.trim()),
+                Ok(Request::Subscribe)
+            ));
+            reader.get_mut().write_all(lines.as_bytes()).unwrap();
+        });
+        socket
+    }
+
+    #[test]
+    fn a_subscription_skips_what_it_cannot_read() {
+        let socket = fake_daemon(
+            "subscribe",
+            "not json\n\
+             {\"Changed\":{\"topics\":[\"files\",\"from_a_newer_daemon\"]}}\n\
+             {\"NewEvent\":{}}\n\
+             \"Heartbeat\"\n",
+        );
+        let mut subscription = subscribe(&socket).unwrap();
+        let first = subscription.next_event().unwrap();
+        let second = subscription.next_event().unwrap();
+        let end = subscription.next_event().unwrap();
+        let _ = std::fs::remove_file(&socket);
+        match first {
+            Some(Event::Changed { topics }) => {
+                assert_eq!(topics, vec![Topic::Files, Topic::Unknown]);
+            }
+            other => panic!("expected a change, got {other:?}"),
+        }
+        assert!(matches!(second, Some(Event::Heartbeat)), "{second:?}");
+        assert!(end.is_none(), "{end:?}");
+    }
+
+    #[test]
+    fn a_daemon_without_subscriptions_is_told_apart_from_a_dead_one() {
+        let socket = fake_daemon("legacy", "{\"Error\":{\"message\":\"unknown request\"}}\n");
+        let mut subscription = subscribe(&socket).unwrap();
+        let answer = subscription.next_event();
+        let _ = std::fs::remove_file(&socket);
+        assert!(matches!(answer, Err(crate::Error::Other(_))), "{answer:?}");
     }
 
     #[test]

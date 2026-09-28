@@ -97,7 +97,7 @@ impl Busy {
     pub(crate) fn start(button: &gtk4::Button) -> Self {
         let label = button.label();
         let icon = button.icon_name();
-        let spinner = gtk4::Spinner::builder().spinning(true).build();
+        let spinner = spinner();
         match &label {
             Some(text) => {
                 let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -408,10 +408,9 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     });
 
     // Shared by me lists what this dialog changes: reload it when it is the
-    // page underneath, and have the next visit fetch otherwise.
+    // page underneath. Any other page reads it again on the next visit.
     let ui_closed = ui.clone();
     dialog.connect_closed(move |_| {
-        ui_closed.shared_by_me.loaded_at.set(None);
         if ui_closed.stack.visible_child_name().as_deref() == Some("sharedbyme") {
             load_shared_by_me(&ui_closed);
         }

@@ -422,6 +422,10 @@ pub(super) async fn run_event_sync(
             cursor = Some(applied);
         }
         flush_dirty_parents(&core, &dirty);
+        // Another device changed the tree: whatever a front-end lists may have
+        // moved, including what is shared and what is in the trash.
+        core.events
+            .publish(&[Topic::Files, Topic::Trash, Topic::Shares, Topic::Conflicts]);
     }
 }
 
@@ -479,6 +483,7 @@ pub(super) async fn run_photos_event_sync(core: Core) {
             continue;
         };
         apply_photo_events(&core, &events);
+        core.events.publish(&[Topic::Photos]);
         // One cursor write per batch, after the batch is applied: a crash in
         // between replays events whose effects are idempotent.
         if let Err(error) = core.db.set_state_str(PHOTOS_EVENT_CURSOR, head.as_str()) {
