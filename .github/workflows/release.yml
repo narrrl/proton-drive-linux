@@ -10,8 +10,60 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    name: Release quality gates
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libfuse3-dev \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libsecret-1-dev \
+            libdbus-1-dev
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.96'
+          components: rustfmt, clippy
+          cache: false
+
+      # A tag can read the caches of main but its own caches are useless to the next
+      # tag, so this only restores what CI saved on main.
+      - name: Cache Cargo target
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+          save-if: false
+
+      - name: Verify tag and manifest versions
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          pkgbuild_version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD | head -n1)"
+          test "$tag_version" = "$manifest_version"
+          test "$tag_version" = "$pkgbuild_version"
+
+      - name: Release quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --locked
+          scripts/fuse-acceptance.sh --offline-only
+
   build-release:
-    name: Build and Release
+    name: Build packages
     runs-on: ubuntu-24.04
     environment: 'rpm signing'
 
@@ -38,27 +90,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: '1.96'
-          components: rustfmt, clippy
+          cache: false
 
+      # Restores the release-profile dependencies that CI builds on main.
       - name: Cache Cargo target
         uses: swatinem/rust-cache@v2
-
-      - name: Verify tag and manifest versions
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
-          pkgbuild_version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD | head -n1)"
-          test "$tag_version" = "$manifest_version"
-          test "$tag_version" = "$pkgbuild_version"
-
-      - name: Release quality gates
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --locked
-          scripts/fuse-acceptance.sh --offline-only
+        with:
+          shared-key: release
+          save-if: false
 
       - name: Build release binaries
         run: |
@@ -152,6 +191,7 @@ jobs:
             --define "_topdir $PWD/rpmbuild" \
             --define "_sourcedir $PWD" \
             --define "git_dir $PWD" \
+            --define "prebuilt 1" \
             --define "version ${RPM_VERSION}" \
             --define "_dbpath $PWD/rpmbuild/db" \
             packaging/proton-drive-linux.spec
@@ -190,8 +230,19 @@ jobs:
             *.rpm
           if-no-files-found: error
 
+  publish:
+    name: Create GitHub Release
+    needs: [checks, build-release]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: proton-drive-linux-builds
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           files: |
@@ -205,7 +256,7 @@ jobs:
 
   aur:
     name: Publish AUR packages
-    needs: build-release
+    needs: publish
     if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/aur.yml
     with:

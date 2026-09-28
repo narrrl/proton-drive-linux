@@ -32,8 +32,14 @@ jobs:
         with:
           toolchain: '1.96'
           components: rustfmt, clippy
+          cache: false
 
+      # Tags can only restore caches saved on main, so only main saves one. The
+      # release workflow restores this key for its quality gates.
       - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -57,3 +63,37 @@ jobs:
 
   # Real Proton credentials and /dev/fuse deliberately do not run on pull
   # requests. Follow docs/TESTING.md on a dedicated test-account runner.
+
+  # Keeps the release-profile dependencies cached on main, where the release
+  # workflow can restore them; a tag cannot reuse the caches of earlier tags.
+  release-cache:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libfuse3-dev \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libsecret-1-dev \
+            libdbus-1-dev
+
+      - name: Install minimum supported Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.96'
+          cache: false
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: Release build
+        run: cargo build --release --locked

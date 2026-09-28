@@ -60,12 +60,18 @@ test -n "%{?git_dir}" || (echo 'Pass --define "git_dir $PWD" from the repo root'
 test -f %{git_dir}/Cargo.toml
 cp -a %{git_dir}/LICENSE .
 %build
+# The release workflow has already built target/release and passes --define "prebuilt 1".
+# rpmbuild exports its own compiler flags, which would make cargo rebuild everything.
+%if 0%{?prebuilt}
+test -x %{git_dir}/target/release/pdfs
+%else
 cd %{git_dir}
 cargo build --release --locked \
   --bin pdfs \
   --bin pdfs-tray \
   --bin pdfs-app \
   --bin pdfs-prompt
+%endif
 
 %install
 rel=%{git_dir}/target/release
