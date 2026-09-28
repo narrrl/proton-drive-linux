@@ -268,6 +268,9 @@ Options:
                         every keystroke — results appear as you type, unlike
                         --dmenu. Also settable as \"prompt\": { \"mode\": \"fzf\" }.
   --gtk                 Force the built-in window, overriding that setting.
+  --preload             Start the built-in window hidden and stay resident, so
+                        the first summon opens at once. For session autostart;
+                        does nothing if the prompt is already running.
   --menu <COMMAND>      Launcher command line for --dmenu, e.g.
                         --menu 'fuzzel --dmenu --width 60'. Overrides
                         \"prompt\": { \"menu\": [...] }.
@@ -293,6 +296,8 @@ struct Args {
     feed: Option<Option<String>>,
     /// `--inner`: we are the process a spawned terminal is running.
     inner: bool,
+    /// `--preload`: become the resident GTK instance without showing it.
+    preload: bool,
 }
 
 fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -302,6 +307,7 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         query: None,
         feed: None,
         inner: false,
+        preload: false,
     };
     let mut argv = argv.peekable();
     while let Some(arg) = argv.next() {
@@ -310,6 +316,7 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--fzf" => args.mode = Some(PromptMode::Fzf),
             "--gtk" => args.mode = Some(PromptMode::Gtk),
             "--inner" => args.inner = true,
+            "--preload" => args.preload = true,
             // fzf passes an empty argument for an empty input, so a missing
             // value here is that case rather than a user error.
             "--feed" => args.feed = Some(argv.next().filter(|text| !text.trim().is_empty())),
@@ -336,6 +343,13 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             other => return Err(format!("unrecognised argument: {other}")),
         }
+    }
+    // Only the GTK window has a resident process worth warming up.
+    if args.preload {
+        if matches!(args.mode, Some(PromptMode::Dmenu | PromptMode::Fzf)) || args.query.is_some() {
+            return Err("--preload only applies to the built-in window".to_string());
+        }
+        args.mode = Some(PromptMode::Gtk);
     }
     Ok(args)
 }
@@ -398,9 +412,31 @@ fn main() -> glib::ExitCode {
     // GtkApplication normally remains active while it owns a window, including
     // when that window is hidden. Hold it explicitly as well: residency is a
     // product requirement here, not an incidental window-lifetime side effect.
-    let _resident = app.hold();
-    app.connect_startup(|_| theme::load_resources("/de/nils/protondrivelinux/prompt.css"));
+    // Only the primary instance runs startup; a hold taken before registration
+    // would also keep every remote invocation alive after it has forwarded
+    // its activation.
+    let resident = Rc::new(RefCell::new(None));
+    app.connect_startup(move |app| {
+        *resident.borrow_mut() = Some(app.hold());
+        theme::load_resources("/de/nils/protondrivelinux/prompt.css");
+    });
+    if args.preload {
+        if let Err(e) = app.register(gtk4::gio::Cancellable::NONE) {
+            eprintln!("pdfs-prompt: {e}");
+            return glib::ExitCode::FAILURE;
+        }
+        // Another instance is already resident; activating it would show it.
+        // Dropping a registered application that never ran makes GIO warn
+        // about the D-Bus registration, so leave it to process exit.
+        if app.is_remote() {
+            std::mem::forget(app);
+            return glib::ExitCode::SUCCESS;
+        }
+    }
     let prompt: Rc<RefCell<Option<Rc<hud::Ui>>>> = Rc::new(RefCell::new(None));
+    // The first activation of a preloading instance is its own startup, not a
+    // summon: build the window but leave it hidden.
+    let quiet = std::cell::Cell::new(args.preload);
     app.connect_activate(move |app| {
         let ui = if let Some(ui) = prompt.borrow().clone() {
             ui
@@ -411,6 +447,10 @@ fn main() -> glib::ExitCode {
             *prompt.borrow_mut() = Some(ui.clone());
             ui
         };
+        if quiet.replace(false) {
+            ui.preload();
+            return;
+        }
         ui.activate();
     });
     // GTK must not try to parse our own flags; they were consumed above.
@@ -581,5 +621,17 @@ mod tests {
     fn a_query_is_taken_verbatim_including_spaces() {
         let args = parse(&["--dmenu", "--query", "tax return 2024"]).unwrap();
         assert_eq!(args.query.as_deref(), Some("tax return 2024"));
+    }
+
+    #[test]
+    fn preload_forces_the_gtk_window_and_rejects_the_launchers() {
+        let args = parse(&["--preload"]).unwrap();
+        assert!(args.preload);
+        assert_eq!(args.mode, Some(PromptMode::Gtk));
+
+        assert!(parse(&["--preload", "--dmenu"]).is_err());
+        assert!(parse(&["--fzf", "--preload"]).is_err());
+        assert!(parse(&["--preload", "--menu", "fuzzel --dmenu"]).is_err());
+        assert!(parse(&["--preload", "--query", "tax"]).is_err());
     }
 }

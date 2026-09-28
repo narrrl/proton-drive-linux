@@ -235,6 +235,15 @@ The window stays loaded after the first use, so later shortcuts open it instantl
 and video open straight from the Proton Drive folder, so players can start before the whole file
 downloads. Other Drive files download first, then open.
 
+To make the first shortcut instant as well, start the launcher hidden with your session.
+`pdfs-prompt --preload` loads the window without showing it and does nothing if the launcher is
+already running. For Hyprland:
+
+```ini
+exec-once = pdfs-prompt --preload
+bind = SUPER, space, exec, pdfs-prompt
+```
+
 ### Using your own launcher
 
 `pdfs-prompt --dmenu` shows the results in fuzzel, rofi, wofi, tofi, bemenu or dmenu, whichever is

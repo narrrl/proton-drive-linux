@@ -535,6 +535,12 @@ async fn mounted_target_within(mountpoint: PathBuf, hit: SearchHit) -> Option<Pa
 }
 
 impl Ui {
+    /// `--preload`: create the surface, renderer and style state now, without
+    /// mapping the window, so the first real summon only has to present it.
+    pub(crate) fn preload(&self) {
+        WidgetExt::realize(&self.window);
+    }
+
     /// Reset and present the resident prompt in response to GApplication
     /// activation. A second invocation while a file is materialising merely
     /// raises the progress window; it must not make the in-flight open mutable.
