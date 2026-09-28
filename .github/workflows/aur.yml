@@ -45,7 +45,7 @@ jobs:
         run: pacman -Syu --noconfirm --needed git openssh pacman-contrib
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The updated recipes are committed back to main, not to the tag.
           ref: main
