@@ -262,20 +262,22 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
     (frame.upcast(), widgets)
 }
 
-/// `child` in a clamp that scrolls vertically only, with page margins.
+/// `child` across the page's full width, scrolling vertically only, with page
+/// margins.
 fn scrolled_column(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
-    let clamp = adw::Clamp::builder().child(child).build();
-    clamp.set_margin_top(18);
-    clamp.set_margin_bottom(18);
-    clamp.set_margin_start(18);
-    clamp.set_margin_end(18);
+    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    column.append(child);
+    column.set_margin_top(18);
+    column.set_margin_bottom(18);
+    column.set_margin_start(18);
+    column.set_margin_end(18);
     // Never scroll sideways: a location's subtitle holds a full path, and letting
     // the row grow to fit one pushes the controls at its end off screen.
     // Constrained, the path ellipsizes and the controls stay reachable.
     gtk4::ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
-        .child(&clamp)
+        .child(&column)
         .build()
 }
 

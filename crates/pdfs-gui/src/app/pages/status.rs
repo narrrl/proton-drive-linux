@@ -1069,7 +1069,11 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
             let row_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
             row_box.set_margin_top(8);
             row_box.set_margin_bottom(8);
-            let label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
+            // Ellipsized so a long file name cannot widen the page.
+            let label = gtk4::Label::builder()
+                .halign(gtk4::Align::Start)
+                .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+                .build();
             label.add_css_class("dim-label");
             let bar = gtk4::ProgressBar::new();
             row_box.append(&label);
