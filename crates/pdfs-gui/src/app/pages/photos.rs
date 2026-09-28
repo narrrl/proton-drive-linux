@@ -76,6 +76,9 @@ pub(crate) struct GalleryState {
     pub(crate) places_mapping_label: gtk4::Label,
     pub(crate) places_mapping_bar: gtk4::ProgressBar,
     pub(crate) places_poll: RefCell<Option<glib::SourceId>>,
+    /// The place map, and the Grid/Map toggle's Map half.
+    pub(crate) places_map: Rc<PlacesMap>,
+    pub(crate) places_map_btn: gtk4::ToggleButton,
     /// How many places the grid shows, for the subtitle when back returns there.
     pub(crate) place_count: Cell<usize>,
     /// The place currently open, paged by [`load_gallery`] like an album.
@@ -426,6 +429,8 @@ pub(crate) struct GalleryWidgets {
     pub(crate) places_mapping: gtk4::Box,
     pub(crate) places_mapping_label: gtk4::Label,
     pub(crate) places_mapping_bar: gtk4::ProgressBar,
+    pub(crate) places_map: Rc<PlacesMap>,
+    pub(crate) places_map_btn: gtk4::ToggleButton,
     pub(crate) back: gtk4::Button,
     /// The kind toggles and date jump, as one box so an album view can hide them.
     pub(crate) filters: gtk4::Box,
@@ -827,6 +832,21 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     places_stack.set_vexpand(true);
     places_stack.add_named(&places_scroll, Some("grid"));
     places_stack.add_named(&places_status, Some("status"));
+    let places_map = PlacesMap::new();
+    places_stack.add_named(places_map.widget(), Some("map"));
+    // The places as cards or on the map.
+    let places_grid_btn = gtk4::ToggleButton::builder()
+        .label(pgettext("layout", "Grid"))
+        .active(true)
+        .build();
+    let places_map_btn = gtk4::ToggleButton::builder()
+        .label(pgettext("layout", "Map"))
+        .group(&places_grid_btn)
+        .build();
+    let places_switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    places_switch.add_css_class("linked");
+    places_switch.append(&places_grid_btn);
+    places_switch.append(&places_map_btn);
     // While a refresh reads the library's locations (the first one after an
     // update reads all of them), a bar says how far it has got.
     let places_mapping_label = gtk4::Label::new(None);
@@ -836,11 +856,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .valign(gtk4::Align::Center)
         .build();
     let places_mapping = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    places_mapping.set_hexpand(true);
     places_mapping.append(&places_mapping_label);
     places_mapping.append(&places_mapping_bar);
     places_mapping.set_visible(false);
+    let places_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    places_bar.append(&places_switch);
+    places_bar.append(&places_mapping);
     let places_page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    places_page.append(&places_mapping);
+    places_page.append(&places_bar);
     places_page.append(&places_stack);
 
     let content = gtk4::Stack::new();
@@ -926,6 +950,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             places_mapping,
             places_mapping_label,
             places_mapping_bar,
+            places_map,
+            places_map_btn,
             back,
             filters,
         },

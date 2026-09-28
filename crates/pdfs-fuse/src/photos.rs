@@ -764,6 +764,8 @@ impl Core {
                     id: place.id,
                     name: city.name.to_string(),
                     country: city.country.to_string(),
+                    latitude: city.latitude,
+                    longitude: city.longitude,
                     photo_count: place.count,
                     cover: self.photo_item(place.cover),
                 })

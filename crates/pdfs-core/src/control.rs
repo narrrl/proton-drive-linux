@@ -1456,6 +1456,12 @@ pub struct PlaceInfo {
     pub name: String,
     /// ISO 3166-1 alpha-2 code of the town's country.
     pub country: String,
+    /// Where the town is, in decimal degrees, for the map. Zero from a daemon
+    /// older than the map.
+    #[serde(default)]
+    pub latitude: f64,
+    #[serde(default)]
+    pub longitude: f64,
     /// How many photos were taken there, counting a RAW+JPEG shot once.
     pub photo_count: usize,
     /// The newest photo taken there, shown as the place's cover.

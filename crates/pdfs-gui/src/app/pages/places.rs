@@ -83,7 +83,8 @@ pub(crate) fn load_places(ui: &Rc<Ui>) {
             }
             Ok(Ok(Response::Places { items, .. })) => {
                 fill_places(&ui, &items);
-                ui.gallery.places_stack.set_visible_child_name("grid");
+                ui.gallery.places_map.set_places(&items);
+                show_places_layout(&ui);
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &gettext("Couldn't load places"), &message, kind);
@@ -161,12 +162,12 @@ fn fill_places(ui: &Rc<Ui>, places: &[PlaceInfo]) {
     }
 }
 
-fn places_subtitle(count: usize) -> String {
+pub(crate) fn places_subtitle(count: usize) -> String {
     ngettext_f("{n} place", "{n} places", count as u64, &[])
 }
 
 /// "Germany · 12 photos": where the town is, and how much was taken there.
-fn place_subtitle(place: &PlaceInfo) -> String {
+pub(crate) fn place_subtitle(place: &PlaceInfo) -> String {
     ngettext_f(
         // Translators: {country} is a country name, {n} a number of photos.
         "{country} · {n} photo",
@@ -285,4 +286,34 @@ pub(crate) fn wire_places(ui: &Rc<Ui>) {
             show_places(&ui_places);
         }
     });
+
+    let ui_layout = ui.clone();
+    ui.gallery.places_map_btn.connect_toggled(move |_| {
+        // A status page (loading, empty, an error) stays until a listing
+        // replaces it; only the grid and the map swap.
+        if ui_layout
+            .gallery
+            .places_stack
+            .visible_child_name()
+            .as_deref()
+            != Some("status")
+        {
+            show_places_layout(&ui_layout);
+        }
+    });
+
+    let ui_open = ui.clone();
+    ui.gallery
+        .places_map
+        .connect_open(move |place| open_place(&ui_open, place));
+}
+
+/// Show the places as cards or on the map, as the Grid/Map toggle says.
+fn show_places_layout(ui: &Rc<Ui>) {
+    let layout = if ui.gallery.places_map_btn.is_active() {
+        "map"
+    } else {
+        "grid"
+    };
+    ui.gallery.places_stack.set_visible_child_name(layout);
 }

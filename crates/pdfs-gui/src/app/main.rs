@@ -15,6 +15,7 @@ use pages::login::*;
 use pages::photo_viewer::*;
 use pages::photos::*;
 use pages::places::*;
+use pages::places_map::*;
 use pages::shared::*;
 use pages::shared_by_me::*;
 use pages::status::*;
@@ -562,6 +563,8 @@ fn build_window(app: &adw::Application) {
             places_mapping_label: gallery_widgets.places_mapping_label.clone(),
             places_mapping_bar: gallery_widgets.places_mapping_bar.clone(),
             places_poll: RefCell::new(None),
+            places_map: gallery_widgets.places_map.clone(),
+            places_map_btn: gallery_widgets.places_map_btn.clone(),
             place_count: Cell::new(0),
             place: RefCell::new(None),
             album: RefCell::new(None),
@@ -1358,6 +1361,14 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::License::Custom,
             Some(&gettext(
                 "Places are named with data from <a href=\"https://www.geonames.org/\">GeoNames</a>, licensed under <a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>.",
+            )),
+        );
+        dialog.add_legal_section(
+            "Natural Earth",
+            None,
+            gtk4::License::Custom,
+            Some(&gettext(
+                "The places map is drawn from <a href=\"https://www.naturalearthdata.com/\">Natural Earth</a> land outlines, which are in the public domain.",
             )),
         );
         dialog.add_legal_section(
