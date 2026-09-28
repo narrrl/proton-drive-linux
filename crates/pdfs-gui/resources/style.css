@@ -19,10 +19,19 @@
 .sidebar-status image.error { color: var(--error-color); }
 .sidebar-quota progressbar trough, .sidebar-quota progressbar progress { min-height: 4px; }
 .sidebar-account { padding: 4px 4px 4px 8px; }
+/* A count of what waits on a page, at the end of its sidebar row */
+.sidebar-badge {
+  min-width: 10px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: alpha(currentColor, 0.15);
+  font-size: 0.8em;
+  font-weight: 700;
+}
 
 /* Sync page status card: the state is the headline, the detail explains it */
-.sync-card .title { font-size: 1.15rem; font-weight: 700; }
-.sync-card-icon { padding: 6px 8px; }
+.sync-card { padding: 18px 24px; }
+.sync-card-icon { padding: 6px; }
 .sync-card-icon.success { color: var(--success-color); }
 .sync-card-icon.warning { color: var(--warning-color); }
 .sync-card-icon.error { color: var(--error-color); }

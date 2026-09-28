@@ -1,8 +1,5 @@
 use crate::*;
 
-/// An action run by an [`ActionMenu`] item.
-pub(crate) type MenuAction = Box<dyn Fn()>;
-
 /// A `gio::Menu` whose items run closures, for menus whose contents depend on
 /// what they were opened for (a row, a selection, a photo). Each item gets its
 /// own action in a private `menu` group, installed on whatever hosts the
@@ -147,13 +144,4 @@ fn popover_host(anchor: &gtk4::Widget) -> gtk4::Widget {
         }
     }
     host
-}
-
-/// A flat ⋮ button whose menu lists `items` as (label, action).
-pub(crate) fn more_menu_button(items: Vec<(&str, MenuAction)>) -> gtk4::MenuButton {
-    let mut menu = ActionMenu::new();
-    for (label, run) in items {
-        menu.item(label, run);
-    }
-    menu.button()
 }

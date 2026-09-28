@@ -96,6 +96,26 @@ pub fn is_transient_name(name: &str) -> bool {
     false
 }
 
+/// Whether `name` is scratch another program writes and throws away: the
+/// [`is_transient_name`] set, plus the save-by-rename temporaries of GTK, Qt,
+/// Chromium and Electron, generic `.tmp` files and Emacs lock files. None of
+/// them is a file the user made, so a front-end can hide them from a history
+/// of what happened to the user's files.
+pub fn is_scratch_name(name: &str) -> bool {
+    if is_transient_name(name) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".tmp")
+        || lower.ends_with(".temp")
+        || name.starts_with(".goutputstream-")
+        || name.starts_with(".org.chromium.")
+        || name.starts_with(".com.google.chrome.")
+        || name.starts_with(".#")
+        || (name.starts_with('#') && name.ends_with('#') && name.len() > 1)
+        || (name.starts_with('.') && name.contains(".tmp."))
+}
+
 /// Filenames accepted as a folder's ignore file, in precedence order.
 const IGNORE_FILE_NAMES: &[&str] = &[".pdfsignore", ".protonignore"];
 
@@ -338,6 +358,25 @@ mod tests {
             "FOO.CRDOWNLOAD",
         ] {
             assert!(is_transient_name(name), "{name} should be transient");
+        }
+    }
+
+    #[test]
+    fn save_by_rename_temporaries_are_scratch() {
+        for name in [
+            ".goutputstream-4XK2B2",
+            ".org.chromium.Chromium.aBc123",
+            "~$report.docx",
+            ".~lock.budget.ods#",
+            ".#notes.org",
+            "#notes.org#",
+            "cache.tmp",
+            "page.html.crdownload",
+        ] {
+            assert!(is_scratch_name(name), "{name}");
+        }
+        for name in ["report.docx", "notes.org", "#1 hits.txt", ".bashrc"] {
+            assert!(!is_scratch_name(name), "{name}");
         }
     }
 

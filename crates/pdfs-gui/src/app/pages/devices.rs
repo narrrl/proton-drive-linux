@@ -1,85 +1,119 @@
 use crate::*;
 
 pub(crate) struct DevicesState {
-    // Devices page: two sections (synced folders + other devices), rebuilt
-    // wholesale on each load.
+    // Computers page: one list of the account's computers, this one first, and
+    // a read-only browser over another computer's backup.
+    /// "list", "browse", or "status" while the page loads or can't be read.
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     pub(crate) group: adw::PreferencesGroup,
+    /// Rows added last time, removed before the next paint (adw groups have no
+    /// clear-all).
     pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
-    pub(crate) sync_group: adw::PreferencesGroup,
-    /// The single "This computer" summary row. The per-folder rows moved to the
-    /// Locations page, which owns every local path.
-    pub(crate) sync_rows: RefCell<Vec<gtk4::Widget>>,
-    /// "Rename" action in the "This computer" header. Insensitive until the
-    /// device list identifies this machine's own device.
-    pub(crate) rename_this: gtk4::Button,
-    /// This machine's own device `(uid, name)`, from the last device list. The
-    /// current device is filtered out of the "Other computers" rows, so this is
-    /// where its rename target lives. `None` until identified.
-    pub(crate) this_device: RefCell<Option<(String, String)>>,
+    /// The browse view's files.
+    pub(crate) files: FileList,
+    /// The browse view: "list", or "empty".
+    pub(crate) files_content: gtk4::Stack,
+    /// The breadcrumb trail from "Computers" down to the current folder.
+    pub(crate) crumb: gtk4::Box,
+    /// Grid or list for the browse view; hidden on the device list.
+    pub(crate) layout: gtk4::Button,
+    /// Where the browse view is, as `(uid, name)`: the computer first, then each
+    /// folder below it. Empty = the device list. A backup has no path in the
+    /// mount, so descending is uid-addressed and the stack is the breadcrumb.
+    pub(crate) nav: RefCell<Vec<(String, String)>>,
+    /// The [`DevicesState::nav`] the page on screen was painted for, or `None`
+    /// before the first paint.
+    pub(crate) listed: RefCell<Option<Vec<(String, String)>>>,
     /// Runs the loads; the rows stay up while one runs.
     pub(crate) loader: Rc<Loader>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
+}
+
+impl DevicesState {
+    pub(crate) fn new(widgets: &DevicesWidgets) -> Self {
+        DevicesState {
+            content: widgets.content.clone(),
+            status: widgets.status.clone(),
+            retry: widgets.retry.clone(),
+            group: widgets.group.clone(),
+            rows: RefCell::new(Vec::new()),
+            files: widgets.files.clone(),
+            files_content: widgets.files_content.clone(),
+            crumb: widgets.crumb.clone(),
+            layout: widgets.layout.clone(),
+            nav: RefCell::new(Vec::new()),
+            listed: RefCell::new(None),
+            loader: Loader::new(&widgets.content),
+            loaded_at: Cell::new(None),
+        }
+    }
 }
 
 /// Widgets the Devices page's load/repaint touch.
 pub(crate) struct DevicesWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
-    /// "This computer" — this machine's device identity and a pointer to its
-    /// folders on the Locations page.
-    pub(crate) sync_group: adw::PreferencesGroup,
-    /// "Rename" in the "This computer" header — renames this machine's device.
-    pub(crate) rename_this: gtk4::Button,
-    /// "Other computers" — the account's *other* registered devices. This
-    /// machine's own device is deliberately not among them; see
-    /// [`repaint_devices`].
+    /// Every computer on the account, this one first.
     pub(crate) group: adw::PreferencesGroup,
+    pub(crate) files: FileList,
+    pub(crate) files_content: gtk4::Stack,
+    /// Goes up one folder, and from a computer's top level back to the list.
+    pub(crate) back: gtk4::Button,
+    pub(crate) crumb: gtk4::Box,
+    pub(crate) layout: gtk4::Button,
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
 }
 
-/// The Computers page: a "This computer" section naming the device this machine
-/// backs up to (renamable from its header), plus an "Other computers" section
-/// listing the account's other registered devices. The synced folders
-/// themselves live on the Sync page.
+/// The Computers page: every computer backing up to the account, with this one
+/// first. This computer's row leads to its folders on the Sync page; another
+/// computer's row opens its backup read-only, in the same list as My files.
 pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     let refresh = refresh_button();
 
-    // This page is about device *identity* — which computer this is, which other
-    // computers back up to the account, and how to adopt one. The folders
-    // themselves are local paths, so they live on the Sync page; keeping a
-    // second copy of that list here would be two places to change the same mode.
-    let sync_group = adw::PreferencesGroup::builder()
-        .title(gettext("This computer"))
-        .description(gettext("The computer this machine backs up as."))
-        .build();
-    // Rename control for *this* machine's device, in the section header. The
-    // current device is filtered out of "Other computers", so this is the only
-    // place it can be renamed; insensitive until the device list identifies it.
-    let rename_this = gtk4::Button::builder()
-        .icon_name("document-edit-symbolic")
-        .tooltip_text(gettext("Rename this computer"))
-        .valign(gtk4::Align::Center)
-        .sensitive(false)
-        .build();
-    rename_this.add_css_class("flat");
-    sync_group.set_header_suffix(Some(&rename_this));
-    let group = adw::PreferencesGroup::builder()
-        .title(gettext("Other computers"))
-        .description(gettext("Other computers backing up to this account."))
-        .build();
-
-    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
-    groups.append(&sync_group);
-    groups.append(&group);
-    let clamp = adw::Clamp::builder().child(&groups).build();
+    let group = adw::PreferencesGroup::new();
+    let clamp = adw::Clamp::builder().child(&group).build();
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
         .child(&clamp)
         .build();
+
+    // Browse: a path bar over the list, as on Shared with me.
+    let files = FileList::new();
+    files.show_list(true);
+    let layout = layout_button(&files);
+    layout.set_visible(false);
+    let back = gtk4::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text(gettext("Back"))
+        .build();
+    back.add_css_class("flat");
+    let crumb = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    crumb.set_valign(gtk4::Align::Center);
+    let crumb_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::External)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .hexpand(true)
+        .child(&crumb)
+        .build();
+    let path_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    path_bar.append(&back);
+    path_bar.append(&crumb_scroll);
+    let files_empty = adw::StatusPage::builder()
+        .icon_name("folder-open-symbolic")
+        .title(gettext("This folder is empty"))
+        .description(gettext("Nothing in this folder has been backed up."))
+        .vexpand(true)
+        .build();
+    files_empty.add_css_class("compact");
+    let files_content = gtk4::Stack::new();
+    files_content.add_named(&files.views, Some("list"));
+    files_content.add_named(&files_empty, Some("empty"));
+    let browse = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    browse.append(&path_bar);
+    browse.append(&files_content);
 
     let retry = gtk4::Button::builder()
         .label(gettext("Retry"))
@@ -99,6 +133,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     content.set_vexpand(true);
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
     content.add_named(&scroll, Some("list"));
+    content.add_named(&browse, Some("browse"));
     content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
@@ -109,31 +144,67 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     inner.append(&content);
     let (frame, header, _) = page_frame(&gettext("Computers"), &inner);
     header.pack_end(&refresh);
+    header.pack_end(&layout);
 
     (
         frame.upcast(),
         DevicesWidgets {
             content,
             status,
-            sync_group,
-            rename_this,
             group,
+            files,
+            files_content,
+            back,
+            crumb,
+            layout,
             retry,
             refresh,
         },
     )
 }
 
-/// Install the Devices page's retry button and the Rename action.
-pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button) {
-    let ui_retry = ui.clone();
-    retry.connect_clicked(move |_| restart_service_then(&ui_retry, load_devices));
-    let ui_ren = ui.clone();
-    ui.devices.rename_this.connect_clicked(move |_| {
-        if let Some((uid, name)) = ui_ren.devices.this_device.borrow().clone() {
-            prompt_rename_device(&ui_ren, &uid, &name);
-        }
+/// Install the browse view's file list and the page's buttons.
+pub(crate) fn wire_devices(ui: &Rc<Ui>, widgets: &DevicesWidgets) {
+    let files = &ui.devices.files;
+    files.wire(
+        ui,
+        FileListBehavior {
+            activate: open_device_entry,
+            entry_menu: device_entry_menu,
+            bulk_menu: device_bulk_menu,
+            background_menu: device_background_menu,
+            badges: false,
+            drag_and_drop: false,
+        },
+    );
+    files
+        .column_view
+        .append_column(&text_column(&pgettext("column", "Modified"), |e| {
+            if e.modified > 0 {
+                dates::short_date(e.modified)
+            } else {
+                "—".to_string()
+            }
+        }));
+    files
+        .column_view
+        .append_column(&text_column(&pgettext("column", "Size"), |e| {
+            if e.is_dir {
+                "—".to_string()
+            } else {
+                human_bytes(e.size)
+            }
+        }));
+
+    let ui_back = ui.clone();
+    widgets.back.connect_clicked(move |_| {
+        ui_back.devices.nav.borrow_mut().pop();
+        load_devices(&ui_back);
     });
+    let ui_retry = ui.clone();
+    widgets
+        .retry
+        .connect_clicked(move |_| restart_service_then(&ui_retry, load_devices));
 }
 
 /// Show a status page in place of the Devices list.
@@ -145,20 +216,17 @@ pub(crate) fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     ui.devices.content.set_visible_child_name("status");
 }
 
-/// Fetch this machine's synced folders and the account's other devices, then
-/// repaint both sections. The two requests are chained so a single unreachable
-/// daemon collapses the whole page to a status view.
+/// Load the view [`DevicesState::nav`] points at: the device list, or a folder
+/// of another computer's backup.
 pub(crate) fn load_devices(ui: &Rc<Ui>) {
-    let ui_p = ui.clone();
-    let ticket = ui.devices.loader.refresh(move || {
-        devices_status(
-            &ui_p,
-            "computer-symbolic",
-            &gettext("Loading…"),
-            &gettext("Reading your computers."),
-            false,
-        );
-    });
+    cancel_file_thumbnails(ui);
+    let nav = ui.devices.nav.borrow().clone();
+    ui.devices.layout.set_visible(!nav.is_empty());
+    if !nav.is_empty() {
+        load_device_folder(ui, &nav);
+        return;
+    }
+    let ticket = begin_devices_load(ui, "computer-symbolic", gettext("Reading your computers."));
     ui.busy_begin();
     // The two lists are independent and the daemon serves requests concurrently,
     // so fire both up front and collect them, rather than paying two round trips
@@ -184,17 +252,95 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
                 return;
             }
         };
-        // Daemon reachable: show the list and paint the "This computer" section.
-        ui.devices.content.set_visible_child_name("list");
-        repaint_this_computer(&ui, &folders);
-
         let devices = match devices_reply {
             Ok(Ok(Response::Devices { items })) => items,
             _ => Vec::new(),
         };
-        repaint_devices(&ui, &devices);
+        ui.devices.content.set_visible_child_name("list");
+        repaint_devices(&ui, &devices, &folders);
+        repaint_device_crumb(&ui, &[]);
+        *ui.devices.listed.borrow_mut() = Some(Vec::new());
         ui.devices.loaded_at.set(Some(Instant::now()));
     });
+}
+
+/// List one folder of another computer's backup. The computer's own top level
+/// is its restorable folders; below that, any folder lists by uid.
+fn load_device_folder(ui: &Rc<Ui>, nav: &[(String, String)]) {
+    let ticket = begin_devices_load(ui, "folder-symbolic", gettext("Reading this folder."));
+    ui.busy_begin();
+    let (uid, _) = nav.last().cloned().unwrap_or_default();
+    let request = if nav.len() == 1 {
+        Request::ListDeviceRestorableFolders { device: uid }
+    } else {
+        Request::ListSharedFolder { uid }
+    };
+    let rx = spawn_request(ui.dirs.control_socket(), request);
+    let ui = ui.clone();
+    let nav = nav.to_vec();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.busy_end();
+        if !ticket.is_current() {
+            return;
+        }
+        let entries = match result {
+            Ok(Ok(Response::Entries { entries })) => entries,
+            Ok(Ok(Response::RestorableFolders { items })) => {
+                items.into_iter().map(restorable_entry).collect()
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                // The folder or the computer is gone: fall back a level rather
+                // than stranding the page on a dead uid.
+                ui.devices.nav.borrow_mut().pop();
+                toast_failure(&ui, &gettext("Couldn't open folder"), &message, kind);
+                load_devices(&ui);
+                return;
+            }
+            _ => {
+                ui.devices.loaded_at.set(None);
+                devices_unreachable(&ui);
+                return;
+            }
+        };
+        ui.devices.content.set_visible_child_name("browse");
+        repaint_device_crumb(&ui, &nav);
+        *ui.devices.listed.borrow_mut() = Some(nav);
+        if entries.is_empty() {
+            ui.devices.files.model.remove_all();
+            ui.devices.files_content.set_visible_child_name("empty");
+        } else {
+            ui.devices.files_content.set_visible_child_name("list");
+            replace_items(&ui.devices.files.model, &entries);
+        }
+        ui.devices.loaded_at.set(Some(Instant::now()));
+    });
+}
+
+/// A computer's top-level folder as a browsable entry.
+fn restorable_entry(folder: RestorableFolder) -> DirEntry {
+    DirEntry {
+        name: folder.name,
+        is_dir: true,
+        uid: folder.remote_uid,
+        ..DirEntry::default()
+    }
+}
+
+/// Start a load of the view [`DevicesState::nav`] points at. A reload of the
+/// view on screen keeps it up and usable; moving elsewhere greys it out until
+/// the new view arrives.
+fn begin_devices_load(ui: &Rc<Ui>, icon: &'static str, description: String) -> LoadTicket {
+    let ui_p = ui.clone();
+    let placeholder = move || {
+        devices_status(&ui_p, icon, &gettext("Loading…"), &description, false);
+    };
+    if *ui.devices.listed.borrow() == Some(ui.devices.nav.borrow().clone()) {
+        ui.devices.loader.refresh(placeholder)
+    } else {
+        ui.devices.listed.borrow_mut().take();
+        ui.devices.loader.replace(placeholder)
+    }
 }
 
 /// The daemon didn't answer the Devices page.
@@ -202,158 +348,254 @@ pub(crate) fn devices_unreachable(ui: &Rc<Ui>) {
     service_unreachable(ui, "devices", devices_status, load_devices);
 }
 
-/// Rebuild the "Other computers" section from a fresh listing. Empty is a normal
-/// state (this machine may be the only device), so it shows a placeholder row
-/// rather than collapsing the page.
+/// Rebuild the device list: this computer first, then the others.
 ///
-/// This machine's own device is filtered out. Deleting a device deletes its root
-/// folder — every file backed up from it — and for *this* machine that would also
-/// pull the ground out from under the synced folders listed directly above, so it
-/// is not offered as a peer of "remove some other laptop". Removing this
-/// computer's backup means removing its folders, each of which asks about its
-/// cloud copy on its own terms.
-pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo]) {
+/// This computer's row offers no Remove. Deleting a device deletes its root
+/// folder — every file backed up from it — and for this machine that would also
+/// pull the ground out from under its synced folders, so it is not offered as a
+/// peer of "remove some other laptop". Removing this computer's backup means
+/// removing its folders, each of which asks about its cloud copy on its own
+/// terms.
+pub(crate) fn repaint_devices(ui: &Rc<Ui>, devices: &[DeviceInfo], folders: &[SyncFolderInfo]) {
     for row in ui.devices.rows.borrow_mut().drain(..) {
         ui.devices.group.remove(&row);
     }
-    // Identify this machine's own device so the "This computer" header's Rename
-    // action has a target. It never appears in the rows below, so this is the
-    // only place its name/uid is captured.
-    match devices.iter().find(|d| d.this_device) {
-        Some(me) => {
-            *ui.devices.this_device.borrow_mut() = Some((me.uid.clone(), me.name.clone()));
-            ui.devices
-                .sync_group
-                // Translators: {name} is the name of this computer's device.
-                .set_description(Some(&gettext_f(
-                    "Backing up as “{name}”.",
-                    &[("name", &me.name)],
-                )));
-            ui.devices.rename_this.set_sensitive(true);
-            ui.devices
-                .rename_this
-                // Translators: {name} is the name of this computer's device.
-                .set_tooltip_text(Some(&gettext_f(
-                    "Rename this computer ({name})",
-                    &[("name", &me.name)],
-                )));
-        }
-        None => {
-            *ui.devices.this_device.borrow_mut() = None;
-            ui.devices.rename_this.set_sensitive(false);
-        }
-    }
+    let mut rows: Vec<gtk4::Widget> = Vec::new();
+    let me = devices.iter().find(|d| d.this_device);
+    rows.push(this_computer_row(ui, me, folders).upcast());
     let others: Vec<&DeviceInfo> = devices.iter().filter(|d| !d.this_device).collect();
+    for dev in &others {
+        rows.push(other_computer_row(ui, dev).upcast());
+    }
     if others.is_empty() {
         let row = adw::ActionRow::builder()
             .title(gettext("No other computers"))
-            .subtitle(gettext("Desktop apps syncing to this account appear here."))
+            .subtitle(gettext(
+                "Install Proton Drive on another computer to see it here.",
+            ))
             .build();
         row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
-        ui.devices.group.add(&row);
-        *ui.devices.rows.borrow_mut() = vec![row.upcast()];
-        return;
-    }
-    let mut rows: Vec<gtk4::Widget> = Vec::new();
-    for dev in others {
-        let row = adw::ActionRow::builder()
-            .title(&dev.name)
-            .subtitle(device_subtitle(dev))
-            .build();
-        row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
-        // Adoption is how a reinstalled or renamed machine re-attaches to the
-        // device it used to be, instead of registering a duplicate. It only
-        // makes sense on *another* computer's row, which is the only place this
-        // loop paints.
-        let (ui_ren, uid_ren, name_ren) = (ui.clone(), dev.uid.clone(), dev.name.clone());
-        let (ui_ad, uid_ad, name_ad) = (ui.clone(), dev.uid.clone(), dev.name.clone());
-        let (ui_rm, uid_rm, name_rm) = (ui.clone(), dev.uid.clone(), dev.name.clone());
-        let (ui_rs, uid_rs, name_rs) = (ui.clone(), dev.uid.clone(), dev.name.clone());
-        row.add_suffix(&more_menu_button(vec![
-            (
-                &gettext("Restore to This Computer…"),
-                Box::new(move || {
-                    prompt_restore_folders(&ui_rs, Some((uid_rs.clone(), name_rs.clone())))
-                }),
-            ),
-            (
-                &gettext("Rename…"),
-                Box::new(move || prompt_rename_device(&ui_ren, &uid_ren, &name_ren)),
-            ),
-            (
-                &gettext("Use This Computer's Identity…"),
-                Box::new(move || prompt_adopt_device(&ui_ad, &uid_ad, &name_ad)),
-            ),
-            (
-                &gettext("Remove Computer…"),
-                Box::new(move || prompt_remove_device(&ui_rm, &uid_rm, &name_rm)),
-            ),
-        ]));
-        ui.devices.group.add(&row);
+        let get = gtk4::LinkButton::with_label(PROTON_DRIVE_DOWNLOAD, &gettext("Get Proton Drive"));
+        get.set_valign(gtk4::Align::Center);
+        row.add_suffix(&get);
         rows.push(row.upcast());
+    }
+    for row in &rows {
+        ui.devices.group.add(row);
     }
     *ui.devices.rows.borrow_mut() = rows;
 }
 
-/// A device row's subtitle: its platform, and when it last synced. A device that
-/// has never synced says so — an unexplained missing date reads as a bug, and
-/// "never" is the fact that tells the user this computer isn't backing anything up.
-pub(crate) fn device_subtitle(dev: &DeviceInfo) -> String {
-    match dev.last_sync {
-        // Translators: {platform} is the device's platform (such as "Linux"), {time} a date and time.
-        Some(secs) if secs > 0 => gettext_f(
-            "{platform} · last synced {time}",
-            &[
-                ("platform", &dev.device_type),
-                ("time", &dates::relative(secs)),
-            ],
-        ),
-        // Translators: {platform} is the device's platform, such as "Linux".
-        _ => gettext_f(
-            "{platform} · never synced",
-            &[("platform", &dev.device_type)],
-        ),
+/// Where the Proton Drive apps for other systems are.
+const PROTON_DRIVE_DOWNLOAD: &str = "https://proton.me/drive/download";
+
+/// This computer's row: its device name with a "This computer" pill, and how
+/// many folders it backs up. It leads to those folders on the Sync page, which
+/// owns every local path. `me` is `None` until the daemon has registered this
+/// machine as a device.
+fn this_computer_row(
+    ui: &Rc<Ui>,
+    me: Option<&DeviceInfo>,
+    folders: &[SyncFolderInfo],
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(me.map_or_else(|| gettext("This computer"), |d| d.name.clone()))
+        .subtitle(this_computer_subtitle(folders))
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
+    if me.is_some() {
+        let pill = gtk4::Label::new(Some(&gettext("This computer")));
+        pill.add_css_class("role-pill");
+        pill.add_css_class("caption");
+        pill.set_valign(gtk4::Align::Center);
+        row.add_suffix(&pill);
+    }
+    let mut menu = ActionMenu::new();
+    if let Some(me) = me {
+        let (ui_c, uid, name) = (ui.clone(), me.uid.clone(), me.name.clone());
+        menu.item(&gettext("Rename…"), move || {
+            prompt_rename_device(&ui_c, &uid, &name)
+        });
+    }
+    let ui_c = ui.clone();
+    menu.item(&gettext("Restore Folders…"), move || {
+        prompt_restore_folders(&ui_c, None)
+    });
+    row.add_suffix(&menu.button());
+    row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    let ui_c = ui.clone();
+    row.connect_activated(move |_| {
+        ui_c.locations.views.set_visible_child_name("folders");
+        ui_c.stack.set_visible_child_name("locations");
+    });
+    row
+}
+
+/// Another computer's row. Opening it browses that computer's backup.
+fn other_computer_row(ui: &Rc<Ui>, dev: &DeviceInfo) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&dev.name)
+        .subtitle(device_subtitle(dev))
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
+    let (uid, name) = (dev.uid.clone(), dev.name.clone());
+    let mut menu = ActionMenu::new();
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Browse Files"), move || {
+        browse_device(&ui_c, &uid_c, &name_c)
+    });
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Restore to This Computer…"), move || {
+        prompt_restore_folders(&ui_c, Some((uid_c.clone(), name_c.clone())))
+    });
+    menu.section();
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Rename…"), move || {
+        prompt_rename_device(&ui_c, &uid_c, &name_c)
+    });
+    // Adoption is how a reinstalled or renamed machine re-attaches to the device
+    // it used to be, instead of registering a duplicate. It only makes sense on
+    // another computer's row.
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Continue This Backup Here…"), move || {
+        prompt_adopt_device(&ui_c, &uid_c, &name_c)
+    });
+    menu.section();
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Remove…"), move || {
+        prompt_remove_device(&ui_c, &uid_c, &name_c)
+    });
+    row.add_suffix(&menu.button());
+    row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    let ui_c = ui.clone();
+    row.connect_activated(move |_| browse_device(&ui_c, &uid, &name));
+    row
+}
+
+/// Open another computer's backup at its top level.
+fn browse_device(ui: &Rc<Ui>, uid: &str, name: &str) {
+    *ui.devices.nav.borrow_mut() = vec![(uid.to_string(), name.to_string())];
+    load_devices(ui);
+}
+
+/// Rebuild the breadcrumb trail for `nav`: "Computers", then the computer and
+/// each folder down to the current one, which is a plain heading.
+fn repaint_device_crumb(ui: &Rc<Ui>, nav: &[(String, String)]) {
+    let crumb = &ui.devices.crumb;
+    while let Some(child) = crumb.first_child() {
+        crumb.remove(&child);
+    }
+    crumb.append(&device_crumb_node(
+        ui,
+        &gettext("Computers"),
+        0,
+        nav.is_empty(),
+    ));
+    for (i, (_, name)) in nav.iter().enumerate() {
+        let sep = gtk4::Label::new(Some("›"));
+        sep.add_css_class("dim-label");
+        crumb.append(&sep);
+        crumb.append(&device_crumb_node(ui, name, i + 1, i + 1 == nav.len()));
     }
 }
 
-/// Rebuild the "This computer" section: one row naming the device this machine
-/// backs up to, and how many folders it carries.
-///
-/// The per-folder rows (mode switch, sync now, remove) live on the Locations
-/// page. They are local paths, and Locations is the one page that owns those;
-/// two lists of the same folders would be two places to flip the same switch.
-pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
-    for row in ui.devices.sync_rows.borrow_mut().drain(..) {
-        ui.devices.sync_group.remove(&row);
+/// One breadcrumb segment: a heading for the current folder, or a flat button
+/// that goes back up to `depth` levels below the device list.
+fn device_crumb_node(ui: &Rc<Ui>, label: &str, depth: usize, current: bool) -> gtk4::Widget {
+    if current {
+        let l = gtk4::Label::builder()
+            .label(label)
+            .ellipsize(gtk4::pango::EllipsizeMode::Start)
+            .build();
+        l.add_css_class("heading");
+        return l.upcast();
     }
-    let row = adw::ActionRow::builder()
-        .title(gettext("This computer"))
-        .subtitle(this_computer_subtitle(folders))
-        .build();
-    row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
-    let manage = gtk4::Button::builder()
-        .label(gettext("Open Sync"))
-        .tooltip_text(gettext("Manage this computer's synced folders"))
-        .valign(gtk4::Align::Center)
-        .build();
-    manage.add_css_class("flat");
-    let ui_go = ui.clone();
-    manage.connect_clicked(move |_| ui_go.stack.set_visible_child_name("locations"));
-    row.add_suffix(&manage);
-    let ui_rs = ui.clone();
-    row.add_suffix(&more_menu_button(vec![(
-        &gettext("Restore Folders…"),
-        Box::new(move || prompt_restore_folders(&ui_rs, None)),
-    )]));
-    ui.devices.sync_group.add(&row);
-    *ui.devices.sync_rows.borrow_mut() = vec![row.upcast()];
+    let button = gtk4::Button::builder().label(label).build();
+    button.add_css_class("flat");
+    let ui = ui.clone();
+    button.connect_clicked(move |_| {
+        ui.devices.nav.borrow_mut().truncate(depth);
+        load_devices(&ui);
+    });
+    button.upcast()
+}
+
+/// Folders open in place; files download and open with the default app.
+fn open_device_entry(ui: &Rc<Ui>, entry: &DirEntry) {
+    if entry.is_dir {
+        ui.devices
+            .nav
+            .borrow_mut()
+            .push((entry.uid.clone(), entry.name.clone()));
+        load_devices(ui);
+    } else {
+        open_shared_file(ui, &entry.uid, &entry.name);
+    }
+}
+
+fn device_entry_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item(&pgettext("verb", "Open"), move || {
+        open_device_entry(&ui_c, &entry_c)
+    });
+    menu
+}
+
+fn device_bulk_menu(_ui: &Rc<Ui>, entries: Vec<DirEntry>) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    menu.labelled_section(&ngettext_f(
+        "{n} selected",
+        "{n} selected",
+        entries.len() as u64,
+        &[],
+    ));
+    menu
+}
+
+fn device_background_menu(ui: &Rc<Ui>) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    let ui_c = ui.clone();
+    menu.item(&gettext("Select All"), move || {
+        ui_c.devices.files.selection.select_all();
+    });
+    let ui_c = ui.clone();
+    menu.item(&gettext("Refresh"), move || reload_current_page(&ui_c));
+    menu
+}
+
+/// A device row's subtitle: its platform, and when it last backed up. A device
+/// that never did says so — an unexplained missing date reads as a bug, and
+/// "no backups yet" is the fact that tells the user this computer isn't backing
+/// anything up.
+pub(crate) fn device_subtitle(dev: &DeviceInfo) -> String {
+    let platform = platform_label(&dev.device_type);
+    match dev.last_sync {
+        // Translators: {platform} is the device's platform (such as "Linux"), {time} a relative time such as "5 minutes ago".
+        Some(secs) if secs > 0 => gettext_f(
+            "{platform} · last backup {time}",
+            &[("platform", platform), ("time", &dates::relative(secs))],
+        ),
+        // Translators: {platform} is the device's platform, such as "Linux".
+        _ => gettext_f("{platform} · no backups yet", &[("platform", platform)]),
+    }
+}
+
+/// The platform as its maker spells it. The API's names are enum variants.
+fn platform_label(device_type: &str) -> &str {
+    match device_type {
+        "MacOs" => "macOS",
+        other => other,
+    }
 }
 
 /// How many folders this machine backs up, and whether any of them needs
 /// attention — the one fact worth surfacing away from the folder list itself.
 pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
     if folders.is_empty() {
-        return gettext("No folders backed up yet — add one on the Sync page.");
+        return gettext("No folders backed up yet");
     }
     let count = ngettext_f(
         "{n} folder backed up",
@@ -366,11 +608,7 @@ pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
         .filter(|f| f.state == "error" || f.state == "conflict")
         .count();
     match attention {
-        // Translators: {folders} is "N folders backed up".
-        0 => gettext_f(
-            "{folders} · manage them on the Sync page",
-            &[("folders", &count)],
-        ),
+        0 => count,
         // Translators: {folders} is "N folders backed up"; {n} counts the folders with a problem.
         n => ngettext_f(
             "{folders} · {n} needs attention",
@@ -827,7 +1065,8 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     dialog.present(win.as_ref());
 }
 
-/// Confirm, then adopt another device as this machine's identity.
+/// Confirm, then continue another computer's backup on this machine (adopt its
+/// device).
 ///
 /// Worth a confirmation rather than a plain click: adoption re-points this
 /// machine's syncing at another computer's device folder, and the folders
@@ -837,20 +1076,22 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Use This Computer's Identity?"))
-        // Translators: {name} is the name of the other computer whose identity is adopted.
+        .heading(gettext("Continue This Backup Here?"))
+        // Translators: {name} is the name of the other computer whose backup this one takes over.
         .body(gettext_f(
-            "Treat this machine as “{name}”?\n\nNew synced folders are created under that computer in Proton Drive, and this machine keeps that identity even if its hostname changes. Folders already synced here are not moved.\n\nUse “Restore folders” afterwards to bring back what “{name}” was syncing.",
+            "This computer takes over the backup of “{name}”, for example after a reinstall.\n\nNew synced folders go under “{name}” in Proton Drive, even if this computer's name changes. Folders already synced here are not moved. Use “Restore to This Computer” afterwards to bring back what “{name}” was syncing.",
             &[("name", name)],
         ))
         .build();
     dialog.add_response("cancel", &gettext("Cancel"));
-    dialog.add_response("adopt", &gettext("Use Identity"));
+    dialog.add_response("adopt", &gettext("Continue Here"));
     dialog.set_response_appearance("adopt", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     let ui = ui.clone();
     let uid = uid.to_string();
+    // Translators: {name} is the name of the computer whose backup this one took over.
+    let done = gettext_f("Now backing up as “{name}”", &[("name", name)]);
     dialog.connect_response(None, move |_, resp| {
         if resp == "adopt" {
             run_devices_mutation(
@@ -858,8 +1099,8 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
                 Request::AdoptDevice {
                     uid: Some(uid.clone()),
                 },
-                &gettext("Identity adopted"),
-                &gettext("Couldn't adopt that computer"),
+                &done,
+                &gettext("Couldn't continue that backup here"),
             );
         }
     });
@@ -912,20 +1153,17 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_with_no_folders_is_told_where_to_add_one() {
-        assert_eq!(
-            this_computer_subtitle(&[]),
-            "No folders backed up yet — add one on the Sync page."
-        );
+    fn a_machine_with_no_folders_says_so() {
+        assert_eq!(this_computer_subtitle(&[]), "No folders backed up yet");
     }
 
     #[test]
     fn folders_needing_attention_are_counted_not_hidden() {
-        // The per-folder rows moved to Locations, so this row is the only place
-        // the Computers page can surface that something is wrong.
+        // The per-folder rows live on the Sync page, so this row is the only
+        // place the Computers page can surface that something is wrong.
         assert_eq!(
             this_computer_subtitle(&[folder("idle"), folder("idle")]),
-            "2 folders backed up · manage them on the Sync page"
+            "2 folders backed up"
         );
         assert_eq!(
             this_computer_subtitle(&[folder("idle"), folder("error")]),
@@ -942,5 +1180,29 @@ mod tests {
         assert!(restore_picker_body(Some("laptop")).contains("“laptop”"));
         assert!(restore_picker_body(None).contains("this computer"));
         assert!(nothing_to_restore(Some("laptop")).contains("“laptop”"));
+    }
+
+    fn device(device_type: &str, last_sync: Option<i64>) -> DeviceInfo {
+        DeviceInfo {
+            uid: "dev".into(),
+            name: "laptop".into(),
+            device_type: device_type.into(),
+            last_sync,
+            this_device: false,
+            adopted: false,
+        }
+    }
+
+    #[test]
+    fn a_computer_that_never_backed_up_says_no_backups_yet() {
+        assert_eq!(
+            device_subtitle(&device("Linux", None)),
+            "Linux · no backups yet"
+        );
+        assert_eq!(
+            device_subtitle(&device("Linux", Some(0))),
+            "Linux · no backups yet"
+        );
+        assert!(device_subtitle(&device("MacOs", Some(1))).starts_with("macOS · last backup "));
     }
 }

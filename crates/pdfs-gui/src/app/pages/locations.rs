@@ -1,5 +1,7 @@
-//! The Sync page (formerly Locations): what is moving right now, and every local
-//! place Proton Drive occupies on this machine.
+//! The Sync page (formerly Locations), in three views: Overview (what sync
+//! is doing, what needs a decision, what is moving), Folders (every local
+//! place Proton Drive occupies on this machine) and History (the activity
+//! feed, built in `activity.rs`).
 //!
 //! One row per [`MountSpec`] from [`Request::ListLocations`] — the primary
 //! `~/ProtonDrive` mount, plus each folder this computer backs up, whether it is
@@ -28,12 +30,20 @@ pub(crate) struct LocationsState {
     pub(crate) card: SyncCard,
     pub(crate) queue: QueueState,
     pub(crate) conflicts: ConflictsState,
+    /// Overview, Folders and History.
+    pub(crate) views: adw::ViewStack,
+    /// Points at the Overview while conflicts or failures wait there.
+    pub(crate) banner: adw::Banner,
+    /// Changes the daemon failed to upload, from the last status.
+    pub(crate) failing: Cell<u64>,
 }
 
-/// The status card heading the Sync page: what sync is doing, and Pause/Resume.
+/// The status card heading the Sync page's Overview, and Pause/Resume in the
+/// page header.
 pub(crate) struct SyncCard {
     pub(crate) icon: gtk4::Image,
-    pub(crate) row: adw::ActionRow,
+    pub(crate) title: gtk4::Label,
+    pub(crate) detail: gtk4::Label,
     pub(crate) pause: adw::SplitButton,
     /// Whether the last status said paused, so the button knows which way to go.
     pub(crate) paused: Cell<bool>,
@@ -97,17 +107,23 @@ pub(crate) struct LocationsWidgets {
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
     pub(crate) add_folder: gtk4::Button,
-    /// Live transfers, above the folder list; painted by the refresh loop.
+    /// Live transfers, on the Overview; painted by the refresh loop.
     pub(crate) transfers_group: adw::PreferencesGroup,
     pub(crate) card_icon: gtk4::Image,
-    pub(crate) card_row: adw::ActionRow,
+    pub(crate) card_title: gtk4::Label,
+    pub(crate) card_detail: gtk4::Label,
     pub(crate) pause: adw::SplitButton,
     pub(crate) queue_group: adw::PreferencesGroup,
     pub(crate) retry_all: gtk4::Button,
     pub(crate) conflicts_group: adw::PreferencesGroup,
+    pub(crate) views: adw::ViewStack,
+    pub(crate) banner: adw::Banner,
 }
 
-pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
+/// The Sync page: Overview (the status, conflicts, transfers and queue),
+/// Folders (this computer's synced folders) and History (the activity feed,
+/// `history`), switched from the header.
+pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, LocationsWidgets) {
     let add_folder = gtk4::Button::builder()
         .child(
             &adw::ButtonContent::builder()
@@ -118,10 +134,13 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .tooltip_text(gettext(
             "Back a local folder up to this computer's Proton Drive device",
         ))
+        .valign(gtk4::Align::Center)
         .build();
+    add_folder.add_css_class("flat");
     let refresh = refresh_button();
     let transfers_group = build_transfers_group();
-    let (card, card_icon, card_row, pause) = build_sync_card();
+    let (card, card_icon, card_title, card_detail) = build_sync_card();
+    let pause = build_pause_button();
     let (queue_group, retry_all) = build_queue_group();
     let conflicts_group = adw::PreferencesGroup::builder()
         .title(gettext("Conflicts"))
@@ -131,28 +150,39 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .visible(false)
         .build();
 
+    // Overview: what sync is doing, then what needs a decision, then what is
+    // moving.
+    let overview = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+    overview.append(&card);
+    overview.append(&conflicts_group);
+    overview.append(&transfers_group);
+    overview.append(&queue_group);
+
+    // Folders: the explanation of the two modes waits behind a "?" rather
+    // than sitting over the list as a paragraph.
+    let help = gtk4::Label::builder()
+        .label(gettext("Synced folders keep a full copy on this computer. Online-only folders fetch each file when you open it."))
+        .wrap(true)
+        .max_width_chars(40)
+        .xalign(0.0)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let help_button = gtk4::MenuButton::builder()
+        .icon_name("info-outline-symbolic")
+        .tooltip_text(gettext("About Sync Modes"))
+        .valign(gtk4::Align::Center)
+        .popover(&gtk4::Popover::builder().child(&help).build())
+        .build();
+    help_button.add_css_class("flat");
+    let suffix = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    suffix.append(&help_button);
+    suffix.append(&add_folder);
     let group = adw::PreferencesGroup::builder()
         .title(gettext("Folders"))
-        .description(gettext("Synced folders keep a full copy on this computer. Online-only folders fetch each file when you open it."))
-        .build();
-
-    // The folder list is the page's settings, so it sits right under what needs
-    // a decision; the transfer and queue lists come and go below it instead of
-    // pushing it down.
-    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
-    groups.append(&card);
-    groups.append(&conflicts_group);
-    groups.append(&group);
-    groups.append(&transfers_group);
-    groups.append(&queue_group);
-    let clamp = adw::Clamp::builder().child(&groups).build();
-    // Never scroll sideways: a location's subtitle holds a full path, and letting
-    // the row grow to fit one pushes the controls at its end off screen.
-    // Constrained, the path ellipsizes and the controls stay reachable.
-    let scroll = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .child(&clamp)
+        .header_suffix(&suffix)
         .build();
 
     let retry = gtk4::Button::builder()
@@ -178,17 +208,45 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .build();
 
     let content = gtk4::Stack::new();
-    content.add_named(&scroll, Some("list"));
+    content.add_named(&scrolled_column(&group), Some("list"));
     content.add_named(&status_scroll, Some("status"));
 
-    let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    page.set_margin_top(18);
-    page.set_margin_bottom(18);
-    page.set_margin_start(18);
-    page.set_margin_end(18);
-    page.append(&content);
-    let (frame, header, _) = page_frame(&pgettext("page", "Sync"), &page);
-    header.pack_start(&add_folder);
+    let views = adw::ViewStack::new();
+    views.set_vexpand(true);
+    views.add_titled_with_icon(
+        &scrolled_column(&overview),
+        Some("overview"),
+        &pgettext("sync view", "Overview"),
+        "pdfs-sync-symbolic",
+    );
+    views.add_titled_with_icon(
+        &content,
+        Some("folders"),
+        &pgettext("sync view", "Folders"),
+        "folder-symbolic",
+    );
+    views.add_titled_with_icon(
+        history,
+        Some("history"),
+        &pgettext("sync view", "History"),
+        "document-open-recent-symbolic",
+    );
+
+    // Conflicts and failures are on the Overview; away from it, a banner
+    // says they are there.
+    let banner = adw::Banner::builder()
+        .button_label(gettext("Review"))
+        .build();
+    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    column.append(&banner);
+    column.append(&views);
+
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&views)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    let (frame, header) = page_frame_with(&switcher, &column);
+    header.pack_start(&pause);
     header.pack_end(&refresh);
 
     let widgets = LocationsWidgets {
@@ -200,13 +258,33 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         add_folder,
         transfers_group,
         card_icon,
-        card_row,
+        card_title,
+        card_detail,
         pause,
         queue_group,
         retry_all,
         conflicts_group,
+        views,
+        banner,
     };
     (frame.upcast(), widgets)
+}
+
+/// `child` in a clamp that scrolls vertically only, with page margins.
+fn scrolled_column(child: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
+    let clamp = adw::Clamp::builder().child(child).build();
+    clamp.set_margin_top(18);
+    clamp.set_margin_bottom(18);
+    clamp.set_margin_start(18);
+    clamp.set_margin_end(18);
+    // Never scroll sideways: a location's subtitle holds a full path, and letting
+    // the row grow to fit one pushes the controls at its end off screen.
+    // Constrained, the path ellipsizes and the controls stay reachable.
+    gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&clamp)
+        .build()
 }
 
 pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk4::Button) {
@@ -223,23 +301,121 @@ pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk
         .queue
         .retry_all
         .connect_clicked(move |_| retry_queued(&ui_retry, None));
+    let ui_review = ui.clone();
+    ui.locations.banner.connect_button_clicked(move |_| {
+        ui_review.locations.views.set_visible_child_name("overview");
+    });
+    let ui_views = ui.clone();
+    ui.locations
+        .views
+        .connect_visible_child_name_notify(move |_| {
+            paint_sync_banner(&ui_views);
+            if ui_views.stack.visible_child_name().as_deref() == Some("locations") {
+                load_sync_view(&ui_views);
+            }
+        });
 }
 
-/// The status card: a large state icon, the state in words, and Pause/Resume
-/// with timed pauses in its menu.
-fn build_sync_card() -> (
-    adw::PreferencesGroup,
-    gtk4::Image,
-    adw::ActionRow,
-    adw::SplitButton,
-) {
+/// Load what the Sync page's current view shows, on arrival.
+pub(crate) fn load_sync_view(ui: &Rc<Ui>) {
+    match ui.locations.views.visible_child_name().as_deref() {
+        // Activity changes out from under the page as background uploads and
+        // edits complete, so it reloads on every visit.
+        Some("history") => load_activity(ui),
+        _ => {
+            refresh_conflicts(ui, true);
+            if !page_fresh(&ui.locations.loaded_at) {
+                load_locations(ui);
+            }
+        }
+    }
+}
+
+/// Reload the Sync page's current view, for Refresh.
+pub(crate) fn reload_sync_view(ui: &Rc<Ui>) {
+    if ui.locations.views.visible_child_name().as_deref() == Some("history") {
+        load_activity(ui);
+    } else {
+        refresh_conflicts(ui, true);
+        load_locations(ui);
+    }
+}
+
+/// Follow the refresh tick on the Sync page's current view.
+pub(crate) fn tick_sync_view(ui: &Rc<Ui>) {
+    if ui.locations.views.visible_child_name().as_deref() == Some("history") {
+        refresh_activity(ui);
+    } else {
+        refresh_locations(ui);
+        refresh_queue(ui);
+        refresh_conflicts(ui, false);
+    }
+}
+
+/// Show the banner over Folders and History while conflicts or failed
+/// changes wait on the Overview, and badge the sidebar's Sync row with them.
+pub(crate) fn paint_sync_banner(ui: &Rc<Ui>) {
+    let state = &ui.locations;
+    let conflicts = state.conflicts.painted.borrow().len() as u64;
+    let failing = state.failing.get();
+    set_sidebar_badge(ui, "locations", conflicts + failing);
+    let title = match (conflicts, failing) {
+        (0, 0) => None,
+        (0, n) => Some(ngettext_f(
+            "{n} change couldn't be uploaded",
+            "{n} changes couldn't be uploaded",
+            n,
+            &[],
+        )),
+        (n, 0) => Some(ngettext_f(
+            "{n} file was changed in two places at once",
+            "{n} files were changed in two places at once",
+            n,
+            &[],
+        )),
+        _ => Some(gettext("Some files need your attention")),
+    };
+    let away = state.views.visible_child_name().as_deref() != Some("overview");
+    state.banner.set_title(title.as_deref().unwrap_or_default());
+    state.banner.set_revealed(away && title.is_some());
+}
+
+/// The status hero: a large state icon, the state in words, and what it
+/// means.
+fn build_sync_card() -> (gtk4::Box, gtk4::Image, gtk4::Label, gtk4::Label) {
     let icon = gtk4::Image::builder()
         .icon_name("pdfs-sync-symbolic")
-        .pixel_size(32)
-        .margin_top(6)
-        .margin_bottom(6)
+        .pixel_size(48)
+        .valign(gtk4::Align::Center)
         .build();
     icon.add_css_class("sync-card-icon");
+    let title = gtk4::Label::builder()
+        .label(gettext("Checking…"))
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    title.add_css_class("title-2");
+    let detail = gtk4::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .build();
+    detail.add_css_class("dim-label");
+    let text = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    text.set_valign(gtk4::Align::Center);
+    text.set_hexpand(true);
+    text.append(&title);
+    text.append(&detail);
+    let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 18);
+    card.add_css_class("card");
+    card.add_css_class("sync-card");
+    card.append(&icon);
+    card.append(&text);
+    (card, icon, title, detail)
+}
+
+/// Pause/Resume, with timed pauses in its menu.
+fn build_pause_button() -> adw::SplitButton {
     let menu = gio::Menu::new();
     menu.append(
         Some(&gettext("Pause for 1 Hour")),
@@ -253,7 +429,7 @@ fn build_sync_card() -> (
         Some(&gettext("Pause for 24 Hours")),
         Some("sync.pause-for(int64 86400)"),
     );
-    let pause = adw::SplitButton::builder()
+    adw::SplitButton::builder()
         .label(pgettext("verb", "Pause"))
         .menu_model(&menu)
         .valign(gtk4::Align::Center)
@@ -261,20 +437,7 @@ fn build_sync_card() -> (
             "Stop uploading until you resume. Files still open as usual.",
         ))
         .dropdown_tooltip(gettext("Pause for a while"))
-        .build();
-    let row = adw::ActionRow::builder()
-        .title(gettext("Checking…"))
-        .title_lines(1)
-        .subtitle_lines(2)
-        .build();
-    // The state is the headline and the detail explains it, so the title is
-    // large and the subtitle stays the usual dim line.
-    row.add_css_class("sync-card");
-    row.add_prefix(&icon);
-    row.add_suffix(&pause);
-    let group = adw::PreferencesGroup::new();
-    group.add(&row);
-    (group, icon, row, pause)
+        .build()
 }
 
 /// Paint the Sync page's status card from what the sidebar strip shows.
@@ -295,8 +458,10 @@ pub(crate) fn paint_sync_card(
     if let Some(class) = class {
         card.icon.add_css_class(class);
     }
-    card.row.set_title(title);
-    card.row.set_subtitle(detail.unwrap_or_default());
+    card.title.set_label(title);
+    card.detail
+        .set_visible(detail.is_some_and(|d| !d.is_empty()));
+    card.detail.set_label(detail.unwrap_or_default());
     card.paused.set(paused);
     card.pause.set_label(&if paused {
         pgettext("verb", "Resume")
@@ -553,16 +718,29 @@ fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
 /// How long a conflict listing stays fresh on the refresh tick.
 pub(crate) const CONFLICTS_TTL: Duration = Duration::from_secs(30);
 
+/// How long a conflict listing stays fresh for the sidebar badge while the
+/// Sync page is not on screen.
+const CONFLICTS_BADGE_TTL: Duration = Duration::from_secs(300);
+
 /// Poll the conflict list while the Sync page is on screen. `force` skips the
 /// TTL, for navigation and right after a resolution.
 pub(crate) fn refresh_conflicts(ui: &Rc<Ui>, force: bool) {
+    fetch_conflicts(ui, if force { Duration::ZERO } else { CONFLICTS_TTL });
+}
+
+/// Poll the conflict list now and then from anywhere, for the sidebar badge.
+pub(crate) fn refresh_conflicts_badge(ui: &Rc<Ui>) {
+    fetch_conflicts(ui, CONFLICTS_BADGE_TTL);
+}
+
+/// Ask for the conflict list unless the last one is younger than `ttl`.
+fn fetch_conflicts(ui: &Rc<Ui>, ttl: Duration) {
     let conflicts = &ui.locations.conflicts;
     if conflicts.inflight.get()
-        || (!force
-            && conflicts
-                .fetched_at
-                .get()
-                .is_some_and(|at| at.elapsed() < CONFLICTS_TTL))
+        || conflicts
+            .fetched_at
+            .get()
+            .is_some_and(|at| !ttl.is_zero() && at.elapsed() < ttl)
     {
         return;
     }
@@ -600,6 +778,7 @@ fn repaint_conflicts(ui: &Rc<Ui>, items: &[ConflictInfo]) {
         return;
     }
     *conflicts.painted.borrow_mut() = key;
+    paint_sync_banner(ui);
 
     for row in conflicts.rows.borrow_mut().drain(..) {
         conflicts.group.remove(&row);

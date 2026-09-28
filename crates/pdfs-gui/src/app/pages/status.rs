@@ -876,15 +876,14 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     // The quota sits in the sidebar footer, visible on every page; its TTL
     // keeps this from asking more than once a minute.
     refresh_quota(ui);
-    match ui.stack.visible_child_name().as_deref() {
-        Some("locations") => {
-            refresh_locations(ui);
-            refresh_queue(ui);
-            refresh_conflicts(ui, false);
-        }
-        Some("activity") => refresh_activity(ui),
-        _ => {}
+    if ui.stack.visible_child_name().as_deref() == Some("locations") {
+        tick_sync_view(ui);
+    } else {
+        // The sidebar badges count conflicts and invitations wherever the
+        // user is; both lists are costly enough to ask for rarely.
+        refresh_conflicts_badge(ui);
     }
+    refresh_invitations_badge(ui);
 }
 
 /// How long a quota reading stays fresh. Account storage barely moves, so the
@@ -1237,6 +1236,8 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                     SyncState::UpToDate { mountpoint }
                 };
                 paint_sync_status(&ui, state);
+                ui.locations.failing.set(failing_ops);
+                paint_sync_banner(&ui);
                 let fraction = if budget == 0 {
                     0.0
                 } else {

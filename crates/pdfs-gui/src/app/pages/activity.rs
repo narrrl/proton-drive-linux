@@ -1,4 +1,7 @@
 use crate::*;
+use pdfs_core::syncignore::is_scratch_name;
+
+use super::activity_text::{Described, describe};
 
 pub(crate) struct ActivityState {
     // Activity page: a "Needs attention" section for live conflicts, then the
@@ -26,7 +29,25 @@ pub(crate) struct ActivityState {
     pub(crate) conflicts: RefCell<Option<Vec<ConflictInfo>>>,
     pub(crate) conflicts_inflight: Cell<bool>,
     pub(crate) conflicts_at: Cell<Option<Instant>>,
+    /// Whether entries about editors' scratch files (`.goutputstream-*`,
+    /// `~$report.docx`, …) show. Off by default: one save can log several.
+    pub(crate) show_scratch: Cell<bool>,
+    /// How many entries to ask the daemon for; "Show Older" raises it.
+    pub(crate) limit: Cell<usize>,
 }
+
+/// How many entries the feed asks for at first, and how many more each
+/// "Show Older" adds.
+pub(crate) const ACTIVITY_PAGE: usize = 200;
+
+/// The most the daemon keeps.
+const ACTIVITY_KEPT: usize = 2000;
+
+/// Entries of one kind this close together read as one burst.
+const BURST_GAP: i64 = 5 * 60;
+
+/// The fewest entries that make a burst.
+const BURST_MIN: usize = 3;
 
 /// Widgets the Activity page's load/repaint touch.
 pub(crate) struct ActivityWidgets {
@@ -36,8 +57,9 @@ pub(crate) struct ActivityWidgets {
     pub(crate) list: gtk4::ListView,
     pub(crate) feed: gtk4::Stack,
     pub(crate) filters: Vec<(ActivityFilter, gtk4::ToggleButton)>,
+    /// Holds the ⋮ menu, which needs the [`Ui`] and so is built when wiring.
+    pub(crate) options: gtk4::Box,
     pub(crate) retry: gtk4::Button,
-    pub(crate) refresh: gtk4::Button,
 }
 
 /// Which slice of the feed the filter bar shows.
@@ -86,12 +108,11 @@ impl ActivityFilter {
     }
 }
 
-/// The Activity page: a newest-first feed of the mutations and transfers the
-/// daemon performed (uploads, deletes, shares, …), grouped by day, with the
-/// conflicts that still need a decision on top.
+/// The activity feed, shown as the Sync page's History view: a newest-first
+/// feed of the mutations and transfers the daemon performed (uploads,
+/// deletes, shares, …), grouped by day, with the conflicts that still need a
+/// decision on top.
 pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
-    let refresh = refresh_button();
-
     // Filter chips: a linked row of radio toggles. They sit above the list,
     // not in it, so they stay in reach however far the feed is scrolled.
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -108,14 +129,19 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
         bar.append(&button);
         filters.push((filter, button));
     }
-    bar.set_margin_top(12);
-    bar.set_margin_bottom(6);
-    bar.set_margin_start(12);
-    bar.set_margin_end(12);
+    bar.set_hexpand(true);
+    let options = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    top.append(&bar);
+    top.append(&options);
+    top.set_margin_top(12);
+    top.set_margin_bottom(6);
+    top.set_margin_start(12);
+    top.set_margin_end(12);
     let bar_clamp = adw::Clamp::builder()
         .maximum_size(900)
         .tightening_threshold(600)
-        .child(&bar)
+        .child(&top)
         .build();
 
     // Rows are sectioned by the key each item carries: the conflicts first,
@@ -184,11 +210,8 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     content.add_named(&column, Some("list"));
     content.add_named(&status, Some("status"));
 
-    let (frame, header, _) = page_frame(&gettext("Activity"), &content);
-    header.pack_end(&refresh);
-
     (
-        frame.upcast(),
+        content.clone().upcast(),
         ActivityWidgets {
             content,
             status,
@@ -196,8 +219,8 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
             list,
             feed,
             filters,
+            options,
             retry,
-            refresh,
         },
     )
 }
@@ -242,7 +265,9 @@ fn feed_header_factory() -> gtk4::SignalListItemFactory {
                     &[],
                 )),
             ),
-            FeedItem::Logged { day_label, .. } => (day_label.clone(), None),
+            FeedItem::Logged { day_label, .. }
+            | FeedItem::Burst { day_label, .. }
+            | FeedItem::More { day_label, .. } => (day_label.clone(), None),
         };
         title.set_label(&heading);
         description.set_visible(line.is_some());
@@ -267,6 +292,17 @@ pub(crate) fn wire_activity(ui: &Rc<Ui>, widgets: &ActivityWidgets) {
             }
         });
     }
+    let mut menu = ActionMenu::new();
+    menu.toggle(&gettext("Show Temporary Files"), false, {
+        let ui = ui.clone();
+        move |on| {
+            ui.activity.show_scratch.set(on);
+            paint_activity(&ui);
+        }
+    });
+    let options = menu.button();
+    options.set_tooltip_text(Some(&gettext("View Options")));
+    widgets.options.append(&options);
 
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_bind({
@@ -279,18 +315,42 @@ pub(crate) fn wire_activity(ui: &Rc<Ui>, widgets: &ActivityWidgets) {
             let row = match &*object.borrow::<FeedItem>() {
                 FeedItem::Attention { conflict, .. } => {
                     item.set_activatable(true);
-                    conflict_row(&ui, conflict)
+                    conflict_row(&ui, conflict).upcast::<gtk4::Widget>()
                 }
                 FeedItem::Logged {
                     entry,
                     count,
                     first,
+                    when,
                     pending,
                     resolved,
                     ..
                 } => {
                     item.set_activatable(false);
-                    feed_row(&ui, entry, *count, *first, pending.as_ref(), *resolved)
+                    feed_row(
+                        &ui,
+                        entry,
+                        *count,
+                        *first,
+                        when,
+                        pending.as_ref(),
+                        *resolved,
+                    )
+                    .upcast()
+                }
+                FeedItem::Burst {
+                    kind,
+                    entries,
+                    when,
+                    ..
+                } => {
+                    item.set_activatable(false);
+                    burst_row(*kind, entries, when).upcast()
+                }
+                FeedItem::More { .. } => {
+                    item.set_activatable(false);
+                    item.set_child(Some(&more_row(&ui)));
+                    return;
                 }
             };
             row.add_css_class("card");
@@ -340,13 +400,20 @@ pub(crate) fn activity_status(
 /// other than a good answer leaves the rows alone until the next tick.
 pub(crate) fn refresh_activity(ui: &Rc<Ui>) {
     refresh_activity_conflicts(ui, false);
+    fetch_activity(ui);
+}
+
+/// Ask for the feed and repaint with it if the feed is still on screen.
+fn fetch_activity(ui: &Rc<Ui>) {
     if ui.activity.inflight.get() {
         return;
     }
     ui.activity.inflight.set(true);
     let rx = spawn_request(
         ui.dirs.control_socket(),
-        Request::ListActivity { limit: 200 },
+        Request::ListActivity {
+            limit: ui.activity.limit.get(),
+        },
     );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -355,11 +422,18 @@ pub(crate) fn refresh_activity(ui: &Rc<Ui>) {
         // The page may have been navigated away from while the request was in
         // flight.
         if let Ok(Ok(Response::Activity { items })) = result
-            && ui.stack.visible_child_name().as_deref() == Some("activity")
+            && activity_visible(&ui)
         {
             repaint_activity(&ui, &items);
         }
     });
+}
+
+/// Whether the activity feed is on screen: the Sync page, on its History
+/// view.
+pub(crate) fn activity_visible(ui: &Ui) -> bool {
+    ui.stack.visible_child_name().as_deref() == Some("locations")
+        && ui.locations.views.visible_child_name().as_deref() == Some("history")
 }
 
 pub(crate) fn load_activity(ui: &Rc<Ui>) {
@@ -381,7 +455,9 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
     ui.busy_begin();
     let rx = spawn_request(
         ui.dirs.control_socket(),
-        Request::ListActivity { limit: 200 },
+        Request::ListActivity {
+            limit: ui.activity.limit.get(),
+        },
     );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -412,7 +488,11 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
 
 /// The daemon didn't answer the Activity page.
 pub(crate) fn activity_unreachable(ui: &Rc<Ui>) {
-    service_unreachable(ui, "activity", activity_status, load_activity);
+    service_unreachable(ui, "locations", activity_status, |ui| {
+        if activity_visible(ui) {
+            load_activity(ui);
+        }
+    });
 }
 
 /// Poll the conflicts still waiting for a decision while the Activity page is
@@ -445,7 +525,7 @@ pub(crate) fn refresh_activity_conflicts(ui: &Rc<Ui>, force: bool) {
             _ => None,
         };
         *state.conflicts.borrow_mut() = items;
-        if ui.stack.visible_child_name().as_deref() == Some("activity") {
+        if activity_visible(&ui) {
             paint_activity(&ui);
         }
     });
@@ -475,12 +555,28 @@ pub(crate) enum FeedItem {
         /// section, and that day's heading.
         day: i64,
         day_label: String,
+        /// When it happened, as the row shows it.
+        when: String,
         /// The open conflict a logged conflict names, which the row offers
         /// to resolve.
         pending: Option<ConflictInfo>,
         /// A logged conflict that is no longer open.
         resolved: bool,
     },
+    /// The same action on several items within minutes, such as a folder's
+    /// files uploading, shown as one row that expands to list them.
+    Burst {
+        kind: ActivityKind,
+        /// Newest first.
+        entries: Vec<ActivityEntry>,
+        day: i64,
+        day_label: String,
+        /// When the newest of them happened, as the row shows it.
+        when: String,
+    },
+    /// The "Show Older" row at the end, while the daemon keeps older
+    /// entries than the feed asked for. In the last day's section.
+    More { day: i64, day_label: String },
 }
 
 impl FeedItem {
@@ -489,7 +585,9 @@ impl FeedItem {
     fn section(&self) -> i64 {
         match self {
             FeedItem::Attention { .. } => i64::MAX,
-            FeedItem::Logged { day, .. } => *day,
+            FeedItem::Logged { day, .. }
+            | FeedItem::Burst { day, .. }
+            | FeedItem::More { day, .. } => *day,
         }
     }
 }
@@ -559,14 +657,23 @@ pub(crate) fn day_label(at: &glib::DateTime, now: &glib::DateTime) -> String {
         .unwrap_or_default()
 }
 
+/// What the feed shows besides the filter: whether scratch files count, and
+/// whether a "Show Older" row ends it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FeedOptions {
+    pub(crate) show_scratch: bool,
+    pub(crate) more: bool,
+}
+
 /// The rows of the page: the open conflicts, then the feed entries the filter
-/// lets through, each with its day. `conflicts` is `None` while the open
-/// conflicts are not known yet.
+/// lets through, each with its day, runs of one action folded into bursts.
+/// `conflicts` is `None` while the open conflicts are not known yet.
 pub(crate) fn feed_items(
     items: &[ActivityEntry],
     filter: ActivityFilter,
     conflicts: Option<&[ConflictInfo]>,
     now: Option<&glib::DateTime>,
+    options: FeedOptions,
 ) -> Vec<FeedItem> {
     let open = conflicts.unwrap_or_default();
     let mut rows: Vec<FeedItem> = open
@@ -576,7 +683,13 @@ pub(crate) fn feed_items(
             open: open.len(),
         })
         .collect();
-    for row in collapse_feed(items) {
+    let kept: Vec<ActivityEntry> = items
+        .iter()
+        .filter(|entry| options.show_scratch || !is_scratch(entry))
+        .cloned()
+        .collect();
+    let mut logged = Vec::new();
+    for row in collapse_feed(&kept) {
         if !filter.matches(row.entry) {
             continue;
         }
@@ -599,17 +712,146 @@ pub(crate) fn feed_items(
             .flatten()
             .cloned();
         let resolved = a.kind == ActivityKind::Conflict && pending.is_none() && conflicts.is_some();
-        rows.push(FeedItem::Logged {
+        logged.push(FeedItem::Logged {
             entry: a.clone(),
             count: row.count,
             first: row.first,
             day,
             day_label,
+            when: now.map(|now| feed_time(a.time, now)).unwrap_or_default(),
             pending,
             resolved,
         });
     }
+    let last = logged.last().map(|row| match row {
+        FeedItem::Logged { day, day_label, .. } => (*day, day_label.clone()),
+        _ => (0, String::new()),
+    });
+    rows.extend(fold_bursts(logged));
+    if options.more
+        && let Some((day, day_label)) = last
+    {
+        rows.push(FeedItem::More { day, day_label });
+    }
     rows
+}
+
+/// Whether an entry is about an editor's scratch file: the temporary a save
+/// writes before renaming it over the real file, a lock file, a partial
+/// download. A rename away from one is the save itself.
+fn is_scratch(entry: &ActivityEntry) -> bool {
+    use ActivityKind::*;
+    if !matches!(
+        entry.kind,
+        Upload | Download | Rename | Move | Trash | Restore | DeleteForever | CreateFolder
+    ) {
+        return false;
+    }
+    is_scratch_name(file_name(&entry.target))
+        || (entry.kind == Rename
+            && entry
+                .detail
+                .strip_prefix("was ")
+                .is_some_and(|old| is_scratch_name(file_name(old))))
+}
+
+/// Fold runs of the same successful action on single items, close together
+/// on one day, into [`FeedItem::Burst`]s. `rows` are logged rows, newest
+/// first.
+fn fold_bursts(rows: Vec<FeedItem>) -> Vec<FeedItem> {
+    let burstable = |row: &FeedItem| match row {
+        FeedItem::Logged { entry, count, .. } => {
+            *count == 1
+                && entry.ok
+                && matches!(
+                    entry.kind,
+                    ActivityKind::Upload
+                        | ActivityKind::Download
+                        | ActivityKind::Trash
+                        | ActivityKind::Restore
+                        | ActivityKind::DeleteForever
+                        | ActivityKind::Move
+                        | ActivityKind::Rename
+                        | ActivityKind::CreateFolder
+                )
+        }
+        _ => false,
+    };
+    let joins = |run: &[FeedItem], row: &FeedItem| {
+        let (
+            Some(FeedItem::Logged {
+                entry: prev,
+                day: prev_day,
+                ..
+            }),
+            FeedItem::Logged { entry, day, .. },
+        ) = (run.last(), row)
+        else {
+            return false;
+        };
+        prev.kind == entry.kind && prev_day == day && prev.time - entry.time <= BURST_GAP
+    };
+    let mut out = Vec::new();
+    let mut run: Vec<FeedItem> = Vec::new();
+    let flush = |run: &mut Vec<FeedItem>, out: &mut Vec<FeedItem>| {
+        if run.len() < BURST_MIN {
+            out.append(run);
+            return;
+        }
+        let mut entries = Vec::with_capacity(run.len());
+        let mut head = None;
+        for row in run.drain(..) {
+            if let FeedItem::Logged {
+                entry,
+                day,
+                day_label,
+                when,
+                ..
+            } = row
+            {
+                head.get_or_insert((entry.kind, day, day_label, when));
+                entries.push(entry);
+            }
+        }
+        if let Some((kind, day, day_label, when)) = head {
+            out.push(FeedItem::Burst {
+                kind,
+                entries,
+                day,
+                day_label,
+                when,
+            });
+        }
+    };
+    for row in rows {
+        if burstable(&row) && (run.is_empty() || joins(&run, &row)) {
+            run.push(row);
+            continue;
+        }
+        flush(&mut run, &mut out);
+        if burstable(&row) {
+            run.push(row);
+        } else {
+            out.push(row);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// When an entry happened, as its row shows it under its day's heading: how
+/// long ago within the last hour, else the time of day.
+pub(crate) fn feed_time(time: i64, now: &glib::DateTime) -> String {
+    if (0..3600).contains(&(now.to_unix() - time)) {
+        return dates::relative(time);
+    }
+    // Translators: strftime format for the time of day in the activity feed, such as "14:05".
+    let format = gettext("%H:%M");
+    glib::DateTime::from_unix_local(time)
+        .ok()
+        .and_then(|at| at.format(&format).ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 /// Bring the page up to date with the kept feed and conflict list, changing
@@ -631,17 +873,32 @@ pub(crate) fn paint_activity(ui: &Rc<Ui>) {
         return;
     }
     let now = glib::DateTime::now_local().ok();
+    let limit = state.limit.get();
     let rows = feed_items(
         &items,
         state.filter.get(),
         conflicts.as_deref(),
         now.as_ref(),
+        FeedOptions {
+            show_scratch: state.show_scratch.get(),
+            more: items.len() >= limit && limit < ACTIVITY_KEPT,
+        },
     );
     replace_items(&state.model, &rows);
+    let shows_entries = rows.iter().any(|row| !matches!(row, FeedItem::More { .. }));
     state
         .feed
-        .set_visible_child_name(if rows.is_empty() { "empty" } else { "rows" });
+        .set_visible_child_name(if shows_entries { "rows" } else { "empty" });
     state.content.set_visible_child_name("list");
+}
+
+/// A time label for the end of a row, with the whole moment in its tooltip.
+fn time_label(when: &str, time: i64) -> gtk4::Label {
+    let label = gtk4::Label::new(Some(when));
+    label.add_css_class("dim-label");
+    label.add_css_class("numeric");
+    label.set_tooltip_text(Some(&dates::full(time)));
+    label
 }
 
 /// One logged row of the feed, with the fields of [`FeedItem::Logged`].
@@ -650,19 +907,15 @@ fn feed_row(
     a: &ActivityEntry,
     count: usize,
     first: i64,
+    when: &str,
     pending: Option<&ConflictInfo>,
     resolved: bool,
 ) -> adw::ActionRow {
-    let title = activity_title(a.kind, &a.target);
-
-    let mut subtitle: Vec<String> = Vec::new();
-    if !a.detail.is_empty() {
-        subtitle.push(capitalize(&a.detail));
-    }
+    let Described { title, mut details } = describe(a);
     if count > 1 {
         let since = dates::relative(first);
         // Translators: {time} is a date or time such as "Sep 21" or "5 min ago".
-        subtitle.push(ngettext_f(
+        details.push(ngettext_f(
             "{n} time since {time}",
             "{n} times since {time}",
             count as u64,
@@ -670,11 +923,11 @@ fn feed_row(
         ));
     }
     if resolved {
-        subtitle.push(pgettext("state", "Resolved"));
+        details.push(pgettext("state", "Resolved"));
     }
     let widget = adw::ActionRow::builder()
         .title(title)
-        .subtitle(subtitle.join(" · "))
+        .subtitle(details.join(" · "))
         .use_markup(false)
         .title_lines(1)
         .subtitle_lines(2)
@@ -697,20 +950,7 @@ fn feed_row(
         icon.add_css_class("error");
     }
     widget.add_prefix(&icon);
-
-    // Translators: strftime format for the time of day in the activity feed, such as "14:05".
-    let time_format = gettext("%H:%M");
-    let time = gtk4::Label::new(Some(
-        &glib::DateTime::from_unix_local(a.time)
-            .ok()
-            .and_then(|at| at.format(&time_format).ok())
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-    ));
-    time.add_css_class("dim-label");
-    time.add_css_class("numeric");
-    time.set_tooltip_text(Some(&dates::full(a.time)));
-    widget.add_suffix(&time);
+    widget.add_suffix(&time_label(when, a.time));
 
     if let Some(conflict) = pending {
         let resolve = gtk4::Button::builder()
@@ -725,41 +965,83 @@ fn feed_row(
     widget
 }
 
-/// The row title for an activity: what happened to `target`, as one sentence
-/// per kind so translators can place the name where their language needs it.
-pub(crate) fn activity_title(kind: ActivityKind, target: &str) -> String {
-    let args = [("name", target)];
-    match kind {
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Upload => gettext_f("Uploaded {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Download => gettext_f("Downloaded {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Sync => gettext_f("Synced {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Rename => gettext_f("Renamed {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Move => gettext_f("Moved {name}", &args),
-        // Translators: {name} is a folder name.
-        ActivityKind::CreateFolder => gettext_f("Created folder {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Trash => gettext_f("Trashed {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Restore => gettext_f("Restored {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::DeleteForever => gettext_f("Deleted {name}", &args),
-        // The target of an empty is a count, not a name to lead with a verb.
-        // Translators: {count} is the number of items removed from the Trash.
-        ActivityKind::EmptyTrash => gettext_f("Emptied Trash ({count})", &[("count", target)]),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Share => gettext_f("Shared {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::PublicLink => gettext_f("Created a link to {name}", &args),
-        // Translators: {name} is a file or folder name.
-        ActivityKind::Unshare => gettext_f("Unshared {name}", &args),
-        // Translators: {name} is the name of the conflict copy.
-        ActivityKind::Conflict => gettext_f("Conflict {name}", &args),
+/// A burst row: one line for the whole run, expanding to one row per item.
+fn burst_row(kind: ActivityKind, entries: &[ActivityEntry], when: &str) -> adw::ExpanderRow {
+    let n = entries.len() as u64;
+    let title = match kind {
+        ActivityKind::Upload => ngettext_f("Uploaded {n} item", "Uploaded {n} items", n, &[]),
+        ActivityKind::Download => ngettext_f("Downloaded {n} item", "Downloaded {n} items", n, &[]),
+        ActivityKind::Trash => ngettext_f(
+            "Moved {n} item to the Trash",
+            "Moved {n} items to the Trash",
+            n,
+            &[],
+        ),
+        ActivityKind::Restore => ngettext_f("Restored {n} item", "Restored {n} items", n, &[]),
+        ActivityKind::DeleteForever => ngettext_f(
+            "Deleted {n} item forever",
+            "Deleted {n} items forever",
+            n,
+            &[],
+        ),
+        ActivityKind::Move => ngettext_f("Moved {n} item", "Moved {n} items", n, &[]),
+        ActivityKind::Rename => ngettext_f("Renamed {n} item", "Renamed {n} items", n, &[]),
+        ActivityKind::CreateFolder => {
+            ngettext_f("Created {n} folder", "Created {n} folders", n, &[])
+        }
+        _ => ngettext_f("{n} change", "{n} changes", n, &[]),
+    };
+    let names: Vec<&str> = entries.iter().map(|e| file_name(&e.target)).collect();
+    let row = adw::ExpanderRow::builder()
+        .title(title)
+        .subtitle(names.join(", "))
+        .use_markup(false)
+        .title_lines(1)
+        .subtitle_lines(1)
+        .build();
+    row.add_prefix(&gtk4::Image::from_icon_name(activity_icon(kind)));
+    if let Some(newest) = entries.first() {
+        row.add_suffix(&time_label(when, newest.time));
     }
+    let now = glib::DateTime::now_local().ok();
+    for entry in entries {
+        let Described { details, .. } = describe(entry);
+        let child = adw::ActionRow::builder()
+            .title(file_name(&entry.target))
+            .subtitle(details.join(" · "))
+            .use_markup(false)
+            .title_lines(1)
+            .subtitle_lines(1)
+            .build();
+        let when = now
+            .as_ref()
+            .map(|now| feed_time(entry.time, now))
+            .unwrap_or_default();
+        child.add_suffix(&time_label(&when, entry.time));
+        row.add_row(&child);
+    }
+    row
+}
+
+/// The row at the end of the feed that asks the daemon for older entries.
+fn more_row(ui: &Rc<Ui>) -> gtk4::Widget {
+    let button = gtk4::Button::builder()
+        .label(gettext("Show Older"))
+        .halign(gtk4::Align::Center)
+        .margin_top(6)
+        .margin_bottom(12)
+        .build();
+    button.add_css_class("pill");
+    let ui = ui.clone();
+    button.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        let state = &ui.activity;
+        state
+            .limit
+            .set((state.limit.get() + ACTIVITY_PAGE).min(ACTIVITY_KEPT));
+        fetch_activity(&ui);
+    });
+    button.upcast()
 }
 
 /// A themed icon for an activity kind.
@@ -885,7 +1167,13 @@ mod tests {
             entry(100, ActivityKind::Upload, "c.txt", "", true),
         ];
         let open = [conflict("docs/a (sync-conflict).txt")];
-        let rows = feed_items(&items, ActivityFilter::All, Some(&open), None);
+        let rows = feed_items(
+            &items,
+            ActivityFilter::All,
+            Some(&open),
+            None,
+            FeedOptions::default(),
+        );
         assert_eq!(rows.len(), 4);
         assert!(matches!(&rows[0], FeedItem::Attention { open: 1, .. }));
         assert!(rows[0].section() > rows[1].section());
@@ -895,7 +1183,7 @@ mod tests {
                 FeedItem::Logged {
                     pending, resolved, ..
                 } => (pending.is_some(), *resolved),
-                FeedItem::Attention { .. } => unreachable!(),
+                _ => unreachable!(),
             })
             .collect();
         assert_eq!(states, vec![(true, false), (false, true), (false, false)]);
@@ -913,7 +1201,13 @@ mod tests {
             ),
             entry(100, ActivityKind::Upload, "c.txt", "", true),
         ];
-        let rows = feed_items(&items, ActivityFilter::All, None, None);
+        let rows = feed_items(
+            &items,
+            ActivityFilter::All,
+            None,
+            None,
+            FeedOptions::default(),
+        );
         assert!(matches!(
             &rows[0],
             FeedItem::Logged {
@@ -922,9 +1216,100 @@ mod tests {
             }
         ));
         let open = [conflict("docs/a (sync-conflict).txt")];
-        let rows = feed_items(&items, ActivityFilter::Sharing, Some(&open), None);
+        let rows = feed_items(
+            &items,
+            ActivityFilter::Sharing,
+            Some(&open),
+            None,
+            FeedOptions::default(),
+        );
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], FeedItem::Attention { .. }));
+    }
+
+    #[test]
+    fn a_run_of_uploads_folds_into_one_burst() {
+        let items: Vec<ActivityEntry> = (0..4)
+            .map(|i| {
+                entry(
+                    1000 - i * 60,
+                    ActivityKind::Upload,
+                    &format!("{i}.jpg"),
+                    "",
+                    true,
+                )
+            })
+            .chain([entry(100, ActivityKind::Upload, "late.jpg", "", true)])
+            .collect();
+        let rows = feed_items(
+            &items,
+            ActivityFilter::All,
+            Some(&[]),
+            None,
+            FeedOptions::default(),
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0], FeedItem::Burst { entries, .. } if entries.len() == 4));
+        assert!(matches!(&rows[1], FeedItem::Logged { .. }));
+    }
+
+    #[test]
+    fn two_in_a_row_stay_separate_and_failures_never_fold() {
+        let items = vec![
+            entry(300, ActivityKind::Upload, "a", "", true),
+            entry(290, ActivityKind::Upload, "b", "", true),
+            entry(280, ActivityKind::Upload, "c", "timeout", false),
+            entry(270, ActivityKind::Upload, "d", "", true),
+        ];
+        let rows = feed_items(
+            &items,
+            ActivityFilter::All,
+            Some(&[]),
+            None,
+            FeedOptions::default(),
+        );
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn scratch_files_hide_unless_asked_for() {
+        let items = vec![
+            entry(300, ActivityKind::Upload, ".goutputstream-AB12", "", true),
+            entry(
+                290,
+                ActivityKind::Rename,
+                "notes.txt",
+                "was .goutputstream-AB12",
+                true,
+            ),
+            entry(280, ActivityKind::Upload, "notes.txt", "", true),
+        ];
+        let rows = feed_items(
+            &items,
+            ActivityFilter::All,
+            Some(&[]),
+            None,
+            FeedOptions::default(),
+        );
+        assert_eq!(rows.len(), 1);
+        let shown = FeedOptions {
+            show_scratch: true,
+            ..FeedOptions::default()
+        };
+        let rows = feed_items(&items, ActivityFilter::All, Some(&[]), None, shown);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn show_older_ends_the_last_section() {
+        let items = vec![entry(300, ActivityKind::Trash, "a", "", true)];
+        let more = FeedOptions {
+            more: true,
+            ..FeedOptions::default()
+        };
+        let rows = feed_items(&items, ActivityFilter::All, Some(&[]), None, more);
+        assert!(matches!(rows.last(), Some(FeedItem::More { .. })));
+        assert_eq!(rows[0].section(), rows[1].section());
     }
 
     #[test]

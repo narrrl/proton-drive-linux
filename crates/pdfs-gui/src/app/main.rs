@@ -465,8 +465,8 @@ fn build_window(app: &adw::Application) {
     let (shared_page, shared_widgets) = build_shared_page();
     let (shared_by_me_page, shared_by_me_widgets) = build_shared_by_me_page();
     let (devices_page, devices_widgets) = build_devices_page();
-    let (locations_page, locations_widgets) = build_locations_page();
     let (activity_page, activity_widgets) = build_activity_page();
+    let (locations_page, locations_widgets) = build_locations_page(&activity_page);
     let (trash_page, trash_widgets) = build_trash_page();
     let (takeout_page, takeout_widgets) = build_takeout_page();
     // The login page has no title and no actions, but it still needs a header
@@ -485,7 +485,6 @@ fn build_window(app: &adw::Application) {
     stack.add_named(&shared_page, Some("shared"));
     stack.add_named(&devices_page, Some("devices"));
     stack.add_named(&locations_page, Some("locations"));
-    stack.add_named(&activity_page, Some("activity"));
     stack.add_named(&trash_page, Some("trash"));
     stack.add_named(&takeout_page, Some("takeout"));
 
@@ -706,19 +705,7 @@ fn build_window(app: &adw::Application) {
         },
         shared: SharedState::new(&shared_widgets),
         shared_by_me: SharedByMeState::new(&shared_by_me_widgets),
-        devices: DevicesState {
-            content: devices_widgets.content.clone(),
-            status: devices_widgets.status.clone(),
-            retry: devices_widgets.retry.clone(),
-            group: devices_widgets.group.clone(),
-            rows: RefCell::new(Vec::new()),
-            sync_group: devices_widgets.sync_group.clone(),
-            sync_rows: RefCell::new(Vec::new()),
-            rename_this: devices_widgets.rename_this.clone(),
-            this_device: RefCell::new(None),
-            loader: Loader::new(&devices_widgets.content),
-            loaded_at: Cell::new(None),
-        },
+        devices: DevicesState::new(&devices_widgets),
         locations: LocationsState {
             content: locations_widgets.content.clone(),
             status: locations_widgets.status.clone(),
@@ -730,7 +717,8 @@ fn build_window(app: &adw::Application) {
             loaded_at: Cell::new(None),
             card: SyncCard {
                 icon: locations_widgets.card_icon.clone(),
-                row: locations_widgets.card_row.clone(),
+                title: locations_widgets.card_title.clone(),
+                detail: locations_widgets.card_detail.clone(),
                 pause: locations_widgets.pause.clone(),
                 paused: Cell::new(false),
             },
@@ -748,6 +736,9 @@ fn build_window(app: &adw::Application) {
                 inflight: Cell::new(false),
                 fetched_at: Cell::new(None),
             },
+            views: locations_widgets.views.clone(),
+            banner: locations_widgets.banner.clone(),
+            failing: Cell::new(0),
         },
         activity: ActivityState {
             content: activity_widgets.content.clone(),
@@ -762,6 +753,8 @@ fn build_window(app: &adw::Application) {
             conflicts: RefCell::new(None),
             conflicts_inflight: Cell::new(false),
             conflicts_at: Cell::new(None),
+            show_scratch: Cell::new(false),
+            limit: Cell::new(ACTIVITY_PAGE),
         },
         takeout: TakeoutState {
             archives: RefCell::new(Vec::new()),
@@ -819,7 +812,7 @@ fn build_window(app: &adw::Application) {
     wire_trash(&ui, &trash_widgets);
     wire_shared(&ui, &shared_widgets);
     wire_shared_by_me(&ui, &shared_by_me_widgets);
-    wire_devices(&ui, &devices_widgets.retry);
+    wire_devices(&ui, &devices_widgets);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
     wire_activity(&ui, &activity_widgets);
     wire_takeout(&ui, &takeout_widgets);
@@ -833,7 +826,6 @@ fn build_window(app: &adw::Application) {
             &shared_by_me_widgets.refresh,
             &devices_widgets.refresh,
             &locations_widgets.refresh,
-            &activity_widgets.refresh,
         ],
     );
     wire_retry(&ui);
@@ -859,16 +851,7 @@ fn build_window(app: &adw::Application) {
             Some("shared") => load_shared(&ui_nav),
             Some("devices") if page_fresh(&ui_nav.devices.loaded_at) => {}
             Some("devices") => load_devices(&ui_nav),
-            Some("locations") => {
-                refresh_conflicts(&ui_nav, true);
-                if !page_fresh(&ui_nav.locations.loaded_at) {
-                    load_locations(&ui_nav);
-                }
-            }
-            // Activity is intentionally not TTL-cached: it changes out from under
-            // the page as background uploads and edits complete, so it reloads on
-            // every visit to stay live.
-            Some("activity") => load_activity(&ui_nav),
+            Some("locations") => load_sync_view(&ui_nav),
             Some("trash") => load_trash(&ui_nav),
             // The import runs in the daemon and outlives this page, so arriving
             // here asks straight away whether one is in flight.
@@ -957,7 +940,7 @@ fn window_hidden(window: &adw::ApplicationWindow) -> bool {
 /// and each entry is `(stack page name, label, icon)`. The places in the account
 /// come first; the rows from [`SIDEBAR_SYNC_SECTION`] on are about this computer's
 /// sync, set off by a separator.
-const DESTINATIONS: [(&str, &str, &str); 8] = [
+const DESTINATIONS: [(&str, &str, &str); 7] = [
     ("browser", gettext_noop("My files"), "folder-symbolic"),
     (
         "gallery",
@@ -978,11 +961,6 @@ const DESTINATIONS: [(&str, &str, &str); 8] = [
     ("trash", gettext_noop("Trash"), "user-trash-symbolic"),
     // Translators: sidebar entry for the page listing this computer's synced folders.
     ("locations", gettext_noop("Sync"), "pdfs-sync-symbolic"),
-    (
-        "activity",
-        gettext_noop("Activity"),
-        "document-open-recent-symbolic",
-    ),
 ];
 
 /// Index of the first row in the sidebar's sync section.
@@ -998,7 +976,20 @@ fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
     for (_, label, icon) in DESTINATIONS {
         let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         row_box.append(&gtk4::Image::from_icon_name(icon));
-        row_box.append(&gtk4::Label::new(Some(&gettext(label))));
+        let title = gtk4::Label::builder()
+            .label(gettext(label))
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        row_box.append(&title);
+        // A count of what waits there; see `set_sidebar_badge`.
+        let badge = gtk4::Label::builder()
+            .visible(false)
+            .valign(gtk4::Align::Center)
+            .build();
+        badge.add_css_class("sidebar-badge");
+        badge.add_css_class("numeric");
+        row_box.append(&badge);
         let row = gtk4::ListBoxRow::builder().child(&row_box).build();
         list.append(&row);
     }
@@ -1190,9 +1181,8 @@ fn reload_current_page(ui: &Rc<Ui>) {
         }
         Some("locations") => {
             ui.locations.loaded_at.set(None);
-            load_locations(ui);
+            reload_sync_view(ui);
         }
-        Some("activity") => load_activity(ui),
         _ => {}
     }
 }
@@ -1274,6 +1264,24 @@ fn sync_sidebar(ui: &Rc<Ui>) {
         // The login page has no destination row.
         None => ui.sidebar.unselect_all(),
     }
+}
+
+/// Show `count` on the sidebar row of `page`, or nothing when it is 0.
+pub(crate) fn set_sidebar_badge(ui: &Ui, page: &str, count: u64) {
+    let Some(index) = DESTINATIONS.iter().position(|(p, _, _)| *p == page) else {
+        return;
+    };
+    let Some(badge) = ui
+        .sidebar
+        .row_at_index(index as i32)
+        .and_then(|row| row.child())
+        .and_then(|row_box| row_box.last_child())
+        .and_downcast::<gtk4::Label>()
+    else {
+        return;
+    };
+    badge.set_visible(count > 0);
+    badge.set_label(&count.to_string());
 }
 
 /// Show a transient toast. Non-blocking by design: an action's outcome is
@@ -1522,7 +1530,14 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
             return;
         };
         // Signed out, the login page owns the window; unknown names are ignored.
-        if ui_page.session.borrow().is_some() && ui_page.stack.child_by_name(page).is_some() {
+        if ui_page.session.borrow().is_none() {
+            return;
+        }
+        // Activity lives on as the Sync page's History view.
+        if page == "activity" {
+            ui_page.locations.views.set_visible_child_name("history");
+            ui_page.stack.set_visible_child_name("locations");
+        } else if ui_page.stack.child_by_name(page).is_some() {
             ui_page.stack.set_visible_child_name(page);
         }
     });

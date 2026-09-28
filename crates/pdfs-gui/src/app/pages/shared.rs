@@ -23,6 +23,9 @@ pub(crate) struct SharedState {
     pub(crate) invitations_banner: adw::Banner,
     /// The invitations from the last top-level load.
     pub(crate) invitations: RefCell<Vec<InvitationInfo>>,
+    /// When the invitations were last read, for the sidebar badge's poll.
+    pub(crate) invitations_at: Cell<Option<Instant>>,
+    pub(crate) invitations_inflight: Cell<bool>,
     /// The links view: "list", or "empty".
     pub(crate) links_content: gtk4::Stack,
     pub(crate) links_group: adw::PreferencesGroup,
@@ -58,6 +61,8 @@ impl SharedState {
             crumb: widgets.crumb.clone(),
             invitations_banner: widgets.invitations_banner.clone(),
             invitations: RefCell::new(Vec::new()),
+            invitations_at: Cell::new(None),
+            invitations_inflight: Cell::new(false),
             links_content: widgets.links_content.clone(),
             links_group: widgets.links_group.clone(),
             link_rows: RefCell::new(Vec::new()),
@@ -678,7 +683,7 @@ pub(crate) fn role_access(role: &str) -> Option<String> {
 /// download-and-open, addressed by uid because the file lives outside the mount.
 /// The daemon reports the download as a transfer, so it shows with its
 /// progress beside every other one.
-fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
+pub(crate) fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
     // Ignore a repeat activation of a file already downloading, so an impatient
     // double-click doesn't kick off a second round-trip.
     if !ui.opening.borrow_mut().insert(uid.to_string()) {
@@ -716,8 +721,40 @@ fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
     });
 }
 
-/// Keep the top level's invitations and say in the banner how many wait.
+/// How often the sidebar badge asks for invitations away from the page.
+const INVITATIONS_TTL: Duration = Duration::from_secs(300);
+
+/// Poll the invitations now and then from anywhere, so the sidebar's Shared
+/// with me row can say that some wait.
+pub(crate) fn refresh_invitations_badge(ui: &Rc<Ui>) {
+    let state = &ui.shared;
+    if state.invitations_inflight.get()
+        || state
+            .invitations_at
+            .get()
+            .is_some_and(|at| at.elapsed() < INVITATIONS_TTL)
+    {
+        return;
+    }
+    state.invitations_inflight.set(true);
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ListInvitations);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.shared.invitations_inflight.set(false);
+        match result {
+            Ok(Ok(Response::Invitations { items })) => repaint_invitations(&ui, items),
+            // Try again at the next interval rather than on every tick.
+            _ => ui.shared.invitations_at.set(Some(Instant::now())),
+        }
+    });
+}
+
+/// Keep the top level's invitations and say in the banner and the sidebar
+/// how many wait.
 fn repaint_invitations(ui: &Rc<Ui>, invitations: Vec<InvitationInfo>) {
+    ui.shared.invitations_at.set(Some(Instant::now()));
+    set_sidebar_badge(ui, "shared", invitations.len() as u64);
     let banner = &ui.shared.invitations_banner;
     banner.set_revealed(!invitations.is_empty());
     if !invitations.is_empty() {

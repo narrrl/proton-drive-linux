@@ -1093,7 +1093,7 @@ pub struct TransferItem {
 }
 
 /// One entry in a [`Request::ListDir`] listing.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct DirEntry {
     /// Decrypted node name.
     pub name: String,

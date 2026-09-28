@@ -2,6 +2,7 @@ crates/pdfs-gui/src/activation.rs
 crates/pdfs-gui/src/app/dates.rs
 crates/pdfs-gui/src/app/main.rs
 crates/pdfs-gui/src/app/pages/activity.rs
+crates/pdfs-gui/src/app/pages/activity_text.rs
 crates/pdfs-gui/src/app/pages/albums.rs
 crates/pdfs-gui/src/app/pages/browser.rs
 crates/pdfs-gui/src/app/pages/devices.rs

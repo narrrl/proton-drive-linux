@@ -1,4 +1,5 @@
 pub(crate) mod activity;
+pub(crate) mod activity_text;
 pub(crate) mod albums;
 pub(crate) mod browser;
 pub(crate) mod devices;
