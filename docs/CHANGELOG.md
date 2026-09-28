@@ -11,6 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.4.0] — 2026-09-28
+
 Schema: **34**. Photos gain a `similar_hash` column for the similar-photo finder. It stays
 empty until the finder is first opened, so updating reads and downloads nothing.
 
@@ -21,19 +23,6 @@ empty until the finder is first opened, so updating reads and downloads nothing.
   downloaded and are counted as not compared. Every photo in a set starts ticked Keep, since
   photos that look alike can be different shots, and a photo not kept goes to Trash with the
   rest of its shot.
-
-## [2.3.0] — 2026-09-28
-
-Schema: **33**. Photos gain their location; the first timeline refresh after updating reads
-the metadata of the whole library once (nothing is downloaded), and the Places view shows how
-far it has got.
-
-### Added
-- **Places.** A third Photos view groups photos by the town they were taken in, as cards or on a
-  world map. Towns are looked up offline in bundled GeoNames data (CC BY 4.0), and the map is
-  drawn offline from Natural Earth land outlines and country borders (public domain), with
-  sea and land in their own colours. Install `iso-codes`, a new optional dependency, for
-  country names in your language.
 - **Photos on the map.** Every town is marked with one of its photos and a count, and nearby
   towns merge into one marker until you zoom in. Zoomed in on a town, each photo gets its own
   marker where it was taken; clicking one opens it in the viewer, and clicking photos taken
@@ -49,6 +38,20 @@ far it has got.
   imports another GTK theme (Catppuccin, Fluent, ...), whose own colours used to show through
   almost everywhere. Folders get Proton's purple folder icon rather than the icon theme's.
   Anyone who had the accent turned on gets the theme.
+- **Country borders on the Places map.** The offline map draws country borders, with sea and
+  land in their own colours.
+
+## [2.3.0] — 2026-09-28
+
+Schema: **33**. Photos gain their location; the first timeline refresh after updating reads
+the metadata of the whole library once (nothing is downloaded), and the Places view shows how
+far it has got.
+
+### Added
+- **Places.** A third Photos view groups photos by the town they were taken in, as cards or on a
+  world map. Towns are looked up offline in bundled GeoNames data (CC BY 4.0), and the map is
+  drawn offline from Natural Earth land outlines (public domain), so no map tiles are fetched.
+  Install `iso-codes`, a new optional dependency, for country names in your language.
 - **On this day.** A strip at the top of the timeline shows a card for every earlier year with
   photos taken on today's date.
 - **Find duplicates.** Photos can list every set of byte-identical copies and move the copies
@@ -1106,6 +1109,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[2.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.4.0
 
 [2.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.3.0
 [2.2.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.2
