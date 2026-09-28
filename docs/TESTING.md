@@ -78,10 +78,9 @@ in-flight `.crdownload` must not be sealed as a revision) and B74 (a file
 renamed after close must keep its content) need a real mount and a reachable
 daemon; they are skipped, not failed, without one.
 
-B74 is currently **failing** — it is a live data-loss defect, not a regression
-guard, and it was found by exactly this mechanism: the B70 case failed, and
-narrowing it produced a smaller reproduction that has its own case now. Expect a
-red run against a real mount until it is fixed.
+B74 was found by exactly this mechanism: the B70 case failed, and narrowing it
+produced a smaller reproduction that got its own case. The defect is fixed and
+live-validated (2026-07-26); the case now guards against its return.
 
 **B79** (an on-demand device folder accepts writes) discovers its target from
 `pdfs locations --json` and skips when this machine has no mounted on-demand

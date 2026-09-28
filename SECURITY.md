@@ -30,5 +30,10 @@ the interesting boundaries are:
 - **Cryptography.** Key derivation, signature handling, and anything that could publish plaintext
   or the wrong key material to Proton.
 
+What the client deliberately keeps in plaintext on disk, and why, is documented in the
+[threat model](docs/ARCHITECTURE.md#8-threat-model-what-this-client-writes-to-disk-in-plaintext).
+Behaviour described there is known and not a vulnerability by itself; a way to make it worse
+than described is.
+
 Out of scope: vulnerabilities in Proton's own service (report those to Proton AG), and issues that
 require an attacker who already has your user account on the machine.

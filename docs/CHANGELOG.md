@@ -11,6 +11,17 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Documentation
+- **Rewritten user documentation.** New pages for installation, the user guide, the command-line
+  reference, configuration and troubleshooting, and a documentation index in `docs/README.md`.
+  The README is shorter and points to them.
+- **Recovery** describes the current restore flow (adopting a computer, `pdfs sync restore`, the
+  machine profile) instead of the old manual runbook.
+- **Architecture** covers push events, remote event streams, the revision block geometry, the
+  thread layout of 2.5.0 and the machine profile. The development page is now a developer guide,
+  and open work moved to `docs/ROADMAP.md`.
+- `scripts/publish-wiki.sh` publishes the user pages to the GitHub wiki.
+
 ## [2.5.0] — 2026-09-28
 
 A polish pass over the desktop app: the daemon pushes changes instead of being polled, pages

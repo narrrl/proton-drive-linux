@@ -1,6 +1,13 @@
-# Proton Drive Linux Client: Architecture Specification
+# Architecture
 
-This document provides a deep, comprehensive architectural description of the Proton Drive Linux Client (`pdfs`). It specifies the design patterns, data flows, thread models, and subsystem dependencies that govern the virtual filesystem (FUSE), database persistence, cache management, and two-way sync engine.
+This document describes how the Proton Drive Linux client (`pdfs`) is built: the crates, the
+filesystem and its caches, the write queue, the sync engine, the control protocol, the thread
+layout, what the client writes to disk in plaintext, and the CAPTCHA flow. It is written for
+contributors and for anyone auditing the client. User-facing documentation starts at
+[docs/README.md](README.md).
+
+Numbers quoted here (thread counts, timeouts, limits) are the constants in the source at the time
+of writing; the source is authoritative when they disagree.
 
 ---
 
@@ -34,6 +41,11 @@ graph TD
 | [`pdfs-fuse`](../crates/pdfs-fuse) | VFS Layer & Reconciliation | FUSE callbacks, background upload queue (`drain`), two-way sync runner. | Manages in-memory inode maps (`State`), active descriptors (`WriteHandle`), and background task threads. |
 | [`pdfs-cli`](../crates/pdfs-cli) | Command Line Interface | Command routing, daemon launcher, IPC client wrapper. | Stateless; communicates with daemon over IPC control socket. |
 | [`pdfs-gui`](../crates/pdfs-gui) | Graphical Interface | GTK pages, tray, and the resident quick-search prompt. | Keeps UI state only; all durable state and Drive access remain behind the IPC socket. |
+
+The workspace ships four binaries: `pdfs` (the CLI, and the daemon as `pdfs daemon`) from
+`pdfs-cli`, and `pdfs-app`, `pdfs-tray` and `pdfs-prompt` from `pdfs-gui`. The daemon runs as the
+systemd user unit `proton-drive.service`. Only the daemon holds the database, the caches and the
+API client; every other binary is a client of its control socket.
 
 ---
 
@@ -105,11 +117,29 @@ A mirror folder is a plain local directory with no FUSE session, so a row can le
 
 ## 3. Read Path & Block Caching Pipeline
 
-Read requests are parallelized and served in blocks of size `BLOCK_SIZE` (4 MiB).
+Reads are served from the revision's content blocks. `Core::read_range` looks in three places
+before the network:
 
-* **Unpinned files (Streaming):** Avoids writing full files to disk to preserve storage. Instead, blocks are kept in a fixed-size `stream_ring` (in-memory ring cache) and evicted immediately.
-* **Pinned files (Persistent):** Block downloads are saved directly to `ContentCache` on disk.
-* **Read-Ahead:** The reader thread spawns asynchronous tasks to pre-fetch upcoming blocks.
+1. **Whole-file blob.** A file kept available offline is downloaded completely into
+   `ContentCache` and read from there.
+2. **Stream ring.** For every other file, a bounded in-memory ring (`RING_BYTES`, 128 MiB) of
+   recently decrypted blocks is checked first, because the kernel reads in pieces far smaller
+   than a block.
+3. **Block cache.** Blocks are then looked up on disk, under `content/blocks/`. They count
+   against `cache_budget` and are evicted least-recently-used.
+
+On a miss, only the blocks that overlap the request are fetched, through a `RevisionReader` kept
+open per revision (`MAX_OPEN_READERS = 64`, validated by `(mtime, size)`).
+
+* **Block geometry.** Block boundaries come from the revision itself. The first read of a file
+  assumes uniform `BLOCK_SIZE` (4 MiB) blocks; once a reader is open, the real block sizes are
+  recorded (`store_block_geometry`) and later reads plan on them. Proton does not guarantee
+  4 MiB blocks, and assuming it served wrong bytes (`docs/BUGS.md` B85).
+* **Read-ahead.** A read that proves sequential prefetches a window of 2 to 8 blocks
+  (`PREFETCH_MIN`, `PREFETCH_MAX`). Prefetch takes a permit from a global budget of 8 and gives up
+  instead of queueing, so it never delays a demand read.
+* **Large videos.** An unpinned video of 256 MiB or more (`STREAM_BYPASS_MIN`) streams without
+  persisting its blocks, so watching a film does not evict the rest of the cache.
 
 ```mermaid
 sequenceDiagram
@@ -121,21 +151,25 @@ sequenceDiagram
     participant API as Proton API Client
 
     Kernel->>FUSE: read(ino, fh, offset, size)
-    FUSE->>FUSE: calculate block indices [first_block..last_block]
-    loop For each block index
-        alt Block in disk Cache (Pinned/Cache hit)
-            FUSE->>Cache: read_block(block_idx)
-            Cache-->>FUSE: block bytes
-        else Block in stream ring cache
-            FUSE->>Ring: get(block_idx)
-            Ring-->>FUSE: block bytes
-        else Block Cache Miss
-            FUSE->>API: download_range(offset, len)
-            API-->>FUSE: decrypted block bytes
-            alt caching_enabled
-                FUSE->>Cache: store_block(block_idx)
-            else streaming_only
-                FUSE->>Ring: insert(block_idx)
+    alt Whole-file blob cached (available offline)
+        FUSE->>Cache: read blob range
+        Cache-->>FUSE: bytes
+    else
+        FUSE->>FUSE: block_geometry() spans overlapping [offset, offset+size)
+        loop For each span
+            alt Span in stream ring
+                FUSE->>Ring: get(span)
+                Ring-->>FUSE: block bytes
+            else Span in block cache
+                FUSE->>Cache: read_block(span)
+                Cache-->>FUSE: block bytes
+            else Miss
+                FUSE->>API: RevisionReader.read_at(span)
+                API-->>FUSE: decrypted block bytes
+                opt Not a large unpinned video
+                    FUSE->>Cache: store_block(span)
+                end
+                FUSE->>Ring: insert(span)
             end
         end
     end
@@ -220,6 +254,35 @@ graph TD
 5. **Depth-Ascending Batching:** Folders are processed first to ensure hierarchies exist before files are placed. Work is executed concurrently up to a set limit.
 6. **Safety Gate and Settle:** Destructive plans are rejected when the scan is incomplete. Total-wipe protection applies to every non-empty baseline, including a single-entry folder. On success, baseline entries are upserted, timestamps updated, and any pending mode switches (e.g. going on-demand) are evaluated. Failed local deletion or conflict preservation retains the previous baseline and prevents remote content from overwriting the local source.
 
+### Conflict Copies
+
+A conflict keeps both versions. The local file is renamed to
+`{stem} (sync-conflict {unix_secs}).{ext}` (with `-1`, `-2`, … appended to the timestamp when the
+name is taken) and the remote version is downloaded under the original name. The conflict sweep
+(§7) later trashes copies proven byte-identical to their sibling when `conflict_sweep` is
+`enforce`.
+
+### Devices and the Machine Profile
+
+Synced folders live under a *device*: a per-computer root in Proton Drive. `Core::ensure_device`
+decides which device this machine is: the adopted `device_uid` from `config.json` when set,
+otherwise a Linux device whose name equals the hostname, otherwise a newly registered one. An
+adopted UID that no longer exists is reported, never silently replaced.
+
+Because the local database does not survive a lost machine, the daemon backs up the machine's
+arrangement to `<device root>/.proton-drive-linux/profile.json` (`pdfs_core::profile`): each synced
+folder's remote UID, local path and mode, the pins, and the ignore patterns. It goes up the normal
+upload path and so is end-to-end encrypted like any other file. Mutating requests call
+`Core::touch_profile`, which coalesces a burst of changes into one upload. `PROFILE_VERSION`
+guards the format: a reader refuses a profile from a newer version instead of applying part of it.
+
+Restore (`ListRestorableFolders`, `RestoreSyncFolders`, and the `Device` variants for another
+computer) lists the device root's folders, proposes a local path from the profile when its parent
+exists on this machine and `~/<name>` otherwise, and on confirmation adds a `sync_folder` row per
+folder bound to the remote UID. The download is an ordinary reconcile against an empty baseline;
+on-demand mode is applied through the normal mode-switch request. The user guide is
+[RECOVERY.md](RECOVERY.md).
+
 ---
 
 ## 6. IPC Socket Protocol
@@ -232,7 +295,31 @@ The CLI and GUI front-ends do not access database files or make network calls di
 * **Control Protocol:**
   * Client sends a single JSON line (`Request`).
   * Daemon parses, handles the request, and replies with a single JSON line (`Response`).
-  * Timeout durations are separated: **2 seconds** for writes (avoids hangs on defunct sockets) and **120 seconds** for reads (accommodates heavy transfers).
+  * Timeout durations are separated: **2 seconds** for writes (avoids hangs on defunct sockets) and **120 seconds** for reads (accommodates heavy transfers). Status polls use a 5-second read timeout, which is what the app reports as "Not responding".
+* **Errors:** A failed request replies with `Response::Error { message, kind }`. The `kind` is machine-readable, and `pdfs --json` passes it through.
+* **Compatibility:** After an upgrade, the old daemon keeps running until the service restarts, so front ends must cope with a daemon that does not know a newer request. It answers such a request with an error instead of dropping the connection. New fields are added with `#[serde(default)]`, and new variants get a separate request rather than an optional field an old daemon would ignore.
+
+### Push Events
+
+Since 2.5.0 the front ends do not poll. The app and the tray each send `Request::Subscribe` once
+and keep the connection open; the daemon then streams one `Event` per line:
+
+| Event | Sent when | Payload |
+|---|---|---|
+| `Status` | On subscribe, and whenever any status field changes | A full `Response::Status` |
+| `Transfers` | On subscribe, and whenever the transfer snapshot changes | Transfers and background jobs |
+| `Changed { topics }` | Something a page shows changed | `Topic`s to re-read: `files`, `photos`, `trash`, `shares`, `devices`, `locations`, `queue`, `conflicts`, `activity` |
+| `Heartbeat` | Every 10 seconds of silence | — |
+
+Code that changes state publishes its topics to the `EventHub` (`crates/pdfs-fuse/src/events.rs`);
+the control handler maps each mutating request to the topics it touches. Changes within 150 ms
+of each other are coalesced into one event. A new subscription is told every topic changed, so it
+catches up on anything it missed. At most 8 subscriptions are served at once.
+
+On the client side, `pdfs_core::control::follow` reconnects across daemon restarts with backoff
+and treats 25 seconds without a line as a stuck daemon. A daemon older than 2.5.0 answers
+`Subscribe` with an error; `follow` then falls back to polling status and transfers, so the front
+end sees the same events, only later.
 
 ### Unified Search
 
@@ -246,12 +333,18 @@ The prompt is a single-instance GTK application. It retains and hides its window
 
 The background daemon relies on the following thread topology:
 
-1. **Main Thread / Dispatch Loop:** Blocks on `fuser::Session` loop. Reads kernel FUSE events and hands off network-bound VFS work to the FUSE workers pool.
+1. **Main Thread / Dispatch Loop:** Blocks on `fuser::Session` loop. Reads kernel FUSE events and hands off network-bound VFS work to the FUSE workers pool. Each on-demand synced folder is a further FUSE session with its own dispatch loop and its own inode space (`State`).
 2. **FUSE Workers Pool (11 threads, two lanes):** Bounded thread pool handling network operations. Split into 3 threads reserved for metadata (`lookup`, `readdir`) and 8 general threads that serve transfers (block reads) and fall back to metadata when no transfer is waiting. Reserved threads never accept a transfer — that is what keeps a directory listing from queuing behind saturated downloads (audit A6).
-3. **IPC listener Thread:** Listens on the Unix socket and admits at most 64 concurrent, timeout-bound handlers for front-end status/configuration requests.
-4. **Sync Engine Loop Thread:** Serializes sync runs. Wakes on debounced local inotify filesystem changes, remote polling intervals, or manual user requests.
-5. **Drain Queue Worker Thread:** Processes staged writes (`PendingOp`) sequentially, uploading revisions and retrying with exponential backoff on failures.
+3. **Control Threads (`pdfs-control`):** Listen on the Unix socket and admit at most 64 concurrent, timeout-bound handlers. Long-lived subscriptions hold one handler each, up to 8 (see §6).
+4. **Sync Engine Threads (`pdfs-sync`, `pdfs-sync-poll`):** Serialize sync passes. Wake on debounced inotify changes, the periodic poll, remote events, or a user request.
+5. **Drain Workers (`pdfs-drain-0` … `pdfs-drain-2`):** `DRAIN_WORKERS = 3` threads share the queue of staged writes and changes (`PendingOp`), with per-node ordering (§4), and retry failures with exponential backoff. Worker 0 also runs the queue's idle chores.
 6. **Conflict Sweep Thread (`pdfs-conflict-sweep`, optional):** Reconciles leftover `(sync-conflict …)` copies — 30 s warmup, then one pass every 5 minutes. A copy proven identical to its live sibling (equal size **and** equal `content_sha1`) is redundant; anything it cannot prove identical is surfaced to the activity feed and left alone. Governed by `AppConfig.conflict_sweep` / `PDFS_CONFLICT_SWEEP` (`SweepMode`): **report-only by default**, `off` skips the thread entirely, and only `enforce` lets it trash. Because it deletes, the enforcing path re-verifies revision id, size, digest, name, parent, queued ops and open handles immediately before acting rather than trusting its own pass-start snapshot. See `docs/BUGS.md` B69 and B71.
+7. **Remote Event Tasks (Tokio):** `run_event_sync` follows Proton's event stream for the Drive volume and applies each change to every mounted inode space, invalidating kernel entries as it goes. The cursor is persisted after every batch, so changes made while the daemon was stopped are applied on the next start. `run_photos_event_sync` follows the photos volume separately; it only drops gallery rows or the timeline's freshness stamp, since photos are not part of the mount.
+8. **Event Sampler (`pdfs-events`):** Publishes status, transfer and sync-progress changes to subscribed front-ends (§6).
+9. **Supervisor (`pdfs-supervisor`):** Logs workers that hold one job for minutes, a queue that stops draining and control requests that never return; samples memory; and pings the systemd watchdog only after a real round trip over the control socket, so a hung daemon is restarted (`WatchdogSec=120`). `pdfs diagnostics` reports the same data on demand.
+10. **Smaller helpers:** `pdfs-online-probe` (connectivity), `pdfs-localindex` (home-directory index for the search prompt), `pdfs-pause` (ends a timed pause), `pdfs-conflict-sweep`, and `pdfs-similar` (duplicate-photo detection, on request).
+
+Every long-lived loop waits on one shared `Shutdown` signal instead of sleeping, so an in-process remount joins the old generation of threads instead of leaking it (`docs/BUGS.md` B44).
 
 ---
 
@@ -377,3 +470,100 @@ sequenceDiagram
    This ensures compatibility with all versions of Proton's client verification scripts.
 3. **SRP Handshake Reset:** Because a gated login burns the SRP handshake on the API side, the client cannot simply resume the previous request. Instead, `auth::login_interactive` restarts the SRP process from scratch with the verification credentials attached, keeping the complex handshake details isolated from the front-end.
 4. **CLI Fallback:** Since the CLI has no native web browser engine, hitting the CAPTCHA gate fails immediately with a user-friendly message directing the user to sign in once via the GUI (`pdfs-app`) to persist the authenticated session keys to the system keyring.
+
+---
+
+## 10. Feature Design Notes
+
+Notes on individual features whose code is shaped by a constraint that is not obvious from the
+code alone.
+
+### File Version History
+**Files**: [`revisions.rs`](../crates/pdfs-fuse/src/revisions.rs), [`control.rs`](../crates/pdfs-core/src/control.rs), [`versions_dialog.rs`](../crates/pdfs-gui/src/app/widgets/versions_dialog.rs)
+
+Proton Drive keeps every revision a client committed; the daemon only ever addressed the active one, so a file overwritten by a sync pass could be recovered only from whatever the local `recovery/` directory happened to hold.
+
+The control protocol gained `ListRevisions` / `RestoreRevision` / `DeleteRevision` / `SaveRevisionAs` (each with a `…ByUid` twin for nodes the primary mount cannot name), the CLI gained `pdfs versions list|restore|save|rm`, and the browser's details pane gained a **Versions** button opening a per-file dialog.
+
+Three properties that shape the code:
+
+- **A restore is server-side and asynchronous.** No content crosses the wire and nothing enters the drain queue; the server answers 202 and swaps the active revision in the background, so the daemon evicts the file's cached blocks and open readers rather than describing the new state, and the UI wording promises the request, not the result.
+- **The active revision cannot be deleted.** `Core::delete_revision_for_uid` checks that locally so the user gets a sentence rather than an API code, and the dialog gives the current row no delete button.
+- **Saving a version never overwrites.** `SaveRevisionAs` refuses an existing destination and removes a partial file if the download fails — a half-written export looks identical to a good one to every tool that opens it afterwards.
+
+### Photo Favorites
+**Files**: [`photos.rs`](../crates/pdfs-fuse/src/photos.rs), [`photo_viewer.rs`](../crates/pdfs-gui/src/app/pages/photo_viewer.rs)
+
+The gallery can mark and filter favorites, through the SDK's photo-tag API (`update_photos`). Schema **v20** adds `photos.favorite`; the flag is learned in the timeline enrichment pass that already resolves each photo's name and media type, and is kept across a refresh that could not resolve a photo — the same learned-and-kept rule as `media_type`. The lightbox carries a star toggle, the Photos header a favorites filter, and the CLI has `pdfs favorite <uid> [--remove]` plus `pdfs photos --favorites`.
+
+Favouriting a photo that is not on this account's own photos volume (shared with us, or album-only) needs it re-encrypted for our timeline root, which the SDK does not implement; the daemon surfaces that as an error rather than silently doing nothing.
+
+### Justified Gallery, Gallery Delete
+**Files**: [`photos.rs`](../crates/pdfs-gui/src/app/pages/photos.rs), [`photo_viewer.rs`](../crates/pdfs-gui/src/app/pages/photo_viewer.rs), [`photos.rs`](../crates/pdfs-fuse/src/photos.rs), [`background.rs`](../crates/pdfs-fuse/src/background.rs)
+
+The gallery lays each day out in justified rows (`justify_rows` / `plan_rows` / `fit_row`): photos are taken in capture order until their summed aspect ratio no longer fits the target row height, and the row is then scaled so it ends exactly on the content width. A tile is therefore its own photo's shape, and `ContentFit::Contain` has nothing left to crop. The last row of a day is left at the target height rather than stretched, because a day holding two photos is a short day, not a layout fault.
+
+- **Ratios that are not known yet.** `PhotoItem::ratio` is persisted, but a photo that has never been decoded has none. Those are laid out square and remembered in `assumed_ratios`; when a decode proves the real shape the day re-flows on the existing debounce timer, so a screenful of decodes costs one re-flow rather than one per photo. Ratios are clamped to 0.4–3.0 so a single panorama cannot decide what a row looks like.
+- **Thumbnails survive recycling.** A reply for a tile that has already been re-bound still lands in the texture cache, which is an LRU of 1500 textures keyed by uid, and the rows just outside the realised range are prefetched in the scroll direction.
+- **Delete is uid-addressed.** The photos volume is not in the FUSE mount, so the path-based `Request::Delete` cannot reach it. `Request::TrashNodes { uids }` trashes through the SDK and answers `Response::Trashed { trashed, failed }`; the daemon then drops those rows with `Db::photos_delete` (album membership included) so the gallery does not wait for a timeline refresh. The GUI removes the tiles optimistically with an Undo toast and puts back anything the server refused.
+- **Remote deletions arrive on their own.** The Drive volume and the photos volume have separate event streams, so `run_photos_event_sync` polls the photos volume with its own cursor (`photos_event_cursor` in the state table). Trash and delete events remove rows; anything else only invalidates freshness, because there is no inode space to converge on this volume. Together with a 60 s `TIMELINE_TTL` and a `RefreshScope::Photos` that now awaits the refresh, a photo deleted on a phone leaves the grid in about ten seconds.
+
+### RAW + JPEG Grouping
+**Files**: [`photos.rs`](../crates/pdfs-core/src/db/photos.rs), [`migrations.rs`](../crates/pdfs-core/src/db/migrations.rs), [`photos.rs`](../crates/pdfs-fuse/src/photos.rs), [`photo_viewer.rs`](../crates/pdfs-gui/src/app/pages/photo_viewer.rs)
+
+Schema **v30** adds `content_hash`, `main_uid` and an indexed `group_key` to `photos`. The first two come from the server's `PhotoProperties` and are filled by the enrichment pass in `refresh_timeline` that already resolves each photo's name, media type and favorite tag; `group_key` is computed in `photos_replace`, where the whole timeline is in hand.
+
+- **Precedence.** The server relation first (`main_photo_uid` and `related_photo_uids`, read from whichever end resolves — the two can land in different enrichment chunks); then same capture day, same case-insensitive name stem, and one member raw while the other is not; otherwise the photo is its own group. The union-find pass is over the timeline in memory, so it costs one pass per refresh rather than a query per photo.
+- **Representative.** The non-raw member when there is one — a JPEG decodes in milliseconds and is what the person expects to see. `group_key` holds that member's uid, so "is this the tile" is `uid = group_key`, an index scan.
+- **What is grouped and what is not.** `photos_page`, `photos_months` and `photos_counts` count groups, except on the Raw tab, which lists files. Album pages are never grouped: an album is a list someone made. The relation is learned-and-kept like `media_type`, so a refresh that could not resolve a node does not break a group up.
+- **Deleting.** `Core::trash_photos` expands each uid to its group before trashing, because the grid shows the shot as one tile — leaving the RAW behind would put the photo back on the Raw tab and nowhere else. The GUI's confirmation names the file count.
+- **The other files.** `Request::PhotoGroup { uid }` answers with the group's members as ordinary `PhotoItem`s, which is what the lightbox's switch steps through.
+
+### Persistent SDK Entity Cache
+**Files**: [`sdkcache.rs`](../crates/pdfs-core/src/sdkcache.rs), [`auth.rs`](../crates/pdfs-core/src/auth.rs), [`background.rs`](../crates/pdfs-fuse/src/background.rs)
+
+The SDK's Drive entity cache (decrypted node metadata: name, size, parent, signing share) defaulted to memory, so every daemon restart re-fetched and re-decrypted the tree the previous run had already walked. It is now backed by SQLite.
+
+- **Its own file** (`sdk_cache.db` in the state directory), not `cache.db`: the daemon's `Db` is one `Mutex<Connection>` shared by every FUSE thread and the control socket, and this traffic is frequent, small and entirely reconstructible. A separate file also means no schema migration — the store can be deleted at any time.
+- **Encrypted at rest** by wrapping it in the SDK's `EncryptedCacheRepository`, keyed by the mailbox password. A password change reads as a cold cache (the SDK treats an undecryptable entry as a miss and clears the store), not as an error.
+- **Staleness** is closed by the event loop, which already replays from a persisted cursor and calls `invalidate_caches_for_event` for every event — including those raised while the daemon was down. The one case with no trail is a *seeded* cursor (first-ever mount, or a lost cursor), where the seed path now clears the store instead of trusting it. `auth::logout` removes the file.
+
+Needed a small additive SDK change (`ProtonDriveClient::with_entity_repository`, 0.5.1): `with_entity_cache` is a constructor and so could not be combined with `with_key_salts`, which the daemon requires.
+
+### Per-node Batch Outcomes
+**File**: [`batch.rs`](../crates/pdfs-core/src/batch.rs)
+
+SDK 0.5.0 made `trash_nodes` / `restore_nodes` / `delete_nodes` report one outcome per node instead of failing the whole call (mirroring upstream's streamed `NodeActionResult`). `pdfs_core::batch::into_unit` collapses the single-node calls back to a `Result`; `batch::split` handles a collected batch.
+
+A restore is expanded before it is sent (`expand_restore`, `pdfs-fuse/src/lib.rs`): the persisted trash listing carries each row's `parent_uid` (schema 29), so a restore takes the connected piece of the trashed tree — every trashed descendant of what was asked for, and every trashed ancestor above it — and sends it shallowest wave first, because the server cannot put a node back under a parent that is still trashed. A uid the listing does not know about (it is materialised in chunks, and can be stale) is restored on its own rather than dropped.
+
+The trash view's restore and permanent-delete use the SDK's **streaming** variants (`restore_nodes_streaming` / `delete_nodes_streaming`) and apply local state per node as each batch lands rather than after the last one. For a permanent delete — which is irreversible — that means a daemon interrupted mid-batch has forgotten exactly the nodes the server destroyed, no more and no fewer. Both report per-node failures and count only what actually succeeded; only a batch where nothing succeeded is an error.
+
+### Open-for-Write Deferral for Mirror Sync
+**File**: [`sync.rs`](../crates/pdfs-fuse/src/sync.rs)
+
+The mirror folder sync engine now defers uploading any file that is currently held open for writing by another process, matching the guarantee the FUSE mount path already provides (where uploads are deferred until `close(fd)`).
+
+**Problem**: Previously, the mirror sync path relied solely on a 2-second trailing-edge debounce (with a 30-second ceiling) to avoid uploading files mid-write. This was insufficient for slow continuous writers (e.g., database dumps, large exports, or editors that keep files open for extended periods), which could have their incomplete state uploaded as a real revision.
+
+**Solution**: Before each reconcile pass, the sync engine scans `/proc/*/fd` once to build a set of canonical paths within the sync root that any process holds open for writing (`O_WRONLY` or `O_RDWR`). Files in this set are:
+
+- **Kept in the local walk** — so they are not misclassified as deletions
+- **Treated as unchanged** — so no upload is queued for them
+- **Counted as `deferred`** — so the activity summary reports them (e.g., "3 uploaded, 1 deferred (open for write)")
+- **Picked up on the next pass** — after the writer has closed the file
+
+**How it works**:
+1. `open_for_write_set(root)` reads `/proc/*/fd` → `readlink` for each fd → prefix-checks against the sync root → reads `/proc/<pid>/fdinfo/<n>` to check the `flags:` line's low two bits (O_ACCMODE)
+2. `walk_local` sets `LocalItem.open_for_write = true` for matching files
+3. Both `do_reconcile` and `push_pass` skip upload classification for flagged files
+4. `Outcome.deferred` tracks the count for the activity summary
+
+**Performance**: The `/proc` scan completes in low single-digit milliseconds on a typical desktop. Only fds whose `readlink` target falls under the sync root incur the `fdinfo` read.
+
+**Tests added**: 8 unit tests covering `is_write_mode` parsing of various fdinfo flag combinations, and `Outcome` summary formatting with deferred counts.
+
+| Sync Path | Open-for-write protection | Mechanism |
+|---|---|---|
+| FUSE mount | Yes | Upload deferred until `close(fd)` |
+| Mirror folders | Yes | `/proc/*/fd` scan per reconcile pass |

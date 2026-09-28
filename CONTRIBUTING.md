@@ -6,9 +6,10 @@ deliberately high — everything else is ordinary Rust review.
 
 ## Before you start
 
-- Read [`AGENTS.md`](AGENTS.md) for repository conventions and
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the daemon, front ends, and SDK fit
-  together.
+- Read [`AGENTS.md`](AGENTS.md) for repository conventions,
+  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for building, running and debugging from source,
+  and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the daemon, front ends, and SDK fit
+  together. [`docs/README.md`](docs/README.md) indexes the rest.
 - Check [`docs/BUGS.md`](docs/BUGS.md) — it is the authoritative issue ledger, and your problem may
   already be tracked there with context.
 - For anything larger than a fix, open an issue first so the design can be discussed before you
@@ -23,8 +24,9 @@ cargo build --workspace
 ```
 
 GUI and FUSE targets need the GTK4, libadwaita, WebKitGTK 6, libsecret, D-Bus, and FUSE3
-development packages listed in the [README](README.md#prerequisites). Minimum supported Rust
-version is 1.96.
+development packages listed in [`docs/INSTALL.md`](docs/INSTALL.md#build-dependencies). Minimum
+supported Rust version is 1.96. [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#running-from-source)
+explains how to run your build next to, or instead of, the installed service.
 
 ## Quality gates
 
@@ -51,6 +53,13 @@ use a dedicated test account, never one holding data you cannot lose.
   control-socket work stays off GTK's main thread.
 - **`staging/` and `recovery/` may hold the only copy of user data.** Nothing may clear or purge
   them opportunistically.
+- **The GUI is fully translated.** Wrap every user-visible string in the helpers from
+  `crates/pdfs-gui/src/i18n.rs`, run `po/update.sh`, and translate the new entries in every
+  catalog in `po/LINGUAS` in the same change. See [`docs/TRANSLATING.md`](docs/TRANSLATING.md).
+  The CLI and daemon messages stay in English.
+- **Document what users see.** A new command, setting or behaviour belongs in the matching page
+  under `docs/` (user guide, CLI reference or configuration) and in the `[Unreleased]` section of
+  [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
 
 ## Commits and pull requests
 
