@@ -2920,6 +2920,94 @@ fn clearing_a_stale_pending_mode_preserves_the_newer_intent() {
     assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
 }
 
+fn baseline_row(rel: &str) -> StoredSyncEntry {
+    StoredSyncEntry {
+        rel_path: rel.into(),
+        remote_uid: Some(format!("vol~{rel}")),
+        local_mtime: 1_700_000_000,
+        local_mtime_ns: Some(1_700_000_000_000_000_001),
+        local_size: 7,
+        remote_rev: Some("1700000000".into()),
+        remote_hash: Some("7".into()),
+    }
+}
+
+#[test]
+fn moving_a_baseline_subtree_takes_its_rows_and_leaves_name_prefixed_siblings() {
+    let db = Db::open_in_memory().unwrap();
+    let from = db.sync_folder_add("/home/me/A", "vol~a", "share").unwrap();
+    let to = db.sync_folder_add("/home/me/B", "vol~b", "share").unwrap();
+    for rel in [
+        "docs",
+        "docs/x.txt",
+        "docs/sub/y.txt",
+        "docsextra.txt",
+        "other",
+    ] {
+        db.sync_entry_upsert(from, &baseline_row(rel)).unwrap();
+    }
+    db.sync_entry_upsert(to, &baseline_row("inbox")).unwrap();
+
+    db.sync_entries_move(from, "docs", to, "inbox/docs")
+        .unwrap();
+
+    let left = db.sync_entries(from).unwrap();
+    let mut left: Vec<_> = left.keys().cloned().collect();
+    left.sort();
+    assert_eq!(left, ["docsextra.txt", "other"]);
+
+    let moved = db.sync_entries(to).unwrap();
+    let mut keys: Vec<_> = moved.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "inbox",
+            "inbox/docs",
+            "inbox/docs/sub/y.txt",
+            "inbox/docs/x.txt"
+        ]
+    );
+    // Only the path changes: the row still describes the same node on both sides.
+    assert_eq!(
+        moved["inbox/docs/x.txt"],
+        StoredSyncEntry {
+            rel_path: "inbox/docs/x.txt".into(),
+            ..baseline_row("docs/x.txt")
+        }
+    );
+}
+
+#[test]
+fn moving_a_baseline_subtree_within_one_folder_renames_it() {
+    let db = Db::open_in_memory().unwrap();
+    let folder = db.sync_folder_add("/home/me/A", "vol~a", "share").unwrap();
+    for rel in ["old", "old/f.txt", "new"] {
+        db.sync_entry_upsert(folder, &baseline_row(rel)).unwrap();
+    }
+
+    db.sync_entries_move(folder, "old", folder, "new/old")
+        .unwrap();
+
+    let mut keys: Vec<_> = db.sync_entries(folder).unwrap().into_keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["new", "new/old", "new/old/f.txt"]);
+}
+
+#[test]
+fn removing_a_baseline_subtree_keeps_name_prefixed_siblings() {
+    let db = Db::open_in_memory().unwrap();
+    let folder = db.sync_folder_add("/home/me/A", "vol~a", "share").unwrap();
+    for rel in ["docs", "docs/x.txt", "docsextra.txt"] {
+        db.sync_entry_upsert(folder, &baseline_row(rel)).unwrap();
+    }
+
+    db.sync_entries_remove_subtree(folder, "docs").unwrap();
+
+    let keys: Vec<_> = db.sync_entries(folder).unwrap().into_keys().collect();
+    assert_eq!(keys, ["docsextra.txt"]);
+}
+
 #[test]
 fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
     let db = Db::open_in_memory().unwrap();

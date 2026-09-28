@@ -9,7 +9,7 @@ use crate::shutdown::Shutdown;
 ///
 /// Returns whether this mount actually held the node, so the caller can evict
 /// its content blob once if *any* mount did.
-fn forget_and_notify(st: &mut State, notify: &mut NotifyBatch, uid: &NodeUid) -> bool {
+pub(crate) fn forget_and_notify(st: &mut State, notify: &mut NotifyBatch, uid: &NodeUid) -> bool {
     // Capture the inode before `forget` clears the uid mapping.
     let child = st.by_uid.get(uid).copied();
     let Some((parent, name)) = st.forget(uid) else {

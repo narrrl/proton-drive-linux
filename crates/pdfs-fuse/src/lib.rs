@@ -96,6 +96,7 @@ mod profile;
 mod queue;
 mod reads;
 mod redate;
+mod relocate;
 mod revisions;
 mod sharing;
 mod shutdown;

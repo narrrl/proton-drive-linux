@@ -95,6 +95,23 @@ of the folder, so the files stay visible but take no disk space until opened. Sw
 **Synced / Online only** switch on the folder's card, or `pdfs sync mode <id> ondemand` and back
 with `pdfs sync mode <id> mirror`. `pdfs locations` lists every local place the service occupies.
 
+### Moving between synced folders and My files
+
+`~/ProtonDrive` and each online-only folder are separate mounts, and a mirrored folder is a plain
+folder on disk. `mv`, and dragging in a file manager, cannot rename across them, so they copy
+and then delete: every file is downloaded, uploaded again, and the original goes to the Trash.
+
+Use `pdfs move <path> <folder>` or **Move to…** in the app instead. The move happens on Proton
+Drive, so it takes seconds whatever the size. For example:
+
+```sh
+pdfs move ~/Documents/Scans ~/ProtonDrive/Archive
+```
+
+A move out of a synced folder waits until its files are on Proton Drive. A file that is still
+uploading, has changes that are not uploaded, or is excluded by `.pdfsignore` stops the move,
+and the message names it.
+
 Removing a synced folder (**Stop Syncing** or `pdfs sync rm <id>`) keeps the local files and the
 copy on Proton Drive. Add `--delete-remote` (or tick **Also delete from Proton Drive**) to delete
 the copy on Proton Drive as well.

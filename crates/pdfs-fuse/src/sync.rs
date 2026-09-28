@@ -1602,6 +1602,76 @@ fn walk_local_tree(
     Ok(())
 }
 
+/// Why the mirror copy at `rel` holds something Proton Drive does not, or
+/// `None` when everything under it is on Drive exactly as it is on disk.
+///
+/// A move out of a mirror folder removes the local copy once Drive has moved
+/// the node, so anything only this disk has would be lost with it: a file not
+/// uploaded yet, one edited since, a deletion not carried up yet, or anything
+/// the engine never uploads. That is why ignored names count here, and why the
+/// walk is its own rather than [`walk_local_tree`], which skips symlinks.
+pub(crate) fn mirror_subtree_unsynced(
+    root: &Path,
+    rel: &str,
+    baseline: &HashMap<String, StoredSyncEntry>,
+) -> Option<String> {
+    let mut seen = HashSet::new();
+    if let Some(reason) = unsynced_local(root, rel, baseline, &mut seen) {
+        return Some(reason);
+    }
+    let prefix = format!("{rel}/");
+    baseline
+        .keys()
+        .filter(|r| *r == rel || r.starts_with(&prefix))
+        .find(|r| !seen.contains(r.as_str()))
+        .map(|r| format!("{r} was deleted here but not on Proton Drive yet"))
+}
+
+fn unsynced_local(
+    root: &Path,
+    rel: &str,
+    baseline: &HashMap<String, StoredSyncEntry>,
+    seen: &mut HashSet<String>,
+) -> Option<String> {
+    let path = root.join(rel_to_path(rel));
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("cannot read {rel}: {e}")),
+    };
+    let Some(base) = baseline.get(rel) else {
+        return Some(format!("{rel} is not on Proton Drive yet"));
+    };
+    seen.insert(rel.to_string());
+    if meta.is_file() {
+        return (!LocalSig::from(&meta).same_content(&LocalSig::from(base)))
+            .then(|| format!("{rel} has changes that are not on Proton Drive yet"));
+    }
+    if !meta.is_dir() {
+        return Some(format!("{rel} is not a regular file or folder"));
+    }
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(e) => return Some(format!("cannot read {rel}: {e}")),
+    };
+    for entry in entries {
+        let name = match entry {
+            Ok(entry) => entry.file_name(),
+            Err(e) => return Some(format!("cannot read {rel}: {e}")),
+        };
+        let Some(name) = name.to_str() else {
+            return Some(format!("{rel} holds a name that is not valid UTF-8"));
+        };
+        // A download the engine left half done; it is the engine's to clean up.
+        if name.contains(".pdfs-tmp-") {
+            continue;
+        }
+        if let Some(reason) = unsynced_local(root, &format!("{rel}/{name}"), baseline, seen) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 /// Publish a conflict copy without overwriting an earlier conflict bearing the
 /// same timestamp. The original is removed only after the new copy is durable.
 fn preserve_conflict_copy(path: &Path, stamp: i64) -> std::io::Result<PathBuf> {
@@ -2344,6 +2414,94 @@ mod tests {
             error.contains("locked"),
             "the error should name the subtree it could not read: {error}"
         );
+    }
+
+    /// A baseline row recording `path` as it is on disk right now.
+    fn synced_row(root: &Path, rel: &str) -> (String, StoredSyncEntry) {
+        let meta = std::fs::symlink_metadata(root.join(rel_to_path(rel))).unwrap();
+        let sig = LocalSig::from(&meta);
+        let entry = StoredSyncEntry {
+            rel_path: rel.to_string(),
+            remote_uid: Some(format!("vol~{rel}")),
+            local_mtime: sig.mtime,
+            local_mtime_ns: sig.mtime_ns,
+            local_size: sig.size,
+            remote_rev: None,
+            remote_hash: None,
+        };
+        (rel.to_string(), entry)
+    }
+
+    fn synced_subtree(name: &str) -> (PathBuf, HashMap<String, StoredSyncEntry>) {
+        let root = sync_test_dir(name);
+        std::fs::create_dir_all(root.join("dir/sub")).unwrap();
+        std::fs::write(root.join("dir/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("dir/sub/b.txt"), b"b").unwrap();
+        let baseline = ["dir", "dir/sub", "dir/a.txt", "dir/sub/b.txt"]
+            .into_iter()
+            .map(|rel| synced_row(&root, rel))
+            .collect();
+        (root, baseline)
+    }
+
+    #[test]
+    fn a_fully_synced_mirror_subtree_may_leave() {
+        let (root, baseline) = synced_subtree("move-synced");
+        let reason = mirror_subtree_unsynced(&root, "dir", &baseline);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn a_mirror_subtree_with_a_file_not_uploaded_may_not_leave() {
+        let (root, baseline) = synced_subtree("move-new-file");
+        std::fs::write(root.join("dir/sub/new.txt"), b"n").unwrap();
+        let reason = mirror_subtree_unsynced(&root, "dir", &baseline);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(reason.unwrap().contains("dir/sub/new.txt"));
+    }
+
+    #[test]
+    fn a_mirror_subtree_with_an_edit_not_uploaded_may_not_leave() {
+        let (root, baseline) = synced_subtree("move-edit");
+        std::fs::write(root.join("dir/a.txt"), b"longer now").unwrap();
+        let reason = mirror_subtree_unsynced(&root, "dir", &baseline);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(reason.unwrap().contains("dir/a.txt"));
+    }
+
+    #[test]
+    fn a_mirror_subtree_with_a_deletion_not_carried_up_may_not_leave() {
+        let (root, baseline) = synced_subtree("move-deleted");
+        std::fs::remove_file(root.join("dir/sub/b.txt")).unwrap();
+        let reason = mirror_subtree_unsynced(&root, "dir", &baseline);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(reason.unwrap().contains("dir/sub/b.txt"));
+    }
+
+    #[test]
+    fn a_mirror_subtree_holding_a_symlink_may_not_leave() {
+        let (root, baseline) = synced_subtree("move-symlink");
+        std::os::unix::fs::symlink("a.txt", root.join("dir/link")).unwrap();
+        let reason = mirror_subtree_unsynced(&root, "dir", &baseline);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(reason.unwrap().contains("dir/link"));
+    }
+
+    #[test]
+    fn a_name_prefixed_sibling_does_not_hold_a_mirror_subtree_back() {
+        let (root, mut baseline) = synced_subtree("move-sibling");
+        // Deleted here but not on Drive, yet outside the subtree being moved.
+        baseline.insert(
+            "dirt".to_string(),
+            StoredSyncEntry {
+                rel_path: "dirt".to_string(),
+                ..baseline["dir/a.txt"].clone()
+            },
+        );
+        let reason = mirror_subtree_unsynced(&root, "dir", &baseline);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(reason, None);
     }
 
     /// The same rule one level up: if the sync root itself cannot be read, the

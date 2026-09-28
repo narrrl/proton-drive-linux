@@ -260,6 +260,88 @@ impl Db {
         Ok(())
     }
 
+    /// Drop the baseline rows of `rel_path` and everything under it.
+    ///
+    /// Used when a subtree leaves a mirror folder through a move on Drive: its
+    /// local copy is about to be removed, and rows left behind would read as
+    /// "deleted locally" and trash the moved nodes at their new place.
+    pub fn sync_entries_remove_subtree(&self, folder_id: i64, rel_path: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM sync_entry
+              WHERE folder_id = ?1
+                AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
+            params![folder_id, rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// Move the baseline rows of `from_rel` and everything under it to `to_rel`
+    /// in folder `to_folder`, in one transaction.
+    ///
+    /// Used when a move on Drive took a mirror subtree along with its local
+    /// copy: the rows still describe both sides correctly, only under a new
+    /// path, so the next pass on either folder has nothing to do. The two
+    /// folders may be the same one.
+    pub fn sync_entries_move(
+        &self,
+        from_folder: i64,
+        from_rel: &str,
+        to_folder: i64,
+        to_rel: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut select = tx.prepare(
+                "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash,
+                        local_mtime_ns
+                   FROM sync_entry
+                  WHERE folder_id = ?1
+                    AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
+            )?;
+            let rows = select
+                .query_map(params![from_folder, from_rel], |r| {
+                    Ok(StoredSyncEntry {
+                        rel_path: r.get(0)?,
+                        remote_uid: r.get(1)?,
+                        local_mtime: r.get(2)?,
+                        local_size: r.get(3)?,
+                        remote_rev: r.get(4)?,
+                        remote_hash: r.get(5)?,
+                        local_mtime_ns: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut delete =
+                tx.prepare("DELETE FROM sync_entry WHERE folder_id = ?1 AND rel_path = ?2")?;
+            for row in &rows {
+                delete.execute(params![from_folder, row.rel_path])?;
+            }
+            let mut insert = tx.prepare(
+                "INSERT OR REPLACE INTO sync_entry
+                   (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev,
+                    remote_hash, local_mtime_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for row in rows {
+                let rel = format!("{to_rel}{}", &row.rel_path[from_rel.len()..]);
+                insert.execute(params![
+                    to_folder,
+                    rel,
+                    row.remote_uid,
+                    row.local_mtime,
+                    row.local_size,
+                    row.remote_rev,
+                    row.remote_hash,
+                    row.local_mtime_ns,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop the entire baseline for a folder. Used when flipping ondemand→mirror:
     /// the local tree was evicted, so the old baseline is stale and would make the
     /// next reconcile mistake "locally deleted" for "must re-download". Clearing it

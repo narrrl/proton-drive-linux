@@ -339,7 +339,10 @@ pub enum Request {
     /// single path component (no separators). Replies with [`Response::Ok`].
     Rename { path: String, new_name: String },
     /// Move a file or folder into a new parent folder. Both `path` and
-    /// `new_parent` are mountpoint-relative. Replies with [`Response::Ok`].
+    /// `new_parent` are mountpoint-relative, or both absolute local paths; two
+    /// absolute paths may lie in different locations (My files, an on-demand
+    /// or a mirror synced folder), and the move is still made on Proton Drive
+    /// without transferring content. Replies with [`Response::Ok`].
     Move { path: String, new_parent: String },
     /// Trash a file or folder. `path` is mountpoint-relative. Replies with
     /// [`Response::Ok`].

@@ -1920,6 +1920,10 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
 
 /// Pick a destination folder by browsing Drive's folders, and move `entries`
 /// there through the daemon.
+///
+/// Besides My files the picker offers every synced folder. A move into one is
+/// still made on Proton Drive, so nothing is downloaded or uploaded again; it
+/// is sent with absolute paths, which is how the daemon tells locations apart.
 pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
     if entries.is_empty() {
         return;
@@ -1967,6 +1971,7 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
     dialog.set_default_response(Some("move"));
     dialog.set_close_response("cancel");
 
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
     let picker = Rc::new(MovePicker {
         ui: ui.clone(),
         dialog: dialog.clone(),
@@ -1974,26 +1979,91 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
         list,
         up: up.clone(),
         sources: sources.clone(),
-        folder: RefCell::new(String::new()),
+        folder: RefCell::new(MoveTarget::Locations),
         generation: Cell::new(0),
     });
     let picker_up = picker.clone();
     up.connect_clicked(move |_| {
-        let folder = picker_up.folder.borrow().clone();
-        let parent = folder.rfind('/').map(|i| &folder[..i]).unwrap_or_default();
-        picker_up.open(parent.to_string());
+        let parent = picker_up.folder.borrow().parent();
+        picker_up.open(parent);
     });
     // Start where the browser is: moving is most often one level up or down.
-    picker.open(ui.browser.path.borrow().clone());
+    picker.open(MoveTarget::Drive(ui.browser.path.borrow().clone()));
 
     let ui = ui.clone();
     let picker_done = picker.clone();
     dialog.connect_response(None, move |_, resp| {
-        if resp == "move" {
-            run_bulk_move(&ui, sources.clone(), picker_done.folder.borrow().clone());
+        if resp != "move" {
+            return;
+        }
+        match picker_done.folder.borrow().clone() {
+            MoveTarget::Locations => {}
+            MoveTarget::Drive(folder) => run_bulk_move(&ui, sources.clone(), folder),
+            MoveTarget::Synced { path, .. } => {
+                let absolute = sources
+                    .iter()
+                    .map(|rel| mountpoint.join(rel).to_string_lossy().into_owned())
+                    .collect();
+                run_bulk_move(&ui, absolute, path);
+            }
         }
     });
     dialog.present(ui_window(&picker.ui).as_ref());
+}
+
+/// Where the Move dialog is looking, and the destination if the user confirms.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MoveTarget {
+    /// The list of places to move to: My files and each synced folder.
+    Locations,
+    /// A folder in My files, mountpoint-relative; empty for My files itself.
+    Drive(String),
+    /// A folder inside a synced folder, as an absolute local path. `root` is
+    /// the synced folder. A mirror folder is a plain directory, read from disk.
+    Synced {
+        root: String,
+        path: String,
+        mirror: bool,
+    },
+}
+
+impl MoveTarget {
+    /// One level up. The top of a location leads back to the list of them.
+    pub(crate) fn parent(&self) -> MoveTarget {
+        match self {
+            MoveTarget::Locations => MoveTarget::Locations,
+            MoveTarget::Drive(folder) if folder.is_empty() => MoveTarget::Locations,
+            MoveTarget::Drive(folder) => MoveTarget::Drive(
+                folder
+                    .rfind('/')
+                    .map(|i| folder[..i].to_string())
+                    .unwrap_or_default(),
+            ),
+            MoveTarget::Synced { root, path, .. } if path == root => MoveTarget::Locations,
+            MoveTarget::Synced { root, path, mirror } => MoveTarget::Synced {
+                root: root.clone(),
+                path: Path::new(path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.clone()),
+                mirror: *mirror,
+            },
+        }
+    }
+
+    /// `name` inside this folder, in the same form.
+    fn child(&self, name: &str) -> MoveTarget {
+        match self {
+            MoveTarget::Locations => MoveTarget::Locations,
+            MoveTarget::Drive(folder) if folder.is_empty() => MoveTarget::Drive(name.to_string()),
+            MoveTarget::Drive(folder) => MoveTarget::Drive(format!("{folder}/{name}")),
+            MoveTarget::Synced { root, path, mirror } => MoveTarget::Synced {
+                root: root.clone(),
+                path: Path::new(path).join(name).to_string_lossy().into_owned(),
+                mirror: *mirror,
+            },
+        }
+    }
 }
 
 /// The Move dialog's folder browser.
@@ -2006,71 +2076,81 @@ struct MovePicker {
     /// What is being moved, mountpoint-relative.
     sources: Vec<String>,
     /// The folder on show, and the destination if the user confirms now.
-    folder: RefCell<String>,
+    folder: RefCell<MoveTarget>,
     /// Drops a listing that arrives after the user went elsewhere.
     generation: Cell<u64>,
 }
 
 impl MovePicker {
-    fn open(self: &Rc<Self>, folder: String) {
+    fn open(self: &Rc<Self>, folder: MoveTarget) {
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
-        self.location.set_label(if folder.is_empty() {
-            "Proton Drive"
-        } else {
-            &folder
-        });
-        self.location.set_tooltip_text(Some(&folder));
-        self.up.set_sensitive(!folder.is_empty());
-        self.dialog
-            .set_response_enabled("move", move_target_allowed(&self.sources, &folder));
+        let (label, tooltip) = match &folder {
+            MoveTarget::Locations => (gettext("Locations"), String::new()),
+            MoveTarget::Drive(rel) if rel.is_empty() => (gettext("My files"), String::new()),
+            MoveTarget::Drive(rel) => (rel.clone(), rel.clone()),
+            MoveTarget::Synced { path, .. } => (path.clone(), path.clone()),
+        };
+        self.location.set_label(&label);
+        self.location.set_tooltip_text(Some(&tooltip));
+        self.up
+            .set_sensitive(!matches!(folder, MoveTarget::Locations));
+        let allowed = match &folder {
+            MoveTarget::Locations => false,
+            MoveTarget::Drive(rel) => move_target_allowed(&self.sources, rel),
+            // What is moved is in My files, so it cannot be in a synced folder.
+            MoveTarget::Synced { .. } => true,
+        };
+        self.dialog.set_response_enabled("move", allowed);
         *self.folder.borrow_mut() = folder.clone();
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
         self.list.append(&picker_note(&gettext("Loading…")));
-        let rx = spawn_request(
-            self.ui.dirs.control_socket(),
-            Request::ListDir {
-                path: folder.clone(),
-            },
-        );
+
         let picker = self.clone();
         glib::spawn_future_local(async move {
-            let result = rx.recv().await;
+            let listed = match &folder {
+                MoveTarget::Locations => picker.locations().await,
+                MoveTarget::Drive(rel) => picker.drive_folders(&folder, rel.clone()).await,
+                MoveTarget::Synced {
+                    path, mirror: true, ..
+                } => local_folders(&folder, path.clone()).await,
+                MoveTarget::Synced { path, .. } => {
+                    picker.drive_folders(&folder, path.clone()).await
+                }
+            };
             if picker.generation.get() != generation {
                 return;
             }
             while let Some(row) = picker.list.first_child() {
                 picker.list.remove(&row);
             }
-            let Ok(Ok(Response::Entries { entries })) = result else {
+            let Some(rows) = listed else {
                 picker
                     .list
                     .append(&picker_note(&gettext("Couldn't read this folder.")));
                 return;
             };
-            let mut folders: Vec<DirEntry> = entries.into_iter().filter(|e| e.is_dir).collect();
-            folders.sort_by_key(|e| e.name.to_lowercase());
             let mut shown = 0;
-            for entry in folders {
-                let path = if folder.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{folder}/{}", entry.name)
-                };
+            for (title, subtitle, target) in rows {
                 // A folder cannot go inside itself, so do not offer to open it.
-                if picker.sources.contains(&path) {
+                if let MoveTarget::Drive(path) = &target
+                    && picker.sources.contains(path)
+                {
                     continue;
                 }
                 let row = adw::ActionRow::builder()
-                    .title(glib::markup_escape_text(&entry.name).as_str())
+                    .title(glib::markup_escape_text(&title).as_str())
                     .activatable(true)
                     .build();
+                if let Some(subtitle) = subtitle {
+                    row.set_subtitle(glib::markup_escape_text(&subtitle).as_str());
+                }
                 row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
                 row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
                 let open = picker.clone();
-                row.connect_activated(move |_| open.open(path.clone()));
+                row.connect_activated(move |_| open.open(target.clone()));
                 picker.list.append(&row);
                 shown += 1;
             }
@@ -2081,6 +2161,92 @@ impl MovePicker {
             }
         });
     }
+
+    /// My files and every synced folder, as rows of the top level.
+    async fn locations(&self) -> Option<Vec<PickerRow>> {
+        let mut rows = vec![(gettext("My files"), None, MoveTarget::Drive(String::new()))];
+        let rx = spawn_request(self.ui.dirs.control_socket(), Request::ListSyncFolders);
+        let Ok(Ok(Response::SyncFolders { mut items })) = rx.recv().await else {
+            // My files alone is still somewhere to move to.
+            return Some(rows);
+        };
+        items.sort_by_key(|f| f.local_path.to_lowercase());
+        for folder in items {
+            let name = Path::new(&folder.local_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| folder.local_path.clone());
+            rows.push((
+                name,
+                Some(folder.local_path.clone()),
+                MoveTarget::Synced {
+                    root: folder.local_path.clone(),
+                    path: folder.local_path,
+                    mirror: folder.mode == "mirror",
+                },
+            ));
+        }
+        Some(rows)
+    }
+
+    /// The folders in a mounted folder: `folder` is mountpoint-relative for My
+    /// files and absolute for an on-demand synced folder.
+    async fn drive_folders(&self, here: &MoveTarget, folder: String) -> Option<Vec<PickerRow>> {
+        let rx = spawn_request(
+            self.ui.dirs.control_socket(),
+            Request::ListDir {
+                path: folder.clone(),
+            },
+        );
+        let Ok(Ok(Response::Entries { entries })) = rx.recv().await else {
+            return None;
+        };
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name)
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        Some(
+            names
+                .into_iter()
+                .map(|name| {
+                    let target = here.child(&name);
+                    (name, None, target)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// One row of the picker: its title, an optional subtitle, and where it leads.
+type PickerRow = (String, Option<String>, MoveTarget);
+
+/// The folders in a mirror folder's directory `path`, read from disk off the
+/// main thread. A mirror folder has no mount for `ListDir` to read.
+async fn local_folders(here: &MoveTarget, path: String) -> Option<Vec<PickerRow>> {
+    let names = gio::spawn_blocking(move || {
+        let mut names: Vec<String> = std::fs::read_dir(&path)
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| !name.contains(".pdfs-tmp-"))
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        Some(names)
+    })
+    .await
+    .ok()??;
+    Some(
+        names
+            .into_iter()
+            .map(|name| {
+                let target = here.child(&name);
+                (name, None, target)
+            })
+            .collect(),
+    )
 }
 
 fn picker_note(text: &str) -> gtk4::ListBoxRow {
@@ -2786,8 +2952,8 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_location, listing_summary, move_target_allowed, show_thumbnail_build_progress,
-        sort_entries,
+        MoveTarget, hit_location, listing_summary, move_target_allowed,
+        show_thumbnail_build_progress, sort_entries,
     };
     use pdfs_core::config::{FileSort, FilesView};
     use pdfs_core::control::{DirEntry, ThumbnailBuildStatus};
@@ -2879,5 +3045,44 @@ mod tests {
 
         status.running = false;
         assert!(!show_thumbnail_build_progress(&status));
+    }
+
+    #[test]
+    fn move_picker_climbs_from_a_location_top_to_the_list_of_locations() {
+        assert_eq!(
+            MoveTarget::Drive(String::new()).parent(),
+            MoveTarget::Locations
+        );
+        let root = MoveTarget::Synced {
+            root: "/home/u/Docs".into(),
+            path: "/home/u/Docs".into(),
+            mirror: true,
+        };
+        assert_eq!(root.parent(), MoveTarget::Locations);
+    }
+
+    #[test]
+    fn move_picker_climbs_one_folder_at_a_time_inside_a_location() {
+        assert_eq!(
+            MoveTarget::Drive("a/b".into()).parent(),
+            MoveTarget::Drive("a".into())
+        );
+        assert_eq!(
+            MoveTarget::Drive("a".into()).parent(),
+            MoveTarget::Drive(String::new())
+        );
+        let inner = MoveTarget::Synced {
+            root: "/home/u/Docs".into(),
+            path: "/home/u/Docs/x/y".into(),
+            mirror: false,
+        };
+        assert_eq!(
+            inner.parent(),
+            MoveTarget::Synced {
+                root: "/home/u/Docs".into(),
+                path: "/home/u/Docs/x".into(),
+                mirror: false,
+            }
+        );
     }
 }

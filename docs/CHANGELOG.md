@@ -11,6 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **Moves between locations without transferring content.** `pdfs move` and the app's
+  **Move to…** now take a file or folder from My files into a synced folder, or between two
+  synced folders, on-demand or mirrored. The move happens on Proton Drive, so nothing is
+  downloaded or uploaded again. `mv` between two locations still copies, because the kernel
+  refuses a rename between two mounts. The app's Move dialog lists every location at its top
+  level. A move is refused, with the reason, when the source still has changes that are not on
+  Proton Drive, when the two locations are on different volumes, or when a synced folder stays
+  busy with a sync pass.
+
 ## [2.6.2] — 2026-09-28
 
 Schema: **35** (unchanged).

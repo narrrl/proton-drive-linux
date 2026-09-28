@@ -291,10 +291,16 @@ enum Command {
         new_name: String,
     },
     /// Move a file or folder into another folder via the running daemon.
+    ///
+    /// The two paths may be in different locations: My files and any synced
+    /// folder, on-demand or mirrored. The move happens on Proton Drive, so
+    /// nothing is downloaded or uploaded again, unlike `mv` between two
+    /// locations.
     Move {
-        /// File/folder path, inside the mountpoint or relative to it.
+        /// File/folder path: inside a location, or relative to the mountpoint.
         path: PathBuf,
-        /// Destination folder path, inside the mountpoint or relative to it.
+        /// Destination folder path: inside a location, or relative to the
+        /// mountpoint.
         new_parent: PathBuf,
     },
     /// Trash a file or folder via the running daemon.

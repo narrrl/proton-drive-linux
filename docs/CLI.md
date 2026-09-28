@@ -53,7 +53,7 @@ talks to the running service (`proton-drive.service`); `login`, `logout`, `mount
 | `pdfs search QUERY [--in FOLDER] [--limit N]` | Search names in the local index. |
 | `pdfs mkdir PARENT NAME` | Create a folder. |
 | `pdfs rename PATH NEW_NAME` | Rename a file or folder. |
-| `pdfs move PATH NEW_PARENT` | Move into another folder. |
+| `pdfs move PATH NEW_PARENT` | Move into another folder. The two may be in different locations (My files, an on-demand or a mirrored synced folder); the move happens on Proton Drive, without downloading or uploading anything. |
 | `pdfs rm PATH` | Move to the Trash. |
 | `pdfs upload SOURCES... [-t FOLDER]` | Upload local files and folders (recursively) in the background. Follow with `pdfs transfers`. |
 | `pdfs refresh [TARGET] [--full]` | Forget a cached listing so the next read fetches it again. `TARGET` is a folder, `trash` or `photos`; `--full` with `photos` re-reads every photo's metadata. |

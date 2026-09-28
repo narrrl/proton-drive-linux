@@ -539,6 +539,18 @@ A restore is expanded before it is sent (`expand_restore`, `pdfs-fuse/src/lib.rs
 
 The trash view's restore and permanent-delete use the SDK's **streaming** variants (`restore_nodes_streaming` / `delete_nodes_streaming`) and apply local state per node as each batch lands rather than after the last one. For a permanent delete — which is irreversible — that means a daemon interrupted mid-batch has forgotten exactly the nodes the server destroyed, no more and no fewer. Both report per-node failures and count only what actually succeeded; only a batch where nothing succeeded is an error.
 
+### Moves Between Locations
+**Files**: [`relocate.rs`](../crates/pdfs-fuse/src/relocate.rs), [`control.rs`](../crates/pdfs-fuse/src/control.rs), [`browser.rs`](../crates/pdfs-gui/src/app/pages/browser.rs)
+
+The primary mount and every on-demand folder are separate FUSE sessions, and a mirror folder has no session at all. The kernel answers `rename(2)` between two mounts with `EXDEV` before the daemon hears of it, so `mv` copies and deletes. On Proton Drive the same move is one `move_node`, because My files and this device's folders are on the main volume.
+
+`Request::Move` with two absolute paths is therefore resolved by `Core::move_between` against every location: a live mount through `rooted_at`, otherwise the mirror folder with the longest `local_path` prefix, whose uids come from the `sync_entry` baseline. Two paths in one inode space still go to `move_to`. Relative paths keep their old meaning.
+
+- **Nothing that exists only on this disk may be lost.** A mounted source is refused while it or anything under it has a queued op or a file open for writing. A mirror source is refused unless every file under it matches its baseline and every baseline row still has its file (`mirror_subtree_unsynced`); ignored names and symlinks count as unsynced, because the local copy is removed after the move.
+- **Mirror to mirror renames along.** The local copy is renamed first and its baseline rows are moved with `sync_entries_move`, so neither folder's next pass has anything to do. If `move_node` fails, the rename is undone. `EXDEV` between two filesystems falls back to the check above, then drops the source copy.
+- **Sync passes are held off.** Every mirror folder involved is locked through `sync_lock`, by ascending id, with a five-second bound. A folder that is still busy is reported rather than waited on.
+- **The local side is levelled afterwards.** A mounted source forgets the node in every inode space and notifies the kernel. A mounted destination has its listing cleared. A mirror destination that received nothing locally gets a reconcile, which downloads the node.
+
 ### Open-for-Write Deferral for Mirror Sync
 **File**: [`sync.rs`](../crates/pdfs-fuse/src/sync.rs)
 

@@ -974,6 +974,24 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        // Two absolute paths may name two different locations, which only
+        // `move_between` can resolve; a relative pair keeps the old meaning.
+        Ok(CtlRequest::Move { path, new_parent })
+            if Path::new(&path).is_absolute() && Path::new(&new_parent).is_absolute() =>
+        {
+            match core.move_between(Path::new(&path), Path::new(&new_parent)) {
+                Ok(name) => {
+                    core.log_activity(ActivityKind::Move, &name, format!("to {new_parent}"), true);
+                    CtlResponse::Ok {
+                        message: format!("moved {name}"),
+                    }
+                }
+                Err(e) => {
+                    core.log_activity(ActivityKind::Move, &path, &e, false);
+                    CtlResponse::error(e)
+                }
+            }
+        }
         Ok(CtlRequest::Move { path, new_parent }) => {
             match (
                 rel_to_mount(mountpoint, &path),
