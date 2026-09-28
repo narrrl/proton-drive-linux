@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-09-28 03:11+0200\n"
+"POT-Creation-Date: 2026-09-28 03:33+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Polish\n"
@@ -314,7 +314,6 @@ msgstr "Zmień nazwę"
 #: crates/pdfs-gui/src/app/pages/browser.rs:414
 #: crates/pdfs-gui/src/app/pages/browser.rs:1306
 #: crates/pdfs-gui/src/app/pages/browser.rs:1338
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:24
 #: crates/pdfs-gui/src/app/pages/photos.rs:607
 #: crates/pdfs-gui/src/app/pages/photos.rs:2063
 #: crates/pdfs-gui/src/app/pages/photos.rs:2067
@@ -771,7 +770,7 @@ msgstr "Nie można utworzyć albumu"
 #: crates/pdfs-gui/src/app/pages/devices.rs:532
 #: crates/pdfs-gui/src/app/pages/devices.rs:682
 #: crates/pdfs-gui/src/app/pages/devices.rs:912
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:63
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:223
 #: crates/pdfs-gui/src/app/pages/locations.rs:342
 #: crates/pdfs-gui/src/app/pages/locations.rs:516
 #: crates/pdfs-gui/src/app/pages/locations.rs:739
@@ -1930,28 +1929,83 @@ msgstr "Przejęto tożsamość"
 msgid "Couldn't adopt that computer"
 msgstr "Nie można przejąć tożsamości tego komputera"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:15
-msgid "Looking for duplicates…"
-msgstr "Wyszukiwanie duplikatów…"
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:79
+msgctxt "duplicates"
+msgid "Exact"
+msgstr "Dokładne"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:42
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:80
+msgid "Photos stored more than once"
+msgstr "Zdjęcia zapisane więcej niż raz"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:84
+msgctxt "duplicates"
+msgid "Similar"
+msgstr "Podobne"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:85
+msgid "Photos that look alike"
+msgstr "Zdjęcia, które wyglądają podobnie"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:102
 msgid "Duplicates"
 msgstr "Duplikaty"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:56
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:62
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:151
+msgid "Looking for duplicates…"
+msgstr "Wyszukiwanie duplikatów…"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:152
+msgid "Looking for similar photos…"
+msgstr "Wyszukiwanie podobnych zdjęć…"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:176
 msgid "Couldn't look for duplicates"
 msgstr "Nie można wyszukać duplikatów"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:69
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:177
+msgid "Couldn't look for similar photos"
+msgstr "Nie można wyszukać podobnych zdjęć"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:185
+msgid "Comparing photos…"
+msgstr "Porównywanie zdjęć…"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:187
+msgid "Photos are compared by their thumbnails. The first time takes a while."
+msgstr "Zdjęcia są porównywane na podstawie miniatur. Za pierwszym razem trwa to chwilę."
+
+#. Translators: {done} and {total} are numbers of photos.
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:196
+#, rust-format
+msgid "{done} of {total}"
+msgstr "{done} z {total}"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:233
 msgid "No duplicates"
 msgstr "Brak duplikatów"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:71
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:235
 msgid "Every photo in your library is stored once."
 msgstr "Każde zdjęcie w bibliotece jest zapisane tylko raz."
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:88
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:239
+msgid "No similar photos"
+msgstr "Brak podobnych zdjęć"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:241
+msgid "No two photos in your library look alike."
+msgstr "W bibliotece nie ma dwóch podobnych zdjęć."
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:263
+#, rust-format
+msgid "{n} photo couldn't be compared because it has no thumbnail yet."
+msgid_plural "{n} photos couldn't be compared because they have no thumbnail yet."
+msgstr[0] "Nie udało się porównać {n} zdjęcia, bo nie ma jeszcze miniatury."
+msgstr[1] "Nie udało się porównać {n} zdjęć, bo nie mają jeszcze miniatur."
+msgstr[2] "Nie udało się porównać {n} zdjęć, bo nie mają jeszcze miniatur."
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:286
 msgid ""
 "These photos are stored more than once. The copies you don't keep move to "
 "Trash, where you can restore them."
@@ -1959,7 +2013,11 @@ msgstr ""
 "Te zdjęcia są zapisane więcej niż raz. Kopie, których nie zachowasz, trafią "
 "do kosza, skąd można je przywrócić."
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:111
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:289
+msgid "These photos look alike. They can be copies of one photo or different shots of one moment, so all of them are kept until you untick them. The photos you don't keep move to Trash, where you can restore them."
+msgstr "Te zdjęcia wyglądają podobnie. Mogą to być kopie jednego zdjęcia albo różne ujęcia jednej chwili, dlatego wszystkie są zachowywane, dopóki ich nie odznaczysz. Zdjęcia, których nie zachowasz, trafią do kosza, skąd można je przywrócić."
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:323
 #, rust-format
 msgid "{date}, {n} copy"
 msgid_plural "{date}, {n} copies"
@@ -1967,7 +2025,16 @@ msgstr[0] "{date}, {n} kopia"
 msgstr[1] "{date}, {n} kopie"
 msgstr[2] "{date}, {n} kopii"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:143
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:330
+#: crates/pdfs-gui/src/app/pages/photos.rs:2994
+#, rust-format
+msgid "{date}, {n} photo"
+msgid_plural "{date}, {n} photos"
+msgstr[0] "{date}, {n} zdjęcie"
+msgstr[1] "{date}, {n} zdjęcia"
+msgstr[2] "{date}, {n} zdjęć"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:364
 #, rust-format
 msgid "Move {n} copy to Trash"
 msgid_plural "Move {n} copies to Trash"
@@ -1975,7 +2042,15 @@ msgstr[0] "Przenieś {n} kopię do kosza"
 msgstr[1] "Przenieś {n} kopie do kosza"
 msgstr[2] "Przenieś {n} kopii do kosza"
 
-#: crates/pdfs-gui/src/app/pages/duplicates.rs:235
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:370
+#, rust-format
+msgid "Move {n} photo to Trash"
+msgid_plural "Move {n} photos to Trash"
+msgstr[0] "Przenieś {n} zdjęcie do kosza"
+msgstr[1] "Przenieś {n} zdjęcia do kosza"
+msgstr[2] "Przenieś {n} zdjęć do kosza"
+
+#: crates/pdfs-gui/src/app/pages/duplicates.rs:465
 msgid "Keep"
 msgstr "Zachowaj"
 
@@ -3033,14 +3108,6 @@ msgid_plural "{n} years ago"
 msgstr[0] "{n} rok temu"
 msgstr[1] "{n} lata temu"
 msgstr[2] "{n} lat temu"
-
-#: crates/pdfs-gui/src/app/pages/photos.rs:2994
-#, rust-format
-msgid "{date}, {n} photo"
-msgid_plural "{date}, {n} photos"
-msgstr[0] "{date}, {n} zdjęcie"
-msgstr[1] "{date}, {n} zdjęcia"
-msgstr[2] "{date}, {n} zdjęć"
 
 #. Translators: a check item in a photo's menu, on while the photo is a favorite.
 #: crates/pdfs-gui/src/app/pages/photos.rs:3231

@@ -43,6 +43,8 @@ const THUMB_QUALITY: u8 = 82;
 /// thumbnails. Bounded: a screenful of 20 MB digicam JPEGs would otherwise
 /// saturate the link and starve the rest of the daemon.
 pub(crate) const THUMB_GEN_CONCURRENCY: usize = 4;
+/// Shots the similar-photo pass fetches thumbnails for at a time.
+const SIMILAR_CHUNK: usize = 64;
 /// Images processed between recursive-build progress updates.
 const THUMB_BUILD_CHUNK: usize = 16;
 /// A recursive build may wait briefly for an opportunistic tile job that
@@ -79,6 +81,46 @@ fn ratio_of(bytes: &[u8]) -> Option<f64> {
         .into_dimensions()
         .ok()?;
     (height > 0).then(|| f64::from(width) / f64::from(height))
+}
+
+/// The difference hash of each cached thumbnail in `paths`, keyed like the
+/// input, or [`pdfs_core::similar::NO_HASH`] for one that can't be decoded or
+/// shows no picture. Decoding is spread over the machine's cores.
+fn similar_hashes(paths: Vec<(String, PathBuf)>) -> Vec<(String, u64)> {
+    fn hash(path: &Path) -> u64 {
+        image::ImageReader::open(path)
+            .ok()
+            .and_then(|reader| reader.with_guessed_format().ok())
+            .and_then(|reader| reader.decode().ok())
+            .and_then(|image| {
+                let luma = image.to_luma8();
+                pdfs_core::similar::difference_hash(
+                    luma.width() as usize,
+                    luma.height() as usize,
+                    luma.as_raw(),
+                )
+            })
+            .unwrap_or(pdfs_core::similar::NO_HASH)
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per_thread = paths.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = paths
+            .chunks(per_thread)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(uid, path)| (uid.clone(), hash(path)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 /// A thumbnail the daemon made itself, and the aspect ratio of the photo it was
@@ -751,6 +793,83 @@ impl Core {
             .collect())
     }
 
+    /// The sets of shots that look alike, as wire items (see
+    /// [`db::Db::photo_similar`]), how far hashing has got while it runs, and
+    /// how many shots couldn't be compared once it's done. Starts a hashing
+    /// pass for the shots not hashed yet unless one is running.
+    pub(crate) fn photo_similar(
+        &self,
+    ) -> CoreResult<(Vec<Vec<PhotoItem>>, Option<MappingProgress>, usize)> {
+        self.spawn_similar_hashing();
+        let sets = self.db.photo_similar().map_err(CoreError::from)?;
+        let (done, total) = self.db.similar_progress().map_err(CoreError::from)?;
+        let hashing = self
+            .similar_hashing
+            .load(Ordering::SeqCst)
+            .then_some(MappingProgress { done, total });
+        let uncompared = if hashing.is_some() { 0 } else { total - done };
+        let sets = sets
+            .into_iter()
+            .map(|set| set.into_iter().map(|p| self.photo_item(p)).collect())
+            .collect();
+        Ok((sets, hashing, uncompared))
+    }
+
+    fn spawn_similar_hashing(&self) {
+        if self.similar_hashing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let core = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-similar".into())
+            .spawn(move || {
+                if let Err(e) = core.hash_similar() {
+                    warn!(error = %e, "similar-photo hashing failed");
+                }
+                core.similar_hashing.store(false, Ordering::SeqCst);
+            });
+        if let Err(e) = spawned {
+            warn!(error = %e, "could not start similar-photo hashing");
+            self.similar_hashing.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Hash the look of every shot not hashed yet, a chunk at a time. Only
+    /// thumbnails the server has are used: a photo without one is skipped
+    /// rather than downloaded whole, and tried again on the next pass.
+    fn hash_similar(&self) -> CoreResult<()> {
+        let mut tried: HashSet<String> = HashSet::new();
+        loop {
+            if self.shutdown.is_stopping() {
+                return Ok(());
+            }
+            // Shots tried this pass without a thumbnail are still unhashed and
+            // come back first, so ask past them.
+            let chunk: Vec<NodeUid> = self
+                .db
+                .photos_unhashed(tried.len() + SIMILAR_CHUNK)
+                .map_err(CoreError::from)?
+                .into_iter()
+                .filter(|photo| tried.insert(photo.uid.clone()))
+                .take(SIMILAR_CHUNK)
+                .filter_map(|photo| parse_uid(&photo.uid))
+                .collect();
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            let paths: Vec<(String, PathBuf)> = self
+                .photo_thumbs_with(&chunk, false)
+                .into_iter()
+                .filter_map(|thumb| Some((thumb.uid, PathBuf::from(thumb.path?))))
+                .collect();
+            for (uid, hash) in similar_hashes(paths) {
+                self.db
+                    .photo_set_similar_hash(&uid, hash)
+                    .map_err(CoreError::from)?;
+            }
+        }
+    }
+
     /// The towns the photos were taken in, as wire items. A town the bundled
     /// table no longer knows (the stored id came from an older table) is left
     /// out rather than shown without a name.
@@ -961,6 +1080,13 @@ impl Core {
     /// milliseconds where the raw costs a full download and a raw decode. The
     /// tile still answers under the uid that was asked for.
     pub(crate) fn photo_thumbs(&self, requested: &[NodeUid]) -> Vec<PhotoThumb> {
+        self.photo_thumbs_with(requested, true)
+    }
+
+    /// [`Core::photo_thumbs`], with local generation only when `generate` is
+    /// set. Without it, a photo the server has no thumbnail for is left
+    /// without one rather than downloaded whole.
+    fn photo_thumbs_with(&self, requested: &[NodeUid], generate: bool) -> Vec<PhotoThumb> {
         let ttype = ThumbnailType::Thumbnail.as_i32();
         // Only a raw can be stood in for, and that is one batched read; the
         // per-shot group lookup is then paid for raws alone, not for a page of
@@ -1061,7 +1187,7 @@ impl Core {
             // that never generated one. Off the request path: a full-size photo
             // takes far longer to fetch than the whole rest of the batch, and the
             // thumbnails that *are* ready must not wait behind it.
-            if !missing.is_empty() {
+            if generate && !missing.is_empty() {
                 self.spawn_generate_thumbs(missing, &tags, &names, ThumbJob::Photos);
             }
         }
@@ -1964,10 +2090,11 @@ mod thumb_tests {
     use super::{
         RawTempFile, ScaleAttempt, THUMB_EDGE, UPLOAD_THUMB_MAX_BYTES, exiftool_binary,
         fit_upload_thumb, is_video_name, ratio_of, scale_thumbnail, scale_thumbnail_with_exiftool,
-        thumbnail_build_may_start, upload_thumbnails_with, video_thumbnail,
+        similar_hashes, thumbnail_build_may_start, upload_thumbnails_with, video_thumbnail,
     };
     use pdfs_core::control::{ThumbnailBuildStatus, is_thumbnail_image_name};
     use proton_drive_rs::ThumbnailType;
+    use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -2239,6 +2366,46 @@ mod thumb_tests {
 
         let idle = ThumbnailBuildStatus::default();
         assert!(thumbnail_build_may_start(&idle, "pictures/second").unwrap());
+    }
+
+    #[test]
+    fn thumbnails_hash_alike_across_sizes_and_undecodable_ones_get_no_hash() {
+        let tmp = scratch("similar-hashes");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // One picture at two sizes: a diagonal gradient with a bright corner.
+        let picture = |width: u32, height: u32| {
+            let image = image::GrayImage::from_fn(width, height, |x, y| {
+                let (fx, fy) = (x * 4 / width, y * 4 / height);
+                image::Luma([if fx + fy == 0 {
+                    250
+                } else {
+                    (fx * 40 + fy * 20) as u8
+                }])
+            });
+            let mut bytes = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+                .encode_image(&image)
+                .unwrap();
+            bytes
+        };
+        std::fs::write(tmp.join("big"), picture(512, 384)).unwrap();
+        std::fs::write(tmp.join("small"), picture(256, 192)).unwrap();
+        std::fs::write(tmp.join("torn"), b"not a picture").unwrap();
+
+        let hashes: HashMap<String, u64> = similar_hashes(
+            ["big", "small", "torn", "gone"]
+                .iter()
+                .map(|name| (name.to_string(), tmp.join(name)))
+                .collect(),
+        )
+        .into_iter()
+        .collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(hashes.len(), 4);
+        assert_ne!(hashes["big"], pdfs_core::similar::NO_HASH);
+        assert!(pdfs_core::similar::alike(hashes["big"], hashes["small"]));
+        assert_eq!(hashes["torn"], pdfs_core::similar::NO_HASH);
+        assert_eq!(hashes["gone"], pdfs_core::similar::NO_HASH);
     }
 
     #[test]

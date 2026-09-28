@@ -91,6 +91,12 @@ pub enum Request {
     /// Sets of photos that are byte-identical copies of each other, going by
     /// the server's content hash. Replies with [`Response::PhotoDuplicates`].
     PhotoDuplicates,
+    /// Sets of shots that look alike going by their thumbnails: resized or
+    /// re-encoded copies, and bursts of one moment. Starts hashing the
+    /// thumbnails not hashed yet in the background and replies at once with
+    /// the sets found so far; a front-end asks again until the reply's
+    /// `hashing` is `None`. Replies with [`Response::PhotoSimilar`].
+    PhotoSimilar,
     /// The towns the photos were taken in, the one with the most photos first.
     /// Only photos whose uploader recorded a location count. Replies with
     /// [`Response::Places`].
@@ -1481,7 +1487,8 @@ pub struct PhotoLocation {
 }
 
 /// How many of the timeline's photos a running refresh has read the metadata
-/// (and so the location) of, out of how many. Part of [`Response::Places`].
+/// (and so the location) of, out of how many. Part of [`Response::Places`],
+/// and of [`Response::PhotoSimilar`] for how many shots have been hashed.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MappingProgress {
     pub done: usize,
@@ -1849,6 +1856,17 @@ pub enum Response {
     /// The duplicate sets (reply to [`Request::PhotoDuplicates`]), newest
     /// first. Each set lists the copy worth keeping first.
     PhotoDuplicates { sets: Vec<Vec<PhotoItem>> },
+    /// The sets of alike shots (reply to [`Request::PhotoSimilar`]), newest
+    /// first, each in capture order; and how far hashing has got, `None`
+    /// once no pass is running. `uncompared` counts the shots left out
+    /// because no thumbnail could be read for them.
+    PhotoSimilar {
+        sets: Vec<Vec<PhotoItem>>,
+        #[serde(default)]
+        hashing: Option<MappingProgress>,
+        #[serde(default)]
+        uncompared: usize,
+    },
     /// The towns the photos were taken in (reply to [`Request::PhotoPlaces`]),
     /// and how far a running timeline refresh has got reading photo locations
     /// — `None` when none is reading any.

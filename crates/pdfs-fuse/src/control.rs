@@ -465,6 +465,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(sets) => CtlResponse::PhotoDuplicates { sets },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::PhotoSimilar) => match core.photo_similar() {
+            Ok((sets, hashing, uncompared)) => CtlResponse::PhotoSimilar {
+                sets,
+                hashing,
+                uncompared,
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::PhotoPlaces) => match core.photo_places() {
             Ok(items) => CtlResponse::Places {
                 items,

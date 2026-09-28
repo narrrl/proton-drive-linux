@@ -557,6 +557,9 @@ struct Core {
     /// The same, for the album listing.
     albums_refreshing: Arc<AtomicBool>,
     trash_refreshing: Arc<AtomicBool>,
+    /// True while the similar-photo pass hashes thumbnails (see
+    /// [`Core::photo_similar`]), so asking again doesn't start a second one.
+    similar_hashing: Arc<AtomicBool>,
     /// Fires whenever a trash refresh persists a batch or finishes, so a
     /// `ListTrash` request waiting on a first-ever refresh wakes on progress
     /// instead of polling or blocking for the whole run. See

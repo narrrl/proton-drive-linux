@@ -392,6 +392,7 @@ pub fn mount(
         upload_cancel: Arc::new(Mutex::new(HashMap::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         timeline_progress: Arc::new(Mutex::new(None)),
+        similar_hashing: Arc::new(AtomicBool::new(false)),
         albums_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         trash_progress: Arc::new(tokio::sync::Notify::new()),

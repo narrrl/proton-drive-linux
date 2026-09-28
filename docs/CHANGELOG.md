@@ -11,8 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **34**. Photos gain a `similar_hash` column for the coming similar-photo finder. It
-stays empty until the daemon hashes thumbnails, so updating reads and downloads nothing.
+Schema: **34**. Photos gain a `similar_hash` column for the similar-photo finder. It stays
+empty until the finder is first opened, so updating reads and downloads nothing.
+
+### Added
+- **Similar photos.** The duplicate finder gains a Similar switch that also finds resized or
+  re-encoded copies and shots of one moment, by comparing the thumbnails. The first search
+  hashes every thumbnail the server has, with a progress bar; photos without one are not
+  downloaded and are counted as not compared. Every photo in a set starts ticked Keep, since
+  photos that look alike can be different shots, and a photo not kept goes to Trash with the
+  rest of its shot.
 
 ## [2.3.0] — 2026-09-28
 
