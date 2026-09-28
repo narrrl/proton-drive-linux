@@ -1328,7 +1328,21 @@ impl Core {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        {
+        // A file an on-demand mount already read, say one just moved here from
+        // it, is in the content cache under the same revision key.
+        let seeded = size > 0 && self.cache.copy_cached_to(uid, mtime, size as u64, &tmp);
+        if seeded {
+            std::fs::File::open(&tmp)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    format!("sync tmp {rel}: {e}")
+                })?;
+            debug!(
+                rel,
+                "sync: placed from the content cache instead of downloading"
+            );
+        } else {
             let out = std::fs::File::create(&tmp).map_err(|e| format!("create tmp {rel}: {e}"))?;
             // Count the bytes as they land, so the download reports progress like
             // an on-demand hydration does.

@@ -730,6 +730,60 @@ impl ContentCache {
         Some(buf)
     }
 
+    /// Write the whole content of `uid` at `(mtime, size)` to `dst` from the
+    /// cache alone, and report whether that worked.
+    ///
+    /// A whole-file blob is cloned. Otherwise every block of the revision has to
+    /// be cached, under its recorded geometry or, failing that, the uniform one
+    /// the read path would use. Anything short of the full content leaves
+    /// nothing at `dst`, so a caller falls back to a download with a clean slate.
+    ///
+    /// This is what lets a mirror folder take a file an on-demand mount has
+    /// already read, after a move between them, without fetching it again. The
+    /// trust is the read path's: the same `(mtime, size)` key, and blocks that
+    /// were validated when they were fetched.
+    pub fn copy_cached_to(&self, uid: &NodeUid, mtime: i64, size: u64, dst: &Path) -> bool {
+        if size == 0 {
+            return false;
+        }
+        if let Some(blob) = self.valid_blob(uid, mtime, size) {
+            if Self::clone_or_copy(&blob, dst).is_ok_and(|len| len == size) {
+                self.touch(Self::key(uid));
+                return true;
+            }
+            let _ = std::fs::remove_file(dst);
+            return false;
+        }
+        let geometry = self
+            .block_geometry(uid, mtime, size)
+            .unwrap_or_else(|| BlockGeometry::uniform(size));
+        if geometry.size() != size {
+            return false;
+        }
+        let spans = geometry.spans(0, size);
+        // Checked up front so a file with one block missing costs stats, not a
+        // copy of every block before it.
+        if !spans
+            .iter()
+            .all(|&span| self.has_block(uid, mtime, size, span))
+        {
+            return false;
+        }
+        let written = (|| -> Option<()> {
+            use std::io::Write;
+            let mut out = std::fs::File::create(dst).ok()?;
+            for span in spans {
+                out.write_all(&self.cached_block(uid, mtime, size, span)?)
+                    .ok()?;
+            }
+            (out.metadata().ok()?.len() == size).then_some(())
+        })();
+        if written.is_none() {
+            let _ = std::fs::remove_file(dst);
+        }
+        written.is_some()
+    }
+
     /// Store `bytes` as the cached content for `uid`, tagged with `(mtime,
     /// size)`. The blob is written to a temp file then renamed so a concurrent
     /// reader never sees a partial blob; the meta tag is written last so a
@@ -2559,6 +2613,46 @@ mod tests {
         // A new revision (mtime/size bump) invalidates the block.
         assert!(c.cached_block(&u, 101, 10, blk(10, 0)).is_none());
         assert!(c.cached_block(&u, 100, 5000, blk(5000, 0)).is_none());
+    }
+
+    #[test]
+    fn a_cached_blob_is_copied_out_whole() {
+        let (c, d) = cache();
+        let u = uid("blob");
+        c.store(&u, 7, 5, b"hello").unwrap();
+        let dst = d.path().join("out");
+        assert!(c.copy_cached_to(&u, 7, 5, &dst));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+        // Another revision is not this one.
+        assert!(!c.copy_cached_to(&u, 8, 5, &d.path().join("stale")));
+        assert!(!d.path().join("stale").exists());
+    }
+
+    #[test]
+    fn cached_blocks_are_copied_out_in_order() {
+        let (c, d) = cache();
+        let u = uid("blocks");
+        let size = BLOCK_SIZE + 3;
+        let first = vec![1_u8; BLOCK_SIZE as usize];
+        c.store_block(&u, 7, size, blk(size, 0), &first).unwrap();
+        c.store_block(&u, 7, size, blk(size, 1), b"end").unwrap();
+        let dst = d.path().join("out");
+        assert!(c.copy_cached_to(&u, 7, size, &dst));
+        let bytes = std::fs::read(&dst).unwrap();
+        assert_eq!(bytes.len() as u64, size);
+        assert_eq!(&bytes[..BLOCK_SIZE as usize], first.as_slice());
+        assert_eq!(&bytes[BLOCK_SIZE as usize..], b"end");
+    }
+
+    #[test]
+    fn a_file_with_a_block_missing_is_not_copied_out() {
+        let (c, d) = cache();
+        let u = uid("partial");
+        let size = BLOCK_SIZE + 3;
+        c.store_block(&u, 7, size, blk(size, 1), b"end").unwrap();
+        let dst = d.path().join("out");
+        assert!(!c.copy_cached_to(&u, 7, size, &dst));
+        assert!(!dst.exists(), "a partial copy must not be left behind");
     }
 
     /// The [`BlockSpan`] the uniform geometry gives block `idx` of a file of

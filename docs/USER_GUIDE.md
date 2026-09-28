@@ -106,7 +106,12 @@ Drive, so it takes seconds whatever the size. For example:
 
 ```sh
 pdfs move ~/Documents/Scans ~/ProtonDrive/Archive
+pdfs move ~/Documents/a.pdf ~/Documents/b.pdf ~/ProtonDrive/Archive
 ```
+
+The last path is the destination folder; everything before it moves there.
+Files already opened in an online-only folder are not downloaded again when
+they move into a mirrored one.
 
 A move out of a synced folder waits until its files are on Proton Drive. A file that is still
 uploading, has changes that are not uploaded, or is excluded by `.pdfsignore` stops the move,

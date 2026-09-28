@@ -20,6 +20,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   level. A move is refused, with the reason, when the source still has changes that are not on
   Proton Drive, when the two locations are on different volumes, or when a synced folder stays
   busy with a sync pass.
+- **`pdfs move` takes several sources.** `pdfs move a b c DEST` moves all three and
+  reports each one that could not move.
+- **Moving into a mirrored folder reuses cached content.** A file already cached by
+  an online-only folder is copied into place instead of downloaded again.
 
 ## [2.6.2] — 2026-09-28
 

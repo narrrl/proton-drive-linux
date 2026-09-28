@@ -290,18 +290,17 @@ enum Command {
         /// New name (a single path component).
         new_name: String,
     },
-    /// Move a file or folder into another folder via the running daemon.
+    /// Move files or folders into another folder via the running daemon.
     ///
-    /// The two paths may be in different locations: My files and any synced
+    /// The paths may be in different locations: My files and any synced
     /// folder, on-demand or mirrored. The move happens on Proton Drive, so
     /// nothing is downloaded or uploaded again, unlike `mv` between two
-    /// locations.
+    /// locations. The last path is the destination folder.
     Move {
-        /// File/folder path: inside a location, or relative to the mountpoint.
-        path: PathBuf,
-        /// Destination folder path: inside a location, or relative to the
-        /// mountpoint.
-        new_parent: PathBuf,
+        /// Files/folders to move, then the destination folder: each inside a
+        /// location, or relative to the mountpoint.
+        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        paths: Vec<PathBuf>,
     },
     /// Trash a file or folder via the running daemon.
     Rm {
@@ -806,7 +805,10 @@ fn main() -> Result<()> {
             scope,
         } => cmd_search(query, limit, scope),
         Command::Rename { path, new_name } => cmd_rename(path, new_name),
-        Command::Move { path, new_parent } => cmd_move(path, new_parent),
+        Command::Move { mut paths } => {
+            let new_parent = paths.pop().expect("clap requires at least two paths");
+            cmd_move(paths, new_parent)
+        }
         Command::Rm { path } => cmd_rm(path),
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
         Command::Upload { sources, parent } => cmd_upload(sources, parent),
@@ -2445,14 +2447,33 @@ fn cmd_rename(path: PathBuf, new_name: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_move(path: PathBuf, new_parent: PathBuf) -> Result<()> {
-    match control_request(CtlRequest::Move {
-        path: path_arg(&path)?,
-        new_parent: path_arg(&new_parent)?,
-    })? {
-        CtlResponse::Ok { message } => println!("{message}"),
-        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
-        other => bail!("unexpected response: {other:?}"),
+/// Move each of `sources` into `new_parent`, one request each. A refusal names
+/// its source and the rest still move; the command fails if any did not.
+fn cmd_move(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
+    let new_parent = path_arg(&new_parent)?;
+    let mut failed = 0;
+    for source in &sources {
+        let outcome = path_arg(source).and_then(|path| {
+            match control_request(CtlRequest::Move {
+                path,
+                new_parent: new_parent.clone(),
+            })? {
+                CtlResponse::Ok { message } => Ok(message),
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        });
+        match outcome {
+            Ok(message) => println!("{message}"),
+            Err(e) if sources.len() == 1 => return Err(e),
+            Err(e) => {
+                eprintln!("{}: {e:#}", source.display());
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} could not be moved", sources.len());
     }
     Ok(())
 }

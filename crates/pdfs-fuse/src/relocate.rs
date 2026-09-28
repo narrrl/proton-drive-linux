@@ -93,6 +93,44 @@ fn join_rel(parent: &str, name: &str) -> String {
     }
 }
 
+/// Rename `from` to `to`, failing with `EEXIST` rather than replacing
+/// whatever appeared at `to` since it was checked. A filesystem that cannot
+/// promise that gets a plain rename after one more look.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cstr = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    };
+    let (c_from, c_to) = (cstr(from)?, cstr(to)?);
+    // SAFETY: both are valid NUL-terminated paths that outlive the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            c_from.as_ptr(),
+            libc::AT_FDCWD,
+            c_to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            std::fs::rename(from, to)
+        }
+        _ => Err(err),
+    }
+}
+
 /// Whether `uid` is `root` or lies under it, as far as the nodes table knows.
 fn under(core: &Core, root: &NodeUid, uid: &str) -> bool {
     let root = root.to_string();
@@ -186,11 +224,17 @@ impl Core {
         {
             let from = src.to_path_buf();
             let to = dest_parent.join(&name);
-            match std::fs::rename(&from, &to) {
+            match rename_noreplace(&from, &to) {
                 Ok(()) => renamed = Some((from, to)),
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
                     info!(from = %folder.local_path, to = %dest_folder.local_path,
                         "move: mirror folders are on different filesystems");
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    return Err(CoreError::conflict(format!(
+                        "{name} already exists in {}",
+                        dest_parent.display()
+                    )));
                 }
                 Err(e) => {
                     return Err(CoreError::internal(format!(
@@ -425,10 +469,23 @@ impl Core {
                 }
             }
             Place::Mirror { folder, rel } => {
-                // Drive has all of it (checked before the move), so the local
-                // copy is only a stale duplicate now.
+                // Drive had all of it when the move was checked, so the local
+                // copy is only a stale duplicate now. Something written into it
+                // since would go with it, so look again first; if anything is
+                // new, the copy stays and the next pass uploads it as new.
+                let changed = match self.db.sync_entries(folder.id) {
+                    Ok(baseline) => {
+                        mirror_subtree_unsynced(Path::new(&folder.local_path), rel, &baseline)
+                    }
+                    Err(e) => Some(format!("db: {e}")),
+                };
                 if let Err(e) = self.db.sync_entries_remove_subtree(folder.id, rel) {
                     warn!(error = ?e, "move: could not drop the sync baseline");
+                }
+                if let Some(reason) = changed {
+                    warn!(path = %src.display(), reason,
+                        "move: the local copy changed during the move; keeping it");
+                    return;
                 }
                 let removed = if src.is_dir() {
                     std::fs::remove_dir_all(src)
@@ -522,5 +579,25 @@ mod tests {
     fn join_rel_names_a_child_of_the_folder_root_without_a_slash() {
         assert_eq!(join_rel("", "a"), "a");
         assert_eq!(join_rel("x/y", "a"), "x/y/a");
+    }
+
+    #[test]
+    fn a_local_rename_never_replaces_what_is_already_there() {
+        let dir = std::env::temp_dir().join(format!("pdfs-relocate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
+        std::fs::write(&a, b"moved").unwrap();
+        std::fs::write(&b, b"kept").unwrap();
+
+        let err = rename_noreplace(&a, &b).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(std::fs::read(&b).unwrap(), b"kept");
+        assert!(a.exists());
+
+        rename_noreplace(&a, &c).unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&c).unwrap(), b"moved");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
