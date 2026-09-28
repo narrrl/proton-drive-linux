@@ -117,20 +117,16 @@ For contributors: [development guide](docs/DEVELOPMENT.md), [architecture](docs/
     <td align="center" width="50%"><img src="images/photos.png" alt="Photos timeline" width="100%"><br><sub><b>Photos</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="images/shared_with_me.png" alt="Shared with me" width="100%"><br><sub><b>Shared with me</b></sub></td>
-    <td align="center" width="50%"><img src="images/shared.png" alt="Shared by me" width="100%"><br><sub><b>Shared by me</b></sub></td>
+    <td align="center" width="50%"><img src="images/sync.png" alt="Sync folders" width="100%"><br><sub><b>Sync</b></sub></td>
+    <td align="center" width="50%"><img src="images/conflicts.png" alt="Sync history showing resolved conflicts" width="100%"><br><sub><b>Sync history</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="images/restore_devices.png" alt="Computers" width="100%"><br><sub><b>Computers</b></sub></td>
-    <td align="center" width="50%"><img src="images/activity.png" alt="Sync history" width="100%"><br><sub><b>Sync</b></sub></td>
+    <td align="center" width="50%"><img src="images/computers.png" alt="Computers" width="100%"><br><sub><b>Computers</b></sub></td>
+    <td align="center" width="50%"><img src="images/login.png" alt="Sign in" width="100%"><br><sub><b>Sign in</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="images/prompt_gtk.png" alt="Search launcher" width="100%"><br><sub><b>Search launcher</b></sub></td>
     <td align="center" width="50%"><img src="images/prompt_fzf.png" alt="Search launcher in fzf" width="100%"><br><sub><b>Search launcher in fzf</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="images/settings.png" alt="Preferences" width="100%"><br><sub><b>Preferences</b></sub></td>
-    <td align="center" width="50%"><img src="images/login.png" alt="Sign in" width="100%"><br><sub><b>Sign in</b></sub></td>
   </tr>
 </table>
 
