@@ -668,6 +668,15 @@ fn build_window(app: &adw::Application) {
         sync_sidebar(&ui_nav);
         match st.visible_child_name().as_deref() {
             Some("browser") => load_browser(&ui_nav),
+            // The Albums and Places listings are re-read in place. Loading the
+            // timeline instead would swap it in under the Albums or Places toggle.
+            Some("gallery") if !ui_nav.gallery.in_collection() => {
+                match ui_nav.gallery.view_switch.active() {
+                    VIEW_ALBUMS => load_albums(&ui_nav),
+                    VIEW_PLACES => load_places(&ui_nav),
+                    _ => load_gallery(&ui_nav, false),
+                }
+            }
             Some("gallery") => load_gallery(&ui_nav, false),
             // Every visit reads the page again. The rows already on screen stay
             // up while it does, so arriving costs no "Loading…" flash.
