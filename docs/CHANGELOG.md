@@ -11,6 +11,17 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.6.2] — 2026-09-28
+
+Schema: **35** (unchanged).
+
+### Fixed
+- **Photos remembers the Albums and Places views.** Leaving Photos from Albums or Places and
+  coming back showed the timeline while the Albums or Places toggle stayed selected. The page
+  now reopens on the selected view, and Places keeps its Grid or Map layout.
+- **The Sync page keeps a steady width.** A long file name in Transfers no longer widens the
+  page. Overview and Folders now fill the width next to the sidebar.
+
 ## [2.6.1] — 2026-09-28
 
 Schema: **35** (unchanged).
@@ -1239,6 +1250,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.6.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.2
 [2.6.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.1
 [2.6.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.0
 [2.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.5.0
