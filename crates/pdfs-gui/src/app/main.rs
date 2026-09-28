@@ -69,10 +69,6 @@ use pdfs_core::service;
 
 const APP_ID: &str = "io.narl.proton-drive-linux";
 
-/// Proton brand purple, applied as the libadwaita accent when the user opts in
-/// (Preferences → Appearance), so switches, buttons and links all pick it up.
-const PROTON_PURPLE: &str = "#6d4aff";
-
 /// How often the window re-reads mount status, cache usage and the pin list.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -213,7 +209,7 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|_| {
         load_proton_theme();
         if let Ok(dirs) = AppDirs::new() {
-            set_proton_accent(dirs.load_config().proton_accent.unwrap_or(false));
+            set_proton_theme(dirs.load_config().proton_theme.unwrap_or(false));
         }
         // Refresh the file manager's right-click pin/unpin scripts, so they always
         // match the installed `pdfs`.
@@ -289,8 +285,8 @@ pub(crate) fn spawn_tray() {
 }
 
 /// Register the bundled GResources (custom icons, the stylesheet) and load the
-/// app stylesheet. The Proton accent is a separate provider, applied by
-/// [`set_proton_accent`] from the saved preference.
+/// app stylesheet. The Proton theme is a separate provider, applied by
+/// [`set_proton_theme`] from the saved preference.
 fn load_proton_theme() {
     let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/pdfs.gresource"));
     let resource_data = glib::Bytes::from_static(bytes);
@@ -309,38 +305,124 @@ fn load_proton_theme() {
     // `button { padding: 6px 10px; min-width: 16px }` would otherwise pad every
     // photo tile and push the grid past the window. Every rule in the sheet is
     // scoped to the app's own classes, so nothing else the user styled changes.
+    // One above the Proton theme too, so the app's rules refine it.
     gtk4::style_context_add_provider_for_display(
         &display,
         &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
+        gtk4::STYLE_PROVIDER_PRIORITY_USER + 2,
     );
     gtk4::IconTheme::for_display(&display).add_resource_path("/de/nils/protondrivelinux/icons");
 }
 
 thread_local! {
-    /// The Proton purple accent provider while it is installed. Kept so turning
-    /// the preference off can remove exactly what turning it on added.
-    static PROTON_ACCENT: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+    /// The Proton theme provider while it is installed. Kept so turning the
+    /// preference off can remove exactly what turning it on added.
+    static PROTON_THEME: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
 }
 
-/// Paint the app in Proton purple (`on`) or follow the system accent colour.
-/// Every accent-coloured widget reads `--accent-bg-color`, so overriding that
-/// one variable recolours the whole app.
-fn set_proton_accent(on: bool) {
+/// Whether the Proton theme is on.
+fn proton_theme_active() -> bool {
+    PROTON_THEME.with(|slot| slot.borrow().is_some())
+}
+
+/// libadwaita's own stylesheet, bundled in the library.
+const ADWAITA_STYLESHEET: &str = "/org/gnome/Adwaita/styles/gtk.css";
+
+/// The Proton palette laid over it, from our own bundle.
+const PROTON_PALETTE: &str = "/de/nils/protondrivelinux/proton-theme.css";
+
+/// Make the theme provider's `@media (prefers-color-scheme)` and
+/// `(prefers-contrast)` rules match what libadwaita shows, now and whenever it
+/// changes. A provider evaluates those itself, and a new one assumes light.
+///
+/// The properties are set by name because they only exist since GTK 4.20, and
+/// the app still runs on older GTK, whose libadwaita has no such rules anyway.
+fn follow_style_manager(provider: &gtk4::CssProvider) {
+    fn set_enum(provider: &gtk4::CssProvider, property: &str, nick: &str) {
+        let Some(pspec) = provider.find_property(property) else {
+            return;
+        };
+        if let Some(value) = glib::EnumClass::with_type(pspec.value_type())
+            .and_then(|class| class.to_value_by_nick(nick))
+        {
+            provider.set_property_from_value(property, &value);
+        }
+    }
+    fn apply(provider: &gtk4::CssProvider, manager: &adw::StyleManager) {
+        let scheme = if manager.is_dark() { "dark" } else { "light" };
+        set_enum(provider, "prefers-color-scheme", scheme);
+        let contrast = if manager.is_high_contrast() {
+            "more"
+        } else {
+            "no-preference"
+        };
+        set_enum(provider, "prefers-contrast", contrast);
+    }
+
+    let manager = adw::StyleManager::default();
+    apply(provider, &manager);
+    // Weak, so a provider the preference removed isn't kept alive; its
+    // handlers then do nothing.
+    let weak = provider.downgrade();
+    let weak_dark = weak.clone();
+    manager.connect_dark_notify(move |manager| {
+        if let Some(provider) = weak_dark.upgrade() {
+            apply(&provider, manager);
+        }
+    });
+    manager.connect_high_contrast_notify(move |manager| {
+        if let Some(provider) = weak.upgrade() {
+            apply(&provider, manager);
+        }
+    });
+}
+
+/// Paint the app in the Proton web apps' colours (`on`) or follow the system
+/// theme and accent colour.
+///
+/// Setting libadwaita's colour variables alone isn't enough: a GTK theme the
+/// user's `gtk.css` imports (Catppuccin, Fluent, ...) sits above the app and
+/// hard-codes its own accent into hundreds of rules. So the theme provider,
+/// one above the user's CSS, first resets every property, then re-applies
+/// libadwaita's whole stylesheet and finally the Proton palette, which leaves
+/// nothing of the user's theme inside the app.
+fn set_proton_theme(on: bool) {
     let Some(display) = gtk4::gdk::Display::default() else {
         return;
     };
-    PROTON_ACCENT.with(|slot| {
+    PROTON_THEME.with(|slot| {
         let mut slot = slot.borrow_mut();
         match (on, slot.as_ref()) {
             (true, None) => {
+                let stylesheet = |path| {
+                    gio::resources_lookup_data(path, gio::ResourceLookupFlags::NONE)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                };
+                let palette = stylesheet(PROTON_PALETTE).unwrap_or_default();
+                let css = match stylesheet(ADWAITA_STYLESHEET) {
+                    // Its images are named relative to the sheet, which a
+                    // string loaded here doesn't have.
+                    Ok(adwaita) => format!(
+                        "* {{ all: unset; }}\n{}\n{palette}",
+                        adwaita.replace(
+                            "url(\"assets/",
+                            "url(\"resource:///org/gnome/Adwaita/styles/assets/"
+                        )
+                    ),
+                    // Still recolours everything that follows libadwaita's
+                    // variables; only a custom theme's own rules show through.
+                    Err(e) => {
+                        tracing::warn!("libadwaita stylesheet not found, only recolouring: {e}");
+                        palette
+                    }
+                };
                 let provider = gtk4::CssProvider::new();
-                provider
-                    .load_from_string(&format!(":root {{ --accent-bg-color: {PROTON_PURPLE}; }}"));
+                follow_style_manager(&provider);
+                provider.load_from_string(&css);
                 gtk4::style_context_add_provider_for_display(
                     &display,
                     &provider,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                    gtk4::STYLE_PROVIDER_PRIORITY_USER + 1,
                 );
                 *slot = Some(provider);
             }
@@ -454,7 +536,8 @@ fn build_window(app: &adw::Application) {
             upload_limit_row: main_widgets.upload_limit_row.clone(),
             download_limit_row: main_widgets.download_limit_row.clone(),
             mountpoint_row: main_widgets.mountpoint_row.clone(),
-            accent_row: main_widgets.accent_row.clone(),
+            theme_row: main_widgets.theme_row.clone(),
+            online_map_row: main_widgets.online_map_row.clone(),
             tray_row: main_widgets.tray_row.clone(),
             language_row: main_widgets.language_row.clone(),
             settings_suppress: Cell::new(false),
@@ -1368,7 +1451,15 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             None,
             gtk4::License::Custom,
             Some(&gettext(
-                "The places map is drawn from <a href=\"https://www.naturalearthdata.com/\">Natural Earth</a> land outlines, which are in the public domain.",
+                "The places map is drawn from <a href=\"https://www.naturalearthdata.com/\">Natural Earth</a> land outlines and country borders, which are in the public domain.",
+            )),
+        );
+        dialog.add_legal_section(
+            "OpenStreetMap",
+            None,
+            gtk4::License::Custom,
+            Some(&gettext(
+                "The street map, when turned on, comes from <a href=\"https://openfreemap.org/\">OpenFreeMap</a> in the <a href=\"https://www.openmaptiles.org/\">OpenMapTiles</a> schema. Map data © <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors, available under the Open Database License.",
             )),
         );
         dialog.add_legal_section(

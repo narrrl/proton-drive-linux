@@ -103,6 +103,9 @@ pub enum Request {
         offset: usize,
         limit: usize,
     },
+    /// Every photo taken in one town with where exactly it was taken, for the
+    /// map's close-up. Replies with [`Response::PhotoLocations`].
+    PlaceLocations { id: u32 },
     /// List the account's photo albums, newest activity first, including the
     /// albums other people share with us. Metadata only — an album's cover
     /// thumbnail is fetched with [`Request::PhotoThumbs`] like any other photo.
@@ -1468,6 +1471,15 @@ pub struct PlaceInfo {
     pub cover: PhotoItem,
 }
 
+/// One photo and where it was taken, in decimal degrees. Part of
+/// [`Response::PhotoLocations`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoLocation {
+    pub photo: PhotoItem,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
 /// How many of the timeline's photos a running refresh has read the metadata
 /// (and so the location) of, out of how many. Part of [`Response::Places`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1845,6 +1857,9 @@ pub enum Response {
         #[serde(default)]
         mapping: Option<MappingProgress>,
     },
+    /// The photos of one town, each with its location (reply to
+    /// [`Request::PlaceLocations`]).
+    PhotoLocations { items: Vec<PhotoLocation> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
     /// Per-node outcome of a [`Request::TrashNodes`] batch. Reported per uid
@@ -2549,6 +2564,7 @@ mod tests {
                 offset: 60,
                 limit: 30,
             },
+            Request::PlaceLocations { id: 2950159 },
         ] {
             let line = serde_json::to_string(&req).unwrap();
             let back: Request = serde_json::from_str(&line).unwrap();

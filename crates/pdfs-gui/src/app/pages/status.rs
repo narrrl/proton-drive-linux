@@ -44,8 +44,10 @@ pub(crate) struct StatusState {
     pub(crate) download_limit_row: adw::SpinRow,
     /// Shows where the primary mount lives; its Change button picks a new one.
     pub(crate) mountpoint_row: adw::ActionRow,
-    /// "Proton purple accent" toggle. Guarded by [`Self::settings_suppress`].
-    pub(crate) accent_row: adw::SwitchRow,
+    /// "Proton theme" toggle. Guarded by [`Self::settings_suppress`].
+    pub(crate) theme_row: adw::SwitchRow,
+    /// Street map on the Places map. Guarded by [`Self::settings_suppress`].
+    pub(crate) online_map_row: adw::SwitchRow,
     /// "Show tray icon" toggle. Guarded by [`Self::settings_suppress`].
     pub(crate) tray_row: adw::SwitchRow,
     /// Language picker: "System Default", then [`i18n::LANGUAGES`]. Guarded by
@@ -139,7 +141,8 @@ pub(crate) struct MainWidgets {
     /// Shows the active mountpoint; its suffix button picks a new one.
     pub(crate) mountpoint_row: adw::ActionRow,
     pub(crate) mountpoint_button: gtk4::Button,
-    pub(crate) accent_row: adw::SwitchRow,
+    pub(crate) theme_row: adw::SwitchRow,
+    pub(crate) online_map_row: adw::SwitchRow,
     pub(crate) tray_row: adw::SwitchRow,
     pub(crate) language_row: adw::ComboRow,
 }
@@ -207,13 +210,20 @@ pub(crate) fn build_main_page() -> MainWidgets {
     let appearance_group = adw::PreferencesGroup::builder()
         .title(gettext("Appearance"))
         .build();
-    let accent_row = adw::SwitchRow::builder()
-        .title(gettext("Proton purple accent"))
+    let theme_row = adw::SwitchRow::builder()
+        .title(gettext("Proton theme"))
         .subtitle(gettext(
-            "Use the Proton brand color instead of the system accent color",
+            "Use Proton's colors instead of the system theme and accent color",
         ))
         .build();
-    appearance_group.add(&accent_row);
+    appearance_group.add(&theme_row);
+    let online_map_row = adw::SwitchRow::builder()
+        .title(gettext("Street map for Places"))
+        .subtitle(gettext(
+            "Show streets and town names from OpenFreeMap. It learns which parts of the world you look at.",
+        ))
+        .build();
+    appearance_group.add(&online_map_row);
     let tray_row = adw::SwitchRow::builder()
         .title(gettext("Show tray icon"))
         .subtitle(gettext("Sync status and quick actions in the panel"))
@@ -395,7 +405,8 @@ pub(crate) fn build_main_page() -> MainWidgets {
         purge_button,
         mountpoint_row,
         mountpoint_button,
-        accent_row,
+        theme_row,
+        online_map_row,
         tray_row,
         language_row,
     }
@@ -455,7 +466,7 @@ pub(crate) const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 pub(crate) const MIB: f64 = 1024.0 * 1024.0;
 
 /// Wire the Preferences controls: the cache-budget editor, the purge button, the
-/// start-on-login switch, the mountpoint chooser and the accent toggle. Initial widget state is
+/// start-on-login switch, the mountpoint chooser and the theme toggle. Initial widget state is
 /// read once from config / systemd here (the refresh loop owns only the live
 /// mount + cache-usage read-out), with [`Ui::settings_suppress`] set around the
 /// programmatic populate so the change handlers don't fire on it.
@@ -482,8 +493,9 @@ pub(crate) fn wire_settings(
         .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
     ui.status.autostart_row.set_active(service::is_enabled());
     ui.status
-        .accent_row
-        .set_active(config.proton_accent.unwrap_or(false));
+        .theme_row
+        .set_active(config.proton_theme.unwrap_or(false));
+    ui.status.online_map_row.set_active(config.online_map);
     ui.status.tray_row.set_active(!config.tray_hidden);
     ui.status
         .language_row
@@ -585,20 +597,45 @@ pub(crate) fn wire_settings(
     let ui_mp = ui.clone();
     mountpoint_button.connect_clicked(move |_| prompt_mountpoint(&ui_mp));
 
-    // Accent: saved with the rest of the config, applied right away.
-    let ui_accent = ui.clone();
-    ui.status.accent_row.connect_active_notify(move |row| {
-        if ui_accent.status.settings_suppress.get() {
+    // Theme: saved with the rest of the config, applied right away.
+    let ui_theme = ui.clone();
+    ui.status.theme_row.connect_active_notify(move |row| {
+        if ui_theme.status.settings_suppress.get() {
             return;
         }
         let on = row.is_active();
-        set_proton_accent(on);
-        let mut config = ui_accent.dirs.load_config();
-        config.proton_accent = Some(on);
-        if let Err(e) = ui_accent.dirs.save_config(&config) {
+        set_proton_theme(on);
+        // Folders swap their icon with the theme; have every row bound again.
+        let rows = ui_theme.browser.model.n_items();
+        ui_theme.browser.model.items_changed(0, rows, rows);
+        let mut config = ui_theme.dirs.load_config();
+        config.proton_theme = Some(on);
+        if let Err(e) = ui_theme.dirs.save_config(&config) {
             toast_error(
-                &ui_accent,
-                &gettext("Couldn't save the accent color"),
+                &ui_theme,
+                &gettext("Couldn't save the theme"),
+                &e.to_string(),
+            );
+        }
+    });
+
+    // Street map: saved, and the Places map switches over right away.
+    let ui_map = ui.clone();
+    ui.status.online_map_row.connect_active_notify(move |row| {
+        if ui_map.status.settings_suppress.get() {
+            return;
+        }
+        let on = row.is_active();
+        ui_map
+            .gallery
+            .places_map
+            .set_online(on, ui_map.dirs.cache_dir());
+        let mut config = ui_map.dirs.load_config();
+        config.online_map = on;
+        if let Err(e) = ui_map.dirs.save_config(&config) {
+            toast_error(
+                &ui_map,
+                &gettext("Couldn't save the map setting"),
                 &e.to_string(),
             );
         }

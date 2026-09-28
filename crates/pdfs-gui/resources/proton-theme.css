@@ -1,0 +1,72 @@
+/* Proton theme — the Proton web apps' Snow (light) and Carbon (dark) palettes.
+ *
+ * Loaded by main.rs after libadwaita's own stylesheet, which it re-applies on
+ * top of the user's GTK theme so that theme's hard-coded colours can't show
+ * through. Only libadwaita's colour variables are set here; every widget
+ * derives its look from them. Values from ProtonMail/WebClients,
+ * packages/colors/themes/src/{snow,carbon}/standard-base.css.
+ */
+
+:root {
+    --accent-bg-color: #6d4aff;
+    --accent-fg-color: #ffffff;
+    --destructive-bg-color: #dc3251;
+    --destructive-fg-color: #ffffff;
+    --error-bg-color: #dc3251;
+    --error-fg-color: #ffffff;
+    --success-bg-color: #1ea885;
+    --success-fg-color: #ffffff;
+    --warning-bg-color: #ff9900;
+    --warning-fg-color: rgb(0 0 0 / 80%);
+
+    --window-bg-color: #ffffff;
+    --window-fg-color: #0c0c14;
+    --view-bg-color: #ffffff;
+    --view-fg-color: #0c0c14;
+    --headerbar-bg-color: #ffffff;
+    --headerbar-fg-color: #0c0c14;
+    --headerbar-backdrop-color: #ffffff;
+    --sidebar-bg-color: #f5f4f2;
+    --sidebar-fg-color: #0c0c14;
+    --sidebar-backdrop-color: #f8f8f6;
+    --secondary-sidebar-bg-color: #f8f8f6;
+    --secondary-sidebar-fg-color: #0c0c14;
+    --secondary-sidebar-backdrop-color: #f8f8f6;
+    --card-bg-color: #f5f4f2;
+    --card-fg-color: #0c0c14;
+    --dialog-bg-color: #ffffff;
+    --dialog-fg-color: #0c0c14;
+    --popover-bg-color: #ffffff;
+    --popover-fg-color: #0c0c14;
+    --thumbnail-bg-color: #f5f4f2;
+    --thumbnail-fg-color: #0c0c14;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --destructive-bg-color: #f5385a;
+        --error-bg-color: #f5385a;
+
+        --window-bg-color: #1e1c26;
+        --window-fg-color: #ffffff;
+        --view-bg-color: #1e1c26;
+        --view-fg-color: #ffffff;
+        --headerbar-bg-color: #1e1c26;
+        --headerbar-fg-color: #ffffff;
+        --headerbar-backdrop-color: #1e1c26;
+        --sidebar-bg-color: #16141c;
+        --sidebar-fg-color: #ffffff;
+        --sidebar-backdrop-color: #16141c;
+        --secondary-sidebar-bg-color: #1a1821;
+        --secondary-sidebar-fg-color: #ffffff;
+        --secondary-sidebar-backdrop-color: #1a1821;
+        --card-bg-color: #292733;
+        --card-fg-color: #ffffff;
+        --dialog-bg-color: #292733;
+        --dialog-fg-color: #ffffff;
+        --popover-bg-color: #292733;
+        --popover-fg-color: #ffffff;
+        --thumbnail-bg-color: #292733;
+        --thumbnail-fg-color: #ffffff;
+    }
+}

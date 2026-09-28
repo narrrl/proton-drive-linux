@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use pdfs_core::control::{
-    FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoThumb, PlaceInfo,
+    FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoLocation, PhotoThumb, PlaceInfo,
     ThumbnailBuildStatus, is_raw_image_name, is_thumbnail_image_name,
 };
 use pdfs_core::db::{self, StoredPhoto};
@@ -785,6 +785,22 @@ impl Core {
             .photos_at_place(id, offset, limit)
             .map_err(CoreError::from)?;
         Ok(photos.into_iter().map(|p| self.photo_item(p)).collect())
+    }
+
+    /// Every photo taken in town `id` with its own location, as wire items.
+    pub(crate) fn place_locations(&self, id: u32) -> CoreResult<Vec<PhotoLocation>> {
+        let photos = self
+            .db
+            .photo_locations_at_place(id)
+            .map_err(CoreError::from)?;
+        Ok(photos
+            .into_iter()
+            .map(|(photo, (latitude, longitude))| PhotoLocation {
+                photo: self.photo_item(photo),
+                latitude,
+                longitude,
+            })
+            .collect())
     }
 
     /// Photos taken on today's date in earlier years, as wire items. Served

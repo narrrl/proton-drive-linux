@@ -339,6 +339,30 @@ fn places_group_photos_by_the_nearest_town() {
     assert_eq!(berlin, ["b2", "b1-jpeg"]);
 }
 
+/// A town's photos come with where each was taken, one per RAW+JPEG shot.
+#[test]
+fn place_photos_carry_their_own_location() {
+    let db = Db::open_in_memory().unwrap();
+    let kreuzberg = (52.497, 13.411);
+    db.photos_replace(&[
+        located("b2", 500, "IMG_5.JPG", BERLIN),
+        located("b1-jpeg", 300, "IMG_3.JPG", kreuzberg),
+        located("b1-raw", 300, "IMG_3.CR2", kreuzberg),
+    ])
+    .unwrap();
+    let id = db.photo_places().unwrap()[0].id;
+    let located: Vec<(String, (f64, f64))> = db
+        .photo_locations_at_place(id)
+        .unwrap()
+        .into_iter()
+        .map(|(photo, at)| (photo.uid, at))
+        .collect();
+    assert_eq!(
+        located,
+        [("b2".to_owned(), BERLIN), ("b1-jpeg".to_owned(), kreuzberg)]
+    );
+}
+
 /// A refresh that skips an already-resolved photo keeps where it was taken; one
 /// that reads the node again takes what the node now says.
 #[test]

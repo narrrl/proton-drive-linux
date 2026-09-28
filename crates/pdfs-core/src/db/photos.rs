@@ -697,6 +697,29 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every photo taken in a town, one per group as in [`Self::photos_at_place`],
+    /// with where exactly it was taken. A group's own location is that of the
+    /// photo standing for it.
+    pub fn photo_locations_at_place(&self, id: u32) -> Result<Vec<(StoredPhoto, (f64, f64))>> {
+        let photos = self.photos_at_place(id, 0, usize::MAX >> 1)?;
+        let located: HashMap<String, (f64, f64)> = {
+            let conn = self.read();
+            let mut stmt = conn.prepare(
+                "SELECT uid, latitude, longitude FROM photos \
+                 WHERE place_id = ?1 AND latitude IS NOT NULL AND longitude IS NOT NULL",
+            )?;
+            stmt.query_map(params![id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        Ok(photos
+            .into_iter()
+            .filter_map(|photo| {
+                let at = *located.get(&photo.uid)?;
+                Some((photo, at))
+            })
+            .collect())
+    }
+
     /// Sets of photos with the same content hash, each set ordered with the
     /// copy worth keeping first, and the sets newest first.
     ///

@@ -1390,12 +1390,14 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let toggle_off = info_toggle.clone();
     info_close.connect_clicked(move |_| toggle_off.set_active(false));
 
+    let ui_map = ui.clone();
     let viewer_map = viewer.clone();
+    let w_map = window.clone();
     info_map.connect_clicked(move |_| {
-        if let Some((lat, lon)) = *viewer_map.coords.borrow() {
-            open_path(&format!(
-                "https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}"
-            ));
+        let coords = *viewer_map.coords.borrow();
+        if let Some((lat, lon)) = coords {
+            w_map.close();
+            show_on_map(&ui_map, lat, lon);
         }
     });
 

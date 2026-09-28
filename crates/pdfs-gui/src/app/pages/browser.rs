@@ -2797,6 +2797,15 @@ pub(crate) fn attach_drop(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box
     anchor.add_controller(target);
 }
 
+/// The full-colour icon for an entry: [`icon_base_for`], except that folders
+/// are Proton's own purple ones while the Proton theme is on.
+pub(crate) fn icon_for(entry: &DirEntry) -> &'static str {
+    if entry.is_dir && proton_theme_active() {
+        return "pdfs-proton-folder";
+    }
+    icon_base_for(entry)
+}
+
 /// Pick a freedesktop icon base name for an entry from its kind / extension.
 /// Callers append `-symbolic` for the column view's small icons.
 pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {

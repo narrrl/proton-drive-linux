@@ -173,7 +173,7 @@ pub(crate) fn bind_file_thumbnail(
     let fallback_name = if symbolic_fallback {
         format!("{}-symbolic", icon_base_for(entry))
     } else {
-        icon_base_for(entry).to_string()
+        icon_for(entry).to_string()
     };
     fallback.set_icon_name(Some(&fallback_name));
     fallback.set_visible(true);

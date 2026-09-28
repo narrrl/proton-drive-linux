@@ -5,6 +5,8 @@ pub(crate) mod devices;
 pub(crate) mod duplicates;
 pub(crate) mod locations;
 pub(crate) mod login;
+pub(crate) mod map_tiles;
+pub(crate) mod mvt;
 pub(crate) mod photo_viewer;
 pub(crate) mod photos;
 pub(crate) mod places;

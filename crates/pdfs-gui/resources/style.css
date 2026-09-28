@@ -4,7 +4,8 @@
  * var(--success-color), ...) so the app follows the system accent, light/dark
  * and high contrast. The one exception is the photo viewer, which always sits
  * on a near-black backdrop and so uses fixed light-on-dark colours. The Proton
- * purple accent is opt-in and lives in its own provider (see main.rs).
+ * theme is opt-in and lives in its own provider (see main.rs and
+ * proton-theme.css).
  */
 
 /* Brand */
@@ -89,7 +90,11 @@ progressbar.browser-status-meter trough, progressbar.browser-status-meter progre
 
 /* Photos: how many timeline filters are on, as a small badge on the Filters button. */
 .filter-count { min-width: 18px; padding: 0 5px; border-radius: 999px; font-size: 0.8em; font-weight: 700; color: var(--accent-fg-color); background-color: var(--accent-bg-color); }
-/* The Places map: water a faint wash of the text colour, bubbles (drawn in
- * the area's own colour) in the accent. */
-.places-map-frame { border-radius: 12px; background: color-mix(in srgb, currentColor 5%, transparent); }
+/* The Places map: sea and land come in the map's own colours; markers (drawn
+ * in the area's own colour) in the accent. */
+.places-map-frame { border-radius: 12px; }
 .places-map { color: var(--accent-bg-color); }
+/* Credit on the Places street map, in the corner as on every web map. */
+.places-spot-photo { padding: 0; }
+.places-spot-photo picture { border-radius: 6px; overflow: hidden; }
+.places-map-credit { padding: 2px 8px; border-top-left-radius: 8px; color: var(--window-fg-color); background: color-mix(in srgb, var(--window-bg-color) 80%, transparent); }

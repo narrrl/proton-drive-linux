@@ -10,14 +10,18 @@
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-filter-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-offline-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-online-only-symbolic.svg</file>
+    <!-- The Proton theme's folder: a full-colour icon from the icon theme
+         can't be recoloured by CSS. -->
+    <file preprocess="xml-stripblanks">scalable/places/pdfs-proton-folder.svg</file>
     <!-- The app icon, from the one file packaging installs, so the in-app brand
          matches the launcher and resolves even when nothing is installed. -->
     <file alias="scalable/apps/io.narl.proton-drive-linux.svg" preprocess="xml-stripblanks">../../../packaging/io.narl.proton-drive-linux.svg</file>
   </gresource>
   <!-- The app stylesheet, loaded once at startup. Colours come from the
        libadwaita palette so the app follows the system accent, light/dark and
-       high contrast; the Proton purple accent is a separate, opt-in provider. -->
+       high contrast. The Proton theme is a separate, opt-in provider. -->
   <gresource prefix="/de/nils/protondrivelinux">
     <file>style.css</file>
+    <file>proton-theme.css</file>
   </gresource>
 </gresources>

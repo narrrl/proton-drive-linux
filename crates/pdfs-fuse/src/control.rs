@@ -482,6 +482,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::PlaceLocations { id }) => match core.place_locations(id) {
+            Ok(items) => CtlResponse::PhotoLocations { items },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::PhotosOnThisDay { limit }) => {
             match core.photos_on_this_day(clamp_limit(limit)) {
                 Ok(items) => CtlResponse::Photos {

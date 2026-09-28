@@ -359,7 +359,7 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
 pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     ui.details.details_suppress.set(true);
     let d = &ui.details.details;
-    d.icon.set_icon_name(Some(icon_base_for(entry)));
+    d.icon.set_icon_name(Some(icon_for(entry)));
     d.name.set_label(&entry.name);
     d.kind.set_label(&if entry.is_dir {
         gettext("Folder")

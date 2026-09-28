@@ -20,8 +20,24 @@ far it has got.
 ### Added
 - **Places.** A third Photos view groups photos by the town they were taken in, as cards or on a
   world map. Towns are looked up offline in bundled GeoNames data (CC BY 4.0), and the map is
-  drawn offline from Natural Earth land outlines (public domain), so no map tiles are fetched.
-  Install `iso-codes`, a new optional dependency, for country names in your language.
+  drawn offline from Natural Earth land outlines and country borders (public domain), with
+  sea and land in their own colours. Install `iso-codes`, a new optional dependency, for
+  country names in your language.
+- **Photos on the map.** Every town is marked with one of its photos and a count, and nearby
+  towns merge into one marker until you zoom in. Zoomed in on a town, each photo gets its own
+  marker where it was taken; clicking one opens it in the viewer, and clicking photos taken
+  on one spot lists them all. "Show on map" in the photo viewer now goes to that spot on the
+  Places map instead of a web browser.
+- **Street map for Places.** An opt-in setting under Appearance draws the map from
+  [OpenFreeMap](https://openfreemap.org/) (OpenStreetMap data), with streets, water, parks and
+  town names in your language. It is off by default because the tile server learns which parts
+  of the world you look at. Tiles are cached under the cache directory (at most 256 MB), and
+  the built-in outline shows wherever they haven't loaded.
+- **Proton theme.** The "Proton purple accent" preference is now a whole Proton theme: the
+  Proton web apps' light and dark colours, not just the accent. It also holds when `gtk.css`
+  imports another GTK theme (Catppuccin, Fluent, ...), whose own colours used to show through
+  almost everywhere. Folders get Proton's purple folder icon rather than the icon theme's.
+  Anyone who had the accent turned on gets the theme.
 - **On this day.** A strip at the top of the timeline shows a card for every earlier year with
   photos taken on today's date.
 - **Find duplicates.** Photos can list every set of byte-identical copies and move the copies

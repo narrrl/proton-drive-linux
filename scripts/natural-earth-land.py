@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Regenerate crates/pdfs-gui/data/land.txt from Natural Earth's land polygons.
+"""Regenerate crates/pdfs-gui/data/land.txt from Natural Earth's land polygons,
+and crates/pdfs-gui/data/borders.txt from its country borders.
 
 Usage:
     curl -LO https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson
     scripts/natural-earth-land.py ne_50m_land.geojson crates/pdfs-gui/data/land.txt
+    curl -LO https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_admin_0_boundary_lines_land.geojson
+    scripts/natural-earth-land.py ne_50m_admin_0_boundary_lines_land.geojson crates/pdfs-gui/data/borders.txt
 
 Natural Earth is in the public domain; the About dialog credits it anyway.
 
@@ -12,7 +15,8 @@ pairs rounded to two decimals (about a kilometre). Each ring is simplified
 with Ramer-Douglas-Peucker to TOLERANCE degrees, which is finer than the map
 can show at its closest zoom, and rings left with fewer than four points
 (islets smaller than the tolerance) are dropped. Holes (lakes) are dropped
-too: the map fills the land and draws nothing on top of it.
+too: the map fills the land and draws nothing on top of it. Borders are lines
+rather than rings, simplified the same way; a line needs two points.
 """
 
 import json
@@ -54,16 +58,27 @@ def main(source, target):
     lines = []
     for feature in features:
         geometry = feature["geometry"]
-        polygons = (
-            geometry["coordinates"]
-            if geometry["type"] == "MultiPolygon"
-            else [geometry["coordinates"]]
-        )
-        for polygon in polygons:
-            ring = simplify(polygon[0])
-            if len(ring) < 4:
+        kind = geometry["type"]
+        if kind in ("LineString", "MultiLineString"):
+            paths = (
+                geometry["coordinates"]
+                if kind == "MultiLineString"
+                else [geometry["coordinates"]]
+            )
+            shortest = 2
+        else:
+            polygons = (
+                geometry["coordinates"]
+                if kind == "MultiPolygon"
+                else [geometry["coordinates"]]
+            )
+            paths = [polygon[0] for polygon in polygons]
+            shortest = 4
+        for path in paths:
+            path = simplify(path)
+            if len(path) < shortest:
                 continue
-            lines.append(" ".join(f"{lon:.2f},{lat:.2f}" for lon, lat in ring))
+            lines.append(" ".join(f"{lon:.2f},{lat:.2f}" for lon, lat in path))
     with open(target, "w") as out:
         out.write("\n".join(lines) + "\n")
 

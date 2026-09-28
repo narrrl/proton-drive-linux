@@ -128,11 +128,12 @@ pub struct AppConfig {
     /// field.
     #[serde(default)]
     pub prompt: Option<PromptConfig>,
-    /// Paint the desktop app in Proton purple instead of the system accent
-    /// colour. `None` means "follow the system". Defaulted for configs
-    /// predating the field.
-    #[serde(default)]
-    pub proton_accent: Option<bool>,
+    /// Paint the desktop app in Proton's colours instead of the system theme
+    /// and accent colour. `None` means "follow the system". Defaulted for
+    /// configs predating the field; also read from `proton_accent`, its name
+    /// while it only changed the accent.
+    #[serde(default, alias = "proton_accent")]
+    pub proton_theme: Option<bool>,
     /// How the desktop app's My Files page lays out and orders a folder.
     /// Defaulted for configs predating the field.
     #[serde(default)]
@@ -147,6 +148,12 @@ pub struct AppConfig {
     /// Defaulted for configs predating the field.
     #[serde(default)]
     pub language: Option<String>,
+    /// Draw the Places map from OpenFreeMap's street map instead of the
+    /// built-in outline. Off by default: the tiles come from a third party,
+    /// which then learns which parts of the world are looked at. Defaulted for
+    /// configs predating the field.
+    #[serde(default)]
+    pub online_map: bool,
 }
 
 /// The My Files page's view choices, remembered between runs.
@@ -216,10 +223,11 @@ impl Default for AppConfig {
             conflict_sweep: None,
             open_with: None,
             prompt: None,
-            proton_accent: None,
+            proton_theme: None,
             files_view: FilesView::default(),
             tray_hidden: false,
             language: None,
+            online_map: false,
         }
     }
 }
@@ -566,7 +574,7 @@ mod tests {
             conflict_sweep: Some(SweepMode::Enforce),
             open_with: None,
             prompt: None,
-            proton_accent: Some(true),
+            proton_theme: Some(true),
             files_view: FilesView {
                 list: true,
                 sort: FileSort::Modified,
@@ -575,13 +583,15 @@ mod tests {
             },
             tray_hidden: true,
             language: Some("de".to_string()),
+            online_map: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
         assert_eq!(decoded.user_agent, "test-agent/1.0");
-        assert_eq!(decoded.proton_accent, Some(true));
+        assert_eq!(decoded.proton_theme, Some(true));
         assert!(decoded.tray_hidden);
+        assert!(decoded.online_map);
         assert_eq!(decoded.language.as_deref(), Some("de"));
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
@@ -596,6 +606,14 @@ mod tests {
         let partial: FilesView = serde_json::from_str(r#"{"sort":"size"}"#).unwrap();
         assert_eq!(partial.sort, FileSort::Size);
         assert!(partial.folders_first);
+    }
+
+    #[test]
+    fn the_old_proton_accent_setting_turns_on_the_proton_theme() {
+        let decoded: AppConfig =
+            serde_json::from_str(r#"{"app_version":"a","user_agent":"b","proton_accent":true}"#)
+                .unwrap();
+        assert_eq!(decoded.proton_theme, Some(true));
     }
 
     #[test]
