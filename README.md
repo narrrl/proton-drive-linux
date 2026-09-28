@@ -117,16 +117,20 @@ For contributors: [development guide](docs/DEVELOPMENT.md), [architecture](docs/
     <td align="center" width="50%"><img src="images/photos.png" alt="Photos timeline" width="100%"><br><sub><b>Photos</b></sub></td>
   </tr>
   <tr>
+    <td align="center" width="50%"><img src="images/photos_map.png" alt="Photos places map" width="100%"><br><sub><b>Places</b></sub></td>
+    <td align="center" width="50%"><img src="images/computers.png" alt="Computers" width="100%"><br><sub><b>Computers</b></sub></td>
+  </tr>
+  <tr>
     <td align="center" width="50%"><img src="images/sync.png" alt="Sync folders" width="100%"><br><sub><b>Sync</b></sub></td>
     <td align="center" width="50%"><img src="images/conflicts.png" alt="Sync history showing resolved conflicts" width="100%"><br><sub><b>Sync history</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="images/computers.png" alt="Computers" width="100%"><br><sub><b>Computers</b></sub></td>
-    <td align="center" width="50%"><img src="images/login.png" alt="Sign in" width="100%"><br><sub><b>Sign in</b></sub></td>
-  </tr>
-  <tr>
     <td align="center" width="50%"><img src="images/prompt_gtk.png" alt="Search launcher" width="100%"><br><sub><b>Search launcher</b></sub></td>
     <td align="center" width="50%"><img src="images/prompt_fzf.png" alt="Search launcher in fzf" width="100%"><br><sub><b>Search launcher in fzf</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="images/login.png" alt="Sign in" width="100%"><br><sub><b>Sign in</b></sub></td>
+    <td></td>
   </tr>
 </table>
 
