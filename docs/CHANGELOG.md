@@ -11,6 +11,73 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-09-28
+
+A polish pass over the desktop app: the daemon pushes changes instead of being polled, pages
+stay up while they reload, Trash and the shared pages use the same file list as My files, the
+Sync page is split into views, the Computers page can browse another computer's backup, and
+Photos gains a timeline scrubber.
+
+Schema: **35**. The daemon notes when it first sees an item in the trash, since Proton does not
+report the trash time to this client yet.
+
+### Added
+- **Browse other computers.** Opening another computer on the Computers page shows its backup
+  read-only, in the same list and grid as My files, and files open with a double-click.
+- **Trash shows where items came from and when they were deleted.** The date is when this client
+  first saw the item in the trash until Proton reports the exact time. Restoring offers a Show
+  action, and opening a trashed item explains that it must be restored first.
+- **Shared with me** shows who shared each item, with a warning for unverified senders, the
+  access it gives and when it was shared. Pending invitations wait in a banner, several items can
+  be left at once, and saved links have their own view.
+- **Shared by me** gains a filter (links, people, expired links), columns for location, people
+  and link state, a copy button for live links, and stopping several shares at once.
+- **Sidebar badges** count sync problems and waiting invitations.
+
+### Changed
+- **The app and the tray no longer poll.** The daemon pushes its status, its transfers and what
+  changed over one control connection (`Request::Subscribe`), and the window reloads the page on
+  screen when that page's data changes, including changes made with the `pdfs` CLI. A hidden
+  window keeps the changes and catches up when it is focused. Front-ends fall back to polling a
+  daemon that predates subscriptions until its service restarts.
+- **Refresh buttons are gone** from the page headers now that pages follow the daemon. F5 and
+  Ctrl+R still reload the page from the server.
+- **Photos timeline scrubber.** A strip along the right edge of the timeline shows the years
+  and appears when the pointer comes near or the timeline scrolls. Hovering names the month
+  under the pointer, and dragging jumps to it. It replaces the slider above the grid and the
+  scrollbar.
+- **Upload is a split button** on the Photos page. Its menu holds "Import from Google Photos…",
+  and the page menu keeps "Find Duplicates…".
+- **Quieter photo tiles.** Hovering enlarges the thumbnail slightly instead of lifting the tile
+  with a shadow, and tiles no longer show a tooltip. Tiles are reused while scrolling rather than
+  rebuilt for every row.
+- **Newer libadwaita widgets where available.** On libadwaita 1.8 or newer the app uses its
+  spinner, toggle groups, button rows and shortcuts dialog, and on older releases it keeps
+  look-alike stand-ins. The choice is made at run time, so every package gets them and the app
+  still builds and runs on libadwaita 1.5. Set `PDFS_STAND_IN_WIDGETS=1` to see the stand-ins
+  on a newer system.
+- **Sync page views.** Overview holds the status, conflicts, transfers and queue; Folders holds
+  the folder list, with a short explanation of the sync modes; History is the former Activity
+  page. A banner points back to Overview when changes fail or conflict. Each folder is one card
+  with a Synced / Online only switch, and switching either way asks first.
+- **Activity reads better.** Temporary files that editors save through are hidden (a menu shows
+  them again), runs of similar events fold into one expandable row, entries are full translated
+  sentences, and "Show Older" reaches further back.
+- **Computers** lists every computer in one group, this one first. "Use This Computer's
+  Identity" is now "Continue This Backup Here", with an explanation in its dialog, and "never
+  synced" reads "no backups yet".
+- **Pages stay up while they reload.** A loading state shows only when a reply takes longer than
+  300 ms, and a refresh keeps the selection, scroll position and thumbnails.
+- **One glossary.** "Proton Drive service" replaces "mount service" and "daemon", and "Online
+  only" replaces "On-demand"; dialogs use title case, and dates and sizes are formatted one way.
+- **Bundled icons** replace glyphs that stock icon themes lack or draw ambiguously.
+
+### Fixed
+- **Enabling, disabling or restarting the service no longer freezes the window.**
+- **A daemon that runs but doesn't answer** reads as "Not responding" instead of disconnected,
+  and requests to it give up after 5 s instead of 120 s.
+- The Sync and share-link icons drew only half of themselves on recent GTK versions.
+
 ## [2.4.0] — 2026-09-28
 
 Schema: **34**. Photos gain a `similar_hash` column for the similar-photo finder. It stays
