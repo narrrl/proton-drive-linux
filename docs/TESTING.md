@@ -159,6 +159,23 @@ in `pdfs sync list`. Use `PDFS_ACCEPTANCE_SYNC_TIMEOUT` to extend transition
 timeouts and `PDFS_ACCEPTANCE_PDFS` to select a non-installed CLI binary, for
 example `target/debug/pdfs`.
 
+After the contract, each mode pair also runs the move cases (`--list` shows
+them as `managed`). They move trees between the two folders in both
+directions, move several sources in one `pdfs move`, and pass a tree through
+My files and out again. Every case waits for Drive before and after the move.
+It then checks that the tree is only at the destination, that every byte
+arrived, and that neither side made conflict copies. The refusal cases prove
+that nothing moves and nothing is lost when:
+
+- the destination already has the name;
+- a folder would move into itself;
+- a mirror source holds something Drive lacks (a symlink);
+- a file in an on-demand source is still open for writing.
+
+The My files case writes a test folder into your real My files and removes it
+afterwards. It skips when the daemon reports no My files mount, or when the
+locations are on different volumes.
+
 ### Durability drill
 
 `--durability` restarts `proton-drive.service` in the middle of the suite and

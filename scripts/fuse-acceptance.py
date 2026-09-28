@@ -1384,9 +1384,9 @@ class Run:
 REPORT: list[Run] = []
 
 
-def select_cases(kind: str) -> list[Case]:
+def select_cases(kind: str, pool: list[Case] | None = None) -> list[Case]:
     selected = os.environ.get("PDFS_ACCEPTANCE_ONLY")
-    cases = [case for case in TESTS if kind in case.kinds]
+    cases = [case for case in (TESTS if pool is None else pool) if kind in case.kinds]
     if not selected:
         return cases
     needle = selected.lower()
@@ -1395,7 +1395,7 @@ def select_cases(kind: str) -> list[Case]:
     # simply has nothing to do. Only a filter that matches *no case at all* is a
     # typo worth failing on.
     check(
-        any(needle in case.name.lower() for case in TESTS),
+        any(needle in case.name.lower() for case in TESTS + MOVE_CASES),
         f"PDFS_ACCEPTANCE_ONLY={selected!r} matched no tests",
     )
     return [case for case in cases if needle in case.name.lower()]
@@ -1927,6 +1927,340 @@ class ManagedSyncPair:
                 print(f"WARNING: could not remove managed sentinel {sentinel}: {error}")
 
 
+# --------------------------------------------------------------------------
+# Moves between locations
+# --------------------------------------------------------------------------
+
+
+class Location:
+    """One place a move can start or end: a managed folder, or My files."""
+
+    def __init__(self, name: str, folder: Path, mode: str, pair: ManagedSyncPair) -> None:
+        self.name = name
+        self.folder = folder
+        self.mode = mode
+        self.pair = pair
+        self.root = folder / f"pdfs-acceptance-{uuid.uuid4().hex}"
+
+    def settle(self) -> None:
+        """Wait until Drive holds everything written here so far."""
+        self.pair.wait_for_queue()
+        if self.mode == "mirror":
+            self.pair.force_sync(self.folder)
+
+    def conflict_copies(self) -> list[str]:
+        found = []
+        for directory, dirs, files in os.walk(self.root):
+            found.extend(
+                str(Path(directory) / name) for name in dirs + files if "(sync-conflict" in name
+            )
+        return found
+
+
+class MoveContext:
+    def __init__(self, first: Location, second: Location, myfiles: Location | None) -> None:
+        self.first = first
+        self.second = second
+        self.myfiles = myfiles
+        self.pair = first.pair
+
+    def move(self, *paths: Path) -> subprocess.CompletedProcess:
+        """`pdfs move`, bounded: a wedged mount must not hang the harness."""
+        command = [self.pair.pdfs, "move", *(str(path) for path in paths)]
+        result = subprocess.run(
+            command, text=True, capture_output=True, timeout=self.pair.timeout
+        )
+        detail = result.stderr.strip() or result.stdout.strip()
+        if result.returncode and "different Proton Drive volumes" in detail:
+            raise Skip(f"the locations are on different volumes: {detail}")
+        return result
+
+    def move_ok(self, *paths: Path) -> None:
+        result = self.move(*paths)
+        check(
+            result.returncode == 0,
+            f"pdfs move {' '.join(map(str, paths))} failed: "
+            f"{result.stderr.strip() or result.stdout.strip()}",
+        )
+
+    def move_refused(self, *paths: Path) -> str:
+        result = self.move(*paths)
+        detail = result.stderr.strip() or result.stdout.strip()
+        check(
+            result.returncode != 0,
+            f"pdfs move {' '.join(map(str, paths))} should have been refused: {detail}",
+        )
+        return detail
+
+
+def _move_tree(root: Path, name: str) -> dict[Path, bytes]:
+    """A small tree worth moving: nesting, an empty file, and a file spanning
+    several content blocks, all with bytes unique to this run."""
+    tag = uuid.uuid4().bytes
+    files = {
+        Path(name) / "note.txt": b"moved note " + tag,
+        Path(name) / "nested" / "large.bin": hashlib.sha256(tag).digest() * (330 * 1024 // 32)
+        + os.urandom(4099),
+        Path(name) / "nested" / "deeper" / "empty.txt": b"",
+    }
+    for relative, data in files.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        write_durable(root / relative, data)
+    (root / name / "empty-dir").mkdir()
+    return files
+
+
+def _await_tree(dest: Location, name: str, files: dict[Path, bytes]) -> None:
+    for relative, data in files.items():
+        wait_for_copy(dest.root, relative, hashlib.sha256(data).hexdigest(), dest.pair.timeout)
+    deadline = time.monotonic() + dest.pair.timeout
+    while not (dest.root / name / "empty-dir").is_dir():
+        check(time.monotonic() < deadline, f"{dest.name}: empty folder did not arrive")
+        time.sleep(1)
+
+
+def _check_moved(source: Location, dest: Location, name: str, files: dict[Path, bytes]) -> None:
+    """After both sides have synced again: the tree is only at the destination,
+    byte-for-byte, and neither side made conflict copies of it."""
+    source.settle()
+    dest.settle()
+    check(
+        not (source.root / name).exists(),
+        f"{source.name}: {name} came back after moving it to {dest.name}",
+    )
+    for relative, data in files.items():
+        check_bytes(read(dest.root / relative), data, f"{dest.name}: {relative} after the move")
+    for location in (source, dest):
+        copies = location.conflict_copies()
+        check(not copies, f"{location.name}: the move left conflict copies: {copies}")
+
+
+def _moves_between(mc: MoveContext, source: Location, dest: Location) -> None:
+    name = f"tree-{uuid.uuid4().hex[:8]}"
+    files = _move_tree(source.root, name)
+    source.settle()
+    mc.move_ok(source.root / name, dest.root)
+    check(not (source.root / name).exists(), f"{source.name}: {name} is still there after the move")
+    _await_tree(dest, name, files)
+    _check_moved(source, dest, name, files)
+
+
+def test_move_folder_first_to_second(mc: MoveContext) -> None:
+    _moves_between(mc, mc.first, mc.second)
+
+
+def test_move_folder_second_to_first(mc: MoveContext) -> None:
+    _moves_between(mc, mc.second, mc.first)
+
+
+def test_move_several_sources_at_once(mc: MoveContext) -> None:
+    source, dest = mc.first, mc.second
+    tag = uuid.uuid4().hex[:8]
+    files = {
+        Path(f"one-{tag}.txt"): b"first of several " + tag.encode(),
+        Path(f"two-{tag}.bin"): os.urandom(70_001),
+        Path(f"dir-{tag}") / "inside.txt": b"inside " + tag.encode(),
+    }
+    for relative, data in files.items():
+        (source.root / relative).parent.mkdir(parents=True, exist_ok=True)
+        write_durable(source.root / relative, data)
+    source.settle()
+    tops = sorted({relative.parts[0] for relative in files})
+    mc.move_ok(*(source.root / top for top in tops), dest.root)
+    for relative, data in files.items():
+        wait_for_copy(dest.root, relative, hashlib.sha256(data).hexdigest(), dest.pair.timeout)
+    source.settle()
+    dest.settle()
+    for top in tops:
+        check(not (source.root / top).exists(), f"{source.name}: {top} came back after the move")
+    for relative, data in files.items():
+        check_bytes(read(dest.root / relative), data, f"{dest.name}: {relative} after the move")
+
+
+def test_move_through_my_files(mc: MoveContext) -> None:
+    if mc.myfiles is None:
+        raise Skip("the daemon reports no My files mount")
+    name = f"tree-{uuid.uuid4().hex[:8]}"
+    files = _move_tree(mc.first.root, name)
+    mc.first.settle()
+    mc.move_ok(mc.first.root / name, mc.myfiles.root)
+    _await_tree(mc.myfiles, name, files)
+    _check_moved(mc.first, mc.myfiles, name, files)
+    mc.move_ok(mc.myfiles.root / name, mc.second.root)
+    _await_tree(mc.second, name, files)
+    _check_moved(mc.myfiles, mc.second, name, files)
+
+
+def _unchanged(location: Location, files: dict[Path, bytes], what: str) -> None:
+    for relative, data in files.items():
+        check_bytes(read(location.root / relative), data, f"{location.name}: {relative} {what}")
+
+
+def test_move_refuses_a_name_taken_at_the_destination(mc: MoveContext) -> None:
+    source, dest = mc.first, mc.second
+    name = f"clash-{uuid.uuid4().hex[:8]}.txt"
+    ours, theirs = b"source side " + name.encode(), b"destination side " + name.encode()
+    write_durable(source.root / name, ours)
+    write_durable(dest.root / name, theirs)
+    source.settle()
+    dest.settle()
+    mc.move_refused(source.root / name, dest.root)
+    source.settle()
+    dest.settle()
+    _unchanged(source, {Path(name): ours}, "after a refused move")
+    _unchanged(dest, {Path(name): theirs}, "after a refused move")
+
+
+def test_move_refuses_a_folder_into_itself(mc: MoveContext) -> None:
+    source = mc.first
+    name = f"self-{uuid.uuid4().hex[:8]}"
+    files = {Path(name) / "sub" / "kept.txt": b"kept " + name.encode()}
+    (source.root / name / "sub").mkdir(parents=True)
+    write_durable(source.root / name / "sub" / "kept.txt", files[Path(name) / "sub" / "kept.txt"])
+    source.settle()
+    mc.move_refused(source.root / name, source.root / name / "sub")
+    source.settle()
+    _unchanged(source, files, "after refusing to move it into itself")
+
+
+def test_move_refuses_a_mirror_copy_drive_lacks(mc: MoveContext) -> None:
+    source, dest = next(
+        ((a, b) for a, b in ((mc.first, mc.second), (mc.second, mc.first)) if a.mode == "mirror"),
+        (None, None),
+    )
+    if source is None:
+        raise Skip("needs a mirror source")
+    name = f"unsynced-{uuid.uuid4().hex[:8]}"
+    files = {Path(name) / "data.txt": b"synced " + name.encode()}
+    (source.root / name).mkdir()
+    write_durable(source.root / name / "data.txt", files[Path(name) / "data.txt"])
+    # Sync skips symlinks, so Drive never gets this one: removing the local
+    # copy after a move would lose it.
+    os.symlink("data.txt", source.root / name / "link")
+    source.settle()
+    detail = mc.move_refused(source.root / name, dest.root)
+    check("not fully synced" in detail, f"unexpected refusal: {detail}")
+    check((source.root / name / "link").is_symlink(), "the symlink was lost by a refused move")
+    _unchanged(source, files, "after a refused move")
+    dest.settle()
+    check(not (dest.root / name).exists(), f"{dest.name}: {name} appeared after a refused move")
+
+
+def test_move_refuses_a_file_still_being_written(mc: MoveContext) -> None:
+    source, dest = next(
+        ((a, b) for a, b in ((mc.first, mc.second), (mc.second, mc.first)) if a.mode == "ondemand"),
+        (None, None),
+    )
+    if source is None:
+        raise Skip("needs an on-demand source")
+    name = f"open-{uuid.uuid4().hex[:8]}"
+    path = source.root / name / "open.txt"
+    path.parent.mkdir()
+    write_durable(path, b"before")
+    source.settle()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(fd, b" and after")
+        mc.move_refused(source.root / name, dest.root)
+    finally:
+        os.fsync(fd)
+        os.close(fd)
+    source.settle()
+    _unchanged(source, {Path(name) / "open.txt": b"before and after"}, "after a refused move")
+    dest.settle()
+    check(not (dest.root / name).exists(), f"{dest.name}: {name} appeared after a refused move")
+
+
+# Only --managed-live has two locations of its own to move between.
+MOVE_CASES = [
+    Case("move a folder from the first location to the second", test_move_folder_first_to_second, (LIVE,)),
+    Case("move a folder from the second location to the first", test_move_folder_second_to_first, (LIVE,)),
+    Case("move several sources in one command", test_move_several_sources_at_once, (LIVE,)),
+    Case("move into My files and out again", test_move_through_my_files, (LIVE,)),
+    Case("move refuses a name taken at the destination", test_move_refuses_a_name_taken_at_the_destination, (LIVE,)),
+    Case("move refuses a folder into itself", test_move_refuses_a_folder_into_itself, (LIVE,)),
+    Case("move refuses a mirror copy Drive lacks", test_move_refuses_a_mirror_copy_drive_lacks, (LIVE,)),
+    Case("move refuses a file still being written", test_move_refuses_a_file_still_being_written, (LIVE,)),
+]
+
+
+def _my_files(pair: ManagedSyncPair) -> Path | None:
+    try:
+        status = json.loads(pair.command("status", json_output=True))
+    except Exception as error:  # noqa: BLE001 - My files is optional here
+        print(f"WARNING: could not ask the daemon for My files: {error}")
+        return None
+    mountpoint = (status.get("mount") or {}).get("mountpoint")
+    if not mountpoint or not is_mountpoint(Path(mountpoint)):
+        return None
+    path = Path(mountpoint).resolve()
+    return None if path in pair.paths else path
+
+
+def run_move_contract(
+    pair: ManagedSyncPair, modes: tuple[str, str], timeout: int, fail_fast: bool
+) -> Run:
+    """Move trees between the two managed folders, and through My files.
+
+    Every case waits for Drive before and after, so a pass here means the move
+    happened on Drive, the content arrived intact, and no side put anything
+    back or made conflict copies.
+    """
+    first = Location("first", pair.paths[0], modes[0], pair)
+    second = Location("second", pair.paths[1], modes[1], pair)
+    my_files = _my_files(pair)
+    myfiles = Location("My files", my_files, "ondemand", pair) if my_files else None
+    locations = [first, second] + ([myfiles] if myfiles else [])
+    label = f"managed move {modes[0]}/{modes[1]}"
+    run = Run(label, LIVE, first.root)
+    REPORT.append(run)
+    print(f"[target] {label}")
+    try:
+        for location in locations:
+            reap_stale_roots(location.folder, int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600")))
+            location.root.mkdir()
+        for location in locations:
+            location.settle()
+        context = MoveContext(first, second, myfiles)
+        for case in select_cases(LIVE, MOVE_CASES):
+            started = time.monotonic()
+            print(f"  [test] {case.name}")
+            try:
+                with time_limit(timeout, case.name):
+                    case.run(context)
+            except Skip as reason:
+                print(f"    SKIP  {reason}")
+                run.results.append(
+                    Result(case.name, label, "skip", time.monotonic() - started, str(reason))
+                )
+                continue
+            except TestTimeout as reason:
+                print(f"    TIMEOUT  {reason}")
+                run.results.append(
+                    Result(case.name, label, "timeout", time.monotonic() - started, str(reason))
+                )
+                break
+            except BaseException as error:  # noqa: BLE001 - reported, then continued
+                detail = f"{type(error).__name__}: {error}"
+                print(f"    FAIL  {detail}")
+                run.results.append(Result(case.name, label, "fail", time.monotonic() - started, detail))
+                if fail_fast:
+                    raise
+                continue
+            elapsed = time.monotonic() - started
+            print(f"    ok    {elapsed:.2f}s")
+            run.results.append(Result(case.name, label, "pass", elapsed))
+            run.ran.add(case.name)
+    finally:
+        for location in locations:
+            try:
+                pair.remove_tree(location.root)
+                location.settle()
+            except Exception as error:  # noqa: BLE001 - cleanup must reach every root
+                print(f"WARNING: could not remove {location.root}: {error}")
+    return run
+
+
 def is_mountpoint(path: Path) -> bool:
     """True for a distinct mount, including FUSE mounts over an existing dir."""
     return os.path.ismount(path)
@@ -1965,6 +2299,12 @@ def run_managed_matrix(paths: list[Path], reference: Run, args) -> None:
                 pair.wait_for_queue()
                 # Mirror changes are asynchronous; force and await a pass before
                 # changing its mode so authored bytes/deletions cannot be lost.
+                if mode == "mirror":
+                    pair.force_sync(path)
+            # A pass settles Drive several times over, so it gets the sync
+            # timeout per settle rather than the per-case filesystem limit.
+            run_move_contract(pair, modes, max(args.timeout, 8 * timeout), args.fail_fast)
+            for path, mode in zip(pair.paths, modes, strict=True):
                 if mode == "mirror":
                     pair.force_sync(path)
     finally:
@@ -2041,6 +2381,8 @@ def main() -> int:
     if args.list:
         for case in TESTS:
             print(f"{','.join(case.kinds):<18} {case.name}")
+        for case in MOVE_CASES:
+            print(f"{'managed':<18} {case.name}")
         return 0
 
     journal = JournalWatch(os.environ.get("PDFS_ACCEPTANCE_UNIT", "proton-drive.service"))
