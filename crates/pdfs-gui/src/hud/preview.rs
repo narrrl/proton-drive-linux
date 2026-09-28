@@ -38,11 +38,17 @@ impl Detail {
             .valign(gtk4::Align::Start)
             .build();
         title.add_css_class("preview-key");
+        // A wrapping label asks for its whole text on one line as its natural
+        // width, which would widen the pane and squeeze the results. Capping it
+        // keeps the pane at its fixed width; long values wrap, then ellipsize.
         let value = gtk4::Label::builder()
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .lines(3)
+            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
             .build();
         value.add_css_class("preview-value");
         grid.attach(&title, 0, row, 1, 1);
@@ -85,6 +91,8 @@ fn action(icon: &str, label: &str, accelerator: &str) -> (gtk4::Button, gtk4::La
         .label(label)
         .xalign(0.0)
         .hexpand(true)
+        .max_width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
     content.append(&text);
     let shortcut = gtk4::ShortcutLabel::new(accelerator);
@@ -112,6 +120,7 @@ impl Preview {
             .xalign(0.0)
             .wrap(true)
             .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .max_width_chars(1)
             .lines(3)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
@@ -120,6 +129,7 @@ impl Preview {
 
         let kind = gtk4::Label::builder()
             .xalign(0.0)
+            .max_width_chars(1)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
         kind.add_css_class("preview-kind");
@@ -186,6 +196,7 @@ impl Preview {
         let root = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .width_request(PREVIEW_WIDTH)
+            .hexpand(false)
             .build();
         root.add_css_class("preview");
         root.append(&stack);
@@ -242,6 +253,7 @@ impl Preview {
 
         let location = hit.location();
         self.location.set(Some(&location));
+        self.location.value.set_tooltip_text(Some(&location));
 
         match availability(hit) {
             Some((icon, class, text)) => {
