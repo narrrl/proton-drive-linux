@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 34;
+pub(super) const SCHEMA_VERSION: i64 = 35;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -314,6 +314,22 @@ impl Db {
             )? > 0;
             if has_photos && !has_column {
                 tx.execute_batch(MIGRATION_V34)?;
+            }
+        }
+        if current < 35 {
+            // Same guards as V26-V34.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('trash') WHERE name = 'trashed_at'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_trash: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'trash'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_trash && !has_column {
+                tx.execute_batch(MIGRATION_V35)?;
             }
         }
         tx.execute(
@@ -1032,4 +1048,14 @@ UPDATE photos SET resolved_at = NULL;
 /// thumbnails arrive and when the similar-photo finder asks for the rest.
 const MIGRATION_V34: &str = "
 ALTER TABLE photos ADD COLUMN similar_hash INTEGER;
+";
+
+/// Schema v35: when each trashed node went to the trash.
+///
+/// The API does not tell this client, so `trashed_at` is when the daemon first
+/// saw the node in the trash, in epoch seconds. `NULL` when it cannot say: rows
+/// from before this version, and nodes found by a refresh that did not follow a
+/// complete one, which may have been in the trash for a long time already.
+const MIGRATION_V35: &str = "
+ALTER TABLE trash ADD COLUMN trashed_at INTEGER;
 ";

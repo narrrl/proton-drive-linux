@@ -583,6 +583,7 @@ fn trash_replace_lists_folders_first() {
             size: 10,
             mtime: 1,
             parent_uid: Some("t2".into()),
+            trashed_at: Some(100),
         },
         StoredTrash {
             uid: "t2".into(),
@@ -591,6 +592,7 @@ fn trash_replace_lists_folders_first() {
             size: 0,
             mtime: 2,
             parent_uid: None,
+            trashed_at: None,
         },
     ])
     .unwrap();
@@ -612,6 +614,15 @@ fn trash_replace_lists_folders_first() {
             ("t2".to_string(), None),
         ]
     );
+
+    // The first-seen times round-trip, unknown ones included.
+    let mut seen: Vec<_> = db.trash_seen().unwrap().into_iter().collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("t1".to_string(), Some(100)), ("t2".to_string(), None)]
+    );
+    assert_eq!(items[1].trashed_at, Some(100));
 
     // A replace is a replace: emptying the trash on the server empties it here.
     db.trash_replace(&[]).unwrap();

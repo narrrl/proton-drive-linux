@@ -3,15 +3,14 @@ use crate::*;
 pub(crate) struct TrashState {
     // Trash page. Trashed nodes are addressed by uid, not by path, so this page
     // keeps no current-directory state — it re-lists from the daemon on show.
-    pub(crate) model: gio::ListStore,
+    pub(crate) files: FileList,
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
-    /// Empties the trash; insensitive while it is empty (or unread).
+    /// Empties the trash; hidden while it is empty (or unread).
     pub(crate) empty: gtk4::Button,
     /// "12 items" under the page title.
     pub(crate) subtitle: adw::WindowTitle,
-    pub(crate) selection: gtk4::MultiSelection,
     /// The bottom bar acting on the selection; revealed while anything is selected.
     pub(crate) selection_bar: gtk4::Revealer,
     pub(crate) selection_label: gtk4::Label,
@@ -21,33 +20,30 @@ pub(crate) struct TrashState {
 
 /// The widgets of the Trash page that a load repaints.
 pub(crate) struct TrashWidgets {
-    pub(crate) model: gio::ListStore,
-    pub(crate) list: gtk4::ListView,
+    pub(crate) files: FileList,
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     pub(crate) empty: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
     pub(crate) subtitle: adw::WindowTitle,
-    pub(crate) selection: gtk4::MultiSelection,
     pub(crate) selection_bar: gtk4::Revealer,
     pub(crate) selection_label: gtk4::Label,
     pub(crate) restore_selected: gtk4::Button,
     pub(crate) delete_selected: gtk4::Button,
 }
 
-/// The Trash page: a flat list of everything Drive is holding in the trash, each
-/// row offering Restore and Delete Forever, with Empty Trash in the header. A
-/// selection (click, Shift/Ctrl+click, Ctrl+A) gets the same two actions in a
-/// bottom bar.
+/// The Trash page: everything Drive is holding in the trash, as a list with
+/// the folder each item came from and when it was deleted, or as a grid, where
+/// photos are easier to recognise. Restore and Delete Permanently sit in the
+/// right-click menu and, for a selection, in a bottom bar; Empty Trash is in
+/// the header while there is something to empty.
 ///
-/// A trashed node has no path inside the mount — the daemon forgets it when it is
-/// trashed — so unlike the Files page this one addresses entries by uid and always
-/// re-lists from the server rather than from a cached listing. Row rendering needs
-/// the [`Ui`] handle for its buttons, so the factory is installed in [`wire_trash`].
+/// A trashed node has no path inside the mount — the daemon forgets it when it
+/// is trashed — so unlike the Files page this one addresses entries by uid. The
+/// list's factories need the [`Ui`] handle, so they are installed in
+/// [`wire_trash`].
 pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
-    let model = gio::ListStore::new::<BoxedAnyObject>();
-
     let empty = gtk4::Button::builder()
         .label(gettext("Empty Trash…"))
         .tooltip_text(gettext("Permanently delete everything in the Trash"))
@@ -69,28 +65,27 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
         .build();
     status.add_css_class("compact");
 
-    // Bulk Delete Forever always confirms with the count, so a stale selection
-    // can't delete anything silently.
-    let selection = gtk4::MultiSelection::new(Some(model.clone()));
-    let list = gtk4::ListView::builder().model(&selection).build();
-    let scroll = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .child(&list)
-        .build();
+    // The list first: where an item came from and when it went are what tell
+    // two copies of a file apart here.
+    let files = FileList::new();
+    files.show_list(true);
+    let layout = layout_button(&files);
 
     let content = gtk4::Stack::new();
     content.set_vexpand(true);
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
-    content.add_named(&scroll, Some("list"));
+    content.add_named(&files.views, Some("list"));
     content.add_named(&status, Some("status"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    inner.set_margin_top(18);
-    inner.set_margin_bottom(18);
-    inner.set_margin_start(18);
-    inner.set_margin_end(18);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
     inner.append(&content);
 
+    // Bulk Delete Permanently always confirms with the count, so a stale
+    // selection can't delete anything silently.
     let selection_label = gtk4::Label::new(None);
     let restore_selected = gtk4::Button::with_label(&pgettext("verb", "Restore"));
     let delete_selected = gtk4::Button::with_label(&gettext("Delete Permanently…"));
@@ -108,19 +103,18 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     let (frame, header, subtitle) = page_frame(&gettext("Trash"), &inner);
     header.pack_start(&empty);
     header.pack_end(&refresh);
+    header.pack_end(&layout);
 
     (
         frame.upcast(),
         TrashWidgets {
-            model,
-            list,
+            files,
             content,
             status,
             retry,
             empty,
             refresh,
             subtitle,
-            selection,
             selection_bar,
             selection_label,
             restore_selected,
@@ -129,142 +123,144 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     )
 }
 
-/// Install the row factory and the Empty Trash button. The row's two buttons read
-/// the entry off the [`gtk4::ListItem`] they were clicked on rather than a
-/// captured copy, so a recycled row always acts on the item it currently shows.
+/// Install the list's factories and columns, the Empty Trash button and the
+/// selection bar.
 pub(crate) fn wire_trash(ui: &Rc<Ui>, widgets: &TrashWidgets) {
-    let list = &widgets.list;
-    let empty = &widgets.empty;
-    let factory = gtk4::SignalListItemFactory::new();
-    let ui_setup = ui.clone();
-    factory.connect_setup(move |_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-
-        let thumbnail = file_thumbnail_widget(40, 32);
-        let name = gtk4::Label::builder()
-            .halign(gtk4::Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
-            .build();
-        let meta = gtk4::Label::builder().halign(gtk4::Align::Start).build();
-        meta.add_css_class("dim-label");
-        meta.add_css_class("caption");
-        let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-        text.set_hexpand(true);
-        text.set_valign(gtk4::Align::Center);
-        text.append(&name);
-        text.append(&meta);
-
-        let restore = gtk4::Button::builder()
-            .icon_name("edit-undo-symbolic")
-            .tooltip_text(gettext("Restore to its original folder"))
-            .valign(gtk4::Align::Center)
-            .build();
-        restore.add_css_class("flat");
-        let purge = gtk4::Button::builder()
-            .icon_name("edit-delete-symbolic")
-            .tooltip_text(gettext("Delete permanently"))
-            .valign(gtk4::Align::Center)
-            .build();
-        purge.add_css_class("flat");
-
-        let ui_restore = ui_setup.clone();
-        let item_restore = item.clone();
-        restore.connect_clicked(move |_| {
-            if let Some(entry) = bound_entry(&item_restore) {
-                restore_entry(&ui_restore, &entry);
+    let files = &ui.trash.files;
+    files.wire(
+        ui,
+        FileListBehavior {
+            activate: activate_trashed,
+            entry_menu: trash_entry_menu,
+            bulk_menu: trash_bulk_menu,
+            background_menu: trash_background_menu,
+            badges: false,
+            drag_and_drop: false,
+        },
+    );
+    files
+        .column_view
+        .append_column(&text_column(&gettext("Original Location"), |e| {
+            trashed_from_label(e)
+        }));
+    files
+        .column_view
+        .append_column(&text_column(&pgettext("column", "Deleted"), |e| {
+            if e.trashed_at > 0 {
+                dates::relative(e.trashed_at)
+            } else {
+                "—".to_string()
             }
-        });
-        let ui_purge = ui_setup.clone();
-        let item_purge = item.clone();
-        purge.connect_clicked(move |_| {
-            if let Some(entry) = bound_entry(&item_purge) {
-                prompt_delete_forever(&ui_purge, std::slice::from_ref(&entry));
+        }));
+    files
+        .column_view
+        .append_column(&text_column(&pgettext("column", "Size"), |e| {
+            if e.is_dir {
+                "—".to_string()
+            } else {
+                human_bytes(e.size)
             }
-        });
-
-        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-        row.set_margin_top(6);
-        row.set_margin_bottom(6);
-        row.set_margin_start(6);
-        row.set_margin_end(6);
-        row.append(&thumbnail);
-        row.append(&text);
-        row.append(&restore);
-        row.append(&purge);
-        item.set_child(Some(&row));
-    });
-    factory.connect_bind({
-        let ui = ui.clone();
-        move |_, item| {
-            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let Some(entry) = bound_entry(item) else {
-                return;
-            };
-            let row = item.child().and_downcast::<gtk4::Box>().unwrap();
-            let Some(thumbnail) = row.first_child().and_downcast::<gtk4::Overlay>() else {
-                return;
-            };
-            bind_file_thumbnail(&ui, &thumbnail, &entry, true);
-            let Some(text) = thumbnail.next_sibling().and_downcast::<gtk4::Box>() else {
-                return;
-            };
-            if let Some(name) = text.first_child().and_downcast::<gtk4::Label>() {
-                name.set_label(&entry.name);
-            }
-            if let Some(meta) = text.last_child().and_downcast::<gtk4::Label>() {
-                let kind = if entry.is_dir {
-                    gettext("Folder")
-                } else {
-                    human_bytes(entry.size)
-                };
-                let modified = dates::short_date(entry.modified);
-                // Translators: {kind} is "Folder" or a file size; {modified} is a date.
-                let text = gettext_f(
-                    "{kind} · {modified}",
-                    &[("kind", &kind), ("modified", &modified)],
-                );
-                meta.set_label(&text);
-            }
-        }
-    });
-    list.set_factory(Some(&factory));
+        }));
 
     let ui_empty = ui.clone();
-    empty.connect_clicked(move |_| prompt_empty_trash(&ui_empty));
+    widgets
+        .empty
+        .connect_clicked(move |_| prompt_empty_trash(&ui_empty));
 
     let ui_sel = ui.clone();
-    widgets
+    files
         .selection
         .connect_selection_changed(move |_, _, _| sync_trash_selection(&ui_sel));
     let ui_restore = ui.clone();
     widgets.restore_selected.connect_clicked(move |_| {
-        let entries = selected_trash(&ui_restore);
+        let entries = ui_restore.trash.files.selected();
         if !entries.is_empty() {
             restore_entries(&ui_restore, &entries);
         }
     });
     let ui_delete = ui.clone();
     widgets.delete_selected.connect_clicked(move |_| {
-        let entries = selected_trash(&ui_delete);
+        let entries = ui_delete.trash.files.selected();
         if !entries.is_empty() {
             prompt_delete_forever(&ui_delete, &entries);
         }
     });
 }
 
-/// The trashed entries currently selected, in list order.
-fn selected_trash(ui: &Rc<Ui>) -> Vec<DirEntry> {
-    let selected = ui.trash.selection.selection();
-    (0..selected.size())
-        .filter_map(|i| ui.trash.model.item(selected.nth(i as u32)))
-        .filter_map(|obj| obj.downcast::<BoxedAnyObject>().ok())
-        .map(|obj| obj.borrow::<DirEntry>().clone())
-        .collect()
+/// Where a trashed entry goes back to on restore, for the Original Location
+/// column.
+fn trashed_from_label(entry: &DirEntry) -> String {
+    match entry.trashed_from.as_deref() {
+        None => "—".to_string(),
+        Some("") => gettext("My files"),
+        Some(path) => path.to_string(),
+    }
+}
+
+/// A trashed file can't be opened; say what would let it be.
+fn activate_trashed(ui: &Rc<Ui>, entry: &DirEntry) {
+    toast(
+        ui,
+        // Translators: {name} is a file or folder name.
+        &gettext_f("Restore “{name}” to open it", &[("name", &entry.name)]),
+    );
+}
+
+fn trash_entry_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item(&pgettext("verb", "Restore"), move || {
+        restore_entries(&ui_c, std::slice::from_ref(&entry_c))
+    });
+    menu.section();
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item(&gettext("Delete Permanently…"), move || {
+        prompt_delete_forever(&ui_c, std::slice::from_ref(&entry_c))
+    });
+    menu
+}
+
+fn trash_bulk_menu(ui: &Rc<Ui>, entries: Vec<DirEntry>) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    menu.labelled_section(&ngettext_f(
+        "{n} selected",
+        "{n} selected",
+        entries.len() as u64,
+        &[],
+    ));
+    let (ui_c, batch) = (ui.clone(), entries.clone());
+    menu.item(&pgettext("verb", "Restore"), move || {
+        restore_entries(&ui_c, &batch)
+    });
+    menu.section();
+    let ui_c = ui.clone();
+    menu.item(&gettext("Delete Permanently…"), move || {
+        prompt_delete_forever(&ui_c, &entries)
+    });
+    menu
+}
+
+fn trash_background_menu(ui: &Rc<Ui>) -> ActionMenu {
+    let mut menu = ActionMenu::new();
+    let ui_c = ui.clone();
+    menu.item(&gettext("Select All"), move || {
+        ui_c.trash.files.selection.select_all();
+    });
+    let ui_c = ui.clone();
+    menu.item(&gettext("Refresh"), move || reload_current_page(&ui_c));
+    if ui.trash.files.model.n_items() > 0 {
+        menu.section();
+        let ui_c = ui.clone();
+        menu.item(&gettext("Empty Trash…"), move || {
+            prompt_empty_trash(&ui_c)
+        });
+    }
+    menu
 }
 
 /// Reveal the selection bar while anything is selected and count what is.
 fn sync_trash_selection(ui: &Rc<Ui>) {
-    let count = ui.trash.selection.selection().size() as usize;
+    let count = ui.trash.files.selection.selection().size() as usize;
     ui.trash.selection_bar.set_reveal_child(count > 0);
     if count > 0 {
         ui.trash.selection_label.set_label(&ngettext_f(
@@ -274,14 +270,6 @@ fn sync_trash_selection(ui: &Rc<Ui>) {
             &[],
         ));
     }
-}
-
-/// The [`DirEntry`] a list item is currently bound to, or `None` for an unbound
-/// (recycled) row.
-pub(crate) fn bound_entry(item: &gtk4::ListItem) -> Option<DirEntry> {
-    let obj = item.item().and_downcast::<BoxedAnyObject>()?;
-    let entry = obj.borrow::<DirEntry>().clone();
-    Some(entry)
 }
 
 /// Fetch the trash listing and repaint the page.
@@ -352,8 +340,8 @@ pub(crate) fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &s
     ui.trash.subtitle.set_subtitle("");
 }
 
-/// Repopulate the trash list, most recently modified first — the order in which a
-/// user looks for what they just deleted.
+/// Repopulate the trash, most recently deleted first: the order in which a user
+/// looks for what they just deleted.
 pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
     // An empty Trash has nothing to empty, so the button goes away rather than
     // sitting there greyed out.
@@ -379,43 +367,67 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ));
 
     let mut sorted = entries.to_vec();
-    sorted.sort_by_key(|e| std::cmp::Reverse(e.modified));
+    sort_trash(&mut sorted);
     // Only the rows that changed are swapped, so a refresh keeps the
     // selection and the scroll position.
-    replace_items(&ui.trash.model, &sorted);
+    replace_items(&ui.trash.files.model, &sorted);
     sync_trash_selection(ui);
+}
+
+/// Newest deletion first. Entries with no known deletion time go last, newest
+/// modification first among themselves.
+fn sort_trash(entries: &mut [DirEntry]) {
+    entries.sort_by_key(|e| {
+        (
+            e.trashed_at == 0,
+            std::cmp::Reverse(e.trashed_at),
+            std::cmp::Reverse(e.modified),
+        )
+    });
 }
 
 /// Drop every row, and with them the selection and its bar.
 fn clear_trash(ui: &Rc<Ui>) {
-    ui.trash.model.remove_all();
+    ui.trash.files.model.remove_all();
     sync_trash_selection(ui);
 }
 
-/// Restore one trashed entry to the folder it was trashed from.
-pub(crate) fn restore_entry(ui: &Rc<Ui>, entry: &DirEntry) {
-    restore_entries(ui, std::slice::from_ref(entry));
-}
-
-/// Restore trashed entries to the folders they were trashed from.
+/// Restore trashed entries to the folders they were trashed from. When they
+/// all came from one known folder, the toast offers to show it.
 pub(crate) fn restore_entries(ui: &Rc<Ui>, entries: &[DirEntry]) {
-    run_mutation(
+    let message = match entries {
+        // Translators: {name} is a file or folder name.
+        [one] => gettext_f("Restored “{name}”", &[("name", &one.name)]),
+        _ => ngettext_f(
+            "Restored {n} item",
+            "Restored {n} items",
+            entries.len() as u64,
+            &[],
+        ),
+    };
+    let folder = common_origin(entries);
+    run_mutation_then(
         ui,
         Request::Restore {
             uids: entries.iter().map(|e| e.uid.clone()).collect(),
         },
-        match entries {
-            // Translators: {name} is a file or folder name.
-            [one] => gettext_f("Restored “{name}”", &[("name", &one.name)]),
-            _ => ngettext_f(
-                "Restored {n} item",
-                "Restored {n} items",
-                entries.len() as u64,
-                &[],
-            ),
-        },
         gettext_noop("Couldn't restore"),
+        move |ui| match folder {
+            Some(folder) => toast_action(ui, &message, &gettext("Show"), move |ui| {
+                open_in_my_files(ui, folder.clone())
+            }),
+            None => toast(ui, &message),
+        },
     );
+}
+
+/// The folder every entry goes back to, when that is one known folder.
+fn common_origin(entries: &[DirEntry]) -> Option<String> {
+    let first = entries.first()?.trashed_from.clone()?;
+    entries
+        .iter()
+        .all(|e| e.trashed_from.as_deref() == Some(first.as_str()))
+        .then_some(first)
 }
 
 /// Confirm, then permanently delete trashed entries. Irreversible, so it asks.
@@ -475,7 +487,7 @@ pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entries: &[DirEntry]) {
 /// Confirm, then permanently delete everything in the trash.
 pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let count = ui.trash.model.n_items();
+    let count = ui.trash.files.model.n_items();
     let dialog = adw::AlertDialog::builder()
         .heading(gettext("Empty Trash?"))
         .body(ngettext_f(
@@ -503,4 +515,60 @@ pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
         }
     });
     dialog.present(win.as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trashed(name: &str, trashed_at: i64, modified: i64, from: Option<&str>) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            is_dir: false,
+            size: 0,
+            modified,
+            pinned: false,
+            cached: false,
+            uid: name.into(),
+            path: String::new(),
+            role: String::new(),
+            shared_by: String::new(),
+            shared_at: 0,
+            shared_by_unverified: false,
+            trashed_at,
+            trashed_from: from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn trash_lists_newest_deletion_first_and_undated_last() {
+        let mut entries = vec![
+            trashed("undated-old", 0, 1, None),
+            trashed("older", 10, 50, None),
+            trashed("undated-new", 0, 9, None),
+            trashed("newest", 20, 5, None),
+        ];
+        sort_trash(&mut entries);
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["newest", "older", "undated-new", "undated-old"]);
+    }
+
+    #[test]
+    fn restore_offers_a_folder_only_when_all_share_one() {
+        let docs = trashed("a", 1, 1, Some("Documents"));
+        let docs2 = trashed("b", 1, 1, Some("Documents"));
+        let root = trashed("c", 1, 1, Some(""));
+        let unknown = trashed("d", 1, 1, None);
+        assert_eq!(
+            common_origin(&[docs.clone(), docs2]).as_deref(),
+            Some("Documents")
+        );
+        assert_eq!(
+            common_origin(std::slice::from_ref(&root)).as_deref(),
+            Some("")
+        );
+        assert_eq!(common_origin(&[docs.clone(), root]), None);
+        assert_eq!(common_origin(&[docs, unknown]), None);
+        assert_eq!(common_origin(&[]), None);
+    }
 }

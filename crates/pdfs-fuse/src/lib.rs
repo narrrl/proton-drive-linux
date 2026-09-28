@@ -271,6 +271,12 @@ const PHOTOS_AVAILABLE: &str = "photos_available";
 const ALBUMS_SYNCED_MS: &str = "albums_synced_ms";
 const ALBUM_SYNCED_PREFIX: &str = "album_synced_ms:";
 const TRASH_SYNCED_MS: &str = "trash_synced_ms";
+/// Set when a trash refresh finishes and cleared when one starts, so it is only
+/// present while the stored listing is the whole trash as of some moment. A node
+/// that a refresh finds and that listing lacks went to the trash since then; one
+/// found after an interrupted refresh may have been there all along. Unlike
+/// [`TRASH_SYNCED_MS`], our own mutations leave it alone.
+const TRASH_COMPLETE_MS: &str = "trash_complete_ms";
 const SHARED_WITH_ME_NAME: &str = "shared_with_me_name";
 const SHARED_WITH_ME_SYNCED_MS: &str = "shared_with_me_synced_ms";
 const SHARED_FOLDER_SYNCED_PREFIX: &str = "shared_folder_synced_ms:";
@@ -3815,6 +3821,8 @@ impl Core {
                 shared_by: String::new(),
                 shared_at: 0,
                 shared_by_unverified: false,
+                trashed_at: 0,
+                trashed_from: None,
             })
             .collect())
     }
@@ -4406,12 +4414,21 @@ impl Core {
             self.await_trash_refresh(TRASH_FIRST_WAIT);
         }
 
+        // Most of a trash comes from a handful of folders.
+        let mut origins: HashMap<String, Option<String>> = HashMap::new();
         Ok(self
             .db
             .trash_list()
             .map_err(CoreError::from)?
             .into_iter()
             .map(|item| DirEntry {
+                trashed_from: item.parent_uid.as_ref().and_then(|parent| {
+                    origins
+                        .entry(parent.clone())
+                        .or_insert_with(|| self.db.node_path(parent).ok().flatten())
+                        .clone()
+                }),
+                trashed_at: item.trashed_at.unwrap_or(0),
                 name: item.name,
                 is_dir: item.is_dir,
                 size: item.size.max(0) as u64,
@@ -4450,6 +4467,18 @@ impl Core {
             "trash refresh: enumerated"
         );
 
+        // What the listing held before, and whether it was the whole trash: the
+        // chunks below overwrite it, so both are read up front.
+        let seen = self.db.trash_seen().unwrap_or_default();
+        let complete = self
+            .db
+            .state_i64(TRASH_COMPLETE_MS)
+            .ok()
+            .flatten()
+            .is_some();
+        let _ = self.db.clear_state(TRASH_COMPLETE_MS);
+        let now = now_secs();
+
         if uids.is_empty() {
             self.db.trash_replace(&[]).map_err(CoreError::from)?;
         }
@@ -4470,6 +4499,7 @@ impl Core {
                 // The folder the node will go back to, which is also what tells
                 // a restore whether that folder is itself in the trash.
                 parent_uid: node.parent_uid.as_ref().map(|uid| uid.to_string()),
+                trashed_at: first_seen_in_trash(&seen, &node.uid.to_string(), complete, now),
             }));
             // Cumulative, so the table is always a prefix of the real trash
             // rather than a mix of this refresh and the last one.
@@ -4484,6 +4514,7 @@ impl Core {
         }
 
         let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
+        let _ = self.db.set_state_i64(TRASH_COMPLETE_MS, now_ms());
         info!(
             count = items.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -4997,6 +5028,7 @@ fn public_link_info(link: proton_drive_rs::PublicLink) -> PublicLinkInfo {
         role: role_to_str(link.role).to_string(),
         expires: link.expiration_time,
         has_password: link.has_custom_password,
+        created: link.creation_time,
     }
 }
 
@@ -5426,6 +5458,25 @@ fn node_size(node: &Node) -> u64 {
             total_size_on_storage,
             ..
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+    }
+}
+
+/// When a node a trash refresh found went to the trash, as far as the daemon
+/// can tell. A node the stored listing already had keeps the time it had. A new
+/// one went there since the last refresh, so now is close, but only when that
+/// refresh saw the whole trash (`complete`): after a first or interrupted one,
+/// a node missing from the listing may be years old, and no date beats a wrong
+/// one.
+fn first_seen_in_trash(
+    seen: &HashMap<String, Option<i64>>,
+    uid: &str,
+    complete: bool,
+    now: i64,
+) -> Option<i64> {
+    match seen.get(uid) {
+        Some(at) => *at,
+        None if complete => Some(now),
+        None => None,
     }
 }
 
@@ -6220,8 +6271,8 @@ mod tests {
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
         SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
         accepted_share_provenance, conflict_name, copy_pending_for_truncate, expand_restore,
-        fuse_name, is_stale_mount, node_visible, note_self_change, orphan_past_retention,
-        parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        first_seen_in_trash, fuse_name, is_stale_mount, node_visible, note_self_change,
+        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
         publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
         release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
         rename_needs_queue, require_node_parent_access, require_rename_access,
@@ -6362,6 +6413,18 @@ mod tests {
             expand_restore(&uids(&["dir", "file"]), &trash),
             vec![vec!["dir".to_string()], vec!["file".to_string()]]
         );
+    }
+
+    /// A node keeps the time it was first seen in the trash; a new one is dated
+    /// now only when the previous refresh saw the whole trash.
+    #[test]
+    fn trash_dates_are_kept_and_only_guessed_after_a_complete_refresh() {
+        let seen = HashMap::from([("old".to_string(), Some(5)), ("unknown".to_string(), None)]);
+        assert_eq!(first_seen_in_trash(&seen, "old", true, 9), Some(5));
+        assert_eq!(first_seen_in_trash(&seen, "old", false, 9), Some(5));
+        assert_eq!(first_seen_in_trash(&seen, "unknown", true, 9), None);
+        assert_eq!(first_seen_in_trash(&seen, "new", true, 9), Some(9));
+        assert_eq!(first_seen_in_trash(&seen, "new", false, 9), None);
     }
 
     /// A parent chain that loops back on itself must terminate.

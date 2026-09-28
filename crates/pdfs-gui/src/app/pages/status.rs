@@ -642,8 +642,10 @@ pub(crate) fn wire_settings(
         let on = row.is_active();
         set_proton_theme(on);
         // Folders swap their icon with the theme; have every row bound again.
-        let rows = ui_theme.browser.model.n_items();
-        ui_theme.browser.model.items_changed(0, rows, rows);
+        for list in file_lists(&ui_theme) {
+            let rows = list.model.n_items();
+            list.model.items_changed(0, rows, rows);
+        }
         let mut config = ui_theme.dirs.load_config();
         config.proton_theme = Some(on);
         if let Err(e) = ui_theme.dirs.save_config(&config) {

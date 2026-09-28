@@ -214,19 +214,6 @@ pub(crate) fn bind_file_thumbnail(
     schedule_file_thumbs(ui);
 }
 
-/// Create and immediately bind a thumbnail for a non-recycled row.
-pub(crate) fn file_thumbnail(
-    ui: &Rc<Ui>,
-    entry: &DirEntry,
-    size: i32,
-    fallback_size: i32,
-    symbolic_fallback: bool,
-) -> gtk4::Overlay {
-    let widget = file_thumbnail_widget(size, fallback_size);
-    bind_file_thumbnail(ui, &widget, entry, symbolic_fallback);
-    widget
-}
-
 /// Whether the file name denotes an image format for which Proton or the local
 /// decoder can reasonably provide a thumbnail.
 pub(crate) fn is_image_name(name: &str) -> bool {

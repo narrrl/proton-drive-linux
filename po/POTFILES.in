@@ -19,6 +19,7 @@ crates/pdfs-gui/src/app/pages/takeout.rs
 crates/pdfs-gui/src/app/pages/trash.rs
 crates/pdfs-gui/src/app/pages/verify.rs
 crates/pdfs-gui/src/app/widgets/details.rs
+crates/pdfs-gui/src/app/widgets/file_list.rs
 crates/pdfs-gui/src/app/widgets/menu.rs
 crates/pdfs-gui/src/app/widgets/share_dialog.rs
 crates/pdfs-gui/src/app/widgets/thumbnails.rs

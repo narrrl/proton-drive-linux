@@ -3364,6 +3364,8 @@ mod login_wait_tests {
             shared_by: String::new(),
             shared_at: 0,
             shared_by_unverified: false,
+            trashed_at: 0,
+            trashed_from: None,
         };
         assert_eq!(shared_by_line(&entry), None, "no invitation, no line");
         entry.shared_by = "alice@proton.me".into();

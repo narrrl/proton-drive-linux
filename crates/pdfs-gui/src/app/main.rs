@@ -26,6 +26,7 @@ use pages::trash::*;
 use pages::verify::*;
 use reload::{LoadTicket, Loader, replace_items};
 use widgets::details::*;
+use widgets::file_list::*;
 use widgets::menu::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
@@ -563,7 +564,7 @@ fn build_window(app: &adw::Application) {
             transfer_batch: RefCell::new(None),
         },
         browser: BrowserState {
-            model: browser_widgets.model.clone(),
+            files: browser_widgets.files.clone(),
             history: RefCell::new(Vec::new()),
             future: RefCell::new(Vec::new()),
             crumb: browser_widgets.crumb.clone(),
@@ -588,8 +589,6 @@ fn build_window(app: &adw::Application) {
             search_source: RefCell::new(None),
             loader: Loader::new(&browser_widgets.content),
             listed: RefCell::new(None),
-            views: browser_widgets.views.clone(),
-            column_view: browser_widgets.column_view.clone(),
             bulk: browser_widgets.bulk.clone(),
             bulk_label: browser_widgets.bulk_label.clone(),
             bulk_trash: browser_widgets.bulk_trash.clone(),
@@ -599,23 +598,20 @@ fn build_window(app: &adw::Application) {
             empty_actions: browser_widgets.empty_actions.clone(),
             summary: browser_widgets.summary.clone(),
             zoom: browser_widgets.zoom.clone(),
-            grid_thumbnail_size: Cell::new(GRID_THUMB_DEFAULT),
-            grid_tiles: RefCell::new(Vec::new()),
         },
         details: DetailsState {
             details: browser_widgets.details,
             details_entry: RefCell::new(None),
             details_suppress: Cell::new(false),
-            selection: browser_widgets.selection.clone(),
+            selection: browser_widgets.files.selection.clone(),
         },
         trash: TrashState {
-            model: trash_widgets.model.clone(),
+            files: trash_widgets.files.clone(),
             content: trash_widgets.content.clone(),
             status: trash_widgets.status.clone(),
             retry: trash_widgets.retry.clone(),
             empty: trash_widgets.empty.clone(),
             subtitle: trash_widgets.subtitle.clone(),
-            selection: trash_widgets.selection.clone(),
             selection_bar: trash_widgets.selection_bar.clone(),
             selection_label: trash_widgets.selection_label.clone(),
             loader: Loader::new(&trash_widgets.content),
@@ -708,31 +704,8 @@ fn build_window(app: &adw::Application) {
             select_trash: gallery_widgets.select_trash.clone(),
             select_album: gallery_widgets.select_album.clone(),
         },
-        shared: SharedState {
-            content: shared_widgets.content.clone(),
-            status: shared_widgets.status.clone(),
-            retry: shared_widgets.retry.clone(),
-            with_me_group: shared_widgets.shared_with_me.clone(),
-            invitations_group: shared_widgets.invitations.clone(),
-            bookmarks_group: shared_widgets.bookmarks.clone(),
-            title: shared_widgets.title.clone(),
-            back: shared_widgets.back.clone(),
-            add_bookmark: shared_widgets.add_bookmark.clone(),
-            nav: RefCell::new(Vec::new()),
-            rows: RefCell::new(Vec::new()),
-            loader: Loader::new(&shared_widgets.content),
-            listed: RefCell::new(None),
-            loaded_at: Cell::new(None),
-        },
-        shared_by_me: SharedByMeState {
-            content: shared_by_me_widgets.content.clone(),
-            status: shared_by_me_widgets.status.clone(),
-            retry: shared_by_me_widgets.retry.clone(),
-            group: shared_by_me_widgets.group.clone(),
-            rows: RefCell::new(Vec::new()),
-            loader: Loader::new(&shared_by_me_widgets.content),
-            loaded_at: Cell::new(None),
-        },
+        shared: SharedState::new(&shared_widgets),
+        shared_by_me: SharedByMeState::new(&shared_by_me_widgets),
         devices: DevicesState {
             content: devices_widgets.content.clone(),
             status: devices_widgets.status.clone(),
@@ -820,7 +793,7 @@ fn build_window(app: &adw::Application) {
         &main_widgets.mountpoint_button,
     );
     wire_sidebar(&ui);
-    wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
+    wire_browser(&ui);
     wire_bulk(
         &ui,
         &browser_widgets.bulk_clear,
@@ -844,8 +817,8 @@ fn build_window(app: &adw::Application) {
     wire_albums(&ui);
     wire_places(&ui);
     wire_trash(&ui, &trash_widgets);
-    wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
-    wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
+    wire_shared(&ui, &shared_widgets);
+    wire_shared_by_me(&ui, &shared_by_me_widgets);
     wire_devices(&ui, &devices_widgets.retry);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
     wire_activity(&ui, &activity_widgets);
@@ -1094,11 +1067,21 @@ fn page_frame(
     content: &impl IsA<gtk4::Widget>,
 ) -> (adw::ToolbarView, adw::HeaderBar, adw::WindowTitle) {
     let window_title = adw::WindowTitle::new(title, "");
+    let (toolbar, header) = page_frame_with(&window_title, content);
+    (toolbar, header, window_title)
+}
+
+/// [`page_frame`] with `title` in the header's title slot instead of a plain
+/// title, such as a view switcher.
+fn page_frame_with(
+    title: &impl IsA<gtk4::Widget>,
+    content: &impl IsA<gtk4::Widget>,
+) -> (adw::ToolbarView, adw::HeaderBar) {
     let spinner = gtk4::Spinner::new();
     spinner.set_visible(false);
     BUSY_SPINNERS.with(|spinners| spinners.borrow_mut().push(spinner.clone()));
     let title_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    title_box.append(&window_title);
+    title_box.append(title);
     title_box.append(&spinner);
 
     let header = adw::HeaderBar::new();
@@ -1106,7 +1089,7 @@ fn page_frame(
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(content));
-    (toolbar, header, window_title)
+    (toolbar, header)
 }
 
 /// The sidebar destination a page belongs under. Most pages are their own
@@ -1693,6 +1676,7 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let alt = state.contains(gtk4::gdk::ModifierType::ALT_MASK);
         let on_browser = ui.stack.visible_child_name().as_deref() == Some("browser");
+        let on_trash = ui.stack.visible_child_name().as_deref() == Some("trash");
         match key {
             // Refresh works on every page, so it is matched before the
             // browser-only bindings.
@@ -1708,20 +1692,18 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 ui.browser.search.grab_focus();
             }
             gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
-            gtk4::gdk::Key::_1 if ctrl && on_browser => set_files_view(
+            gtk4::gdk::Key::_1 | gtk4::gdk::Key::_2 if ctrl && on_browser => set_files_view(
                 &ui,
                 FilesView {
-                    list: false,
+                    list: key == gtk4::gdk::Key::_2,
                     ..ui.browser.view.get()
                 },
             ),
-            gtk4::gdk::Key::_2 if ctrl && on_browser => set_files_view(
-                &ui,
-                FilesView {
-                    list: true,
-                    ..ui.browser.view.get()
-                },
-            ),
+            gtk4::gdk::Key::_1 | gtk4::gdk::Key::_2 if ctrl && visible_file_list(&ui).is_some() => {
+                if let Some(list) = visible_file_list(&ui) {
+                    list.show_list(key == gtk4::gdk::Key::_2);
+                }
+            }
             gtk4::gdk::Key::Left if alt && on_browser => {
                 ui.browser.actions.activate_action("back", None)
             }
@@ -1737,14 +1719,21 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 ui.browser.actions.activate_action("back", None)
             }
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
-            gtk4::gdk::Key::Menu if on_browser => popup_keyboard_context_menu(&ui),
+            gtk4::gdk::Key::Menu if visible_file_list(&ui).is_some() => {
+                if let Some(list) = visible_file_list(&ui) {
+                    list.popup_keyboard_menu(&ui);
+                }
+            }
             gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter if alt && on_browser => {
                 toggle_details(&ui)
             }
             gtk4::gdk::Key::F10
-                if on_browser && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) =>
+                if visible_file_list(&ui).is_some()
+                    && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) =>
             {
-                popup_keyboard_context_menu(&ui)
+                if let Some(list) = visible_file_list(&ui) {
+                    list.popup_keyboard_menu(&ui);
+                }
             }
             gtk4::gdk::Key::F2 if on_browser => {
                 // Renaming is one name at a time; saying so beats a key that
@@ -1764,6 +1753,12 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                     trash_entries(&ui, entries);
                 }
             }
+            gtk4::gdk::Key::Delete if on_trash => {
+                let entries = ui.trash.files.selected();
+                if !entries.is_empty() {
+                    prompt_delete_forever(&ui, &entries);
+                }
+            }
             gtk4::gdk::Key::Escape
                 if on_browser
                     && (ui.browser.split.shows_sidebar() || ui.browser.bulk.reveals_child()) =>
@@ -1772,6 +1767,15 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 sync_bulk_bar(&ui);
                 clear_details(&ui);
                 ui.details.details.toggle.set_active(false);
+            }
+            gtk4::gdk::Key::Escape
+                if !on_browser
+                    && visible_file_list(&ui)
+                        .is_some_and(|list| list.selection.selection().size() > 0) =>
+            {
+                if let Some(list) = visible_file_list(&ui) {
+                    list.selection.unselect_all();
+                }
             }
             _ => return glib::Propagation::Proceed,
         }

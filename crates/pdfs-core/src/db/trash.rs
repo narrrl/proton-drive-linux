@@ -1,5 +1,7 @@
 //! Trashed nodes, persisted so the trash view opens without a round-trip.
 
+use std::collections::HashMap;
+
 use rusqlite::params;
 
 use super::Db;
@@ -15,6 +17,9 @@ pub struct StoredTrash {
     /// row written before schema v29, and for a node whose parent the server
     /// did not report.
     pub parent_uid: Option<String>,
+    /// When the daemon first saw the node in the trash, epoch seconds. `None`
+    /// when it cannot say (see schema v35).
+    pub trashed_at: Option<i64>,
 }
 
 impl Db {
@@ -24,8 +29,8 @@ impl Db {
         tx.execute("DELETE FROM trash", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO trash (uid, name, is_dir, size, mtime, parent_uid) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO trash (uid, name, is_dir, size, mtime, parent_uid, trashed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for item in items {
                 stmt.execute(params![
@@ -34,7 +39,8 @@ impl Db {
                     item.is_dir as i64,
                     item.size,
                     item.mtime,
-                    item.parent_uid
+                    item.parent_uid,
+                    item.trashed_at
                 ])?;
             }
         }
@@ -47,7 +53,7 @@ impl Db {
     pub fn trash_list(&self) -> Result<Vec<StoredTrash>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "SELECT uid, name, is_dir, size, mtime, parent_uid FROM trash
+            "SELECT uid, name, is_dir, size, mtime, parent_uid, trashed_at FROM trash
              ORDER BY is_dir DESC, name COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -58,6 +64,7 @@ impl Db {
                 size: r.get(3)?,
                 mtime: r.get(4)?,
                 parent_uid: r.get(5)?,
+                trashed_at: r.get(6)?,
             })
         })?;
         let mut items = Vec::new();
@@ -79,6 +86,20 @@ impl Db {
             pairs.push(row?);
         }
         Ok(pairs)
+    }
+
+    /// When each node now in the trash was first seen there, keyed by uid, so
+    /// a refresh can carry the times over into the listing it writes.
+    pub fn trash_seen(&self) -> Result<HashMap<String, Option<i64>>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare("SELECT uid, trashed_at FROM trash")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut seen = HashMap::new();
+        for row in rows {
+            let (uid, at) = row?;
+            seen.insert(uid, at);
+        }
+        Ok(seen)
     }
 
     // ---- device sync (devices.md) -----------------------------------------

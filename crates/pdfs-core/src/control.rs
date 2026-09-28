@@ -905,7 +905,7 @@ pub struct ShareEntry {
 }
 
 /// A node's public link (in [`Response::Share`] / [`Response::PublicLink`]).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PublicLinkInfo {
     /// Public-link id — the handle for [`Request::RemovePublicLink`].
     pub id: String,
@@ -918,6 +918,9 @@ pub struct PublicLinkInfo {
     pub expires: Option<i64>,
     /// Whether a custom password additionally protects the link.
     pub has_password: bool,
+    /// When the link was made, epoch seconds; 0 when unknown.
+    #[serde(default)]
+    pub created: i64,
 }
 
 /// One invitation addressed to me (in [`Response::Invitations`]).
@@ -950,7 +953,7 @@ pub struct BookmarkInfo {
 /// the share's state so the "Shared" view renders in one pass: how many people
 /// have access, how many invitations are still pending, and the public link if
 /// the node has one.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SharedItem {
     /// Node uid in `volume~link` form — the handle for opening the node's share
     /// (via its mount path) or its details.
@@ -1138,6 +1141,16 @@ pub struct DirEntry {
     /// warning worth showing.
     #[serde(default)]
     pub shared_by_unverified: bool,
+    /// When a [`Request::ListTrash`] entry went to the trash, epoch seconds; 0
+    /// when unknown, and for anything not in the trash. The API does not report
+    /// it to this client, so the daemon notes when it first saw the node there.
+    #[serde(default)]
+    pub trashed_at: i64,
+    /// The folder a [`Request::ListTrash`] entry goes back to on restore, as a
+    /// mountpoint-relative path (`""` for the root). `None` when that folder is
+    /// not known, and for anything not in the trash.
+    #[serde(default)]
+    pub trashed_from: Option<String>,
 }
 
 /// One hit in a [`Request::Search`] result. Like [`DirEntry`] but carries the

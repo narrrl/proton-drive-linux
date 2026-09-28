@@ -407,6 +407,15 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         );
     });
 
+    // Shared by me lists what this dialog changes: reload it when it is the
+    // page underneath, and have the next visit fetch otherwise.
+    let ui_closed = ui.clone();
+    dialog.connect_closed(move |_| {
+        ui_closed.shared_by_me.loaded_at.set(None);
+        if ui_closed.stack.visible_child_name().as_deref() == Some("sharedbyme") {
+            load_shared_by_me(&ui_closed);
+        }
+    });
     share_dialog_reload(&state);
     dialog.present(ui_window(ui).as_ref());
 }

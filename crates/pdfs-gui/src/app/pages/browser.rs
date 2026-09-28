@@ -3,8 +3,8 @@ use crate::*;
 
 pub(crate) struct BrowserState {
     // Files (browser) page.
-    /// Shared model behind the grid and column views; repopulated per directory.
-    pub(crate) model: gio::ListStore,
+    /// The grid and list; the model is repopulated per directory.
+    pub(crate) files: FileList,
     /// Folders left by navigating, newest last, and folders left by going back:
     /// the `files.back` and `files.forward` history. Up is Alt+Up or a
     /// breadcrumb.
@@ -60,10 +60,6 @@ pub(crate) struct BrowserState {
     /// hits or nothing. Reloading this folder keeps the rows up and usable;
     /// loading any other greys them out until the new ones arrive.
     pub(crate) listed: RefCell<Option<String>>,
-    /// The grid/list view stack, read to find out which view is on screen.
-    pub(crate) views: gtk4::Stack,
-    /// The list view, whose Location column shows only for search hits.
-    pub(crate) column_view: gtk4::ColumnView,
     /// The bulk-action bar, revealed once more than one entry is selected.
     pub(crate) bulk: gtk4::Revealer,
     pub(crate) bulk_label: gtk4::Label,
@@ -81,10 +77,6 @@ pub(crate) struct BrowserState {
     /// zoom value, and Proton account storage usage.
     pub(crate) summary: gtk4::Label,
     pub(crate) zoom: gtk4::Scale,
-    pub(crate) grid_thumbnail_size: Cell<i32>,
-    /// Weak references to realised grid cells. Zoom resizes only these visible,
-    /// recycled surfaces instead of invalidating the whole list model.
-    pub(crate) grid_tiles: RefCell<Vec<(glib::WeakRef<gtk4::Overlay>, glib::WeakRef<gtk4::Label>)>>,
 }
 
 /// Idle pause after the last keystroke before a search query is sent, so typing
@@ -102,11 +94,8 @@ pub(crate) const GRID_THUMB_DEFAULT: i32 = 72;
 pub(crate) const GRID_THUMB_STEP: i32 = 8;
 
 /// The Files page: a Nautilus-style file manager. A back/breadcrumb header with
-/// a grid/list view toggle sits over a [`gtk4::Stack`] that swaps between an
-/// **icon grid** ([`gtk4::GridView`]) and a **column list** ([`gtk4::ColumnView`]
-/// with Name / Size / Modified columns). Both views are driven by one shared
-/// [`gio::ListStore`] of [`BoxedAnyObject`]-wrapped [`DirEntry`]s, so a directory
-/// load repopulates the model once and both views update.
+/// a grid/list view toggle sits over a [`FileList`] with Name / Size / Modified
+/// columns, so a directory load repopulates one model and both views update.
 ///
 /// The factories that render entries — and the columns — need the [`Ui`] handle
 /// for activation and the right-click menu, so they're installed later in
@@ -117,10 +106,8 @@ pub(crate) const GRID_THUMB_STEP: i32 = 8;
 /// so "this folder is empty" and "the mount is down" read as first-class states
 /// rather than a stray line above a blank grid.
 pub(crate) struct BrowserWidgets {
-    pub(crate) model: gio::ListStore,
+    pub(crate) files: FileList,
     pub(crate) crumb: gtk4::Box,
-    pub(crate) grid: gtk4::GridView,
-    pub(crate) column_view: gtk4::ColumnView,
     /// Swaps the content area between the grid/list views and the status page.
     pub(crate) content: gtk4::Stack,
     /// The empty/loading/error surface shown in place of the views.
@@ -141,11 +128,6 @@ pub(crate) struct BrowserWidgets {
     /// Wraps the views + the details pane; the pane shows the selection while its header toggle is on.
     pub(crate) split: adw::OverlaySplitView,
     pub(crate) details: DetailsWidgets,
-    /// The selection shared by both views, so a selection change can drive the
-    /// details pane and an action can re-read the entries the user highlighted.
-    pub(crate) selection: gtk4::MultiSelection,
-    /// The grid/list stack, so the page can tell which view is on screen.
-    pub(crate) views: gtk4::Stack,
     pub(crate) bulk: gtk4::Revealer,
     pub(crate) bulk_label: gtk4::Label,
     pub(crate) bulk_trash: gtk4::Button,
@@ -159,8 +141,6 @@ pub(crate) struct BrowserWidgets {
 }
 
 pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
-    let model = gio::ListStore::new::<BoxedAnyObject>();
-
     let back = gtk4::Button::builder()
         .icon_name("go-previous-symbolic")
         .tooltip_text(gettext("Back (Alt+Left)"))
@@ -333,40 +313,8 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .build();
     status.add_css_class("compact");
 
-    // Icon grid. Multi-select: acting on a batch is the common case for trashing
-    // and for taking a folder's worth of files offline, and doing it one
-    // confirmation dialog at a time is not a workflow.
-    // One selection for both views: switching layout keeps what is selected.
-    // Rubberband drags a selection box from empty space, as a file manager does.
-    let selection = gtk4::MultiSelection::new(Some(model.clone()));
-    let grid = gtk4::GridView::builder()
-        .model(&selection)
-        .min_columns(2)
-        .max_columns(32)
-        .enable_rubberband(true)
-        .build();
-    grid.add_css_class("file-grid");
-    let grid_scroll = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .child(&grid)
-        .build();
-
-    // Column list, over the same selection.
-    let column_view = gtk4::ColumnView::builder()
-        .model(&selection)
-        .enable_rubberband(true)
-        .build();
-    column_view.add_css_class("data-table");
-    let column_scroll = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .child(&column_view)
-        .build();
-
-    // Stack swapped by the `files.view` action.
-    let view_stack = gtk4::Stack::new();
-    view_stack.set_vexpand(true);
-    view_stack.add_named(&grid_scroll, Some("grid"));
-    view_stack.add_named(&column_scroll, Some("list"));
+    let files = FileList::new();
+    let view_stack = files.views.clone();
 
     // Outer stack: the views, or the status page when there's nothing to show.
     let content = gtk4::Stack::new();
@@ -520,10 +468,8 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     (
         frame.upcast(),
         BrowserWidgets {
-            model,
+            files,
             crumb,
-            grid,
-            column_view,
             content,
             status,
             retry,
@@ -540,8 +486,6 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             refresh,
             split,
             details,
-            selection,
-            views: view_stack,
             bulk,
             bulk_label,
             bulk_trash,
@@ -570,28 +514,14 @@ pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     clear_details(ui);
 }
 
-/// The selection model shared by the grid and the list.
-pub(crate) fn active_selection(ui: &Rc<Ui>) -> gtk4::MultiSelection {
-    ui.details.selection.clone()
-}
-
-/// Every entry highlighted in the view on screen, in model order.
-///
-/// Walks the model rather than the selection bitset: a listing is at most a few
-/// thousand rows, and asking each position whether it is selected keeps this
-/// free of bitset-iterator lifetimes for no measurable cost.
+/// Every entry highlighted in My files, in model order.
 pub(crate) fn selected_entries(ui: &Rc<Ui>) -> Vec<DirEntry> {
-    let selection = active_selection(ui);
-    let count = selection.n_items();
-    (0..count)
-        .filter(|i| selection.is_selected(*i))
-        .filter_map(|i| entry_at(Some(&selection), i))
-        .collect()
+    ui.browser.files.selected()
 }
 
 /// Drop the selection, which also retracts the bulk bar.
 pub(crate) fn clear_selection(ui: &Rc<Ui>) {
-    ui.details.selection.unselect_all();
+    ui.browser.files.selection.unselect_all();
 }
 
 /// Reflect the current selection in the bulk bar: how many are selected, and
@@ -822,13 +752,6 @@ pub(crate) fn wire_bulk(
         sync_bulk_bar(&ui_clear);
     });
 
-    // Switching views switches which selection is live, so the bar has to be
-    // re-derived rather than left showing the other view's count.
-    let ui_view = ui.clone();
-    ui.browser
-        .views
-        .connect_visible_child_name_notify(move |_| sync_bulk_bar(&ui_view));
-
     let ui_upload = ui.clone();
     empty_upload.connect_clicked(move |_| prompt_upload(&ui_upload));
     let ui_new = ui.clone();
@@ -840,21 +763,27 @@ pub(crate) fn browser_views(ui: &Rc<Ui>) {
     ui.browser.content.set_visible_child_name("views");
 }
 
-/// Install the entry factories, columns, activation handlers and the back
-/// button. Split out from [`build_browser_page`] because every renderer needs
+/// Install the entry factories, columns, activation handlers and the zoom
+/// slider. Split out from [`build_browser_page`] because every renderer needs
 /// the [`Ui`] handle to open entries and raise the context menu.
-pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk4::ColumnView) {
-    attach_background_menu(ui, grid);
-    attach_background_menu(ui, column_view);
-    attach_background_deselect(ui, grid);
-    attach_background_deselect(ui, column_view);
+pub(crate) fn wire_browser(ui: &Rc<Ui>) {
+    let files = &ui.browser.files;
+    files.wire(
+        ui,
+        FileListBehavior {
+            activate: activate_entry,
+            entry_menu: entry_context_menu,
+            bulk_menu: bulk_context_menu,
+            background_menu: background_context_menu,
+            badges: true,
+            drag_and_drop: true,
+        },
+    );
     // Resize only realised grid cells. Rebuilding the whole model for every
     // slider step would repeatedly tear down selection state while the pointer
     // is still moving.
-    let zoom = ui.browser.zoom.clone();
     let ui_zoom = ui.clone();
-    let grid_zoom = grid.clone();
-    zoom.connect_value_changed(move |scale| {
+    ui.browser.zoom.connect_value_changed(move |scale| {
         let size = (scale.value().round() as i32).clamp(GRID_THUMB_MIN, GRID_THUMB_MAX);
         scale.set_tooltip_text(Some(&ngettext_f(
             "Size: {n} pixel",
@@ -862,199 +791,27 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>, grid: &gtk4::GridView, column_view: &gtk
             size as u64,
             &[],
         )));
-        if ui_zoom.browser.grid_thumbnail_size.replace(size) == size {
-            return;
-        }
-        ui_zoom
-            .browser
-            .grid_tiles
-            .borrow_mut()
-            .retain(|(thumbnail_ref, label_ref)| {
-                let (Some(thumbnail), Some(label)) = (thumbnail_ref.upgrade(), label_ref.upgrade())
-                else {
-                    return false;
-                };
-                resize_grid_tile(&thumbnail, &label, size);
-                true
-            });
-        grid_zoom.queue_resize();
+        ui_zoom.browser.files.set_thumbnail_size(size);
     });
 
-    // Grid tiles: a thumbnail over an ellipsized name, with a right-click menu.
-    let factory = gtk4::SignalListItemFactory::new();
-    factory.connect_setup({
-        let ui = ui.clone();
-        move |_, item| {
-            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let size = ui.browser.grid_thumbnail_size.get();
-            let thumbnail = file_thumbnail_widget(size, grid_fallback_size(size));
-            // Keep the sync-state badge inside the thumbnail surface.
-            let badge = gtk4::Image::builder()
-                .pixel_size(18)
-                .halign(gtk4::Align::End)
-                .valign(gtk4::Align::Start)
-                .margin_top(2)
-                .margin_end(2)
-                .build();
-            badge.add_css_class("file-badge");
-            thumbnail.add_overlay(&badge);
-            // `WordChar` rather than the default `Word`: a name with no spaces
-            // offers no word-break opportunity, so word wrapping cannot break it
-            // at all and the label asks for its full natural width instead —
-            // one tile stretches to the width of the window and the grid
-            // collapses to a single column. Allowing a mid-word break is what
-            // keeps the two-line-then-ellipsis budget below enforceable for
-            // *every* name rather than only the ones that happen to have spaces.
-            let label = gtk4::Label::builder()
-                .ellipsize(gtk4::pango::EllipsizeMode::End)
-                .justify(gtk4::Justification::Center)
-                .max_width_chars(13)
-                .width_chars(13)
-                .wrap(true)
-                .wrap_mode(gtk4::pango::WrapMode::WordChar)
-                .lines(2)
-                .build();
-            ui.browser
-                .grid_tiles
-                .borrow_mut()
-                .push((thumbnail.downgrade(), label.downgrade()));
-            let tile = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-            tile.add_css_class("file-tile");
-            tile.append(&thumbnail);
-            tile.append(&label);
-            attach_context_menu(&ui, item, &tile);
-            attach_drag(&ui, item, &tile);
-            attach_drop(&ui, item, &tile);
-            item.set_child(Some(&tile));
-        }
-    });
-    factory.connect_bind({
-        let ui = ui.clone();
-        move |_, item| {
-            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let tile = item.child().and_downcast::<gtk4::Box>().unwrap();
-            let thumbnail = tile.first_child().and_downcast::<gtk4::Overlay>().unwrap();
-            let badge = thumbnail
-                .last_child()
-                .and_downcast::<gtk4::Image>()
-                .unwrap();
-            let label = thumbnail
-                .next_sibling()
-                .and_downcast::<gtk4::Label>()
-                .unwrap();
-            let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-            let entry = obj.borrow::<DirEntry>();
-            let size = ui.browser.grid_thumbnail_size.get();
-            resize_grid_tile(&thumbnail, &label, size);
-            bind_file_thumbnail(&ui, &thumbnail, &entry, false);
-            label.set_label(&entry.name);
-            label.set_tooltip_text(Some(&entry.name));
-            apply_badge(&badge, &entry);
-        }
-    });
-    grid.set_factory(Some(&factory));
-
-    let ui_grid = ui.clone();
-    grid.connect_activate(move |grid, pos| {
-        if let Some(entry) = entry_at(grid.model().as_ref(), pos) {
-            activate_entry(&ui_grid, &entry);
-        }
-    });
-
-    // Column list: Name (icon + label, right-clickable), Size, Modified.
-    column_view.append_column(&name_column(ui));
-    column_view.append_column(&text_column(&pgettext("column", "Size"), |e| {
-        if e.is_dir {
-            "—".to_string()
-        } else {
-            human_bytes(e.size)
-        }
-    }));
-    column_view.append_column(&text_column(&pgettext("column", "Modified"), |e| {
-        dates::short_date(e.modified)
-    }));
+    files
+        .column_view
+        .append_column(&text_column(&pgettext("column", "Size"), |e| {
+            if e.is_dir {
+                "—".to_string()
+            } else {
+                human_bytes(e.size)
+            }
+        }));
+    files
+        .column_view
+        .append_column(&text_column(&pgettext("column", "Modified"), |e| {
+            dates::short_date(e.modified)
+        }));
     // Search hits come from anywhere in the Drive; this says where.
     let location = text_column(&gettext(LOCATION_COLUMN), |e| hit_location(&e.path));
     location.set_visible(false);
-    column_view.append_column(&location);
-
-    let ui_col = ui.clone();
-    column_view.connect_activate(move |view, pos| {
-        if let Some(entry) = entry_at(view.model().as_ref(), pos) {
-            activate_entry(&ui_col, &entry);
-        }
-    });
-}
-
-fn resize_grid_tile(thumbnail: &gtk4::Overlay, label: &gtk4::Label, size: i32) {
-    resize_file_thumbnail(thumbnail, size, grid_fallback_size(size));
-    let name_width = (size / 6 + 1).clamp(8, 24);
-    label.set_width_chars(name_width);
-    label.set_max_width_chars(name_width);
-}
-
-fn grid_fallback_size(thumbnail_size: i32) -> i32 {
-    (thumbnail_size * 8 / 9).clamp(24, thumbnail_size)
-}
-
-/// Build the Name column: a small thumbnail with its local-state badge overlaid,
-/// followed by the name and the same right-click menu the grid tiles carry.
-pub(crate) fn name_column(ui: &Rc<Ui>) -> gtk4::ColumnViewColumn {
-    let factory = gtk4::SignalListItemFactory::new();
-    factory.connect_setup({
-        let ui = ui.clone();
-        move |_, item| {
-            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let thumbnail = file_thumbnail_widget(28, 16);
-            let badge = gtk4::Image::builder()
-                .pixel_size(14)
-                .halign(gtk4::Align::End)
-                .valign(gtk4::Align::Start)
-                .build();
-            badge.add_css_class("file-badge");
-            thumbnail.add_overlay(&badge);
-            // Ellipsized so the Name column can be *narrower* than its longest
-            // name. Without it the label's minimum width is the whole string,
-            // the column inherits that minimum, and one long name pushes Size
-            // and Modified off the right edge of the window for every row.
-            let label = gtk4::Label::builder()
-                .halign(gtk4::Align::Start)
-                .ellipsize(gtk4::pango::EllipsizeMode::End)
-                .build();
-            let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            cell.append(&thumbnail);
-            cell.append(&label);
-            attach_context_menu(&ui, item, &cell);
-            attach_drag(&ui, item, &cell);
-            attach_drop(&ui, item, &cell);
-            item.set_child(Some(&cell));
-        }
-    });
-    factory.connect_bind({
-        let ui = ui.clone();
-        move |_, item| {
-            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-            let cell = item.child().and_downcast::<gtk4::Box>().unwrap();
-            let thumbnail = cell.first_child().and_downcast::<gtk4::Overlay>().unwrap();
-            let badge = thumbnail
-                .last_child()
-                .and_downcast::<gtk4::Image>()
-                .unwrap();
-            let label = thumbnail
-                .next_sibling()
-                .and_downcast::<gtk4::Label>()
-                .unwrap();
-            let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-            let entry = obj.borrow::<DirEntry>();
-            bind_file_thumbnail(&ui, &thumbnail, &entry, true);
-            label.set_label(&entry.name);
-            label.set_tooltip_text(Some(&entry.name));
-            apply_badge(&badge, &entry);
-        }
-    });
-    let column = gtk4::ColumnViewColumn::new(Some(&pgettext("column", "Name")), Some(factory));
-    column.set_expand(true);
-    column
+    files.column_view.append_column(&location);
 }
 
 /// Title of the search-hit folder column, also how the column is found again.
@@ -1070,7 +827,7 @@ fn hit_location(path: &str) -> String {
 
 /// Show the Location column only while the list holds search hits.
 fn show_location_column(ui: &Rc<Ui>, visible: bool) {
-    let columns = ui.browser.column_view.columns();
+    let columns = ui.browser.files.column_view.columns();
     for column in (0..columns.n_items())
         .filter_map(|i| columns.item(i).and_downcast::<gtk4::ColumnViewColumn>())
     {
@@ -1078,141 +835,6 @@ fn show_location_column(ui: &Rc<Ui>, visible: bool) {
             column.set_visible(visible);
         }
     }
-}
-
-/// Build a trailing text column whose cell text is derived from each [`DirEntry`]
-/// by `render`.
-pub(crate) fn text_column(
-    title: &str,
-    render: impl Fn(&DirEntry) -> String + 'static,
-) -> gtk4::ColumnViewColumn {
-    let factory = gtk4::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let label = gtk4::Label::builder().halign(gtk4::Align::Start).build();
-        label.add_css_class("dim-label");
-        item.set_child(Some(&label));
-    });
-    factory.connect_bind(move |_, item| {
-        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-        let label = item.child().and_downcast::<gtk4::Label>().unwrap();
-        let obj = item.item().and_downcast::<BoxedAnyObject>().unwrap();
-        let entry = obj.borrow::<DirEntry>();
-        label.set_label(&render(&entry));
-    });
-    gtk4::ColumnViewColumn::new(Some(title), Some(factory))
-}
-
-/// Attach a secondary-button [`gtk4::GestureClick`] to a cell that pops a context
-/// menu for whatever entry the owning `item` is currently bound to. Capturing the
-/// [`gtk4::ListItem`] (rather than a snapshot of the entry) keeps the menu correct
-/// as the view recycles cells while scrolling. The click is claimed, so the
-/// view's own background menu does not open on top of it.
-pub(crate) fn attach_context_menu(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &gtk4::Box) {
-    let gesture = gtk4::GestureClick::new();
-    gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
-    let ui = ui.clone();
-    let item = item.clone();
-    let target = anchor.clone();
-    gesture.connect_pressed(move |gesture, _, x, y| {
-        gesture.set_state(gtk4::EventSequenceState::Claimed);
-        if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
-            let entry = obj.borrow::<DirEntry>().clone();
-            // Right-clicking a row that is part of a multi-selection acts on the
-            // batch; right-clicking outside one acts on the row, as before.
-            let selected = selected_entries(&ui);
-            if selected.len() > 1 && selected.iter().any(|e| e.uid == entry.uid) {
-                bulk_context_menu(&ui, selected).popup_at(&target, x, y);
-            } else {
-                entry_context_menu(&ui, &entry).popup_at(&target, x, y);
-            }
-        }
-    });
-    anchor.add_controller(gesture);
-}
-
-/// Right-clicking the empty space of a view offers the folder's own actions.
-pub(crate) fn attach_background_menu(ui: &Rc<Ui>, view: &impl IsA<gtk4::Widget>) {
-    let gesture = gtk4::GestureClick::new();
-    gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
-    let ui = ui.clone();
-    let target = view.clone().upcast::<gtk4::Widget>();
-    gesture.connect_pressed(move |_, _, x, y| {
-        background_context_menu(&ui).popup_at(&target, x, y);
-    });
-    view.add_controller(gesture);
-}
-
-/// Clicking the empty space of a view drops the selection, as in a file
-/// manager. GTK's list views leave it alone, so a stray highlight otherwise
-/// sticks around until another item is clicked.
-pub(crate) fn attach_background_deselect(ui: &Rc<Ui>, view: &impl IsA<gtk4::Widget>) {
-    let gesture = gtk4::GestureClick::new();
-    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
-    // Capture sees the press before an item's own gesture claims it; this only
-    // looks, so the item still gets its click.
-    gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let ui = ui.clone();
-    let target = view.clone().upcast::<gtk4::Widget>();
-    gesture.connect_pressed(move |gesture, _, x, y| {
-        let modifiers = gesture.current_event_state();
-        if modifiers
-            .intersects(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK)
-        {
-            return;
-        }
-        if !on_item(&target, x, y) {
-            clear_selection(&ui);
-            sync_bulk_bar(&ui);
-        }
-    });
-    view.add_controller(gesture);
-}
-
-/// Whether `(x, y)` in `view` lands on an item: a grid tile ("child"), a list
-/// row ("row"), or a column header ("header"), which has clicks of its own.
-fn on_item(view: &gtk4::Widget, x: f64, y: f64) -> bool {
-    let mut widget = view.pick(x, y, gtk4::PickFlags::DEFAULT);
-    while let Some(w) = widget {
-        if &w == view {
-            return false;
-        }
-        if matches!(w.css_name().as_str(), "child" | "row" | "header") {
-            return true;
-        }
-        widget = w.parent();
-    }
-    false
-}
-
-/// The Menu key or Shift+F10: the menu for the selection, or for the folder
-/// when nothing is selected, opened at the focused item.
-pub(crate) fn popup_keyboard_context_menu(ui: &Rc<Ui>) {
-    let view = ui
-        .browser
-        .views
-        .visible_child()
-        .unwrap_or_else(|| ui.browser.views.clone().upcast());
-    // The focused cell is where the eye is; without one, the middle of the view.
-    let (x, y) = view
-        .root()
-        .and_then(|root| root.focus())
-        .filter(|focus| focus.is_ancestor(&view))
-        .and_then(|focus| focus.compute_bounds(&view))
-        .map(|b| {
-            (
-                (b.x() + b.width() / 2.0) as f64,
-                (b.y() + b.height() / 2.0) as f64,
-            )
-        })
-        .unwrap_or((view.width() as f64 / 2.0, view.height() as f64 / 2.0));
-    let selected = selected_entries(ui);
-    let menu = match selected.len() {
-        0 => background_context_menu(ui),
-        1 => entry_context_menu(ui, &selected[0]),
-        _ => bulk_context_menu(ui, selected),
-    };
-    menu.popup_at(&view, x, y);
 }
 
 /// The menu for one entry, in the order of `docs/UI_UX_PLAN.md` §6: open,
@@ -1334,7 +956,7 @@ pub(crate) fn background_context_menu(ui: &Rc<Ui>) -> ActionMenu {
     }
     let ui_c = ui.clone();
     menu.item(&gettext("Select All"), move || {
-        active_selection(&ui_c).select_all();
+        ui_c.browser.files.selection.select_all();
     });
     let ui_c = ui.clone();
     menu.item(&gettext("Refresh"), move || reload_listing(&ui_c));
@@ -1795,7 +1417,7 @@ pub(crate) fn set_files_view(ui: &Rc<Ui>, view: FilesView) {
 /// Bring the view stack, the view button and the actions' check marks in line
 /// with `view`.
 fn apply_files_view(ui: &Rc<Ui>, view: FilesView) {
-    ui.browser.views.set_visible_child_name(layout_name(view));
+    ui.browser.files.show_list(view.list);
     // The button offers the other layout, the way a toggle reads.
     ui.browser.view_button.set_icon_name(if view.list {
         "view-grid-symbolic"
@@ -1850,6 +1472,13 @@ pub(crate) fn browse_to(ui: &Rc<Ui>, target: String) {
         ui.browser.future.borrow_mut().clear();
     }
     load_browser(ui);
+}
+
+/// Switch to My files and open `folder`, a mountpoint-relative path.
+pub(crate) fn open_in_my_files(ui: &Rc<Ui>, folder: String) {
+    ui.stack.set_visible_child_name("browser");
+    ui.browser.search.set_text("");
+    browse_to(ui, folder);
 }
 
 /// Back: out of a search first, then to the previous folder.
@@ -2186,6 +1815,17 @@ fn thumbnail_build_failed(ui: &Rc<Ui>) {
 /// `failed` is an untranslated msgid: callers mark it with [`gettext_noop`] and
 /// it is translated here.
 pub(crate) fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'static str) {
+    run_mutation_then(ui, req, failed, move |ui| toast(ui, &done));
+}
+
+/// [`run_mutation`] with the confirmation left to `done`, for an outcome that
+/// deserves more than a plain toast.
+pub(crate) fn run_mutation_then(
+    ui: &Rc<Ui>,
+    req: Request,
+    failed: &'static str,
+    done: impl FnOnce(&Rc<Ui>) + 'static,
+) {
     let failed = gettext(failed);
     if !*ui.mounted.borrow() {
         toast_error(ui, &failed, &gettext("Proton Drive isn't connected."));
@@ -2202,7 +1842,7 @@ pub(crate) fn run_mutation(ui: &Rc<Ui>, req: Request, done: String, failed: &'st
                 // The listing the mutation changed is stale now; reload it, then
                 // confirm, so the toast lands over the updated view.
                 reload_listing(&ui);
-                toast(&ui, &done);
+                done(&ui);
             }
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &failed, &message, kind)
@@ -2830,7 +2470,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     // wrong file.
     let ui_p = ui.clone();
     let placeholder = move || {
-        ui_p.browser.model.remove_all();
+        ui_p.browser.files.model.remove_all();
         ui_p.browser.summary.set_label(&gettext("Loading…"));
         browser_status(
             &ui_p,
@@ -2880,7 +2520,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
 /// (which restarts the service) wouldn't help and isn't offered.
 pub(crate) fn browser_failed(ui: &Rc<Ui>, message: &str, kind: ErrorKind) {
     forget_listing(ui);
-    ui.browser.model.remove_all();
+    ui.browser.files.model.remove_all();
     ui.browser.summary.set_label(&gettext("Folder unavailable"));
     browser_status(
         ui,
@@ -2931,7 +2571,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
             &gettext("Drop files here, or upload a file or create a folder to get started."),
             false,
         );
-        ui.browser.model.remove_all();
+        ui.browser.files.model.remove_all();
         ui.browser.empty_actions.set_visible(true);
         return;
     }
@@ -2941,14 +2581,14 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     sort_entries(&mut sorted, ui.browser.view.get());
     // Only the rows that changed are swapped, so a refresh keeps the
     // selection, the scroll position and the thumbnails already drawn.
-    replace_items(&ui.browser.model, &sorted);
+    replace_items(&ui.browser.files.model, &sorted);
 }
 
 /// Forget which folder the rows belong to and drop the selection, before the
 /// rows stop matching the folder on screen.
 fn forget_listing(ui: &Rc<Ui>) {
     ui.browser.listed.borrow_mut().take();
-    active_selection(ui).unselect_all();
+    clear_selection(ui);
     clear_details(ui);
 }
 
@@ -3013,7 +2653,7 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
     let ui_p = ui.clone();
     let looking_for = query.to_string();
     let ticket = ui.browser.loader.replace(move || {
-        ui_p.browser.model.remove_all();
+        ui_p.browser.files.model.remove_all();
         ui_p.browser.summary.set_label(&gettext("Searching…"));
         browser_status(
             &ui_p,
@@ -3092,7 +2732,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             &gettext("No files or folders match that search."),
             false,
         );
-        ui.browser.model.remove_all();
+        ui.browser.files.model.remove_all();
         return;
     }
     browser_views(ui);
@@ -3112,10 +2752,12 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             shared_by: String::new(),
             shared_at: 0,
             shared_by_unverified: false,
+            trashed_at: 0,
+            trashed_from: None,
         })
         .collect();
     sort_entries(&mut entries, ui.browser.view.get());
-    replace_items(&ui.browser.model, &entries);
+    replace_items(&ui.browser.files.model, &entries);
 }
 
 fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
@@ -3169,6 +2811,8 @@ mod tests {
             shared_by: String::new(),
             shared_at: 0,
             shared_by_unverified: false,
+            trashed_at: 0,
+            trashed_from: None,
         }
     }
 
