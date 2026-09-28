@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Syncing: two arrows chasing each other round a circle. Bundled because
+       Adwaita 50 no longer ships emblem-synchronizing-symbolic. -->
+  <path fill="#222222" d="M 2,8 A 6,6 0 0 1 12.91,4.56 L 11.48,5.56 A 4.25,4.25 0 0 0 3.75,8 Z"/>
+  <path fill="#222222" d="M 14.23,3.64 L 14.03,7.68 L 10.17,6.48 Z"/>
+  <g transform="rotate(180 8 8)">
+    <path fill="#222222" d="M 2,8 A 6,6 0 0 1 12.91,4.56 L 11.48,5.56 A 4.25,4.25 0 0 0 3.75,8 Z"/>
+    <path fill="#222222" d="M 14.23,3.64 L 14.03,7.68 L 10.17,6.48 Z"/>
+  </g>
+</svg>

@@ -1,5 +1,6 @@
 #[path = "../activation.rs"]
 pub(crate) mod activation;
+pub(crate) mod dates;
 #[path = "../i18n.rs"]
 pub(crate) mod i18n;
 pub(crate) mod pages;
@@ -28,7 +29,9 @@ use widgets::share_dialog::*;
 use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
 
-pub(crate) use i18n::{country_name, gettext, gettext_f, gettext_noop, ngettext_f, pgettext};
+pub(crate) use i18n::{
+    country_name, gettext, gettext_f, gettext_noop, human_bytes, ngettext_f, pgettext,
+};
 
 use std::cell::{Cell, RefCell};
 
@@ -71,6 +74,11 @@ const APP_ID: &str = "io.narl.proton-drive-linux";
 
 /// How often the window re-reads mount status, cache usage and the pin list.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// While the window is open but not focused, only every this-many ticks
+/// refreshes (every 10 s). A minimised or hidden window skips them all, and
+/// focusing the window refreshes at once.
+const BACKGROUND_REFRESH_EVERY: u32 = 5;
 
 /// Backoff between auto-retries of a Files/Photos load while the mount service
 /// is still coming up (see [`load_browser`] / [`load_gallery`]).
@@ -520,6 +528,7 @@ fn build_window(app: &adw::Application) {
             account_name: main_widgets.account_name.clone(),
             avatar: main_widgets.avatar.clone(),
             status_icon: main_widgets.status_icon.clone(),
+            status_spinner: main_widgets.status_spinner.clone(),
             status_title: main_widgets.status_title.clone(),
             status_detail: main_widgets.status_detail.clone(),
             transfer_rows: RefCell::new(Vec::new()),
@@ -549,6 +558,7 @@ fn build_window(app: &adw::Application) {
             pins_state: RefCell::new(None),
             notified_mounted: Cell::new(None),
             active_transfers: Cell::new(0),
+            transfer_batch: RefCell::new(None),
         },
         browser: BrowserState {
             model: browser_widgets.model.clone(),
@@ -588,9 +598,6 @@ fn build_window(app: &adw::Application) {
             zoom: browser_widgets.zoom.clone(),
             grid_thumbnail_size: Cell::new(GRID_THUMB_DEFAULT),
             grid_tiles: RefCell::new(Vec::new()),
-            quota_box: browser_widgets.quota_box.clone(),
-            quota: browser_widgets.quota.clone(),
-            quota_text: browser_widgets.quota_text.clone(),
         },
         details: DetailsState {
             details: browser_widgets.details,
@@ -627,7 +634,6 @@ fn build_window(app: &adw::Application) {
             burst: Cell::new(false),
             import_banner: gallery_widgets.import_banner.clone(),
             upload: gallery_widgets.upload.clone(),
-            import: gallery_widgets.import.clone(),
             empty_actions: gallery_widgets.empty_actions.clone(),
             title: gallery_widgets.title.clone(),
             albums: gallery_widgets.albums.clone(),
@@ -830,10 +836,6 @@ fn build_window(app: &adw::Application) {
         &gallery_widgets.empty_upload,
         &gallery_widgets.empty_import,
     );
-    let ui_duplicates = ui.clone();
-    gallery_widgets
-        .duplicates
-        .connect_clicked(move |_| show_duplicates(&ui_duplicates));
     wire_albums(&ui);
     wire_places(&ui);
     wire_trash(&ui, &trash_widgets);
@@ -919,11 +921,32 @@ fn build_window(app: &adw::Application) {
 
     refresh(&ui);
     // Periodic refresh while the window lives. The closure holds a strong `Rc`;
-    // it is dropped when the source is removed on window close.
+    // it is dropped when the source is removed on window close. A window in the
+    // background refreshes less often, and one nobody can see not at all.
     let ui_tick = ui.clone();
+    let window_tick = window.downgrade();
+    let skipped = Cell::new(0u32);
     let source = glib::timeout_add_local(REFRESH_INTERVAL, move || {
+        let Some(window) = window_tick.upgrade() else {
+            return glib::ControlFlow::Continue;
+        };
+        if window_hidden(&window) {
+            return glib::ControlFlow::Continue;
+        }
+        if !window.is_active() && skipped.get() + 1 < BACKGROUND_REFRESH_EVERY {
+            skipped.set(skipped.get() + 1);
+            return glib::ControlFlow::Continue;
+        }
+        skipped.set(0);
         refresh(&ui_tick);
         glib::ControlFlow::Continue
+    });
+    // Catch up as soon as the user comes back to the window.
+    let ui_focus = ui.clone();
+    window.connect_is_active_notify(move |window| {
+        if window.is_active() {
+            refresh(&ui_focus);
+        }
     });
     let cell = RefCell::new(Some(source));
     window.connect_close_request(move |_| {
@@ -934,6 +957,22 @@ fn build_window(app: &adw::Application) {
     });
 
     window.present();
+}
+
+/// Whether `window` is minimised or otherwise out of sight (another workspace,
+/// fully covered), as far as the compositor tells us.
+fn window_hidden(window: &adw::ApplicationWindow) -> bool {
+    if !window.is_visible() {
+        return true;
+    }
+    window
+        .surface()
+        .and_downcast::<gtk4::gdk::Toplevel>()
+        .is_some_and(|toplevel| {
+            toplevel.state().intersects(
+                gtk4::gdk::ToplevelState::MINIMIZED | gtk4::gdk::ToplevelState::SUSPENDED,
+            )
+        })
 }
 
 /// The sidebar destinations, in order: the row index is the index into this table,
@@ -950,21 +989,17 @@ const DESTINATIONS: [(&str, &str, &str); 8] = [
     (
         "shared",
         gettext_noop("Shared with me"),
-        "system-users-symbolic",
+        "pdfs-people-symbolic",
     ),
     (
         "sharedbyme",
         gettext_noop("Shared by me"),
-        "emblem-shared-symbolic",
+        "pdfs-share-symbolic",
     ),
     ("devices", gettext_noop("Computers"), "computer-symbolic"),
     ("trash", gettext_noop("Trash"), "user-trash-symbolic"),
     // Translators: sidebar entry for the page listing this computer's synced folders.
-    (
-        "locations",
-        gettext_noop("Sync"),
-        "emblem-synchronizing-symbolic",
-    ),
+    ("locations", gettext_noop("Sync"), "pdfs-sync-symbolic"),
     (
         "activity",
         gettext_noop("Activity"),
@@ -1358,7 +1393,7 @@ fn build_primary_menu() -> gtk4::MenuButton {
         Some("win.about"),
     );
     gtk4::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
+        .icon_name("pdfs-menu-symbolic")
         .tooltip_text(gettext("Main menu"))
         .primary(true)
         .menu_model(&menu)
@@ -1383,11 +1418,21 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     sign_out_action.connect_activate(move |_, _| sign_out(&ui_out));
     window.add_action(&sign_out_action);
 
-    // The Photos page's import banner leads here.
+    // The Photos page's import banner and page menu lead here. The import is a
+    // staged, hours-long migration, so it gets its own page rather than a file
+    // chooser: the archives need reviewing before anything is sent, and the run
+    // needs somewhere to report.
     let show_import = gio::SimpleAction::new("show-import", None);
     let ui_import = ui.clone();
     show_import.connect_activate(move |_, _| ui_import.stack.set_visible_child_name("takeout"));
     window.add_action(&show_import);
+
+    // The Photos page menu's Find Duplicates. The finder opens over the page:
+    // a review, not a view of it.
+    let find_duplicates = gio::SimpleAction::new("find-duplicates", None);
+    let ui_duplicates = ui.clone();
+    find_duplicates.connect_activate(move |_, _| show_duplicates(&ui_duplicates));
+    window.add_action(&find_duplicates);
 
     // The Albums view's New Album button.
     let new_album = gio::SimpleAction::new("new-album", None);
@@ -1502,7 +1547,7 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
     confirm_stop.connect_activate(move |_, _| {
         let dialog = adw::AlertDialog::builder()
             .heading(gettext("Stop Proton Drive?"))
-            .body(gettext("The drive unmounts and nothing syncs until you connect again. Proton Drive starts again at your next login."))
+            .body(gettext("My files goes offline and nothing syncs until you connect again. Proton Drive starts again at your next login."))
             .build();
         dialog.add_response("cancel", &gettext("Cancel"));
         dialog.add_response("stop", &pgettext("verb", "Stop"));
@@ -1523,7 +1568,7 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
                     toast_error(
                         &ui,
                         &gettext("Couldn't stop Proton Drive"),
-                        &gettext("The mount service did not stop."),
+                        &gettext("The Proton Drive service did not stop."),
                     );
                 }
             });
@@ -1810,6 +1855,77 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Whether the Proton Drive service is down (failed, or not running at all).
+/// Asks systemd on a worker thread: `systemctl` can take seconds to answer,
+/// and the window must not freeze while it does.
+pub(crate) async fn service_down() -> bool {
+    gio::spawn_blocking(|| service::is_failed() || !service::is_active())
+        .await
+        .unwrap_or(true)
+}
+
+/// Restart the Proton Drive service off the main thread, then run `then`.
+pub(crate) fn restart_service_then(ui: &Rc<Ui>, then: impl FnOnce(&Rc<Ui>) + 'static) {
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let _ = gio::spawn_blocking(service::restart).await;
+        then(&ui);
+    });
+}
+
+/// A page's answer to "the daemon didn't reply". It tells *still starting*
+/// (poll again, no button) from *down* (an error with Retry, which restarts the
+/// service), so a cold start heals itself but a real failure stays visible.
+/// `status` paints the page's status view; `reload` loads the page again, and
+/// runs only while `page` is still the one on screen.
+pub(crate) fn service_unreachable(
+    ui: &Rc<Ui>,
+    page: &'static str,
+    status: impl Fn(&Rc<Ui>, &str, &str, &str, bool) + 'static,
+    reload: impl Fn(&Rc<Ui>) + 'static,
+) {
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        if service_down().await {
+            status(
+                &ui,
+                "network-offline-symbolic",
+                &gettext("Not connected"),
+                &gettext("The Proton Drive service isn't running."),
+                true,
+            );
+            return;
+        }
+        status(
+            &ui,
+            "network-idle-symbolic",
+            &gettext("Connecting…"),
+            &gettext("Waiting for the Proton Drive service to start."),
+            false,
+        );
+        glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
+            if ui.stack.visible_child_name().as_deref() == Some(page) {
+                reload(&ui);
+            }
+        });
+    });
+}
+
+/// How long a copy button shows its check after copying.
+const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
+
+/// Confirm a copy on the button itself: its icon turns into a check for a
+/// moment, then back to `icon`.
+pub(crate) fn flash_copied(button: &gtk4::Button, icon: &'static str) {
+    button.set_icon_name("object-select-symbolic");
+    let button = button.downgrade();
+    glib::timeout_add_local_once(COPIED_FEEDBACK, move || {
+        if let Some(button) = button.upgrade() {
+            button.set_icon_name(icon);
+        }
+    });
+}
+
 /// Open a local path with the handler the user configured — `xdg-open` unless
 /// `open_with` in `config.json` overrides it for this kind of file.
 fn open_path(path: &str) {
@@ -1822,17 +1938,6 @@ fn open_path(path: &str) {
 /// rules (or `xdg-open`) to key off. `name` is the Drive name it was opened as.
 pub(crate) fn open_named_path(path: &str, name: &str) {
     pdfs_core::opener::open_default_named(Path::new(path), name, false);
-}
-
-/// Format a byte count as a short binary-unit string (e.g. `1.2 GiB`, or
-/// `512 bytes` below one KiB).
-///
-/// GLib does the formatting, so the units, the plural of "bytes" and the
-/// decimal separator follow the user's language from GLib's own catalog. GLib
-/// separates number and unit with a no-break space; it is turned back into a
-/// plain space so the text matches what the rest of the UI builds around it.
-fn human_bytes(bytes: u64) -> String {
-    glib::format_size_full(bytes, glib::FormatSizeFlags::IEC_UNITS).replace('\u{a0}', " ")
 }
 
 #[cfg(test)]

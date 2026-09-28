@@ -63,6 +63,19 @@ stored as `language` in `config.json` and takes effect the next time they start.
 - Keep product names as they are: Proton Drive, Proton, Google Takeout.
 - Use the same term for the same thing across the catalog, and follow the terminology of your
   desktop (GNOME or KDE) for common actions such as Trash, Preferences and Cancel.
+- The English UI uses one term per concept. Pick one translation for each and keep it:
+
+  | Concept | English term |
+  |---|---|
+  | The root of the user's Drive | My files |
+  | The background service | Proton Drive service (never "daemon" or "mount") |
+  | A folder with a full copy on this computer | Synced folder |
+  | A folder whose files download when opened | Online-only folder |
+  | A single file kept on this computer | Available offline |
+  | A single file that is not on this computer | Online only |
+  | Where My files appears on disk | Proton Drive folder |
+  | Stop syncing a folder | Stop syncing |
+  | Two versions of one file | Conflict |
 
 ## Rules for developers
 

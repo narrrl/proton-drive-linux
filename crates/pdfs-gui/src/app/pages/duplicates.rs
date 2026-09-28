@@ -220,14 +220,14 @@ fn ask(view: &Rc<FinderView>, finder: Finder, generation: u32) {
                 view.status.set_icon_name(Some("dialog-warning-symbolic"));
                 view.status.set_title(&failed);
                 view.status
-                    .set_description(Some(&gettext("The mount service didn't respond.")));
+                    .set_description(Some(&gettext("The Proton Drive service didn't respond.")));
                 view.progress.set_visible(false);
                 return;
             }
         };
         view.progress.set_visible(false);
         if sets.is_empty() {
-            view.status.set_icon_name(Some("emblem-ok-symbolic"));
+            view.status.set_icon_name(Some("pdfs-synced-symbolic"));
             match finder {
                 Finder::Exact => {
                     view.status.set_title(&gettext("No duplicates"));

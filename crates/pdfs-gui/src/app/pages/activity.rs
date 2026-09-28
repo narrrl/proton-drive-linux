@@ -174,10 +174,7 @@ pub(crate) fn wire_activity(
     filters: &[(ActivityFilter, gtk4::ToggleButton)],
 ) {
     let ui_retry = ui.clone();
-    retry.connect_clicked(move |_| {
-        service::restart();
-        load_activity(&ui_retry);
-    });
+    retry.connect_clicked(move |_| restart_service_then(&ui_retry, load_activity));
     for (filter, button) in filters {
         let ui = ui.clone();
         let filter = *filter;
@@ -272,7 +269,7 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
                 &ui,
                 "dialog-warning-symbolic",
                 &gettext("Couldn't read activity"),
-                &gettext("Unexpected reply from the mount service."),
+                &gettext("Unexpected reply from the Proton Drive service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) => activity_unreachable(&ui),
@@ -282,29 +279,7 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
 
 /// The daemon didn't answer the Activity page.
 pub(crate) fn activity_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        activity_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    activity_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("activity") {
-            load_activity(&ui);
-        }
-    });
+    service_unreachable(ui, "activity", activity_status, load_activity);
 }
 
 /// Poll the conflicts still waiting for a decision while the Activity page is
@@ -538,8 +513,8 @@ fn feed_row(
         subtitle.push(capitalize(&a.detail));
     }
     if row.count > 1 {
-        let since = activity_time(row.first);
-        // Translators: {time} is a date and time such as "Sep 21, 14:05".
+        let since = dates::relative(row.first);
+        // Translators: {time} is a date or time such as "Sep 21" or "5 min ago".
         subtitle.push(ngettext_f(
             "{n} time since {time}",
             "{n} times since {time}",
@@ -585,9 +560,7 @@ fn feed_row(
     ));
     time.add_css_class("dim-label");
     time.add_css_class("numeric");
-    if let Some(at) = at.and_then(|at| at.format("%c").ok()) {
-        time.set_tooltip_text(Some(&at));
-    }
+    time.set_tooltip_text(Some(&dates::full(a.time)));
     widget.add_suffix(&time);
 
     if let Some(conflict) = pending {
@@ -645,26 +618,17 @@ pub(crate) fn activity_icon(kind: ActivityKind) -> &'static str {
     match kind {
         ActivityKind::Upload => "pdfs-upload-symbolic",
         ActivityKind::Download => "document-save-symbolic",
-        ActivityKind::Sync => "emblem-synchronizing-symbolic",
+        ActivityKind::Sync => "pdfs-sync-symbolic",
         ActivityKind::Rename => "document-edit-symbolic",
         ActivityKind::Move => "go-jump-symbolic",
         ActivityKind::CreateFolder => "folder-new-symbolic",
         ActivityKind::Trash => "user-trash-symbolic",
         ActivityKind::DeleteForever | ActivityKind::EmptyTrash => "edit-delete-symbolic",
         ActivityKind::Restore => "edit-undo-symbolic",
-        ActivityKind::Share | ActivityKind::PublicLink => "emblem-shared-symbolic",
-        ActivityKind::Unshare => "action-unavailable-symbolic",
+        ActivityKind::Share | ActivityKind::PublicLink => "pdfs-share-symbolic",
+        ActivityKind::Unshare => "pdfs-unshare-symbolic",
         ActivityKind::Conflict => "dialog-warning-symbolic",
     }
-}
-
-/// Format an epoch-seconds timestamp for the Activity feed, in local time.
-pub(crate) fn activity_time(secs: i64) -> String {
-    glib::DateTime::from_unix_local(secs)
-        // Translators: strftime format for a date and time in the activity feed, such as "Sep 23, 14:05".
-        .and_then(|dt| dt.format(&gettext("%b %-d, %H:%M")))
-        .map(|s| s.to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

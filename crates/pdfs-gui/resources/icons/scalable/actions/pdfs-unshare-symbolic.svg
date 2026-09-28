@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Sharing stopped: the share glyph with its last node crossed out. Not
+       a no-entry sign, which reads as an error. -->
+  <path fill="#222222" d="M 12,1.25 A 2.25,2.25 0 1 0 12,5.75 A 2.25,2.25 0 1 0 12,1.25 Z M 4,5.75 A 2.25,2.25 0 1 0 4,10.25 A 2.25,2.25 0 1 0 4,5.75 Z"/>
+  <path fill="#222222" d="M 4.37,8.65 L 12.37,4.15 L 11.63,2.85 L 3.63,7.35 Z"/>
+  <path fill="#222222" d="M 3.63,8.65 L 8.23,11.25 L 8.97,9.95 L 4.37,7.35 Z"/>
+  <path fill="#222222" d="M 9.28,11.02 L 13.48,15.22 L 14.72,13.98 L 10.52,9.78 Z"/>
+  <path fill="#222222" d="M 13.48,9.78 L 9.28,13.98 L 10.52,15.22 L 14.72,11.02 Z"/>
+</svg>

@@ -170,7 +170,7 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     // Cache the new identity so `refresh` never hits the keyring.
                     *ui.session.borrow_mut() = auth::load().ok();
                     // Enable+start the mount service now that we have a session.
-                    service::enable_start();
+                    let _ = gio::spawn_blocking(service::enable_start).await;
                     refresh(&ui);
                 }
                 Err(e) => ui.login.login_status.set_text(&e),
@@ -295,7 +295,7 @@ pub(crate) fn spawn_login(
 /// the worker reads as a cancelled login.
 pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Two-factor authentication"))
+        .heading(gettext("Two-Factor Authentication"))
         .body(gettext(
             "Enter the code from your authenticator app, or one of your recovery codes.",
         ))
@@ -344,12 +344,20 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
         ),
         &gettext("Sign Out"),
         move || {
-            service::disable_stop();
-            if let Err(e) = auth::logout() {
-                tracing::error!("logout failed: {e}");
-            }
-            *ui.session.borrow_mut() = None;
-            refresh(&ui);
+            // systemctl and the keyring both block, so run them on a worker.
+            let ui = ui.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(|| {
+                    service::disable_stop();
+                    auth::logout().map_err(|e| e.to_string())
+                })
+                .await;
+                if let Ok(Err(e)) = result {
+                    tracing::error!("logout failed: {e}");
+                }
+                *ui.session.borrow_mut() = None;
+                refresh(&ui);
+            });
         },
     );
 }

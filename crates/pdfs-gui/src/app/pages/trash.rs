@@ -49,7 +49,7 @@ pub(crate) fn build_trash_page() -> (gtk4::Widget, TrashWidgets) {
     let empty = gtk4::Button::builder()
         .label(gettext("Empty Trash…"))
         .tooltip_text(gettext("Permanently delete everything in the Trash"))
-        .sensitive(false)
+        .visible(false)
         .build();
     let refresh = refresh_button();
 
@@ -215,7 +215,7 @@ pub(crate) fn wire_trash(ui: &Rc<Ui>, widgets: &TrashWidgets) {
                 } else {
                     human_bytes(entry.size)
                 };
-                let modified = format_modified(entry.modified);
+                let modified = dates::short_date(entry.modified);
                 // Translators: {kind} is "Folder" or a file size; {modified} is a date.
                 let text = gettext_f(
                     "{kind} · {modified}",
@@ -317,7 +317,7 @@ pub(crate) fn load_trash(ui: &Rc<Ui>) {
                 &ui,
                 "dialog-warning-symbolic",
                 &gettext("Couldn't read the trash"),
-                &gettext("Unexpected reply from the mount service."),
+                &gettext("Unexpected reply from the Proton Drive service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) => trash_unreachable(&ui),
@@ -328,29 +328,7 @@ pub(crate) fn load_trash(ui: &Rc<Ui>) {
 /// The daemon didn't answer. Same split as the Files page: still starting (poll
 /// again, no button) versus actually down (Retry, which restarts the service).
 pub(crate) fn trash_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        trash_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    trash_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("trash") {
-            load_trash(&ui);
-        }
-    });
+    service_unreachable(ui, "trash", trash_status, load_trash);
 }
 
 /// Show a status page in place of the trash list.
@@ -368,7 +346,10 @@ pub(crate) fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &s
 pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
     ui.trash.model.remove_all();
     sync_trash_selection(ui);
-    ui.trash.empty.set_sensitive(!entries.is_empty());
+    // An empty Trash has nothing to empty, so the button goes away rather than
+    // sitting there greyed out.
+    ui.trash.empty.set_sensitive(true);
+    ui.trash.empty.set_visible(!entries.is_empty());
     if entries.is_empty() {
         trash_status(
             ui,
@@ -451,7 +432,7 @@ pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entries: &[DirEntry]) {
         ),
     };
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Delete Permanently"))
+        .heading(gettext("Delete Permanently?"))
         .body(body)
         .build();
     dialog.add_response("cancel", &gettext("Cancel"));
@@ -479,7 +460,7 @@ pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let count = ui.trash.model.n_items();
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Empty Trash"))
+        .heading(gettext("Empty Trash?"))
         .body(ngettext_f(
             "Permanently delete all {n} item in the trash? This cannot be undone.",
             "Permanently delete all {n} items in the trash? This cannot be undone.",

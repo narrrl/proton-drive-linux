@@ -53,7 +53,7 @@ impl Phase {
     fn icon(self) -> &'static str {
         match self {
             Phase::Synced => "folder-remote-symbolic",
-            Phase::Syncing => "emblem-synchronizing-symbolic",
+            Phase::Syncing => "view-refresh-symbolic",
             Phase::Paused => "media-playback-pause-symbolic",
             Phase::Offline => "network-offline-symbolic",
             Phase::Attention => "dialog-warning-symbolic",
@@ -172,8 +172,8 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                     ),
                     // Translators: {mountpoint} is a folder path; {n} is the number of pinned items.
                     (true, None) => ngettext_f(
-                        "Mounted at {mountpoint} ({n} pinned)",
-                        "Mounted at {mountpoint} ({n} pinned)",
+                        "Up to date in {mountpoint} ({n} pinned)",
+                        "Up to date in {mountpoint} ({n} pinned)",
                         pinned as u64,
                         &[("mountpoint", &mountpoint)],
                     ),
@@ -204,7 +204,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
         }
         // Socket answered but with something unexpected — treat as up but odd.
         Ok(_) => DriveState {
-            line: gettext("Mount: unexpected daemon response"),
+            line: gettext("Proton Drive sent an unexpected reply"),
             phase: Phase::Attention,
             mounted: true,
             mountpoint: default_mountpoint.to_path_buf(),
@@ -218,7 +218,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 Ok(s) => (
                     // Translators: {username} is the Proton account name.
                     gettext_f(
-                        "Logged in as {username} — not mounted",
+                        "Signed in as {username} — not connected",
                         &[("username", &s.username)],
                     ),
                     Phase::Disconnected,

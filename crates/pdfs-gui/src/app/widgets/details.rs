@@ -49,7 +49,7 @@ pub(crate) struct DetailsWidgets {
 /// [`DirEntry`] and [`wire_details`] connects the buttons.
 pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     let toggle = gtk4::ToggleButton::builder()
-        .icon_name("sidebar-show-right-symbolic")
+        .icon_name("pdfs-details-pane-symbolic")
         .tooltip_text(gettext("Details (Alt+Enter)"))
         .build();
 
@@ -202,7 +202,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     let toggle_off = toggle.clone();
     empty_close.connect_clicked(move |_| toggle_off.set_active(false));
     let empty_status = adw::StatusPage::builder()
-        .icon_name("sidebar-show-right-symbolic")
+        .icon_name("pdfs-details-pane-symbolic")
         .title(gettext("No item selected"))
         .description(gettext("Select a file or folder to see its details."))
         .vexpand(true)
@@ -373,7 +373,7 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     });
     d.size_row.set_visible(!entry.is_dir);
     d.modified_row
-        .set_subtitle(&format_modified(entry.modified));
+        .set_subtitle(&dates::short_date(entry.modified));
     let rel = entry_rel(ui, entry);
     let parent = match rel.rfind('/') {
         Some(i) => &rel[..i],
@@ -494,13 +494,13 @@ pub(crate) fn versions_summary(items: &[RevisionInfo]) -> String {
     match (items.len(), latest) {
         (0, _) | (_, None) => gettext("No earlier versions"),
         // Translators: {date} is the date of the only version.
-        (1, Some(t)) => gettext_f("1 version · {date}", &[("date", &format_modified(t))]),
+        (1, Some(t)) => gettext_f("1 version · {date}", &[("date", &dates::short_date(t))]),
         // Translators: {date} is the date of the newest version.
         (n, Some(t)) => ngettext_f(
             "{n} version · latest {date}",
             "{n} versions · latest {date}",
             n as u64,
-            &[("date", &format_modified(t))],
+            &[("date", &dates::short_date(t))],
         ),
     }
 }

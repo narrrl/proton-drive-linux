@@ -24,7 +24,7 @@ use pdfs_core::opener::{self, OpenWith};
 
 mod activation;
 mod i18n;
-use i18n::{gettext, gettext_f, gettext_noop, ngettext_f, pgettext};
+use i18n::{gettext, gettext_f, gettext_noop, human_bytes, ngettext_f, pgettext};
 mod dmenu;
 mod fzf;
 mod query;
@@ -586,7 +586,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     let offline = adw::StatusPage::builder()
         .icon_name("network-offline-symbolic")
         .title(gettext("Proton Drive is not running"))
-        .description(gettext("Start the mount daemon to search your Drive."))
+        .description(gettext("Start Proton Drive to search your files."))
         .build();
     offline.add_css_class("compact");
     let retry = gtk4::Button::builder()
@@ -876,7 +876,7 @@ impl Ui {
                 }
                 _ => {
                     ui.entry.set_sensitive(false);
-                    ui.hint.set_label(&gettext("Daemon offline"));
+                    ui.hint.set_label(&gettext("Proton Drive isn't running"));
                     ui.stack.set_visible_child_name("offline");
                 }
             }
@@ -890,7 +890,7 @@ impl Ui {
         self.spinner.stop();
         self.spinner.set_visible(false);
         self.entry.set_sensitive(false);
-        self.hint.set_label(&gettext("Daemon offline"));
+        self.hint.set_label(&gettext("Proton Drive isn't running"));
         self.stack.set_visible_child_name("offline");
     }
 
@@ -1322,7 +1322,7 @@ impl Ui {
                                 &[("message", &message)],
                             ));
                         }
-                        _ => ui.hint.set_label(&gettext("Could not reach the daemon")),
+                        _ => ui.hint.set_label(&gettext("Couldn't reach Proton Drive")),
                     }
                 });
             }
@@ -1370,7 +1370,7 @@ fn build_row(hit: &Hit) -> gtk4::ListBoxRow {
         meta.append(&pin);
     }
     if !hit.is_dir() && hit.size() > 0 {
-        let size = gtk4::Label::new(Some(&format_size(hit.size())));
+        let size = gtk4::Label::new(Some(&human_bytes(hit.size())));
         size.add_css_class("result-meta");
         meta.append(&size);
     }
@@ -1443,25 +1443,6 @@ fn parent_of(path: &str) -> String {
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_default()
-}
-
-fn format_size(bytes: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [
-        // Translators: a file size in gigabytes; {size} is a number such as "4.2".
-        (1024 * 1024 * 1024, gettext_noop("{size} GB")),
-        // Translators: a file size in megabytes; {size} is a number such as "4.2".
-        (1024 * 1024, gettext_noop("{size} MB")),
-        // Translators: a file size in kilobytes; {size} is a number such as "4.2".
-        (1024, gettext_noop("{size} KB")),
-    ];
-    for (scale, unit) in UNITS {
-        if bytes >= scale {
-            let size = format!("{:.1}", bytes as f64 / scale as f64);
-            return gettext_f(unit, &[("size", &size)]);
-        }
-    }
-    // Translators: a file size in bytes; {size} is a whole number.
-    gettext_f("{size} B", &[("size", &bytes.to_string())])
 }
 
 /// Coarse relative age, in the granularity a launcher row has room for.

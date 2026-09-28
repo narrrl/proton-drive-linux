@@ -19,6 +19,8 @@ pub(crate) struct StatusState {
     /// Sidebar footer: the one-line sync state. The mount is driven by the
     /// systemd user service, not by the user — so this only reports.
     pub(crate) status_icon: gtk4::Image,
+    /// Stands in for [`Self::status_icon`] until the first status arrives.
+    pub(crate) status_spinner: gtk4::Spinner,
     pub(crate) status_title: gtk4::Label,
     pub(crate) status_detail: gtk4::Label,
     pub(crate) cache_bar: gtk4::ProgressBar,
@@ -82,7 +84,24 @@ pub(crate) struct StatusState {
     /// How many transfers were in flight on the previous poll. A drop to zero is
     /// what "sync complete" means; there's no completion event on the wire.
     pub(crate) active_transfers: Cell<usize>,
+    /// The run of transfers since the count last left zero, for deciding
+    /// whether its end is worth a "Sync complete" notification.
+    pub(crate) transfer_batch: RefCell<Option<TransferBatch>>,
 }
+
+/// One run of transfers, from the first file to the count falling back to 0.
+pub(crate) struct TransferBatch {
+    started: Instant,
+    /// Every file seen in flight during the run, so the notification can count
+    /// files rather than the handful still moving on the last poll.
+    names: HashSet<String>,
+}
+
+/// A run of transfers earns a "Sync complete" notification only when it moved
+/// at least this many files or lasted at least [`SYNC_NOTIFY_MIN_DURATION`].
+/// Saving one document at a time would otherwise notify on every save.
+const SYNC_NOTIFY_MIN_FILES: usize = 5;
+const SYNC_NOTIFY_MIN_DURATION: Duration = Duration::from_secs(30);
 
 /// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
 /// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
@@ -121,6 +140,7 @@ pub(crate) struct MainWidgets {
     pub(crate) account_name: gtk4::Label,
     pub(crate) avatar: adw::Avatar,
     pub(crate) status_icon: gtk4::Image,
+    pub(crate) status_spinner: gtk4::Spinner,
     pub(crate) status_title: gtk4::Label,
     pub(crate) status_detail: gtk4::Label,
     pub(crate) quota_box: gtk4::Box,
@@ -178,9 +198,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     mountpoint_row.add_css_class("property");
     let mountpoint_button = gtk4::Button::builder()
         .label(gettext("Change…"))
-        .tooltip_text(gettext(
-            "Choose a different folder for the Proton Drive mount",
-        ))
+        .tooltip_text(gettext("Choose where My files appears on this computer"))
         .valign(gtk4::Align::Center)
         .build();
     mountpoint_button.add_css_class("flat");
@@ -310,7 +328,10 @@ pub(crate) fn build_main_page() -> MainWidgets {
     prefs.add(&storage);
 
     // ---- Sidebar footer
-    let status_icon = gtk4::Image::from_icon_name("content-loading-symbolic");
+    // Until the first status arrives there is no state to show, only that the
+    // app is still asking.
+    let status_icon = gtk4::Image::builder().visible(false).build();
+    let status_spinner = gtk4::Spinner::builder().spinning(true).build();
     let status_title = gtk4::Label::builder()
         .label(gettext("Connecting…"))
         .halign(gtk4::Align::Start)
@@ -329,6 +350,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
     status_text.append(&status_title);
     status_text.append(&status_detail);
     let status_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    status_content.append(&status_spinner);
     status_content.append(&status_icon);
     status_content.append(&status_text);
     let status_button = gtk4::Button::builder()
@@ -390,6 +412,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
         account_name,
         avatar,
         status_icon,
+        status_spinner,
         status_title,
         status_detail,
         quota_box,
@@ -491,7 +514,17 @@ pub(crate) fn wire_settings(
     ui.status
         .mountpoint_row
         .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
-    ui.status.autostart_row.set_active(service::is_enabled());
+    // systemctl can take a while, so ask off the main thread and fill the
+    // switch in when it answers, without firing its change handler.
+    let ui_auto = ui.clone();
+    glib::spawn_future_local(async move {
+        let enabled = gio::spawn_blocking(service::is_enabled)
+            .await
+            .unwrap_or(false);
+        let suppress = ui_auto.status.settings_suppress.replace(true);
+        ui_auto.status.autostart_row.set_active(enabled);
+        ui_auto.status.settings_suppress.set(suppress);
+    });
     ui.status
         .theme_row
         .set_active(config.proton_theme.unwrap_or(false));
@@ -587,11 +620,14 @@ pub(crate) fn wire_settings(
         if ui_auto.status.settings_suppress.get() {
             return;
         }
-        if row.is_active() {
-            service::enable();
-        } else {
-            service::disable();
-        }
+        let enable = row.is_active();
+        gio::spawn_blocking(move || {
+            if enable {
+                service::enable();
+            } else {
+                service::disable();
+            }
+        });
     });
 
     let ui_mp = ui.clone();
@@ -706,7 +742,11 @@ pub(crate) fn settings_request(ui: &Rc<Ui>, req: Request, done: String, failed: 
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &failed, &message, kind)
             }
-            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
+            _ => toast_error(
+                &ui,
+                &failed,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
         }
     });
 }
@@ -716,7 +756,7 @@ pub(crate) fn settings_request(ui: &Rc<Ui>, req: Request, done: String, failed: 
 pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let dialog = gtk4::FileDialog::builder()
-        .title(gettext("Choose mountpoint folder"))
+        .title(gettext("Choose Proton Drive Folder"))
         .build();
     let ui = ui.clone();
     dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
@@ -728,7 +768,7 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
         let mut config = ui.dirs.load_config();
         config.mountpoint = Some(path_str.clone());
         if let Err(e) = ui.dirs.save_config(&config) {
-            toast_error(&ui, &gettext("Couldn't save mountpoint"), &e.to_string());
+            toast_error(&ui, &gettext("Couldn't save the folder"), &e.to_string());
             return;
         }
         ui.status.mountpoint_row.set_subtitle(&path_str);
@@ -741,21 +781,22 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
 
         // The daemon only reads the mountpoint at mount time, so offer a restart.
         let confirm = adw::AlertDialog::builder()
-            .heading(gettext("Restart to apply"))
+            .heading(gettext("Restart Proton Drive?"))
             // Translators: {path} is the folder the drive is mounted at.
             .body(gettext_f(
-                "The mountpoint is now “{path}”. Restart the Drive mount to use it?",
+                "My files now appears in “{path}” after Proton Drive restarts.",
                 &[("path", &path_str)],
             ))
             .build();
         confirm.add_response("later", &gettext("Later"));
-        confirm.add_response("restart", &gettext("Restart now"));
+        confirm.add_response("restart", &gettext("Restart Now"));
         confirm.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
         confirm.set_default_response(Some("restart"));
         confirm.set_close_response("later");
-        confirm.connect_response(None, |_, resp| {
+        let ui_restart = ui.clone();
+        confirm.connect_response(None, move |_, resp| {
             if resp == "restart" {
-                service::restart();
+                restart_service_then(&ui_restart, |_| {});
             }
         });
         confirm.present(ui_window(&ui).as_ref());
@@ -767,20 +808,20 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
 /// reload the page.
 pub(crate) fn wire_retry(ui: &Rc<Ui>) {
     let ui_browser = ui.clone();
-    ui.browser.retry.clone().connect_clicked(move |_| {
-        service::restart();
-        load_browser(&ui_browser);
-    });
+    ui.browser
+        .retry
+        .clone()
+        .connect_clicked(move |_| restart_service_then(&ui_browser, load_browser));
     let ui_gallery = ui.clone();
-    ui.gallery.retry.clone().connect_clicked(move |_| {
-        service::restart();
-        load_gallery(&ui_gallery, false);
-    });
+    ui.gallery
+        .retry
+        .clone()
+        .connect_clicked(move |_| restart_service_then(&ui_gallery, |ui| load_gallery(ui, false)));
     let ui_trash = ui.clone();
-    ui.trash.retry.clone().connect_clicked(move |_| {
-        service::restart();
-        load_trash(&ui_trash);
-    });
+    ui.trash
+        .retry
+        .clone()
+        .connect_clicked(move |_| restart_service_then(&ui_trash, load_trash));
 }
 
 /// Repaint the window from the cached login identity, then kick an async mount-
@@ -848,9 +889,8 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
 /// active-page tick refetches it only this often rather than every 2s.
 const QUOTA_TTL: Duration = Duration::from_secs(60);
 
-/// Fetch the account quota (if the last reading is stale) and paint both the
-/// sidebar footer and Files status bar. A failed fetch leaves the last
-/// good reading in place.
+/// Fetch the account quota (if the last reading is stale) and paint the
+/// sidebar footer. A failed fetch leaves the last good reading in place.
 pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
     if ui.status.quota_inflight.get() {
         return;
@@ -874,10 +914,6 @@ pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
             ui.status.quota_checked_at.set(Some(Instant::now()));
             paint_account_quota(&ui, max_space, used_space);
             ui.status.quota_box.set_visible(true);
-        } else if ui.status.quota_checked_at.get().is_none() {
-            // Match Dolphin: capacity information does not occupy the bar until
-            // the backing observer has real figures.
-            ui.browser.quota_box.set_visible(false);
         }
     });
 }
@@ -886,15 +922,6 @@ fn paint_account_quota(ui: &Rc<Ui>, max_space: i64, used_space: i64) {
     let (fraction, text) = quota_display(max_space, used_space);
     ui.status.quota_bar.set_fraction(fraction);
     ui.status.quota_label.set_text(&text);
-    if let Some((fraction, free_text, tooltip)) = quota_status_display(max_space, used_space) {
-        ui.browser.quota.set_fraction(fraction);
-        ui.browser.quota.set_tooltip_text(Some(&tooltip));
-        ui.browser.quota_text.set_label(&free_text);
-        ui.browser.quota_text.set_tooltip_text(Some(&tooltip));
-        ui.browser.quota_box.set_visible(true);
-    } else {
-        ui.browser.quota_box.set_visible(false);
-    }
 }
 
 fn quota_display(max_space: i64, used_space: i64) -> (f64, String) {
@@ -922,34 +949,6 @@ fn quota_display(max_space: i64, used_space: i64) -> (f64, String) {
             ],
         ),
     )
-}
-
-/// Dolphin's status bar shows a bare capacity bar followed by “X free”; the
-/// full free/total/percentage sentence is a tooltip rather than inline bar text.
-fn quota_status_display(max_space: i64, used_space: i64) -> Option<(f64, String, String)> {
-    if max_space <= 0 {
-        return None;
-    }
-    let total = max_space as u64;
-    let used = (used_space.max(0) as u64).min(total);
-    let free = total.saturating_sub(used);
-    let fraction = used as f64 / total as f64;
-    let pct = (fraction * 100.0).round() as u64;
-    Some((
-        fraction,
-        // Translators: {size} is an amount of storage, such as "1.2 GiB".
-        gettext_f("{size} free", &[("size", &human_bytes(free))]),
-        // Translators: account storage. {free} and {total} are sizes such as
-        // "1.2 GiB"; {percent} is a whole number, followed by the percent sign.
-        gettext_f(
-            "{free} free out of {total} ({percent}% used)",
-            &[
-                ("free", &human_bytes(free)),
-                ("total", &human_bytes(total)),
-                ("percent", &pct.to_string()),
-            ],
-        ),
-    ))
 }
 
 /// Record the mount state seen by the last status poll: gate every control that
@@ -981,13 +980,13 @@ pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
         notify(
             "mount-state",
             &gettext("Proton Drive connected"),
-            &gettext("Your Drive is mounted and available."),
+            &gettext("Your files are available."),
         );
     } else {
         notify(
             "mount-state",
             &gettext("Proton Drive disconnected"),
-            &gettext("The mount service stopped. Files aren't available until it restarts."),
+            &gettext("The Proton Drive service stopped. Files aren't available until it restarts."),
         );
     }
 }
@@ -1036,17 +1035,35 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
     takeout_progress(ui, jobs);
 
     let previous = ui.status.active_transfers.replace(items.len());
+    if !items.is_empty() {
+        let mut batch = ui.status.transfer_batch.borrow_mut();
+        let batch = batch.get_or_insert_with(|| TransferBatch {
+            started: Instant::now(),
+            names: HashSet::new(),
+        });
+        batch
+            .names
+            .extend(items.iter().map(|item| item.name.clone()));
+    }
     if items.is_empty() && previous > 0 {
-        notify(
-            "sync-complete",
-            &gettext("Sync complete"),
-            &ngettext_f(
-                "{n} file finished transferring.",
-                "{n} files finished transferring.",
-                previous as u64,
-                &[],
-            ),
-        );
+        // Nobody needs a notification for what they are watching happen.
+        let watching = ui_window(ui).is_some_and(|window| window.is_active());
+        if let Some(batch) = ui.status.transfer_batch.take()
+            && !watching
+            && (batch.names.len() >= SYNC_NOTIFY_MIN_FILES
+                || batch.started.elapsed() >= SYNC_NOTIFY_MIN_DURATION)
+        {
+            notify(
+                "sync-complete",
+                &gettext("Sync complete"),
+                &ngettext_f(
+                    "{n} file finished transferring.",
+                    "{n} files finished transferring.",
+                    batch.names.len() as u64,
+                    &[],
+                ),
+            );
+        }
         // A just-finished batch may have added files (bulk upload) the current
         // listing doesn't show yet; refresh whichever listing is on screen.
         reload_listing(ui);
@@ -1228,9 +1245,20 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 // used" reads as a broken read-out, and there is no fraction to
                 // draw against no limit.
                 ui.status.cache_label.set_text(&if budget == 0 {
-                    format!("{} cached — no limit set", human_bytes(used))
+                    // Translators: {used} is a size such as "1.2 GiB".
+                    gettext_f(
+                        "{used} cached — no limit set",
+                        &[("used", &human_bytes(used))],
+                    )
                 } else {
-                    format!("{} of {} used", human_bytes(used), human_bytes(budget))
+                    // Translators: {used} and {limit} are sizes such as "1.2 GiB".
+                    gettext_f(
+                        "{used} of {limit} used",
+                        &[
+                            ("used", &human_bytes(used)),
+                            ("limit", &human_bytes(budget)),
+                        ],
+                    )
                 });
                 repaint_pins(&ui, &pins, true);
             }
@@ -1321,13 +1349,13 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
             Some(queued.unwrap_or_else(|| gettext("Cached files only"))),
         ),
         SyncState::Syncing { queued } => (
-            "emblem-synchronizing-symbolic",
+            "pdfs-sync-symbolic",
             None,
             pgettext("state", "Syncing"),
             Some(queued),
         ),
         SyncState::UpToDate { mountpoint } => (
-            "emblem-ok-symbolic",
+            "pdfs-synced-symbolic",
             Some("success"),
             gettext("Up to date"),
             Some(mountpoint),
@@ -1341,6 +1369,9 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     };
     let image = &ui.status.status_icon;
     image.set_icon_name(Some(icon));
+    image.set_visible(true);
+    ui.status.status_spinner.set_visible(false);
+    ui.status.status_spinner.set_spinning(false);
     for c in ["success", "warning", "error"] {
         image.remove_css_class(c);
     }
@@ -1474,7 +1505,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
                     _ => toast_error(
                         &ui,
                         &gettext("Couldn't make it online only"),
-                        &gettext("The mount service didn't respond."),
+                        &gettext("The Proton Drive service didn't respond."),
                     ),
                 }
             });
@@ -1529,7 +1560,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
 
 #[cfg(test)]
 mod tests {
-    use super::{quota_display, quota_status_display};
+    use super::quota_display;
 
     #[test]
     fn quota_display_reports_used_total_and_percentage() {
@@ -1543,19 +1574,5 @@ mod tests {
     fn quota_display_clamps_bad_api_values() {
         assert_eq!(quota_display(0, -1), (0.0, "0 bytes used".to_string()));
         assert_eq!(quota_display(100, 150).0, 1.0);
-    }
-
-    #[test]
-    fn quota_status_display_matches_dolphin_wording() {
-        let gib = 1024_i64.pow(3);
-        assert_eq!(
-            quota_status_display(4 * gib, gib),
-            Some((
-                0.25,
-                "3.0 GiB free".to_string(),
-                "3.0 GiB free out of 4.0 GiB (25% used)".to_string()
-            ))
-        );
-        assert_eq!(quota_status_display(0, 0), None);
     }
 }

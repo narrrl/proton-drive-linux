@@ -198,6 +198,18 @@ pub(crate) fn pending_summary(uploads: u64, changes: u64) -> Option<String> {
     }
 }
 
+/// Format a byte count as a short binary-unit string (e.g. `1.2 GiB`, or
+/// `512 bytes` below one KiB).
+///
+/// GLib does the formatting, so the units, the plural of "bytes" and the
+/// decimal separator follow the user's language from GLib's own catalog. GLib
+/// separates number and unit with a no-break space; it is turned back into a
+/// plain space so the text matches what the rest of the UI builds around it.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    gtk4::glib::format_size_full(bytes, gtk4::glib::FormatSizeFlags::IEC_UNITS)
+        .replace('\u{a0}', " ")
+}
+
 /// gettext takes the count as `u32`. Counts past that pick the same form as
 /// the largest one, which is the plural in every shipped language.
 fn plural_count(n: u64) -> u32 {

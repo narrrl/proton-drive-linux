@@ -126,10 +126,7 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
 /// Install the Devices page's retry button and the Rename action.
 pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button) {
     let ui_retry = ui.clone();
-    retry.connect_clicked(move |_| {
-        service::restart();
-        load_devices(&ui_retry);
-    });
+    retry.connect_clicked(move |_| restart_service_then(&ui_retry, load_devices));
     let ui_ren = ui.clone();
     ui.devices.rename_this.connect_clicked(move |_| {
         if let Some((uid, name)) = ui_ren.devices.this_device.borrow().clone() {
@@ -202,29 +199,7 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
 
 /// The daemon didn't answer the Devices page.
 pub(crate) fn devices_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        devices_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    devices_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("devices") {
-            load_devices(&ui);
-        }
-    });
+    service_unreachable(ui, "devices", devices_status, load_devices);
 }
 
 /// Rebuild the "Other computers" section from a fresh listing. Empty is a normal
@@ -330,7 +305,7 @@ pub(crate) fn device_subtitle(dev: &DeviceInfo) -> String {
             "{platform} · last synced {time}",
             &[
                 ("platform", &dev.device_type),
-                ("time", &activity_time(secs)),
+                ("time", &dates::relative(secs)),
             ],
         ),
         // Translators: {platform} is the device's platform, such as "Linux".
@@ -358,7 +333,7 @@ pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
     let manage = gtk4::Button::builder()
         .label(gettext("Open Sync"))
-        .tooltip_text(gettext("Manage this computer's folders and mountpoint"))
+        .tooltip_text(gettext("Manage this computer's synced folders"))
         .valign(gtk4::Align::Center)
         .build();
     manage.add_css_class("flat");
@@ -489,7 +464,7 @@ pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
                 _ => toast_error(
                     &ui,
                     &gettext("Couldn't add folder"),
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 ),
             }
         });
@@ -529,7 +504,7 @@ pub(crate) fn prompt_restore_folders(ui: &Rc<Ui>, device: Option<(String, String
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't list folders to restore"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -577,7 +552,7 @@ fn show_restore_picker(
         .child(&group)
         .build();
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Restore folders"))
+        .heading(gettext("Restore Folders"))
         .body(restore_picker_body(
             device.as_ref().map(|(_, n)| n.as_str()),
         ))
@@ -668,7 +643,7 @@ pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &'static str) {
             Ok(Ok(Response::Ok { .. })) => toast(
                 &ui,
                 &if mode == "ondemand" {
-                    gettext("Folder will switch to on-demand")
+                    gettext("Folder will switch to online only")
                 } else {
                     gettext("Folder will download and stay synced")
                 },
@@ -679,7 +654,7 @@ pub(crate) fn set_sync_folder_mode(ui: &Rc<Ui>, id: i64, mode: &'static str) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't change mode"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
         reload_sync_pages(&ui);
@@ -710,7 +685,7 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
     let body = if ondemand {
         // Translators: {path} is a local folder path.
         gettext_f(
-            "Stop syncing “{path}”?\n\nThis folder is on-demand: its files live in Proton Drive, not on this disk, so the folder will be empty once it is unmounted. To keep a local copy, cancel, turn off On-demand, and wait for the download to finish before removing it.",
+            "Stop syncing “{path}”?\n\nThis folder is online only: its files live in Proton Drive, not on this disk, so the folder will be empty once it stops syncing. To keep a local copy, cancel, switch the folder to Synced, and wait for the download to finish before removing it.",
             &[("path", path)],
         )
     } else {
@@ -721,7 +696,7 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
         )
     };
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Stop syncing folder"))
+        .heading(gettext("Stop Syncing Folder?"))
         .body(body)
         .build();
     let group = adw::PreferencesGroup::new();
@@ -818,7 +793,7 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let group = adw::PreferencesGroup::new();
     group.add(&confirm);
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Remove Computer"))
+        .heading(gettext("Remove Computer?"))
         // Translators: {name} is the name of the computer being removed.
         .body(gettext_f(
             "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is deleted along with it. The files on that computer itself are not touched — but this cannot be undone from here.",
@@ -862,7 +837,7 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Use this computer's identity"))
+        .heading(gettext("Use This Computer's Identity?"))
         // Translators: {name} is the name of the other computer whose identity is adopted.
         .body(gettext_f(
             "Treat this machine as “{name}”?\n\nNew synced folders are created under that computer in Proton Drive, and this machine keeps that identity even if its hostname changes. Folders already synced here are not moved.\n\nUse “Restore folders” afterwards to bring back what “{name}” was syncing.",
@@ -870,7 +845,7 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
         ))
         .build();
     dialog.add_response("cancel", &gettext("Cancel"));
-    dialog.add_response("adopt", &gettext("Use identity"));
+    dialog.add_response("adopt", &gettext("Use Identity"));
     dialog.set_response_appearance("adopt", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -909,7 +884,11 @@ pub(crate) fn run_devices_mutation(ui: &Rc<Ui>, req: Request, done: &str, failed
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &failed, &message, kind)
             }
-            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
+            _ => toast_error(
+                &ui,
+                &failed,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
         }
     });
 }

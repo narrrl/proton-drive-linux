@@ -42,7 +42,7 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
     retry.add_css_class("suggested-action");
     retry.set_visible(false);
     let status = adw::StatusPage::builder()
-        .icon_name("emblem-shared-symbolic")
+        .icon_name("pdfs-share-symbolic")
         .vexpand(true)
         .child(&retry)
         .build();
@@ -60,7 +60,7 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
     inner.set_margin_start(18);
     inner.set_margin_end(18);
     inner.append(&content);
-    let (frame, header, _) = page_frame(&gettext("Shared by Me"), &inner);
+    let (frame, header, _) = page_frame(&gettext("Shared by me"), &inner);
     header.pack_end(&refresh);
 
     (
@@ -78,10 +78,7 @@ pub(crate) fn build_shared_by_me_page() -> (gtk4::Widget, SharedByMeWidgets) {
 /// Install the Shared (by-me) page's retry button.
 pub(crate) fn wire_shared_by_me(ui: &Rc<Ui>, retry: &gtk4::Button) {
     let ui_retry = ui.clone();
-    retry.connect_clicked(move |_| {
-        service::restart();
-        load_shared_by_me(&ui_retry);
-    });
+    retry.connect_clicked(move |_| restart_service_then(&ui_retry, load_shared_by_me));
 }
 
 /// Show a status page in place of the Shared (by-me) list.
@@ -108,7 +105,7 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
     ui.shared_by_me.inflight.set(true);
     shared_by_me_status(
         ui,
-        "emblem-shared-symbolic",
+        "pdfs-share-symbolic",
         &gettext("Loading…"),
         &gettext("Reading what you've shared."),
         false,
@@ -136,7 +133,7 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
                 &ui,
                 "dialog-warning-symbolic",
                 &gettext("Couldn't read your shares"),
-                &gettext("Unexpected reply from the mount service."),
+                &gettext("Unexpected reply from the Proton Drive service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) => {
@@ -149,29 +146,7 @@ pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
 
 /// The daemon didn't answer the Shared (by-me) page.
 pub(crate) fn shared_by_me_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        shared_by_me_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    shared_by_me_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("sharedbyme") {
-            load_shared_by_me(&ui);
-        }
-    });
+    service_unreachable(ui, "sharedbyme", shared_by_me_status, load_shared_by_me);
 }
 
 /// Rebuild the Shared (by-me) section from a fresh listing.
@@ -182,7 +157,7 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
     if items.is_empty() {
         shared_by_me_status(
             ui,
-            "emblem-shared-symbolic",
+            "pdfs-share-symbolic",
             &gettext("Nothing shared yet"),
             &gettext("Items you share with people or by link show up here."),
             false,
@@ -211,7 +186,7 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
         // The one action people come here for most gets its own button.
         if let Some(url) = url.clone() {
             let copy = gtk4::Button::builder()
-                .icon_name("edit-copy-symbolic")
+                .icon_name("pdfs-link-symbolic")
                 .tooltip_text(gettext("Copy link"))
                 .valign(gtk4::Align::Center)
                 .build();
@@ -219,6 +194,7 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
             let ui_copy = ui.clone();
             copy.connect_clicked(move |btn| {
                 btn.clipboard().set_text(&url);
+                flash_copied(btn, "pdfs-link-symbolic");
                 toast(&ui_copy, &gettext("Link copied"));
             });
             row.add_suffix(&copy);
@@ -270,7 +246,7 @@ fn shared_by_me_menu(ui: &Rc<Ui>, entry: &DirEntry, url: Option<String>) -> gtk4
 /// Confirm, then remove every member, invitation and the public link.
 pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entry: &DirEntry) {
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Stop sharing?"))
+        .heading(gettext("Stop Sharing?"))
         // Translators: {name} is the shared item's name.
         .body(gettext_f(
             "Everyone you invited loses access to “{name}”, pending invitations are withdrawn and its public link stops working.",

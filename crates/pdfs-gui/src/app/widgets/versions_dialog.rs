@@ -167,7 +167,7 @@ pub(crate) fn versions_dialog_reload(state: &Rc<VersionsDialog>) {
             _ => toast_error(
                 &state.ui,
                 &gettext("Couldn't load versions"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -204,13 +204,13 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
                 gettext_f(
                     "{time} · {size}",
                     &[
-                        ("time", &activity_time(item.created)),
+                        ("time", &dates::relative(item.created)),
                         ("size", &human_bytes(size)),
                     ],
                 ),
             )
         } else {
-            (activity_time(item.created), human_bytes(size))
+            (dates::relative(item.created), human_bytes(size))
         };
         if let Some(email) = &item.signed_by {
             subtitle.push_str(" · ");
@@ -266,7 +266,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
 /// every device on the account, not only this one.
 fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Restore version"))
+        .heading(gettext("Restore Version?"))
         // Translators: {name} is a file name.
         .body(gettext_f(
             "Make this version the current content of “{name}”? The version it replaces stays in the history.",
@@ -301,7 +301,7 @@ fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
 /// Confirm, then permanently delete one revision.
 fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Delete version"))
+        .heading(gettext("Delete Version?"))
         .body(gettext(
             "Delete this version permanently? Its content can't be recovered.",
         ))
@@ -377,7 +377,7 @@ fn versions_dialog_op(state: &Rc<VersionsDialog>, request: Request, done: &str, 
             _ => toast_error(
                 &state.ui,
                 &failed,
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });

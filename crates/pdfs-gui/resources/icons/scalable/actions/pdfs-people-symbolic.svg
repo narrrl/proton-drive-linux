@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Shared with me: two people. system-users-symbolic survives only in
+       Adwaita's legacy folder. -->
+  <path fill="#222222" d="M 6,2.5 A 2.5,2.5 0 1 0 6,7.5 A 2.5,2.5 0 1 0 6,2.5 Z M 1.5,14.5 C 1.5,11 3.5,9 6,9 C 8.5,9 10.5,11 10.5,14.5 Z"/>
+  <path fill="#222222" d="M 11,2.4 A 2.1,2.1 0 1 0 11,6.6 A 2.1,2.1 0 1 0 11,2.4 Z M 9.8,8.4 C 10.2,8.3 10.6,8.25 11,8.25 C 13.3,8.25 15,10 15,13.5 H 11.8 C 11.7,11.5 11,9.7 9.8,8.4 Z"/>
+</svg>

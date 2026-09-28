@@ -307,7 +307,7 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
                 }
             },
             Ok(Ok(Response::Error { message, .. })) => fail(&message),
-            Ok(Ok(_)) => fail(&gettext("Unexpected reply from the mount service.")),
+            Ok(Ok(_)) => fail(&gettext("Unexpected reply from the Proton Drive service.")),
             Ok(Err(_)) | Err(_) => fail(&gettext("Couldn't reach Proton Drive.")),
         }
     });
@@ -1136,7 +1136,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         .child(
             &adw::ButtonContent::builder()
                 .label(gettext("Show on map"))
-                .icon_name("map-symbolic")
+                .icon_name("pdfs-map-symbolic")
                 .build(),
         )
         .halign(gtk4::Align::Start)
@@ -1426,7 +1426,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
                     None
                 }
                 Ok(Ok(Response::Error { message, .. })) => Some(message),
-                _ => Some(gettext("The mount service didn't respond.")),
+                _ => Some(gettext("The Proton Drive service didn't respond.")),
             };
             if let Some(detail) = failed {
                 toast_error(

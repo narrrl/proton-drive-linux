@@ -40,8 +40,6 @@ pub(crate) struct GalleryState {
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
     pub(crate) upload: gtk4::Button,
-    /// Opens the Google Photos Takeout import chooser.
-    pub(crate) import: gtk4::Button,
     /// Upload / Import offered on the *empty timeline* status page, so a fresh
     /// account is a place to start rather than a dead end. Hidden on every other
     /// status: a load error is not the moment to offer an upload.
@@ -401,12 +399,10 @@ pub(crate) struct GalleryWidgets {
     pub(crate) scroll: gtk4::ScrolledWindow,
     pub(crate) retry: gtk4::Button,
     pub(crate) upload: gtk4::Button,
-    pub(crate) import: gtk4::Button,
     pub(crate) empty_actions: gtk4::Box,
     pub(crate) empty_upload: gtk4::Button,
     pub(crate) empty_import: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
-    pub(crate) duplicates: gtk4::Button,
     /// The Select toggle and the bar it reveals.
     pub(crate) select_btn: gtk4::ToggleButton,
     pub(crate) select_bar: gtk4::Revealer,
@@ -567,34 +563,36 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     upload.add_css_class("suggested-action");
 
-    // Importing an export is a rarer, heavier action than adding one photo, so
-    // it sits beside Upload as a plain button rather than a second accent one.
-    let import = gtk4::Button::builder()
-        .icon_name("folder-download-symbolic")
-        .tooltip_text(gettext("Import a Google Photos Takeout export"))
-        .valign(gtk4::Align::Center)
-        .build();
-    import.add_css_class("flat");
-    import.add_css_class("circular");
     let refresh = refresh_button();
 
-    // The duplicate finder opens over the page: a review, not a view of it.
-    let duplicates = gtk4::Button::builder()
-        .icon_name("edit-copy-symbolic")
-        .tooltip_text(gettext("Find duplicates"))
+    // Importing an export and hunting for duplicates are rarer, heavier jobs
+    // than adding one photo, so they wait in the page menu rather than taking
+    // a header button each.
+    let page_menu = gio::Menu::new();
+    page_menu.append(
+        Some(&gettext("Import from Google Photos…")),
+        Some("win.show-import"),
+    );
+    page_menu.append(
+        Some(&gettext("Find Duplicates…")),
+        Some("win.find-duplicates"),
+    );
+    let more = gtk4::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text(gettext("More"))
         .valign(gtk4::Align::Center)
+        .menu_model(&page_menu)
         .build();
-    duplicates.add_css_class("flat");
-    duplicates.add_css_class("circular");
+    more.add_css_class("flat");
 
-    // Picking photos is a mode, so its control is a toggle rather than a button.
+    // Picking photos is a mode, so its control is a toggle rather than a
+    // button. It has a label: no icon says "select" in every theme.
     let select_btn = gtk4::ToggleButton::builder()
-        .icon_name("selection-mode-symbolic")
+        .label(pgettext("verb", "Select"))
         .tooltip_text(gettext("Select photos"))
         .valign(gtk4::Align::Center)
         .build();
     select_btn.add_css_class("flat");
-    select_btn.add_css_class("circular");
 
     // What the selection can do, revealed with the mode. A revealer rather than
     // a hidden box so the grid slides down instead of jumping.
@@ -798,8 +796,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     albums_stack.add_named(&albums_scroll, Some("grid"));
     albums_stack.add_named(&albums_status, Some("status"));
     let new_album = gtk4::Button::builder()
-        .icon_name("list-add-symbolic")
-        .label(gettext("New Album…"))
+        .child(
+            &adw::ButtonContent::builder()
+                .label(gettext("New Album…"))
+                .icon_name("list-add-symbolic")
+                .build(),
+        )
         .halign(gtk4::Align::Start)
         .action_name("win.new-album")
         .build();
@@ -896,10 +898,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let (frame, header, title) = page_frame(&gettext("Photos"), &body);
     header.pack_start(&back);
     header.pack_start(&upload);
+    header.pack_end(&more);
     header.pack_end(&refresh);
     header.pack_end(&select_btn);
-    header.pack_end(&import);
-    header.pack_end(&duplicates);
 
     (
         frame.upcast(),
@@ -916,12 +917,10 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             scroll,
             retry,
             upload,
-            import,
             empty_actions,
             empty_upload,
             empty_import,
             refresh,
-            duplicates,
             select_btn,
             select_bar,
             select_label,
@@ -1408,14 +1407,6 @@ pub(crate) fn wire_gallery(
         load_gallery(&ui_dates, false);
     });
 
-    // The import is a staged, hours-long migration, so the button hands over to
-    // the Import page rather than opening a file chooser here: the archives need
-    // reviewing before anything is sent, and the run needs somewhere to report.
-    let ui_import = ui.clone();
-    ui.gallery
-        .import
-        .connect_clicked(move |_| ui_import.stack.set_visible_child_name("takeout"));
-
     let ui_upload = ui.clone();
     ui.gallery.upload.connect_clicked(move |_| {
         let dialog = gtk4::FileDialog::builder()
@@ -1493,7 +1484,7 @@ pub(crate) fn wire_gallery(
                             toast_error(
                                 &ui_clone,
                                 &gettext("Couldn't upload photo"),
-                                &gettext("The mount service didn't respond."),
+                                &gettext("The Proton Drive service didn't respond."),
                             );
                         }
                     }
@@ -1647,9 +1638,10 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     // A shot stored as more than one file says so, in the corner the caption
     // does not use. "RAW" is the useful word when one of the members is a raw
     // file — that is what the person wants to find — and a plain count covers
-    // the rest (a live photo, a burst). Zoomed out to years the badge would
-    // cover most of a tile, so it is left off there.
-    if (tile.photo.has_raw || tile.photo.group_size > 1) && tile.grouping != Grouping::Year {
+    // the rest (a live photo, a burst). Only the Day zoom shows it: on the
+    // smaller Month and Year tiles a badge on every raw+JPEG shot turns the
+    // grid into noise.
+    if (tile.photo.has_raw || tile.photo.group_size > 1) && tile.grouping == Grouping::Day {
         let badge = gtk4::Label::builder()
             .label(if tile.photo.has_raw {
                 // Translators: badge on a photo tile whose shot includes a raw camera file.
@@ -2060,7 +2052,7 @@ pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
         ),
     };
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Move to Trash"))
+        .heading(gettext("Move to Trash?"))
         .body(body)
         .build();
     dialog.add_response("cancel", &gettext("Cancel"));
@@ -2148,7 +2140,7 @@ pub(crate) fn trash_photos(ui: &Rc<Ui>, uids: Vec<String>, files_only: bool) {
                 toast_error(
                     &ui,
                     &gettext("Couldn't move to Trash"),
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 );
             }
         }
@@ -3287,7 +3279,7 @@ fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't change the favorite"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -3470,13 +3462,13 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 &ui,
                 "dialog-warning-symbolic",
                 &gettext("Couldn't load photos"),
-                &gettext("Unexpected reply from the mount service."),
+                &gettext("Unexpected reply from the Proton Drive service."),
                 false,
             ),
             Ok(Err(_)) | Err(_) if append => toast_error(
                 &ui,
                 &gettext("Couldn't load more photos"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
             Ok(Err(_)) | Err(_) => gallery_unreachable(&ui),
         }
@@ -3500,29 +3492,7 @@ pub(crate) fn gallery_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
 /// Photos counterpart of [`browser_unreachable`]: auto-retry while the mount is
 /// still starting, surface an actionable error + Retry once it's actually down.
 pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        gallery_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    gallery_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("gallery") {
-            load_gallery(&ui, false);
-        }
-    });
+    service_unreachable(ui, "gallery", gallery_status, |ui| load_gallery(ui, false));
 }
 
 /// Play a video with an external player. Prefers `mpv` — it sniffs the container

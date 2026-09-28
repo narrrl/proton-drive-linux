@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- A copy is on this computer: a check in an outlined circle. Adwaita 50
+       no longer ships emblem-ok-symbolic. -->
+  <path fill="#222222" fill-rule="evenodd" d="M 8,1 A 7,7 0 1 0 8,15 A 7,7 0 1 0 8,1 Z M 8,2.5 A 5.5,5.5 0 1 1 8,13.5 A 5.5,5.5 0 1 1 8,2.5 Z"/>
+  <path fill="#222222" d="M 4.1,8.6 L 5.2,7.5 L 7,9.3 L 10.8,5.4 L 11.9,6.5 L 7,11.5 Z"/>
+</svg>

@@ -19,7 +19,7 @@ pub(crate) struct LocationsState {
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     pub(crate) group: adw::PreferencesGroup,
-    pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
+    pub(crate) rows: RefCell<Vec<LocationRow>>,
     pub(crate) inflight: Cell<bool>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
     pub(crate) card: SyncCard,
@@ -34,6 +34,28 @@ pub(crate) struct SyncCard {
     pub(crate) pause: adw::SplitButton,
     /// Whether the last status said paused, so the button knows which way to go.
     pub(crate) paused: Cell<bool>,
+}
+
+/// What a folder row's controls are built from. The subtitle and progress bar
+/// change on every tick of a running pass and are updated in place; anything
+/// in here changes which controls the row has, so a new key rebuilds it.
+pub(crate) type LocationKey = (
+    i64,
+    MountKind,
+    String,
+    MountMode,
+    Option<MountMode>,
+    bool,
+    MountAccess,
+);
+
+/// One row of the folder list, kept so the refresh tick can update it in place
+/// instead of replacing it under the pointer every two seconds.
+pub(crate) struct LocationRow {
+    /// `None` for the "No locations" placeholder.
+    key: Option<LocationKey>,
+    row: adw::ActionRow,
+    progress: gtk4::ProgressBar,
 }
 
 /// What a queue row shows that can change: id, attempts, next attempt, parked.
@@ -106,24 +128,24 @@ pub(crate) fn build_locations_page() -> (gtk4::Widget, LocationsWidgets) {
         .visible(false)
         .build();
 
-    // Same warning the Computers page carried, for the same reason: the
-    // on-demand switch removes the local copy, which is not a thing to discover
-    // after the fact.
     let group = adw::PreferencesGroup::builder()
-        .title(gettext("On this computer"))
-        .description(gettext("Where Proton Drive lives on this machine. Synced folders keep a full copy on this disk; on-demand folders keep the files in Proton Drive only and fetch them as you open them."))
+        .title(gettext("Folders"))
+        .description(gettext("Synced folders keep a full copy on this computer. Online-only folders fetch each file when you open it."))
         .build();
 
-    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    // The folder list is the page's settings, so it sits right under what needs
+    // a decision; the transfer and queue lists come and go below it instead of
+    // pushing it down.
+    let groups = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
     groups.append(&card);
     groups.append(&conflicts_group);
-    groups.append(&queue_group);
-    groups.append(&transfers_group);
     groups.append(&group);
+    groups.append(&transfers_group);
+    groups.append(&queue_group);
     let clamp = adw::Clamp::builder().child(&groups).build();
-    // Never scroll sideways: a location's title is a full path, and letting the
-    // row grow to fit one pushes the controls at its end off screen. Constrained,
-    // the path ellipsizes and the switch/remove/open stay reachable.
+    // Never scroll sideways: a location's subtitle holds a full path, and letting
+    // the row grow to fit one pushes the controls at its end off screen.
+    // Constrained, the path ellipsizes and the controls stay reachable.
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -209,12 +231,12 @@ fn build_sync_card() -> (
     adw::SplitButton,
 ) {
     let icon = gtk4::Image::builder()
-        .icon_name("emblem-synchronizing-symbolic")
+        .icon_name("pdfs-sync-symbolic")
         .pixel_size(32)
         .margin_top(6)
         .margin_bottom(6)
         .build();
-    icon.add_css_class("sidebar-status");
+    icon.add_css_class("sync-card-icon");
     let menu = gio::Menu::new();
     menu.append(
         Some(&gettext("Pause for 1 Hour")),
@@ -242,7 +264,9 @@ fn build_sync_card() -> (
         .title_lines(1)
         .subtitle_lines(2)
         .build();
-    row.add_css_class("property");
+    // The state is the headline and the detail explains it, so the title is
+    // large and the subtitle stays the usual dim line.
+    row.add_css_class("sync-card");
     row.add_prefix(&icon);
     row.add_suffix(&pause);
     let group = adw::PreferencesGroup::new();
@@ -339,7 +363,11 @@ fn set_sync_paused(ui: &Rc<Ui>, paused: bool, until: Option<i64>) {
                 },
             ),
             Ok(Ok(Response::Error { message, kind })) => toast_failure(&ui, &what, &message, kind),
-            _ => toast_error(&ui, &what, &gettext("The mount service didn't respond.")),
+            _ => toast_error(
+                &ui,
+                &what,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
         }
         ui.locations.card.pause.set_sensitive(true);
         refresh_status(&ui);
@@ -438,7 +466,7 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
         "rename" => ("document-edit-symbolic", gettext("Rename or move")),
         "trash" => ("user-trash-symbolic", gettext("Move to trash")),
         // Translators: a queued change of an unknown kind.
-        _ => ("emblem-synchronizing-symbolic", pgettext("noun", "Change")),
+        _ => ("pdfs-sync-symbolic", pgettext("noun", "Change")),
     };
     let state = match (op.parked, op.next_attempt_at) {
         (true, _) => gettext("waiting for the app writing it to finish"),
@@ -483,7 +511,7 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
     let waiting = !op.parked && op.attempts > 0 && op.next_attempt_at.is_some_and(|at| at > now);
     if waiting {
         let retry = gtk4::Button::builder()
-            .icon_name("view-refresh-symbolic")
+            .label(gettext("Retry"))
             .tooltip_text(gettext("Retry now"))
             .valign(gtk4::Align::Center)
             .build();
@@ -513,7 +541,7 @@ fn retry_queued(ui: &Rc<Ui>, id: Option<i64>) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't retry"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -584,12 +612,12 @@ fn repaint_conflicts(ui: &Rc<Ui>, items: &[ConflictInfo]) {
 
 /// "12.3 MB, changed at 14:30": one side of a conflict.
 fn conflict_side(size: u64, modified: i64) -> String {
-    // Translators: one side of a conflict; {size} is a file size such as "12.3 MB", {time} when it was changed, such as "14:30".
+    // Translators: one side of a conflict; {size} is a file size such as "12.3 MB", {time} when it was changed, such as "5 min ago" or "Sep 21".
     gettext_f(
         "{size}, changed {time}",
         &[
-            ("size", &glib::format_size(size)),
-            ("time", &clock_time(modified)),
+            ("size", &human_bytes(size)),
+            ("time", &dates::relative(modified)),
         ],
     )
 }
@@ -657,7 +685,7 @@ pub(crate) fn prompt_resolve_conflict(ui: &Rc<Ui>, conflict: &ConflictInfo) {
         }
     };
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Resolve conflict"))
+        .heading(gettext("Resolve Conflict"))
         .body(body)
         .build();
     let group = adw::PreferencesGroup::new();
@@ -736,7 +764,7 @@ fn resolve_conflict(ui: &Rc<Ui>, path: String, keep: ConflictKeep) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't resolve the conflict"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -837,218 +865,312 @@ pub(crate) fn refresh_locations(ui: &Rc<Ui>) {
 
 /// The daemon didn't answer the Locations page.
 pub(crate) fn locations_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        locations_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    locations_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("locations") {
-            load_locations(&ui);
-        }
-    });
+    service_unreachable(ui, "locations", locations_status, load_locations);
 }
 
+/// Paint the folder list. The rows are rebuilt only when what they offer
+/// changes (a mode switch, a pause, a folder added); otherwise the tick updates
+/// their subtitle and progress in place, so a menu, tooltip or keyboard focus
+/// on a row survives the refresh.
 pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
-    for row in ui.locations.rows.borrow_mut().drain(..) {
-        ui.locations.group.remove(&row);
+    let keys: Vec<Option<LocationKey>> = if items.is_empty() {
+        vec![None]
+    } else {
+        items.iter().map(|spec| Some(location_key(spec))).collect()
+    };
+    let unchanged = {
+        let rows = ui.locations.rows.borrow();
+        rows.len() == keys.len() && rows.iter().zip(&keys).all(|(row, key)| row.key == *key)
+    };
+    if !unchanged {
+        rebuild_locations(ui, items, keys);
     }
+    for (row, spec) in ui.locations.rows.borrow().iter().zip(items) {
+        update_location_row(row, spec);
+    }
+}
+
+fn location_key(spec: &MountSpec) -> LocationKey {
+    (
+        spec.id,
+        spec.kind.clone(),
+        spec.local_path.clone(),
+        spec.mode,
+        spec.pending_mode,
+        spec.paused,
+        spec.access,
+    )
+}
+
+fn rebuild_locations(ui: &Rc<Ui>, items: &[MountSpec], keys: Vec<Option<LocationKey>>) {
+    for row in ui.locations.rows.borrow_mut().drain(..) {
+        ui.locations.group.remove(&row.row);
+    }
+    let mut rows = Vec::new();
     if items.is_empty() {
         let row = adw::ActionRow::builder()
-            .title(gettext("No locations"))
+            .title(gettext("No folders yet"))
             .subtitle(gettext(
-                "The mount service hasn't reported a mountpoint yet.",
+                "The Proton Drive service hasn't reported its folder yet.",
             ))
             .build();
-        row.add_prefix(&gtk4::Image::from_icon_name("drive-harddisk-symbolic"));
+        row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
         ui.locations.group.add(&row);
-        *ui.locations.rows.borrow_mut() = vec![row.upcast()];
-        return;
+        rows.push(LocationRow {
+            key: None,
+            row,
+            progress: gtk4::ProgressBar::new(),
+        });
     }
-
-    let mut rows: Vec<gtk4::Widget> = Vec::new();
-    for spec in items {
-        let row = adw::ActionRow::builder()
-            .title(&spec.local_path)
-            .subtitle(location_subtitle(spec))
-            // One line each: a wrapped path would reflow the whole list every
-            // time a sync state changed under it.
-            .title_lines(1)
-            .subtitle_lines(1)
-            .build();
-        row.add_prefix(&gtk4::Image::from_icon_name(location_icon(&spec.kind)));
-
-        // A read-only location cannot be written through even where the files are
-        // visible; saying so on the row is cheaper than letting the user find out
-        // from a save dialog.
-        if spec.access == MountAccess::Ro {
-            let badge = gtk4::Label::new(Some(&gettext("Read-only")));
-            badge.add_css_class("dim-label");
-            badge.add_css_class("caption");
-            badge.set_valign(gtk4::Align::Center);
-            row.add_suffix(&badge);
-        }
-
-        // Same rule as the Computers page: a first pass has no estimate to draw
-        // against, so the bar appears only once real counts exist.
-        if let Some(p) = &spec.progress
-            && p.total > 0
-        {
-            let bar = gtk4::ProgressBar::builder()
-                .fraction((p.done as f64 / p.total.max(p.done) as f64).min(1.0))
-                .valign(gtk4::Align::Center)
-                .width_request(120)
-                .build();
-            row.add_suffix(&bar);
-        }
-
-        match &spec.kind {
-            MountKind::MyFiles => add_my_files_controls(ui, &row),
-            MountKind::Device { sync_folder_id } => {
-                add_device_controls(ui, &row, spec, *sync_folder_id)
-            }
-            // A standalone shared mount has no local mode to switch and is not
-            // this device's to remove.
-            MountKind::Shared { .. } => {}
-        }
-
-        let open = gtk4::Button::builder()
-            .icon_name("folder-open-symbolic")
-            .tooltip_text(gettext("Open this folder"))
-            .valign(gtk4::Align::Center)
-            .build();
-        open.add_css_class("flat");
-        let path = spec.local_path.clone();
-        open.connect_clicked(move |_| open_path(&path));
-        row.add_suffix(&open);
-
-        ui.locations.group.add(&row);
-        rows.push(row.upcast());
+    for (spec, key) in items.iter().zip(keys) {
+        let row = location_row(ui, spec);
+        ui.locations.group.add(&row.row);
+        rows.push(LocationRow { key, ..row });
     }
     *ui.locations.rows.borrow_mut() = rows;
 }
 
-/// The primary mount's only control: where it lives. Changing it rewrites config
-/// and offers a service restart, which is why it goes through the shared
-/// [`prompt_mountpoint`] dialog.
-fn add_my_files_controls(ui: &Rc<Ui>, row: &adw::ActionRow) {
-    let change = gtk4::Button::builder()
-        .label(pgettext("verb", "Change"))
-        .tooltip_text(gettext(
-            "Choose a different folder for the Proton Drive mount",
-        ))
-        .valign(gtk4::Align::Center)
-        .build();
-    change.add_css_class("flat");
-    let ui_mp = ui.clone();
-    change.connect_clicked(move |_| prompt_mountpoint(&ui_mp));
-    row.add_suffix(&change);
+/// The parts of a folder row that move while a pass runs.
+fn update_location_row(row: &LocationRow, spec: &MountSpec) {
+    // Translators: a synced folder's location and state, such as "~/Documents · Synced · up to date".
+    let subtitle = gettext_f(
+        "{path} · {state}",
+        &[
+            ("path", &tilde_path(&spec.local_path)),
+            ("state", &location_subtitle(spec)),
+        ],
+    );
+    let subtitle = glib::markup_escape_text(&subtitle);
+    if row.row.subtitle().as_deref() != Some(subtitle.as_str()) {
+        row.row.set_subtitle(&subtitle);
+    }
+    // A first pass has no estimate to draw against, so the bar appears only
+    // once real counts exist.
+    match &spec.progress {
+        Some(p) if p.total > 0 => {
+            row.progress
+                .set_fraction((p.done as f64 / p.total.max(p.done) as f64).min(1.0));
+            row.progress.set_visible(true);
+        }
+        _ => row.progress.set_visible(false),
+    }
 }
 
-/// Pause or resume and Sync now (mirror only), the on-demand switch, and Stop
-/// syncing for one synced folder.
-fn add_device_controls(ui: &Rc<Ui>, row: &adw::ActionRow, spec: &MountSpec, id: i64) {
-    if spec.mode != MountMode::OnDemand {
-        let (icon, tooltip) = match spec.paused {
-            true => (
-                "media-playback-start-symbolic",
-                gettext("Resume syncing this folder"),
-            ),
-            false => (
-                "media-playback-pause-symbolic",
-                gettext("Pause syncing this folder"),
-            ),
-        };
-        let pause = gtk4::Button::builder()
-            .icon_name(icon)
-            .tooltip_text(tooltip)
-            .valign(gtk4::Align::Center)
-            .build();
-        pause.add_css_class("flat");
-        let ui_pause = ui.clone();
-        let paused = spec.paused;
-        pause.connect_clicked(move |_| set_folder_paused(&ui_pause, id, !paused));
-        row.add_suffix(&pause);
-    }
-    // A paused folder skips its passes, so Sync now would do nothing.
-    if spec.mode != MountMode::OnDemand && !spec.paused {
-        let sync_now = gtk4::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text(gettext("Sync this folder now"))
-            .valign(gtk4::Align::Center)
-            .build();
-        sync_now.add_css_class("flat");
-        let ui_sync = ui.clone();
-        sync_now.connect_clicked(move |_| sync_folder_now(&ui_sync, id));
-        row.add_suffix(&sync_now);
+/// A folder row: its name, where it is and what it is doing, the folder's mode
+/// as a button that names it, and one menu for everything else. Activating the
+/// row opens the folder.
+fn location_row(ui: &Rc<Ui>, spec: &MountSpec) -> LocationRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&location_name(spec)).as_str())
+        .tooltip_text(&spec.local_path)
+        // One line each: a wrapped path would reflow the whole list every time
+        // a sync state changed under it.
+        .title_lines(1)
+        .subtitle_lines(1)
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk4::Image::from_icon_name(location_icon(&spec.kind)));
+    let path = spec.local_path.clone();
+    row.connect_activated(move |_| open_path(&path));
+
+    // A read-only location cannot be written through even where the files are
+    // visible; saying so on the row is cheaper than letting the user find out
+    // from a save dialog.
+    if spec.access == MountAccess::Ro {
+        let badge = gtk4::Label::new(Some(&gettext("Read-only")));
+        badge.add_css_class("dim-label");
+        badge.add_css_class("caption");
+        badge.set_valign(gtk4::Align::Center);
+        row.add_suffix(&badge);
     }
 
-    // A queued switch paints as already flipped: the daemon accepted it and will
-    // act on it, so snapping back would read as "it didn't take". The state is
-    // set before the handler is wired so painting the current mode doesn't fire
-    // a spurious request.
-    let target = spec.pending_mode.unwrap_or(spec.mode);
-    let ondemand = gtk4::Switch::builder()
-        .tooltip_text(gettext("On-demand: free this disk by keeping the files in Proton Drive only, fetching each as you open it. Turn off to download them back and keep a full local copy."))
+    let progress = gtk4::ProgressBar::builder()
         .valign(gtk4::Align::Center)
-        .active(target == MountMode::OnDemand)
+        .width_request(120)
+        .visible(false)
+        .build();
+    row.add_suffix(&progress);
+
+    let mut menu = ActionMenu::new();
+    let path = spec.local_path.clone();
+    menu.item(&gettext("Open in Files"), move || open_path(&path));
+    menu.section();
+    match &spec.kind {
+        MountKind::MyFiles => {
+            let ui = ui.clone();
+            menu.item(&gettext("Change Location…"), move || {
+                prompt_mountpoint(&ui)
+            });
+        }
+        MountKind::Device { sync_folder_id } => {
+            row.add_suffix(&mode_button(ui, spec, *sync_folder_id));
+            add_device_items(ui, &mut menu, spec, *sync_folder_id);
+        }
+        // A standalone shared mount has no local mode to switch and is not
+        // this device's to remove.
+        MountKind::Shared { .. } => {}
+    }
+    row.add_suffix(&menu.button());
+
+    let row = LocationRow {
+        key: None,
+        row,
+        progress,
+    };
+    update_location_row(&row, spec);
+    row
+}
+
+/// What a folder row is called: the folder's own name, which is the part of
+/// its path a person recognises.
+fn location_name(spec: &MountSpec) -> String {
+    Path::new(&spec.local_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&spec.local_path)
+        .to_string()
+}
+
+/// `path` with the home directory written as `~`.
+pub(crate) fn tilde_path(path: &str) -> String {
+    let home = glib::home_dir();
+    match Path::new(path).strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_string(),
+    }
+}
+
+/// The button naming a synced folder's mode, whose popover switches it. It
+/// shows the mode the folder is heading for: a queued switch was accepted and
+/// will happen, so showing the old mode would read as "it didn't take".
+fn mode_button(ui: &Rc<Ui>, spec: &MountSpec, id: i64) -> gtk4::MenuButton {
+    let target = spec.pending_mode.unwrap_or(spec.mode);
+    let ondemand = target == MountMode::OnDemand;
+    let button = gtk4::MenuButton::builder()
+        .label(folder_mode_label(ondemand))
+        .tooltip_text(gettext(
+            "Choose whether this folder keeps a full copy on this computer",
+        ))
+        .valign(gtk4::Align::Center)
+        .always_show_arrow(true)
         // The daemon refuses a mode switch on a paused folder.
         .sensitive(!spec.paused)
         .build();
-    let ui_mode = ui.clone();
-    let mode_path = spec.local_path.clone();
-    ondemand.connect_state_set(move |_, on| {
-        if on {
-            // Going on-demand deletes the local copies, so it is asked for rather
-            // than done on a flick of the switch. Stop leaves the switch's state
-            // alone; the next repaint paints whatever the daemon then reports.
-            confirm_ondemand(&ui_mode, id, &mode_path);
-            glib::Propagation::Stop
-        } else {
-            set_sync_folder_mode(&ui_mode, id, "mirror");
-            glib::Propagation::Proceed
-        }
-    });
-    row.add_suffix(&ondemand);
+    button.add_css_class("flat");
 
-    let remove = gtk4::Button::builder()
-        .icon_name("media-playback-stop-symbolic")
-        .tooltip_text(gettext("Stop syncing this folder"))
-        .valign(gtk4::Align::Center)
-        .build();
-    remove.add_css_class("flat");
-    let ui_rm = ui.clone();
+    let options = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    let popover = gtk4::Popover::builder().child(&options).build();
+    popover.add_css_class("menu");
+    for (choice, title, description) in [
+        (
+            false,
+            folder_mode_label(false),
+            gettext("Keep every file on this computer and in Proton Drive."),
+        ),
+        (
+            true,
+            folder_mode_label(true),
+            gettext("Keep the files in Proton Drive and download each one when you open it."),
+        ),
+    ] {
+        let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        text.append(
+            &gtk4::Label::builder()
+                .label(&title)
+                .xalign(0.0)
+                .css_classes(["heading"])
+                .build(),
+        );
+        text.append(
+            &gtk4::Label::builder()
+                .label(&description)
+                .xalign(0.0)
+                .wrap(true)
+                .max_width_chars(36)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+        let check = gtk4::Image::from_icon_name("object-select-symbolic");
+        check.set_opacity(if choice == ondemand { 1.0 } else { 0.0 });
+        let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        content.append(&text);
+        content.append(&check);
+        text.set_hexpand(true);
+        let option = gtk4::Button::builder().child(&content).build();
+        option.add_css_class("flat");
+        let ui = ui.clone();
+        let path = spec.local_path.clone();
+        let popover_ref = popover.downgrade();
+        option.connect_clicked(move |_| {
+            if let Some(popover) = popover_ref.upgrade() {
+                popover.popdown();
+            }
+            if choice == ondemand {
+                return;
+            }
+            if choice {
+                confirm_online_only(&ui, id, &path);
+            } else {
+                confirm_synced(&ui, id, &path);
+            }
+        });
+        options.append(&option);
+    }
+    button.set_popover(Some(&popover));
+    button
+}
+
+/// A synced folder's mode, as the row's mode button names it.
+fn folder_mode_label(ondemand: bool) -> String {
+    if ondemand {
+        // Translators: a folder mode: files are kept in Proton Drive and fetched when opened.
+        pgettext("folder mode", "Online only")
+    } else {
+        // Translators: a folder mode: a full copy is kept on this computer.
+        pgettext("folder mode", "Synced")
+    }
+}
+
+/// Sync now, pause or resume (synced folders only), and Stop syncing, in a
+/// synced folder's menu.
+fn add_device_items(ui: &Rc<Ui>, menu: &mut ActionMenu, spec: &MountSpec, id: i64) {
+    if spec.mode != MountMode::OnDemand {
+        // A paused folder skips its passes, so Sync now would do nothing.
+        if !spec.paused {
+            let ui = ui.clone();
+            menu.item(&gettext("Sync Now"), move || sync_folder_now(&ui, id));
+        }
+        let paused = spec.paused;
+        let label = if paused {
+            gettext("Resume Syncing")
+        } else {
+            gettext("Pause Syncing")
+        };
+        let ui = ui.clone();
+        menu.item(&label, move || set_folder_paused(&ui, id, !paused));
+        menu.section();
+    }
+    let ui = ui.clone();
     let path = spec.local_path.clone();
     // The folder's *current* mode, not a queued one: a switch that hasn't landed
     // yet has not moved the files anywhere.
     let is_ondemand = spec.mode == MountMode::OnDemand;
-    remove.connect_clicked(move |_| prompt_remove_sync_folder(&ui_rm, id, &path, is_ondemand));
-    row.add_suffix(&remove);
+    menu.item(&gettext("Stop Syncing…"), move || {
+        prompt_remove_sync_folder(&ui, id, &path, is_ondemand)
+    });
 }
 
-/// Ask before switching a synced folder to on-demand: the switch frees disk
-/// space by removing the local copies, which is not something to do by accident.
-fn confirm_ondemand(ui: &Rc<Ui>, id: i64, path: &str) {
+/// Ask before making a synced folder online only: the switch frees disk space
+/// by removing the local copies, which is not something to do by accident.
+fn confirm_online_only(ui: &Rc<Ui>, id: i64, path: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Make Folder On-Demand?"))
+        .heading(gettext("Make Folder Online Only?"))
         // Translators: {path} is a local folder path.
         .body(gettext_f("Files in {path} will be removed from this computer and kept in Proton Drive only. Each file downloads again when you open it.", &[("path", path)]))
         .build();
     dialog.add_response("cancel", &gettext("Cancel"));
-    dialog.add_response("ondemand", &gettext("Make On-Demand"));
+    dialog.add_response("ondemand", &gettext("Make Online Only"));
     dialog.set_response_appearance("ondemand", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -1057,11 +1179,60 @@ fn confirm_ondemand(ui: &Rc<Ui>, id: i64, path: &str) {
     dialog.connect_response(None, move |_, response| {
         if response == "ondemand" {
             set_sync_folder_mode(&ui, id, "ondemand");
-        } else {
-            refresh_locations(&ui);
         }
     });
     dialog.present(win.as_ref());
+}
+
+/// Ask before making an online-only folder synced: every file downloads, which
+/// can fill the disk. The free space is read from the folder's parent, which is
+/// on the local disk; the folder itself is a FUSE mount that may not answer.
+fn confirm_synced(ui: &Rc<Ui>, id: i64, path: &str) {
+    let ui = ui.clone();
+    let path = path.to_string();
+    glib::spawn_future_local(async move {
+        let parent = Path::new(&path)
+            .parent()
+            .map(gio::File::for_path)
+            .unwrap_or_else(|| gio::File::for_path(&path));
+        let free = parent
+            .query_filesystem_info_future(
+                gio::FILE_ATTRIBUTE_FILESYSTEM_FREE,
+                glib::Priority::DEFAULT,
+            )
+            .await
+            .ok()
+            .map(|info| info.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE));
+        let body = match free {
+            // Translators: {path} is a local folder path, {free} the free disk space such as "12.3 GiB".
+            Some(free) => gettext_f(
+                "Every file in {path} will download to this computer and stay synced. {free} is free on this disk.",
+                &[("path", &path), ("free", &human_bytes(free))],
+            ),
+            // Translators: {path} is a local folder path.
+            None => gettext_f(
+                "Every file in {path} will download to this computer and stay synced.",
+                &[("path", &path)],
+            ),
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading(gettext("Download Folder?"))
+            .body(body)
+            .build();
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("mirror", &gettext("Download"));
+        dialog.set_response_appearance("mirror", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("mirror"));
+        dialog.set_close_response("cancel");
+        let win = ui_window(&ui);
+        let ui = ui.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "mirror" {
+                set_sync_folder_mode(&ui, id, "mirror");
+            }
+        });
+        dialog.present(win.as_ref());
+    });
 }
 
 /// Pause or resume one synced folder, then repaint so its row shows the result.
@@ -1087,7 +1258,11 @@ fn set_folder_paused(ui: &Rc<Ui>, id: i64, paused: bool) {
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &failed, &message, kind)
             }
-            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
+            _ => toast_error(
+                &ui,
+                &failed,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
         }
         refresh_locations(&ui);
     });
@@ -1106,7 +1281,7 @@ fn sync_folder_now(ui: &Rc<Ui>, id: i64) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't sync"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -1116,7 +1291,7 @@ pub(crate) fn location_icon(kind: &MountKind) -> &'static str {
     match kind {
         MountKind::MyFiles => "folder-remote-symbolic",
         MountKind::Device { .. } => "folder-symbolic",
-        MountKind::Shared { .. } => "system-users-symbolic",
+        MountKind::Shared { .. } => "pdfs-people-symbolic",
     }
 }
 
@@ -1125,22 +1300,20 @@ pub(crate) fn location_icon(kind: &MountKind) -> &'static str {
 /// Ordered by how likely it is to be what the user came to check: a queued mode
 /// switch leads (they just asked for it), then the resting mode, then the sync
 /// state, then — only when it is surprising — the fact that no session owns the
-/// path. A mirror folder is a plain directory with no FUSE session, so "not
-/// mounted" is its normal state and saying it would be noise.
+/// path. A mirror folder is a plain directory with no FUSE session, so having
+/// none is its normal state and saying so would be noise.
 pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
     let mut parts: Vec<String> = Vec::new();
     match &spec.kind {
         MountKind::MyFiles => parts.push(gettext("My files")),
         MountKind::Shared { .. } => parts.push(gettext("Shared folder")),
         MountKind::Device { .. } => match (spec.pending_mode, spec.mode) {
-            (Some(MountMode::OnDemand), _) => parts.push(gettext("Going on-demand")),
+            (Some(MountMode::OnDemand), _) => parts.push(gettext("Going online only")),
             (Some(MountMode::Mirror), _) => parts.push(gettext("Switching to synced")),
             (Some(MountMode::Unknown) | None, MountMode::OnDemand) => {
-                // Translators: a folder mode: files are kept online and fetched when opened.
-                parts.push(pgettext("folder mode", "On-demand"))
+                parts.push(folder_mode_label(true))
             }
-            // Translators: a folder mode: a full copy is kept on this computer.
-            (Some(MountMode::Unknown) | None, _) => parts.push(pgettext("folder mode", "Synced")),
+            (Some(MountMode::Unknown) | None, _) => parts.push(folder_mode_label(false)),
         },
     }
     if matches!(spec.kind, MountKind::Device { .. }) {
@@ -1156,7 +1329,8 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
         || spec.mode == MountMode::OnDemand
         || spec.pending_mode == Some(MountMode::OnDemand);
     if expects_session && !spec.mounted {
-        parts.push(gettext("not mounted"));
+        // Translators: a folder's files can't be opened right now.
+        parts.push(gettext("not available"));
     }
     parts.join(" · ")
 }
@@ -1215,7 +1389,7 @@ mod tests {
         );
         assert_eq!(
             location_subtitle(&spec),
-            "On-demand · up to date · not mounted"
+            "Online only · up to date · not available"
         );
     }
 
@@ -1227,7 +1401,7 @@ mod tests {
             true,
         );
         spec.pending_mode = Some(MountMode::OnDemand);
-        assert!(location_subtitle(&spec).starts_with("Going on-demand"));
+        assert!(location_subtitle(&spec).starts_with("Going online only"));
         spec.mode = MountMode::OnDemand;
         spec.pending_mode = Some(MountMode::Mirror);
         assert!(location_subtitle(&spec).starts_with("Switching to synced"));
@@ -1240,7 +1414,7 @@ mod tests {
         let mut spec = spec(MountKind::MyFiles, MountMode::OnDemand, true);
         assert_eq!(location_subtitle(&spec), "My files");
         spec.mounted = false;
-        assert_eq!(location_subtitle(&spec), "My files · not mounted");
+        assert_eq!(location_subtitle(&spec), "My files · not available");
     }
 
     #[test]

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- A share link: two open chain ends and the bar that joins them, laid
+       on the diagonal. -->
+  <g transform="rotate(-45 8 8)">
+  <path fill="#222222" d="M 7,4.5 H 4.5 A 3.5,3.5 0 0 0 4.5,11.5 H 7 V 9.75 H 4.5 A 1.75,1.75 0 0 1 4.5,6.25 H 7 Z"/>
+  <path fill="#222222" d="M 9,4.5 H 11.5 A 3.5,3.5 0 0 1 11.5,11.5 H 9 V 9.75 H 11.5 A 1.75,1.75 0 0 0 11.5,6.25 H 9 Z"/>
+  <path fill="#222222" d="M 5,7.125 H 11 V 8.875 H 5 Z"/>
+  </g>
+</svg>

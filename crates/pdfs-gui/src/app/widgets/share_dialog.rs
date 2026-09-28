@@ -427,7 +427,7 @@ pub(crate) fn share_dialog_reload(state: &Rc<ShareDialog>) {
             _ => toast_error(
                 &state.ui,
                 &gettext("Couldn't load sharing"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -582,6 +582,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                 let url_copy = url.clone();
                 copy.connect_clicked(move |btn| {
                     btn.clipboard().set_text(&url_copy);
+                    flash_copied(btn, "edit-copy-symbolic");
                     toast(&state_copy.ui, &gettext("Link copied"));
                 });
                 row.add_suffix(&copy);
@@ -718,7 +719,7 @@ pub(crate) fn share_dialog_create_link(
             _ => toast_error(
                 &state.ui,
                 &gettext("Couldn't create the link"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -756,7 +757,7 @@ pub(crate) fn share_dialog_op(
                 toast_error(
                     &state.ui,
                     &failed,
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 );
                 share_dialog_reload(&state);
             }

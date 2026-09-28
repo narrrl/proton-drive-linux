@@ -384,7 +384,7 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
         let count = ui_import.takeout.archives.borrow().len();
         let ui = ui_import.clone();
         let dialog = adw::AlertDialog::builder()
-            .heading(gettext("Import this export?"))
+            .heading(gettext("Import This Export?"))
             .body(ngettext_f(
                 "{n} archive will be uploaded to Proton Photos, creating albums as they appear in the export. This can take hours; you can stop it at any point and what has been uploaded stays. Photos you already have are skipped.",
                 "{n} archives will be uploaded to Proton Photos, creating albums as they appear in the export. This can take hours; you can stop it at any point and what has been uploaded stays. Photos you already have are skipped.",
@@ -421,7 +421,7 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
                 _ => toast_error(
                     &ui,
                     &gettext("Couldn't stop the import"),
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 ),
             }
         });
@@ -613,7 +613,7 @@ fn start_import(ui: &Rc<Ui>, dry_run: bool) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't start the import"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });

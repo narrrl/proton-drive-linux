@@ -102,7 +102,7 @@ pub(crate) fn load_places(ui: &Rc<Ui>) {
                 &ui,
                 "network-offline-symbolic",
                 &gettext("Not connected"),
-                &gettext("The Proton Drive mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });

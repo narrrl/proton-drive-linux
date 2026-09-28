@@ -83,7 +83,7 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
                 &ui,
                 "network-offline-symbolic",
                 &gettext("Not connected"),
-                &gettext("The Proton Drive mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -286,7 +286,7 @@ pub(crate) fn prompt_new_album(ui: &Rc<Ui>, photos: Vec<String>) {
                 _ => toast_error(
                     &ui,
                     &gettext("Couldn't create the album"),
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 ),
             }
         });
@@ -351,7 +351,11 @@ fn run_album_request(ui: &Rc<Ui>, request: Request, done: String, failed: String
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &failed, &message, kind)
             }
-            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
+            _ => toast_error(
+                &ui,
+                &failed,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
         }
     });
 }
@@ -380,7 +384,7 @@ pub(crate) fn prompt_add_to_album(ui: &Rc<Ui>, photos: Vec<String>) {
                 toast_error(
                     &ui,
                     &gettext("Couldn't load albums"),
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 );
                 return;
             }
@@ -487,7 +491,7 @@ fn add_to_album(ui: &Rc<Ui>, album: String, photos: Vec<String>) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't add to the album"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -559,7 +563,7 @@ pub(crate) fn remove_from_album(ui: &Rc<Ui>, album: &AlbumInfo, photos: Vec<Stri
                 toast_error(
                     &ui,
                     &gettext("Couldn't remove from the album"),
-                    &gettext("The mount service didn't respond."),
+                    &gettext("The Proton Drive service didn't respond."),
                 )
             }
         }

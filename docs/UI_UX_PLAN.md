@@ -283,7 +283,8 @@ Header: `[‹ ›]  Path bar (breadcrumbs, scroll to end, Ctrl+L to edit)  … [
 | Cloud-only file | Online only | none / `cloud-outline` |
 | Pinned file | Available offline | pin/download-filled custom icon, not stars |
 | Upload | Upload files / Upload folder | `document-upload`-style arrow up, custom pair |
-| Folder sync mode | Synced / On-demand | — |
+| Folder sync mode | Synced / Online only | — |
+| Where My files appears on disk | Proton Drive folder — never "mountpoint" in UI | — |
 | Stop syncing a folder | Stop syncing… | `media-playback-stop-symbolic` in a menu, not trash |
 | Remove a computer | Remove computer… | destructive, in menu |
 | Conflict copy | Conflict | `dialog-warning-symbolic` + warning colour |

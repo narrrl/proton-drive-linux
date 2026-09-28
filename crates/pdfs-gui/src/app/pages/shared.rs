@@ -46,12 +46,13 @@ pub(crate) struct SharedWidgets {
 /// links I've bookmarked (open / remove). All three live outside the mount tree,
 /// so the page addresses them by uid/id/token and always re-lists from the daemon.
 pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
+    // A label, not a bookmark glyph: nothing about the icon says what a Drive
+    // bookmark is.
     let add_bookmark = gtk4::Button::builder()
-        .icon_name("bookmark-new-symbolic")
-        .tooltip_text(gettext(
-            "Add Bookmark — save a public link to open it from here",
-        ))
+        .label(gettext("Add Bookmark…"))
+        .tooltip_text(gettext("Save a public link to open it from here"))
         .build();
+    add_bookmark.add_css_class("flat");
     let refresh = refresh_button();
 
     // Only sections with something in them are shown, so an account with one
@@ -87,7 +88,7 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
     retry.add_css_class("suggested-action");
     retry.set_visible(false);
     let status = adw::StatusPage::builder()
-        .icon_name("emblem-shared-symbolic")
+        .icon_name("pdfs-people-symbolic")
         .vexpand(true)
         .child(&retry)
         .build();
@@ -111,7 +112,7 @@ pub(crate) fn build_shared_page() -> (gtk4::Widget, SharedWidgets) {
         .tooltip_text(gettext("Back"))
         .visible(false)
         .build();
-    let (frame, header, title) = page_frame(&gettext("Shared with Me"), &inner);
+    let (frame, header, title) = page_frame(&gettext("Shared with me"), &inner);
     header.pack_start(&back);
     header.pack_end(&refresh);
     header.pack_end(&add_bookmark);
@@ -141,10 +142,7 @@ pub(crate) fn wire_shared(ui: &Rc<Ui>, retry: &gtk4::Button, add_bookmark: &gtk4
         load_shared(&ui_back);
     });
     let ui_retry = ui.clone();
-    retry.connect_clicked(move |_| {
-        service::restart();
-        load_shared(&ui_retry);
-    });
+    retry.connect_clicked(move |_| restart_service_then(&ui_retry, load_shared));
     let ui_add = ui.clone();
     add_bookmark.connect_clicked(move |_| prompt_add_bookmark(&ui_add));
 }
@@ -177,7 +175,7 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
     ui.shared.inflight.set(true);
     shared_status(
         ui,
-        "emblem-shared-symbolic",
+        "pdfs-people-symbolic",
         &gettext("Loading…"),
         &gettext("Reading your shared items."),
         false,
@@ -429,7 +427,7 @@ pub(crate) fn shared_row_subtitle(entry: &DirEntry) -> String {
     if !entry.shared_by.is_empty() {
         parts.push(entry.shared_by.clone());
         if entry.shared_at > 0 {
-            parts.push(format_modified(entry.shared_at));
+            parts.push(dates::short_date(entry.shared_at));
         }
     }
     if !entry.is_dir {
@@ -507,7 +505,7 @@ fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
             _ => toast_error(
                 &ui,
                 &gettext("Couldn't open file"),
-                &gettext("The mount service didn't respond."),
+                &gettext("The Proton Drive service didn't respond."),
             ),
         }
     });
@@ -516,29 +514,7 @@ fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
 /// The daemon didn't answer the Shared page. Same still-starting vs. down split
 /// as the other pages.
 pub(crate) fn shared_unreachable(ui: &Rc<Ui>) {
-    if service::is_failed() || !service::is_active() {
-        shared_status(
-            ui,
-            "network-offline-symbolic",
-            &gettext("Not connected"),
-            &gettext("The Proton Drive mount service isn't running."),
-            true,
-        );
-        return;
-    }
-    shared_status(
-        ui,
-        "folder-remote-symbolic",
-        &gettext("Connecting…"),
-        &gettext("Waiting for the Proton Drive mount service to come up."),
-        false,
-    );
-    let ui = ui.clone();
-    glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
-        if ui.stack.visible_child_name().as_deref() == Some("shared") {
-            load_shared(&ui);
-        }
-    });
+    service_unreachable(ui, "shared", shared_status, load_shared);
 }
 
 /// Rebuild the three Shared sections. Rows added last time are removed first —
@@ -559,7 +535,7 @@ pub(crate) fn repaint_shared(
     if shared.is_empty() && invitations.is_empty() && bookmarks.is_empty() {
         shared_status(
             ui,
-            "emblem-shared-symbolic",
+            "pdfs-people-symbolic",
             &gettext("Nothing Shared with You"),
             &gettext(
                 "Files and folders other people share with you appear here. Public links you bookmark are kept here too.",
@@ -593,7 +569,7 @@ pub(crate) fn repaint_shared(
         rows.push((ui.shared.with_me_group.clone(), row.upcast()));
     }
 
-    // Invitations: inviter + item, Accept / Reject.
+    // Invitations: inviter + item, Accept / Decline.
     for inv in invitations {
         let item = inv.name.clone().unwrap_or_else(|| gettext("a shared item"));
         let row = adw::ActionRow::builder()
@@ -606,12 +582,13 @@ pub(crate) fn repaint_shared(
         } else {
             "text-x-generic-symbolic"
         }));
+        // Labelled: a close glyph here reads as "dismiss this row".
         let reject = gtk4::Button::builder()
-            .icon_name("window-close-symbolic")
-            .tooltip_text(gettext("Reject"))
+            .label(gettext("Decline"))
             .valign(gtk4::Align::Center)
             .build();
         reject.add_css_class("flat");
+        reject.add_css_class("pill");
         let accept = gtk4::Button::builder()
             .label(gettext("Accept"))
             .valign(gtk4::Align::Center)
@@ -631,13 +608,13 @@ pub(crate) fn repaint_shared(
             let id = id_rej.clone();
             confirm_destructive(
                 btn,
-                &gettext("Reject Invitation?"),
+                &gettext("Decline Invitation?"),
                 // Translators: {name} is the shared item's name, or "this item".
                 &gettext_f(
                     "You won't have access to {name} unless it is shared again.",
                     &[("name", &name_rej)],
                 ),
-                &gettext("Reject"),
+                &gettext("Decline"),
                 move || respond_invitation(&ui, &id, false),
             );
         });
@@ -662,7 +639,7 @@ pub(crate) fn repaint_shared(
             .build();
         remove.add_css_class("flat");
         let open = gtk4::Button::builder()
-            .icon_name("external-link-symbolic")
+            .icon_name("adw-external-link-symbolic")
             .tooltip_text(gettext("Open in browser"))
             .valign(gtk4::Align::Center)
             .build();
@@ -707,7 +684,7 @@ pub(crate) fn respond_invitation(ui: &Rc<Ui>, id: &str, accept: bool) {
 pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Leave shared item"))
+        .heading(gettext("Leave Shared Item?"))
         // Translators: {name} is the shared item's name.
         .body(gettext_f(
             "Leave “{name}”? You'll lose access until you're invited again.",
@@ -738,7 +715,7 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
 pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Remove bookmark"))
+        .heading(gettext("Remove Bookmark?"))
         // Translators: {name} is the bookmark's name.
         .body(gettext_f(
             "Remove the bookmark for “{name}”?",
@@ -771,7 +748,7 @@ pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
 pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let dialog = adw::AlertDialog::builder()
-        .heading(gettext("Add bookmark"))
+        .heading(gettext("Add Bookmark"))
         .body(gettext("Paste a Proton Drive public link to save it here."))
         .build();
     let group = adw::PreferencesGroup::new();
@@ -835,7 +812,11 @@ pub(crate) fn run_shared_mutation(ui: &Rc<Ui>, req: Request, done: &str, failed:
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, &failed, &message, kind)
             }
-            _ => toast_error(&ui, &failed, &gettext("The mount service didn't respond.")),
+            _ => toast_error(
+                &ui,
+                &failed,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
         }
     });
 }
