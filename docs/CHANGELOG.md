@@ -11,6 +11,19 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.6.1] — 2026-09-28
+
+Schema: **35** (unchanged).
+
+### Added
+- **`pdfs-prompt --preload`.** Starts the launcher hidden, for session autostart such as
+  Hyprland's `exec-once`, so the first shortcut opens it as fast as later ones. It does nothing
+  when the launcher is already running.
+
+### Fixed
+- **Launcher invocations no longer pile up.** Each shortcut press after the first used to leave
+  a `pdfs-prompt` process behind after handing the request to the running launcher. It now exits.
+
 ## [2.6.0] — 2026-09-28
 
 The search launcher (`pdfs-prompt`) is rebuilt around a preview pane, and it now looks like the
@@ -1226,6 +1239,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.6.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.1
 [2.6.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.0
 [2.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.5.0
 [2.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.4.0
