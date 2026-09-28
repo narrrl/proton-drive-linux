@@ -11,6 +11,44 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.6.0] — 2026-09-28
+
+The search launcher (`pdfs-prompt`) is rebuilt around a preview pane, and it now looks like the
+app it belongs to.
+
+Schema: **35** (unchanged).
+
+### Added
+- **Launcher preview pane.** The selected result shows a large thumbnail, its type, size,
+  modified date, location and whether it is on this computer, with Open (Enter), Show in Folder
+  (Ctrl+Enter) and Copy Path (Ctrl+C, or Ctrl+Shift+C while text is selected in the search box).
+  Show in Folder selects the file in the file manager through `org.freedesktop.FileManager1`
+  and falls back to opening the folder.
+- **Recent files.** With an empty search box, the launcher lists the last files opened from it
+  above the pinned ones. Files opened often and lately also rank higher in search results. The
+  history lives in `prompt-history.json` in the state directory and forgets local files that
+  no longer exist.
+- **Thumbnails in the launcher.** Images show a thumbnail in the result list and the preview,
+  from the desktop's thumbnail cache, decoded locally (and written back to that cache), or
+  fetched by the daemon for Drive files.
+- **Drag and drop from the launcher.** A result can be dragged into a file manager or another
+  application as a file.
+
+### Changed
+- **The launcher follows the app's theme.** It uses the system accent colour, light and dark
+  style, and the opt-in Proton theme, instead of always pinning Proton purple. Changes to the
+  theme or to `open_with` apply the next time the launcher opens.
+- **Launcher layout.** Results are grouped into Recent, Pinned in Proton Drive and Best matches;
+  matched characters are bold, and each row shows its sync state, size and age. A click selects
+  a row and a double-click opens it; the search box keeps the keyboard focus throughout.
+- **Faster search as you type.** The launcher searches 80 ms after the last keystroke instead
+  of 120 ms.
+
+### Fixed
+- **The launcher no longer freezes on a stuck mount.** Checking whether a Drive file is in the
+  mount runs off the main thread and gives up after 2 seconds, falling back to the daemon.
+  Escape cancels a Drive file that is still opening.
+
 ### Documentation
 - **Rewritten user documentation.** New pages for installation, the user guide, the command-line
   reference, configuration and troubleshooting, and a documentation index in `docs/README.md`.
@@ -331,7 +369,7 @@ Schema: **31** (unchanged).
   opened in between.
 - **Photo viewer rewrite.** The lightbox's controls fade out after two seconds without pointer
   movement. Photos zoom with Ctrl+scroll, a pinch, `+`/`-`, `1` for 100 % and double-click, and
-  pan by dragging; `0` fits them again. The details panel docks beside the photo instead of
+  pan by dragging; `0` fits them again. The details panel docks beside the photo instead of 120 ms
   covering it. Stepping past the last loaded photo loads the next page, and the counter shows the
   library's total rather than the loaded count. A video plays inline. Save a Copy uses the photo's
   real name and reports failures, and Open With… offers the app chooser.
@@ -669,7 +707,7 @@ thumbnail.
   slider for the icon grid, and account storage usage. Zoom resizes the realised grid cells rather
   than rebuilding the model, so dragging the slider does not tear down the selection; the default
   size reproduces the previous fixed 72 px tiles. Capacity stays out of the bar until a real
-  reading lands, and the quota fetch (60 s TTL) now also runs while Files is on screen instead of
+  reading lands, and the quota fetch (60 s TTL) now also runs while Files is on screen instead of 120 ms
   only in Settings.
 - Repository housekeeping: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue and pull
   request templates, a project logo, and workspace crate metadata (`repository`, `homepage`,
@@ -1188,8 +1226,9 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.6.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.0
+[2.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.5.0
 [2.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.4.0
-
 [2.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.3.0
 [2.2.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.2
 [2.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.1
