@@ -8,7 +8,8 @@ pub(crate) struct SharedByMeState {
     pub(crate) retry: gtk4::Button,
     pub(crate) group: adw::PreferencesGroup,
     pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
-    pub(crate) inflight: Cell<bool>,
+    /// Runs the loads; the rows stay up while one runs.
+    pub(crate) loader: Rc<Loader>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
 }
 
@@ -98,25 +99,26 @@ pub(crate) fn shared_by_me_status(
 
 /// Fetch the shared-by-me listing and repaint the page.
 pub(crate) fn load_shared_by_me(ui: &Rc<Ui>) {
-    if ui.shared_by_me.inflight.get() {
-        return;
-    }
     cancel_file_thumbnails(ui);
-    ui.shared_by_me.inflight.set(true);
-    shared_by_me_status(
-        ui,
-        "pdfs-share-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading what you've shared."),
-        false,
-    );
+    let ui_p = ui.clone();
+    let ticket = ui.shared_by_me.loader.refresh(move || {
+        shared_by_me_status(
+            &ui_p,
+            "pdfs-share-symbolic",
+            &gettext("Loading…"),
+            &gettext("Reading what you've shared."),
+            false,
+        );
+    });
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListSharedByMe);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
-        ui.shared_by_me.inflight.set(false);
+        if !ticket.is_current() {
+            return;
+        }
         match result {
             Ok(Ok(Response::SharedByMe { items })) => {
                 repaint_shared_by_me(&ui, &items);

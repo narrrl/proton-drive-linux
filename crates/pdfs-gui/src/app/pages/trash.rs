@@ -15,6 +15,8 @@ pub(crate) struct TrashState {
     /// The bottom bar acting on the selection; revealed while anything is selected.
     pub(crate) selection_bar: gtk4::Revealer,
     pub(crate) selection_label: gtk4::Label,
+    /// Runs the loads; the rows stay up while one runs.
+    pub(crate) loader: Rc<Loader>,
 }
 
 /// The widgets of the Trash page that a load repaints.
@@ -285,18 +287,21 @@ pub(crate) fn bound_entry(item: &gtk4::ListItem) -> Option<DirEntry> {
 /// Fetch the trash listing and repaint the page.
 pub(crate) fn load_trash(ui: &Rc<Ui>) {
     cancel_file_thumbnails(ui);
-    // Drop the old rows first: a stale row here would offer Restore on something
-    // that may already be gone.
-    ui.trash.model.remove_all();
-    ui.trash.empty.set_sensitive(false);
-    sync_trash_selection(ui);
-    trash_status(
-        ui,
-        "user-trash-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading the trash."),
-        false,
-    );
+    // The rows stay up while the trash is read again. Trashed items are
+    // addressed by uid, so acting on one that has gone meanwhile fails
+    // cleanly rather than hitting something else.
+    let ui_p = ui.clone();
+    let ticket = ui.trash.loader.refresh(move || {
+        clear_trash(&ui_p);
+        ui_p.trash.empty.set_sensitive(false);
+        trash_status(
+            &ui_p,
+            "user-trash-symbolic",
+            &gettext("Loading…"),
+            &gettext("Reading the trash."),
+            false,
+        );
+    });
 
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListTrash);
@@ -304,6 +309,12 @@ pub(crate) fn load_trash(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
+        if !ticket.is_current() {
+            return;
+        }
+        if !matches!(result, Ok(Ok(Response::Entries { .. }))) {
+            clear_trash(&ui);
+        }
         match result {
             Ok(Ok(Response::Entries { entries })) => repaint_trash(&ui, &entries),
             Ok(Ok(Response::Error { message, .. })) => trash_status(
@@ -344,8 +355,6 @@ pub(crate) fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &s
 /// Repopulate the trash list, most recently modified first — the order in which a
 /// user looks for what they just deleted.
 pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
-    ui.trash.model.remove_all();
-    sync_trash_selection(ui);
     // An empty Trash has nothing to empty, so the button goes away rather than
     // sitting there greyed out.
     ui.trash.empty.set_sensitive(true);
@@ -358,6 +367,7 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
             &gettext("Items you delete from Proton Drive show up here."),
             false,
         );
+        clear_trash(ui);
         return;
     }
     ui.trash.content.set_visible_child_name("list");
@@ -370,9 +380,16 @@ pub(crate) fn repaint_trash(ui: &Rc<Ui>, entries: &[DirEntry]) {
 
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.modified));
-    for entry in sorted {
-        ui.trash.model.append(&BoxedAnyObject::new(entry));
-    }
+    // Only the rows that changed are swapped, so a refresh keeps the
+    // selection and the scroll position.
+    replace_items(&ui.trash.model, &sorted);
+    sync_trash_selection(ui);
+}
+
+/// Drop every row, and with them the selection and its bar.
+fn clear_trash(ui: &Rc<Ui>) {
+    ui.trash.model.remove_all();
+    sync_trash_selection(ui);
 }
 
 /// Restore one trashed entry to the folder it was trashed from.

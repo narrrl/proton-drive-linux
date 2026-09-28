@@ -31,6 +31,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// answers.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Cap on the read half for the requests front ends poll ([`Request::is_poll`]).
+/// The daemon answers those from memory or its database, so a reply that takes
+/// longer than this means it is stuck. Waiting the full [`READ_TIMEOUT`] would
+/// freeze the poller's read-out for two minutes; failing fast lets it say "not
+/// responding" and ask again on its next tick.
+const POLL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A command sent from the CLI to the daemon.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -739,7 +746,7 @@ pub struct DeviceInfo {
 
 /// One `(sync-conflict …)` copy and the file it is a copy of (in
 /// [`Response::Conflicts`]).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ConflictInfo {
     /// Mountpoint-relative path of the copy, or its absolute local path when it
     /// sits in a synced folder.
@@ -1025,7 +1032,7 @@ pub enum ActivityKind {
 /// One line in the daemon's activity log (in [`Response::Activity`]). Newest
 /// first. Records a mutation or transfer the daemon performed, with enough
 /// context to read as a sentence: "Uploaded report.pdf to /docs".
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ActivityEntry {
     /// When it happened, epoch seconds.
     pub time: i64,
@@ -1083,7 +1090,7 @@ pub struct TransferItem {
 }
 
 /// One entry in a [`Request::ListDir`] listing.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DirEntry {
     /// Decrypted node name.
     pub name: String,
@@ -2046,13 +2053,45 @@ impl ErrorKind {
     }
 }
 
+impl Request {
+    /// Whether this is one of the cheap state reads that front ends repeat on a
+    /// timer. The daemon answers these without touching the network, so they
+    /// get the short [`POLL_READ_TIMEOUT`].
+    pub fn is_poll(&self) -> bool {
+        matches!(
+            self,
+            Request::Status
+                | Request::GetQueueStatus
+                | Request::ListLocations
+                | Request::ListPendingOps
+                | Request::ListConflicts
+                | Request::ListActivity { .. }
+                | Request::ThumbnailBuildStatus
+                | Request::PhotosRefreshStatus
+                | Request::RedateStatus
+                | Request::ImportStatus
+        )
+    }
+
+    /// How long to wait for the daemon's reply to this request.
+    pub fn read_timeout(&self) -> Duration {
+        if self.is_poll() {
+            POLL_READ_TIMEOUT
+        } else {
+            READ_TIMEOUT
+        }
+    }
+}
+
 /// Send one [`Request`] to the daemon listening on `socket` and read its
-/// [`Response`]. Returns a crate [`crate::Error`] if no daemon is listening.
+/// [`Response`]. Returns a crate [`crate::Error`] if no daemon is listening, and
+/// one for which [`crate::Error::is_timeout`] holds if the daemon took longer
+/// than [`Request::read_timeout`] to answer.
 ///
 /// Shared by the CLI and GUI so both speak the wire format identically.
 pub fn send(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_read_timeout(Some(req.read_timeout()))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
@@ -2067,6 +2106,36 @@ pub fn send(socket: &Path, req: &Request) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polls_wait_briefly_and_real_work_waits_long() {
+        assert_eq!(Request::Status.read_timeout(), POLL_READ_TIMEOUT);
+        assert_eq!(
+            Request::ListActivity { limit: 200 }.read_timeout(),
+            POLL_READ_TIMEOUT
+        );
+        assert_eq!(
+            Request::OpenFile {
+                path: "a.txt".into(),
+                uid: None,
+            }
+            .read_timeout(),
+            READ_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_never_answers_times_out_as_not_responding() {
+        let socket = std::env::temp_dir().join(format!("pdfs-silent-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        // Bound but never accepted: connect succeeds, no reply ever comes.
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        let err = send(&socket, &Request::Status).unwrap_err();
+        let _ = std::fs::remove_file(&socket);
+        assert!(err.is_timeout(), "{err}");
+        assert!(started.elapsed() < READ_TIMEOUT);
+    }
 
     #[test]
     fn photo_kind_classifies_by_extension_then_mime() {

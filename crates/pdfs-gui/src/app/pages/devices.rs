@@ -19,7 +19,8 @@ pub(crate) struct DevicesState {
     /// current device is filtered out of the "Other computers" rows, so this is
     /// where its rename target lives. `None` until identified.
     pub(crate) this_device: RefCell<Option<(String, String)>>,
-    pub(crate) inflight: Cell<bool>,
+    /// Runs the loads; the rows stay up while one runs.
+    pub(crate) loader: Rc<Loader>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
 }
 
@@ -148,17 +149,16 @@ pub(crate) fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
 /// repaint both sections. The two requests are chained so a single unreachable
 /// daemon collapses the whole page to a status view.
 pub(crate) fn load_devices(ui: &Rc<Ui>) {
-    if ui.devices.inflight.get() {
-        return;
-    }
-    ui.devices.inflight.set(true);
-    devices_status(
-        ui,
-        "computer-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading your computers."),
-        false,
-    );
+    let ui_p = ui.clone();
+    let ticket = ui.devices.loader.refresh(move || {
+        devices_status(
+            &ui_p,
+            "computer-symbolic",
+            &gettext("Loading…"),
+            &gettext("Reading your computers."),
+            false,
+        );
+    });
     ui.busy_begin();
     // The two lists are independent and the daemon serves requests concurrently,
     // so fire both up front and collect them, rather than paying two round trips
@@ -169,14 +169,16 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         let sync = rx.recv().await;
         let devices_reply = rx2.recv().await;
+        ui.busy_end();
+        if !ticket.is_current() {
+            return;
+        }
         let folders = match sync {
             Ok(Ok(Response::SyncFolders { items })) => items,
             // The daemon answered but not as expected — treat as empty and carry
             // on to the devices list rather than failing the whole page.
             Ok(Ok(_)) => Vec::new(),
             Ok(Err(_)) | Err(_) => {
-                ui.busy_end();
-                ui.devices.inflight.set(false);
                 ui.devices.loaded_at.set(None);
                 devices_unreachable(&ui);
                 return;
@@ -190,8 +192,6 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
             Ok(Ok(Response::Devices { items })) => items,
             _ => Vec::new(),
         };
-        ui.busy_end();
-        ui.devices.inflight.set(false);
         repaint_devices(&ui, &devices);
         ui.devices.loaded_at.set(Some(Instant::now()));
     });

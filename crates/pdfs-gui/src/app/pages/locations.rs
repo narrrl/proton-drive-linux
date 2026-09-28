@@ -21,6 +21,9 @@ pub(crate) struct LocationsState {
     pub(crate) group: adw::PreferencesGroup,
     pub(crate) rows: RefCell<Vec<LocationRow>>,
     pub(crate) inflight: Cell<bool>,
+    /// Shows the loading state if a full load is slow; the rows stay up
+    /// until then.
+    pub(crate) loader: Rc<Loader>,
     pub(crate) loaded_at: Cell<Option<Instant>>,
     pub(crate) card: SyncCard,
     pub(crate) queue: QueueState,
@@ -800,13 +803,16 @@ pub(crate) fn load_locations(ui: &Rc<Ui>) {
         return;
     }
     ui.locations.inflight.set(true);
-    locations_status(
-        ui,
-        "drive-harddisk-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading this computer's Proton Drive locations."),
-        false,
-    );
+    let ui_p = ui.clone();
+    let ticket = ui.locations.loader.refresh(move || {
+        locations_status(
+            &ui_p,
+            "drive-harddisk-symbolic",
+            &gettext("Loading…"),
+            &gettext("Reading this computer's Proton Drive locations."),
+            false,
+        );
+    });
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListLocations);
     let ui = ui.clone();
@@ -814,6 +820,7 @@ pub(crate) fn load_locations(ui: &Rc<Ui>) {
         let result = rx.recv().await;
         ui.busy_end();
         ui.locations.inflight.set(false);
+        drop(ticket);
         match result {
             Ok(Ok(Response::Locations { items })) => {
                 ui.locations.content.set_visible_child_name("list");

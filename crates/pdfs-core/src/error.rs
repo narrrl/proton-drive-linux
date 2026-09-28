@@ -66,6 +66,20 @@ impl Error {
     }
 }
 
+impl Error {
+    /// Whether a control-socket round-trip gave up waiting for the reply: the
+    /// daemon is running but stuck, as opposed to not running at all.
+    pub fn is_timeout(&self) -> bool {
+        matches!(
+            self,
+            Error::Io(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A failure on its way to a front-end: prose for the user, plus the

@@ -20,8 +20,12 @@ pub(crate) struct SharedState {
     /// mount, so descending is uid-addressed and the stack *is* the breadcrumb.
     pub(crate) nav: RefCell<Vec<(String, String)>>,
     pub(crate) rows: RefCell<Vec<(adw::PreferencesGroup, gtk4::Widget)>>,
-    /// Guards the Shared page's load so overlapping navigations don't stack.
-    pub(crate) inflight: Cell<bool>,
+    /// Runs the loads. A newer one, such as a navigation made while a folder
+    /// was loading, supersedes the one before it.
+    pub(crate) loader: Rc<Loader>,
+    /// The [`SharedState::nav`] the rows on screen were painted for, or `None`
+    /// before the first paint.
+    pub(crate) listed: RefCell<Option<Vec<(String, String)>>>,
     /// When the Shared page last painted good data. `None` = never / invalidated,
     /// forcing a fetch on next visit. See [`PAGE_TTL`].
     pub(crate) loaded_at: Cell<Option<Instant>>,
@@ -163,22 +167,16 @@ pub(crate) fn shared_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &
 /// children are fetched: invitations and bookmarks belong to the top level, and
 /// carrying them down a subtree would read as if they lived there.
 pub(crate) fn load_shared(ui: &Rc<Ui>) {
-    if ui.shared.inflight.get() {
-        return;
-    }
     cancel_file_thumbnails(ui);
     let current = ui.shared.nav.borrow().last().cloned();
     if let Some((uid, _)) = current {
         load_shared_folder(ui, uid);
         return;
     }
-    ui.shared.inflight.set(true);
-    shared_status(
+    let ticket = begin_shared_load(
         ui,
         "pdfs-people-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading your shared items."),
-        false,
+        gettext("Reading your shared items."),
     );
 
     ui.busy_begin();
@@ -192,7 +190,9 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
         let invites = invites_rx.recv().await;
         let bookmarks = bookmarks_rx.recv().await;
         ui.busy_end();
-        ui.shared.inflight.set(false);
+        if !ticket.is_current() {
+            return;
+        }
 
         // A transport failure on any of the three means the daemon isn't up.
         if matches!(shared, Ok(Err(_)) | Err(_))
@@ -225,13 +225,10 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
 /// The uid comes from the row that was activated (or from the nav stack on a
 /// reload) — a shared subtree is reachable no other way.
 fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
-    ui.shared.inflight.set(true);
-    shared_status(
+    let ticket = begin_shared_load(
         ui,
         "folder-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading this shared folder."),
-        false,
+        gettext("Reading this shared folder."),
     );
     ui.busy_begin();
     let rx = spawn_request(ui.dirs.control_socket(), Request::ListSharedFolder { uid });
@@ -239,7 +236,9 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
-        ui.shared.inflight.set(false);
+        if !ticket.is_current() {
+            return;
+        }
         match result {
             Ok(Ok(Response::Entries { entries })) => {
                 repaint_shared_folder(&ui, &entries);
@@ -258,6 +257,22 @@ fn load_shared_folder(ui: &Rc<Ui>, uid: String) {
             }
         }
     });
+}
+
+/// Start a load of the view [`SharedState::nav`] points at. A reload of the
+/// view on screen keeps its rows up and usable. Moving to another view greys
+/// them out until the new rows arrive, since they belong to another folder.
+fn begin_shared_load(ui: &Rc<Ui>, icon: &'static str, description: String) -> LoadTicket {
+    let ui_p = ui.clone();
+    let placeholder = move || {
+        shared_status(&ui_p, icon, &gettext("Loading…"), &description, false);
+    };
+    if *ui.shared.listed.borrow() == Some(ui.shared.nav.borrow().clone()) {
+        ui.shared.loader.refresh(placeholder)
+    } else {
+        ui.shared.listed.borrow_mut().take();
+        ui.shared.loader.replace(placeholder)
+    }
 }
 
 /// The header subtitle inside a shared folder: the folders from the share root
@@ -295,6 +310,7 @@ fn repaint_shared_folder(ui: &Rc<Ui>, entries: &[DirEntry]) {
 
     let nav = ui.shared.nav.borrow().clone();
     ui.shared.title.set_subtitle(&shared_path(&nav));
+    *ui.shared.listed.borrow_mut() = Some(nav);
     ui.shared.with_me_group.set_title("");
 
     let mut rows: Vec<(adw::PreferencesGroup, gtk4::Widget)> = Vec::new();
@@ -529,6 +545,7 @@ pub(crate) fn repaint_shared(
     for (group, row) in ui.shared.rows.borrow_mut().drain(..) {
         group.remove(&row);
     }
+    *ui.shared.listed.borrow_mut() = Some(Vec::new());
     ui.shared.title.set_subtitle("");
     ui.shared.back.set_visible(false);
     ui.shared.add_bookmark.set_visible(true);

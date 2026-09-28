@@ -1262,6 +1262,10 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                 });
                 repaint_pins(&ui, &pins, true);
             }
+            // The daemon is up but stuck. Say so, and keep the mount state:
+            // announcing "disconnected" for a slow reply would be wrong, and
+            // the next tick asks again.
+            Ok(Err(e)) if e.is_timeout() => paint_sync_status(&ui, SyncState::NotResponding),
             // Daemon unreachable (still starting, or down): report not-mounted and
             // grey out the unpin buttons in place, but leave the last-known pin
             // rows and cache read-out so the page doesn't flicker on a blip.
@@ -1305,13 +1309,15 @@ pub(crate) enum SyncState {
     },
     /// No mount daemon answered: still starting, or the service is down.
     Disconnected,
+    /// The daemon is running but didn't answer in time.
+    NotResponding,
 }
 
 /// Paint the sidebar status strip and the Sync page's status card: icon,
 /// one-line state, and a detail line.
 fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     let paused = matches!(state, SyncState::Paused { .. });
-    let connected = !matches!(state, SyncState::Disconnected);
+    let connected = !matches!(state, SyncState::Disconnected | SyncState::NotResponding);
     let (icon, class, title, detail) = match state {
         SyncState::Paused { until, queued } => (
             "media-playback-pause-symbolic",
@@ -1365,6 +1371,12 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
             Some("warning"),
             gettext("Not connected"),
             Some(gettext("Proton Drive isn't running")),
+        ),
+        SyncState::NotResponding => (
+            "dialog-warning-symbolic",
+            Some("warning"),
+            gettext("Not responding"),
+            Some(gettext("Proton Drive is taking too long to answer")),
         ),
     };
     let image = &ui.status.status_icon;

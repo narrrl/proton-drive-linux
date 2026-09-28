@@ -212,6 +212,17 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             paused: false,
             failing: 0,
         },
+        // The daemon is up but stuck: say so rather than "not connected", and
+        // keep the mount actions, which still work on the folder itself.
+        Err(e) if e.is_timeout() => DriveState {
+            line: gettext("Proton Drive isn't responding"),
+            phase: Phase::Attention,
+            mounted: true,
+            mountpoint: default_mountpoint.to_path_buf(),
+            sync: String::new(),
+            paused: false,
+            failing: 0,
+        },
         // No daemon: describe login state instead so the menu is still useful.
         Err(_) => {
             let (line, phase) = match auth::load() {

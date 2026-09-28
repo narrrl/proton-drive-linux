@@ -93,6 +93,13 @@ scale.browser-status-meter trough { min-width: 104px; min-height: 6px; }
 /* Shared with Me: what a share lets me do, as a tinted pill beside the name. */
 .role-pill { padding: 2px 10px; border-radius: 999px; font-weight: 600; color: var(--accent-color); background-color: color-mix(in srgb, var(--accent-bg-color) 16%, transparent); }
 
+/* Activity: the feed sits on the window background as one card per row, under
+ * day headings, like a boxed list with its rows set apart. */
+listview.activity-feed { background: none; color: inherit; padding: 0 12px 18px 12px; }
+listview.activity-feed > row { padding: 0; margin-bottom: 6px; background: none; }
+listview.activity-feed > header { padding: 18px 6px 6px 6px; background: none; }
+listview.activity-feed row.card { border-radius: 12px; }
+
 /* Photos: how many timeline filters are on, as a small badge on the Filters button. */
 .filter-count { min-width: 18px; padding: 0 5px; border-radius: 999px; font-size: 0.8em; font-weight: 700; color: var(--accent-fg-color); background-color: var(--accent-bg-color); }
 /* The Places map: sea and land come in the map's own colours; markers (drawn

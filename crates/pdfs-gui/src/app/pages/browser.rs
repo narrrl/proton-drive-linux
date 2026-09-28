@@ -52,10 +52,14 @@ pub(crate) struct BrowserState {
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     pub(crate) search_source: RefCell<Option<glib::SourceId>>,
-    /// Identity of the newest folder/search request. Paths and queries can be
-    /// requested repeatedly, so comparing their text alone cannot reject an
-    /// older response that finishes after a manual refresh.
-    pub(crate) load_generation: Cell<u64>,
+    /// Runs folder loads and searches. Paths and queries can be requested
+    /// repeatedly, so only its tickets can tell an older reply that finishes
+    /// after a manual refresh from the newest one.
+    pub(crate) loader: Rc<Loader>,
+    /// The folder the model holds rows for, or `None` while it holds search
+    /// hits or nothing. Reloading this folder keeps the rows up and usable;
+    /// loading any other greys them out until the new ones arrive.
+    pub(crate) listed: RefCell<Option<String>>,
     /// The grid/list view stack, read to find out which view is on screen.
     pub(crate) views: gtk4::Stack,
     /// The list view, whose Location column shows only for search hits.
@@ -2815,24 +2819,33 @@ pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {
 /// Request the current browser directory from the daemon and repaint both views.
 pub(crate) fn load_browser(ui: &Rc<Ui>) {
     cancel_file_thumbnails(ui);
-    let generation = ui.browser.load_generation.get().wrapping_add(1);
-    ui.browser.load_generation.set(generation);
     let path = ui.browser.path.borrow().clone();
     repaint_crumb(ui, &path);
     sync_history_actions(ui);
     sync_search_scope(ui);
-    ui.browser.summary.set_label(&gettext("Loading…"));
 
-    // Drop the previous folder's rows up front: a slow reply must not leave stale
-    // entries visible, where clicking one would open with a wrong relative path.
-    ui.browser.model.remove_all();
-    browser_status(
-        ui,
-        "folder-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading this folder."),
-        false,
-    );
+    // A reload of the folder on screen leaves its rows alone. Any other load
+    // keeps the old rows up only greyed out, with nothing selected: their
+    // paths resolve against the new folder, so acting on one would hit the
+    // wrong file.
+    let ui_p = ui.clone();
+    let placeholder = move || {
+        ui_p.browser.model.remove_all();
+        ui_p.browser.summary.set_label(&gettext("Loading…"));
+        browser_status(
+            &ui_p,
+            "folder-symbolic",
+            &gettext("Loading…"),
+            &gettext("Reading this folder."),
+            false,
+        );
+    };
+    let ticket = if ui.browser.listed.borrow().as_deref() == Some(path.as_str()) {
+        ui.browser.loader.refresh(placeholder)
+    } else {
+        forget_listing(ui);
+        ui.browser.loader.replace(placeholder)
+    };
 
     ui.busy_begin();
     let rx = spawn_request(
@@ -2846,7 +2859,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
         // The user may have navigated on while this folder was loading. A stale
         // out-of-order reply must not repaint rows for a folder we've left, or
         // the breadcrumb and the grid would disagree.
-        if ui.browser.load_generation.get() != generation || *ui.browser.path.borrow() != path {
+        if !ticket.is_current() || *ui.browser.path.borrow() != path {
             return;
         }
         match result {
@@ -2866,6 +2879,7 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
 /// in-band failures (a bad path, a permission error) — the mount is up, so Retry
 /// (which restarts the service) wouldn't help and isn't offered.
 pub(crate) fn browser_failed(ui: &Rc<Ui>, message: &str, kind: ErrorKind) {
+    forget_listing(ui);
     ui.browser.model.remove_all();
     ui.browser.summary.set_label(&gettext("Folder unavailable"));
     browser_status(
@@ -2899,7 +2913,7 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
 pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     show_location_column(ui, false);
     *ui.browser.listing.borrow_mut() = entries.to_vec();
-    ui.browser.model.remove_all();
+    *ui.browser.listed.borrow_mut() = Some(ui.browser.path.borrow().clone());
     ui.browser.summary.set_label(&listing_summary(
         entries.iter().filter(|entry| !entry.is_dir).count(),
         entries.iter().filter(|entry| entry.is_dir).count(),
@@ -2917,6 +2931,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
             &gettext("Drop files here, or upload a file or create a folder to get started."),
             false,
         );
+        ui.browser.model.remove_all();
         ui.browser.empty_actions.set_visible(true);
         return;
     }
@@ -2924,9 +2939,17 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
 
     let mut sorted = entries.to_vec();
     sort_entries(&mut sorted, ui.browser.view.get());
-    for entry in sorted {
-        ui.browser.model.append(&BoxedAnyObject::new(entry));
-    }
+    // Only the rows that changed are swapped, so a refresh keeps the
+    // selection, the scroll position and the thumbnails already drawn.
+    replace_items(&ui.browser.model, &sorted);
+}
+
+/// Forget which folder the rows belong to and drop the selection, before the
+/// rows stop matching the folder on screen.
+fn forget_listing(ui: &Rc<Ui>) {
+    ui.browser.listed.borrow_mut().take();
+    active_selection(ui).unselect_all();
+    clear_details(ui);
 }
 
 /// Wire the browser header's search box: debounce keystrokes, then either run a
@@ -2984,17 +3007,22 @@ fn search_scope(ui: &Rc<Ui>) -> Option<String> {
 /// (each hit carries its full path; see [`entry_rel`]).
 pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
     cancel_file_thumbnails(ui);
-    let generation = ui.browser.load_generation.get().wrapping_add(1);
-    ui.browser.load_generation.set(generation);
-    ui.browser.model.remove_all();
-    ui.browser.summary.set_label(&gettext("Searching…"));
-    browser_status(
-        ui,
-        "system-search-symbolic",
-        &gettext("Searching…"),
-        &gettext_f("Looking for “{query}”.", &[("query", query)]),
-        false,
-    );
+    // Hits carry their own paths, but the old rows may not: grey them out and
+    // drop the selection until the hits arrive.
+    forget_listing(ui);
+    let ui_p = ui.clone();
+    let looking_for = query.to_string();
+    let ticket = ui.browser.loader.replace(move || {
+        ui_p.browser.model.remove_all();
+        ui_p.browser.summary.set_label(&gettext("Searching…"));
+        browser_status(
+            &ui_p,
+            "system-search-symbolic",
+            &gettext("Searching…"),
+            &gettext_f("Looking for “{query}”.", &[("query", &looking_for)]),
+            false,
+        );
+    });
 
     ui.busy_begin();
     let query = query.to_string();
@@ -3013,9 +3041,7 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
         // The box may have been cleared or typed past while the reply was in
         // flight; if the query no longer matches, a fresher load/search already
         // owns the model — drop this stale, possibly out-of-order result.
-        if ui.browser.load_generation.get() != generation
-            || ui.browser.search.text().trim() != query
-        {
+        if !ticket.is_current() || ui.browser.search.text().trim() != query {
             return;
         }
         match result {
@@ -3036,7 +3062,6 @@ pub(crate) fn run_search(ui: &Rc<Ui>, query: &str) {
 /// handlers already understand.
 pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
     show_location_column(ui, true);
-    ui.browser.model.remove_all();
     let counts = listing_summary(
         hits.iter().filter(|hit| !hit.is_dir).count(),
         hits.iter().filter(|hit| hit.is_dir).count(),
@@ -3067,6 +3092,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             &gettext("No files or folders match that search."),
             false,
         );
+        ui.browser.model.remove_all();
         return;
     }
     browser_views(ui);
@@ -3089,9 +3115,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
         })
         .collect();
     sort_entries(&mut entries, ui.browser.view.get());
-    for entry in entries {
-        ui.browser.model.append(&BoxedAnyObject::new(entry));
-    }
+    replace_items(&ui.browser.model, &entries);
 }
 
 fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {

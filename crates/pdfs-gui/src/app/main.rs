@@ -4,6 +4,7 @@ pub(crate) mod dates;
 #[path = "../i18n.rs"]
 pub(crate) mod i18n;
 pub(crate) mod pages;
+pub(crate) mod reload;
 pub(crate) mod widgets;
 
 use pages::activity::*;
@@ -23,6 +24,7 @@ use pages::status::*;
 use pages::takeout::*;
 use pages::trash::*;
 use pages::verify::*;
+use reload::{LoadTicket, Loader, replace_items};
 use widgets::details::*;
 use widgets::menu::*;
 use widgets::share_dialog::*;
@@ -584,7 +586,8 @@ fn build_window(app: &adw::Application) {
             thumbnail_build_running: Cell::new(false),
             thumbnail_cancel_pending: Cell::new(false),
             search_source: RefCell::new(None),
-            load_generation: Cell::new(0),
+            loader: Loader::new(&browser_widgets.content),
+            listed: RefCell::new(None),
             views: browser_widgets.views.clone(),
             column_view: browser_widgets.column_view.clone(),
             bulk: browser_widgets.bulk.clone(),
@@ -615,6 +618,7 @@ fn build_window(app: &adw::Application) {
             selection: trash_widgets.selection.clone(),
             selection_bar: trash_widgets.selection_bar.clone(),
             selection_label: trash_widgets.selection_label.clone(),
+            loader: Loader::new(&trash_widgets.content),
         },
         gallery: GalleryState {
             model: gallery_widgets.model.clone(),
@@ -716,7 +720,8 @@ fn build_window(app: &adw::Application) {
             add_bookmark: shared_widgets.add_bookmark.clone(),
             nav: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
-            inflight: Cell::new(false),
+            loader: Loader::new(&shared_widgets.content),
+            listed: RefCell::new(None),
             loaded_at: Cell::new(None),
         },
         shared_by_me: SharedByMeState {
@@ -725,7 +730,7 @@ fn build_window(app: &adw::Application) {
             retry: shared_by_me_widgets.retry.clone(),
             group: shared_by_me_widgets.group.clone(),
             rows: RefCell::new(Vec::new()),
-            inflight: Cell::new(false),
+            loader: Loader::new(&shared_by_me_widgets.content),
             loaded_at: Cell::new(None),
         },
         devices: DevicesState {
@@ -738,7 +743,7 @@ fn build_window(app: &adw::Application) {
             sync_rows: RefCell::new(Vec::new()),
             rename_this: devices_widgets.rename_this.clone(),
             this_device: RefCell::new(None),
-            inflight: Cell::new(false),
+            loader: Loader::new(&devices_widgets.content),
             loaded_at: Cell::new(None),
         },
         locations: LocationsState {
@@ -748,6 +753,7 @@ fn build_window(app: &adw::Application) {
             group: locations_widgets.group.clone(),
             rows: RefCell::new(Vec::new()),
             inflight: Cell::new(false),
+            loader: Loader::new(&locations_widgets.content),
             loaded_at: Cell::new(None),
             card: SyncCard {
                 icon: locations_widgets.card_icon.clone(),
@@ -774,11 +780,10 @@ fn build_window(app: &adw::Application) {
             content: activity_widgets.content.clone(),
             status: activity_widgets.status.clone(),
             retry: activity_widgets.retry.clone(),
-            attention: activity_widgets.attention.clone(),
-            attention_rows: RefCell::new(Vec::new()),
-            days: activity_widgets.days.clone(),
+            model: activity_widgets.model.clone(),
+            feed: activity_widgets.feed.clone(),
             inflight: Cell::new(false),
-            key: RefCell::new(None),
+            loader: Loader::new(&activity_widgets.content),
             items: RefCell::new(Vec::new()),
             filter: Cell::new(ActivityFilter::All),
             conflicts: RefCell::new(None),
@@ -843,7 +848,7 @@ fn build_window(app: &adw::Application) {
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
     wire_devices(&ui, &devices_widgets.retry);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
-    wire_activity(&ui, &activity_widgets.retry, &activity_widgets.filters);
+    wire_activity(&ui, &activity_widgets);
     wire_takeout(&ui, &takeout_widgets);
     wire_refresh(
         &ui,
@@ -1795,10 +1800,10 @@ fn notify(id: &str, title: &str, body: &str) {
 fn spawn_request(
     socket: PathBuf,
     req: Request,
-) -> async_channel::Receiver<Result<Response, String>> {
+) -> async_channel::Receiver<Result<Response, pdfs_core::Error>> {
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let result = send(&socket, &req).map_err(|e| e.to_string());
+        let result = send(&socket, &req);
         let _ = tx.send_blocking(result);
     });
     rx

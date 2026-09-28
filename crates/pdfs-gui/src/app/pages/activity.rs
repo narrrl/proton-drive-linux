@@ -2,19 +2,21 @@ use crate::*;
 
 pub(crate) struct ActivityState {
     // Activity page: a "Needs attention" section for live conflicts, then the
-    // feed grouped by day, rebuilt wholesale on each change.
+    // feed grouped by day, in one list that a repaint updates in place.
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
-    pub(crate) attention: adw::PreferencesGroup,
-    pub(crate) attention_rows: RefCell<Vec<adw::ActionRow>>,
-    pub(crate) days: gtk4::Box,
+    /// The rows, as [`FeedItem`]s. A repaint swaps only the ones that
+    /// changed, so the page polling every couple of seconds keeps the user's
+    /// scroll position.
+    pub(crate) model: gio::ListStore,
+    /// The list, or the "No matching activity" status when the filter leaves
+    /// nothing.
+    pub(crate) feed: gtk4::Stack,
     pub(crate) inflight: Cell<bool>,
-    /// Fingerprint of what is on screen (see [`activity_key`]). The page polls
-    /// every couple of seconds and usually gets back exactly what it is already
-    /// showing; rebuilding every row for that would throw away the user's
-    /// scroll position several times a minute.
-    pub(crate) key: RefCell<Option<String>>,
+    /// Shows the loading state if a full load is slow; the rows stay up
+    /// until then.
+    pub(crate) loader: Rc<Loader>,
     /// The last feed the daemon sent, so a filter change repaints without a
     /// round-trip.
     pub(crate) items: RefCell<Vec<ActivityEntry>>,
@@ -30,8 +32,9 @@ pub(crate) struct ActivityState {
 pub(crate) struct ActivityWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
-    pub(crate) attention: adw::PreferencesGroup,
-    pub(crate) days: gtk4::Box,
+    pub(crate) model: gio::ListStore,
+    pub(crate) list: gtk4::ListView,
+    pub(crate) feed: gtk4::Stack,
     pub(crate) filters: Vec<(ActivityFilter, gtk4::ToggleButton)>,
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
@@ -89,7 +92,8 @@ impl ActivityFilter {
 pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     let refresh = refresh_button();
 
-    // Filter chips: a linked row of radio toggles.
+    // Filter chips: a linked row of radio toggles. They sit above the list,
+    // not in it, so they stay in reach however far the feed is scrolled.
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("linked");
     bar.set_halign(gtk4::Align::Start);
@@ -104,31 +108,61 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
         bar.append(&button);
         filters.push((filter, button));
     }
-
-    let attention = adw::PreferencesGroup::builder()
-        .title(gettext("Needs attention"))
-        .visible(false)
-        .build();
-    let days = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
-
-    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
-    column.set_margin_top(18);
-    column.set_margin_bottom(18);
-    column.set_margin_start(18);
-    column.set_margin_end(18);
-    column.append(&bar);
-    column.append(&attention);
-    column.append(&days);
-    let clamp = adw::Clamp::builder()
+    bar.set_margin_top(12);
+    bar.set_margin_bottom(6);
+    bar.set_margin_start(12);
+    bar.set_margin_end(12);
+    let bar_clamp = adw::Clamp::builder()
         .maximum_size(900)
         .tightening_threshold(600)
-        .child(&column)
+        .child(&bar)
+        .build();
+
+    // Rows are sectioned by the key each item carries: the conflicts first,
+    // then one section per day. The items already arrive in that order, and
+    // the sort is stable, so this only marks where each section starts.
+    let model = gio::ListStore::new::<BoxedAnyObject>();
+    let sections = gtk4::SortListModel::new(Some(model.clone()), None::<gtk4::Sorter>);
+    sections.set_section_sorter(Some(&gtk4::CustomSorter::new(|a, b| {
+        let key = |object: &glib::Object| {
+            object
+                .downcast_ref::<BoxedAnyObject>()
+                .map_or(i64::MIN, |item| item.borrow::<FeedItem>().section())
+        };
+        // Newest section first.
+        key(b).cmp(&key(a)).into()
+    })));
+    let list = gtk4::ListView::builder()
+        .model(&gtk4::NoSelection::new(Some(sections)))
+        .single_click_activate(true)
+        .build();
+    list.add_css_class("activity-feed");
+    list.set_header_factory(Some(&feed_header_factory()));
+    let clamp = adw::ClampScrollable::builder()
+        .maximum_size(900)
+        .tightening_threshold(600)
+        .child(&list)
         .build();
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&clamp)
         .build();
+
+    let no_match = adw::StatusPage::builder()
+        .icon_name("edit-find-symbolic")
+        .title(gettext("No matching activity"))
+        .description(gettext("Nothing in the recent log fits this filter."))
+        .vexpand(true)
+        .build();
+    no_match.add_css_class("compact");
+    let feed = gtk4::Stack::new();
+    feed.add_named(&scroll, Some("rows"));
+    feed.add_named(&no_match, Some("empty"));
+
+    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    column.append(&bar_clamp);
+    column.append(&feed);
 
     let retry = gtk4::Button::builder()
         .label(gettext("Retry"))
@@ -147,7 +181,7 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     let content = gtk4::Stack::new();
     content.set_vexpand(true);
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
-    content.add_named(&scroll, Some("list"));
+    content.add_named(&column, Some("list"));
     content.add_named(&status, Some("status"));
 
     let (frame, header, _) = page_frame(&gettext("Activity"), &content);
@@ -158,8 +192,9 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
         ActivityWidgets {
             content,
             status,
-            attention,
-            days,
+            model,
+            list,
+            feed,
             filters,
             retry,
             refresh,
@@ -167,15 +202,62 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     )
 }
 
-/// Install the Activity page's retry button.
-pub(crate) fn wire_activity(
-    ui: &Rc<Ui>,
-    retry: &gtk4::Button,
-    filters: &[(ActivityFilter, gtk4::ToggleButton)],
-) {
+/// Section headings: "Needs attention" with a line on what to do, or the day.
+/// Each is read from the first item of its section.
+fn feed_header_factory() -> gtk4::SignalListItemFactory {
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(|_, header| {
+        let header = header.downcast_ref::<gtk4::ListHeader>().unwrap();
+        let title = gtk4::Label::builder().xalign(0.0).build();
+        title.add_css_class("heading");
+        let description = gtk4::Label::builder().xalign(0.0).wrap(true).build();
+        description.add_css_class("dim-label");
+        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        column.add_css_class("activity-heading");
+        column.append(&title);
+        column.append(&description);
+        header.set_child(Some(&column));
+    });
+    factory.connect_bind(|_, header| {
+        let header = header.downcast_ref::<gtk4::ListHeader>().unwrap();
+        let Some(column) = header.child() else {
+            return;
+        };
+        let Some(title) = column.first_child().and_downcast::<gtk4::Label>() else {
+            return;
+        };
+        let Some(description) = title.next_sibling().and_downcast::<gtk4::Label>() else {
+            return;
+        };
+        let Some(item) = header.item().and_downcast::<BoxedAnyObject>() else {
+            return;
+        };
+        let (heading, line) = match &*item.borrow::<FeedItem>() {
+            FeedItem::Attention { open, .. } => (
+                gettext("Needs attention"),
+                Some(ngettext_f(
+                    "A file was changed in two places at once. Choose which version to keep.",
+                    "{n} files were changed in two places at once. Choose which versions to keep.",
+                    *open as u64,
+                    &[],
+                )),
+            ),
+            FeedItem::Logged { day_label, .. } => (day_label.clone(), None),
+        };
+        title.set_label(&heading);
+        description.set_visible(line.is_some());
+        description.set_label(line.as_deref().unwrap_or_default());
+    });
+    factory
+}
+
+/// Install the Activity page's retry button, filters and rows.
+pub(crate) fn wire_activity(ui: &Rc<Ui>, widgets: &ActivityWidgets) {
     let ui_retry = ui.clone();
-    retry.connect_clicked(move |_| restart_service_then(&ui_retry, load_activity));
-    for (filter, button) in filters {
+    widgets
+        .retry
+        .connect_clicked(move |_| restart_service_then(&ui_retry, load_activity));
+    for (filter, button) in &widgets.filters {
         let ui = ui.clone();
         let filter = *filter;
         button.connect_toggled(move |button| {
@@ -185,6 +267,56 @@ pub(crate) fn wire_activity(
             }
         });
     }
+
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_bind({
+        let ui = ui.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            let Some(object) = item.item().and_downcast::<BoxedAnyObject>() else {
+                return;
+            };
+            let row = match &*object.borrow::<FeedItem>() {
+                FeedItem::Attention { conflict, .. } => {
+                    item.set_activatable(true);
+                    conflict_row(&ui, conflict)
+                }
+                FeedItem::Logged {
+                    entry,
+                    count,
+                    first,
+                    pending,
+                    resolved,
+                    ..
+                } => {
+                    item.set_activatable(false);
+                    feed_row(&ui, entry, *count, *first, pending.as_ref(), *resolved)
+                }
+            };
+            row.add_css_class("card");
+            item.set_child(Some(&row));
+        }
+    });
+    factory.connect_unbind(|_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        item.set_child(None::<&gtk4::Widget>);
+    });
+    widgets.list.set_factory(Some(&factory));
+    // A list row does not emit the action row's own `activated`, so the
+    // conflicts open their dialog from here.
+    let ui = ui.clone();
+    widgets.list.connect_activate(move |list, position| {
+        let Some(object) = list
+            .model()
+            .and_then(|sections| sections.item(position))
+            .and_downcast::<BoxedAnyObject>()
+        else {
+            return;
+        };
+        if let FeedItem::Attention { conflict, .. } = &*object.borrow::<FeedItem>() {
+            prompt_resolve_conflict(&ui, conflict);
+        }
+    });
 }
 
 /// Show a status page in place of the Activity list.
@@ -200,9 +332,6 @@ pub(crate) fn activity_status(
     ui.activity.status.set_description(Some(description));
     ui.activity.retry.set_visible(retry);
     ui.activity.content.set_visible_child_name("status");
-    // The list is no longer what is on screen, so the next repaint must not skip
-    // itself as a no-op and leave this status view up.
-    *ui.activity.key.borrow_mut() = None;
 }
 
 /// Refresh the Activity feed in place, with no status flash and no spinner.
@@ -239,13 +368,16 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
         return;
     }
     ui.activity.inflight.set(true);
-    activity_status(
-        ui,
-        "document-open-recent-symbolic",
-        &gettext("Loading…"),
-        &gettext("Reading recent activity."),
-        false,
-    );
+    let ui_p = ui.clone();
+    let ticket = ui.activity.loader.refresh(move || {
+        activity_status(
+            &ui_p,
+            "document-open-recent-symbolic",
+            &gettext("Loading…"),
+            &gettext("Reading recent activity."),
+            false,
+        );
+    });
     ui.busy_begin();
     let rx = spawn_request(
         ui.dirs.control_socket(),
@@ -256,6 +388,7 @@ pub(crate) fn load_activity(ui: &Rc<Ui>) {
         let result = rx.recv().await;
         ui.busy_end();
         ui.activity.inflight.set(false);
+        drop(ticket);
         match result {
             Ok(Ok(Response::Activity { items })) => repaint_activity(&ui, &items),
             Ok(Ok(Response::Error { message, .. })) => activity_status(
@@ -318,31 +451,47 @@ pub(crate) fn refresh_activity_conflicts(ui: &Rc<Ui>, force: bool) {
     });
 }
 
-/// A cheap fingerprint of what the page shows: the feed's length and newest
-/// entry (the log is append-only and newest-first, so that pins the feed), the
-/// filter, and which conflicts are still open.
-pub(crate) fn activity_key(
-    items: &[ActivityEntry],
-    filter: ActivityFilter,
-    conflicts: Option<&[ConflictInfo]>,
-) -> String {
-    let newest = match items.first() {
-        Some(a) => format!("{}:{}:{}:{}", items.len(), a.time, a.target, a.detail),
-        None => String::new(),
-    };
-    let open = conflicts.map(|c| {
-        c.iter()
-            .map(|c| c.path.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    });
-    format!("{newest}|{filter:?}|{open:?}")
-}
-
 /// Keep a fresh log from the daemon and repaint with it.
 pub(crate) fn repaint_activity(ui: &Rc<Ui>, items: &[ActivityEntry]) {
     *ui.activity.items.borrow_mut() = items.to_vec();
     paint_activity(ui);
+}
+
+/// One row of the Activity list, with everything its row and its section
+/// heading show, so that comparing two says whether the row must be redrawn.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FeedItem {
+    /// A conflict still waiting for a decision. `open` counts all of them,
+    /// for the section heading.
+    Attention { conflict: ConflictInfo, open: usize },
+    /// A logged activity, folded together with its repeats.
+    Logged {
+        entry: ActivityEntry,
+        /// How many times it was logged in a row (or, for a conflict, at all).
+        count: usize,
+        /// When the oldest collapsed repeat happened.
+        first: i64,
+        /// The local day it happened on as `yyyymmdd`, which picks its
+        /// section, and that day's heading.
+        day: i64,
+        day_label: String,
+        /// The open conflict a logged conflict names, which the row offers
+        /// to resolve.
+        pending: Option<ConflictInfo>,
+        /// A logged conflict that is no longer open.
+        resolved: bool,
+    },
+}
+
+impl FeedItem {
+    /// The section the item belongs to. Sections run from the highest key
+    /// down: the conflicts, then the days, newest first.
+    fn section(&self) -> i64 {
+        match self {
+            FeedItem::Attention { .. } => i64::MAX,
+            FeedItem::Logged { day, .. } => *day,
+        }
+    }
 }
 
 /// One feed row: an entry and how many times it was logged in a row (or, for
@@ -410,18 +559,66 @@ pub(crate) fn day_label(at: &glib::DateTime, now: &glib::DateTime) -> String {
         .unwrap_or_default()
 }
 
-/// Rebuild the page from the kept feed and conflict list, unless it already
-/// shows exactly this.
+/// The rows of the page: the open conflicts, then the feed entries the filter
+/// lets through, each with its day. `conflicts` is `None` while the open
+/// conflicts are not known yet.
+pub(crate) fn feed_items(
+    items: &[ActivityEntry],
+    filter: ActivityFilter,
+    conflicts: Option<&[ConflictInfo]>,
+    now: Option<&glib::DateTime>,
+) -> Vec<FeedItem> {
+    let open = conflicts.unwrap_or_default();
+    let mut rows: Vec<FeedItem> = open
+        .iter()
+        .map(|conflict| FeedItem::Attention {
+            conflict: conflict.clone(),
+            open: open.len(),
+        })
+        .collect();
+    for row in collapse_feed(items) {
+        if !filter.matches(row.entry) {
+            continue;
+        }
+        let a = row.entry;
+        let at = glib::DateTime::from_unix_local(a.time).ok();
+        let (day, day_label) = match (&at, now) {
+            (Some(at), Some(now)) => {
+                let (y, m, d) = at.ymd();
+                (
+                    i64::from(y) * 10_000 + i64::from(m) * 100 + i64::from(d),
+                    day_label(at, now),
+                )
+            }
+            _ => (0, String::new()),
+        };
+        // A logged conflict names the copy; it is still open while the daemon
+        // still lists a copy by that name.
+        let pending = (a.kind == ActivityKind::Conflict)
+            .then(|| open.iter().find(|c| file_name(&c.path) == a.target))
+            .flatten()
+            .cloned();
+        let resolved = a.kind == ActivityKind::Conflict && pending.is_none() && conflicts.is_some();
+        rows.push(FeedItem::Logged {
+            entry: a.clone(),
+            count: row.count,
+            first: row.first,
+            day,
+            day_label,
+            pending,
+            resolved,
+        });
+    }
+    rows
+}
+
+/// Bring the page up to date with the kept feed and conflict list, changing
+/// only the rows that differ.
 pub(crate) fn paint_activity(ui: &Rc<Ui>) {
     let state = &ui.activity;
     let items = state.items.borrow();
     let conflicts = state.conflicts.borrow();
-    let filter = state.filter.get();
-    let key = activity_key(&items, filter, conflicts.as_deref());
-    if state.key.borrow().as_deref() == Some(key.as_str()) {
-        return;
-    }
-    let open: &[ConflictInfo] = conflicts.as_deref().unwrap_or_default();
+    let open = conflicts.as_deref().unwrap_or_default();
     if items.is_empty() && open.is_empty() {
         activity_status(
             ui,
@@ -430,95 +627,45 @@ pub(crate) fn paint_activity(ui: &Rc<Ui>) {
             &gettext("Uploads, moves, shares and other changes appear here as they happen."),
             false,
         );
-        return;
-    }
-    *state.key.borrow_mut() = Some(key);
-    state.content.set_visible_child_name("list");
-
-    // Needs attention: the live conflicts, each opening the resolve dialog.
-    for row in state.attention_rows.borrow_mut().drain(..) {
-        state.attention.remove(&row);
-    }
-    state.attention.set_visible(!open.is_empty());
-    state.attention.set_description(Some(&ngettext_f(
-        "A file was changed in two places at once. Choose which version to keep.",
-        "{n} files were changed in two places at once. Choose which versions to keep.",
-        open.len() as u64,
-        &[],
-    )));
-    let mut attention_rows = state.attention_rows.borrow_mut();
-    for conflict in open {
-        let row = conflict_row(ui, conflict);
-        state.attention.add(&row);
-        attention_rows.push(row);
-    }
-    drop(attention_rows);
-
-    while let Some(child) = state.days.first_child() {
-        state.days.remove(&child);
-    }
-    let rows: Vec<FeedRow> = collapse_feed(&items)
-        .into_iter()
-        .filter(|row| filter.matches(row.entry))
-        .collect();
-    if rows.is_empty() {
-        let empty = adw::StatusPage::builder()
-            .icon_name("edit-find-symbolic")
-            .title(gettext("No matching activity"))
-            .description(gettext("Nothing in the recent log fits this filter."))
-            .build();
-        empty.add_css_class("compact");
-        state.days.append(&empty);
+        state.model.remove_all();
         return;
     }
     let now = glib::DateTime::now_local().ok();
-    let mut group: Option<(String, adw::PreferencesGroup)> = None;
-    for row in rows {
-        let at = glib::DateTime::from_unix_local(row.entry.time).ok();
-        let label = match (&at, &now) {
-            (Some(at), Some(now)) => day_label(at, now),
-            _ => String::new(),
-        };
-        if group.as_ref().is_none_or(|(day, _)| *day != label) {
-            let section = adw::PreferencesGroup::builder().title(&label).build();
-            state.days.append(&section);
-            group = Some((label, section));
-        }
-        if let Some((_, section)) = &group {
-            section.add(&feed_row(ui, &row, at.as_ref(), open));
-        }
-    }
+    let rows = feed_items(
+        &items,
+        state.filter.get(),
+        conflicts.as_deref(),
+        now.as_ref(),
+    );
+    replace_items(&state.model, &rows);
+    state
+        .feed
+        .set_visible_child_name(if rows.is_empty() { "empty" } else { "rows" });
+    state.content.set_visible_child_name("list");
 }
 
-/// One row of the feed.
+/// One logged row of the feed, with the fields of [`FeedItem::Logged`].
 fn feed_row(
     ui: &Rc<Ui>,
-    row: &FeedRow,
-    at: Option<&glib::DateTime>,
-    open: &[ConflictInfo],
+    a: &ActivityEntry,
+    count: usize,
+    first: i64,
+    pending: Option<&ConflictInfo>,
+    resolved: bool,
 ) -> adw::ActionRow {
-    let a = row.entry;
     let title = activity_title(a.kind, &a.target);
-    // A logged conflict names the copy; it is still open while the daemon
-    // still lists a copy by that name.
-    let pending = (a.kind == ActivityKind::Conflict)
-        .then(|| open.iter().find(|c| file_name(&c.path) == a.target))
-        .flatten();
-    let resolved = a.kind == ActivityKind::Conflict
-        && pending.is_none()
-        && ui.activity.conflicts.borrow().is_some();
 
     let mut subtitle: Vec<String> = Vec::new();
     if !a.detail.is_empty() {
         subtitle.push(capitalize(&a.detail));
     }
-    if row.count > 1 {
-        let since = dates::relative(row.first);
+    if count > 1 {
+        let since = dates::relative(first);
         // Translators: {time} is a date or time such as "Sep 21" or "5 min ago".
         subtitle.push(ngettext_f(
             "{n} time since {time}",
             "{n} times since {time}",
-            row.count as u64,
+            count as u64,
             &[("time", &since)],
         ));
     }
@@ -554,7 +701,9 @@ fn feed_row(
     // Translators: strftime format for the time of day in the activity feed, such as "14:05".
     let time_format = gettext("%H:%M");
     let time = gtk4::Label::new(Some(
-        &at.and_then(|at| at.format(&time_format).ok())
+        &glib::DateTime::from_unix_local(a.time)
+            .ok()
+            .and_then(|at| at.format(&time_format).ok())
             .map(|s| s.to_string())
             .unwrap_or_default(),
     ));
@@ -701,6 +850,81 @@ mod tests {
         assert!(!ActivityFilter::Problems.matches(&fine));
         assert!(ActivityFilter::Transfers.matches(&failed));
         assert!(!ActivityFilter::Sharing.matches(&fine));
+    }
+
+    fn conflict(path: &str) -> ConflictInfo {
+        ConflictInfo {
+            path: path.into(),
+            original_path: "docs/a.txt".into(),
+            original_exists: true,
+            size: 1,
+            modified: 0,
+            original_size: None,
+            original_modified: None,
+            identical: false,
+        }
+    }
+
+    #[test]
+    fn open_conflicts_lead_and_logged_ones_know_their_state() {
+        let items = vec![
+            entry(
+                300,
+                ActivityKind::Conflict,
+                "a (sync-conflict).txt",
+                "",
+                false,
+            ),
+            entry(
+                200,
+                ActivityKind::Conflict,
+                "b (sync-conflict).txt",
+                "",
+                false,
+            ),
+            entry(100, ActivityKind::Upload, "c.txt", "", true),
+        ];
+        let open = [conflict("docs/a (sync-conflict).txt")];
+        let rows = feed_items(&items, ActivityFilter::All, Some(&open), None);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0], FeedItem::Attention { open: 1, .. }));
+        assert!(rows[0].section() > rows[1].section());
+        let states: Vec<(bool, bool)> = rows[1..]
+            .iter()
+            .map(|row| match row {
+                FeedItem::Logged {
+                    pending, resolved, ..
+                } => (pending.is_some(), *resolved),
+                FeedItem::Attention { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(states, vec![(true, false), (false, true), (false, false)]);
+    }
+
+    #[test]
+    fn unknown_conflicts_resolve_nothing_and_filters_spare_the_attention_rows() {
+        let items = vec![
+            entry(
+                300,
+                ActivityKind::Conflict,
+                "a (sync-conflict).txt",
+                "",
+                false,
+            ),
+            entry(100, ActivityKind::Upload, "c.txt", "", true),
+        ];
+        let rows = feed_items(&items, ActivityFilter::All, None, None);
+        assert!(matches!(
+            &rows[0],
+            FeedItem::Logged {
+                resolved: false,
+                ..
+            }
+        ));
+        let open = [conflict("docs/a (sync-conflict).txt")];
+        let rows = feed_items(&items, ActivityFilter::Sharing, Some(&open), None);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0], FeedItem::Attention { .. }));
     }
 
     #[test]
