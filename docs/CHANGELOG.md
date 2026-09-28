@@ -11,6 +11,39 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-09-28
+
+Schema: **33**. Photos gain their location; the first timeline refresh after updating reads
+the metadata of the whole library once (nothing is downloaded), and the Places view shows how
+far it has got.
+
+### Added
+- **Places.** A third Photos view groups photos by the town they were taken in, as cards or on a
+  world map. Towns are looked up offline in bundled GeoNames data (CC BY 4.0), and the map is
+  drawn offline from Natural Earth land outlines (public domain), so no map tiles are fetched.
+  Install `iso-codes`, a new optional dependency, for country names in your language.
+- **On this day.** A strip at the top of the timeline shows a card for every earlier year with
+  photos taken on today's date.
+- **Find duplicates.** Photos can list every set of byte-identical copies and move the copies
+  you don't keep to Trash. The copy in the most albums is kept by default.
+- **Photos in no album.** A filter narrows the timeline to photos no album holds yet.
+- **One Filters popover.** Favorites, "in no album" and the month jump now share a Filters
+  button, which shows how many filters are on and can clear them all at once.
+- **Zoom-level grouping and range select.** Zooming out groups the timeline by month, then by
+  year. Shift+click selects a range, and dragging across the timeline selects what it sweeps.
+- **Slideshow.** The photo viewer plays the loaded photos full screen, with F5 or a top-bar
+  button.
+- **App icon in the app.** The sidebar header and the login page show the app's own icon.
+
+### Fixed
+- **Photos grid.** The timeline is laid out as square tiles that fill the window's width
+  exactly, and a theme's own `gtk.css` can no longer pad the tiles. It stays at its top, and at
+  the photo you were looking at, when the window is resized or zoomed.
+- **Timeline shaking near the top.** Scrolling up to the "On this day" strip no longer makes the
+  whole page jump between two heights.
+- **Filters while loading.** Changing a filter while a page was still loading could leave the
+  timeline showing the old filter.
+
 ## [2.2.2] — 2026-09-27
 
 Schema: **32** (unchanged).
@@ -1047,6 +1080,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.3.0
 [2.2.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.2
 [2.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.2.1
 [2.1.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.1.0
