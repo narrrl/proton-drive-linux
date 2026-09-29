@@ -3488,9 +3488,17 @@ def run_account(reference: Run, args) -> None:
             "no running pdfs daemon: start proton-drive.service and sign in, "
             "or pass --offline-only for the account-free contract"
         )
-    status = daemon.status()
+    # A daemon that was just (re)started answers before it has mounted My
+    # files; give it the sync timeout to get there rather than failing at once.
+    deadline = time.monotonic() + timeout
+    while True:
+        status = daemon.status()
+        mountpoint = (status.get("mount") or {}).get("mountpoint")
+        ready = bool(mountpoint) and is_mountpoint(Path(mountpoint))
+        if ready or not status.get("logged_in") or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     check(bool(status.get("logged_in")), "the daemon is not signed in; run `pdfs login` first")
-    mountpoint = (status.get("mount") or {}).get("mountpoint")
     check(
         bool(mountpoint) and is_mountpoint(Path(mountpoint)),
         f"My files is not mounted (daemon reports {mountpoint!r})",

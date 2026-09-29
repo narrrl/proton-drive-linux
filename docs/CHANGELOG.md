@@ -40,6 +40,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - **Editors can save over a file several times in a row.** The fix for B104 could leave the
   upload of a replaced file queued, and the next save onto the same name failed with
   `Input/output error` (B106).
+- **Databases and other files kept open while written no longer read back empty.** When the
+  folder was listed again while a file was still open, its size dropped to what Drive held,
+  often 0 bytes, and SQLite reported `database disk image is malformed` (B109).
 - **Deleting files during a mirror pass no longer marks the folder as failed.** A file removed
   after the pass planned its upload was counted as an error, so the folder showed `error` until
   a later pass (B108).

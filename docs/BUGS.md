@@ -12,6 +12,29 @@ Conventions:
 
 ---
 
+## B109 — A re-listing shrinks a file that is open for writing, and SQLite reads it as malformed
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the acceptance case "application workloads" on My files. It failed
+several runs in a row with `database disk image is malformed` at the `SELECT COUNT(*)` right
+after a 500-row insert, and the daemon logged nothing. A diagnosis added to the case showed
+`workload.db` at 0 bytes while SQLite still held it open with 16 KiB written.
+
+**Where:** `crates/pdfs-fuse/src/state.rs` (`State::keep_open_write_size`, called from
+`intern_mem_with_access`), the local-uid remap in `crates/pdfs-fuse/src/drain.rs`, and the size
+upgrade in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** An online create seals an empty file on Drive. Until the last close, the written
+bytes live only in the open handle, and the entry's size is the handle's. Any re-listing of the
+parent re-interned the node from Drive, which replaced that size with 0. Such re-listings come
+from event echoes and sibling creates, and SQLite's journal is one. The kernel then got size 0
+from `getattr` and ended SQLite's reads at EOF without asking the daemon, so the database read
+back as empty pages. Queued writes were already protected (B11); open handles were not.
+
+**Fix.** A node that has an open write handle keeps the handle's size and its local mtime when
+a listing, a size upgrade or a create landing replaces its entry. After the last close, the
+queued write takes over as before.
+
 ## B108 — A file deleted during a mirror pass puts the sync folder in `error`
 
 **Status:** Fixed (unverified).
@@ -30,11 +53,6 @@ ended in `error` and logged "item(s) failed; will retry" for files nobody wanted
 **Fix.** An upload whose local file is gone when it starts is skipped (`Applied::Vanished`) and
 does not count as an error. The next pass sees the deletion and handles it like any other.
 Other open failures are still errors.
-
-**Also open from the same run.** "application workloads" on My files failed with
-`database disk image is malformed` at the `SELECT` after the insert. The daemon logged nothing
-for it. The case now reports the step that failed, the database and journal files beside it,
-and which pages differ from a local replay of the same statements.
 
 ## B107 — One read on a stalled connection hangs the reading program for half an hour
 

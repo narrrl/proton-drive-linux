@@ -800,12 +800,13 @@ impl State {
         self.intern_mem_with_access(parent, node, access)
     }
 
-    fn intern_mem_with_access(&mut self, parent: u64, node: Node, access: Access) -> u64 {
+    fn intern_mem_with_access(&mut self, parent: u64, mut node: Node, access: Access) -> u64 {
         if let Some(&ino) = self.by_uid.get(&node.uid) {
             let changed = self
                 .entries
                 .get(&ino)
                 .is_some_and(|entry| entry.access != access);
+            self.keep_open_write_size(ino, &mut node);
             if let Some(e) = self.entries.get_mut(&ino) {
                 e.node = node;
                 e.parent = parent;
@@ -850,6 +851,23 @@ impl State {
 
     /// Allocate (or reuse) a stable inode for a node that came *from* the
     /// database, which is why nothing is written back.
+    /// Carry the size and mtime of a file open for writing over onto `node`,
+    /// which is about to replace its entry.
+    ///
+    /// The open handle is ahead of anything Drive can report until release
+    /// queues it. Taking the remote's size shrank a SQLite database to its empty
+    /// create while SQLite held it open, and the kernel then capped every read
+    /// at that size (docs/BUGS.md B109).
+    pub(crate) fn keep_open_write_size(&self, ino: u64, node: &mut Node) {
+        let (Some(aw), Some(entry)) = (self.active_writes.get(&ino), self.entries.get(&ino)) else {
+            return;
+        };
+        if let NodeKind::File { claimed_size, .. } = &mut node.kind {
+            *claimed_size = Some(aw.len as i64);
+            node.modification_time = entry.node.modification_time;
+        }
+    }
+
     pub(crate) fn intern_from_db(&mut self, parent: u64, node: Node) -> u64 {
         self.intern_mem(parent, node)
     }
@@ -1898,6 +1916,27 @@ mod tests {
             dirty: false,
             open_count: 1,
         }
+    }
+
+    #[test]
+    fn a_listing_does_not_shrink_a_file_open_for_writing() {
+        let (mut st, _dir) = state();
+        let ino = st.intern(0, node("file", "root", "workload.db", false));
+        let mut h = handle(16384, 0);
+        h.ino = ino;
+        st.active_writes.insert(ino, h);
+        st.set_size(ino, 16384);
+        st.touch_mtime(ino, 500);
+
+        // The remote still holds the empty file the create sealed.
+        st.intern(0, node("file", "root", "workload.db", false));
+        assert_eq!(crate::node_size(&st.entries[&ino].node), 16384);
+        assert_eq!(st.entries[&ino].node.modification_time, 500);
+
+        // Once the handle is gone the remote is authoritative again.
+        st.active_writes.remove(&ino);
+        st.intern(0, node("file", "root", "workload.db", false));
+        assert_eq!(crate::node_size(&st.entries[&ino].node), 0);
     }
 
     #[test]

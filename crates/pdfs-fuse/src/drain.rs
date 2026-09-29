@@ -1060,9 +1060,11 @@ impl Core {
             let Some(&ino) = st.by_uid.get(real) else {
                 return;
             };
+            let mut landed = node.clone();
+            st.keep_open_write_size(ino, &mut landed);
             if let Some(e) = st.entries.get_mut(&ino) {
                 e.uid = real.clone();
-                e.node = node.clone();
+                e.node = landed;
             }
             // Where the op said the node goes and where it actually landed can
             // differ — a conflict re-homes it — so the tree follows the parent
