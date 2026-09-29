@@ -1563,6 +1563,15 @@ fn prepare_shared_roots(
 }
 
 impl Core {
+    /// Rename `uid` on Drive, riding out a stale "out of date" answer that
+    /// follows an earlier rename of the same node. See [`retry_stale_rename`].
+    pub(crate) fn rename_remote(&self, uid: &NodeUid, name: &str) -> Result<(), ProtonError> {
+        retry_stale_rename(
+            || self.rt.block_on(self.client.rename_node(uid, name, None)),
+            || std::thread::sleep(RENAME_RETRY_DELAY),
+        )
+    }
+
     /// Record that this daemon just changed `uid` on the remote, so the event
     /// feed's echo of that change is recognised instead of re-applied. Called
     /// from the drain once the remote has actually accepted the change and the
@@ -2728,9 +2737,15 @@ impl Core {
             // ciphertext size for up to 30 s even though the daemon has had the
             // real one all along. Notify *after* the DB write, so a re-`getattr`
             // provoked by the invalidation cannot race the persistence.
+            //
+            // Attributes only (offset -1): the content did not change, and a
+            // page-cache invalidation deadlocks when this runs inside a `read`
+            // (B100 resolves sizes there). The kernel holds the page lock of
+            // that read until we reply, and the invalidation waits for the
+            // same lock, so the read never answered (docs/BUGS.md B110).
             if let Some(notifier) = core.notifier.get() {
                 for ino in changed {
-                    let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+                    let _ = notifier.inval_inode(INodeNo(ino), -1, 0);
                 }
             }
             debug!(folder_ino, files = updated.len(), "filled in listing sizes");
@@ -4368,8 +4383,7 @@ impl Core {
             &old_parent_uid,
         )
         .map_err(|error| self.errno_error(error, "rename access"))?;
-        self.rt
-            .block_on(self.client.rename_node(&uid, new_name, None))
+        self.rename_remote(&uid, new_name)
             .map_err(|e| CoreError::from_api(&e, "rename"))?;
         // Every mount, so a fork showing the same node re-interns it under the
         // new name instead of keeping the old one (`docs/BUGS.md` B74).
@@ -5282,6 +5296,37 @@ fn api_code(e: &(dyn std::error::Error + 'static)) -> Option<ResponseCode> {
     match e.downcast_ref::<ProtonError>() {
         Some(ProtonError::Api(api)) => Some(api.code),
         _ => None,
+    }
+}
+
+/// How often a rename that Drive calls out of date is retried, and how long
+/// apart. Twenty half-second waits match the move retry in the FUSE `rename`.
+const RENAME_RETRIES: u32 = 20;
+const RENAME_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Run a remote rename, retrying while Drive answers `InvalidRequirements`.
+///
+/// A rename sends the node's current name hash, read from the server just
+/// before. Right after an earlier rename of the same node that read can still
+/// return the old hash, and Drive rejects the request as "out of date" until
+/// its reads catch up (docs/BUGS.md B111). Any other error returns at once.
+fn retry_stale_rename(
+    mut rename: impl FnMut() -> Result<(), ProtonError>,
+    mut wait: impl FnMut(),
+) -> Result<(), ProtonError> {
+    let mut attempts = 0u32;
+    loop {
+        match rename() {
+            Err(e)
+                if api_code(&e) == Some(ResponseCode::InvalidRequirements)
+                    && attempts < RENAME_RETRIES =>
+            {
+                attempts += 1;
+                debug!(attempts, error = %e, "rename was out of date; retrying");
+                wait();
+            }
+            result => return result,
+        }
     }
 }
 
@@ -8031,7 +8076,7 @@ mod tests {
             ("fn serve_create(", "require_uid_writable", "upload_file"),
             ("fn serve_mkdir(", "require_uid_writable", "create_folder"),
             ("fn trash_child(", "require_uid_writable", "trash_nodes"),
-            ("fn serve_rename(", "require_rename_access", "rename_node"),
+            ("fn serve_rename(", "require_rename_access", "rename_remote"),
         ] {
             let function = function_source(filesystem, signature);
             assert_before(function, gate, remote_call);
@@ -8046,7 +8091,7 @@ mod tests {
             (
                 "fn rename(&self, rel: &Path",
                 "require_rename_access",
-                ".rename_node",
+                ".rename_remote",
             ),
             (
                 "fn move_to(&self, rel: &Path",
@@ -8090,6 +8135,85 @@ mod tests {
         // ...but its queued ops go at once, open or not: a revision drained
         // after the trash landed on the trashed node and kept its name taken.
         assert_eq!(replaced.matches("self.withdraw_queued_ops(uid)").count(), 2);
+    }
+
+    #[test]
+    fn a_size_upgrade_leaves_the_page_cache_alone() {
+        // Reads resolve provisional sizes inline, while the kernel holds the
+        // page lock of that read; dropping pages here waited on it forever.
+        let upgrade = function_source(include_str!("lib.rs"), "fn apply_size_upgrade(");
+        assert!(upgrade.contains("notifier.inval_inode(INodeNo(ino), -1, 0)"));
+        assert!(!upgrade.contains("notifier.inval_inode(INodeNo(ino), 0, 0)"));
+        let read = function_source(include_str!("filesystem.rs"), "    fn read(");
+        assert!(read.contains("core.resolve_provisional_size(ino.0, &uid)"));
+    }
+
+    fn api_error(code: super::ResponseCode) -> super::ProtonError {
+        super::ProtonError::Api(proton_drive_rs::proton_sdk::error::ProtonApiError {
+            code,
+            http_status: 422,
+            message: "This file or folder was out of date, rename failed.".into(),
+            details: None,
+        })
+    }
+
+    #[test]
+    fn a_rename_called_out_of_date_is_retried_until_it_lands() {
+        let mut calls = 0;
+        let mut waits = 0;
+        let result = super::retry_stale_rename(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(api_error(super::ResponseCode::InvalidRequirements))
+                } else {
+                    Ok(())
+                }
+            },
+            || waits += 1,
+        );
+        assert!(result.is_ok());
+        assert_eq!((calls, waits), (3, 2));
+    }
+
+    #[test]
+    fn a_rename_gives_up_on_other_errors_and_after_its_retries() {
+        let mut calls = 0;
+        let taken = super::retry_stale_rename(
+            || {
+                calls += 1;
+                Err(api_error(super::ResponseCode::AlreadyExists))
+            },
+            || {},
+        );
+        assert!(taken.is_err());
+        assert_eq!(calls, 1, "a taken name is not a stale read");
+
+        let mut calls = 0;
+        let stale = super::retry_stale_rename(
+            || {
+                calls += 1;
+                Err(api_error(super::ResponseCode::InvalidRequirements))
+            },
+            || {},
+        );
+        assert!(stale.is_err());
+        assert_eq!(calls, super::RENAME_RETRIES + 1);
+    }
+
+    #[test]
+    fn every_remote_rename_rides_out_a_stale_read() {
+        for source in [
+            include_str!("lib.rs"),
+            include_str!("filesystem.rs"),
+            include_str!("drain.rs"),
+        ] {
+            assert_eq!(
+                source.matches(concat!("client.rename_node", "(")).count(),
+                usize::from(source.contains("fn rename_remote(")),
+                "call Core::rename_remote instead of the SDK rename directly"
+            );
+        }
     }
 
     #[test]

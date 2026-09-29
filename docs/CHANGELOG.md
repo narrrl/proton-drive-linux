@@ -40,6 +40,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - **Editors can save over a file several times in a row.** The fix for B104 could leave the
   upload of a replaced file queued, and the next save onto the same name failed with
   `Input/output error` (B106).
+- **Renaming a file back right after renaming it no longer fails.** Drive can briefly call the
+  second rename out of date, and the daemon now waits it out instead of returning an I/O error
+  (B111).
+- **Reading a freshly listed file no longer hangs.** When a read had to fetch the file's real
+  size first, the daemon could wait on the read it was serving, and the program froze until
+  the daemon restarted (B110).
 - **Databases and other files kept open while written no longer read back empty.** When the
   folder was listed again while a file was still open, its size dropped to what Drive held,
   often 0 bytes, and SQLite reported `database disk image is malformed` (B109).

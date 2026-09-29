@@ -729,12 +729,12 @@ impl Core {
         if current == name {
             return Ok(current.to_string());
         }
-        match self.rt.block_on(self.client.rename_node(uid, name, None)) {
+        match self.rename_remote(uid, name) {
             Ok(()) => Ok(name.to_string()),
             Err(e) if is_already_exists(&e) => {
                 let alt = conflict_name(name, now_secs());
                 warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
-                self.rt.block_on(self.client.rename_node(uid, &alt, None))?;
+                self.rename_remote(uid, &alt)?;
                 self.adopt_drained_name(uid, &alt);
                 self.log_activity(
                     ActivityKind::Rename,

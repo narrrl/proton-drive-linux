@@ -12,6 +12,49 @@ Conventions:
 
 ---
 
+## B111 — Renaming a file back right after renaming it fails with EIO
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the acceptance case "unusual but legal names", on My files and on the
+on-demand folder. The case renames each file to `renamed-N` and back at once. One rename back per
+run failed with `EIO`, and the journal showed `rename failed ... proton api error
+InvalidRequirements (http 422): This file or folder was out of date, rename failed.`
+
+**Where:** every remote rename: `serve_rename` in `crates/pdfs-fuse/src/filesystem.rs`,
+`drain_rename_in_place` in `crates/pdfs-fuse/src/drain.rs`, and the control `rename` in
+`crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** The SDK's `rename_node` reads the node's details from the server and sends its current
+name hash as `OriginalHash`. Right after a rename of the same node, that read can still return the
+old hash. Drive then refuses the request as out of date. The daemon reported this at once as
+`EIO`, although the same request succeeds a moment later.
+
+**Fix.** All remote renames go through `Core::rename_remote`. It retries a rename that fails with
+`InvalidRequirements` up to 20 times, half a second apart, the same window the move after a
+rename already uses. Any other error still returns at once.
+
+## B110 — A read that settles a provisional size deadlocks on its own page lock
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the acceptance case "application workloads", which timed out on My
+files and on the on-demand folder on a fast network. The journal showed `a fuse worker has held
+the same job for a long time worker=pdfs-fuse-8 job=read` growing past 700 s with no network
+error. `/proc/<pid>/task/*/wchan` put that worker, and one more, in `__folio_lock`, while the
+daemon had no file on any mount open.
+
+**Where:** `crates/pdfs-fuse/src/lib.rs` (`Core::apply_size_upgrade`).
+
+**Cause.** B100 made `read` settle a provisional size before it fetches, through
+`resolve_provisional_size` and `apply_size_upgrade`. That function tells the kernel about the new
+size with `inval_inode(ino, 0, 0)`, which also drops the file's page cache. The kernel holds the
+page lock of the read being served until the daemon replies. The invalidation waits for the same
+lock, on the thread that has to send the reply, so neither ever finishes. The process that
+issued the read hangs, and so does anything else that touches those pages.
+
+**Fix.** The size upgrade invalidates attributes only (`offset -1`). A size upgrade does not
+change content, so the page cache has nothing stale to drop. A daemon already stuck this way
+needs a restart.
+
 ## B109 — A re-listing shrinks a file that is open for writing, and SQLite reads it as malformed
 
 **Status:** Fixed (unverified).

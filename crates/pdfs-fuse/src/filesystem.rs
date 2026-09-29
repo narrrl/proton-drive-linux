@@ -2039,10 +2039,7 @@ impl ProtonFs {
             return;
         }
         if newname != name
-            && let Err(e) = self
-                .core
-                .rt
-                .block_on(self.core.client.rename_node(&uid, newname, None))
+            && let Err(e) = self.core.rename_remote(&uid, newname)
         {
             error!(%uid, error = %e, "rename failed");
             self.core.restore_replaced(victim.as_ref(), newname);
