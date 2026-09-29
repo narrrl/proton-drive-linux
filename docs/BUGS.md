@@ -12,6 +12,134 @@ Conventions:
 
 ---
 
+## B108 — A file deleted during a mirror pass puts the sync folder in `error`
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the account run of `scripts/fuse-acceptance.sh --quick`. It stopped with
+`sync folder … entered error` before the managed-move phase. At the same time the journal
+showed `sync: step failed; continuing error=open …/workloads/tree.tar: No such file or directory`
+for eleven files. The contract suite had removed its `workloads` tree while the mirror pass
+was still uploading it.
+
+**Where:** `crates/pdfs-fuse/src/sync.rs` (`upload_new`, `upload_revision`, `open_to_upload`).
+
+**Cause.** A pass plans its uploads from a scan and runs them later. When a planned file was
+deleted in between, opening it failed with `NotFound`. That counted as a failed step, so the pass
+ended in `error` and logged "item(s) failed; will retry" for files nobody wanted any more.
+
+**Fix.** An upload whose local file is gone when it starts is skipped (`Applied::Vanished`) and
+does not count as an error. The next pass sees the deletion and handles it like any other.
+Other open failures are still errors.
+
+**Also open from the same run.** "application workloads" on My files failed with
+`database disk image is malformed` at the `SELECT` after the insert. The daemon logged nothing
+for it. The case now reports the step that failed, the database and journal files beside it,
+and which pages differ from a local replay of the same statements.
+
+## B107 — One read on a stalled connection hangs the reading program for half an hour
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the acceptance case "application workloads" on My files, which hit its
+180 s timeout. The journal showed `a fuse worker has held the same job for a long time
+worker=pdfs-fuse-10 job=read` from `age_secs=124` up to `age_secs=2059`. Event polls in the
+same window failed with `HTTP transport error` after 91-103 s.
+
+**Where:** `crates/pdfs-fuse/src/reads.rs` (`Core::read_range_remote`, `READ_FETCH_TIMEOUT`).
+
+**Cause.** The SDK bounds each request (30 s for the API, 300 s for a storage block) and retries
+failed ones, but nothing bounds a whole read. A read can need a block table, several blocks and a
+repair, each with its own retries. On a connection that stalled without dropping, one `read`
+held its FUSE worker for about 34 minutes, and the program that issued it could not be
+interrupted for that time.
+
+**Fix.** The network part of a read now has a 120 s deadline. When it passes, the read fails
+with `EIO`, the file's revision reader is dropped so the next read starts fresh, and blocks that
+already arrived stay cached for the retry. A single read is at most a few 4 MiB blocks, so this
+only fails a read on a link slower than about 70 KB/s. A block repair that has to download a
+large file whole can also hit the deadline on a slow link; pinning the file avoids that.
+
+The first version of this fix built the timer on the FUSE worker thread, outside the runtime.
+Every read that went to the network panicked with `there is no reactor running`, and the kernel
+got `EIO`. The next account run failed 11 cases on My files this way. The timer is now built
+inside `block_on`, and a unit test runs that pattern from a thread without a runtime.
+
+---
+
+## B106 — Saving over a file that was just read fails with "already exists"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the acceptance case "application workloads" on an on-demand folder,
+after installing the B104 fix: `OSError: [Errno 5]` from `os.replace` in the editor-save loop,
+at the third save. The journal had `rename failed … AlreadyExists (http 422): A file or folder
+with name already exists` from `rename_node`.
+
+**Where:** `crates/pdfs-fuse/src/lib.rs` (`Core::remove_replaced`,
+`Core::withdraw_queued_ops`), `crates/pdfs-fuse/src/filesystem.rs` (`trash_child`,
+`finish_release`), `crates/pdfs-fuse/src/drain.rs` (`Core::drain_revision`).
+
+**Cause.** A regression from B104. The save loop writes a temporary file, renames it over the
+document, and reads the document back. `close()` returns before the daemon sees the release, so
+at the next save the replaced file still counts as open. B104 then left its queued upload in
+the queue until the final close, and the drain could send it after the file had been trashed.
+The next rename onto the name was refused. `unlink` of an open file had kept its queued upload
+the same way.
+
+**Fix.** A file trashed or replaced while open now loses its queued ops at once, and an upload
+already under way is cancelled. Only the staged bytes stay, because the open handle reads them,
+and they are deleted at the final close. A drain worker that claimed the op before it was
+withdrawn checks that the op still exists before it sends any bytes.
+
+---
+
+## B105 — A file deleted while its upload is in flight comes back as a conflict copy
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, in the daemon journal of an acceptance run on the account. During the
+SQLite workload two `queued write conflicts; keeping a conflict copy` warnings named files called
+`recovered-XrPUSW5W` and `recovered-JbZM_pWK`, with the reason `the file was trashed remotely`.
+Each was followed by `pending upload failed; will retry` and `No such file or directory`.
+
+**Where:** `crates/pdfs-fuse/src/drain.rs` (`Core::drain_revision`),
+`crates/pdfs-core/src/db/ops.rs` (`Db::op_exists`).
+
+**Cause.** SQLite writes, syncs and deletes its journal file within milliseconds. The sync
+queues an upload of the journal. The delete trashes the node and drops that queued upload, but a
+drain worker that already holds the op carries on. It then asks the server about the node,
+finds it trashed, and treats the trash as another device's change: it tries to upload the bytes
+as a conflict copy. The tree has already forgotten the node, so the copy is named `recovered-…`
+and placed in the Drive root. Here the blob was already gone and the attempt failed, but with
+the blob still on disk the copy would land.
+
+**Fix.** Before keeping a conflict copy, the drain checks that its op is still queued. When the
+op is gone, the write was withdrawn by the delete, or superseded, while the worker held it, and
+it is dropped.
+
+---
+
+## B104 — Reading a file that was replaced by a rename fails with `EIO`
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-29, by the acceptance case "rename patterns" on My files and on an on-demand
+folder: `OSError: [Errno 5] Input/output error` at
+`os.pread(reader, 64, 0)` after `os.replace(replacement, target)` with `reader` open on `target`.
+The mirror folder, a local disk, passed.
+
+**Where:** `crates/pdfs-fuse/src/lib.rs` (`Core::remove_replaced`).
+
+**Cause.** A rename over an existing file first trashes that file, because Drive has no atomic
+replace. That step forgot the replaced inode outright and evicted its cache and reader, even
+when a handle was still open on it. The next read through that handle found no inode and
+failed. `rename(2)`, like `unlink(2)`, keeps a replaced file readable through the handles
+already open on it. The unlink path (`trash_child`) already did this, but the rename path
+did not.
+
+**Fix.** `remove_replaced` now handles an open victim as `unlink` does. It keeps the inode as
+an unlinked entry, and leaves its cache and reader to the final close. That applies both to a
+node the server knows and to one whose create is still queued. Its queued ops at first also
+waited for the final close; B106 moved them back to the trash.
+
+---
+
 ## B103 — One stuck trash refresh freezes the trash listing until the daemon restarts
 
 **Status:** Fixed (unverified). The hang itself has not been reproduced on purpose.

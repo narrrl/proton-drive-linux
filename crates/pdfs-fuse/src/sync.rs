@@ -73,6 +73,9 @@ enum Applied {
     Downloaded,
     /// A conflict copy was kept.
     Conflict,
+    /// The local file to upload was deleted after the scan planned it. There is
+    /// nothing left to send, and the next pass sees the deletion (B108).
+    Vanished,
 }
 
 impl Core {
@@ -1147,13 +1150,10 @@ impl Core {
                 Ok(Applied::Dir(rel.clone(), uid))
             }
             Pending::UploadNew { rel, parent } => {
-                self.upload_new(folder_id, local_root, rel, parent).await?;
-                Ok(Applied::Uploaded)
+                self.upload_new(folder_id, local_root, rel, parent).await
             }
             Pending::UploadRevision { rel, uid } => {
-                self.upload_revision(folder_id, local_root, rel, uid)
-                    .await?;
-                Ok(Applied::Uploaded)
+                self.upload_revision(folder_id, local_root, rel, uid).await
             }
             Pending::Download {
                 rel,
@@ -1217,10 +1217,12 @@ impl Core {
         local_root: &Path,
         rel: &str,
         parent: &NodeUid,
-    ) -> Result<(), String> {
+    ) -> Result<Applied, String> {
         let path = local_root.join(rel_to_path(rel));
         let name = base_name(rel);
-        let file = std::fs::File::open(&path).map_err(|e| format!("open {rel}: {e}"))?;
+        let Some(file) = open_to_upload(&path, rel)? else {
+            return Ok(Applied::Vanished);
+        };
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
         // Taken from the descriptor being streamed, so it names the content that
@@ -1261,7 +1263,8 @@ impl Core {
         self.invalidate_children_of(parent);
         warn_if_torn(rel, &path, streamed);
         self.record_file_baseline(folder_id, rel, Some(streamed), &uid)
-            .await
+            .await?;
+        Ok(Applied::Uploaded)
     }
 
     /// Upload a changed local file as a new revision of an existing remote node.
@@ -1271,9 +1274,11 @@ impl Core {
         local_root: &Path,
         rel: &str,
         uid: &NodeUid,
-    ) -> Result<(), String> {
+    ) -> Result<Applied, String> {
         let path = local_root.join(rel_to_path(rel));
-        let file = std::fs::File::open(&path).map_err(|e| format!("open {rel}: {e}"))?;
+        let Some(file) = open_to_upload(&path, rel)? else {
+            return Ok(Applied::Vanished);
+        };
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
         let streamed = LocalSig::from(&meta);
@@ -1295,7 +1300,8 @@ impl Core {
             .map_err(|e| format!("upload revision {rel}: {e}"))?;
         warn_if_torn(rel, &path, streamed);
         self.record_file_baseline(folder_id, rel, Some(streamed), uid)
-            .await
+            .await?;
+        Ok(Applied::Uploaded)
     }
 
     /// Download a remote file to its local path (atomically via a temp file),
@@ -1442,6 +1448,23 @@ impl Core {
                 },
             )
             .map_err(|e| format!("baseline {rel}: {e:?}"))
+    }
+}
+
+/// Open a local file for upload, or `None` when it is gone.
+///
+/// A scan plans uploads from a listing, and the file can be deleted before its
+/// upload starts — a build or a test tree cleaned up mid-pass. That is not a
+/// failure: the next pass sees the deletion. Counting it as one put the folder
+/// in `error` for a file nobody wanted any more (B108).
+fn open_to_upload(path: &Path, rel: &str) -> Result<Option<std::fs::File>, String> {
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(rel, "sync: file deleted before its upload; skipping");
+            Ok(None)
+        }
+        Err(e) => Err(format!("open {rel}: {e}")),
     }
 }
 
@@ -2237,6 +2260,27 @@ mod tests {
             remote_hash: None,
         };
         assert_eq!(remote_sig(&e), None);
+    }
+
+    #[test]
+    fn a_file_deleted_before_its_upload_is_skipped_not_failed() {
+        let root = std::env::temp_dir().join(format!("pdfs-b108-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let gone = root.join("gone.txt");
+        assert!(open_to_upload(&gone, "gone.txt").unwrap().is_none());
+
+        std::fs::write(&gone, b"x").unwrap();
+        assert!(open_to_upload(&gone, "gone.txt").unwrap().is_some());
+
+        // Other open failures still count as errors.
+        let err = open_to_upload(&gone.join("child"), "gone.txt/child");
+        assert!(err.unwrap_err().starts_with("open gone.txt/child:"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut o = Outcome::default();
+        o.record(&Applied::Vanished);
+        assert!(o.is_empty());
+        assert_eq!(o.errors, 0);
     }
 
     #[test]

@@ -36,6 +36,15 @@ pub(super) const REPAIR_MAX: u64 = 512 * 1024 * 1024;
 /// demand read in the SDK's flat block semaphore.
 pub(super) const PREFETCH_BUDGET: usize = 8;
 
+/// How long one read may wait on the network before it fails with `EIO`.
+///
+/// The SDK bounds each request, not a read: a block that times out is retried,
+/// and a read can need several blocks, a block table and a repair. On a link
+/// that stalled without dropping, one `read` held a FUSE worker for 34 minutes
+/// and the application behind it with it (`docs/BUGS.md` B107). An error the
+/// caller can retry beats a process stuck in `D` state.
+pub(super) const READ_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Cap on tracked sequential streams. Only reads in progress matter, so the map
 /// is cleared wholesale rather than aged — losing the ramp costs one read.
 const MAX_PREFETCH_STREAMS: usize = 256;
@@ -939,7 +948,7 @@ impl Core {
         }
 
         if !misses.is_empty() {
-            let fetched = self.rt.block_on(async {
+            let fetch = async {
                 // Resolve the file's keys and block table once, then read every
                 // missing block through the shared reader. Previously each block
                 // called `download_range`, which redid that resolution per block.
@@ -960,7 +969,22 @@ impl Core {
                     out.push(joined.map_err(|_| Errno::EIO)??);
                 }
                 Ok::<_, Errno>(out)
-            })?;
+            };
+            // Dropping the fetch on the deadline aborts the block tasks with it;
+            // blocks that already landed stay cached for the retry. The timer is
+            // built inside the runtime: a FUSE worker has no reactor of its own,
+            // and building it out here panicked every remote read.
+            let fetched = self
+                .rt
+                .block_on(async { tokio::time::timeout(READ_FETCH_TIMEOUT, fetch).await })
+                .unwrap_or_else(|_| {
+                    warn!(
+                        %uid, offset, len, secs = READ_FETCH_TIMEOUT.as_secs(),
+                        "read got no answer from the network in time; failing it"
+                    );
+                    self.evict_reader(uid);
+                    Err(Errno::EIO)
+                })?;
             for (bidx, bytes) in fetched {
                 blocks[(bidx - first) as usize] = Some(bytes);
             }

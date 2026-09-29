@@ -3539,6 +3539,30 @@ impl Core {
         Ok(())
     }
 
+    /// Drop every op queued against a node that just left the namespace while
+    /// a handle still has it open, but keep the bytes that handle reads.
+    ///
+    /// The ops cannot wait for the final close: the node is already trashed, and
+    /// a revision the drain sends in the meantime lands on it after the trash —
+    /// an editor's save loop then found the name it was renaming onto still
+    /// taken (`docs/BUGS.md` B106). The pending entry and its staged blob are
+    /// what the open handle reads, so they stay until the final close drops
+    /// them.
+    fn withdraw_queued_ops(&self, uid: &NodeUid) -> Result<(), Errno> {
+        self.cancel_upload(uid);
+        let blobs = self.db.delete_ops_for_uid(&uid.to_string()).map_err(|e| {
+            error!(%uid, error = %e, "withdrawing queued ops failed");
+            Errno::EIO
+        })?;
+        let read_from = self.pending_blob(uid);
+        let blobs = blobs
+            .into_iter()
+            .filter(|blob| read_from.as_deref() != Some(Path::new(blob)))
+            .collect();
+        self.release_dropped_below(blobs);
+        Ok(())
+    }
+
     /// Let go of what the ops just dropped for `uid` held: their pending
     /// entries, any upload still reading their bytes, and the bytes.
     ///
@@ -3546,9 +3570,15 @@ impl Core {
     /// (`docs/BUGS.md` B102), so the entries to forget are found by blob, not
     /// only by `uid`.
     fn release_dropped_ops(&self, uid: &NodeUid, blobs: Vec<String>) {
+        self.pending.lock().remove(uid);
+        self.release_dropped_below(blobs);
+    }
+
+    /// [`Core::release_dropped_ops`] without touching the node's own pending
+    /// entry.
+    fn release_dropped_below(&self, blobs: Vec<String>) {
         let below: Vec<NodeUid> = {
             let mut pending = self.pending.lock();
-            pending.remove(uid);
             let below: Vec<NodeUid> = pending
                 .iter()
                 .filter(|(_, p)| blobs.iter().any(|b| p.path == Path::new(b)))
@@ -4420,11 +4450,21 @@ impl Core {
     /// A node whose own creation is still queued has never reached the server, so
     /// dropping its queued ops is the whole removal; nothing goes to the wire and
     /// it works offline.
+    ///
+    /// A handle still open on the replaced node keeps reading its bytes, as
+    /// `rename(2)` promises: the inode stays as an unlinked entry and its
+    /// staged bytes, cache and reader go at the final close, exactly as for an
+    /// `unlink` under an open handle. Its queued ops go now, or the drain would
+    /// upload to the node after it was trashed (`docs/BUGS.md` B106).
     fn remove_replaced(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
         if is_local_uid(uid) {
-            self.discard_queued_ops(uid)?;
+            if self.is_open_anywhere(uid) {
+                self.withdraw_queued_ops(uid)?;
+            } else {
+                self.discard_queued_ops(uid)?;
+            }
             self.for_each_state(|st| {
-                st.forget(uid);
+                st.forget_or_unlink(uid);
             });
             debug!(%uid, name, "replaced a node whose create was still queued");
             return Ok(());
@@ -4439,17 +4479,26 @@ impl Core {
             self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
             return Err(Errno::EIO);
         }
-        if let Err(error) = self.discard_queued_ops(uid) {
-            error!(%uid, "remote replacement landed but queued-op cleanup failed");
-            return Err(error);
-        }
         // The node was trashed on the server; withdraw it from every inode
         // space that had it, not only the mount the rename came through.
+        let open_now = self.is_open_anywhere(uid);
         self.for_each_state(|st| {
-            st.forget(uid);
+            st.forget_or_unlink(uid);
         });
-        self.cache.evict(uid);
-        self.evict_reader(uid);
+        self.hidden.lock().insert(uid.clone());
+        if open_now {
+            if let Err(error) = self.withdraw_queued_ops(uid) {
+                error!(%uid, "remote replacement landed but queued-op cleanup failed");
+                return Err(error);
+            }
+        } else {
+            if let Err(error) = self.discard_queued_ops(uid) {
+                error!(%uid, "remote replacement landed but queued-op cleanup failed");
+                return Err(error);
+            }
+            self.cache.evict(uid);
+            self.evict_reader(uid);
+        }
         self.invalidate_trash();
         // The node is recoverable from the trash, but only if the user knows it
         // went there — a rename is not an operation anyone expects to trash
@@ -4461,6 +4510,19 @@ impl Core {
             true,
         );
         Ok(())
+    }
+
+    /// Whether any mount holds an open handle on `uid`.
+    fn is_open_anywhere(&self, uid: &NodeUid) -> bool {
+        let mut open = false;
+        self.for_each_state(|st| {
+            open |= st
+                .by_uid
+                .get(uid)
+                .and_then(|ino| st.entries.get(ino))
+                .is_some_and(|entry| entry.open_count > 0);
+        });
+        open
     }
 
     /// Put back the node [`Core::remove_replaced`] trashed, after the rename it
@@ -7946,6 +8008,7 @@ mod tests {
             ("fn enqueue_staged_write(", "attach_blob_to_create"),
             ("fn queue_trash(", "replace_ops_with_trash"),
             ("fn discard_queued_ops(", "delete_ops_for_uid"),
+            ("fn withdraw_queued_ops(", "delete_ops_for_uid"),
         ] {
             let function = function_source(source, signature);
             assert_before(function, "cancel_upload", mutation);
@@ -8004,6 +8067,84 @@ mod tests {
         assert_before(bulk, "require_uid_writable", "collect_uploads");
         let folder = function_source(upload, "fn ensure_remote_folder(");
         assert_before(folder, "require_uid_writable(parent_uid)", ".create_folder");
+    }
+
+    #[test]
+    fn a_replaced_node_survives_its_open_handles() {
+        // A rename over a file someone is reading must leave that reader on the
+        // replaced bytes; forgetting the inode outright made its next read EIO.
+        let source = include_str!("lib.rs");
+        let replaced = function_source(source, "fn remove_replaced(");
+        assert!(replaced.contains("forget_or_unlink(uid)"));
+        assert!(!replaced.contains("st.forget(uid)"));
+        assert_before(
+            replaced,
+            "if self.is_open_anywhere(uid)",
+            "self.discard_queued_ops(uid)",
+        );
+        assert_before(replaced, "if open_now", "self.cache.evict(uid)");
+        // ...but its queued ops go at once, open or not: a revision drained
+        // after the trash landed on the trashed node and kept its name taken.
+        assert_eq!(replaced.matches("self.withdraw_queued_ops(uid)").count(), 2);
+    }
+
+    #[test]
+    fn a_remote_read_gives_up_at_its_deadline() {
+        // The SDK bounds requests, not reads; a stalled link held one `read`
+        // for 34 minutes.
+        let remote = function_source(include_str!("reads.rs"), "fn read_range_remote(");
+        assert_before(
+            remote,
+            "let fetch = async",
+            "tokio::time::timeout(READ_FETCH_TIMEOUT, fetch)",
+        );
+        // Built inside the runtime: a FUSE worker has no reactor, and a timer
+        // built there panicked every remote read.
+        assert!(remote.contains("async { tokio::time::timeout(READ_FETCH_TIMEOUT, fetch).await }"));
+    }
+
+    #[test]
+    fn a_deadline_built_under_block_on_needs_no_ambient_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let answered = std::thread::spawn(move || {
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), async { 7 }).await })
+        })
+        .join()
+        .expect("a worker thread outside the runtime can wait on the deadline");
+        assert_eq!(answered.unwrap(), 7);
+    }
+
+    #[test]
+    fn a_trashed_open_node_sends_nothing_more() {
+        // Trashing a file under an open handle withdraws its queued upload at
+        // once; the bytes the handle reads go with the last close.
+        let withdraw = function_source(include_str!("lib.rs"), "fn withdraw_queued_ops(");
+        assert_before(withdraw, "self.pending_blob(uid)", "release_dropped_below");
+        assert!(!withdraw.contains("self.pending.lock().remove(uid)"));
+
+        let filesystem = include_str!("filesystem.rs");
+        let trash = function_source(filesystem, "fn trash_child(");
+        assert_eq!(
+            trash.matches("self.core.withdraw_queued_ops(&uid)").count(),
+            2
+        );
+        let release = function_source(filesystem, "fn finish_release(");
+        assert_before(
+            release,
+            "let withdrawn = self.core.pending_blob(&uid)",
+            "discard_queued_ops",
+        );
+        assert_before(release, "discard_queued_ops", "discard_staged(&blob)");
+
+        // A drain worker that claimed the op before it was withdrawn checks
+        // again before any byte leaves.
+        let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
+        let upload = &drain[drain.find("begin_cancellable_upload").unwrap()..];
+        assert_before(upload, "self.db.op_exists(op.id)", "File::open(&blob)");
     }
 
     #[test]

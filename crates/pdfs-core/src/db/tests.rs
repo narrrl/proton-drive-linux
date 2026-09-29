@@ -5209,3 +5209,28 @@ fn retry_all_touches_only_ops_that_have_failed() {
     assert_eq!(due(debounced), 7_000);
     assert_eq!(due(parked), ops::PARK_UNTIL);
 }
+
+#[test]
+fn a_queued_op_stops_existing_once_the_node_is_deleted() {
+    let db = Db::open_in_memory().unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_REVISION.to_string(),
+            uid: uid("journal").to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: Some("/staging/journal".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    assert!(db.op_exists(id).unwrap());
+
+    let blobs = db.delete_ops_for_uid(&uid("journal").to_string()).unwrap();
+    assert_eq!(blobs, vec!["/staging/journal"]);
+    assert!(!db.op_exists(id).unwrap());
+}

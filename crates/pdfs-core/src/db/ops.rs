@@ -837,6 +837,19 @@ impl Db {
     /// drain replaces it with the uid the server assigns.
     pub const LOCAL_VOLUME: &str = "local";
 
+    /// Whether op `id` is still queued. A drain worker that claimed it can find
+    /// it gone: the node was deleted, or a newer write superseded it, while the
+    /// worker was talking to the server.
+    pub fn op_exists(&self, id: i64) -> Result<bool> {
+        let conn = self.read();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Drop a queued op, once its upload has actually landed.
     pub fn delete_op(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock();

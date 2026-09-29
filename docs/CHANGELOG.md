@@ -31,6 +31,21 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - **Removing a folder also cancels the pending uploads of the files inside it.** Before, an
   edit that had not reached Drive yet kept retrying against the trash forever and kept its
   staged copy on disk. `pdfs rm` now also drops what was queued for what it removes (B102).
+- **A program reading a file keeps its data when another program replaces the file.** Saving
+  over a file by renaming a new copy onto it (what most editors and `os.replace` do) made
+  reads through handles already open on the old file fail with `Input/output error` (B104).
+- **Short-lived files no longer come back as conflict copies.** A file deleted right after it
+  was written, such as a SQLite journal, could be uploaded as a `recovered-…` conflict copy in
+  the Drive root (B105).
+- **Editors can save over a file several times in a row.** The fix for B104 could leave the
+  upload of a replaced file queued, and the next save onto the same name failed with
+  `Input/output error` (B106).
+- **Deleting files during a mirror pass no longer marks the folder as failed.** A file removed
+  after the pass planned its upload was counted as an error, so the folder showed `error` until
+  a later pass (B108).
+- **A read no longer hangs when the connection stalls.** A read that gets no answer from Drive
+  within two minutes now fails with `Input/output error` instead of blocking the program for
+  as long as half an hour (B107).
 - **The trash no longer freezes after a server call hangs.** Until the daemon restarted, the
   trash kept showing the same entries, and a folder just deleted could not be found there to
   delete permanently (B103).

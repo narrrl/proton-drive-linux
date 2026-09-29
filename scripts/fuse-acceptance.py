@@ -35,6 +35,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import traceback
 import uuid
 import xml.etree.ElementTree as ElementTree
 
@@ -115,6 +116,26 @@ def renameat2(old: Path, new: Path, flags: int) -> None:
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def failure_detail(error: BaseException) -> str:
+    """The error, and for anything but a failed check the script line that hit it.
+
+    A bare `OSError: [Errno 5]` from a case with forty filesystem calls says
+    nothing about which one the mount refused.
+    """
+    detail = f"{type(error).__name__}: {error}"
+    if isinstance(error, AssertionError):
+        return detail
+    frames = [
+        frame
+        for frame in traceback.extract_tb(error.__traceback__)
+        if frame.filename == __file__ and frame.name not in {"check", "run"}
+    ]
+    if frames:
+        frame = frames[-1]
+        detail += f" (at {frame.name}:{frame.lineno}: {frame.line})"
+    return detail
 
 
 def expect_errno(expected: set[int], operation, description: str) -> None:
@@ -907,6 +928,59 @@ def test_concurrency(ctx: Context) -> None:
     ctx.record("shared.digest", hashlib.sha256(read(shared)).hexdigest())
 
 
+def _sqlite_create(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT)")
+
+
+def _sqlite_insert(connection: sqlite3.Connection) -> None:
+    with connection:
+        connection.executemany(
+            "INSERT INTO rows (value) VALUES (?)", [(f"row-{index}",) for index in range(500)]
+        )
+
+
+def _sqlite_diagnosis(database: Path) -> str:
+    """What a malformed database on the mount looks like next to a local replay.
+
+    The same statements from the same library write the same bytes, so the
+    pages that differ, and whether a stray journal sat next to the file, say
+    whether the mount lost a write, served a stale read or let a rollback in.
+    """
+    notes = []
+    try:
+        entries = sorted(
+            f"{entry.name}={entry.stat(follow_symlinks=False).st_size}"
+            for entry in os.scandir(database.parent)
+            if entry.name.startswith(database.name)
+        )
+        notes.append(f"files [{', '.join(entries)}]")
+    except OSError as error:
+        notes.append(f"listing failed: {error}")
+    try:
+        actual = database.read_bytes()
+    except OSError as error:
+        return "; ".join(notes + [f"reading the database failed: {error}"])
+    with tempfile.TemporaryDirectory(prefix="pdfs-sqlite-reference-") as scratch:
+        reference_path = Path(scratch) / database.name
+        reference = sqlite3.connect(reference_path)
+        try:
+            _sqlite_create(reference)
+            _sqlite_insert(reference)
+        finally:
+            reference.close()
+        expected = reference_path.read_bytes()
+    page = int.from_bytes(expected[16:18], "big") or 65536
+    notes.append(f"size {len(actual)} vs reference {len(expected)}")
+    differing = []
+    for offset in range(0, max(len(actual), len(expected)), page):
+        ours, theirs = actual[offset : offset + page], expected[offset : offset + page]
+        if ours != theirs:
+            kind = "zeros" if ours.strip(b"\0") == b"" else "differs"
+            differing.append(f"{offset // page + 1}:{kind}")
+    notes.append(f"pages differing [{', '.join(differing[:16]) or 'none'}]")
+    return "; ".join(notes)
+
+
 def test_application_workloads(ctx: Context) -> None:
     """Real tools, because they combine syscalls in ways a matrix will not.
 
@@ -954,14 +1028,20 @@ def test_application_workloads(ctx: Context) -> None:
     # sqlite exercises locking, journal creation and unlink, and fsync ordering.
     database = workloads / "workload.db"
     connection = sqlite3.connect(database)
+    step = "open"
     try:
-        connection.execute("CREATE TABLE rows (id INTEGER PRIMARY KEY, value TEXT)")
-        with connection:
-            connection.executemany(
-                "INSERT INTO rows (value) VALUES (?)", [(f"row-{index}",) for index in range(500)]
-            )
+        step = "create table"
+        _sqlite_create(connection)
+        step = "insert"
+        _sqlite_insert(connection)
+        step = "checkpoint"
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        step = "count"
         count = connection.execute("SELECT COUNT(*) FROM rows").fetchone()[0]
+    except sqlite3.DatabaseError as error:
+        raise AssertionError(
+            f"sqlite failed at {step}: {error}; {_sqlite_diagnosis(database)}"
+        ) from error
     finally:
         connection.close()
     check(count == 500, f"sqlite lost rows: {count}")
@@ -1972,7 +2052,7 @@ def run_contract(
                 raise
             except BaseException as error:  # noqa: BLE001 - reported, then continued
                 elapsed = time.monotonic() - started
-                detail = f"{type(error).__name__}: {error}"
+                detail = failure_detail(error)
                 print(f"    FAIL  {detail}")
                 run.results.append(Result(case.name, label, "fail", elapsed, detail))
                 if fail_fast:
@@ -2148,6 +2228,32 @@ class JournalWatch:
 # --------------------------------------------------------------------------
 
 
+# Queue ops that were already there when the run started, by id. They belong
+# to the user, or to an earlier run that died, and may never drain: a run that
+# waited for an empty queue would time out on every sync case. Waits skip them.
+PREEXISTING_OPS: set[int] = set()
+
+
+def remember_preexisting_ops(queue: list[dict]) -> None:
+    if PREEXISTING_OPS:
+        return
+    PREEXISTING_OPS.update(item["id"] for item in queue)
+    for item in queue:
+        print(
+            f"NOTE: queued {item['kind']} #{item['id']} for {item['path']} predates this run; "
+            "queue waits ignore it"
+        )
+
+
+def queue_settled(mount: dict, queue) -> bool:
+    """Whether everything this run queued has drained. `queue` lists the ops."""
+    if mount.get("pending_uploads", 0) == 0 and mount.get("pending_changes", 0) == 0:
+        return True
+    if not PREEXISTING_OPS:
+        return False
+    return all(item["id"] in PREEXISTING_OPS for item in queue())
+
+
 class Daemon:
     """The `pdfs` CLI, plus the unit control the durability drill needs."""
 
@@ -2166,6 +2272,8 @@ class Daemon:
             daemon.status()
         except Exception:
             return None
+        with contextlib.suppress(Exception):
+            remember_preexisting_ops(daemon.queue())
         return daemon
 
     def command(self, *args: str, json_output: bool = False, stdin: str | None = None) -> str:
@@ -2194,7 +2302,7 @@ class Daemon:
         last = None
         while time.monotonic() < deadline:
             last = self.status().get("mount") or {}
-            if last.get("pending_uploads", 0) == 0 and last.get("pending_changes", 0) == 0:
+            if queue_settled(last, self.queue):
                 return
             time.sleep(1)
         raise TimeoutError(f"daemon mutation queue did not drain: {last}")
@@ -2472,7 +2580,17 @@ class Janitor:
         uid cannot. The node has to show up in the trash first, which is also
         what proves the trash step before it worked, and it has to be gone from
         a fresh listing afterwards.
+
+        The server's own answer comes first, though: it only deletes a node
+        that is in the trash, and it answers per uid. A listing is a whole-trash
+        enumeration, which on a large trash can time out on every attempt and
+        would otherwise keep a folder the server would delete on request.
         """
+        with contextlib.suppress(Exception):
+            reply = self.daemon.command("delete-forever", uid, stdin="yes\n")
+            if re.search(r"\bpermanently deleted 1 item", reply):
+                print(f"[cleanup] permanently deleted {name}")
+                return True
         deadline = time.monotonic() + self.daemon.timeout
         attempted = False
         last_error = ""
@@ -2645,7 +2763,10 @@ class ManagedSyncPair:
         while time.monotonic() < deadline:
             value = json.loads(self.command("status", json_output=True))
             last = value.get("mount") or {}
-            if last.get("pending_uploads", 0) == 0 and last.get("pending_changes", 0) == 0:
+            if queue_settled(
+                last,
+                lambda: json.loads(self.command("sync", "queue", json_output=True))["items"],
+            ):
                 return
             time.sleep(1)
         raise TimeoutError(f"daemon mutation queue did not drain: {last}")
@@ -3158,7 +3279,7 @@ def run_move_contract(
             except KeyboardInterrupt:
                 raise
             except BaseException as error:  # noqa: BLE001 - reported, then continued
-                detail = f"{type(error).__name__}: {error}"
+                detail = failure_detail(error)
                 print(f"    FAIL  {detail}")
                 run.results.append(Result(case.name, label, "fail", time.monotonic() - started, detail))
                 if fail_fast:

@@ -1743,11 +1743,17 @@ impl ProtonFs {
         if let Some(uid) = unlinked_uid
             && release_can_discard_unlinked(&self.core.db, &uid)
         {
+            // Ops withdrawn at unlink left the bytes this handle read behind,
+            // owned by no op any more; they go with the last handle.
+            let withdrawn = self.core.pending_blob(&uid);
             if let Err(error) = self.core.discard_queued_ops(&uid) {
                 warn!(%uid, ?error, "queued-op cleanup failed; retaining unlinked state");
             } else {
                 if let Err(error) = self.core.db.delete_node(&uid) {
                     warn!(%uid, %error, "deleting released unlinked node state failed");
+                }
+                if let Some(blob) = withdrawn {
+                    self.core.cache.discard_staged(&blob);
                 }
                 self.core.cache.evict(&uid);
                 self.core.evict_reader(&uid);
@@ -2129,7 +2135,12 @@ impl ProtonFs {
         // it just means its queued creation is no longer wanted. This works
         // offline, which the remote path below cannot (offline.md Phase 3b).
         if is_local_uid(&uid) {
-            if !open_now && let Err(error) = self.core.discard_queued_ops(&uid) {
+            let dropped = if open_now {
+                self.core.withdraw_queued_ops(&uid)
+            } else {
+                self.core.discard_queued_ops(&uid)
+            };
+            if let Err(error) = dropped {
                 reply.error(error);
                 return;
             }
@@ -2168,7 +2179,13 @@ impl ProtonFs {
         // Otherwise an EIO response still made the path disappear locally.
         self.core.hidden.lock().insert(uid.clone());
         self.core.state().forget_or_unlink(&uid);
-        if !open_now {
+        if open_now {
+            // The open handle keeps the staged bytes; the drain must not send
+            // them to a node that is already in the trash (docs/BUGS.md B106).
+            if let Err(error) = self.core.withdraw_queued_ops(&uid) {
+                warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
+            }
+        } else {
             if let Err(error) = self.core.discard_queued_ops(&uid) {
                 warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
             }

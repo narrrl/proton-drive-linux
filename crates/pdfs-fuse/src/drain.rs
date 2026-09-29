@@ -1486,6 +1486,16 @@ impl Core {
         let uid = parse_node_uid(&meta.uid).ok_or("staged write has an unparseable uid")?;
 
         if let Some(reason) = self.revision_conflict(&uid, &meta)? {
+            // Trashing the file from the mount drops its queued write, but not
+            // from under a worker already holding it. That worker then finds the
+            // node trashed — by us — and would upload the withdrawn bytes as a
+            // conflict copy (a `recovered-…` file in the root when the tree has
+            // already forgotten the node). A write nobody queues any more is
+            // not a conflict.
+            if !self.db.op_exists(op.id)? {
+                debug!(%uid, reason, "queued write withdrawn while it drained; dropping it");
+                return Ok(());
+            }
             return self.keep_as_conflict_copy(op, &blob, &meta, &uid, &reason);
         }
 
@@ -1522,6 +1532,12 @@ impl Core {
         // this is on the wire can stop it rather than paying for a revision the
         // op it queued will immediately replace.
         let cancel = self.begin_cancellable_upload(&uid);
+        // An unlink that withdrew this op before the flag above existed had no
+        // upload to cancel; the row is the record that it happened.
+        if !self.db.op_exists(op.id)? {
+            debug!(%uid, "queued write withdrawn before it went out; dropping it");
+            return Ok(());
+        }
         let reader = CountingReader::new(File::open(&blob)?, &guard).with_cancel(cancel.flag());
         let started = Instant::now();
         let sent = self.rt.block_on(self.client.upload_new_revision_from(

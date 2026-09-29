@@ -108,6 +108,7 @@ impl Outcome {
             Applied::Uploaded => self.uploaded += 1,
             Applied::Downloaded => self.downloaded += 1,
             Applied::Conflict => self.conflicts += 1,
+            Applied::Vanished => {}
         }
     }
 
