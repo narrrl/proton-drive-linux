@@ -97,7 +97,8 @@ Besides the syscall contract, the suite covers:
 - **Throughput.** 64 MiB written and read sequentially, 1 MiB in 4 KiB writes,
   and metadata operations on 100 files. The rates are printed. The case fails
   below `PDFS_ACCEPTANCE_MIN_MIBPS` (default 10) or `PDFS_ACCEPTANCE_MIN_OPS`
-  (default 20 operations per second).
+  (default 20 operations per second, or 3 on a FUSE mount, where each create
+  and unlink waits for Drive before it returns).
 
 ### The mount is diffed against an ordinary filesystem
 

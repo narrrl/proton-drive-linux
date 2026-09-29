@@ -1464,6 +1464,12 @@ impl ProtonFs {
             return;
         }
         if let Err(e) = self.core.ensure_children(parent) {
+            // The parent was looked up a moment ago, so ENOENT here means it
+            // left the tree in between. Log it: the caller only sees "no such
+            // file" on a create.
+            if e == Errno::ENOENT {
+                warn!(parent, name, "create: the parent folder is no longer known");
+            }
             reply.error(e);
             return;
         }
@@ -1472,6 +1478,10 @@ impl ProtonFs {
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
+                    warn!(
+                        parent,
+                        name, "create: the parent folder left the tree during its listing"
+                    );
                     reply.error(Errno::ENOENT);
                     return;
                 }

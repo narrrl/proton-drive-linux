@@ -1357,9 +1357,15 @@ def test_throughput(ctx: Context) -> None:
     reads of just-written data come from the cache, so neither should depend
     on the network. PDFS_ACCEPTANCE_MIN_MIBPS and PDFS_ACCEPTANCE_MIN_OPS move
     the floors; 0 turns one off.
+
+    Metadata is the exception. On a Drive mount each create and each unlink
+    waits for Drive before it returns (about 350 ms for a create), so 20
+    operations a second is out of reach there by design. The default floor for
+    a FUSE target is 3, which still catches a second round trip per operation.
     """
     min_rate = float(os.environ.get("PDFS_ACCEPTANCE_MIN_MIBPS", "10"))
-    min_ops = float(os.environ.get("PDFS_ACCEPTANCE_MIN_OPS", "20"))
+    default_ops = "3" if is_fuse(ctx.root) else "20"
+    min_ops = float(os.environ.get("PDFS_ACCEPTANCE_MIN_OPS", default_ops))
     root = ctx.root / "throughput"
     root.mkdir()
     chunk = pattern(MIB, "throughput")
@@ -3306,6 +3312,20 @@ def run_move_contract(
 def is_mountpoint(path: Path) -> bool:
     """True for a distinct mount, including FUSE mounts over an existing dir."""
     return os.path.ismount(path)
+
+
+def is_fuse(path: Path) -> bool:
+    """True when `path` lives on a FUSE mount, read from /proc/self/mountinfo."""
+    path = path.resolve()
+    best, fstype = -1, ""
+    with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+        for line in mounts:
+            fields = line.split()
+            # Octal escapes (\040 for a space) are how mountinfo writes odd names.
+            point = Path(fields[4].encode().decode("unicode_escape"))
+            if (path == point or point in path.parents) and len(point.parts) > best:
+                best, fstype = len(point.parts), fields[fields.index("-") + 1]
+    return fstype.startswith("fuse")
 
 
 def run_managed_matrix(
