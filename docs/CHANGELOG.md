@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.7.0] — 2026-09-29
+
+Schema: **35** (unchanged).
+
 ### Added
 - **Moves between locations without transferring content.** `pdfs move` and the app's
   **Move to…** now take a file or folder from My files into a synced folder, or between two
@@ -24,6 +28,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   reports each one that could not move.
 - **Moving into a mirrored folder reuses cached content.** A file already cached by
   an online-only folder is copied into place instead of downloaded again.
+
+### Changed
+- **New project homepage: [proton-drive.narl.io](https://proton-drive.narl.io).** The About
+  dialog's website link, the README, and the package metadata (Cargo, PKGBUILDs, `.deb`,
+  `.rpm`) point there. The source code link stays on GitHub.
 
 ## [2.6.2] — 2026-09-28
 
@@ -1263,6 +1272,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[2.7.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.7.0
 
 [2.6.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.2
 [2.6.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.1
