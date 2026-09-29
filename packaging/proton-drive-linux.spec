@@ -14,7 +14,7 @@ Version:        %{version}
 Release:        1%{?dist}
 Summary:        Unofficial Proton Drive client for Linux (FUSE, CLI, GTK4 app + tray)
 License:        MIT
-URL:            https://github.com/narrrl/proton-drive-linux
+URL:            https://proton-drive.narl.io
 ExclusiveArch:  x86_64
 
 BuildRequires:  cargo

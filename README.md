@@ -8,6 +8,8 @@
 local folders, Photos, sharing, and a native GTK4 app with tray and search launcher, plus a
 scriptable CLI.
 
+**[proton-drive.narl.io](https://proton-drive.narl.io)**
+
 [![CI](https://github.com/narrrl/proton-drive-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/narrrl/proton-drive-linux/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/narrrl/proton-drive-linux?sort=semver)](https://github.com/narrrl/proton-drive-linux/releases/latest)
 [![AUR](https://img.shields.io/aur/version/proton-drive-for-linux)](https://aur.archlinux.org/packages/proton-drive-for-linux)

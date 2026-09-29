@@ -166,7 +166,7 @@ jobs:
           Maintainer: Nils Pukropp <contact@narl.io>
           Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4, libimage-exiftool-perl
           Installed-Size: ${INSTALLED_SIZE}
-          Homepage: https://github.com/narrrl/proton-drive-linux
+          Homepage: https://proton-drive.narl.io
           Description: Unofficial Proton Drive client for Linux
            Files-on-demand Proton Drive for the Linux desktop, unaffiliated with Proton AG:
            - FUSE virtual mount with block-level caching

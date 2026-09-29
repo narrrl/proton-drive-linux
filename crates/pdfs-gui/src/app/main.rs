@@ -1208,7 +1208,7 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             .application_icon("io.narl.proton-drive-linux")
             .version(pdfs_core::config::APP_VERSION)
             .developer_name("Nils Pukropp")
-            .website("https://github.com/narrrl/proton-drive-linux")
+            .website("https://proton-drive.narl.io")
             .issue_url("https://github.com/narrrl/proton-drive-linux/issues")
             .copyright("© 2026 Nils Pukropp (contact@narl.io)")
             .license_type(gtk4::License::MitX11)
