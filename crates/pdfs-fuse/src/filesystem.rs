@@ -290,7 +290,7 @@ impl Filesystem for ProtonFs {
             }
             return;
         }
-        let (uid, mtime, fsize, is_video) = {
+        let (uid, mtime, fsize, provisional, is_video) = {
             let st = self.core.state();
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => {
@@ -300,14 +300,24 @@ impl Filesystem for ProtonFs {
                     };
                     let is_video =
                         PhotoKind::classify(Some(&e.node.name), media_type) == PhotoKind::Video;
-                    let fsize = self
-                        .core
-                        .pending
-                        .lock()
-                        .get(&e.uid)
-                        .map(|p| p.meta.len)
-                        .unwrap_or_else(|| node_size(&e.node));
-                    (e.uid.clone(), e.node.modification_time, fsize, is_video)
+                    let queued = self.core.pending.lock().get(&e.uid).map(|p| p.meta.len);
+                    // Still the cheap enumeration's ciphertext size (B12).
+                    let provisional = queued.is_none()
+                        && matches!(
+                            &e.node.kind,
+                            NodeKind::File {
+                                claimed_size: None,
+                                ..
+                            }
+                        );
+                    let fsize = queued.unwrap_or_else(|| node_size(&e.node));
+                    (
+                        e.uid.clone(),
+                        e.node.modification_time,
+                        fsize,
+                        provisional,
+                        is_video,
+                    )
                 }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
@@ -330,6 +340,13 @@ impl Filesystem for ProtonFs {
         // races with nothing. FUSE does not require replies in request order.
         let core = self.core.clone();
         self.core.workers.run(Lane::Transfer, "read", move || {
+            // The revision disagrees with a provisional size, and B84 fails
+            // such a read outright, so settle the size first. On the network,
+            // hence here and not above (bugs.md B100).
+            let fsize = match provisional {
+                true => core.resolve_provisional_size(ino.0, &uid).unwrap_or(fsize),
+                false => fsize,
+            };
             match core.read_range(&uid, mtime, fsize, offset, size as u64, cache_blocks) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(e),
@@ -1193,7 +1210,7 @@ impl ProtonFs {
     /// open.
     fn serve_open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        let (uid, base_mtime, base_size, base_revision_id) = {
+        let (uid, base_mtime, base_size, provisional, base_revision_id) = {
             let mut st = self.core.state();
             match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
@@ -1206,6 +1223,14 @@ impl ProtonFs {
                         e.uid.clone(),
                         e.node.modification_time,
                         node_size(&e.node),
+                        // Still the cheap enumeration's ciphertext size (B12).
+                        matches!(
+                            &e.node.kind,
+                            NodeKind::File {
+                                claimed_size: None,
+                                ..
+                            }
+                        ),
                         node_revision_id(&e.node),
                     )
                 }
@@ -1251,6 +1276,21 @@ impl ProtonFs {
         // `reply` is consumed by whichever arm answers, so the loop yields an
         // outcome and the answer is sent once, after it.
         let outcome = 'install: {
+            // The handle starts at the base's size. A provisional one is the
+            // ciphertext size, so the file would grow by the encryption overhead
+            // and reading the base would fail (bugs.md B100). A queued revision
+            // stamps a real size, so this only goes to the network for a file
+            // the listing has not sized yet.
+            let base_size = match provisional && self.core.pending_blob(&uid).is_none() {
+                false => base_size,
+                true => match self.core.resolve_provisional_size(ino.0, &uid) {
+                    Some(size) => size,
+                    None => {
+                        error!(%uid, "could not settle the size of the base for a write open");
+                        break 'install Err(Errno::EIO);
+                    }
+                },
+            };
             for attempt in 0..OPEN_BASE_ATTEMPTS {
                 let pending_base = self.core.pending.lock().get(&uid).cloned();
                 if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {

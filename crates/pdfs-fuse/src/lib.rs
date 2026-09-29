@@ -323,7 +323,8 @@ const SIZE_UPGRADE_CHUNK: usize = 150;
 /// deduplicates *within* a folder — so without this a recursive listing scaled
 /// both with the number of folders it walked. Eight keeps an interactive `ls -l`
 /// (one folder, sometimes a couple) entirely unaffected while putting a ceiling
-/// on the recursive case.
+/// on the recursive case. A folder past the cap is queued, not dropped: one of
+/// the running threads takes it over when its own batch ends (bugs.md B100).
 const MAX_SIZE_UPGRADES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2511,10 +2512,11 @@ impl Core {
     ///
     /// **Sizes are provisional until this lands.** `node_size` falls back to
     /// `total_size_on_storage`, the *ciphertext* size, which is slightly larger
-    /// than the real one. Reads are unaffected — the revision reader carries its
-    /// own authoritative size — so this is a cosmetic discrepancy in `stat` that
-    /// closes within a round trip, not a repeat of B11 (which reported **0** and
-    /// so suppressed reads entirely).
+    /// than the real one. A read must not plan on it: since B84 a size the
+    /// revision disagrees with fails the read, so `read` settles the size first
+    /// ([`Core::resolve_provisional_size`], bugs.md B100). In `stat` it is a
+    /// discrepancy that closes within a round trip, not a repeat of B11 (which
+    /// reported **0** and so suppressed reads entirely).
     ///
     /// Single-flight per folder: a `stat` of every entry in a fresh listing is
     /// the normal case, and each one must not start its own upgrade.
@@ -2535,32 +2537,16 @@ impl Core {
         if uids.is_empty() {
             return None;
         }
-        let slot = {
-            let mut in_flight = self.size_upgrades.lock();
-            match in_flight.get(&key) {
-                // Someone else is already fetching this folder; their batch
-                // covers us, so just wait on it.
-                Some(existing) => existing.clone(),
-                // Nothing bounded how many of these could be in flight: the
-                // single-flight is per folder, so a recursive listing across
-                // hundreds of cold folders started a thread and a batch for
-                // each (audit F4). Past the cap, answer with the provisional
-                // size — the same fallback the deadline already takes, and the
-                // upgrade is retried by the next `stat` once a slot frees.
-                None if in_flight.len() >= MAX_SIZE_UPGRADES => return None,
-                None => {
-                    let slot = Arc::new(SizeUpgrade::default());
-                    in_flight.insert(key, slot.clone());
-                    let core = self.clone();
-                    let worker = slot.clone();
-                    std::thread::spawn(move || {
-                        core.run_size_upgrade(key, uids, &worker);
-                    });
-                    slot
-                }
+        let claim = claim_size_upgrade(&mut self.size_upgrades.lock(), key, uids);
+        match claim {
+            SizeUpgradeClaim::Joined(slot) | SizeUpgradeClaim::Queued(slot) => Some(slot),
+            SizeUpgradeClaim::Start(slot, uids) => {
+                let core = self.clone();
+                let worker = slot.clone();
+                std::thread::spawn(move || core.run_size_upgrade(key, uids, worker));
+                Some(slot)
             }
-        };
-        Some(slot)
+        }
     }
 
     /// Hold `respond` back until `ino` has a real size, `slot`'s batch ends, or
@@ -2603,16 +2589,52 @@ impl Core {
     /// single 793-node batch took ~80 s, which outran [`SizeUpgrade::WAIT`] and
     /// put provisional sizes back in front of callers — the bug this was
     /// supposed to fix (bugs.md B14).
-    fn run_size_upgrade(&self, key: u64, uids: Vec<NodeUid>, slot: &SizeUpgrade) {
-        for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
-            let result = self.rt.block_on(self.client.enumerate_nodes(chunk));
-            self.apply_size_upgrade(key, result);
-            slot.chunk_done();
+    ///
+    /// When the batch ends, the thread takes over the oldest batch the cap held
+    /// back, so at most [`MAX_SIZE_UPGRADES`] threads run however many folders
+    /// a recursive walk touches (bugs.md B100).
+    fn run_size_upgrade(&self, key: u64, uids: Vec<NodeUid>, slot: Arc<SizeUpgrade>) {
+        let (mut key, mut uids, mut slot) = (key, uids, slot);
+        loop {
+            for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
+                let result = self.rt.block_on(self.client.enumerate_nodes(chunk));
+                self.apply_size_upgrade(key, result);
+                slot.chunk_done();
+            }
+            // Both of these must happen however the loop ended: a folder whose
+            // upgrade failed has to be retryable, and its waiters released.
+            let next = next_size_upgrade(&mut self.size_upgrades.lock(), key);
+            slot.finish();
+            let Some(next) = next else {
+                return;
+            };
+            (key, uids, slot) = next;
         }
-        // Both of these must happen however the loop ended: a folder whose
-        // upgrade failed has to be retryable, and its waiters released.
-        self.size_upgrades.lock().remove(&key);
-        slot.finish();
+    }
+
+    /// Settle the size of a file whose listing only carries the provisional
+    /// one, before a read plans its blocks on it or a write handle starts from
+    /// it. Returns the real size, or `None` when the fetch did not produce one.
+    ///
+    /// A provisional size is the ciphertext size. The read path checks the
+    /// size it is given against the revision's own block table and fails the
+    /// read on a mismatch (B84), so reading on the provisional size is an `EIO`
+    /// every time. `getattr` usually settles the size first, but not when its
+    /// wait times out, so the read cannot rely on it (bugs.md B100).
+    fn resolve_provisional_size(&self, ino: u64, uid: &NodeUid) -> Option<u64> {
+        let parent = self.state().entries.get(&ino)?.parent;
+        let result = self
+            .rt
+            .block_on(self.client.enumerate_nodes(std::slice::from_ref(uid)));
+        self.apply_size_upgrade(parent, result);
+        let st = self.state();
+        match &st.entries.get(&ino)?.node.kind {
+            NodeKind::File {
+                claimed_size: Some(size),
+                ..
+            } => Some((*size).max(0) as u64),
+            _ => None,
+        }
     }
 
     /// Whether `ino` has a real size — the condition a waiter is waiting on.
@@ -5295,6 +5317,64 @@ struct Progress {
 struct SizeUpgrade {
     inner: Mutex<Progress>,
     ready: Condvar,
+    /// The batch, while it waits for a thread because [`MAX_SIZE_UPGRADES`]
+    /// were already running, with when it was queued so the oldest goes first.
+    /// `None` once a thread has it.
+    queued: Mutex<Option<(Instant, Vec<NodeUid>)>>,
+}
+
+/// What [`Core::upgrade_sizes`] does with one folder's batch.
+enum SizeUpgradeClaim {
+    /// A batch for this folder is already running or queued; wait on it.
+    Joined(Arc<SizeUpgrade>),
+    /// The cap is reached. The batch waits for a running thread to take it.
+    Queued(Arc<SizeUpgrade>),
+    /// Start a thread for the batch.
+    Start(Arc<SizeUpgrade>, Vec<NodeUid>),
+}
+
+/// Register the batch for `key` in `in_flight` and decide who runs it.
+///
+/// Past the cap this used to return nothing, and the caller answered with the
+/// provisional size at once. Nothing retried the folder until the next `stat`,
+/// so a recursive walk over more than [`MAX_SIZE_UPGRADES`] fresh folders showed
+/// ciphertext sizes for most of them (bugs.md B100). Queued, the batch is still
+/// fetched, and a waiter gets the real size unless [`SizeUpgrade::WAIT`] runs out.
+fn claim_size_upgrade(
+    in_flight: &mut HashMap<u64, Arc<SizeUpgrade>>,
+    key: u64,
+    uids: Vec<NodeUid>,
+) -> SizeUpgradeClaim {
+    if let Some(existing) = in_flight.get(&key) {
+        return SizeUpgradeClaim::Joined(existing.clone());
+    }
+    let running = in_flight
+        .values()
+        .filter(|slot| slot.queued.lock().is_none())
+        .count();
+    let slot = Arc::new(SizeUpgrade::default());
+    in_flight.insert(key, slot.clone());
+    if running >= MAX_SIZE_UPGRADES {
+        *slot.queued.lock() = Some((Instant::now(), uids));
+        return SizeUpgradeClaim::Queued(slot);
+    }
+    SizeUpgradeClaim::Start(slot, uids)
+}
+
+/// Retire the finished batch for `done` and hand its thread the oldest queued
+/// batch, if there is one.
+fn next_size_upgrade(
+    in_flight: &mut HashMap<u64, Arc<SizeUpgrade>>,
+    done: u64,
+) -> Option<(u64, Vec<NodeUid>, Arc<SizeUpgrade>)> {
+    in_flight.remove(&done);
+    let (key, slot) = in_flight
+        .iter()
+        .filter_map(|(key, slot)| slot.queued.lock().as_ref().map(|(at, _)| (*at, *key, slot)))
+        .min_by_key(|(at, _, _)| *at)
+        .map(|(_, key, slot)| (key, slot.clone()))?;
+    let (_, uids) = slot.queued.lock().take()?;
+    Some((key, uids, slot))
 }
 
 impl SizeUpgrade {
@@ -5882,7 +5962,11 @@ mod merge_over_pending_tests {
 
 #[cfg(test)]
 mod size_upgrade_tests {
-    use super::{SizeUpgrade, SizeWaitQueue, SizeWaiter};
+    use super::{
+        LinkId, MAX_SIZE_UPGRADES, NodeUid, SizeUpgrade, SizeUpgradeClaim, SizeWaitQueue,
+        SizeWaiter, VolumeId, claim_size_upgrade, next_size_upgrade,
+    };
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -6073,6 +6157,60 @@ mod size_upgrade_tests {
         drop(tx);
         queue.answer_all();
         assert_eq!(rx.into_iter().count(), 4);
+    }
+
+    fn uids(links: &[&str]) -> Vec<NodeUid> {
+        links
+            .iter()
+            .map(|link| NodeUid::new(VolumeId::from("vol"), LinkId::from(*link)))
+            .collect()
+    }
+
+    /// Past the cap a folder used to get no upgrade at all, so a recursive
+    /// walk reported ciphertext sizes for most of what it listed (bugs.md B100).
+    #[test]
+    fn a_folder_past_the_cap_is_queued_not_dropped() {
+        let mut in_flight = HashMap::new();
+        for key in 0..MAX_SIZE_UPGRADES as u64 {
+            let claim = claim_size_upgrade(&mut in_flight, key, uids(&["a"]));
+            assert!(matches!(claim, SizeUpgradeClaim::Start(..)));
+        }
+        let key = MAX_SIZE_UPGRADES as u64;
+        let claim = claim_size_upgrade(&mut in_flight, key, uids(&["late"]));
+        let SizeUpgradeClaim::Queued(slot) = claim else {
+            panic!("expected the batch to be queued");
+        };
+        assert!(Arc::ptr_eq(&slot, &in_flight[&key]));
+        // A second caller for the queued folder waits on the same batch.
+        let again = claim_size_upgrade(&mut in_flight, key, uids(&["late"]));
+        assert!(matches!(again, SizeUpgradeClaim::Joined(s) if Arc::ptr_eq(&s, &slot)));
+    }
+
+    #[test]
+    fn a_finished_batch_hands_its_thread_the_oldest_queued_one() {
+        let mut in_flight = HashMap::new();
+        for key in 0..MAX_SIZE_UPGRADES as u64 {
+            claim_size_upgrade(&mut in_flight, key, uids(&["a"]));
+        }
+        let first = MAX_SIZE_UPGRADES as u64;
+        claim_size_upgrade(&mut in_flight, first, uids(&["first"]));
+        std::thread::sleep(Duration::from_millis(2));
+        claim_size_upgrade(&mut in_flight, first + 1, uids(&["second"]));
+
+        let (key, taken, slot) = next_size_upgrade(&mut in_flight, 0).expect("a queued batch");
+        assert_eq!((key, taken), (first, uids(&["first"])));
+        assert!(slot.queued.lock().is_none());
+        assert!(!in_flight.contains_key(&0));
+        // Still at the cap: the handed-over batch counts as running.
+        let running = in_flight
+            .values()
+            .filter(|s| s.queued.lock().is_none())
+            .count();
+        assert_eq!(running, MAX_SIZE_UPGRADES);
+
+        let (key, _, _) = next_size_upgrade(&mut in_flight, 1).expect("the other one");
+        assert_eq!(key, first + 1);
+        assert!(next_size_upgrade(&mut in_flight, 2).is_none());
     }
 }
 

@@ -12,6 +12,46 @@ Conventions:
 
 ---
 
+## B100 — A freshly copied file reads as `EIO` or 53 bytes too big
+
+**Status:** Fixed (unverified). No daemon carrying the change has read a file with a provisional
+size yet.
+**Found:** 2026-09-29, checking a 222-file copy into `Documents/pi-backup` on 2.7.0. `find -printf
+%s` showed 10 small files 52 to 59 bytes bigger than their originals. `cat` of one of them failed
+with `Input/output error`, and the journal had `the revision's block table disagrees with the
+node size ... fsize=221 reader_size=169` followed by `repair download did not match the node
+size`. The node's DB row and `claimed_size` were correct (169). A few minutes later the same files
+reported the right size and matched the originals byte for byte.
+
+**Where:** `crates/pdfs-fuse/src/filesystem.rs` (`read`, `serve_open`),
+`crates/pdfs-fuse/src/lib.rs` (`Core::upgrade_sizes`, `Core::run_size_upgrade`).
+
+**Cause.** Three things together.
+
+- A listing built from the cheap enumeration (B12) has no `claimed_size`, so a file reports its
+  ciphertext size until the size upgrade lands. The upgrade's own documentation said reads were
+  unaffected because the revision reader carries its own size.
+- B84 made that untrue. `read_block` now treats a revision that disagrees with the size it was
+  given as damage: it repairs from the whole-file download, and when that does not match either,
+  it fails the read. With a provisional size the two never match, so every read failed.
+- `getattr` normally settles the size before answering (B14), which kept this rare. But only
+  `MAX_SIZE_UPGRADES` (8) folders may upgrade at once, and past that cap `upgrade_sizes` returned
+  nothing. The `stat` was answered with the ciphertext size at once, and nothing retried the
+  folder until the next `stat`. A recursive walk over many fresh folders goes past the cap.
+
+A write open had the same fault: its handle started at the provisional size, so the file would
+gain the encryption overhead and reading the base would fail.
+
+**Fix.** `read` and a write `open` settle a provisional size before using it
+(`Core::resolve_provisional_size`, one node fetch, on the worker that already goes to the
+network). A folder past the cap is now queued instead of dropped. When a running upgrade ends,
+its thread takes over the oldest queued folder, so at most 8 threads still run.
+Regression tests: `a_folder_past_the_cap_is_queued_not_dropped`,
+`a_finished_batch_hands_its_thread_the_oldest_queued_one`. The read and open paths need a live
+mount and have no unit test.
+
+---
+
 ## B99 — Conflict copies in synced folders are logged again on every start and shown as "Resolved"
 
 **Status:** Fixed (unverified). No daemon carrying the change has been restarted against the

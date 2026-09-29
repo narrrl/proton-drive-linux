@@ -11,6 +11,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **Freshly listed files read correctly.** A file whose real size had not been fetched yet
+  reported its encrypted size, about 53 bytes too big, and reading it failed with
+  `Input/output error`. This happened most often right after copying a large folder. Reads and
+  write opens now fetch the real size first, and a big folder walk no longer skips size lookups
+  (B100).
+
 ## [2.7.0] — 2026-09-29
 
 Schema: **35** (unchanged).
