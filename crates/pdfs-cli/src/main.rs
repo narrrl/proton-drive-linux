@@ -30,7 +30,7 @@ struct Cli {
     /// Emit machine-readable JSON instead of formatted text.
     ///
     /// Applies to the query commands (`status`, `ls`, `pins`, `sync list`,
-    /// `devices list`, `locations`, `transfers`, `activity`, `cache inspect`). Commands that
+    /// `devices list`, `locations`, `transfers`, `activity`, `trash`, `cache inspect`). Commands that
     /// perform an action keep their human output — a script that needs to know
     /// whether one succeeded has the exit code.
     #[arg(long, global = true)]
@@ -2551,7 +2551,11 @@ fn cmd_diagnostics() -> Result<()> {
 }
 
 fn cmd_trash() -> Result<()> {
-    match control_request(CtlRequest::ListTrash)? {
+    let response = control_request(CtlRequest::ListTrash)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Entries { entries } if entries.is_empty() => println!("(trash is empty)"),
         CtlResponse::Entries { entries } => {
             for e in entries {

@@ -442,10 +442,7 @@ impl Filesystem for ProtonFs {
                 reply.error(Errno::EBADF);
                 return;
             };
-            let end = offset + data.len() as u64;
-            aw.written.add(offset, end);
-            aw.len = aw.len.max(end);
-            aw.dirty = true;
+            aw.record_write(offset, offset + data.len() as u64);
             let len = aw.len;
             st.set_size(ino.0, len);
             len

@@ -24,6 +24,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import signal
@@ -65,6 +66,10 @@ ERROR_LEVEL = re.compile(r"\bERROR\b")
 
 FALLOC_FL_KEEP_SIZE = 0x01
 FALLOC_FL_PUNCH_HOLE = 0x02
+MIB = 1024 * 1024
+# Drive stores content in blocks of this size; the edges of one are where an
+# off-by-one in the upload or the read path shows.
+BLOCK = 4 * MIB
 RENAME_NOREPLACE = 1 << 0
 RENAME_EXCHANGE = 1 << 1
 AT_FDCWD = -100
@@ -151,6 +156,19 @@ def check_bytes(actual: bytes, expected: bytes, message: str) -> None:
 def read(path: Path) -> bytes:
     with path.open("rb", buffering=0) as file:
         return file.read()
+
+
+def pattern(size: int, seed: str) -> bytes:
+    """Deterministic bytes that differ at every offset, so a shift cannot hide."""
+    return random.Random(seed).randbytes(size)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        check(written > 0, "write made no progress")
+        view = view[written:]
 
 
 def write_durable(path: Path, data: bytes) -> None:
@@ -274,6 +292,49 @@ class Skip(Exception):
 
 class TestTimeout(Exception):
     pass
+
+
+class Interrupted(KeyboardInterrupt):
+    """SIGTERM or SIGHUP, raised like Ctrl-C so that every `finally` runs."""
+
+
+def _raise_interrupted(signum, _frame):
+    raise Interrupted(f"received {signal.Signals(signum).name}")
+
+
+def install_interrupt_handlers() -> None:
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, _raise_interrupted)
+
+
+@contextlib.contextmanager
+def shielded():
+    """Hold interrupts off while cleanup runs.
+
+    A Ctrl-C that lands in the middle of cleanup would strand exactly the
+    remote state cleanup exists to remove. Two are acknowledged and ignored;
+    a third abandons cleanup, and the next run reaps whatever it left.
+    """
+    received = 0
+
+    def on_signal(signum, _frame):
+        nonlocal received
+        received += 1
+        if received >= 3:
+            raise Interrupted("cleanup abandoned; the next run removes what is left")
+        print(
+            f"[cleanup] {signal.Signals(signum).name} ignored while cleaning up; "
+            f"send it {3 - received} more time(s) to abandon cleanup",
+            file=sys.stderr,
+        )
+
+    watched = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous = {signum: signal.signal(signum, on_signal) for signum in watched}
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 @contextlib.contextmanager
@@ -945,6 +1006,346 @@ def test_application_workloads(ctx: Context) -> None:
         ctx.note("rsync", "not installed")
 
 
+def test_block_boundaries_and_overwrites(ctx: Context) -> None:
+    """Sizes on either side of every boundary the stack has.
+
+    The kernel moves 4 KiB pages, FUSE 128 KiB requests, and Drive 4 MiB
+    blocks. An off-by-one at any of them truncates, pads or shifts a file by one
+    byte, and only a file of exactly that size shows it.
+    """
+    root = ctx.root / "boundaries"
+    root.mkdir()
+    sizes = [0, 1, 4095, 4096, 4097, 131071, 131072, 131073, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 3]
+    for size in sizes:
+        write_durable(root / f"size-{size}", pattern(size, f"size-{size}"))
+    for size in sizes:
+        path = root / f"size-{size}"
+        reported = os.lstat(path).st_size
+        check(reported == size, f"a {size}-byte file reports {reported} bytes")
+        check_bytes(read(path), pattern(size, f"size-{size}"), f"{size}-byte file")
+    ctx.record("sizes", [os.lstat(root / f"size-{size}").st_size for size in sizes])
+
+    # Overwrites that change how many blocks a file has, in both directions.
+    path = root / "reshaped"
+    write_durable(path, pattern(2 * BLOCK + 3, "reshaped"))
+    model = bytearray(pattern(BLOCK + 7, "shorter"))
+    write_durable(path, bytes(model))
+    check_bytes(read(path), bytes(model), "an overwrite with fewer blocks")
+    fd = os.open(path, os.O_RDWR)
+    try:
+        straddle = pattern(8192, "straddle")
+        os.pwrite(fd, straddle, BLOCK - 4096)
+        model[BLOCK - 4096 : BLOCK + 4096] = straddle
+        tail = pattern(BLOCK, "tail")
+        os.pwrite(fd, tail, len(model))
+        model.extend(tail)
+        # Back to exactly one block, then past the end, leaving a hole.
+        os.ftruncate(fd, BLOCK)
+        del model[BLOCK:]
+        os.pwrite(fd, b"after-hole", BLOCK + 10)
+        model.extend(bytes(10) + b"after-hole")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    check(os.lstat(path).st_size == len(model), "block-crossing edits left the wrong size")
+    check_bytes(read(path), bytes(model), "block-crossing edits after reopening")
+    ctx.record("reshaped.digest", hashlib.sha256(model).hexdigest())
+
+    # Until the queue drains, reads come from the staged copy. What reached
+    # Drive is only visible after it has, so read everything again from there.
+    if ctx.is_live and ctx.daemon is not None:
+        ctx.daemon.wait_for_queue()
+        for size in sizes:
+            path = root / f"size-{size}"
+            check(os.lstat(path).st_size == size, f"a {size}-byte file changed size on upload")
+            check_bytes(read(path), pattern(size, f"size-{size}"), f"uploaded {size}-byte file")
+        check_bytes(read(root / "reshaped"), bytes(model), "uploaded block-crossing edits")
+
+
+UNUSUAL_NAMES = [
+    "a" * 255,
+    "é" * 127,
+    " leading space",
+    "trailing space ",
+    "trailing dot.",
+    "...",
+    "-starts-with-dash",
+    "#hash & ampersand",
+    "percent%20encoded",
+    "semi;colon,comma",
+    "quote's \"double\"",
+    "back\\slash",
+    "colon:star*question?",
+    "<angle>|pipe",
+    "tab\there",
+    "new\nline",
+    "emoji 📁🗂️",
+    "zero​width",
+    "rtl‮override",
+    "cjk 文件夹",
+    "latin ñ ü ß",
+    "nfc-é",
+    "nfd-é",
+]
+
+
+def test_unusual_names(ctx: Context) -> None:
+    """Every byte sequence Linux allows in a name must survive a round trip.
+
+    Drive's own clients refuse some of these (Windows forbids `:*?"<>|`, macOS
+    normalizes Unicode), but a Linux program may create any of them, and one
+    that is silently renamed or dropped loses the file for that program.
+    """
+    root = ctx.root / "names"
+    root.mkdir()
+    for name in UNUSUAL_NAMES:
+        write_durable(root / name, name.encode())
+    (root / " spaced dir ").mkdir()
+    write_durable(root / " spaced dir " / "child", b"child")
+    listed = set(os.listdir(root))
+    missing = [name for name in UNUSUAL_NAMES if name not in listed]
+    check(not missing, f"names missing from readdir: {missing!r}")
+    for name in UNUSUAL_NAMES:
+        check_bytes(read(root / name), name.encode(), f"contents of {name!r}")
+    check_bytes(read(root / " spaced dir " / "child"), b"child", "child of a spaced directory")
+    for index, name in enumerate(UNUSUAL_NAMES):
+        os.rename(root / name, root / f"renamed-{index}")
+        os.rename(root / f"renamed-{index}", root / name)
+    check(set(os.listdir(root)) == listed, "renaming names away and back changed the listing")
+
+    write_durable(root / "Case-Only.txt", b"case")
+    os.rename(root / "Case-Only.txt", root / "case-only.txt")
+    names = set(os.listdir(root))
+    check("case-only.txt" in names and "Case-Only.txt" not in names, "a case-only rename did not stick")
+    check_bytes(read(root / "case-only.txt"), b"case", "a case-only rename")
+    ctx.record("names", sorted(os.listdir(root)))
+
+
+def test_deep_tree(ctx: Context) -> None:
+    root = ctx.root / "deep-tree"
+    deep = root / "deep"
+    leaf = deep.joinpath(*(f"level-{level:02d}" for level in range(24)))
+    leaf.mkdir(parents=True)
+    write_durable(leaf / "leaf.txt", b"deep leaf")
+    os.rename(deep, root / "deep-renamed")
+    moved = root / "deep-renamed" / leaf.relative_to(deep)
+    check_bytes(read(moved / "leaf.txt"), b"deep leaf", "a leaf 24 levels down after renaming the top")
+
+    shutil.rmtree(root)
+    check(not root.exists(), "rm -rf left the tree behind")
+    check("deep-tree" not in os.listdir(ctx.root), "rm -rf left the tree in readdir")
+
+
+def test_wide_directory(ctx: Context) -> None:
+    """More entries than one readdir reply holds, created and removed in parallel.
+
+    The kernel serializes creates and unlinks within one directory, so the
+    threads only overlap the parts outside that lock. The per-create time is
+    noted: online, each create is a round trip to the server.
+    """
+    root = ctx.root / "wide"
+    root.mkdir()
+    names = [f"entry-{index:04d}.txt" for index in range(128)]
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda name: write_durable(root / name, name.encode()), names))
+    ctx.note("wide.create_ms", round((time.monotonic() - started) * 1000 / len(names)))
+    listed = sorted(os.listdir(root))
+    check(listed == names, f"a {len(names)}-entry directory lists {len(listed)} entries")
+    with os.scandir(root) as entries:
+        sizes = {entry.name: entry.stat().st_size for entry in entries}
+    wrong = [name for name in names if sizes.get(name) != len(name)]
+    check(not wrong, f"wrong sizes in a wide directory: {wrong[:10]}")
+    for name in names[::17]:
+        check_bytes(read(root / name), name.encode(), f"wide entry {name}")
+    half = len(names) // 2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda name: os.unlink(root / name), names[:half]))
+    check(sorted(os.listdir(root)) == names[half:], "concurrent unlinks left the wrong entries")
+    ctx.record("wide.count", len(listed))
+
+    shutil.rmtree(root)
+    check(not root.exists(), "rm -rf left the directory behind")
+    check("wide" not in os.listdir(ctx.root), "rm -rf left the directory in readdir")
+
+
+def test_rename_patterns(ctx: Context) -> None:
+    """The rename sequences programs actually use, not just single renames."""
+    root = ctx.root / "renames"
+    root.mkdir()
+    first, second, spare = root / "a.txt", root / "b.txt", root / "swap.tmp"
+    write_durable(first, b"alpha")
+    write_durable(second, b"beta")
+    os.rename(first, spare)
+    os.rename(second, first)
+    os.rename(spare, second)
+    check(read(first) == b"beta" and read(second) == b"alpha", "a three-way swap mixed up contents")
+
+    write_durable(root / "chain-0", b"chain")
+    for step in range(1, 6):
+        os.rename(root / f"chain-{step - 1}", root / f"chain-{step}")
+    chain = sorted(name for name in os.listdir(root) if name.startswith("chain"))
+    check(chain == ["chain-5"], f"a rename chain left {chain}")
+    check_bytes(read(root / "chain-5"), b"chain", "the end of a rename chain")
+
+    # Log rotation: rename away and recreate the name straight after.
+    log = root / "app.log"
+    write_durable(log, b"first generation\n")
+    os.rename(log, root / "app.log.1")
+    write_durable(log, b"second generation\n")
+    check_bytes(read(root / "app.log.1"), b"first generation\n", "the rotated log")
+    check_bytes(read(log), b"second generation\n", "the recreated log")
+
+    # Replacing a file must not change what an already open reader sees.
+    target = root / "replaced.txt"
+    write_durable(target, b"old contents")
+    reader = os.open(target, os.O_RDONLY)
+    try:
+        write_durable(root / "replacement.tmp", b"new contents!")
+        os.replace(root / "replacement.tmp", target)
+        check_bytes(os.pread(reader, 64, 0), b"old contents", "an open reader after its file was replaced")
+    finally:
+        os.close(reader)
+    check_bytes(read(target), b"new contents!", "the replacement")
+
+    (root / "a-dir").mkdir()
+    expect_errno({errno.EISDIR}, lambda: os.rename(first, root / "a-dir"), "rename(file over directory)")
+    expect_errno({errno.ENOTDIR}, lambda: os.rename(root / "a-dir", first), "rename(directory over file)")
+    expect_errno({errno.ENOENT}, lambda: os.rename(first, root / "missing" / "a.txt"), "rename(into a missing directory)")
+
+    (root / "left").mkdir()
+    (root / "right").mkdir()
+    write_durable(root / "left" / "payload", b"travels")
+    os.rename(root / "left", root / "right" / "left")
+    os.rename(root / "right" / "left", root / "left")
+    check_bytes(read(root / "left" / "payload"), b"travels", "a directory moved out and back")
+    ctx.record("listing", sorted(os.listdir(root)))
+
+
+def test_handle_coherency(ctx: Context) -> None:
+    """What one handle writes, every other handle and every later open sees."""
+    root = ctx.root
+    path = root / "coherent"
+    write_durable(path, b"")
+    writer = os.open(path, os.O_WRONLY)
+    reader = os.open(path, os.O_RDONLY)
+    try:
+        write_all(writer, b"visible without fsync")
+        check_bytes(os.pread(reader, 64, 0), b"visible without fsync", "a second handle before fsync")
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+    log = root / "appenders"
+    write_durable(log, b"")
+    handles = [os.open(log, os.O_WRONLY | os.O_APPEND) for _ in range(2)]
+    try:
+        for index in range(50):
+            write_all(handles[index % 2], f"record {index:02d}\n".encode())
+    finally:
+        for handle in handles:
+            os.close(handle)
+    lines = read(log).decode().splitlines()
+    check(lines == [f"record {index:02d}" for index in range(50)], "two O_APPEND handles overwrote each other")
+    ctx.record("appenders.lines", len(lines))
+
+    # Rewrite and reread in a tight loop: a stale page cache or attribute
+    # cache serves the previous generation, or the previous generation's size.
+    churn = root / "churn"
+    for generation in range(30):
+        payload = pattern(1000 + generation * 37, f"generation-{generation}")
+        write_durable(churn, payload)
+        check(os.lstat(churn).st_size == len(payload), f"generation {generation}: stale size")
+        check_bytes(read(churn), payload, f"generation {generation} after close and reopen")
+
+    shrink = root / "shrink-under-reader"
+    write_durable(shrink, b"x" * 8192)
+    reader = os.open(shrink, os.O_RDONLY)
+    try:
+        os.truncate(shrink, 100)
+        check(os.fstat(reader).st_size == 100, "an open handle missed a truncate by path")
+        check_bytes(os.pread(reader, 8192, 0), b"x" * 100, "an open handle read past a truncate")
+    finally:
+        os.close(reader)
+
+
+def test_throughput(ctx: Context) -> None:
+    """Measured, printed, and held to floors a working mount clears easily.
+
+    The floors catch a pathological slowdown (a server round trip per write, a
+    re-download per read), not a slow link. Writes land in local staging and
+    reads of just-written data come from the cache, so neither should depend
+    on the network. PDFS_ACCEPTANCE_MIN_MIBPS and PDFS_ACCEPTANCE_MIN_OPS move
+    the floors; 0 turns one off.
+    """
+    min_rate = float(os.environ.get("PDFS_ACCEPTANCE_MIN_MIBPS", "10"))
+    min_ops = float(os.environ.get("PDFS_ACCEPTANCE_MIN_OPS", "20"))
+    root = ctx.root / "throughput"
+    root.mkdir()
+    chunk = pattern(MIB, "throughput")
+    total = 64
+
+    path = root / "sequential.bin"
+    started = time.monotonic()
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        for _ in range(total):
+            write_all(fd, chunk)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    write_rate = total / max(time.monotonic() - started, 1e-6)
+
+    started = time.monotonic()
+    digest = hashlib.sha256()
+    with path.open("rb", buffering=0) as file:
+        while block := file.read(MIB):
+            digest.update(block)
+    read_rate = total / max(time.monotonic() - started, 1e-6)
+    check(digest.hexdigest() == hashlib.sha256(chunk * total).hexdigest(), "the 64 MiB file read back wrong")
+
+    # Many small writes: one upload per write, or a lock held across each,
+    # shows up here long before it shows up in a large copy.
+    small = root / "small-writes.bin"
+    started = time.monotonic()
+    fd = os.open(small, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        for offset in range(0, MIB, 4096):
+            write_all(fd, chunk[offset : offset + 4096])
+    finally:
+        os.close(fd)
+    small_rate = 1 / max(time.monotonic() - started, 1e-6)
+    check_bytes(read(small), chunk, "1 MiB written 4 KiB at a time")
+
+    started = time.monotonic()
+    names = [root / f"meta-{index:03d}" for index in range(100)]
+    for name in names:
+        write_durable(name, b"m")
+    for name in names:
+        os.lstat(name)
+    os.listdir(root)
+    for name in names:
+        os.unlink(name)
+    ops_rate = (3 * len(names) + 1) / max(time.monotonic() - started, 1e-6)
+
+    print(
+        f"    write {write_rate:.0f} MiB/s, read {read_rate:.0f} MiB/s, "
+        f"4 KiB writes {small_rate:.1f} MiB/s, metadata {ops_rate:.0f} ops/s"
+    )
+    ctx.note("write_mibps", round(write_rate, 1))
+    ctx.note("read_mibps", round(read_rate, 1))
+    ctx.note("small_write_mibps", round(small_rate, 2))
+    ctx.note("metadata_ops", round(ops_rate, 1))
+    for label, rate, floor in (
+        ("sequential write", write_rate, min_rate),
+        ("sequential read", read_rate, min_rate),
+        ("4 KiB writes", small_rate, min_rate / 10),
+    ):
+        check(not floor or rate >= floor, f"{label} ran at {rate:.1f} MiB/s, under the {floor:g} MiB/s floor")
+    check(not min_ops or ops_rate >= min_ops, f"metadata ran at {ops_rate:.1f} ops/s, under the {min_ops:g} floor")
+    ctx.record("within_floors", True)
+
+
 def _run_tool(command: list[str], cwd: Path) -> str:
     result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
     if result.returncode:
@@ -1073,6 +1474,40 @@ def test_regression_b74_rename_after_close(ctx: Context) -> None:
     check_bytes(read(final), payload, "renamed file lost its content")
     check(not _conflict_copies(root), "rename after close produced conflict copies")
     ctx.record("digest", hashlib.sha256(read(final)).hexdigest())
+
+
+def test_regression_b101_write_during_create_upload(ctx: Context) -> None:
+    """A write that closes while its file's create uploads must reach Drive (B101).
+
+    The create of a new file drains on its own, often before the first write
+    closes. The write attached its bytes to the create's queue row while the
+    upload was on the wire, and the landed create deleted that row, so Drive
+    kept an empty file. A handle that stayed open across the landing still
+    carried the placeholder uid and failed its close.
+    """
+    daemon = ctx.require_daemon()
+    root = ctx.root / "b101"
+    root.mkdir()
+    payloads = {}
+    for index, pause in enumerate((0.0, 0.5, 2.0, 5.0)):
+        path = root / f"file-{index}"
+        payloads[path] = pattern(BLOCK + 4096 * index + 1, f"b101-{index}")
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        try:
+            # Held open with nothing written, so the empty create can drain
+            # (and land) before the bytes arrive.
+            time.sleep(pause)
+            write_all(fd, payloads[path])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    daemon.wait_for_queue()
+    time.sleep(3)
+    daemon.wait_for_queue()
+    for path, payload in payloads.items():
+        check(os.lstat(path).st_size == len(payload), f"{path.name} has the wrong size after upload")
+        check_bytes(read(path), payload, f"{path.name} after upload")
+    check(not _conflict_copies(root), "writes during a create produced conflict copies")
 
 
 SHARED_DIR_NAME = "Shared with me"
@@ -1277,6 +1712,49 @@ def test_regression_b79_ondemand_location_accepts_writes(ctx: Context) -> None:
     ctx.record("b79.location", str(root))
 
 
+def test_regression_b100_copied_tree_exact_sizes(ctx: Context) -> None:
+    """A tree copied in from another volume reads back at its exact sizes (B100).
+
+    A listing that has not fetched a file's real size reports the encrypted
+    size, 53 bytes over, and reading at that size failed with EIO. It was found
+    by copying a tree and reading it straight away. `pdfs refresh` drops the
+    cached listing, which brings that size-less listing back on purpose.
+    """
+    sizes = [0, 1, 53, 4095, 4096, 20_000, 131_073, 1_000_003]
+    files: dict[Path, bytes] = {}
+    copy = ctx.root / "b100-copy"
+    with tempfile.TemporaryDirectory(prefix="pdfs-b100-source-") as directory:
+        source = Path(directory) / "tree"
+        for index in range(48):
+            relative = Path(f"dir-{index % 6}") / f"sub-{index % 3}" / f"file-{index:02d}.bin"
+            files[relative] = pattern(sizes[index % len(sizes)], f"b100-{index}")
+            (source / relative).parent.mkdir(parents=True, exist_ok=True)
+            write_durable(source / relative, files[relative])
+        shutil.copytree(source, copy)
+
+    def verify(when: str) -> None:
+        for relative, data in files.items():
+            size = os.lstat(copy / relative).st_size
+            check(size == len(data), f"{relative} {when}: {size} bytes, expected {len(data)}")
+            check_bytes(read(copy / relative), data, f"{relative} {when}")
+
+    verify("right after the copy")
+    ctx.record("sizes", sorted(len(data) for data in files.values()))
+    if not ctx.is_live or ctx.daemon is None:
+        return
+    ctx.daemon.wait_for_queue()
+    verify("after the upload")
+    folders = sorted({copy / relative.parent for relative in files} | {copy})
+    try:
+        for folder in folders:
+            ctx.daemon.command("refresh", str(folder))
+    except RuntimeError as error:
+        # A mirror folder is plain local storage with no listing to drop.
+        ctx.note("refresh", str(error))
+        return
+    verify("after dropping the cached listing")
+
+
 def _conflict_copies(root: Path) -> list[str]:
     return sorted(name for name in os.listdir(root) if "(sync-conflict" in name)
 
@@ -1309,10 +1787,19 @@ def test_durability_across_restart(ctx: Context) -> None:
 
 
 class Case:
-    def __init__(self, name: str, run, kinds: tuple[str, ...] = (REFERENCE, LIVE)) -> None:
+    def __init__(
+        self,
+        name: str,
+        run,
+        kinds: tuple[str, ...] = (REFERENCE, LIVE),
+        budget_scale: int = 1,
+    ) -> None:
         self.name = name
         self.run = run
         self.kinds = kinds
+        # A case whose work is bound by per-operation server round trips gets a
+        # multiple of the per-case timeout rather than a smaller workload.
+        self.budget_scale = budget_scale
 
 
 TESTS = [
@@ -1330,6 +1817,13 @@ TESTS = [
     Case("unsupported operations refuse cleanly", test_unsupported_operations),
     Case("independent and shared-file concurrency", test_concurrency),
     Case("application workloads (editor, tar, sqlite, git, rsync)", test_application_workloads),
+    Case("block boundaries and overwrites that change the block count", test_block_boundaries_and_overwrites),
+    Case("unusual but legal names", test_unusual_names),
+    Case("a deep tree", test_deep_tree),
+    Case("a wide directory", test_wide_directory, budget_scale=2),
+    Case("rename patterns: swap, chain, rotation, replace under a reader", test_rename_patterns),
+    Case("coherency between handles and across reopen", test_handle_coherency),
+    Case("throughput floors", test_throughput),
     Case("regression B7: renamed directory stays traversable", test_regression_b7_renamed_directory),
     Case("regression B69: identical rewrite makes no conflict", test_regression_b69_identical_rewrite, (LIVE,)),
     Case("regression B70: transient download name is not sealed", test_regression_b70_transient_download_name, (LIVE,)),
@@ -1338,6 +1832,8 @@ TESTS = [
     Case("regression B34b: an editor share still writes", test_regression_b34b_editor_share_still_writes, (LIVE,)),
     Case("synthetic Shared-with-me directory contract", test_shared_directory_contract, (LIVE,)),
     Case("regression B79: an on-demand device folder accepts writes", test_regression_b79_ondemand_location_accepts_writes, (LIVE,)),
+    Case("regression B100: a copied tree reads back at its exact sizes", test_regression_b100_copied_tree_exact_sizes),
+    Case("regression B101: a write during its create's upload reaches Drive", test_regression_b101_write_during_create_upload, (LIVE,)),
     Case("durability across a daemon restart", test_durability_across_restart, (LIVE,)),
 ]
 
@@ -1434,9 +1930,18 @@ def run_contract(
     daemon=None,
     timeout: int = DEFAULT_TIMEOUT,
     fail_fast: bool = False,
+    janitor: Janitor | None = None,
 ) -> Run:
-    reap_stale_roots(parent, int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600")))
-    root = parent / f"pdfs-acceptance-{uuid.uuid4().hex}"
+    """Run the contract in a fresh root under `parent`.
+
+    With a janitor the root is registered before it exists and removed by the
+    janitor, through the daemon; without one it is this function's to delete.
+    """
+    if janitor is None:
+        reap_stale_roots(parent, int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600")))
+        root = parent / f"pdfs-acceptance-{uuid.uuid4().hex}"
+    else:
+        root = janitor.new_root(parent)
     root.mkdir()
     run = Run(label, kind, root)
     REPORT.append(run)
@@ -1449,7 +1954,7 @@ def run_contract(
             started = time.monotonic()
             print(f"  [test] {case.name}")
             try:
-                with time_limit(timeout, case.name):
+                with time_limit(timeout * case.budget_scale, case.name):
                     case.run(context)
             except Skip as reason:
                 elapsed = time.monotonic() - started
@@ -1463,6 +1968,8 @@ def run_contract(
                 # A timeout means the mount may be wedged; further cases would
                 # only produce noise, and cleanup already has to fight for it.
                 break
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:  # noqa: BLE001 - reported, then continued
                 elapsed = time.monotonic() - started
                 detail = f"{type(error).__name__}: {error}"
@@ -1482,7 +1989,8 @@ def run_contract(
             run.digest = hashlib.sha256(read(digest_path)).hexdigest()
         return run
     except BaseException:
-        shutil.rmtree(root, ignore_errors=True)
+        if janitor is None:
+            shutil.rmtree(root, ignore_errors=True)
         raise
 
 
@@ -1660,12 +2168,19 @@ class Daemon:
             return None
         return daemon
 
-    def command(self, *args: str, json_output: bool = False) -> str:
+    def command(self, *args: str, json_output: bool = False, stdin: str | None = None) -> str:
         command = [self.pdfs]
         if json_output:
             command.append("--json")
         command.extend(args)
-        result = subprocess.run(command, text=True, capture_output=True, timeout=self.timeout)
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=self.timeout,
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
+        )
         if result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(f"{' '.join(command)} failed: {detail}")
@@ -1683,6 +2198,38 @@ class Daemon:
                 return
             time.sleep(1)
         raise TimeoutError(f"daemon mutation queue did not drain: {last}")
+
+    def queue(self) -> list[dict]:
+        """The daemon's queued uploads and changes, each with its path."""
+        return json.loads(self.command("sync", "queue", json_output=True)).get("items", [])
+
+    def sync_folders(self) -> list[dict]:
+        return json.loads(self.command("sync", "list", json_output=True))["items"]
+
+    def listing(self, directory: Path) -> list[dict]:
+        """A directory's entries as the daemon knows them, without touching FUSE."""
+        return json.loads(self.command("ls", str(directory), json_output=True)).get("entries", [])
+
+    def child_uid(self, directory: Path, name: str) -> str | None:
+        return next((entry["uid"] for entry in self.listing(directory) if entry["name"] == name), None)
+
+    def trashed(self, uid: str) -> bool:
+        """Whether `uid` is in the trash, asking the server rather than the cache."""
+        self.command("refresh", "trash")
+        return any(entry["uid"] == uid for entry in self.trash())
+
+    def trash(self) -> list[dict]:
+        output = self.command("trash", json_output=True)
+        try:
+            return json.loads(output).get("entries", [])
+        except ValueError:
+            # A CLI from before `trash --json`: read its table instead.
+            entries = []
+            for line in output.splitlines():
+                match = TRASH_LINE.match(line)
+                if match:
+                    entries.append({"is_dir": match[1] == "d", "name": match[3], "uid": match[4]})
+            return entries
 
     def enclosing_mount(self, path: Path) -> Path:
         current = path.resolve()
@@ -1712,6 +2259,337 @@ class Daemon:
                     return
             time.sleep(1)
         raise TimeoutError(f"{mountpoint} did not come back within {self.timeout}s")
+
+
+TRASH_LINE = re.compile(r"^([d-])\s+(\d+)  (.*)  \[([^\]]+)\]$")
+
+
+def acceptance_home() -> Path:
+    """Where account runs keep their manifests and their local sync folders."""
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "pdfs-acceptance"
+
+
+class Janitor:
+    """What one account run creates, written down before it exists.
+
+    Every remote root and every sync folder goes into a manifest *before* it
+    is created, and the manifest sits next to a lock this process holds for its
+    whole life. Cleanup never has to guess: on a pass, a failure or a signal it
+    removes exactly what the manifest lists. A run killed outright (SIGKILL,
+    the hard timeout, a power cut) leaves a manifest whose lock nobody holds,
+    and the next run finishes that cleanup before it starts its own.
+
+    Removal goes through the daemon, not `rm -rf`: one server-side trash of the
+    root, then a permanent delete by uid. Deleting a trashed folder for good
+    also takes every entry that was trashed out of it one at a time, so the
+    account's trash ends up exactly as it was.
+    """
+
+    def __init__(self, daemon: Daemon, directory: Path, lock_fd: int) -> None:
+        self.daemon = daemon
+        self.directory = directory
+        self.lock_fd = lock_fd
+        self.roots: list[str] = []
+        self.sync_folders: list[str] = []
+
+    @classmethod
+    def start(cls, daemon: Daemon) -> Janitor:
+        home = acceptance_home()
+        home.mkdir(parents=True, exist_ok=True)
+        # Locked under a hidden name and only then renamed into view, so a
+        # concurrent reaper never sees a run directory without a held lock.
+        token = uuid.uuid4().hex
+        pending = home / f".run-{token}"
+        pending.mkdir()
+        lock_fd = os.open(pending / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        directory = home / f"run-{token}"
+        os.rename(pending, directory)
+        janitor = cls(daemon, directory, lock_fd)
+        janitor.save()
+        return janitor
+
+    @property
+    def manifest(self) -> Path:
+        return self.directory / "manifest.json"
+
+    def save(self) -> None:
+        payload = {
+            "pid": os.getpid(),
+            "started": int(time.time()),
+            "roots": self.roots,
+            "sync_folders": self.sync_folders,
+        }
+        temporary = self.directory / "manifest.json.tmp"
+        temporary.write_text(json.dumps(payload, indent=2))
+        os.replace(temporary, self.manifest)
+
+    def new_root(self, parent: Path) -> Path:
+        """A fresh root in a mount, recorded before the caller creates it."""
+        root = parent / f"pdfs-acceptance-{uuid.uuid4().hex}"
+        self.roots.append(str(root))
+        self.save()
+        return root
+
+    def new_sync_folder(self) -> Path:
+        """A fresh local directory to register as a sync folder.
+
+        The daemon names the remote folder after the local basename, so the
+        basename carries the same unique marker as every other root.
+        """
+        path = self.directory / f"pdfs-acceptance-{uuid.uuid4().hex}"
+        self.sync_folders.append(str(path))
+        self.save()
+        path.mkdir()
+        return path
+
+    # -- cleanup ------------------------------------------------------------
+
+    def cleanup(self) -> list[str]:
+        """Remove everything recorded; return what could not be removed."""
+        leftovers: list[str] = []
+        with shielded():
+            print(f"[cleanup] removing what this run created ({self.directory.name})")
+            with contextlib.suppress(Exception):
+                self.daemon.wait_for_queue()
+            for local in reversed(self.sync_folders):
+                leftovers.extend(self._remove_sync_folder(Path(local)))
+            for root in reversed(self.roots):
+                leftovers.extend(self._remove_root(Path(root)))
+            leftovers.extend(self._queued_leftovers())
+            if leftovers:
+                for line in leftovers:
+                    print(f"[cleanup] LEFT OVER: {line}")
+                print(f"[cleanup] the manifest stays at {self.manifest}; the next run retries")
+            else:
+                self._forget()
+                print("[cleanup] nothing left behind")
+        return leftovers
+
+    def _queued_leftovers(self) -> list[str]:
+        """Queued ops still naming something this run created.
+
+        Removing a root has to take its queued uploads along. One that
+        survives keeps its staged bytes on disk and retries against the trash
+        forever, or lands later as a conflict copy, so it is a leftover like
+        any file (`docs/BUGS.md` B102). The daemon drops them as it trashes,
+        so this only waits out a drain worker that was mid-attempt.
+        """
+        names = {Path(path).name for path in self.roots + self.sync_folders}
+        deadline = time.monotonic() + min(self.daemon.timeout, 30)
+        while True:
+            try:
+                queued = [
+                    item
+                    for item in self.daemon.queue()
+                    if names.intersection(Path(item.get("path", "")).parts)
+                ]
+            except Exception as error:  # noqa: BLE001 - reported as a leftover
+                return [f"could not read the daemon queue: {error}"]
+            if not queued or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+        return [
+            f"queued {item['kind']} #{item['id']} for {item['path']}"
+            + (f" ({item['last_error']})" if item.get("last_error") else "")
+            for item in queued
+        ]
+
+    def _forget(self) -> None:
+        with contextlib.suppress(OSError):
+            os.close(self.lock_fd)
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _remove_sync_folder(self, local: Path) -> list[str]:
+        leftovers: list[str] = []
+        registered = None
+        try:
+            registered = next(
+                (
+                    item
+                    for item in self.daemon.sync_folders()
+                    if Path(item["local_path"]) == local
+                ),
+                None,
+            )
+        except Exception as error:  # noqa: BLE001 - reported as a leftover
+            return [f"sync folder {local}: could not list sync folders: {error}"]
+        if registered is not None:
+            print(f"[cleanup] unregistering sync folder {local}")
+            try:
+                self.daemon.command("sync", "rm", str(registered["id"]), "--delete-remote")
+            except Exception as error:  # noqa: BLE001 - reported as a leftover
+                leftovers.append(f"sync folder {local}: sync rm failed: {error}")
+            uid = registered.get("remote_uid")
+            if uid and not self.purge(uid, local.name):
+                leftovers.append(f"remote folder {local.name} ({uid}) is still in the trash")
+        else:
+            # Unregistered by an earlier attempt that died before the purge.
+            leftovers.extend(self._purge_by_name(local.name))
+        if is_mountpoint(local):
+            leftovers.append(f"{local} is still mounted")
+        elif local.exists() or local.is_symlink():
+            shutil.rmtree(local, ignore_errors=True)
+            if local.exists():
+                leftovers.append(f"local directory {local} could not be removed")
+        return leftovers
+
+    def _remove_root(self, root: Path) -> list[str]:
+        uid = None
+        try:
+            uid = self.daemon.child_uid(root.parent, root.name)
+        except Exception as error:  # noqa: BLE001 - reported as a leftover
+            return [f"{root}: could not list its parent through the daemon: {error}"]
+        if uid is None:
+            # Never created, or trashed by an attempt that died before the purge.
+            return self._purge_by_name(root.name)
+        print(f"[cleanup] removing {root}")
+        try:
+            self.daemon.command("rm", str(root))
+        except Exception as error:  # noqa: BLE001 - reported as a leftover
+            return [f"{root}: pdfs rm failed: {error}"]
+        if not self.purge(uid, root.name):
+            return [f"{root.name} ({uid}) is still in the trash"]
+        return []
+
+    def _purge_by_name(self, name: str) -> list[str]:
+        try:
+            self.daemon.command("refresh", "trash")
+            matches = [entry for entry in self.daemon.trash() if entry["name"] == name]
+        except Exception as error:  # noqa: BLE001 - reported as a leftover
+            return [f"{name}: could not read the trash: {error}"]
+        return [
+            f"{name} ({entry['uid']}) is still in the trash"
+            for entry in matches
+            if not self.purge(entry["uid"], name)
+        ]
+
+    def purge(self, uid: str, name: str) -> bool:
+        """Permanently delete one trashed node the run owns, by uid.
+
+        By uid and never by name: a name can match something of the user's, a
+        uid cannot. The node has to show up in the trash first, which is also
+        what proves the trash step before it worked, and it has to be gone from
+        a fresh listing afterwards.
+        """
+        deadline = time.monotonic() + self.daemon.timeout
+        attempted = False
+        last_error = ""
+        while True:
+            try:
+                if self.daemon.trashed(uid):
+                    attempted = True
+                    self.daemon.command("delete-forever", uid, stdin="yes\n")
+                # Gone from the trash after a delete was sent, even one that
+                # reported an error, means the delete landed.
+                if attempted and not self.daemon.trashed(uid):
+                    print(f"[cleanup] permanently deleted {name}")
+                    return True
+            except Exception as error:  # noqa: BLE001 - retried, then reported
+                last_error = f": {error}"
+            if time.monotonic() >= deadline:
+                stage = "it is still in the trash" if attempted else "it never reached the trash"
+                print(f"WARNING: could not permanently delete {name} ({uid}): {stage}{last_error}")
+                return False
+            time.sleep(3)
+
+    # -- reaping ------------------------------------------------------------
+
+    @classmethod
+    def reap(cls, daemon: Daemon, my_files: Path | None) -> list[str]:
+        """Finish the cleanup of every earlier run that died before its own.
+
+        A run directory whose lock can be taken belongs to a dead process. Its
+        manifest says exactly what to remove. Afterwards, sync folders under
+        the acceptance directory and trash entries named like a root that no
+        live run claims are removed too: they are what a run leaves when it
+        dies between creating something and writing it down, which the
+        manifest ordering makes rare but not impossible.
+        """
+        home = acceptance_home()
+        home.mkdir(parents=True, exist_ok=True)
+        leftovers: list[str] = []
+        live_names: set[str] = set()
+        for directory in sorted(home.iterdir()):
+            if not directory.is_dir():
+                continue
+            lock_path = directory / "lock"
+            try:
+                lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(lock_fd)
+                live_names.update(cls._claimed_names(directory))
+                continue
+            print(f"[reap] finishing the cleanup of an earlier run: {directory.name}")
+            janitor = cls(daemon, directory, lock_fd)
+            with contextlib.suppress(OSError, ValueError):
+                recorded = json.loads((directory / "manifest.json").read_text())
+                janitor.roots = list(recorded.get("roots", []))
+                janitor.sync_folders = list(recorded.get("sync_folders", []))
+            # Folders that were created but not yet recorded still sit here.
+            for child in directory.iterdir():
+                if STALE_ROOT.match(child.name) and str(child) not in janitor.sync_folders:
+                    janitor.sync_folders.append(str(child))
+            leftovers.extend(janitor.cleanup())
+        leftovers.extend(cls._reap_orphans(daemon, home, live_names, my_files))
+        return leftovers
+
+    @staticmethod
+    def _claimed_names(directory: Path) -> set[str]:
+        try:
+            recorded = json.loads((directory / "manifest.json").read_text())
+        except (OSError, ValueError):
+            return set()
+        return {Path(path).name for path in recorded.get("roots", []) + recorded.get("sync_folders", [])}
+
+    @classmethod
+    def _reap_orphans(
+        cls, daemon: Daemon, home: Path, live_names: set[str], my_files: Path | None
+    ) -> list[str]:
+        leftovers: list[str] = []
+        orphan = cls(daemon, home, -1)
+        if my_files is not None:
+            # Roots from `--live` runs, or from a run on another machine, have
+            # no manifest here. Age is the only safe signal for those.
+            cutoff = time.time() - int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600"))
+            try:
+                entries = daemon.listing(my_files)
+            except Exception as error:  # noqa: BLE001 - reported as a leftover
+                entries = []
+                leftovers.append(f"could not list {my_files}: {error}")
+            for entry in entries:
+                if (
+                    STALE_ROOT.match(entry["name"])
+                    and entry["name"] not in live_names
+                    and entry.get("modified", 0) < cutoff
+                ):
+                    print(f"[reap] removing an abandoned root: {my_files / entry['name']}")
+                    leftovers.extend(orphan._remove_root(my_files / entry["name"]))
+        try:
+            folders = daemon.sync_folders()
+        except Exception as error:  # noqa: BLE001 - reported as a leftover
+            return [f"could not list sync folders: {error}"]
+        for item in folders:
+            local = Path(item["local_path"])
+            if home in local.parents and local.name not in live_names:
+                print(f"[reap] removing orphaned sync folder {local}")
+                leftovers.extend(orphan._remove_sync_folder(local))
+        try:
+            daemon.command("refresh", "trash")
+            trashed = daemon.trash()
+        except Exception as error:  # noqa: BLE001 - reported as a leftover
+            return leftovers + [f"could not read the trash: {error}"]
+        for entry in trashed:
+            if STALE_ROOT.match(entry["name"]) and entry["name"] not in live_names:
+                print(f"[reap] permanently deleting an abandoned root from the trash: {entry['name']}")
+                if not orphan.purge(entry["uid"], entry["name"]):
+                    leftovers.append(f"{entry['name']} ({entry['uid']}) is still in the trash")
+        return leftovers
 
 
 # --------------------------------------------------------------------------
@@ -2096,6 +2974,34 @@ def _unchanged(location: Location, files: dict[Path, bytes], what: str) -> None:
         check_bytes(read(location.root / relative), data, f"{location.name}: {relative} {what}")
 
 
+def _copy_between(source: Location, dest: Location) -> None:
+    name = f"copied-{uuid.uuid4().hex[:8]}"
+    files = _move_tree(source.root, name)
+    source.settle()
+    shutil.copytree(source.root / name, dest.root / name)
+    for relative, data in files.items():
+        size = os.lstat(dest.root / relative).st_size
+        check(size == len(data), f"{dest.name}: {relative} is {size} bytes right after the copy, expected {len(data)}")
+        check_bytes(read(dest.root / relative), data, f"{dest.name}: {relative} right after the copy")
+    source.settle()
+    dest.settle()
+    for location in (source, dest):
+        _unchanged(location, files, "after the copy settled")
+        check((location.root / name / "empty-dir").is_dir(), f"{location.name}: the empty folder is missing")
+        copies = location.conflict_copies()
+        check(not copies, f"{location.name}: the copy left conflict copies: {copies}")
+
+
+def test_copy_tree_between_locations(mc: MoveContext) -> None:
+    _copy_between(mc.first, mc.second)
+
+
+def test_copy_tree_out_of_my_files(mc: MoveContext) -> None:
+    if mc.myfiles is None:
+        raise Skip("the daemon reports no My files mount")
+    _copy_between(mc.myfiles, mc.first)
+
+
 def test_move_refuses_a_name_taken_at_the_destination(mc: MoveContext) -> None:
     source, dest = mc.first, mc.second
     name = f"clash-{uuid.uuid4().hex[:8]}.txt"
@@ -2177,6 +3083,8 @@ MOVE_CASES = [
     Case("move a folder from the second location to the first", test_move_folder_second_to_first, (LIVE,)),
     Case("move several sources in one command", test_move_several_sources_at_once, (LIVE,)),
     Case("move into My files and out again", test_move_through_my_files, (LIVE,)),
+    Case("copy a tree between the two locations", test_copy_tree_between_locations, (LIVE,)),
+    Case("copy a tree out of My files", test_copy_tree_out_of_my_files, (LIVE,)),
     Case("move refuses a name taken at the destination", test_move_refuses_a_name_taken_at_the_destination, (LIVE,)),
     Case("move refuses a folder into itself", test_move_refuses_a_folder_into_itself, (LIVE,)),
     Case("move refuses a mirror copy Drive lacks", test_move_refuses_a_mirror_copy_drive_lacks, (LIVE,)),
@@ -2198,7 +3106,11 @@ def _my_files(pair: ManagedSyncPair) -> Path | None:
 
 
 def run_move_contract(
-    pair: ManagedSyncPair, modes: tuple[str, str], timeout: int, fail_fast: bool
+    pair: ManagedSyncPair,
+    modes: tuple[str, str],
+    timeout: int,
+    fail_fast: bool,
+    janitor: Janitor | None = None,
 ) -> Run:
     """Move trees between the two managed folders, and through My files.
 
@@ -2210,6 +3122,8 @@ def run_move_contract(
     second = Location("second", pair.paths[1], modes[1], pair)
     my_files = _my_files(pair)
     myfiles = Location("My files", my_files, "ondemand", pair) if my_files else None
+    if myfiles is not None and janitor is not None:
+        myfiles.root = janitor.new_root(my_files)
     locations = [first, second] + ([myfiles] if myfiles else [])
     label = f"managed move {modes[0]}/{modes[1]}"
     run = Run(label, LIVE, first.root)
@@ -2217,7 +3131,8 @@ def run_move_contract(
     print(f"[target] {label}")
     try:
         for location in locations:
-            reap_stale_roots(location.folder, int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600")))
+            if janitor is None:
+                reap_stale_roots(location.folder, int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600")))
             location.root.mkdir()
         for location in locations:
             location.settle()
@@ -2226,7 +3141,7 @@ def run_move_contract(
             started = time.monotonic()
             print(f"  [test] {case.name}")
             try:
-                with time_limit(timeout, case.name):
+                with time_limit(timeout * case.budget_scale, case.name):
                     case.run(context)
             except Skip as reason:
                 print(f"    SKIP  {reason}")
@@ -2240,6 +3155,8 @@ def run_move_contract(
                     Result(case.name, label, "timeout", time.monotonic() - started, str(reason))
                 )
                 break
+            except KeyboardInterrupt:
+                raise
             except BaseException as error:  # noqa: BLE001 - reported, then continued
                 detail = f"{type(error).__name__}: {error}"
                 print(f"    FAIL  {detail}")
@@ -2253,6 +3170,10 @@ def run_move_contract(
             run.ran.add(case.name)
     finally:
         for location in locations:
+            # The janitor removes its My files root in one server-side step,
+            # and each sync folder goes away whole with its registration.
+            if janitor is not None:
+                continue
             try:
                 pair.remove_tree(location.root)
                 location.settle()
@@ -2266,14 +3187,18 @@ def is_mountpoint(path: Path) -> bool:
     return os.path.ismount(path)
 
 
-def run_managed_matrix(paths: list[Path], reference: Run, args) -> None:
+def run_managed_matrix(
+    paths: list[Path], reference: Run, args, janitor: Janitor | None = None
+) -> None:
     timeout = int(os.environ.get("PDFS_ACCEPTANCE_SYNC_TIMEOUT", "180"))
     pair = ManagedSyncPair(paths, timeout)
     daemon = Daemon.discover(timeout, may_restart=args.durability)
     roots: list[Path] = []
     try:
         pair.create()
-        matrices = [
+        # --quick still puts each mode on each side once; the full matrix adds
+        # the same-mode pairs, where a move never changes kind of storage.
+        matrices = [("ondemand", "mirror")] if args.quick else [
             ("ondemand", "ondemand"),
             ("ondemand", "mirror"),
             ("mirror", "ondemand"),
@@ -2303,14 +3228,16 @@ def run_managed_matrix(paths: list[Path], reference: Run, args) -> None:
                     pair.force_sync(path)
             # A pass settles Drive several times over, so it gets the sync
             # timeout per settle rather than the per-case filesystem limit.
-            run_move_contract(pair, modes, max(args.timeout, 8 * timeout), args.fail_fast)
+            run_move_contract(pair, modes, max(args.timeout, 8 * timeout), args.fail_fast, janitor)
             for path, mode in zip(pair.paths, modes, strict=True):
                 if mode == "mirror":
                     pair.force_sync(path)
     finally:
-        for root in roots:
-            shutil.rmtree(root, ignore_errors=True)
-        pair.cleanup()
+        if janitor is None:
+            with shielded():
+                for root in roots:
+                    shutil.rmtree(root, ignore_errors=True)
+                pair.cleanup()
 
 
 def summarize_divergence(reference: Run, target: Run) -> None:
@@ -2348,6 +3275,11 @@ def summarize_divergence(reference: Run, target: Run) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     live_mode = parser.add_mutually_exclusive_group()
+    live_mode.add_argument(
+        "--account",
+        action="store_true",
+        help="run everything on the signed-in account in folders of its own, then remove them",
+    )
     live_mode.add_argument("--live", nargs="+", type=Path, metavar="MOUNTPOINT")
     live_mode.add_argument(
         "--managed-live",
@@ -2358,6 +3290,11 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="per-case seconds")
     parser.add_argument("--fail-fast", action="store_true", help="stop at the first failure")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="with --account or --managed-live: one mode pairing instead of all four",
+    )
     parser.add_argument("--report-json", type=Path, metavar="PATH")
     parser.add_argument("--report-junit", type=Path, metavar="PATH")
     parser.add_argument(
@@ -2385,6 +3322,7 @@ def main() -> int:
             print(f"{'managed':<18} {case.name}")
         return 0
 
+    install_interrupt_handlers()
     journal = JournalWatch(os.environ.get("PDFS_ACCEPTANCE_UNIT", "proton-drive.service"))
     if args.journal_check:
         journal.start()
@@ -2404,13 +3342,71 @@ def main() -> int:
         print("[pass] account-free filesystem API contract")
 
     try:
-        if args.managed_live:
+        if args.account:
+            run_account(reference, args)
+        elif args.managed_live:
             run_managed_matrix(args.managed_live, reference, args)
         elif args.live:
             run_live(args.live, reference, args)
     finally:
         outcome = finish(args, journal)
     return outcome
+
+
+def run_account(reference: Run, args) -> None:
+    """Everything, on the signed-in account, with nothing left behind.
+
+    The contract runs in My files, then in two sync folders this run creates
+    and registers itself, through every pairing of on-demand and mirror, with
+    the moves between them and My files. The janitor owns all of it.
+    """
+    timeout = int(os.environ.get("PDFS_ACCEPTANCE_SYNC_TIMEOUT", "180"))
+    daemon = Daemon.discover(timeout, may_restart=args.durability)
+    if daemon is None:
+        raise RuntimeError(
+            "no running pdfs daemon: start proton-drive.service and sign in, "
+            "or pass --offline-only for the account-free contract"
+        )
+    status = daemon.status()
+    check(bool(status.get("logged_in")), "the daemon is not signed in; run `pdfs login` first")
+    mountpoint = (status.get("mount") or {}).get("mountpoint")
+    check(
+        bool(mountpoint) and is_mountpoint(Path(mountpoint)),
+        f"My files is not mounted (daemon reports {mountpoint!r})",
+    )
+    my_files = Path(mountpoint)
+    print(f"[account] {status.get('username', '?')}, My files at {my_files}")
+
+    stale = Janitor.reap(daemon, my_files)
+    check(not stale, f"leftovers from an earlier run could not be removed: {stale}")
+    janitor = Janitor.start(daemon)
+    try:
+        run = run_contract(
+            my_files,
+            f"My files {my_files}",
+            kind=LIVE,
+            daemon=daemon,
+            timeout=args.timeout,
+            fail_fast=args.fail_fast,
+            janitor=janitor,
+        )
+        summarize_divergence(reference, run)
+        paths = [janitor.new_sync_folder(), janitor.new_sync_folder()]
+        run_managed_matrix(paths, reference, args, janitor)
+    finally:
+        started = time.monotonic()
+        leftovers = janitor.cleanup()
+        cleanup = Run("cleanup", LIVE, janitor.directory)
+        cleanup.results.append(
+            Result(
+                "the run left nothing behind",
+                "cleanup",
+                "fail" if leftovers else "pass",
+                time.monotonic() - started,
+                "; ".join(leftovers),
+            )
+        )
+        REPORT.append(cleanup)
 
 
 def run_live(mountpoints: list[Path], reference: Run, args) -> None:

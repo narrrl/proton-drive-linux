@@ -168,6 +168,10 @@ const DRAIN_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// directly on a new write or a reconnect, so this only bounds how late a
 /// backoff can fire.
 const DRAIN_IDLE_POLL: Duration = Duration::from_secs(30);
+/// How long a write whose create just landed waits for the drain to repoint
+/// its inode (`Core::landed_uid`): 200 polls of 10 ms, two seconds in all.
+const LANDED_UID_POLLS: u32 = 200;
+const LANDED_UID_POLL: Duration = Duration::from_millis(10);
 /// Grace period before a queued revision becomes eligible for draining.
 ///
 /// Tools like aria2c preallocate a file (truncate to target size) and then write
@@ -261,6 +265,15 @@ const TRASH_MATERIALIZE_CHUNK: usize = 150;
 /// outlives that timeout is a hang from the user's side: the client gives up,
 /// the user asks again, and the daemon accumulates another refresh.
 const TRASH_FIRST_WAIT: Duration = Duration::from_secs(20);
+/// How long one server call of a trash refresh may take before the refresh
+/// gives up.
+///
+/// Refreshes are single-flight, so a call that never returns wedges the trash
+/// listing for the life of the daemon: every later request joins the stuck
+/// refresh, times out, and answers with the listing from before it. That hid
+/// a just-trashed folder from a permanent delete for as long as the daemon ran
+/// (`docs/BUGS.md` B103). One call is one request, so this is generous.
+const TRASH_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `sync_state` keys for the freshness stamps of the two persisted listings, and
 /// for whether the account has a photos volume at all (so an account without one
@@ -3098,35 +3111,57 @@ impl Core {
                 Errno::EIO
             }
         })?;
-        let meta_json = serde_json::to_string(&meta).unwrap_or_default();
         // Whatever this write supersedes, it supersedes now — including an
         // upload already on the wire, whose bytes describe a revision the row
         // written just below replaces. Signalled before the enqueue so the
         // in-flight reader stops at its next block rather than after however
         // much of the file is left.
         self.cancel_upload(uid);
-        let superseded = if is_local_uid(uid) {
-            // The node has no server-side identity to hang a revision on, so the
-            // bytes ride on the create that will mint it.
-            let attached = self
-                .db
-                .attach_blob_to_create(&uid.to_string(), &path.to_string_lossy(), &meta_json)
-                .map_err(|e| {
-                    error!(%uid, error = %e, "attaching write to queued create failed");
-                    Errno::EIO
-                })?;
-            match attached {
-                Some(a) => a.superseded,
-                None => {
-                    // The create drained between `release` and here, so the node
-                    // has a real uid now and this handle's is stale. The bytes are
-                    // safe in staging, but nothing here can address them.
+        let mut uid = uid.clone();
+        let len = meta.len;
+        let superseded = 'queued: {
+            if is_local_uid(&uid) {
+                // The node has no server-side identity to hang a revision on, so
+                // the bytes ride on the create that will mint it. Attached and
+                // recorded under one hold of `pending`, which is what the drain
+                // takes to retire a landed create: it either sees this blob and
+                // carries it over, or has already finished and this write
+                // queues against the real uid below (`Core::retire_create`).
+                let meta_json = serde_json::to_string(&meta).unwrap_or_default();
+                let mut pending = self.pending.lock();
+                let attached = self
+                    .db
+                    .attach_blob_to_create(&uid.to_string(), &path.to_string_lossy(), &meta_json)
+                    .map_err(|e| {
+                        error!(%uid, error = %e, "attaching write to queued create failed");
+                        Errno::EIO
+                    })?;
+                if let Some(attached) = attached {
+                    pending.insert(uid.clone(), PendingRevision { path, meta });
+                    break 'queued attached.superseded;
+                }
+                drop(pending);
+                // The create landed while this handle was open. Its uid is the
+                // one the drain has just given the inode.
+                let Some(real) = self.landed_uid(ino) else {
                     error!(%uid, staged = %path.display(),
                            "queued create vanished under a write; bytes kept in staging");
                     return Err(Errno::EIO);
+                };
+                debug!(local = %uid, %real, "create landed under an open write; queueing a revision");
+                uid = real;
+                meta.uid = uid.to_string();
+                let previous = self.pending.lock().get(&uid).cloned();
+                meta.based_on = previous.as_ref().and_then(|p| p.meta.based_on.clone());
+                if !meta.complete
+                    && let Some(previous) = previous
+                    && let Err(error) = merge_over_pending(&mut meta, &path, &previous)
+                {
+                    error!(%uid, %error, staged = %path.display(),
+                           "folding in the write the create carried failed; bytes kept in staging");
+                    return Err(Errno::EIO);
                 }
             }
-        } else {
             let op = PendingOp {
                 id: 0,
                 kind: OP_REVISION.to_string(),
@@ -3134,25 +3169,25 @@ impl Core {
                 parent_uid: None,
                 name: None,
                 blob_path: Some(path.to_string_lossy().into_owned()),
-                meta_json: Some(meta_json),
+                meta_json: Some(serde_json::to_string(&meta).unwrap_or_default()),
                 created_at: now_millis(),
                 attempts: 0,
                 last_error: None,
-                next_attempt_at: now_millis() + self.revision_debounce(uid).as_millis() as i64,
+                next_attempt_at: now_millis() + self.revision_debounce(&uid).as_millis() as i64,
             };
             let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
                 error!(%uid, error = %e, "queueing upload failed");
                 Errno::EIO
             })?;
+            self.pending
+                .lock()
+                .insert(uid.clone(), PendingRevision { path, meta });
             superseded
         };
         if let Some(old) = superseded {
             self.cache.discard_staged(Path::new(&old));
         }
-        let len = meta.len;
-        self.pending
-            .lock()
-            .insert(uid.clone(), PendingRevision { path, meta });
+        let uid = &uid;
         // Reflect the write in the tree straight away: `ls` must show the new
         // size and mtime even though the remote still holds the old revision.
         let now = now_secs();
@@ -3185,6 +3220,23 @@ impl Core {
             });
         }
         Ok(())
+    }
+
+    /// The real uid the drain gave `ino` when its queued create landed.
+    ///
+    /// Called by a write that found the create already retired. The drain
+    /// repoints the inode right after it drops `pending`, with no network in
+    /// between, so a short wait covers the gap; `None` means the inode is gone
+    /// or never stopped being a placeholder.
+    fn landed_uid(&self, ino: u64) -> Option<NodeUid> {
+        for _ in 0..LANDED_UID_POLLS {
+            let uid = self.state().entries.get(&ino).map(|e| e.uid.clone())?;
+            if !is_local_uid(&uid) {
+                return Some(uid);
+            }
+            std::thread::sleep(LANDED_UID_POLL);
+        }
+        None
     }
 
     /// Queue the new content of a path-based truncate — `> file`, or any
@@ -3457,10 +3509,7 @@ impl Core {
                 error!(%uid, error = %e, "queueing trash failed");
                 Errno::EIO
             })?;
-        for blob in blobs {
-            self.cache.discard_staged(Path::new(&blob));
-        }
-        self.pending.lock().remove(uid);
+        self.release_dropped_ops(uid, blobs);
         self.hidden.lock().insert(uid.clone());
         // Withdrawn from every mount, not just the one the unlink came through:
         // a sync folder maps a remote folder that also exists under My Files, so
@@ -3486,11 +3535,36 @@ impl Core {
             error!(%uid, error = %e, "dropping queued ops failed");
             Errno::EIO
         })?;
+        self.release_dropped_ops(uid, blobs);
+        Ok(())
+    }
+
+    /// Let go of what the ops just dropped for `uid` held: their pending
+    /// entries, any upload still reading their bytes, and the bytes.
+    ///
+    /// Removing a folder also drops the queued revisions of the files below it
+    /// (`docs/BUGS.md` B102), so the entries to forget are found by blob, not
+    /// only by `uid`.
+    fn release_dropped_ops(&self, uid: &NodeUid, blobs: Vec<String>) {
+        let below: Vec<NodeUid> = {
+            let mut pending = self.pending.lock();
+            pending.remove(uid);
+            let below: Vec<NodeUid> = pending
+                .iter()
+                .filter(|(_, p)| blobs.iter().any(|b| p.path == Path::new(b)))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &below {
+                pending.remove(k);
+            }
+            below
+        };
+        for k in &below {
+            self.cancel_upload(k);
+        }
         for blob in blobs {
             self.cache.discard_staged(Path::new(&blob));
         }
-        self.pending.lock().remove(uid);
-        Ok(())
     }
 
     /// Which staged blob is currently queued for `uid`, if any.
@@ -4317,6 +4391,11 @@ impl Core {
             .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
             .map_err(|e| CoreError::from_api(&e, "trash"))?;
+        // Uploads queued for the node or anything below it would now only fail
+        // against the trash, forever, holding their bytes (`docs/BUGS.md` B102).
+        if let Err(error) = self.discard_queued_ops(&uid) {
+            warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
+        }
         let name = self
             .state
             .lock()
@@ -4483,10 +4562,8 @@ impl Core {
     /// end. Every batch is a usable listing.
     async fn refresh_trash(&self) -> CoreResult<()> {
         let started = Instant::now();
-        let uids = self
-            .client
-            .enumerate_trash_node_uids()
-            .await
+        let uids = within_trash_call("enumerate trash", self.client.enumerate_trash_node_uids())
+            .await?
             .map_err(|e| CoreError::from_api(&e, "enumerate trash"))?;
         info!(
             count = uids.len(),
@@ -4512,10 +4589,8 @@ impl Core {
         let mut items: Vec<StoredTrash> = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(TRASH_MATERIALIZE_CHUNK) {
             let chunk_started = Instant::now();
-            let nodes = self
-                .client
-                .enumerate_nodes(chunk)
-                .await
+            let nodes = within_trash_call("enumerate nodes", self.client.enumerate_nodes(chunk))
+                .await?
                 .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
             items.extend(nodes.into_iter().map(|node| StoredTrash {
                 uid: node.uid.to_string(),
@@ -5554,6 +5629,19 @@ fn node_size(node: &Node) -> u64 {
             ..
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
     }
+}
+
+/// `call`, failed with a remote error once it has run for
+/// [`TRASH_CALL_TIMEOUT`].
+async fn within_trash_call<T>(what: &str, call: impl Future<Output = T>) -> CoreResult<T> {
+    tokio::time::timeout(TRASH_CALL_TIMEOUT, call)
+        .await
+        .map_err(|_| {
+            CoreError::new(
+                ErrorKind::Remote,
+                format!("{what}: no answer within {}s", TRASH_CALL_TIMEOUT.as_secs()),
+            )
+        })
 }
 
 /// When a node a trash refresh found went to the trash, as far as the daemon
@@ -7848,7 +7936,7 @@ mod tests {
             assert_before(function, "require_uid_writable", first_side_effect);
         }
         let trash = function_source(source, "fn queue_trash(");
-        assert_before(trash, "replace_ops_with_trash", "discard_staged");
+        assert_before(trash, "replace_ops_with_trash", "release_dropped_ops");
 
         // §5, parallel drain: every path that unlinks a staged blob or hands
         // the same node's work to another worker has to stop the upload that

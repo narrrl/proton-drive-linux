@@ -12,6 +12,105 @@ Conventions:
 
 ---
 
+## B103 — One stuck trash refresh freezes the trash listing until the daemon restarts
+
+**Status:** Fixed (unverified). The hang itself has not been reproduced on purpose.
+**Found:** 2026-09-29, while timing the acceptance suite's wide-directory case. Its cleanup trashed
+the test folder, then waited for it to show up in the trash so it could delete it permanently. It
+never did. From 06:55 UTC on, every trash listing logged `trash refresh still running; answering
+with what has materialized` and returned the same 362 entries. No `trash refresh: enumerated` line
+followed, so the first server call of the refresh never returned.
+
+**Where:** `crates/pdfs-fuse/src/lib.rs` (`Core::refresh_trash`, `within_trash_call`).
+
+**Cause.** Trash refreshes are single-flight: a request joins the refresh already running instead
+of starting another. The refresh awaited its server calls with no deadline, so one call that
+never returned kept the flag set forever. Every later request joined it, waited out its 20 s
+budget, and answered with the stale listing.
+
+**Fix.** Each server call of a refresh (`enumerate_trash_node_uids`, and each `enumerate_nodes`
+chunk) fails after `TRASH_CALL_TIMEOUT` (120 s). The refresh then ends with an error, clears the
+flag, and the next request starts a fresh one.
+
+---
+
+## B102 — Removing a folder leaves the queued uploads of the files inside it
+
+**Status:** Fixed (unverified). No daemon carrying the change has run the acceptance suite yet.
+**Found:** 2026-09-29, after the account run that found B101. Its cleanup removed both test roots
+and reported "nothing left behind", but `pdfs sync queue` still listed two `revision` ops for
+`pdfs-acceptance-…/boundaries/reshaped`, each holding about 8 MiB of staged bytes. They retried
+against the trash forever ("the share has not been writable for 300s").
+
+**Where:** `crates/pdfs-core/src/db/ops.rs` (`drop_doomed_ops`, used by
+`Db::replace_ops_with_trash` and `Db::delete_ops_for_uid`), `crates/pdfs-fuse/src/lib.rs`
+(`Core::delete`, `Core::release_dropped_ops`).
+
+**Cause.** Two gaps.
+
+- **The queue could not see which files a folder holds.** Removing a node dropped the ops for it
+  and for anything *queued* beneath it, found through `pending_op.parent_uid`. Only `create` and
+  `mkdir` ops carry a parent, so a `revision` of a file that already existed remotely was never
+  found, however deep in the removed folder it sat.
+- **`pdfs rm` dropped nothing at all.** The control socket's delete trashed the node remotely but
+  left every op queued for it, unlike an unlink through the mount.
+
+**Fix.** Removal also follows the node tree (`nodes.parent_uid`) and drops the `revision` ops of
+every file below the node, with their blobs, pending entries and in-flight uploads. Queued renames
+below it are kept: one that moved a node into the folder still has to land for the node to go to
+the trash with it. `pdfs rm` now drops the queued ops once the remote trash succeeds. The
+acceptance janitor lists the daemon queue after cleanup and reports any op still naming one of its
+roots as a leftover.
+Regression test: `trashing_a_folder_drops_the_queued_revisions_of_files_below_it`.
+
+---
+
+## B101 — A shrunk file written past its end gets old bytes back, or fails with `EIO`; a write during a create's upload is lost
+
+**Status:** Fixed (unverified). No daemon carrying the change has run the acceptance suite yet.
+**Found:** 2026-09-29, by the new acceptance case "block boundaries and overwrites that change
+the block count". It failed with `Input/output error` in My files and in an on-demand folder, every
+time. The journal had `the revision's block table disagrees with the node size ... fsize=8388611
+reader_size=0`, then `pending upload failed; will retry ... gap-fill from base failed: Errno(5)`
+on every retry.
+
+**Where:** `crates/pdfs-fuse/src/state.rs` (`WriteHandle::record_write`),
+`crates/pdfs-fuse/src/drain.rs` (`Core::drain_local_node`, `Core::retire_create`),
+`crates/pdfs-fuse/src/lib.rs` (`Core::enqueue_staged_write`),
+`crates/pdfs-core/src/db/ops.rs` (`Db::finish_create`).
+
+**Cause.** Two defects.
+
+- **The hole of a write past the end was not authored.** A write handle tracks which ranges it
+  wrote; everything else below the base size is filled from the base when it is committed. A
+  grow through `setattr` marks its new tail as written, but a `pwrite` past the end did not mark
+  the hole it leaves. After `ftruncate(fd, 4 MiB)` and `pwrite(fd, data, 4 MiB + 10)`, bytes
+  4 MiB to 4 MiB + 10 were refilled from the old base instead of reading as zeros. That silently
+  restored truncated bytes. When the base was itself a queued revision the remote did not have
+  yet, the fill read a revision of the wrong size, and B84's check failed it: `EIO` on read, and
+  a drain that retried forever.
+- **A write that closed while its file's create uploaded was lost.** The create of a new file
+  drains on its own, often while the file is still open. A write that closes meanwhile attaches
+  its blob to the create's queue row. When the create landed, the drain deleted that row by id,
+  so the server kept the older bytes (often an empty file) and nothing was queued to replace
+  them. A handle still open after the create landed carried the placeholder uid, found no create
+  to attach to, and failed its `close` with `EIO`.
+
+**Fix.** A write past the end authors the hole (`WriteHandle::record_write`).
+`Db::finish_create` retires a landed create in one transaction: if the row now holds a newer blob
+than the one uploaded, it becomes a revision of the real uid instead of being deleted. The drain
+does this under the `pending` lock, which `enqueue_staged_write` holds from attaching a blob until
+it records the pending entry, and then repoints open write handles to the real uid. A write that
+still finds the create gone waits for its inode's real uid (`Core::landed_uid`) and queues a
+revision against it.
+Regression tests: `a_write_past_the_end_authors_the_hole_it_leaves`,
+`a_write_attached_while_its_create_uploads_becomes_a_revision`,
+`a_create_whose_blob_landed_is_retired`, and the live acceptance cases "block boundaries and
+overwrites that change the block count" (now also read back after the queue drains) and
+`regression B101`.
+
+---
+
 ## B100 — A freshly copied file reads as `EIO` or 53 bytes too big
 
 **Status:** Fixed (unverified). No daemon carrying the change has read a file with a provisional
@@ -48,7 +147,7 @@ network). A folder past the cap is now queued instead of dropped. When a running
 its thread takes over the oldest queued folder, so at most 8 threads still run.
 Regression tests: `a_folder_past_the_cap_is_queued_not_dropped`,
 `a_finished_batch_hands_its_thread_the_oldest_queued_one`. The read and open paths need a live
-mount and have no unit test.
+mount and have no unit test; the acceptance case `regression B100` covers them on a real mount.
 
 ---
 

@@ -66,6 +66,52 @@ pub fn op_supersedes(kind: &str) -> bool {
     matches!(kind, OP_REVISION | OP_RENAME | OP_TRASH)
 }
 
+/// Delete the ops that removing `uid` takes with it, returning the staged blobs
+/// they held.
+///
+/// That is every op for `uid` or for anything queued beneath it, plus the
+/// revisions of files the node tree places beneath it. A revision op carries
+/// no `parent_uid`, so the queue alone cannot tell that its file sits inside
+/// a removed folder: the upload outlived the folder, failed forever against a
+/// trashed node, and kept its blob on disk (`docs/BUGS.md` B102).
+///
+/// Only revisions are taken from the node tree. A queued rename that moved a
+/// node *into* the folder has to land, or the node would stay where it was
+/// on the server instead of going to the trash with the folder.
+fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<String>> {
+    const DOOMED: &str = "
+        WITH RECURSIVE
+          queued(uid) AS (
+            SELECT ?1
+            UNION
+            SELECT p.uid FROM pending_op p JOIN queued q ON p.parent_uid = q.uid
+          ),
+          below(uid) AS (
+            SELECT ?1
+            UNION
+            SELECT n.uid FROM nodes n JOIN below b ON n.parent_uid = b.uid
+          ),
+          doomed(id) AS (
+            SELECT id FROM pending_op
+            WHERE uid IN (SELECT uid FROM queued)
+               OR (kind = 'revision' AND uid IN (SELECT uid FROM below))
+          )";
+    let blobs: Vec<String> = {
+        let mut stmt = tx.prepare(&format!(
+            "{DOOMED}
+             SELECT blob_path FROM pending_op
+             WHERE id IN (SELECT id FROM doomed) AND blob_path IS NOT NULL"
+        ))?;
+        let rows = stmt.query_map(params![uid], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        &format!("{DOOMED} DELETE FROM pending_op WHERE id IN (SELECT id FROM doomed)"),
+        params![uid],
+    )?;
+    Ok(blobs)
+}
+
 /// The volume id given to a node that exists only on this machine, so far. A
 /// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
 /// round-trips through the same `Display`/parse path as any other uid.
@@ -252,27 +298,9 @@ impl Db {
         name: &str,
         created_at: i64,
     ) -> Result<(i64, Vec<String>)> {
-        const SUBTREE: &str = "
-            WITH RECURSIVE doomed(uid) AS (
-              SELECT ?1
-              UNION
-              SELECT p.uid FROM pending_op p JOIN doomed d ON p.parent_uid = d.uid
-            )";
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let blobs: Vec<String> = {
-            let mut stmt = tx.prepare(&format!(
-                "{SUBTREE}
-                 SELECT blob_path FROM pending_op
-                 WHERE uid IN (SELECT uid FROM doomed) AND blob_path IS NOT NULL"
-            ))?;
-            let rows = stmt.query_map(params![uid], |row| row.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        tx.execute(
-            &format!("{SUBTREE} DELETE FROM pending_op WHERE uid IN (SELECT uid FROM doomed)"),
-            params![uid],
-        )?;
+        let blobs = drop_doomed_ops(&tx, uid)?;
         tx.execute(
             "INSERT INTO pending_op
                (kind, uid, parent_uid, name, blob_path, meta_json, created_at, next_attempt_at)
@@ -324,6 +352,67 @@ impl Db {
             params![id, blob_path, meta_json, PARK_UNTIL],
         )?;
         Ok(Some(AttachedBlob { id, superseded }))
+    }
+
+    /// Retire a queued create that has just landed as `real`, and repoint
+    /// everything that named its placeholder, in one transaction.
+    ///
+    /// The drain uploads the blob the create held when it was picked up. A
+    /// write that closes while that upload is on the wire attaches a newer blob
+    /// to the *same row* (`attach_blob_to_create`), so deleting the row by id
+    /// threw that write away: the server kept the older bytes and nothing was
+    /// left queued to replace them. When the row no longer holds `uploaded`, it
+    /// becomes a revision of `real` instead, with its sidecar passed through
+    /// `rewrite` so it names the real node. Returns that blob and sidecar, or
+    /// `None` when the create is simply done.
+    pub fn finish_create(
+        &self,
+        id: i64,
+        uploaded: Option<&str>,
+        local: &str,
+        real: &str,
+        rewrite: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<Option<(String, String)>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let row: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT blob_path, meta_json FROM pending_op WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let newer = match row {
+            Some((Some(blob), Some(meta))) if uploaded != Some(blob.as_str()) => {
+                rewrite(&meta).map(|meta| (blob, meta))
+            }
+            _ => None,
+        };
+        match &newer {
+            Some((_, meta)) => {
+                tx.execute(
+                    "UPDATE pending_op
+                     SET kind = ?2, uid = ?3, parent_uid = NULL, name = NULL, meta_json = ?4,
+                         attempts = 0, last_error = NULL, next_attempt_at = 0
+                     WHERE id = ?1",
+                    params![id, OP_REVISION, real, meta],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM pending_op WHERE id = ?1", params![id])?;
+            }
+        }
+        tx.execute(
+            "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
+            params![local, real],
+        )?;
+        tx.execute(
+            "UPDATE nodes SET parent_uid = ?2 WHERE parent_uid = ?1",
+            params![local, real],
+        )?;
+        tx.execute("DELETE FROM nodes WHERE uid = ?1", params![local])?;
+        tx.commit()?;
+        Ok(newer)
     }
 
     /// Replace the sidecar of a queued op, for a baseline that has moved under
@@ -428,29 +517,12 @@ impl Db {
     /// and in the user's pending count, for the life of the database.
     ///
     /// Only `create`/`mkdir` ops carry a `parent_uid`, so for a file this
-    /// recursion finds nothing and costs one query.
+    /// recursion finds nothing and costs one query. Revisions of files the
+    /// node tree places beneath `uid` go too; see [`drop_doomed_ops`].
     pub fn delete_ops_for_uid(&self, uid: &str) -> Result<Vec<String>> {
-        const SUBTREE: &str = "
-            WITH RECURSIVE doomed(uid) AS (
-              SELECT ?1
-              UNION
-              SELECT p.uid FROM pending_op p JOIN doomed d ON p.parent_uid = d.uid
-            )";
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let blobs: Vec<String> = {
-            let mut stmt = tx.prepare(&format!(
-                "{SUBTREE}
-                 SELECT blob_path FROM pending_op
-                 WHERE uid IN (SELECT uid FROM doomed) AND blob_path IS NOT NULL"
-            ))?;
-            let rows = stmt.query_map(params![uid], |r| r.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        tx.execute(
-            &format!("{SUBTREE} DELETE FROM pending_op WHERE uid IN (SELECT uid FROM doomed)"),
-            params![uid],
-        )?;
+        let blobs = drop_doomed_ops(&tx, uid)?;
         tx.commit()?;
         Ok(blobs)
     }

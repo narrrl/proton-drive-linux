@@ -2498,6 +2498,71 @@ fn failed_atomic_trash_insert_keeps_prior_revision_and_blob_ownership() {
     );
 }
 
+/// A revision op names no parent, so the queue alone cannot see that its file
+/// sits inside a folder being removed. The node tree can: trashing the folder
+/// has to take the uploads of the files below it along, or they fail forever
+/// against a trashed node and keep their bytes on disk (B102). A rename that
+/// moved a node into the folder still has to land.
+#[test]
+fn trashing_a_folder_drops_the_queued_revisions_of_files_below_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("doomed", Some("root"), "doomed"),
+        folder("sub", Some("doomed"), "sub"),
+        file("deep", "sub", "deep.bin", 1),
+        file("moved", "doomed", "moved.txt", 1),
+        file("kept", "root", "kept.bin", 1),
+    ])
+    .unwrap();
+    let op = |kind: &str, link: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid(link).to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: blob.map(str::to_string),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op(OP_REVISION, "deep", Some("/staging/deep")))
+        .unwrap();
+    db.enqueue_op(&op(OP_RENAME, "moved", None)).unwrap();
+    db.enqueue_op(&op(OP_REVISION, "kept", Some("/staging/kept")))
+        .unwrap();
+
+    let doomed = uid("doomed").to_string();
+    let (_, blobs) = db.replace_ops_with_trash(&doomed, "doomed", 2).unwrap();
+    assert_eq!(blobs, vec!["/staging/deep"]);
+
+    let mut left: Vec<(String, String)> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| (op.kind, op.uid))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            (OP_RENAME.to_string(), uid("moved").to_string()),
+            (OP_REVISION.to_string(), uid("kept").to_string()),
+            (OP_TRASH.to_string(), doomed.clone()),
+        ]
+    );
+
+    // Deleting outright follows the same tree.
+    db.enqueue_op(&op(OP_REVISION, "deep", Some("/staging/deep2")))
+        .unwrap();
+    assert_eq!(
+        db.delete_ops_for_uid(&uid("sub").to_string()).unwrap(),
+        vec!["/staging/deep2"]
+    );
+}
+
 /// Deleting a folder that was created offline must take the ops queued
 /// underneath it with it: they name a placeholder parent that will now never
 /// become real, so nothing could ever drain them and nothing is left to
@@ -2697,6 +2762,99 @@ fn attaching_to_an_already_drained_create_reports_it_is_gone() {
         .attach_blob_to_create("local~gone", "/staging/x", "{}")
         .unwrap();
     assert!(out.is_none());
+}
+
+#[test]
+fn a_write_attached_while_its_create_uploads_becomes_a_revision() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    let real = uid("real").to_string();
+    let create = |blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: local.to_string(),
+        parent_uid: Some(uid("parent").to_string()),
+        name: Some("new.txt".to_string()),
+        blob_path: blob.map(str::to_string),
+        meta_json: blob.map(|_| "{\"uid\":\"local~abc\"}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (id, _) = db.enqueue_op(&create(None)).unwrap();
+    // The drain picked the create up with no blob; the file's first write
+    // closes while the empty upload is on the wire.
+    db.attach_blob_to_create(local, "/staging/written", "{\"uid\":\"local~abc\"}")
+        .unwrap()
+        .expect("create is still queued");
+
+    let newer = db
+        .finish_create(id, None, local, &real, |json| {
+            Some(json.replace("local~abc", "vol~real"))
+        })
+        .unwrap();
+
+    assert_eq!(
+        newer,
+        Some((
+            "/staging/written".to_string(),
+            "{\"uid\":\"vol~real\"}".to_string()
+        ))
+    );
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "the write is still queued");
+    assert_eq!(ops[0].kind, OP_REVISION);
+    assert_eq!(ops[0].uid, real);
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/written"));
+    assert_eq!(ops[0].parent_uid, None);
+}
+
+#[test]
+fn a_create_whose_blob_landed_is_retired() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    let real = uid("real").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("parent").to_string()),
+            name: Some("new.txt".to_string()),
+            blob_path: Some("/staging/sent".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: "local~child".to_string(),
+        parent_uid: Some(local.to_string()),
+        name: Some("inside.txt".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 2,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let newer = db
+        .finish_create(id, Some("/staging/sent"), local, &real, |_| {
+            panic!("an unchanged create has no sidecar to rewrite")
+        })
+        .unwrap();
+
+    assert_eq!(newer, None);
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "only the child is left");
+    assert_eq!(ops[0].parent_uid.as_deref(), Some(real.as_str()));
 }
 
 #[test]

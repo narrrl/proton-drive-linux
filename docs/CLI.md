@@ -177,7 +177,7 @@ commands are for scripts and for cases where the mount is not available.
 ## Scripting with `--json`
 
 The global `--json` flag makes query commands print JSON: `status`, `ls`, `pins`, `sync list`,
-`devices list`, `locations`, `transfers`, `activity` and `cache inspect`. Commands that change
+`devices list`, `locations`, `transfers`, `activity`, `trash` and `cache inspect`. Commands that change
 something keep their human-readable output; check their exit code.
 
 ```bash

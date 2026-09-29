@@ -4,20 +4,28 @@ set -Eeuo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/fuse-acceptance.sh [--offline-only] [OPTION ...]
+usage: scripts/fuse-acceptance.sh [OPTION ...]
+       scripts/fuse-acceptance.sh --offline-only [OPTION ...]
        scripts/fuse-acceptance.sh --live MOUNTPOINT [MOUNTPOINT ...] [OPTION ...]
        scripts/fuse-acceptance.sh --managed-live EMPTY_DIR EMPTY_DIR [OPTION ...]
        scripts/fuse-acceptance.sh MOUNTPOINT [MOUNTPOINT ...]  # compatibility
 
-The local reference suite always runs first and requires no account; the mount
-is then diffed against its recorded behaviour. --live runs the same contract on
-each mount. Set PDFS_ACCEPTANCE_CONVERGENCE=1 only when all live mountpoints
+With no mode, everything runs on the signed-in account: My files, then two
+sync folders it registers itself, through every pairing of on-demand and
+mirror, with moves and copies between them. Everything it creates is removed
+afterwards, on failure and on Ctrl-C too, and permanently deleted from the
+trash; a run that was killed is cleaned up by the next one.
+
+--offline-only runs only the local reference suite, which needs no account.
+It always runs first; every mount is diffed against its recorded behaviour.
+--live runs the same contract on each given mount. Set PDFS_ACCEPTANCE_CONVERGENCE=1 only when all live mountpoints
 show the same remote folder.
 
 Options are forwarded to the Python runner. The useful ones:
   --list                  print every case and the targets it runs against
   --timeout SECONDS       per-case limit (default 180); a hung case dumps stacks
   --fail-fast             stop at the first failure instead of continuing
+  --quick                 one on-demand/mirror pairing instead of all four
   --report-json PATH      machine-readable results and recorded observations
   --report-junit PATH     JUnit XML for CI
   --budget SECONDS        report any case slower than this
@@ -45,8 +53,11 @@ collect_paths() {
 
 case "${1:-}" in
     -h|--help) usage ;;
-    --offline-only|"")
-        shift || true
+    "")
+        exec "${runner[@]}" --account
+        ;;
+    --offline-only)
+        shift
         exec "${runner[@]}" "$@"
         ;;
     --live)
@@ -60,9 +71,12 @@ case "${1:-}" in
         first="$1"; second="$2"; shift 2
         exec "${runner[@]}" --managed-live "$first" "$second" "$@"
         ;;
-    --*)
-        # Bare options with no mode: an offline run with those options.
+    --account)
         exec "${runner[@]}" "$@"
+        ;;
+    --*)
+        # Bare options with no mode: an account run with those options.
+        exec "${runner[@]}" --account "$@"
         ;;
     *)
         collect_paths "$@"

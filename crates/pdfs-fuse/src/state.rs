@@ -128,6 +128,23 @@ pub(crate) struct WriteHandle {
     pub(crate) open_count: usize,
 }
 
+impl WriteHandle {
+    /// Account for `[offset, end)` having been written through this handle.
+    ///
+    /// A write past the end leaves a hole that reads as zeros, exactly like a
+    /// grow through `setattr`, so the hole is authored too. Left unauthored, a
+    /// hole below the base size was refilled from the base at commit: a file
+    /// shrunk and then written past its new end got its old bytes back.
+    pub(crate) fn record_write(&mut self, offset: u64, end: u64) {
+        if offset > self.len {
+            self.written.add(self.len, offset);
+        }
+        self.written.add(offset, end);
+        self.len = self.len.max(end);
+        self.dirty = true;
+    }
+}
+
 /// A released write whose upload has not happened yet (offline.md Phase 3).
 ///
 /// The bytes live in the content cache's staging dir and the intent lives in the
@@ -1862,5 +1879,51 @@ mod tests {
         shared.membership = Some(membership(38));
         let shared = st.intern(owned_root, shared);
         assert_eq!(st.entries[&shared].access, Access::Viewer);
+    }
+
+    fn handle(len: u64, base_size: u64) -> WriteHandle {
+        let path = std::env::temp_dir().join(format!("pdfs-handle-test-{}", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        WriteHandle {
+            ino: 2,
+            uid: uid("file"),
+            file: Arc::new(file),
+            path,
+            written: Intervals::default(),
+            len,
+            base_size,
+            base_mtime: 0,
+            base_revision_id: None,
+            dirty: false,
+            open_count: 1,
+        }
+    }
+
+    #[test]
+    fn a_write_past_the_end_authors_the_hole_it_leaves() {
+        // Opened over a 100-byte base, shrunk to 10, then written at 50: bytes
+        // 10..50 are zeros now, not the base's bytes 10..50.
+        let mut h = handle(100, 100);
+        h.written.clip(10);
+        h.len = 10;
+        h.record_write(50, 60);
+        assert_eq!(h.len, 60);
+        assert_eq!(
+            h.written.segments(0, 60),
+            vec![(0, 10, false), (10, 60, true)],
+            "only the head still comes from the base"
+        );
+    }
+
+    #[test]
+    fn a_write_inside_the_file_leaves_the_rest_to_the_base() {
+        let mut h = handle(100, 100);
+        h.record_write(40, 50);
+        assert_eq!(h.len, 100);
+        assert_eq!(
+            h.written.segments(0, 100),
+            vec![(0, 40, false), (40, 50, true), (50, 100, false)]
+        );
     }
 }

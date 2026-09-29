@@ -25,17 +25,79 @@ Proton:
 scripts/fuse-acceptance.sh --offline-only
 ```
 
-Kernel/FUSE behavior and remote convergence need a real mount. Live testing is
-explicitly opt-in and always runs the account-free contract first. It runs
-destructive POSIX operations only below a fresh `pdfs-acceptance-*` directory.
-It refuses paths that are not FUSE mounts and removes its directory on success,
-failure, or interruption.
+Kernel/FUSE behavior and remote convergence need a real mount. With no
+arguments, the script tests the account the running service is logged in to:
 
-Use a dedicated test account without irreplaceable data:
+```console
+scripts/fuse-acceptance.sh           # every case, every mount kind
+scripts/fuse-acceptance.sh --quick   # one on-demand/mirror pair instead of four
+```
+
+An account run does this, in order:
+
+1. Runs the account-free contract as the reference.
+2. Runs the contract in a fresh `pdfs-acceptance-<id>` folder in My files and
+   diffs it against the reference.
+3. Registers two new sync folders under `~/.cache/pdfs-acceptance/run-<id>/`
+   and runs the contract and the move cases in every on-demand/mirror pairing.
+4. Removes everything it created, locally and remotely, and reports a
+   `cleanup` result. The run fails if anything is left behind.
+
+Cleanup identifies remote folders by uid, never by name alone, so nothing of
+yours is touched. It removes each sync folder with `sync rm --delete-remote`,
+trashes the My files folder, and then deletes both permanently from the trash.
+It only counts a folder as gone once a fresh trash listing no longer shows it.
+It then reads `pdfs sync queue` and counts any queued op that still names one
+of its folders as left behind too, since such an op keeps its staged bytes and
+retries forever (B102).
+Cleanup also runs on a failure, Ctrl-C, `SIGTERM` or `SIGHUP`. While it runs,
+two more interrupts are ignored; a third abandons it.
+
+Each run records what it is about to create in
+`~/.cache/pdfs-acceptance/run-<id>/manifest.json` before it creates it, and
+holds a lock on that directory. If a run dies without cleaning up (`kill -9`, a
+hard timeout, a power cut), the next run finds the unlocked manifest and
+finishes that cleanup first. It then removes stray `pdfs-acceptance-<32 hex>`
+folders that no live run claims: in My files (older than
+`PDFS_ACCEPTANCE_REAP_AGE`, default one hour), under the acceptance home, and
+in the trash. A run does not start while that reap leaves anything behind.
+
+The run creates and destroys real remote folders, so a dedicated test account
+without irreplaceable data is still the safest target.
+
+`--live PATH...` tests mounts you set up yourself and leaves the sync folder
+configuration alone. It runs destructive POSIX operations only below a fresh
+`pdfs-acceptance-*` directory, refuses paths that are not FUSE mounts, and
+removes its directory on success, failure, or interruption:
 
 ```console
 scripts/fuse-acceptance.sh --live /mnt/on-demand-testmount
 ```
+
+### Edge cases and performance
+
+Besides the syscall contract, the suite covers:
+
+- **Block boundaries.** Files of 0 bytes up to two 4 MiB blocks plus 3 bytes,
+  including every size next to a boundary, then overwrites that grow, shrink
+  and reshape them.
+- **Unusual names.** A 255-byte name, NFC and NFD forms of the same text,
+  newline, tab, emoji, characters Windows forbids, leading and trailing
+  spaces, and a case-only rename.
+- **A deep tree and a wide directory.** 24 levels of nesting renamed at the
+  top; 128 entries created concurrently, concurrent unlinks, then `rm -rf`.
+  Online, each create is a round trip to the server, and the kernel runs
+  creates in one directory one at a time. So the wide case gets twice the
+  per-case timeout and notes the time per create as `wide.create_ms`.
+- **Rename patterns.** Swaps, chains, log rotation, replacing a file under an
+  open reader, the `EISDIR`/`ENOTDIR`/`ENOENT` refusals, and a folder moved out
+  and back.
+- **Handle coherency.** Unsynced writes seen by a second handle, two `O_APPEND`
+  writers, 30 rewrite generations, and a truncate under a reader.
+- **Throughput.** 64 MiB written and read sequentially, 1 MiB in 4 KiB writes,
+  and metadata operations on 100 files. The rates are printed. The case fails
+  below `PDFS_ACCEPTANCE_MIN_MIBPS` (default 10) or `PDFS_ACCEPTANCE_MIN_OPS`
+  (default 20 operations per second).
 
 ### The mount is diffed against an ordinary filesystem
 
@@ -77,6 +139,16 @@ fixed. B69 (identical rewrite must not fork a `(sync-conflict …)` copy), B70 (
 in-flight `.crdownload` must not be sealed as a revision) and B74 (a file
 renamed after close must keep its content) need a real mount and a reachable
 daemon; they are skipped, not failed, without one.
+
+**B100** (a copied tree reads back at its exact sizes) copies 48 files of
+assorted sizes into the mount at once, as `cp -r` does. On a live mount it
+waits for the queue, checks every size and byte, runs `pdfs refresh` on each
+folder to drop the cached listing, and checks again. The refresh is what
+brought back the provisional sizes the bug reported.
+
+**B101** (a write during its create's upload reaches Drive) holds new files open for
+different times before writing, so their empty creates land before, during and after the
+bytes arrive, then checks every file after the queue drains.
 
 B74 was found by exactly this mechanism: the B70 case failed, and narrowing it
 produced a smaller reproduction that got its own case. The defect is fixed and
@@ -136,13 +208,17 @@ stops at the first failure.
 it ran. A suite can pass every assertion while the daemon logs failures behind
 it; that has happened, and it was caught only by reading the journal by hand.
 
-Abandoned `pdfs-acceptance-*` roots from a crashed run are removed at startup,
-but only if they match the exact generated name and are over an hour old
-(`PDFS_ACCEPTANCE_REAP_AGE`), so a concurrent run is never disturbed.
+With `--live`, abandoned `pdfs-acceptance-*` roots from a crashed run are
+removed at startup, but only if they match the exact generated name and are
+over an hour old (`PDFS_ACCEPTANCE_REAP_AGE`), so a concurrent run is never
+disturbed. An account run instead uses the manifest and reaper described
+above.
 
 ### Automated mode matrix
 
-The managed live runner accepts two existing, empty, unmounted directories. It
+An account run drives this matrix itself, in folders it creates. To use
+directories of your choice instead, the managed live runner accepts two
+existing, empty, unmounted directories. It
 registers both as new sync folders, waits for initial synchronization, then
 tests all four pairs in order: on-demand/on-demand, on-demand/mirror,
 mirror/on-demand, and mirror/mirror. Every transition must become idle, and an

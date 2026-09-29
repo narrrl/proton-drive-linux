@@ -41,7 +41,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeMoveItem};
 use tracing::{debug, error, info, warn};
 
-use super::state::Intervals;
+use super::state::{Intervals, PendingRevision};
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
@@ -886,15 +886,20 @@ impl Core {
         // Retire the op before touching anything else: if we crash here the node
         // exists remotely and the local placeholder is reconciled by the event
         // sync, whereas a surviving op would create the file a second time.
-        self.db.delete_op(op.id)?;
+        let newer = self.retire_create(op, &local, &real)?;
         self.adopt_real_uid(&local, &real)?;
         // The feed will report this create back to us; the tree already has it
         // under its real uid, so that event is ours to ignore (`Core::self_changes`).
         self.note_self_change(&real);
+        // The uploaded blob is done with either way: a write that replaced it
+        // while it was on the wire already discarded it when it attached.
         if let Some(blob) = op.blob_path.as_deref() {
             self.cache.discard_staged(Path::new(blob));
         }
-        self.pending.lock().remove(&local);
+        if newer {
+            info!(%local, %real, name, "a write landed during the create; queued it as a revision");
+            self.wake_drain();
+        }
         self.log_activity(ActivityKind::Upload, &name, "created", true);
         info!(%local, %real, name, kind = %op.kind, "pending create landed");
         Ok(())
@@ -963,6 +968,65 @@ impl Core {
         Ok(uid)
     }
 
+    /// Retire a landed create's op and move its queued state to the real uid.
+    /// True when a newer write attached to the create while it was uploading,
+    /// which is now queued as a revision of `real`.
+    ///
+    /// Runs under the `pending` lock, which `Core::enqueue_staged_write` also
+    /// holds from attaching a blob to a create until it records the pending
+    /// entry. So a write either attached before this ran and is carried over,
+    /// or finds the create gone and queues against the real uid itself. The
+    /// open write handles are repointed right after, for the same reason:
+    /// a handle released later must not queue against the placeholder.
+    fn retire_create(
+        &self,
+        op: &PendingOp,
+        local: &NodeUid,
+        real: &NodeUid,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let real_str = real.to_string();
+        let newer = {
+            let mut pending = self.pending.lock();
+            let newer = self.db.finish_create(
+                op.id,
+                op.blob_path.as_deref(),
+                &local.to_string(),
+                &real_str,
+                |json| {
+                    let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
+                    meta.uid = real_str.clone();
+                    serde_json::to_string(&meta).ok()
+                },
+            )?;
+            pending.remove(local);
+            if let Some((blob, json)) = &newer {
+                let meta: StagedWrite = serde_json::from_str(json)?;
+                pending.insert(
+                    real.clone(),
+                    PendingRevision {
+                        path: PathBuf::from(blob),
+                        meta,
+                    },
+                );
+            }
+            newer.is_some()
+        };
+        self.for_each_state(|st| {
+            if let Some(ino) = st.by_uid.remove(local) {
+                st.by_uid.insert(real.clone(), ino);
+                if let Some(e) = st.entries.get_mut(&ino) {
+                    e.uid = real.clone();
+                }
+            }
+            for aw in st.active_writes.values_mut() {
+                if aw.uid == *local {
+                    aw.uid = real.clone();
+                }
+            }
+        });
+        Ok(newer)
+    }
+
     /// Swap a placeholder uid for the real one across everything that keyed off
     /// it: queued children, the DB, the in-memory tree, and the caches.
     ///
@@ -985,14 +1049,17 @@ impl Core {
             .fetch_node(real)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
         // Repoints queued children and node rows, and drops the placeholder row.
+        // A no-op after `retire_create`, which has already done both.
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
 
         self.for_each_state(|st| {
-            let Some(ino) = st.by_uid.remove(local) else {
+            if let Some(ino) = st.by_uid.remove(local) {
+                st.by_uid.insert(real.clone(), ino);
+            }
+            let Some(&ino) = st.by_uid.get(real) else {
                 return;
             };
-            st.by_uid.insert(real.clone(), ino);
             if let Some(e) = st.entries.get_mut(&ino) {
                 e.uid = real.clone();
                 e.node = node.clone();
@@ -1024,6 +1091,9 @@ impl Core {
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(%real, error = %e, "db upsert_node failed after remap");
         }
+        // A write carried over from the create was made against no revision at
+        // all; the one just created is what it now replaces.
+        self.rebaseline_pending(real, &node);
         if node.is_folder() {
             // It was recorded as listed while local (it was empty and had nothing
             // to enumerate). That still holds: its queued children re-intern under

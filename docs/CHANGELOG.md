@@ -11,7 +11,29 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **`pdfs trash --json`** prints the trash listing as JSON.
+- **The FUSE acceptance suite tests the signed-in account by default.**
+  `scripts/fuse-acceptance.sh` with no arguments creates test folders in My files and new
+  on-demand and mirror sync folders, runs every case in each, and removes all of it afterwards,
+  also on a failure or interrupt. A run that dies is cleaned up by the next one. New cases cover
+  block boundaries, unusual names, a deep tree, a wide directory, rename patterns, handle coherency,
+  throughput and B100. `--offline-only` runs the account-free suite as before.
+
 ### Fixed
+- **Truncating and then writing past the end no longer brings old bytes back.** The gap
+  between the new end and the write now reads as zeros, as it should, instead of the file's
+  earlier content. When that earlier content had not been uploaded yet, the file failed with
+  `Input/output error` and its upload retried forever (B101).
+- **A write made while a new file is first uploading is no longer lost.** Drive could keep an
+  empty or older copy of a file written right after it was created, and closing a file held open
+  across its first upload could fail (B101).
+- **Removing a folder also cancels the pending uploads of the files inside it.** Before, an
+  edit that had not reached Drive yet kept retrying against the trash forever and kept its
+  staged copy on disk. `pdfs rm` now also drops what was queued for what it removes (B102).
+- **The trash no longer freezes after a server call hangs.** Until the daemon restarted, the
+  trash kept showing the same entries, and a folder just deleted could not be found there to
+  delete permanently (B103).
 - **Freshly listed files read correctly.** A file whose real size had not been fetched yet
   reported its encrypted size, about 53 bytes too big, and reading it failed with
   `Input/output error`. This happened most often right after copying a large folder. Reads and
