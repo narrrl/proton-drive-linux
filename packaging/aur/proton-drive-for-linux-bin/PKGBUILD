@@ -6,6 +6,7 @@ pkgrel=1
 pkgdesc="Unofficial Proton Drive client: FUSE files-on-demand mount, CLI, GTK4 app, tray (binaries)"
 arch=('x86_64')
 url="https://proton-drive.narl.io"
+_repo="https://github.com/narrrl/proton-drive-linux"
 license=('MIT')
 depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'dbus' 'gcc-libs' 'glibc'
          'hicolor-icon-theme')
@@ -25,7 +26,7 @@ _tag="v$pkgver"
 _raw="https://raw.githubusercontent.com/narrrl/proton-drive-linux/$_tag"
 # The release tarball holds the four binaries only, so the desktop integration
 # files come straight from the tagged tree.
-source=("proton-drive-linux-$pkgver-x86_64.tar.gz::$url/releases/download/$_tag/proton-drive-linux-$pkgver-x86_64.tar.gz"
+source=("proton-drive-linux-$pkgver-x86_64.tar.gz::$_repo/releases/download/$_tag/proton-drive-linux-$pkgver-x86_64.tar.gz"
         "io.narl.proton-drive-linux.desktop::$_raw/packaging/io.narl.proton-drive-linux.desktop"
         "io.narl.proton-drive-linux-tray.desktop::$_raw/packaging/io.narl.proton-drive-linux-tray.desktop"
         "io.narl.proton-drive-linux.svg::$_raw/packaging/io.narl.proton-drive-linux.svg"
