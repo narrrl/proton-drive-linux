@@ -11,6 +11,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **Shared roots no longer disappear when several come from one volume.** The
+  shared-with-me control listing and FUSE listing resolve roots separately to
+  avoid the SDK 0.7.1 parent-key batch collision. Child-folder listing stays batched.
+
 ## [2.8.1] — 2026-09-30
 
 Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.1**.

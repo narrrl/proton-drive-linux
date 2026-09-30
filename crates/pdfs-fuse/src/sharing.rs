@@ -463,7 +463,9 @@ impl Core {
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(crate::root_nodes::enumerate_roots(&uids, |uids| {
+                self.client.enumerate_nodes(uids)
+            }))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
         Ok(nodes
             .into_iter()

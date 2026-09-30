@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## Shared-root enumeration — per-volume parent-key collision
+
+**Status:** Fixed with an app-level workaround. Verified through read-only live listings.
+**Found:** Read-only diagnosis: independently resolving shared roots succeeded,
+while their combined listing skipped roots with missing-key errors.
+
+**Cause:** `proton-drive-rs` 0.7.1 `enumerate_nodes_detail` caches parent keys by
+`Option<LinkId>` per volume batch. Independent parentless roots all use `None`,
+so later roots are decrypted with the first root's share key. Both full and
+light enumeration use this code.
+
+**Workaround:** `pdfs-fuse/src/root_nodes.rs` materializes one root per request,
+in input order, for the control listing and FUSE shared-root publication. SDK
+skip-and-log behavior for individual unreadable nodes and request-level errors
+remain unchanged. This costs one request per root, with concurrency bounded to
+one. Device-root lookups already use singleton requests; ordinary children keep
+their batched enumeration. No SDK, schema, or service configuration changes.
+
+**Verification:** Offline regression exercises the production helper against a
+synthetic SDK seam with the same `None` collision; no credentials or live writes
+are involved. Upstream should distinguish cache keys `Parent(parent_id)` from
+`Root(link_id)` (within the volume), and test multiple independent roots in both
+full and light enumeration. Remove the workaround only after that fix is released
+and verified. Unrelated address-key parsing warnings are outside this fix.
+
 ## B111 — Renaming a file back right after renaming it fails with EIO
 
 **Status:** Fixed (unverified).

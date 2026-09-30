@@ -99,6 +99,7 @@ mod reads;
 mod redate;
 mod relocate;
 mod revisions;
+mod root_nodes;
 mod sharing;
 mod shutdown;
 mod state;
@@ -2155,7 +2156,9 @@ impl Core {
             Vec::new()
         } else {
             self.rt
-                .block_on(self.client.enumerate_nodes_light(&accepted.uids))
+                .block_on(root_nodes::enumerate_roots(&accepted.uids, |uids| {
+                    self.client.enumerate_nodes_light(uids)
+                }))
                 .map_err(|error| {
                     error!(%error, "materializing shared roots failed");
                     Errno::EIO
