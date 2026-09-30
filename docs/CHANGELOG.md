@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.8.0] — 2026-09-30
+
+Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.1**.
+
 ### Added
 - **`pdfs trash --json`** prints the trash listing as JSON.
 - **The FUSE acceptance suite tests the signed-in account by default.**
@@ -19,6 +23,17 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   also on a failure or interrupt. A run that dies is cleaned up by the next one. New cases cover
   block boundaries, unusual names, a deep tree, a wide directory, rename patterns, handle coherency,
   throughput and B100. `--offline-only` runs the account-free suite as before.
+
+### Changed
+- **The mount keeps working through a network drop.** When Drive stops answering, the daemon
+  now marks itself offline within about 20 seconds instead of failing every call for up to two
+  minutes. While offline, creating, renaming and deleting files and folders is queued instead of
+  failing with `Input/output error`, folders list from the local cache, and a read that needs
+  data from Drive waits up to 30 seconds for the connection. The daemon checks every few seconds
+  for the connection to return, then uploads the queued changes. A file whose creation timed
+  out but reached Drive anyway is taken over rather than uploaded again as a conflict copy.
+- **A dead connection is noticed sooner.** `proton-drive-rs` 0.7.1 sends TCP keepalives, so a
+  connection that died silently fails instead of waiting for its request timeout.
 
 ### Fixed
 - **Truncating and then writing past the end no longer brings old bytes back.** The gap
@@ -1326,6 +1341,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.8.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.0
 [2.7.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.7.0
 
 [2.6.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.6.2
