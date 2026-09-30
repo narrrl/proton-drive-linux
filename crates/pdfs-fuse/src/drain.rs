@@ -1537,6 +1537,7 @@ impl Core {
 
     /// Upload a staged revision of a file the server already knows about.
     pub(crate) fn drain_revision(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        let op_started = Instant::now();
         let blob = op
             .blob_path
             .clone()
@@ -1644,7 +1645,15 @@ impl Core {
         self.evict_reader(&uid);
         self.refresh_after_upload(&uid);
         self.log_activity(ActivityKind::Upload, &name, "uploaded", true);
-        info!(%uid, len = meta.len, "pending upload landed");
+        // Both times, so a slow drain shows whether the upload itself or the
+        // checks and gap-fill around it are where the time goes.
+        info!(
+            %uid,
+            len = meta.len,
+            upload_ms = took.as_millis() as u64,
+            total_ms = op_started.elapsed().as_millis() as u64,
+            "pending upload landed"
+        );
         Ok(())
     }
 
