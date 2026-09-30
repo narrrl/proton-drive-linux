@@ -215,6 +215,14 @@ starts; to switch at once:
 systemctl --user restart proton-drive.service
 ```
 
+Coming from 2.8.0 or older, re-enable the service once. Those releases hooked it into
+`default.target`, which starts it before the desktop session is ready; on KDE that crashes
+`ksecretd` at every login. Signing in again or toggling "Start on login" does this as well:
+
+```bash
+systemctl --user reenable proton-drive.service
+```
+
 Database migrations run automatically and only move forward. A database written by a newer
 release refuses to open in an older one, so downgrading means clearing the local database (see
 [Troubleshooting](TROUBLESHOOTING.md#start-over-with-a-clean-local-state)).

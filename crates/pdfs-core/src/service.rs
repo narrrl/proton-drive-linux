@@ -55,9 +55,10 @@ fn systemctl_query(args: &[&str]) -> bool {
 /// keyring checks). `--now` is a no-op on an active unit, so the daemon would
 /// keep sleeping and the mount would not appear until the next poll fired.
 /// Restarting makes the new session take effect immediately, and starts the
-/// unit when it is not running at all.
+/// unit when it is not running at all. `reenable` for the reason given on
+/// [`enable`].
 pub fn enable_start() -> bool {
-    let enabled = systemctl(&["enable"]);
+    let enabled = systemctl(&["reenable"]);
     systemctl(&["restart"]) && enabled
 }
 
@@ -97,8 +98,14 @@ pub fn is_enabled() -> bool {
 /// Enable the service so it auto-starts on future logins, without necessarily
 /// starting it now beyond what `enable` does. Used by the Settings "Start on
 /// login" switch; pairs with [`disable`](disable).
+///
+/// `reenable` rather than `enable`: older installs were enabled
+/// into `default.target.wants`, and a plain `enable` would add the new
+/// `graphical-session.target.wants` link while leaving the old one to start the
+/// unit too early. `reenable` drops every existing link and recreates them from
+/// the current `[Install]` section.
 pub fn enable() -> bool {
-    systemctl(&["enable"])
+    systemctl(&["reenable"])
 }
 
 /// Disable auto-start without stopping the running mount. Used by the Settings
