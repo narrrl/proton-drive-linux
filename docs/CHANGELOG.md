@@ -11,6 +11,19 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.8.1] — 2026-09-30
+
+Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.1**.
+
+### Fixed
+- **The service no longer starts before the desktop session.** `proton-drive.service` was
+  wanted by `default.target`, which is reached before the desktop hands `DISPLAY` /
+  `WAYLAND_DISPLAY` to the user's systemd. The first keyring call then started the Secret
+  Service without a display; on KDE `ksecretd` crashed at every login and the first start of the
+  service failed. The unit is now wanted by `graphical-session.target`. Existing installs switch
+  over on the next sign-in or "Start on login" toggle, or with
+  `systemctl --user reenable proton-drive.service` (#23).
+
 ## [2.8.0] — 2026-09-30
 
 Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.1**.
@@ -1341,6 +1354,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.1
 [2.8.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.0
 [2.7.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.7.0
 
