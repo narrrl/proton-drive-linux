@@ -559,6 +559,15 @@ impl Db {
         if listed != Some(1) {
             return Ok(None);
         }
+        drop(conn);
+        self.known_children(parent).map(Some)
+    }
+
+    /// The children the DB knows under `parent`, whether or not the folder's
+    /// listing is still marked complete. Only for when nothing better can be
+    /// had: a listing dropped as stale may miss or keep a child.
+    pub fn known_children(&self, parent: &NodeUid) -> Result<Vec<Node>> {
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT node_json FROM nodes
              WHERE parent_uid = ?1 AND node_json IS NOT NULL AND trashed = 0",
@@ -568,7 +577,7 @@ impl Db {
         for json in rows {
             out.push(serde_json::from_str(&json?)?);
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     // --- Content-cache LRU index (P4) -------------------------------------

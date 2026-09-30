@@ -88,6 +88,7 @@ mod diagnostics;
 mod drain;
 mod events;
 mod filesystem;
+mod link;
 pub use filesystem::ProtonFs;
 mod mount;
 mod pause;
@@ -155,10 +156,6 @@ const MAX_NAME_LEN: u32 = 255;
 
 /// How often the background task polls the remote event cursor.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// First and longest delay between probes for the network coming back after an
-/// offline mount (offline.md Phase 1). Doubles from min to max: a laptop shut in
-/// a bag is the common case, so the steady state must be cheap, while a brief
-/// blip should still recover in seconds.
 /// Retry backoff for a queued upload, doubling per attempt between these. The
 /// floor is short because the common failure is a brief network blip; the
 /// ceiling keeps a persistently failing op from spinning.
@@ -222,6 +219,10 @@ const DRAIN_WORKERS: usize = 3;
 /// path to go and fetch them from.
 const STAGING_ORPHAN_RETAIN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// First and longest delay between probes for the network coming back after an
+/// offline mount (offline.md Phase 1). Doubles from min to max: a laptop shut in
+/// a bag is the common case, so the steady state must be cheap, while a brief
+/// blip should still recover in seconds.
 const ONLINE_PROBE_MIN: Duration = Duration::from_secs(5);
 const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
 /// How long the persisted photos timeline stays good before a page request
@@ -533,6 +534,9 @@ struct Core {
     /// `Response::Status` so the UI can say so rather than leaving the user to
     /// infer it from a wall of EIO.
     online: Arc<AtomicBool>,
+    /// When the link went down and a condvar for its coming back; the other
+    /// half of `online` (see [`link`]).
+    link: Arc<link::Link>,
     /// When the user paused syncing, the Unix second it resumes by itself;
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
     /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
@@ -646,6 +650,9 @@ struct Core {
     /// storage moves slowly enough that a minute-old number is a better answer
     /// than either a stall or the zeroes the default implementation returns.
     quota: Arc<Mutex<Option<(std::time::Instant, i64, i64)>>>,
+    /// Set while a `statfs` is refreshing [`Core::quota`], so the others serve
+    /// the last figures instead of each holding a worker on the same request.
+    quota_refreshing: Arc<AtomicBool>,
     /// Database maintenance that has been moved off the request thread.
     ///
     /// `VACUUM` and a deep `integrity_check` both hold the single connection for
@@ -1567,7 +1574,7 @@ impl Core {
     /// follows an earlier rename of the same node. See [`retry_stale_rename`].
     pub(crate) fn rename_remote(&self, uid: &NodeUid, name: &str) -> Result<(), ProtonError> {
         retry_stale_rename(
-            || self.rt.block_on(self.client.rename_node(uid, name, None)),
+            || self.block_on_bounded(self.client.rename_node(uid, name, None)),
             || std::thread::sleep(RENAME_RETRY_DELAY),
         )
     }
@@ -1964,47 +1971,6 @@ impl Core {
         }
     }
 
-    /// Poll for the API becoming reachable again after an offline mount, then
-    /// flip `online` and refresh the root (offline.md Phase 1). Runs on its own
-    /// thread and returns once we are back online: nothing sets `online` false
-    /// again, because a mount that has been online once keeps its live event
-    /// sync, which does its own retrying.
-    ///
-    /// Backs off to [`ONLINE_PROBE_MAX`] rather than hammering a fixed interval —
-    /// a laptop can sit offline for days, and each probe is a real API round trip.
-    fn run_online_probe(&self) {
-        let mut delay = ONLINE_PROBE_MIN;
-        loop {
-            if !self.shutdown.sleep(delay) {
-                return;
-            }
-            match self.rt.block_on(self.client.get_my_files_folder()) {
-                Ok(root) => {
-                    {
-                        let mut st = self.state();
-                        if let Some(e) = st.entries.get_mut(&ROOT_INO) {
-                            e.node = root.clone();
-                        }
-                    }
-                    if let Err(e) = self.db.upsert_node(&root) {
-                        warn!(error = %e, "refresh root after reconnect failed");
-                    }
-                    self.online.store(true, Ordering::Relaxed);
-                    // Anything written while offline is queued and waiting on
-                    // exactly this.
-                    self.wake_drain();
-                    info!("back online");
-                    self.repair_primary_share_id(&root.uid);
-                    return;
-                }
-                Err(e) => {
-                    debug!(error = %e, ?delay, "online probe failed; still offline");
-                    delay = (delay * 2).min(ONLINE_PROBE_MAX);
-                }
-            }
-        }
-    }
-
     /// Whether `ino`'s listing is already in memory, i.e. whether
     /// [`Core::ensure_children`] would return without touching the network.
     /// Lets a handler decide between answering inline and handing off to a
@@ -2251,6 +2217,98 @@ impl Core {
         Ok(())
     }
 
+    /// Serve a listing without the network: the one already in memory if any,
+    /// else whatever children the DB still knows. The fallback only answers
+    /// until the link is back, when [`Core::relist_offline_listings`] drops it:
+    /// a listing dropped as stale may lack a child another device made, and a
+    /// create over that name lands as a conflict copy rather than an `EIO` now.
+    fn adopt_stale_listing(
+        &self,
+        ino: u64,
+        folder_uid: &NodeUid,
+        cached: bool,
+        primary_root: bool,
+    ) -> Result<(), Errno> {
+        if cached {
+            return Ok(());
+        }
+        let nodes = self.db.known_children(folder_uid).map_err(|e| {
+            warn!(%folder_uid, error = %e, "db known_children failed");
+            Errno::EIO
+        })?;
+        debug!(%folder_uid, count = nodes.len(), "offline: listing a folder from what the DB knows");
+        self.link.stale_listings.lock().insert(ino);
+        self.adopt_db_listing(ino, folder_uid, nodes, primary_root)
+    }
+
+    /// Relist every folder [`Core::adopt_stale_listing`] served while offline.
+    pub(crate) fn relist_offline_listings(&self) {
+        let stale = std::mem::take(&mut *self.link.stale_listings.lock());
+        if stale.is_empty() {
+            return;
+        }
+        let mut st = self.state();
+        for &ino in &stale {
+            st.invalidate_listing(ino);
+        }
+        drop(st);
+        if let Some(notifier) = self.notifier.get() {
+            for ino in stale {
+                let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+            }
+        }
+    }
+
+    /// Install `nodes`, read from the DB, as `ino`'s listing.
+    fn adopt_db_listing(
+        &self,
+        ino: u64,
+        folder_uid: &NodeUid,
+        mut nodes: Vec<Node>,
+        primary_root: bool,
+    ) -> Result<(), Errno> {
+        let folder_uid = folder_uid.clone();
+        if primary_root {
+            nodes.retain(|node| !is_virtual_uid(&node.uid));
+        }
+        // Before the lock: a DB row carries the size the server last
+        // sealed, which a queued write is ahead of (B11).
+        self.stamp_pending_sizes(&mut nodes);
+        let hidden = self.hidden.lock().clone();
+        let mut st = self.state();
+        if st.children.contains_key(&ino) {
+            return Ok(());
+        }
+        let mut child_inos = Vec::with_capacity(nodes.len());
+        let mut needs_size = Vec::new();
+        for node in nodes {
+            if !node_visible(&node, &folder_uid, &hidden) {
+                continue;
+            }
+            if matches!(
+                &node.kind,
+                NodeKind::File {
+                    claimed_size: None,
+                    ..
+                }
+            ) {
+                needs_size.push(node.uid.clone());
+            }
+            child_inos.push(st.intern_from_db(ino, node));
+        }
+        st.children.insert(ino, child_inos);
+        let root_snapshot = primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
+        drop(st);
+        self.flush_access_changes();
+        if let Some(snapshot) = root_snapshot {
+            self.reconcile_virtual_root_dentry(ino, snapshot)?;
+        }
+        // Rows persisted from a cheap enumeration whose upgrade never
+        // ran (a restart in between, say) still owe their real sizes.
+        self.spawn_size_upgrade(ino, needs_size);
+        Ok(())
+    }
+
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
@@ -2291,61 +2349,29 @@ impl Core {
             self.db.children_if_listed(&folder_uid)
         };
         match cached_nodes {
-            Ok(Some(mut nodes)) => {
-                if primary_root {
-                    nodes.retain(|node| !is_virtual_uid(&node.uid));
-                }
-                // Before the lock: a DB row carries the size the server last
-                // sealed, which a queued write is ahead of (B11).
-                self.stamp_pending_sizes(&mut nodes);
-                let hidden = self.hidden.lock().clone();
-                let mut st = self.state();
-                if st.children.contains_key(&ino) {
-                    return Ok(());
-                }
-                let mut child_inos = Vec::with_capacity(nodes.len());
-                let mut needs_size = Vec::new();
-                for node in nodes {
-                    if !node_visible(&node, &folder_uid, &hidden) {
-                        continue;
-                    }
-                    if matches!(
-                        &node.kind,
-                        NodeKind::File {
-                            claimed_size: None,
-                            ..
-                        }
-                    ) {
-                        needs_size.push(node.uid.clone());
-                    }
-                    child_inos.push(st.intern_from_db(ino, node));
-                }
-                st.children.insert(ino, child_inos);
-                let root_snapshot =
-                    primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
-                drop(st);
-                self.flush_access_changes();
-                if let Some(snapshot) = root_snapshot {
-                    self.reconcile_virtual_root_dentry(ino, snapshot)?;
-                }
-                // Rows persisted from a cheap enumeration whose upgrade never
-                // ran (a restart in between, say) still owe their real sizes.
-                self.spawn_size_upgrade(ino, needs_size);
-                return Ok(());
-            }
+            Ok(Some(nodes)) => return self.adopt_db_listing(ino, &folder_uid, nodes, primary_root),
             Ok(None) => {}
             Err(e) => warn!(%folder_uid, error = %e, "db children_if_listed failed"),
+        }
+        if !self.is_online() {
+            return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
         }
 
         let refresh_generation =
             refresh_foreign.then(|| self.shared_generation.load(Ordering::SeqCst));
-        let uids = self
+        let uids = match self
             .rt
             .block_on(self.client.enumerate_folder_children_node_uids(&folder_uid))
-            .map_err(|e| {
+        {
+            Ok(uids) => uids,
+            Err(e) if self.lost_link(&e, "list folder") => {
+                return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
+            }
+            Err(e) => {
                 error!(%folder_uid, error = %e, "enumerate folder children failed");
-                Errno::EIO
-            })?;
+                return Err(Errno::EIO);
+            }
+        };
         // Cheap enumeration: `Light` skips unlocking each *file's* node key,
         // which is an S2K derivation per file and was ~74% of the cost of a cold
         // listing (B12 — measured with `perf`, 64% of cycles in SHA-256 alone).
@@ -2355,13 +2381,16 @@ impl Core {
         // The price is that files come back without a `claimed_size`, so
         // `node_size` falls back to the *ciphertext* size until
         // `spawn_size_upgrade` below fills the real one in.
-        let mut nodes = self
-            .rt
-            .block_on(self.client.enumerate_nodes_light(&uids))
-            .map_err(|e| {
+        let mut nodes = match self.rt.block_on(self.client.enumerate_nodes_light(&uids)) {
+            Ok(nodes) => nodes,
+            Err(e) if self.lost_link(&e, "list folder") => {
+                return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
+            }
+            Err(e) => {
                 error!(%folder_uid, error = %e, "enumerate nodes failed");
-                Errno::EIO
-            })?;
+                return Err(Errno::EIO);
+            }
+        };
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
@@ -2645,9 +2674,15 @@ impl Core {
     /// wait times out, so the read cannot rely on it (bugs.md B100).
     fn resolve_provisional_size(&self, ino: u64, uid: &NodeUid) -> Option<u64> {
         let parent = self.state().entries.get(&ino)?.parent;
-        let result = self
-            .rt
-            .block_on(self.client.enumerate_nodes(std::slice::from_ref(uid)));
+        // Without a network the answer is `None` either way; the bound keeps a
+        // dead link from holding the open or read for the SDK's two minutes.
+        if !self.is_online() {
+            return None;
+        }
+        let result = self.block_on_bounded(self.client.enumerate_nodes(std::slice::from_ref(uid)));
+        if let Err(e) = &result {
+            self.lost_link(e, "settle a provisional size");
+        }
         self.apply_size_upgrade(parent, result);
         let st = self.state();
         match &st.entries.get(&ino)?.node.kind {
@@ -2874,7 +2909,9 @@ impl Core {
             Ok(Some(node)) => Ok(node),
             Ok(None) => Err(Errno::ENOENT),
             Err(e) => {
-                error!(%uid, error = %e, "enumerate node failed");
+                if !self.lost_link(&e, "fetch node") {
+                    error!(%uid, error = %e, "enumerate node failed");
+                }
                 Err(Errno::EIO)
             }
         }
@@ -2884,10 +2921,7 @@ impl Core {
     /// resolving a conflict turns on *why* a call failed, and "the node is not
     /// there" (`Ok(None)`) is a different outcome from "we could not ask".
     fn fetch_node_remote(&self, uid: &NodeUid) -> Result<Option<Node>, ProtonError> {
-        match self
-            .rt
-            .block_on(self.client.enumerate_nodes(std::slice::from_ref(uid)))
-        {
+        match self.block_on_bounded(self.client.enumerate_nodes(std::slice::from_ref(uid))) {
             Ok(nodes) => Ok(nodes.into_iter().next()),
             // An unknown uid is reported either as an empty result or as an
             // outright refusal, depending on the endpoint.
@@ -4487,12 +4521,19 @@ impl Core {
             debug!(%uid, name, "replaced a node whose create was still queued");
             return Ok(());
         }
+        // Offline, or the network goes away under the call: queue the trash.
+        // The rename that follows queues as well, behind it.
+        if !self.is_online() {
+            return self.queue_trash(uid, name);
+        }
         self.require_uid_writable(uid)?;
         if let Err(e) = self
-            .rt
-            .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
+            .block_on_bounded(self.client.trash_nodes(std::slice::from_ref(uid)))
             .and_then(batch::into_unit)
         {
+            if self.lost_link(&e, "trash a replaced node") {
+                return self.queue_trash(uid, name);
+            }
             error!(%uid, name, error = %e, "trashing the node a rename replaces failed");
             self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
             return Err(Errno::EIO);
@@ -8217,6 +8258,21 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_lists_from_the_db_while_the_link_is_down() {
+        // A listing dropped as stale mid-run, then a drop: every create in that
+        // folder looks the name up first, and answered EIO for want of it.
+        let ensure = function_source(include_str!("lib.rs"), "fn ensure_children(");
+        assert_before(
+            ensure,
+            "if !self.is_online()",
+            "enumerate_folder_children_node_uids",
+        );
+        assert_eq!(ensure.matches("adopt_stale_listing(").count(), 3);
+        let online = function_source(include_str!("link.rs"), "fn mark_online(");
+        assert!(online.contains("self.relist_offline_listings();"));
+    }
+
+    #[test]
     fn a_remote_read_gives_up_at_its_deadline() {
         // The SDK bounds requests, not reads; a stalled link held one `read`
         // for 34 minutes.
@@ -8224,11 +8280,12 @@ mod tests {
         assert_before(
             remote,
             "let fetch = async",
-            "tokio::time::timeout(READ_FETCH_TIMEOUT, fetch)",
+            "tokio::time::timeout(budget, fetch)",
         );
+        assert!(remote.contains("let deadline = Instant::now() + READ_FETCH_TIMEOUT;"));
         // Built inside the runtime: a FUSE worker has no reactor, and a timer
         // built there panicked every remote read.
-        assert!(remote.contains("async { tokio::time::timeout(READ_FETCH_TIMEOUT, fetch).await }"));
+        assert!(remote.contains("async { tokio::time::timeout(budget, fetch).await }"));
     }
 
     #[test]

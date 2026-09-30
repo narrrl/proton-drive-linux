@@ -45,6 +45,12 @@ pub(super) const PREFETCH_BUDGET: usize = 8;
 /// caller can retry beats a process stuck in `D` state.
 pub(super) const READ_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long a read of blocks nothing has cached waits for a lost link to come
+/// back before failing. Long enough to ride out a Wi-Fi blip, short enough
+/// that a program reading while the laptop is really offline gets its `EIO`
+/// before the user gives up on it.
+const READ_OFFLINE_WAIT: Duration = Duration::from_secs(30);
+
 /// Cap on tracked sequential streams. Only reads in progress matter, so the map
 /// is cleared wholesale rather than aged — losing the ramp costs one read.
 const MAX_PREFETCH_STREAMS: usize = 256;
@@ -373,6 +379,7 @@ impl Core {
                     let result = match self.client.open_revision(uid).await {
                         Ok(reader) => Ok(Arc::new(reader)),
                         Err(e) => {
+                            self.lost_link(&e, "open a revision");
                             warn!(%uid, error = %e, "open_revision failed");
                             Err(Errno::EIO)
                         }
@@ -658,6 +665,7 @@ impl Core {
                     .store_block_geometry(uid, mtime, fsize, reader.block_sizes());
             }
             let bytes = reader.read_at(span.start, span.len).await.map_err(|e| {
+                self.lost_link(&e, "read a block");
                 warn!(%uid, start = span.start, len = span.len, error = %e, "block read failed");
                 Errno::EIO
             })?;
@@ -948,43 +956,67 @@ impl Core {
         }
 
         if !misses.is_empty() {
-            let fetch = async {
-                // Resolve the file's keys and block table once, then read every
-                // missing block through the shared reader. Previously each block
-                // called `download_range`, which redid that resolution per block.
-                let reader = self.revision_reader(uid, mtime, fsize).await?;
+            // One deadline for the whole read, including any wait for a lost
+            // link. A fetch that failed because the link went down is tried
+            // once more when it is back, so a blip is a slow read, not an `EIO`.
+            let deadline = Instant::now() + READ_FETCH_TIMEOUT;
+            let mut retried = false;
+            let fetched = loop {
+                if !self.is_online() {
+                    let wait =
+                        READ_OFFLINE_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+                    if !self.wait_online(wait) {
+                        debug!(%uid, offset, len, "read of uncached blocks while offline; failing it");
+                        return Err(Errno::EIO);
+                    }
+                }
+                let fetch = async {
+                    // Resolve the file's keys and block table once, then read every
+                    // missing block through the shared reader. Previously each block
+                    // called `download_range`, which redid that resolution per block.
+                    let reader = self.revision_reader(uid, mtime, fsize).await?;
 
-                let mut set = tokio::task::JoinSet::new();
-                for &span in &misses {
-                    let (core, reader, uid) = (self.clone(), reader.clone(), uid.clone());
-                    set.spawn(async move {
-                        core.fetch_block(&reader, &uid, mtime, fsize, span, cache_blocks)
-                            .await
-                            .map(|bytes| (span.idx, bytes))
-                    });
+                    let mut set = tokio::task::JoinSet::new();
+                    for &span in &misses {
+                        let (core, reader, uid) = (self.clone(), reader.clone(), uid.clone());
+                        set.spawn(async move {
+                            core.fetch_block(&reader, &uid, mtime, fsize, span, cache_blocks)
+                                .await
+                                .map(|bytes| (span.idx, bytes))
+                        });
+                    }
+                    let mut out = Vec::with_capacity(misses.len());
+                    while let Some(joined) = set.join_next().await {
+                        // A join error means the task panicked; surface it as EIO.
+                        out.push(joined.map_err(|_| Errno::EIO)??);
+                    }
+                    Ok::<_, Errno>(out)
+                };
+                // Dropping the fetch on the deadline aborts the block tasks with
+                // it; blocks that already landed stay cached for the retry. The
+                // timer is built inside the runtime: a FUSE worker has no reactor
+                // of its own, and building it out here panicked every remote read.
+                let budget = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .rt
+                    .block_on(async { tokio::time::timeout(budget, fetch).await })
+                {
+                    Ok(Ok(fetched)) => break fetched,
+                    // The fetch saw the link go down; the top of the loop waits
+                    // for it within what is left of the deadline.
+                    Ok(Err(_)) if !retried && !self.is_online() => retried = true,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        warn!(
+                            %uid, offset, len, secs = READ_FETCH_TIMEOUT.as_secs(),
+                            "read got no answer from the network in time; failing it"
+                        );
+                        self.evict_reader(uid);
+                        self.mark_offline("read", &crate::link::no_answer(READ_FETCH_TIMEOUT));
+                        return Err(Errno::EIO);
+                    }
                 }
-                let mut out = Vec::with_capacity(misses.len());
-                while let Some(joined) = set.join_next().await {
-                    // A join error means the task panicked; surface it as EIO.
-                    out.push(joined.map_err(|_| Errno::EIO)??);
-                }
-                Ok::<_, Errno>(out)
             };
-            // Dropping the fetch on the deadline aborts the block tasks with it;
-            // blocks that already landed stay cached for the retry. The timer is
-            // built inside the runtime: a FUSE worker has no reactor of its own,
-            // and building it out here panicked every remote read.
-            let fetched = self
-                .rt
-                .block_on(async { tokio::time::timeout(READ_FETCH_TIMEOUT, fetch).await })
-                .unwrap_or_else(|_| {
-                    warn!(
-                        %uid, offset, len, secs = READ_FETCH_TIMEOUT.as_secs(),
-                        "read got no answer from the network in time; failing it"
-                    );
-                    self.evict_reader(uid);
-                    Err(Errno::EIO)
-                })?;
             for (bidx, bytes) in fetched {
                 blocks[(bidx - first) as usize] = Some(bytes);
             }

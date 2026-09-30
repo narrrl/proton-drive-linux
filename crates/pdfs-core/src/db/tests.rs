@@ -788,6 +788,8 @@ fn children_if_listed_gated_on_flag() {
 
     // Not listed yet → unknown, force a re-fetch.
     assert!(db.children_if_listed(&uid("root")).unwrap().is_none());
+    // Still known, for a caller that has nothing better while offline.
+    assert_eq!(db.known_children(&uid("root")).unwrap().len(), 2);
 
     db.set_listed(&uid("root"), true).unwrap();
     let kids = db.children_if_listed(&uid("root")).unwrap().unwrap();
@@ -2456,6 +2458,20 @@ fn atomic_trash_replacement_returns_owned_blobs_after_commit() {
     assert_eq!(ops[0].uid, root);
     assert_eq!(ops[0].name.as_deref(), Some("removed.txt"));
     assert!(ops[0].blob_path.is_none());
+}
+
+#[test]
+fn a_queued_trash_holds_its_name_until_it_lands() {
+    let db = Db::open_in_memory().unwrap();
+    let node = uid("held-name").to_string();
+    assert!(!db.has_pending_trash_named("report.txt").unwrap());
+
+    let (trash_id, _) = db.replace_ops_with_trash(&node, "report.txt", 1).unwrap();
+    assert!(db.has_pending_trash_named("report.txt").unwrap());
+    assert!(!db.has_pending_trash_named("other.txt").unwrap());
+
+    db.delete_op(trash_id).unwrap();
+    assert!(!db.has_pending_trash_named("report.txt").unwrap());
 }
 
 #[test]

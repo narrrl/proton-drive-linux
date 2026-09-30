@@ -1501,47 +1501,55 @@ impl ProtonFs {
         //
         // A parent that is itself still queued forces the same path even when we
         // are online: the API has no folder to put this in yet.
-        let node =
-            if !transient && self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid)
-            {
-                if let Err(error) = self.core.require_uid_writable(&parent_uid) {
-                    reply.error(error);
+        //
+        // A create that set out online and lost the network on the way lands in
+        // the queue too, so a Wi-Fi drop costs the caller a wait, never an EIO.
+        let minted = if !transient && self.core.is_online() && !is_local_uid(&parent_uid) {
+            if let Err(error) = self.core.require_uid_writable(&parent_uid) {
+                reply.error(error);
+                return;
+            }
+            // Create an empty file on the remote so it has a real uid immediately;
+            // written bytes are buffered and sealed as a new revision on close.
+            match self.core.block_on_bounded(self.core.client.upload_file(
+                &parent_uid,
+                name,
+                media_type_for(name),
+                b"",
+            )) {
+                Ok(new_uid) => match self.core.fetch_node(&new_uid) {
+                    Ok(n) => Some(n),
+                    // The file exists remotely but we could not read it back.
+                    // The queued create finds it by name and adopts it.
+                    Err(e) if e == Errno::EIO && !self.core.is_online() => None,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                },
+                Err(e) if self.core.lost_link(&e, "create") => None,
+                Err(e) => {
+                    error!(%parent_uid, name, error = %e, "create file failed");
+                    reply.error(Errno::EIO);
                     return;
                 }
-                // Create an empty file on the remote so it has a real uid immediately;
-                // written bytes are buffered and sealed as a new revision on close.
-                let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
-                    &parent_uid,
-                    name,
-                    media_type_for(name),
-                    b"",
-                )) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        error!(%parent_uid, name, error = %e, "create file failed");
-                        reply.error(Errno::EIO);
-                        return;
-                    }
-                };
-                match self.core.fetch_node(&new_uid) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        reply.error(e);
-                        return;
-                    }
+            }
+        } else {
+            None
+        };
+        let node = match minted {
+            Some(node) => node,
+            None => match self
+                .core
+                .queue_local_node(&parent_uid, name, false, transient)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    reply.error(e);
+                    return;
                 }
-            } else {
-                match self
-                    .core
-                    .queue_local_node(&parent_uid, name, false, transient)
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        reply.error(e);
-                        return;
-                    }
-                }
-            };
+            },
+        };
         let new_uid = node.uid.clone();
         // The base this handle writes over is the node as it actually exists —
         // the empty file the server just minted — so its modification time comes
@@ -1631,39 +1639,43 @@ impl ProtonFs {
         // As in `create`: offline — or under a parent that is itself still
         // queued — the folder becomes a placeholder that the drain turns into a
         // real one (offline.md Phase 3b).
-        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
+        // Losing the network on the way queues it the same way.
+        let minted = if self.core.is_online() && !is_local_uid(&parent_uid) {
             if let Err(error) = self.core.require_uid_writable(&parent_uid) {
                 reply.error(error);
                 return;
             }
-            let new_uid =
-                match self
-                    .core
-                    .rt
-                    .block_on(self.core.client.create_folder(&parent_uid, name, now))
-                {
-                    Ok(u) => u,
+            match self
+                .core
+                .block_on_bounded(self.core.client.create_folder(&parent_uid, name, now))
+            {
+                Ok(new_uid) => match self.core.fetch_node(&new_uid) {
+                    Ok(n) => Some(n),
+                    Err(e) if e == Errno::EIO && !self.core.is_online() => None,
                     Err(e) => {
-                        error!(%parent_uid, name, error = %e, "create folder failed");
-                        reply.error(Errno::EIO);
+                        reply.error(e);
                         return;
                     }
-                };
-            match self.core.fetch_node(&new_uid) {
-                Ok(n) => n,
+                },
+                Err(e) if self.core.lost_link(&e, "mkdir") => None,
                 Err(e) => {
-                    reply.error(e);
+                    error!(%parent_uid, name, error = %e, "create folder failed");
+                    reply.error(Errno::EIO);
                     return;
                 }
             }
         } else {
-            match self.core.queue_local_node(&parent_uid, name, true, false) {
+            None
+        };
+        let node = match minted {
+            Some(node) => node,
+            None => match self.core.queue_local_node(&parent_uid, name, true, false) {
                 Ok(n) => n,
                 Err(e) => {
                     reply.error(e);
                     return;
                 }
-            }
+            },
         };
         let mut st = self.core.state();
         let local = is_local_uid(&node.uid);
@@ -1985,12 +1997,11 @@ impl ProtonFs {
         // take the synchronous path, so a genuine API refusal (permissions, a
         // name clash) surfaces to the caller instead of becoming a queued op
         // that can only ever conflict.
-        if rename_needs_queue(
-            self.core.online.load(Ordering::Relaxed),
-            is_local_uid(&new_parent_uid),
-            newparent != parent,
-            newname != name,
-        ) {
+        // The queued rename, as a closure: the network going away under the
+        // synchronous path below lands here too, with whatever half already
+        // reached Drive. The op records the end state, so the drain finishes
+        // the rest.
+        let queue_it = |reply: ReplyEmpty| {
             let queued = if replacement_authorized {
                 self.core.queue_rename_authorized(
                     ino,
@@ -2031,6 +2042,14 @@ impl ProtonFs {
                     reply.error(e);
                 }
             }
+        };
+        if rename_needs_queue(
+            self.core.is_online(),
+            is_local_uid(&new_parent_uid),
+            newparent != parent,
+            newname != name,
+        ) {
+            queue_it(reply);
             return;
         }
         // Rename first if both halves change. Moving first makes the encrypted
@@ -2051,6 +2070,10 @@ impl ProtonFs {
         if newname != name
             && let Err(e) = self.core.rename_remote(&uid, newname)
         {
+            if self.core.lost_link(&e, "rename") {
+                queue_it(reply);
+                return;
+            }
             error!(%uid, error = %e, "rename failed");
             self.core.restore_replaced(victim.as_ref(), newname);
             reply.error(Errno::EIO);
@@ -2061,8 +2084,7 @@ impl ProtonFs {
             let moved = loop {
                 match self
                     .core
-                    .rt
-                    .block_on(self.core.client.move_node(&uid, &new_parent_uid))
+                    .block_on_bounded(self.core.client.move_node(&uid, &new_parent_uid))
                 {
                     Ok(()) => break Ok(()),
                     Err(e)
@@ -2081,6 +2103,10 @@ impl ProtonFs {
                 }
             };
             if let Err(e) = moved {
+                if self.core.lost_link(&e, "move") {
+                    queue_it(reply);
+                    return;
+                }
                 error!(%uid, attempts, error = %e, "move after rename failed");
                 // The rename half landed in the source directory.
                 let mut state = self.core.state();
@@ -2158,12 +2184,14 @@ impl ProtonFs {
         }
         // Offline: queue it. Trashing is the one mutation a user expects to work
         // regardless — the file is gone from their point of view the moment the
-        // command returns (offline.md Phase 3b).
-        if !self.core.online.load(Ordering::Relaxed) {
-            match self.core.queue_trash(&uid, name) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
-            }
+        // command returns (offline.md Phase 3b). The same when the network goes
+        // away under the remote call below.
+        let queue_it = |reply: ReplyEmpty| match self.core.queue_trash(&uid, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        };
+        if !self.core.is_online() {
+            queue_it(reply);
             return;
         }
         if let Err(e) = self.core.require_uid_writable(&uid) {
@@ -2172,10 +2200,13 @@ impl ProtonFs {
         }
         if let Err(e) = self
             .core
-            .rt
-            .block_on(self.core.client.trash_nodes(std::slice::from_ref(&uid)))
+            .block_on_bounded(self.core.client.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
         {
+            if self.core.lost_link(&e, "trash") {
+                queue_it(reply);
+                return;
+            }
             error!(%uid, error = %e, "trash failed");
             self.core
                 .log_activity(ActivityKind::Trash, name, e.to_string(), false);

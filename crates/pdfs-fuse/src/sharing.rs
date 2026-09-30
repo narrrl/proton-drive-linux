@@ -610,10 +610,10 @@ impl Core {
     /// Proton products (not Drive-only). A remote round-trip; nothing here is
     /// cached.
     pub(crate) fn account_quota(&self) -> CoreResult<(i64, i64)> {
-        let q = self
-            .rt
-            .block_on(self.client.quota())
-            .map_err(|e| CoreError::from_api(&e, "account quota"))?;
+        let q = self.block_on_bounded(self.client.quota()).map_err(|e| {
+            self.lost_link(&e, "account quota");
+            CoreError::from_api(&e, "account quota")
+        })?;
         *self.quota.lock() = Some((std::time::Instant::now(), q.max_space, q.used_space));
         Ok((q.max_space, q.used_space))
     }
@@ -632,11 +632,22 @@ impl Core {
         {
             return Some((max_space, used_space));
         }
-        match self.account_quota() {
+        let last = || self.quota.lock().map(|(_, max, used)| (max, used));
+        if !self.is_online()
+            || self
+                .quota_refreshing
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return last();
+        }
+        let refreshed = self.account_quota();
+        self.quota_refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
+        match refreshed {
             Ok(q) => Some(q),
             Err(error) => {
                 debug!(%error, "account quota refresh failed; serving the last known figures");
-                self.quota.lock().map(|(_, max, used)| (max, used))
+                last()
             }
         }
     }

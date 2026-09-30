@@ -378,9 +378,10 @@ pub(super) async fn run_event_sync(
     info!(?cursor, "event sync started");
 
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        let events = match client.enumerate_events(&scope, cursor.as_ref()).await {
+        core.next_poll(POLL_INTERVAL).await;
+        let events = match link::bounded(client.enumerate_events(&scope, cursor.as_ref())).await {
             Ok(events) => events,
+            Err(e) if core.lost_link(&e, "poll events") => continue,
             Err(e) => {
                 warn!(error = %e, "event poll failed; retrying after interval");
                 continue;
@@ -471,9 +472,10 @@ pub(super) async fn run_photos_event_sync(core: Core) {
     info!(?cursor, "photo event sync started");
 
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        let events = match photos.enumerate_events(&scope, cursor.as_ref()).await {
+        core.next_poll(POLL_INTERVAL).await;
+        let events = match link::bounded(photos.enumerate_events(&scope, cursor.as_ref())).await {
             Ok(events) => events,
+            Err(error) if core.lost_link(&error, "poll photo events") => continue,
             Err(error) => {
                 warn!(%error, "photo event poll failed; retrying after interval");
                 continue;

@@ -38,7 +38,7 @@ use pdfs_core::db::{
 };
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{Node, NodeMoveItem};
+use proton_drive_rs::{Node, NodeKind, NodeMoveItem};
 use tracing::{debug, error, info, warn};
 
 use super::state::{Intervals, PendingRevision};
@@ -673,6 +673,9 @@ impl Core {
                 // *different* name is the non-destructive resolution: it neither
                 // clobbers their file nor drops ours, and it is visible.
                 Err(e) if is_already_exists(&e) => {
+                    if self.db.has_pending_trash_named(&name)? {
+                        return Err(held_by_queued_trash(&name));
+                    }
                     let alt = conflict_name(&name, now_secs());
                     warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
                     self.move_renaming(&uid, &parent, Some(&alt))?;
@@ -696,8 +699,8 @@ impl Core {
                     let landed = match self.drain_rename_in_place(&uid, &node.name, &name) {
                         Ok(landed) => landed,
                         // The node went with it; nothing is left to rename.
-                        Err(e) if is_gone(&e) => node.name.clone(),
-                        Err(e) => return Err(e.into()),
+                        Err(e) if is_gone(e.as_ref()) => node.name.clone(),
+                        Err(e) => return Err(e),
                     };
                     self.log_activity(
                         ActivityKind::Rename,
@@ -725,13 +728,16 @@ impl Core {
         uid: &NodeUid,
         current: &str,
         name: &str,
-    ) -> Result<String, ProtonError> {
+    ) -> Result<String, Box<dyn std::error::Error>> {
         if current == name {
             return Ok(current.to_string());
         }
         match self.rename_remote(uid, name) {
             Ok(()) => Ok(name.to_string()),
             Err(e) if is_already_exists(&e) => {
+                if self.db.has_pending_trash_named(name)? {
+                    return Err(held_by_queued_trash(name));
+                }
                 let alt = conflict_name(name, now_secs());
                 warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
                 self.rename_remote(uid, &alt)?;
@@ -744,7 +750,7 @@ impl Core {
                 );
                 Ok(alt)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -842,8 +848,26 @@ impl Core {
         // reachable only because the op waited, which is the whole point of the
         // queue. Never overwrite theirs and never drop ours: land under a
         // conflict name, exactly as the sync engine does.
+        //
+        // Two things can hold the name that are not someone else's file. The
+        // node a create made before the network dropped its answer is ours: the
+        // create was queued because nobody heard back, so adopt it. And a node
+        // whose trash is still queued is about to let go of it.
         let mut name = wanted.clone();
+        let mut adopted = false;
         let mut real = self.create_drained_node(op, &parent, &name);
+        if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
+            && let Some(twin) = self.adoptable_twin(op, &parent, &wanted)?
+        {
+            info!(%local, %twin, wanted, "the name is held by our own unanswered create; adopting it");
+            real = Ok(twin);
+            adopted = true;
+        }
+        if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
+            && self.db.has_pending_trash_named(&wanted)?
+        {
+            return Err(held_by_queued_trash(&wanted));
+        }
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref())) {
             name = conflict_name(&wanted, now_secs());
             warn!(%local, wanted, name, "name is taken remotely; creating under a conflict name");
@@ -886,14 +910,17 @@ impl Core {
         // Retire the op before touching anything else: if we crash here the node
         // exists remotely and the local placeholder is reconciled by the event
         // sync, whereas a surviving op would create the file a second time.
-        let newer = self.retire_create(op, &local, &real)?;
+        // An adopted node was made empty, so a blob this op carries has not been
+        // uploaded: it goes on as a revision of the node instead.
+        let uploaded = (!adopted).then_some(op.blob_path.as_deref()).flatten();
+        let newer = self.retire_create(op, uploaded, &local, &real)?;
         self.adopt_real_uid(&local, &real)?;
         // The feed will report this create back to us; the tree already has it
         // under its real uid, so that event is ours to ignore (`Core::self_changes`).
         self.note_self_change(&real);
         // The uploaded blob is done with either way: a write that replaced it
         // while it was on the wire already discarded it when it attached.
-        if let Some(blob) = op.blob_path.as_deref() {
+        if let Some(blob) = uploaded {
             self.cache.discard_staged(Path::new(blob));
         }
         if newer {
@@ -903,6 +930,40 @@ impl Core {
         self.log_activity(ActivityKind::Upload, &name, "created", true);
         info!(%local, %real, name, kind = %op.kind, "pending create landed");
         Ok(())
+    }
+
+    /// The node already holding `name` under `parent`, if it is the one an
+    /// earlier attempt at this op made before its answer was lost.
+    ///
+    /// A create that timed out may still have landed; the op was queued because
+    /// the caller never heard back. Without this, its replay forked a
+    /// `(sync-conflict)` copy of a file nobody else had touched.
+    fn adoptable_twin(
+        &self,
+        op: &PendingOp,
+        parent: &NodeUid,
+        name: &str,
+    ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
+        let uids = self
+            .rt
+            .block_on(self.client.enumerate_folder_children_node_uids(parent))?;
+        let children = self.rt.block_on(self.client.enumerate_nodes_light(&uids))?;
+        let Some(twin) = children
+            .into_iter()
+            .find(|node| node.name == name && !node.trashed)
+        else {
+            return Ok(None);
+        };
+        // The light listing carries no file size, and an adoptable file is
+        // exactly an empty one.
+        let twin = match twin.kind {
+            NodeKind::Folder => twin,
+            NodeKind::File { .. } => match self.fetch_node_remote(&twin.uid)? {
+                Some(node) => node,
+                None => return Ok(None),
+            },
+        };
+        Ok(adoptable(op.kind == OP_MKDIR, &twin, op.created_at).then_some(twin.uid))
     }
 
     /// Make one queued `create`/`mkdir` real under a given name, and hand back
@@ -981,23 +1042,20 @@ impl Core {
     fn retire_create(
         &self,
         op: &PendingOp,
+        uploaded: Option<&str>,
         local: &NodeUid,
         real: &NodeUid,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let real_str = real.to_string();
         let newer = {
             let mut pending = self.pending.lock();
-            let newer = self.db.finish_create(
-                op.id,
-                op.blob_path.as_deref(),
-                &local.to_string(),
-                &real_str,
-                |json| {
-                    let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
-                    meta.uid = real_str.clone();
-                    serde_json::to_string(&meta).ok()
-                },
-            )?;
+            let newer =
+                self.db
+                    .finish_create(op.id, uploaded, &local.to_string(), &real_str, |json| {
+                        let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
+                        meta.uid = real_str.clone();
+                        serde_json::to_string(&meta).ok()
+                    })?;
             pending.remove(local);
             if let Some((blob, json)) = &newer {
                 let meta: StagedWrite = serde_json::from_str(json)?;
@@ -1796,6 +1854,31 @@ fn park_verdict(created_at: i64, now: i64, open: bool) -> ParkVerdict {
     ParkVerdict::Release
 }
 
+/// The retryable error for an op whose name a queued trash has yet to free.
+fn held_by_queued_trash(name: &str) -> Box<dyn std::error::Error> {
+    format!("{name} is still held by a node whose trash is queued").into()
+}
+
+/// How much older than its op a remote node may be and still be the one an
+/// unanswered call made. The op is queued the moment the call gives up, so the
+/// node is at most one call's deadline older; the rest is clock skew between
+/// this machine and Proton.
+const ADOPT_WINDOW_MS: i64 = 2 * 60 * 1000;
+
+/// Whether `twin`, found holding the name a queued create wants, is the node an
+/// earlier, unanswered attempt at that create made: the same kind, created
+/// around when the op was queued, and for a file still empty, as the mount's
+/// create leaves it.
+fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64) -> bool {
+    if twin.creation_time.saturating_mul(1000) < op_created_ms - ADOPT_WINDOW_MS {
+        return false;
+    }
+    match &twin.kind {
+        NodeKind::Folder => is_dir,
+        NodeKind::File { claimed_size, .. } => !is_dir && *claimed_size == Some(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2173,6 +2256,29 @@ mod tests {
             direct_role: None,
             share_id: None,
         }
+    }
+
+    #[test]
+    fn only_a_fresh_empty_twin_of_the_same_kind_is_adopted() {
+        // The op was queued at t=1000 s, after a create that got no answer.
+        let queued = 1_000_000;
+        let made = |mut node: Node, secs: i64| {
+            node.creation_time = secs;
+            node
+        };
+        assert!(adoptable(false, &made(file_node(0, 0, None), 990), queued));
+        assert!(adoptable(true, &made(folder_node("d", None), 990), queued));
+        // Made long before the op: someone else's file, not our lost create.
+        assert!(!adoptable(false, &made(file_node(0, 0, None), 800), queued));
+        // Our create leaves a file empty; one with content is someone else's.
+        assert!(!adoptable(false, &made(file_node(0, 5, None), 990), queued));
+        // The kind has to match what the op makes.
+        assert!(!adoptable(true, &made(file_node(0, 0, None), 990), queued));
+        assert!(!adoptable(
+            false,
+            &made(folder_node("d", None), 990),
+            queued
+        ));
     }
 
     fn baseline(mtime: i64, size: u64, rev: Option<&str>) -> Baseline {

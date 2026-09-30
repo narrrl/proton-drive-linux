@@ -383,6 +383,7 @@ pub fn mount(
         shared_generation: Arc::new(AtomicU64::new(0)),
         shared_refresh_deadlines: Arc::new(Mutex::new(SharedRefreshDeadlines::default())),
         online: Arc::new(AtomicBool::new(online)),
+        link: Arc::new(Default::default()),
         sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
@@ -411,6 +412,7 @@ pub fn mount(
         thumbnail_build_cancel: Arc::new(tokio::sync::Notify::new()),
         thumbnail_misses: Arc::new(Mutex::new(Default::default())),
         quota: Arc::new(Mutex::new(None)),
+        quota_refreshing: Arc::new(AtomicBool::new(false)),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),
         size_waiters: Arc::new(Default::default()),
         notifier: Arc::new(OnceLock::new()),
@@ -484,9 +486,10 @@ pub fn mount(
         );
     }
 
-    // Mounted from the cache: watch for the network coming back so the mount can
-    // stop being read-only-ish without the user restarting the daemon.
-    if !online {
+    // Watch the link for the life of the mount: a mount from the cache waits for
+    // the network to come back, and an online one can lose it at any moment and
+    // must notice it coming back just the same.
+    {
         let core = core.clone();
         workers.push(
             std::thread::Builder::new()

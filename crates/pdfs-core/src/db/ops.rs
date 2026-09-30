@@ -220,6 +220,24 @@ pub struct AttachedBlob {
 }
 
 impl Db {
+    /// Whether a queued trash still holds `name` somewhere.
+    ///
+    /// A replacing rename or a delete-then-recreate queues the trash of the old
+    /// node ahead of the op that wants its name. With several drain workers the
+    /// later op can run first and find the name still taken; this tells it to
+    /// wait for the trash rather than land under a conflict name.
+    pub fn has_pending_trash_named(&self, name: &str) -> Result<bool> {
+        let conn = self.read();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pending_op WHERE kind = ?1 AND name = ?2
+             )",
+            params![OP_TRASH, name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     /// Whether a specific desired-state operation is still queued for a node.
     pub fn has_pending_op(&self, uid: &str, kind: &str) -> Result<bool> {
         let conn = self.read();
