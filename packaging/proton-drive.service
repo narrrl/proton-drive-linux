@@ -32,4 +32,10 @@ MemoryMax=6G
 TimeoutStopSec=15
 
 [Install]
-WantedBy=default.target
+# Not default.target: that is reached before the desktop has exported DISPLAY /
+# WAYLAND_DISPLAY to the user manager, so After= above never orders anything
+# (the two targets are not in the same start transaction). The daemon's first
+# keyring call then D-Bus-activates the Secret Service without a display —
+# on KDE ksecretd aborts, the start fails, and every login leaves a coredump.
+# Being pulled in by the graphical session starts it only once that is up.
+WantedBy=graphical-session.target
