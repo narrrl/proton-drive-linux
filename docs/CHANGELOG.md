@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.8.2] — 2026-10-01
+
+Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.2**.
+
 ### Fixed
 - **Folders shared with you no longer go missing when one person shared several.** When
   several accepted shares came from the same owner's volume, only the first appeared under
@@ -1360,6 +1364,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.8.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.2
 [2.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.1
 [2.8.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.0
 [2.7.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.7.0
