@@ -12,6 +12,27 @@ Conventions:
 
 ---
 
+## B112 — Folders shared by the same person disappear from Shared with me
+
+**Status:** Fixed (unverified).
+**Found:** 2026-09-30, reported in #25. An account with several accepted shares from one other
+account listed only some of them, in both the control listing and the FUSE mount. The journal
+showed `skipping undecryptable node ... failed to decrypt: missing key`. Each missing folder
+opened on the Proton Drive website and resolved when the SDK was asked for it alone.
+
+**Where:** `proton-drive-rs` 0.7.1, `enumerate_nodes_detail`, which serves both
+`enumerate_nodes` and `enumerate_nodes_light`. The app hit it in `list_shared_with_me`
+(`crates/pdfs-fuse/src/sharing.rs`) and in the shared-root listing in
+`crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** The SDK cached parent keys per batch by the link's parent id. Every share root has
+no parent, so all roots on one volume shared the `None` entry, and the roots after the first were
+decrypted with the first root's share key (proton-sdk-rs#2).
+
+**Fix.** Require `proton-drive-rs` 0.7.2, which names each key `Parent(folder)` or `Root(link)`.
+No app code changes. The app-side workaround in #25, one SDK call per root, is not needed.
+Unverified: no account with several shares from one owner has listed through 0.7.2 yet.
+
 ## B111 — Renaming a file back right after renaming it fails with EIO
 
 **Status:** Fixed (unverified).

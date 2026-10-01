@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **Folders shared with you no longer go missing when one person shared several.** When
+  several accepted shares came from the same owner's volume, only the first appeared under
+  Shared with me, and the rest were skipped with `missing key`. `proton-drive-rs` 0.7.2 resolves
+  each shared root with its own key (B112, #25).
+
 ## [2.8.1] — 2026-09-30
 
 Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.1**.
