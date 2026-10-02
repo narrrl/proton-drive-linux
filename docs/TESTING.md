@@ -74,6 +74,44 @@ removes its directory on success, failure, or interruption:
 scripts/fuse-acceptance.sh --live /mnt/on-demand-testmount
 ```
 
+### Reading the output
+
+A run opens with what it is about to test: the mode, the `pdfs` binary and its
+version, Python and the kernel, the per-case limit, the options and the start
+time. Each target then names its root, the storage behind it, the daemon it
+talks to and how many cases it runs, followed by one line per case:
+
+```
+==> live FUSE /mnt/testmount
+  -> root      /mnt/testmount/pdfs-acceptance-…
+  -> storage   FUSE mount /mnt/testmount (fuse.protondrive)
+  -> daemon    pdfs 2.8.3, user@proton.me, online, 0 queued ops
+  -> cases     37 of 37
+  [ 1/37] creation and open flags .................................. ok       0.41s
+  …
+  [21/37] throughput floors ........................................ ok      48.20s
+          write 31 MiB/s, read 54 MiB/s, 4 KiB writes 12.0 MiB/s, metadata 9 ops/s
+  …
+  [36/37] open B115: pdfs ls reports a file's real size ............ known    6.12s
+          B115: pdfs ls shows …
+  -> reference matches the ordinary filesystem in 412 compared observations
+  -> result    35 passed, 1 skipped, 1 known issue in 9m41s
+```
+
+A case ends as `ok`, `FAIL`, `TIMEOUT`, `skip` when it does not apply to the
+target (no daemon, no share at that role), or `known` when an `open B<n>` case
+reproduced a bug that is still open (see below). The dimmed lines under a case
+are its details: the reason for a skip, measured rates, a hash. A failed
+`regression B<n>` case also points to its entry in `docs/BUGS.md`. When a case
+prints something itself, such as a service restart, the case line is printed
+again once the case ends.
+
+The run ends with a table of every target's counts and time, the report paths,
+the slowest cases, the cases over `--budget`, the known issues that still
+reproduce, any errors the daemon logged, and each failure with its target. The
+last line is `PASS:` or `FAIL:` and the totals. Colour is used only on a
+terminal and never with `NO_COLOR` set.
+
 ### Edge cases and performance
 
 Besides the syscall contract, the suite covers:
@@ -105,19 +143,20 @@ Besides the syscall contract, the suite covers:
 The local reference run is not only a self-test of the runner. Every case
 records the facts it established, and a live run is compared against those
 recordings, so a case fails when the mount *differs* from an ordinary
-filesystem — not only when it raises. The report names the exact key:
+filesystem — not only when it raises. The target's `reference` line names the
+exact key:
 
 ```
-  [DIVERGENCE] live FUSE /mnt/testmount does not match the reference filesystem:
-    ! creation and open flags.truncated.size: live=6 reference=0
+  -> reference 1 observation of 412 differs from the ordinary filesystem:
+               ! creation and open flags.truncated.size: live FUSE /mnt/testmount=6 reference=0
 ```
 
 Facts are recorded in one of two ways, chosen in the test body:
 
 - **compared** — a claim about filesystem semantics. The mount must agree.
 - **noted** — context that legitimately differs: inode numbers, block counts,
-  reported mode bits, and which optional syscalls exist at all. Reported under
-  `[capabilities]`, never a failure.
+  reported mode bits, and which optional syscalls exist at all. Listed under
+  the target's `accepted` line, never a failure.
 
 Because the choice is made at each call site, the set of accepted divergences
 is visible in the test that accepts it. There is no separate allowlist to drift
@@ -150,6 +189,24 @@ brought back the provisional sizes the bug reported.
 **B101** (a write during its create's upload reaches Drive) holds new files open for
 different times before writing, so their empty creates land before, during and after the
 bytes arrive, then checks every file after the queue drains.
+
+**B113** (moving a file before its upload makes no conflict) pauses sync with
+`pdfs sync pause --for 10m` and writes three files. While their uploads are held,
+it renames one, moves one into a folder, and renames and moves the third. It then
+resumes sync, waits for the queue, and checks the bytes and names and that no
+conflict copy appeared. It skips when sync was already paused. If the run dies
+before the resume, the pause ends by itself after ten minutes.
+
+**B88** (`pdfs mkdir`, `rename` and `rm` by local path) creates, renames and
+removes a folder and a file by their paths in the mount. Then it checks the
+refusals: `pdfs rename` of the mount's root to its own name, and `pdfs rm` of a
+file outside every mount. `pdfs rm` of the root itself is tried only on a sync
+folder the run created. In a mirrored sync folder all three commands must be
+refused instead, and nothing may change.
+
+**pdfs output into a closed pipe** runs `pdfs ls`, `pdfs --json ls` and
+`pdfs status` with stdout on a pipe whose reader is already gone. Each must exit
+0 with nothing on stderr, as `pdfs ls | head -1` needs.
 
 B74 was found by exactly this mechanism: the B70 case failed, and narrowing it
 produced a smaller reproduction that got its own case. The defect is fixed and
@@ -186,6 +243,15 @@ nothing: the local attribute and content caches will happily return the bytes
 that were just written even when nothing reached Drive, which is precisely how
 B74 stayed invisible.
 
+### Bugs that are still open
+
+Cases named `open B<n>` check a bug that `docs/BUGS.md` still lists as open.
+While the bug reproduces, the case ends as `known`: it is listed at the end of
+the run, but does not fail it. So a known bug does not hide new failures, and
+the run notices when a fix lands, because the case then passes. Rename it to
+`regression B<n>` then. **B114** (a name `pdfs rm` or `rename` took away stops
+resolving) and **B115** (`pdfs ls` reports a file's real size) are of this kind.
+
 ### Timeouts, reports, and hung mounts
 
 A wedged FUSE operation cannot be interrupted from Python, so each case runs
@@ -200,7 +266,8 @@ scripts/fuse-acceptance.sh --live /mnt/testmount \
 ```
 
 `--report-json` also writes every recorded observation, which is what to attach
-to a bug report. `--budget SECONDS` flags cases that pass but got slower —
+to a bug report. A known issue has the status `known` there; JUnit has no such
+status, so `--report-junit` reports it as skipped. `--budget SECONDS` flags cases that pass but got slower —
 B5 was a 186 ms-per-call regression that a pass/fail suite could not see.
 `--list` prints every case and which targets it runs against, and `--fail-fast`
 stops at the first failure.

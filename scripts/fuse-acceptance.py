@@ -24,6 +24,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import platform
 import random
 import re
 import shutil
@@ -277,17 +278,37 @@ class Outcome:
 
 
 class Context:
-    """Everything a case may touch: its sandbox, its recorder, and the daemon."""
+    """Everything a case may touch: its sandbox, its recorder, and the daemon.
 
-    def __init__(self, root: Path, obs: Observations, kind: str, daemon=None) -> None:
+    `location` is the folder the sandbox was made in. Only when the run created
+    that folder itself does `owns_location` allow a case to aim a destructive
+    command at it, on the chance that the command is not refused.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        obs: Observations,
+        kind: str,
+        daemon=None,
+        location: Path | None = None,
+        owns_location: bool = False,
+    ) -> None:
         self.root = root
         self.obs = obs
         self.kind = kind
         self.daemon = daemon
+        self.location = location
+        self.owns_location = owns_location
+        self.infos: list[str] = []
 
     @property
     def is_live(self) -> bool:
         return self.kind == LIVE
+
+    def info(self, line: str) -> None:
+        """Something worth showing under the case's result, like a measured rate."""
+        self.infos.append(line)
 
     def record(self, key: str, value) -> None:
         self.obs.record(key, value)
@@ -309,6 +330,14 @@ class Context:
 
 class Skip(Exception):
     """A case cannot run here, and that is not a failure."""
+
+
+class KnownIssue(Exception):
+    """An open bug from docs/BUGS.md reproduced. Reported, but not a failure.
+
+    A case for an open bug raises this when the bug shows and passes when it
+    does not, so the run says when the entry can be closed.
+    """
 
 
 class TestTimeout(Exception):
@@ -428,7 +457,7 @@ def test_positioned_and_vectored_io(ctx: Context) -> None:
     digest = hashlib.sha256(got).hexdigest()
     ctx.record("digest", digest)
     ctx.stat("file", path)
-    print(f"    sha256 {digest}")
+    ctx.info(f"sha256 {digest}")
 
 
 def test_resize_and_sparse_io(ctx: Context) -> None:
@@ -1414,8 +1443,8 @@ def test_throughput(ctx: Context) -> None:
         os.unlink(name)
     ops_rate = (3 * len(names) + 1) / max(time.monotonic() - started, 1e-6)
 
-    print(
-        f"    write {write_rate:.0f} MiB/s, read {read_rate:.0f} MiB/s, "
+    ctx.info(
+        f"write {write_rate:.0f} MiB/s, read {read_rate:.0f} MiB/s, "
         f"4 KiB writes {small_rate:.1f} MiB/s, metadata {ops_rate:.0f} ops/s"
     )
     ctx.note("write_mibps", round(write_rate, 1))
@@ -1594,6 +1623,253 @@ def test_regression_b101_write_during_create_upload(ctx: Context) -> None:
         check(os.lstat(path).st_size == len(payload), f"{path.name} has the wrong size after upload")
         check_bytes(read(path), payload, f"{path.name} after upload")
     check(not _conflict_copies(root), "writes during a create produced conflict copies")
+
+
+def test_regression_b113_move_before_upload(ctx: Context) -> None:
+    """A new file renamed or moved before its upload drains is no conflict copy (B113).
+
+    A create mints an empty file on Drive at once and queues the bytes. The
+    handle carried no revision id, so the drain fell back to comparing mtimes,
+    and Drive advances a file's mtime when it is renamed or moved. Downloads
+    moved on before they drained came back as `(sync-conflict …)` copies next
+    to an empty original. Pausing sync holds the bytes back while the files
+    move, which is the order the bug needs. The names must not be transient
+    ones like `*.part`: those mint nothing and queue their create instead (B70).
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder uploads in its own passes, not through a minted create")
+    if (daemon.status().get("mount") or {}).get("paused"):
+        raise Skip("sync is paused already; this case has to pause and resume it itself")
+    root = ctx.root / "b113"
+    moved = root / "moved here"
+    moved.mkdir(parents=True)
+    daemon.wait_for_queue()
+    payloads = {
+        name: pattern(4096 * index + 13, f"b113-{name}")
+        for index, name in enumerate(("renamed", "moved", "both"), 1)
+    }
+    # Timed, so a run that dies here leaves sync paused for minutes, not for good.
+    daemon.command("sync", "pause", "--for", "10m")
+    try:
+        for name, payload in payloads.items():
+            write_durable(root / f"{name}.bin", payload)
+        # Drive keeps mtimes in whole seconds: a move in the same second as the
+        # create leaves the mtime as it was and hides the bug.
+        time.sleep(2)
+        os.rename(root / "renamed.bin", root / "renamed later.bin")
+        os.rename(root / "moved.bin", moved / "moved.bin")
+        os.rename(root / "both.bin", moved / "both moved.bin")
+        held = [item for item in daemon.queue() if item["id"] not in PREEXISTING_OPS]
+        check(bool(held), "nothing was queued while sync was paused, so the moves raced nothing")
+        creates = [item["path"] for item in held if item["kind"] == "create"]
+        check(not creates, f"creates were queued, not minted on Drive, so B113 was not replayed: {creates}")
+        ctx.note("held_ops", len(held))
+    finally:
+        daemon.command("sync", "resume")
+    daemon.wait_for_queue()
+    # The queue reports empty as soon as the last op lands; give the revision
+    # behind it time to show up, as B74 does.
+    time.sleep(3)
+    daemon.wait_for_queue()
+
+    expected = {
+        root / "renamed later.bin": payloads["renamed"],
+        moved / "moved.bin": payloads["moved"],
+        moved / "both moved.bin": payloads["both"],
+    }
+    for path, payload in expected.items():
+        size = os.lstat(path).st_size
+        check(size == len(payload), f"{path.name} is {size} bytes after the drain, expected {len(payload)}")
+        check_bytes(read(path), payload, f"{path.name} after the drain")
+    conflicts = _conflict_copies(root) + _conflict_copies(moved)
+    check(not conflicts, f"moving files before their upload made conflict copies: {conflicts}")
+    check(
+        sorted(os.listdir(root)) == ["moved here", "renamed later.bin"],
+        f"old names are still listed: {sorted(os.listdir(root))}",
+    )
+
+
+def _refused(daemon: Daemon, *args: str) -> str:
+    """Run a pdfs command that has to fail, and return what it said."""
+    try:
+        output = daemon.command(*args)
+    except RuntimeError as error:
+        return str(error)
+    raise AssertionError(f"pdfs {' '.join(args)} should have been refused: {output.strip()}")
+
+
+def test_regression_b88_cli_changes_by_local_path(ctx: Context) -> None:
+    """`pdfs mkdir`, `rename` and `rm` take a local path in every location (B88).
+
+    They resolved paths against My files only, so in an on-demand synced folder
+    they answered "is not under the mountpoint". Routing them to the folder's
+    own mount made its root a path they could name, and an on-demand folder's
+    root has a parent on Drive: `pdfs rm ~/Downloads` would have trashed the
+    whole folder. So a mount root has to be refused. `rm` is aimed at one only
+    when this run created the folder itself. A mirror folder has no mount to
+    change, so there all three have to refuse and leave the local files alone.
+    """
+    daemon = ctx.require_daemon()
+    root = ctx.root
+    payload = b"b88-by-path\n" * 512
+    if not is_fuse(root):
+        mirrors = [
+            Path(folder["local_path"]).resolve()
+            for folder in daemon.sync_folders()
+            if folder.get("mode") == "mirror"
+        ]
+        if not any(root.resolve().is_relative_to(mirror) for mirror in mirrors):
+            raise Skip(f"{root.parent} is neither a mount nor a mirror folder of this daemon")
+        local = root / "b88 local.txt"
+        write_durable(local, payload)
+        for args in (
+            ("mkdir", str(root), "b88 folder"),
+            ("rename", str(local), "b88 renamed.txt"),
+            ("rm", str(local)),
+        ):
+            message = _refused(daemon, *args)
+            check("mirrored folder" in message, f"pdfs {args[0]} in a mirror folder: {message}")
+        check(not (root / "b88 folder").exists(), "pdfs mkdir changed a mirror folder")
+        check_bytes(read(local), payload, "a refused command changed the local file")
+        return
+
+    folder = root / "b88 folder"
+    daemon.command("mkdir", str(root), folder.name)
+    check(folder.is_dir(), "pdfs mkdir by local path made no folder")
+    write_durable(folder / "note.txt", payload)
+    daemon.wait_for_queue()
+
+    daemon.command("rename", str(folder / "note.txt"), "renamed.txt")
+    check(os.listdir(folder) == ["renamed.txt"], f"after pdfs rename: {os.listdir(folder)}")
+    check_bytes(read(folder / "renamed.txt"), payload, "the renamed file")
+    renamed = root / "b88 renamed folder"
+    daemon.command("rename", str(folder), renamed.name)
+    check(renamed.name in os.listdir(root), "pdfs rename by local path did not rename the folder")
+    check_bytes(read(renamed / "renamed.txt"), payload, "the file in the renamed folder")
+
+    daemon.command("rm", str(renamed / "renamed.txt"))
+    check(os.listdir(renamed) == [], f"after pdfs rm of the file: {os.listdir(renamed)}")
+    daemon.command("rm", str(renamed))
+    check(renamed.name not in os.listdir(root), "pdfs rm by local path left the folder listed")
+
+    # Renaming a root to its own name changes nothing even if it gets through.
+    mount = daemon.enclosing_mount(root)
+    message = _refused(daemon, "rename", str(mount), mount.name)
+    check("root of a synced location" in message, f"pdfs rename of {mount}: {message}")
+    if ctx.owns_location and ctx.location is not None and mount == ctx.location.resolve():
+        message = _refused(daemon, "rm", str(mount))
+        check("root of a synced location" in message, f"pdfs rm of {mount}: {message}")
+        ctx.note("rm_root", "refused")
+    check(os.path.ismount(mount) and root.name in os.listdir(mount), f"{mount} changed under a refusal")
+
+    with tempfile.TemporaryDirectory(prefix="pdfs-b88-outside-") as directory:
+        outside = Path(directory) / "outside.txt"
+        outside.write_bytes(payload)
+        message = _refused(daemon, "rm", str(outside))
+        check("not under the mountpoint" in message, f"pdfs rm outside every mount: {message}")
+        check(outside.read_bytes() == payload, "pdfs rm changed a file outside every mount")
+
+
+def test_cli_output_into_a_closed_pipe(ctx: Context) -> None:
+    """`pdfs ls | head` ends quietly when the reader stops early.
+
+    Rust's `println!` panics when stdout is a closed pipe, so a listing longer
+    than `head` read ended with a panic message and exit status 101. The
+    reading end is closed before the command starts, so its first line fails.
+    """
+    daemon = ctx.require_daemon()
+    mountpoint = (daemon.status().get("mount") or {}).get("mountpoint")
+    if not mountpoint:
+        raise Skip("the daemon reports no My files mount to list")
+    for args in (["ls", mountpoint], ["--json", "ls", mountpoint], ["status"]):
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            result = subprocess.run(
+                [daemon.pdfs, *args],
+                stdin=subprocess.DEVNULL,
+                stdout=writer,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=daemon.timeout,
+            )
+        finally:
+            os.close(writer)
+        command = f"pdfs {' '.join(args)}"
+        check(
+            result.returncode == 0,
+            f"{command} into a closed pipe exited with {result.returncode}: {result.stderr.strip()}",
+        )
+        check(not result.stderr.strip(), f"{command} into a closed pipe wrote: {result.stderr.strip()}")
+
+
+def test_open_b114_removed_name_stops_resolving(ctx: Context) -> None:
+    """A name `pdfs rm` or `pdfs rename` took away stops resolving at once (B114, open).
+
+    The FUSE handlers tell the kernel when a name goes; the control requests do
+    not. The kernel then keeps answering for the old name from its entry cache
+    for up to 30 seconds (`TTL` in lib.rs), while the listing no longer has it.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder has no kernel entry cache to go stale")
+    removed = ctx.root / "b114 removed.txt"
+    renamed = ctx.root / "b114 renamed.txt"
+    for path in (removed, renamed):
+        write_durable(path, b"b114\n")
+    daemon.wait_for_queue()
+    # Looked up, so the kernel holds both names.
+    os.lstat(removed)
+    os.lstat(renamed)
+    daemon.command("rm", str(removed))
+    daemon.command("rename", str(renamed), "b114 new name.txt")
+    listed = os.listdir(ctx.root)
+    check(removed.name not in listed and renamed.name not in listed, f"old names still listed: {listed}")
+    stale = [
+        f"{path.name} ({command})"
+        for path, command in ((removed, "pdfs rm"), (renamed, "pdfs rename"))
+        if os.path.lexists(path)
+    ]
+    if stale:
+        verb = "resolves" if len(stale) == 1 else "resolve"
+        raise KnownIssue(f"B114: {' and '.join(stale)} still {verb}, though no longer listed")
+
+
+def test_open_b115_ls_reports_the_real_size(ctx: Context) -> None:
+    """`pdfs ls` reports a file's real size, not the size Drive stores (B115, open).
+
+    The listing falls back to the encrypted size on storage when a node has no
+    claimed size, which showed a 6-byte file as 57 bytes. `pdfs refresh` brings
+    back such a listing on purpose (see B100), so both are checked.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("pdfs ls lists a mount; a mirror folder is plain local storage")
+    folder = ctx.root / "b115"
+    folder.mkdir()
+    sizes = {"six.txt": 6, "page.bin": 4097, "block.bin": BLOCK + 7}
+    for name, size in sizes.items():
+        write_durable(folder / name, pattern(size, f"b115-{name}"))
+    daemon.wait_for_queue()
+    listings: dict[str, dict[str, int]] = {}
+    for when in ("after the upload", "after pdfs refresh"):
+        if when == "after pdfs refresh":
+            daemon.command("refresh", str(folder))
+        listed = {entry["name"]: entry["size"] for entry in daemon.listing(folder)}
+        check(set(listed) == set(sizes), f"pdfs ls {when} lists {sorted(listed)}")
+        listings[when] = listed
+    for name, size in sizes.items():
+        check(os.lstat(folder / name).st_size == size, f"{name} has the wrong size through the mount")
+    wrong = []
+    for name, size in sizes.items():
+        shown = {when: listed[name] for when, listed in listings.items() if listed[name] != size}
+        if len(set(shown.values())) == 1:
+            wrong.append(f"{name}: {next(iter(shown.values()))} bytes, not {size}, {' and '.join(shown)}")
+        elif shown:
+            wrong.append(f"{name}: not {size} bytes but " + ", ".join(f"{n} {when}" for when, n in shown.items()))
+    if wrong:
+        raise KnownIssue("B115: pdfs ls shows the wrong size\n" + "\n".join(wrong))
 
 
 SHARED_DIR_NAME = "Shared with me"
@@ -1920,6 +2196,11 @@ TESTS = [
     Case("regression B79: an on-demand device folder accepts writes", test_regression_b79_ondemand_location_accepts_writes, (LIVE,)),
     Case("regression B100: a copied tree reads back at its exact sizes", test_regression_b100_copied_tree_exact_sizes),
     Case("regression B101: a write during its create's upload reaches Drive", test_regression_b101_write_during_create_upload, (LIVE,)),
+    Case("regression B113: moving a file before its upload makes no conflict", test_regression_b113_move_before_upload, (LIVE,)),
+    Case("regression B88: pdfs mkdir, rename and rm by local path", test_regression_b88_cli_changes_by_local_path, (LIVE,)),
+    Case("pdfs output into a closed pipe ends quietly", test_cli_output_into_a_closed_pipe, (LIVE,)),
+    Case("open B114: a name pdfs rm or rename took away stops resolving", test_open_b114_removed_name_stops_resolving, (LIVE,)),
+    Case("open B115: pdfs ls reports a file's real size", test_open_b115_ls_reports_the_real_size, (LIVE,)),
     Case("durability across a daemon restart", test_durability_across_restart, (LIVE,)),
 ]
 
@@ -1929,13 +2210,25 @@ TESTS = [
 # --------------------------------------------------------------------------
 
 
+FAILED = {"fail", "timeout"}
+
+
 class Result:
-    def __init__(self, name: str, target: str, status: str, seconds: float, message: str = "") -> None:
+    def __init__(
+        self,
+        name: str,
+        target: str,
+        status: str,
+        seconds: float,
+        message: str = "",
+        info: list[str] | None = None,
+    ) -> None:
         self.name = name
         self.target = target
         self.status = status
         self.seconds = seconds
         self.message = message
+        self.info = list(info or [])
 
     def as_dict(self) -> dict:
         return {
@@ -1944,6 +2237,7 @@ class Result:
             "status": self.status,
             "seconds": round(self.seconds, 3),
             "message": self.message,
+            "info": self.info,
         }
 
 
@@ -1957,13 +2251,213 @@ class Run:
         self.noted: dict[str, object] = {}
         self.ran: set[str] = set()
         self.digest = ""
+        # What the header said about the target, for the JSON report too.
+        self.facts: dict[str, str] = {}
+        self.wall: float | None = None
 
     @property
     def failed(self) -> bool:
-        return any(result.status in {"fail", "timeout"} for result in self.results)
+        return any(result.status in FAILED for result in self.results)
+
+    @property
+    def seconds(self) -> float:
+        return self.wall if self.wall is not None else sum(r.seconds for r in self.results)
+
+    def counts(self) -> dict[str, int]:
+        counts = dict.fromkeys(("pass", "fail", "skip", "known"), 0)
+        for result in self.results:
+            counts["fail" if result.status in FAILED else result.status] += 1
+        return counts
 
 
 REPORT: list[Run] = []
+
+
+# --------------------------------------------------------------------------
+# Console output
+# --------------------------------------------------------------------------
+
+STATUS_WORDS = {"pass": "ok", "skip": "skip", "known": "known", "fail": "FAIL", "timeout": "TIMEOUT"}
+BOLD, DIM, RED, GREEN, YELLOW, MAGENTA = "1", "2", "1;31", "32", "33", "35"
+STATUS_STYLES = {"pass": GREEN, "skip": YELLOW, "known": MAGENTA, "fail": RED, "timeout": RED}
+BUG_REFERENCE = re.compile(r"\bB(\d+)")
+
+
+class Console:
+    """One line per case, coloured on a terminal.
+
+    A case's line is written when the case starts and finished with its
+    result, so the case that is running, or hanging, is the last line on
+    screen. Anything else written meanwhile, by the case or by cleanup, first
+    ends that line instead of running into it, and the result then gets a whole
+    line of its own.
+    """
+
+    def __init__(self) -> None:
+        self.out = sys.stdout
+        self.color = (
+            self.out.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+        )
+        self.columns = shutil.get_terminal_size((100, 24)).columns
+        self.pending = False
+
+    def install(self) -> None:
+        sys.stdout = _LineBreaker(self, sys.stdout)
+        sys.stderr = _LineBreaker(self, sys.stderr)
+
+    def paint(self, text: str, style: str) -> str:
+        return f"\x1b[{style}m{text}\x1b[0m" if self.color else text
+
+    def heading(self, text: str) -> None:
+        print()
+        print(self.paint(f"==> {text}", BOLD))
+
+    def fact(self, key: str, value: str) -> None:
+        print(f"  -> {key:<10}{value}")
+
+    def begin(self, head: str) -> None:
+        self.out.write(head)
+        self.out.flush()
+        self.pending = True
+
+    def finish(self, head: str, tail: str) -> None:
+        """End the line `begin` opened, or write it whole if something broke it."""
+        self.out.write(f"{tail}\n" if self.pending else f"{head}{tail}\n")
+        self.out.flush()
+        self.pending = False
+
+    def interrupt(self) -> None:
+        if self.pending:
+            self.pending = False
+            self.out.write("\n")
+            self.out.flush()
+
+
+class _LineBreaker:
+    """A stream that ends the console's open case line before it writes."""
+
+    def __init__(self, console: Console, stream) -> None:
+        self._console = console
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        if text:
+            self._console.interrupt()
+        return self._stream.write(text)
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+CONSOLE = Console()
+
+
+def duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, rest = divmod(round(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def plural(count: int, noun: str, many: str | None = None) -> str:
+    return f"{count} {noun if count == 1 else many or noun + 's'}"
+
+
+def indented(text: str, width: int) -> str:
+    return "\n".join(" " * width + line for line in text.splitlines())
+
+
+def tally(counts: dict[str, int], seconds: float | None = None) -> str:
+    """`23 passed, 2 skipped, 1 known issue in 4m12s`, leaving out the zeros."""
+    parts = [
+        f"{counts['pass']} passed",
+        *([f"{counts['fail']} failed"] if counts["fail"] else []),
+        *([f"{counts['skip']} skipped"] if counts["skip"] else []),
+        *([plural(counts["known"], "known issue")] if counts["known"] else []),
+    ]
+    return ", ".join(parts) + (f" in {duration(seconds)}" if seconds is not None else "")
+
+
+def mount_of(path: Path) -> tuple[Path, str]:
+    """The mount `path` lives on and its type, read from /proc/self/mountinfo."""
+    path = path.resolve()
+    best, fstype = Path("/"), ""
+    with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+        for line in mounts:
+            fields = line.split()
+            # Octal escapes (\040 for a space) are how mountinfo writes odd names.
+            point = Path(fields[4].encode().decode("unicode_escape"))
+            if (path == point or point in path.parents) and len(point.parts) >= len(best.parts):
+                best, fstype = point, fields[fields.index("-") + 1]
+    return best, fstype
+
+
+def describe_storage(path: Path) -> str:
+    mountpoint, fstype = mount_of(path)
+    if fstype.startswith("fuse"):
+        return f"FUSE mount {mountpoint} ({fstype})"
+    return f"local directory on {fstype or 'an unknown filesystem'}"
+
+
+def pdfs_version(pdfs: str) -> str:
+    try:
+        result = subprocess.run(
+            [pdfs, "--version"], text=True, capture_output=True, timeout=10, stdin=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"not runnable ({error})"
+    return (result.stdout.strip() or result.stderr.strip()) if result.returncode == 0 else "no version"
+
+
+def describe_daemon(daemon: Daemon | None, kind: str) -> str:
+    if daemon is None:
+        return "not used" if kind == REFERENCE else "none reachable; cases that need it skip"
+    try:
+        status = daemon.status()
+    except Exception as error:  # noqa: BLE001 - only describes the target
+        return f"{daemon.pdfs}: status failed: {error}"
+    mount = status.get("mount") or {}
+    queued = sum(mount.get(key, 0) for key in ("pending_uploads", "pending_changes"))
+    state = "online" if mount.get("online") else "offline"
+    if mount.get("paused"):
+        state += ", sync paused"
+    return f"{status.get('username', 'not signed in')}, {state}, {plural(queued, 'queued op')}"
+
+
+def describe_cases(kind: str, cases: list[Case], pool: list[Case]) -> str:
+    of_kind = [case for case in pool if kind in case.kinds]
+    text = f"{len(cases)} of {len(pool)}"
+    if len(pool) > len(of_kind):
+        need = "a live mount" if kind == REFERENCE else "the reference only"
+        text += f", {len(pool) - len(of_kind)} need {need}"
+    if len(of_kind) > len(cases):
+        only = os.environ.get("PDFS_ACCEPTANCE_ONLY", "")
+        text += f", {len(of_kind) - len(cases)} left out by PDFS_ACCEPTANCE_ONLY={only!r}"
+    return text
+
+
+def announce(run: Run, facts: dict[str, str]) -> None:
+    run.facts = facts
+    CONSOLE.heading(run.label)
+    for key, value in facts.items():
+        CONSOLE.fact(key, value)
+
+
+def print_result(head: str, indent: int, result: Result) -> None:
+    status = CONSOLE.paint(STATUS_WORDS[result.status].ljust(7), STATUS_STYLES[result.status])
+    CONSOLE.finish(head, f"{status} {duration(result.seconds):>6}")
+    pad = " " * indent
+    quiet = result.status in {"pass", "skip"}
+    for line in result.message.splitlines():
+        print(pad + (CONSOLE.paint(line, DIM) if quiet else line))
+    for line in result.info:
+        print(pad + CONSOLE.paint(line, DIM))
+    reference = BUG_REFERENCE.search(result.name)
+    if result.status in FAILED and reference:
+        print(pad + CONSOLE.paint(f"see docs/BUGS.md B{reference[1]}", DIM))
 
 
 def select_cases(kind: str, pool: list[Case] | None = None) -> list[Case]:
@@ -2009,6 +2503,55 @@ def reap_stale_roots(parent: Path, max_age: int) -> None:
         shutil.rmtree(entry, ignore_errors=True)
 
 
+def run_cases(run: Run, cases: list[Case], context_for, timeout: int, fail_fast: bool) -> None:
+    """Run `cases` into `run`, one console line each.
+
+    A timeout ends the loop: the mount may be wedged, so later cases would only
+    produce noise, and cleanup already has to fight for it.
+    """
+    width = min(max((len(case.name) for case in cases), default=0), max(CONSOLE.columns - 32, 40))
+    for index, case in enumerate(cases, 1):
+        context = context_for(case)
+        counter = f"[{index:>{len(str(len(cases)))}}/{len(cases)}]"
+        dots = CONSOLE.paint("." * max(width - len(case.name) + 2, 2), DIM)
+        head = f"  {counter} {case.name} {dots} "
+        CONSOLE.begin(head)
+        started = time.monotonic()
+        failure = None
+        try:
+            with time_limit(timeout * case.budget_scale, case.name):
+                case.run(context)
+            status, message = "pass", ""
+        except Skip as reason:
+            status, message = "skip", str(reason)
+        except KnownIssue as issue:
+            status, message = "known", str(issue)
+        except TestTimeout as reason:
+            status, message = "timeout", str(reason)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:  # noqa: BLE001 - reported, then continued
+            status, message, failure = "fail", failure_detail(error), error
+        result = Result(
+            case.name,
+            run.label,
+            status,
+            time.monotonic() - started,
+            message,
+            getattr(context, "infos", None),
+        )
+        run.results.append(result)
+        print_result(head, len(counter) + 3, result)
+        if status == "pass":
+            run.ran.add(case.name)
+        if status == "timeout":
+            if left := len(cases) - index:
+                print(CONSOLE.paint(f"  {plural(left, 'later case')} not run after the timeout", DIM))
+            break
+        if failure is not None and fail_fast:
+            raise failure
+
+
 def run_contract(
     parent: Path,
     label: str,
@@ -2017,11 +2560,15 @@ def run_contract(
     timeout: int = DEFAULT_TIMEOUT,
     fail_fast: bool = False,
     janitor: Janitor | None = None,
+    owns_location: bool = False,
+    reference: Run | None = None,
 ) -> Run:
     """Run the contract in a fresh root under `parent`.
 
     With a janitor the root is registered before it exists and removed by the
     janitor, through the daemon; without one it is this function's to delete.
+    `owns_location` says this run created `parent` itself. A `reference` run is
+    diffed against before the result line, so that line counts the comparison.
     """
     if janitor is None:
         reap_stale_roots(parent, int(os.environ.get("PDFS_ACCEPTANCE_REAP_AGE", "3600")))
@@ -2031,48 +2578,34 @@ def run_contract(
     root.mkdir()
     run = Run(label, kind, root)
     REPORT.append(run)
-    print(f"[target] {label}: {parent}")
+    cases = select_cases(kind)
+    announce(
+        run,
+        {
+            "root": str(root),
+            "storage": describe_storage(root),
+            "daemon": describe_daemon(daemon, kind),
+            "cases": describe_cases(kind, cases, TESTS),
+        },
+    )
     obs = Observations()
+
+    def context_for(case: Case) -> Context:
+        obs.scope(case.name)
+        return Context(root, obs, kind, daemon, parent, owns_location)
+
+    started = time.monotonic()
     try:
-        for case in select_cases(kind):
-            obs.scope(case.name)
-            context = Context(root, obs, kind, daemon)
-            started = time.monotonic()
-            print(f"  [test] {case.name}")
-            try:
-                with time_limit(timeout * case.budget_scale, case.name):
-                    case.run(context)
-            except Skip as reason:
-                elapsed = time.monotonic() - started
-                print(f"    SKIP  {reason}")
-                run.results.append(Result(case.name, label, "skip", elapsed, str(reason)))
-                continue
-            except TestTimeout as reason:
-                elapsed = time.monotonic() - started
-                print(f"    TIMEOUT  {reason}")
-                run.results.append(Result(case.name, label, "timeout", elapsed, str(reason)))
-                # A timeout means the mount may be wedged; further cases would
-                # only produce noise, and cleanup already has to fight for it.
-                break
-            except KeyboardInterrupt:
-                raise
-            except BaseException as error:  # noqa: BLE001 - reported, then continued
-                elapsed = time.monotonic() - started
-                detail = failure_detail(error)
-                print(f"    FAIL  {detail}")
-                run.results.append(Result(case.name, label, "fail", elapsed, detail))
-                if fail_fast:
-                    raise
-                continue
-            elapsed = time.monotonic() - started
-            print(f"    ok    {elapsed:.2f}s")
-            run.results.append(Result(case.name, label, "pass", elapsed))
-            run.ran.add(case.name)
+        run_cases(run, cases, context_for, timeout, fail_fast)
+        run.wall = time.monotonic() - started
         run.compared = dict(obs.compared)
         run.noted = dict(obs.noted)
         digest_path = root / "positioned.bin"
         if digest_path.exists():
             run.digest = hashlib.sha256(read(digest_path)).hexdigest()
+        if reference is not None:
+            summarize_divergence(reference, run)
+        CONSOLE.fact("result", tally(run.counts(), run.wall))
         return run
     except BaseException:
         if janitor is None:
@@ -2121,6 +2654,8 @@ def write_reports(json_path: Path | None, junit_path: Path | None) -> None:
                 {
                     "label": run.label,
                     "kind": run.kind,
+                    "facts": run.facts,
+                    "seconds": round(run.seconds, 3),
                     "results": [result.as_dict() for result in run.results],
                     "observations": {
                         key: _jsonable(value) for key, value in sorted(run.compared.items())
@@ -2131,7 +2666,7 @@ def write_reports(json_path: Path | None, junit_path: Path | None) -> None:
             ]
         }
         json_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        print(f"[report] wrote {json_path}")
+        CONSOLE.fact("report", str(json_path))
     if junit_path:
         suites = ElementTree.Element("testsuites")
         for run in REPORT:
@@ -2140,9 +2675,9 @@ def write_reports(json_path: Path | None, junit_path: Path | None) -> None:
                 "testsuite",
                 name=run.label,
                 tests=str(len(run.results)),
-                failures=str(sum(1 for r in run.results if r.status in {"fail", "timeout"})),
-                skipped=str(sum(1 for r in run.results if r.status == "skip")),
-                time=f"{sum(r.seconds for r in run.results):.3f}",
+                failures=str(sum(1 for r in run.results if r.status in FAILED)),
+                skipped=str(sum(1 for r in run.results if r.status in {"skip", "known"})),
+                time=f"{run.seconds:.3f}",
             )
             for result in run.results:
                 case = ElementTree.SubElement(
@@ -2152,13 +2687,16 @@ def write_reports(json_path: Path | None, junit_path: Path | None) -> None:
                     classname=run.label,
                     time=f"{result.seconds:.3f}",
                 )
-                if result.status in {"fail", "timeout"}:
+                if result.status in FAILED:
                     failure = ElementTree.SubElement(case, "failure", type=result.status)
                     failure.text = result.message
                 elif result.status == "skip":
                     ElementTree.SubElement(case, "skipped", message=result.message)
+                elif result.status == "known":
+                    # JUnit has no expected failure; a skip is what CI shows as neither.
+                    ElementTree.SubElement(case, "skipped", message=f"known issue: {result.message}")
         ElementTree.ElementTree(suites).write(junit_path, encoding="unicode", xml_declaration=True)
-        print(f"[report] wrote {junit_path}")
+        CONSOLE.fact("report", str(junit_path))
 
 
 def _jsonable(value):
@@ -2310,6 +2848,15 @@ class Daemon:
             last = self.status().get("mount") or {}
             if queue_settled(last, self.queue):
                 return
+            if last.get("parked_uploads"):
+                # A transient name's create waits for a rename, not for the
+                # drain, so waiting out the timeout would only hide which file.
+                parked = [
+                    f"{item['kind']} {item['path']}"
+                    for item in self.queue()
+                    if item["parked"] and item["id"] not in PREEXISTING_OPS
+                ]
+                check(not parked, f"the queue holds parked ops that never drain: {', '.join(parked)}")
             time.sleep(1)
         raise TimeoutError(f"daemon mutation queue did not drain: {last}")
 
@@ -3255,7 +3802,17 @@ def run_move_contract(
     label = f"managed move {modes[0]}/{modes[1]}"
     run = Run(label, LIVE, first.root)
     REPORT.append(run)
-    print(f"[target] {label}")
+    cases = select_cases(LIVE, MOVE_CASES)
+    announce(
+        run,
+        {
+            "first": f"{first.mode}, {first.folder}",
+            "second": f"{second.mode}, {second.folder}",
+            "my files": str(my_files) if my_files else "not mounted; its cases skip",
+            "cases": describe_cases(LIVE, cases, MOVE_CASES),
+        },
+    )
+    started = time.monotonic()
     try:
         for location in locations:
             if janitor is None:
@@ -3264,37 +3821,9 @@ def run_move_contract(
         for location in locations:
             location.settle()
         context = MoveContext(first, second, myfiles)
-        for case in select_cases(LIVE, MOVE_CASES):
-            started = time.monotonic()
-            print(f"  [test] {case.name}")
-            try:
-                with time_limit(timeout * case.budget_scale, case.name):
-                    case.run(context)
-            except Skip as reason:
-                print(f"    SKIP  {reason}")
-                run.results.append(
-                    Result(case.name, label, "skip", time.monotonic() - started, str(reason))
-                )
-                continue
-            except TestTimeout as reason:
-                print(f"    TIMEOUT  {reason}")
-                run.results.append(
-                    Result(case.name, label, "timeout", time.monotonic() - started, str(reason))
-                )
-                break
-            except KeyboardInterrupt:
-                raise
-            except BaseException as error:  # noqa: BLE001 - reported, then continued
-                detail = failure_detail(error)
-                print(f"    FAIL  {detail}")
-                run.results.append(Result(case.name, label, "fail", time.monotonic() - started, detail))
-                if fail_fast:
-                    raise
-                continue
-            elapsed = time.monotonic() - started
-            print(f"    ok    {elapsed:.2f}s")
-            run.results.append(Result(case.name, label, "pass", elapsed))
-            run.ran.add(case.name)
+        run_cases(run, cases, lambda _case: context, timeout, fail_fast)
+        run.wall = time.monotonic() - started
+        CONSOLE.fact("result", tally(run.counts(), run.wall))
     finally:
         for location in locations:
             # The janitor removes its My files root in one server-side step,
@@ -3315,17 +3844,8 @@ def is_mountpoint(path: Path) -> bool:
 
 
 def is_fuse(path: Path) -> bool:
-    """True when `path` lives on a FUSE mount, read from /proc/self/mountinfo."""
-    path = path.resolve()
-    best, fstype = -1, ""
-    with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
-        for line in mounts:
-            fields = line.split()
-            # Octal escapes (\040 for a space) are how mountinfo writes odd names.
-            point = Path(fields[4].encode().decode("unicode_escape"))
-            if (path == point or point in path.parents) and len(point.parts) > best:
-                best, fstype = len(point.parts), fields[fields.index("-") + 1]
-    return fstype.startswith("fuse")
+    """True when `path` lives on a FUSE mount."""
+    return mount_of(path)[1].startswith("fuse")
 
 
 def run_managed_matrix(
@@ -3345,8 +3865,10 @@ def run_managed_matrix(
             ("mirror", "ondemand"),
             ("mirror", "mirror"),
         ]
-        for modes in matrices:
-            print(f"[matrix] first={modes[0]}, second={modes[1]}")
+        for index, modes in enumerate(matrices, 1):
+            CONSOLE.heading(
+                f"Mode pairing {index}/{len(matrices)}: first folder {modes[0]}, second {modes[1]}"
+            )
             pair.set_modes(modes)
             for path, mode in zip(pair.paths, modes, strict=True):
                 run = run_contract(
@@ -3356,9 +3878,10 @@ def run_managed_matrix(
                     daemon=daemon,
                     timeout=args.timeout,
                     fail_fast=args.fail_fast,
+                    owns_location=True,
+                    reference=reference,
                 )
                 roots.append(run.root)
-                summarize_divergence(reference, run)
                 pair.wait_for_queue()
                 pair.remove_tree(run.root)
                 roots.remove(run.root)
@@ -3384,33 +3907,42 @@ def run_managed_matrix(
 def summarize_divergence(reference: Run, target: Run) -> None:
     divergences = compare_runs(reference, target)
     capabilities = note_capability_differences(reference, target)
-    if capabilities:
-        print(f"  [capabilities] {target.label} differs from the reference filesystem:")
-        for line in capabilities:
-            print(f"    - {line}")
+    shared = reference.ran & target.ran
+    compared = sum(1 for key in reference.compared if key.split(".", 1)[0] in shared)
     if divergences:
-        print(f"  [DIVERGENCE] {target.label} does not match the reference filesystem:")
-        for line in divergences:
-            print(f"    ! {line}")
-        target.results.append(
-            Result(
-                "differential comparison against the reference filesystem",
-                target.label,
-                "fail",
-                0.0,
-                "; ".join(divergences),
+        CONSOLE.fact(
+            "reference",
+            CONSOLE.paint(
+                f"{plural(len(divergences), 'observation')} of {compared}"
+                f" {'differs' if len(divergences) == 1 else 'differ'}",
+                RED,
             )
+            + " from the ordinary filesystem:",
+        )
+        for line in divergences:
+            print(f"               ! {line}")
+    elif compared:
+        CONSOLE.fact(
+            "reference",
+            f"matches the ordinary filesystem in {plural(compared, 'compared observation')}",
         )
     else:
-        print(f"  [differential] {target.label} matches the reference filesystem")
-        target.results.append(
-            Result(
-                "differential comparison against the reference filesystem",
-                target.label,
-                "pass",
-                0.0,
-            )
+        CONSOLE.fact("reference", "nothing to compare: no case that records one passed on both")
+    if capabilities:
+        CONSOLE.fact("accepted", f"{plural(len(capabilities), 'capability', 'capabilities')} differ:")
+        for line in capabilities:
+            print(CONSOLE.paint(f"               - {line}", DIM))
+    if not divergences and not compared:
+        return
+    target.results.append(
+        Result(
+            "differential comparison against the reference filesystem",
+            target.label,
+            "fail" if divergences else "pass",
+            0.0,
+            "; ".join(divergences),
         )
+    )
 
 
 def main() -> int:
@@ -3464,6 +3996,9 @@ def main() -> int:
         return 0
 
     install_interrupt_handlers()
+    CONSOLE.install()
+    started = time.monotonic()
+    describe_run(args)
     journal = JournalWatch(os.environ.get("PDFS_ACCEPTANCE_UNIT", "proton-drive.service"))
     if args.journal_check:
         journal.start()
@@ -3478,9 +4013,10 @@ def main() -> int:
         )
         shutil.rmtree(reference.root, ignore_errors=True)
     if reference.failed:
-        print("FAIL: the account-free contract failed against an ordinary filesystem")
-    else:
-        print("[pass] account-free filesystem API contract")
+        CONSOLE.fact(
+            "warning",
+            CONSOLE.paint("this failed on an ordinary filesystem: suspect the runner or this machine", RED),
+        )
 
     try:
         if args.account:
@@ -3490,8 +4026,43 @@ def main() -> int:
         elif args.live:
             run_live(args.live, reference, args)
     finally:
-        outcome = finish(args, journal)
+        outcome = finish(args, journal, time.monotonic() - started)
     return outcome
+
+
+def describe_run(args) -> None:
+    if args.account:
+        mode = "the signed-in account"
+    elif args.managed_live:
+        mode = "managed sync folders " + ", ".join(map(str, args.managed_live))
+    elif args.live:
+        mode = "live mounts " + ", ".join(map(str, args.live))
+    else:
+        mode = "the account-free reference only"
+    CONSOLE.heading(f"pdfs acceptance suite on {mode}")
+    if args.account or args.managed_live or args.live:
+        pdfs = os.environ.get("PDFS_ACCEPTANCE_PDFS", "pdfs")
+        CONSOLE.fact("pdfs", f"{shutil.which(pdfs) or pdfs}, {pdfs_version(pdfs)}")
+    CONSOLE.fact("python", f"{platform.python_version()} on {platform.system()} {platform.release()}")
+    limits = f"{args.timeout}s per case"
+    if args.budget:
+        limits += f", {args.budget:g}s budget"
+    CONSOLE.fact("limits", limits)
+    options = [
+        flag
+        for flag, on in (
+            ("--quick", args.quick),
+            ("--fail-fast", args.fail_fast),
+            ("--durability", args.durability),
+            ("--journal-check", args.journal_check),
+        )
+        if on
+    ]
+    if os.environ.get("PDFS_ACCEPTANCE_ONLY"):
+        options.append(f"PDFS_ACCEPTANCE_ONLY={os.environ['PDFS_ACCEPTANCE_ONLY']!r}")
+    if options:
+        CONSOLE.fact("options", ", ".join(options))
+    CONSOLE.fact("started", time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
 def run_account(reference: Run, args) -> None:
@@ -3538,8 +4109,8 @@ def run_account(reference: Run, args) -> None:
             timeout=args.timeout,
             fail_fast=args.fail_fast,
             janitor=janitor,
+            reference=reference,
         )
-        summarize_divergence(reference, run)
         paths = [janitor.new_sync_folder(), janitor.new_sync_folder()]
         run_managed_matrix(paths, reference, args, janitor)
     finally:
@@ -3579,11 +4150,11 @@ def run_live(mountpoints: list[Path], reference: Run, args) -> None:
                 daemon=daemon,
                 timeout=args.timeout,
                 fail_fast=args.fail_fast,
+                reference=reference,
             )
             completed.append((mountpoint.resolve(), run))
-            summarize_divergence(reference, run)
         if convergence and len(mountpoints) > 1:
-            print("  [test] cross-mount remote convergence")
+            CONSOLE.fact("converge", "waiting for every secondary view to show the primary's bytes")
             source = completed[0][1]
             relative = source.root.relative_to(completed[0][0]) / "positioned.bin"
             for mountpoint in mountpoints[1:]:
@@ -3593,41 +4164,85 @@ def run_live(mountpoints: list[Path], reference: Run, args) -> None:
             shutil.rmtree(run.root, ignore_errors=True)
 
 
-def finish(args, journal: JournalWatch) -> int:
+def finish(args, journal: JournalWatch, seconds: float) -> int:
+    results = [(run, result) for run in REPORT for result in run.results]
+    failures = [(run, result) for run, result in results if result.status in FAILED]
+    known = [(run, result) for run, result in results if result.status == "known"]
+    slow = report_timings(args.budget)
+    journal_errors = journal.errors() if args.journal_check else []
+
+    CONSOLE.heading("Summary")
+    print_summary_table()
     write_reports(args.report_json, args.report_junit)
 
-    slow = report_timings(args.budget)
+    slowest = sorted(
+        ((run, result) for run, result in results if result.seconds >= 1.0),
+        key=lambda item: item[1].seconds,
+        reverse=True,
+    )[:5]
+    if slowest:
+        CONSOLE.heading("Slowest cases")
+        for run, result in slowest:
+            print(f"  {duration(result.seconds):>7}  {result.name}  {CONSOLE.paint(run.label, DIM)}")
     if slow:
-        print("[timing] cases over budget:")
+        CONSOLE.heading(f"Over the {args.budget:g}s budget ({len(slow)})")
         for line in slow:
-            print(f"    - {line}")
-
-    journal_errors = journal.errors() if args.journal_check else []
+            print(f"  - {line}")
+    if known:
+        CONSOLE.heading(f"Known issues that still reproduce ({len(known)})")
+        for run, result in known:
+            print(f"  - {result.name}  {CONSOLE.paint(run.label, DIM)}")
+            print(indented(result.message, 6))
     if journal_errors:
-        print(f"[journal] the daemon logged {len(journal_errors)} error(s) during the run:")
+        CONSOLE.heading(f"The daemon logged {plural(len(journal_errors), 'error')} during the run")
         for line in journal_errors[:20]:
-            print(f"    ! {line}")
+            print(f"  ! {line}")
+        if len(journal_errors) > 20:
+            print(f"  … and {len(journal_errors) - 20} more")
+    if failures:
+        CONSOLE.heading(f"Failures ({len(failures)})")
+        for number, (run, result) in enumerate(failures, 1):
+            word = CONSOLE.paint(STATUS_WORDS[result.status].ljust(8), RED)
+            print(f"  {number}) {result.name}")
+            print(f"     target   {run.label}")
+            print(f"     {word} {indented(result.message, 14).lstrip()}")
+            reference = BUG_REFERENCE.search(result.name)
+            if reference:
+                print(f"     see      docs/BUGS.md B{reference[1]}")
 
-    failures = [
-        (run.label, result)
-        for run in REPORT
-        for result in run.results
-        if result.status in {"fail", "timeout"}
-    ]
-    print()
+    totals = dict.fromkeys(("pass", "fail", "skip", "known"), 0)
     for run in REPORT:
-        counts: dict[str, int] = {}
-        for result in run.results:
-            counts[result.status] = counts.get(result.status, 0) + 1
-        detail = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
-        print(f"[summary] {run.label}: {detail}")
-
+        for status, count in run.counts().items():
+            totals[status] += count
+    print()
     if failures or journal_errors:
-        for label, result in failures:
-            print(f"FAIL {label}: {result.name}: {result.message}")
+        verdict = CONSOLE.paint("FAIL:", RED)
+        if journal_errors and not failures:
+            verdict += f" the daemon logged {plural(len(journal_errors), 'error')};"
+        print(f"{verdict} {tally(totals, seconds)}")
         return 1
-    print("PASS: acceptance suite completed")
+    print(f"{CONSOLE.paint('PASS:', GREEN)} {tally(totals, seconds)}")
     return 0
+
+
+def print_summary_table() -> None:
+    columns = ("pass", "fail", "skip", "known")
+    styles = {"fail": RED, "skip": YELLOW, "known": MAGENTA}
+    width = max([len(run.label) for run in REPORT] + [len("total")])
+    print(f"  {'target':<{width}}  " + "".join(f"{name:>7}" for name in columns) + f"{'time':>9}")
+    totals = dict.fromkeys(columns, 0)
+    for run in REPORT:
+        counts = run.counts()
+        cells = ""
+        for name in columns:
+            totals[name] += counts[name]
+            cell = f"{counts[name]:>7}"
+            cells += CONSOLE.paint(cell, styles[name]) if counts[name] and name in styles else cell
+        print(f"  {run.label:<{width}}  {cells}{duration(run.seconds):>9}")
+    if len(REPORT) > 1:
+        cells = "".join(f"{totals[name]:>7}" for name in columns)
+        total_time = sum(run.seconds for run in REPORT)
+        print(CONSOLE.paint(f"  {'total':<{width}}  {cells}{duration(total_time):>9}", BOLD))
 
 
 if __name__ == "__main__":

@@ -12,9 +12,77 @@ Conventions:
 
 ---
 
+## B116 — Trashing a folder keeps the queued creates in its subfolders
+
+**Status:** Open.
+**Found:** 2026-10-02, by the first live run of the acceptance case "regression B113". That
+version wrote `*.part` files, which park their create until a rename instead of minting the file
+(B70). It moved one of them, still named `moved.part`, into the subfolder `b113/moved here` and
+then hung, waiting for a queue that held a parked op. The run was interrupted, and its cleanup
+trashed the test root with `pdfs rm` and deleted it permanently. The parked create stayed queued
+and kept its staged bytes. The cleanup reported it as left over (`queued create #2 for
+…/b113/moved here/moved.part`).
+
+**Where:** `drop_doomed_ops` in `crates/pdfs-core/src/db/ops.rs`, which
+`Core::discard_queued_ops` runs when a folder is trashed.
+
+**Cause.** The ops removed with a folder are those for the folder and for the nodes queued below
+it through `pending_op.parent_uid`, plus the revisions of every file the node tree places below
+it (B102). A create for a file inside a *real* subfolder is neither: its parent is not a queued
+node, and the tree only contributes revisions. Such a create comes from a transient name, or
+from a file created offline in a folder that already exists on Drive. A parked one stays queued
+for good, holding its bytes. One that is due would run into a trashed parent, and by the code the
+drain then re-homes it to the root (`parent folder is gone remotely; creating in the root
+instead`), so the file would reappear in My files after its folder was trashed. Only the parked
+case has been seen.
+
+**Required fix/test:** take queued creates and mkdirs from the node tree too, as revisions are.
+Test: a db test that trashes a folder holding a real subfolder with a queued create below it, and
+expects the create and its blob gone.
+
+## B115 — `pdfs ls` shows a file's encrypted size
+
+**Status:** Open.
+**Found:** 2026-10-02, while verifying B88 live. `pdfs ls ~/Downloads/pdfs-b88-test` listed the
+6-byte `note.txt` as 57 bytes, and listed `tickets.pdf` as 202316 bytes where the mount's `stat`
+said 202257. The acceptance case "open B115" then showed it for every file it wrote, in My files
+and in an on-demand folder, right after the upload and again after `pdfs refresh`: 6 bytes listed
+as 57, 4097 as 4150, and 4 MiB + 7 bytes (4194311) as 4194421. The mount's `stat` had the real
+sizes throughout.
+
+**Where:** `node_size` in `crates/pdfs-fuse/src/lib.rs` and `crates/pdfs-core/src/db/nodes.rs`.
+
+**Cause (suspected).** `node_size` reports the node's `claimed_size` and falls back to
+`total_size_on_storage` when it has none. That is the size on Drive's storage: encrypted blocks
+plus their signatures. A node decoded without a claimed size therefore lists at its encrypted size.
+The sizes seen fit that: 51 to 55 bytes more per 4 MiB block.
+
+**Test:** the acceptance case "open B115" compares the sizes `pdfs ls` reports with the written
+ones, after the upload and again after `pdfs refresh`. It reports a known issue while they differ.
+
+## B114 — A name `pdfs rm` or `pdfs rename` took away still resolves for up to 30 seconds
+
+**Status:** Open.
+**Found:** 2026-10-02, while verifying B88 live. After `pdfs rm ~/Downloads/pdfs-b88-test` the
+folder was gone from `ls ~/Downloads`, but `ls -d ~/Downloads/pdfs-b88-test` still found it for
+up to 30 seconds. `~/ProtonDrive` behaves the same, so B88's routing did not cause it.
+
+**Where:** `Core::rename` and `Core::delete` in `crates/pdfs-fuse/src/lib.rs`, and the `TTL` the
+kernel gets for entries in the same file.
+
+**Cause.** Both change Drive, forget the node and drop the parent's listing, but never tell the
+kernel. The kernel cached the name's lookup for `TTL`, 30 seconds, and answers from that cache
+until it expires. A rename or unlink through the mount has no such gap, because the kernel made
+that change itself. `pdfs move` already sends `inval_entry` for its destination
+(`settle_dest` in `crates/pdfs-fuse/src/relocate.rs`); its source was not checked.
+
+**Test:** the acceptance case "open B114" removes one file with `pdfs rm` and renames another with
+`pdfs rename`, then checks at once that neither old name resolves. It reports a known issue while
+one does. It reproduced in My files and in an on-demand folder.
+
 ## B113 — A new file moved before its upload drains lands as a conflict copy of itself
 
-**Status:** Fixed (unverified).
+**Status:** Fixed (verified 2026-10-02).
 **Found:** 2026-10-02, on the production account. aria2 downloaded two seasons into the on-demand
 `~/Downloads`. The episodes were moved into `Videos/anime/…` while their uploads were still
 queued. 45 of 48 landed as `(sync-conflict …)` copies next to a 0-byte original, each with
@@ -35,8 +103,18 @@ id.
 **Fix.** `WriteHandle::created` takes the minted node's revision id along with its mtime. When a
 queued create lands, `adopt_real_uid` rebases the handles still open on it onto the new node,
 as `refresh_after_upload` already does after a sealed upload. Both go through
-`WriteHandle::rebase_onto`. Unverified: no file has been moved mid-upload against the fixed
-daemon yet.
+`WriteHandle::rebase_onto`.
+
+**Verified live (2026-10-02)** on the installed daemon, in a scratch folder in `~/Downloads`. A
+`pdfs move` advanced an empty file's server mtime from 1790962386 to 1790962408, the change the old
+check took for another device's edit. With sync paused, three 16 MiB files were written and moved
+into a subfolder while their uploads were queued. After the resume all three logged `pending upload
+landed`, with no conflict warning or copy, and they read back at their exact sizes. Each upload was
+put off once after the move (`the node is missing locally and was re-read`) and landed on the
+retry about 8 seconds later. Meanwhile `pdfs sync queue` showed raw ids instead of the new paths.
+Not verified live: a file created offline that is still open when its create lands. Only the unit
+test covers that half. The acceptance case "regression B113" replays the online order through the
+mount, with a rename and a move, and passed in My files and in an on-demand folder.
 
 ## B112 — Folders shared by the same person disappear from Shared with me
 
@@ -805,7 +883,7 @@ in every version — but that was luck, and the next question of this shape may 
 ## B88 — `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount
 
 **Status:** Partly fixed. B86's fix covers `ls` and `refresh`. `move` takes paths in any location
-through `Core::move_between`. `rm`, `rename` and `mkdir` were fixed 2026-10-02 (unverified live).
+through `Core::move_between`. `rm`, `rename` and `mkdir` were fixed and verified live 2026-10-02.
 `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions are still open.
 **Found:** 2026-08-17, while fixing B86.
 **Where:** `crates/pdfs-fuse/src/control.rs`, every handler still calling `rel_to_mount`.
@@ -846,6 +924,14 @@ Drive, so `pdfs rm ~/Downloads` would have passed `source_parent_uid` and trashe
 folder from under its mount. `rm` and `rename` therefore go through `route_node`, which refuses a
 path naming a mount's root. Test: `only_a_path_below_a_mount_root_names_a_node`. There is still no
 handler-level test, because a `Core` can only be built against a live client.
+
+**Verified live (2026-10-02)** in `~/Downloads`, an on-demand folder. `pdfs mkdir` created a
+folder. `pdfs rename` of a file whose upload was still queued reached Drive under the new name, at
+6 bytes and with no conflict. `pdfs rm` trashed a file and then the folder. `pdfs rm ~/Downloads`,
+`pdfs rename ~/Downloads …` and `pdfs rm ~/ProtonDrive` were refused as the root of a synced
+location, and a path outside every mount as not under the mountpoint. `mkdir` and `rm` in
+`~/ProtonDrive` still work. Not verified: the refusal in a mirrored folder, because the account has
+none. The acceptance case "regression B88" repeats this on every location of a run.
 
 ---
 
