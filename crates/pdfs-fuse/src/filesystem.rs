@@ -1550,26 +1550,16 @@ impl ProtonFs {
                 }
             },
         };
-        let new_uid = node.uid.clone();
-        // The base this handle writes over is the node as it actually exists —
-        // the empty file the server just minted — so its modification time comes
-        // from the node, never from the local clock. `queue_revision` turns this
-        // into `StagedWrite::based_on` and the drain compares that against the
-        // remote: a `now_secs()` here differs from the server's stamp by however
-        // long the create round-trip took, so the first write to a brand-new file
-        // conflicts with its own create whenever the second happens to tick in
-        // between.
-        let base_mtime = node.modification_time;
         let (file, path) = match self.core.cache.create_scratch() {
             Ok(x) => x,
             Err(e) => {
-                error!(%new_uid, error = %e, "create scratch file failed");
+                error!(uid = %node.uid, error = %e, "create scratch file failed");
                 reply.error(Errno::EIO);
                 return;
             }
         };
         let mut st = self.core.state();
-        let ino = st.intern(parent, node);
+        let ino = st.intern(parent, node.clone());
         if let Some(entry) = st.entries.get_mut(&ino) {
             entry.open_count = entry.open_count.saturating_add(1);
         }
@@ -1580,23 +1570,10 @@ impl ProtonFs {
         }
         let fh = st.next_fh;
         st.next_fh += 1;
-        let aw = st.active_writes.entry(ino).or_insert_with(|| {
-            // A brand-new file: empty base, everything written is authored.
-            WriteHandle {
-                ino,
-                uid: new_uid,
-                file: Arc::new(file),
-                path,
-                written: Intervals::default(),
-                len: 0,
-                base_size: 0,
-                base_mtime,
-                // A brand-new file has no sealed remote revision to conflict with.
-                base_revision_id: None,
-                dirty: false,
-                open_count: 0,
-            }
-        });
+        let aw = st
+            .active_writes
+            .entry(ino)
+            .or_insert_with(|| WriteHandle::created(ino, &node, file, path));
         aw.open_count += 1;
         st.handles.insert(fh, ino);
         let entry = st.entries.get(&ino).unwrap();

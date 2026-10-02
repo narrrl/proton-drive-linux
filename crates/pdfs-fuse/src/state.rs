@@ -129,6 +129,44 @@ pub(crate) struct WriteHandle {
 }
 
 impl WriteHandle {
+    /// A handle on a file `create` just made: an empty base, so everything
+    /// written through it is authored.
+    ///
+    /// The base is `node` as it actually exists — the empty file the server just
+    /// minted, or a queued create's placeholder — never the local clock or a
+    /// blank. `queue_revision` turns it into `StagedWrite::based_on` and the
+    /// drain compares the remote against that. A `now_secs()` mtime differs from
+    /// the server's stamp by the create round-trip. A missing revision id drops
+    /// the check to `(mtime, size)`, and moving or renaming the file advances
+    /// its mtime on the server. Either way the first write to a brand-new file
+    /// lands as a conflict copy of its own empty create (`docs/BUGS.md` B113).
+    pub(crate) fn created(ino: u64, node: &Node, file: File, path: PathBuf) -> Self {
+        Self {
+            ino,
+            uid: node.uid.clone(),
+            file: Arc::new(file),
+            path,
+            written: Intervals::default(),
+            len: 0,
+            base_size: 0,
+            base_mtime: node.modification_time,
+            base_revision_id: crate::node_revision_id(node),
+            dirty: false,
+            open_count: 0,
+        }
+    }
+
+    /// Write over `node` from now on: a revision this daemon has just put on the
+    /// server under the handle, by sealing an upload or by landing the queued
+    /// create the handle was opened on. The base the handle opened over is gone,
+    /// and keeping it would make the drain read our own revision as another
+    /// device's edit.
+    pub(crate) fn rebase_onto(&mut self, node: &Node) {
+        self.base_mtime = node.modification_time;
+        self.base_size = crate::node_size(node);
+        self.base_revision_id = crate::node_revision_id(node);
+    }
+
     /// Account for `[offset, end)` having been written through this handle.
     ///
     /// A write past the end leaves a hole that reads as zeros, exactly like a
@@ -1916,6 +1954,27 @@ mod tests {
             dirty: false,
             open_count: 1,
         }
+    }
+
+    /// A file created offline is written while its queued create lands. The
+    /// placeholder had no revision, so the handle takes the empty file the
+    /// create made as its base (docs/BUGS.md B113).
+    #[test]
+    fn a_handle_on_a_placeholder_is_based_on_the_create_that_landed() {
+        let mut h = handle(0, 0);
+        assert_eq!(h.base_revision_id, None);
+        let mut landed = node("real", "root", "f.mkv", false);
+        landed.modification_time = 160;
+        if let NodeKind::File {
+            active_revision_id, ..
+        } = &mut landed.kind
+        {
+            *active_revision_id = Some("empty".into());
+        }
+        h.rebase_onto(&landed);
+        assert_eq!(h.base_mtime, 160);
+        assert_eq!(h.base_size, 0);
+        assert_eq!(h.base_revision_id.as_deref(), Some("empty"));
     }
 
     #[test]

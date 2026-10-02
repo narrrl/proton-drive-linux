@@ -12,6 +12,32 @@ Conventions:
 
 ---
 
+## B113 — A new file moved before its upload drains lands as a conflict copy of itself
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-02, on the production account. aria2 downloaded two seasons into the on-demand
+`~/Downloads`. The episodes were moved into `Videos/anime/…` while their uploads were still
+queued. 45 of 48 landed as `(sync-conflict …)` copies next to a 0-byte original, each with
+`the remote revision changed under the queued write (expected 0 bytes at mtime 1790955809, found 0
+at 1790956593)`. The three that drained before the move uploaded normally.
+
+**Where:** `serve_create` in `crates/pdfs-fuse/src/filesystem.rs`, `adopt_real_uid` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The handle a create opens is based on the empty file the server mints, but it was
+given no revision id. B69 keys the drain's conflict check on the revision id, and without one it
+falls back to `(mtime, size)`. The node's mtime is the link's modify time, which the server
+advances on a move or rename. So a new file moved before its first write drained looked like
+another device had changed it. A file created offline had the same gap in another place: a handle
+still open when its queued create landed kept the placeholder's local-clock mtime and no revision
+id.
+
+**Fix.** `WriteHandle::created` takes the minted node's revision id along with its mtime. When a
+queued create lands, `adopt_real_uid` rebases the handles still open on it onto the new node,
+as `refresh_after_upload` already does after a sealed upload. Both go through
+`WriteHandle::rebase_onto`. Unverified: no file has been moved mid-upload against the fixed
+daemon yet.
+
 ## B112 — Folders shared by the same person disappear from Shared with me
 
 **Status:** Fixed (unverified).

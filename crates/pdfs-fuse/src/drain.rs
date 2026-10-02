@@ -1151,6 +1151,12 @@ impl Core {
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(%real, error = %e, "db upsert_node failed after remap");
         }
+        // A handle still open on the placeholder was based on no revision at
+        // all: a local-clock mtime and no revision id. Released as it is, its
+        // write would land as a conflict copy of the empty file this create just
+        // made (`docs/BUGS.md` B113). Rebased before the restamp below, so a
+        // release that races this is caught there.
+        self.rebase_open_writes(real, &node);
         // A write carried over from the create was made against no revision at
         // all; the one just created is what it now replaces.
         self.rebaseline_pending(real, &node);
@@ -1707,14 +1713,11 @@ impl Core {
         // This is the open-handle counterpart of `rebaseline_pending`, which
         // covers the same gap for *queued* ops.
         {
-            let sealed_mtime = node.modification_time;
-            let sealed_size = node_size(&node);
-            let sealed_rev = node_revision_id(&node);
             // Remember it as ours, so a queued write that opened over an earlier
             // revision recognises this as a self-supersede rather than a foreign
             // change and does not fork (B70 layer B; consulted in
             // `revision_conflict`).
-            if let Some(rev) = sealed_rev.clone() {
+            if let Some(rev) = node_revision_id(&node) {
                 self.own_sealed_revs.lock().insert(uid.clone(), rev.clone());
                 // Write through: losing this at shutdown reopened the fork
                 // window B70 layer B closed, for the first drain after a
@@ -1726,17 +1729,7 @@ impl Core {
                     warn!(%uid, error = %e, "persisting our sealed revision failed");
                 }
             }
-            self.for_each_state(|st| {
-                for aw in st.active_writes.values_mut() {
-                    if aw.uid == *uid {
-                        aw.base_mtime = sealed_mtime;
-                        aw.base_size = sealed_size;
-                        aw.base_revision_id = sealed_rev.clone();
-                        debug!(%uid, mtime = sealed_mtime, size = sealed_size,
-                               "rebased open write handle onto the revision just uploaded");
-                    }
-                }
-            });
+            self.rebase_open_writes(uid, &node);
         }
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
@@ -1754,6 +1747,20 @@ impl Core {
                 return;
             };
             st.intern(parent, node.clone());
+        });
+    }
+
+    /// Rebase every write handle open on `uid` onto `node`, a revision this
+    /// daemon has just put there itself (`WriteHandle::rebase_onto`).
+    fn rebase_open_writes(&self, uid: &NodeUid, node: &Node) {
+        self.for_each_state(|st| {
+            for aw in st.active_writes.values_mut() {
+                if aw.uid == *uid {
+                    aw.rebase_onto(node);
+                    debug!(%uid, mtime = aw.base_mtime, size = aw.base_size,
+                           "rebased open write handle onto the revision just landed");
+                }
+            }
         });
     }
 
@@ -1891,6 +1898,7 @@ fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::WriteHandle;
     use pdfs_core::Access;
     use pdfs_core::db::Db;
     use proton_drive_rs::NodeKind;
@@ -2315,6 +2323,26 @@ mod tests {
         let base = baseline(100, 40, Some("rev-A"));
         let remote = file_node(100, 40, Some("rev-B"));
         assert!(revision_changed(&base, &remote).is_some());
+    }
+
+    /// The reported shape (docs/BUGS.md B113): a downloader creates a file
+    /// through the mount, and the file is moved before its write drains. The
+    /// move re-stamps the node's mtime on the server (1790955809 -> 1790956593),
+    /// but the revision is still the empty one the create minted.
+    #[test]
+    fn a_move_before_the_first_write_drains_is_not_a_conflict() {
+        let minted = file_node(1_790_955_809, 0, Some("empty"));
+        let path = std::env::temp_dir().join(format!("pdfs-drain-test-{}", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let h = WriteHandle::created(2, &minted, file, path);
+        let base = baseline(h.base_mtime, h.base_size, h.base_revision_id.as_deref());
+
+        let moved = file_node(1_790_956_593, 0, Some("empty"));
+        assert_eq!(revision_changed(&base, &moved), None);
+        // Another device writing it is still a conflict.
+        let edited = file_node(1_790_956_593, 0, Some("theirs"));
+        assert!(revision_changed(&base, &edited).is_some());
     }
 
     #[test]
