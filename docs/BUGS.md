@@ -804,7 +804,9 @@ in every version — but that was luck, and the next question of this shape may 
 
 ## B88 — `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount
 
-**Status:** Open — B86's fix covers `ls` and `refresh` only.
+**Status:** Partly fixed. B86's fix covers `ls` and `refresh`. `move` takes paths in any location
+through `Core::move_between`. `rm`, `rename` and `mkdir` were fixed 2026-10-02 (unverified live).
+`pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions are still open.
 **Found:** 2026-08-17, while fixing B86.
 **Where:** `crates/pdfs-fuse/src/control.rs`, every handler still calling `rel_to_mount`.
 
@@ -829,6 +831,21 @@ riskier change than the one B86 needed. Doing it half-way would be worse than no
 per-mount state assumptions as it goes; the `for_each_state`/uid-keyed helpers are the pattern for
 the ones that touch more than their own inode space. Test: a `pdfs pin` and a `pdfs rename` by
 absolute path inside a secondary on-demand mount, plus a path under no mount still erroring.
+
+**Fix so far (`rm`, `rename`, `mkdir`):** the three handlers go through `control.rs::route_change`,
+which is `route_to_mount` plus the mirror-folder hint and escape check that `ResolveConflict`
+already had. The audit found nothing primary-only in `Core::delete`, `Core::rename` or
+`Core::create_folder`. `Core::rooted_at` swaps in the fork's state, notifier, session flag and size
+upgrades, the same per-mount fields `Core::fork_state` makes fresh. So `self.state()` in a routed
+call already is the fork's inode space. My files and the on-demand folders do not overlap, so
+`delete` forgetting the node in its own space alone is enough. `rename` already forgets it
+everywhere (B74).
+
+Routing raised a hazard the primary mount never had. An on-demand folder's root has a parent on
+Drive, so `pdfs rm ~/Downloads` would have passed `source_parent_uid` and trashed the whole synced
+folder from under its mount. `rm` and `rename` therefore go through `route_node`, which refuses a
+path naming a mount's root. Test: `only_a_path_below_a_mount_root_names_a_node`. There is still no
+handler-level test, because a `Core` can only be built against a live client.
 
 ---
 

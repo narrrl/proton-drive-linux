@@ -285,7 +285,8 @@ enum Command {
     },
     /// Rename a file or folder via the running daemon.
     Rename {
-        /// File/folder path, inside the mountpoint or relative to it.
+        /// File/folder path, inside My files or an on-demand synced folder, or
+        /// relative to the mountpoint.
         path: PathBuf,
         /// New name (a single path component).
         new_name: String,
@@ -304,12 +305,14 @@ enum Command {
     },
     /// Trash a file or folder via the running daemon.
     Rm {
-        /// File/folder path, inside the mountpoint or relative to it.
+        /// File/folder path, inside My files or an on-demand synced folder, or
+        /// relative to the mountpoint.
         path: PathBuf,
     },
     /// Create a folder via the running daemon.
     Mkdir {
-        /// Parent folder path, inside the mountpoint or relative to it.
+        /// Parent folder path, inside My files or an on-demand synced folder,
+        /// or relative to the mountpoint.
         parent: PathBuf,
         /// New folder name (a single path component).
         name: String,

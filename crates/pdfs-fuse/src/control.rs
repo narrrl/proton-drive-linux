@@ -163,8 +163,8 @@ fn read_request_line(reader: &mut impl BufRead) -> std::io::Result<Option<String
 /// Turn a CLI-supplied path into the mount that owns it and the path relative
 /// to *that* mount's root.
 ///
-/// [`rel_to_mount`] is the older, primary-only reading, and it is what every
-/// mutating request still uses. It rejects anything outside the primary
+/// [`rel_to_mount`] is the older, primary-only reading, and it is what most
+/// requests still use. It rejects anything outside the primary
 /// mountpoint, which leaves a secondary on-demand mount — a synced folder
 /// switched out of mirror mode — with no way to be named at all: `pdfs ls` and
 /// `pdfs refresh` both answered "is not under the mountpoint", so a folder
@@ -185,11 +185,14 @@ fn route_to_mount(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Cor
     rel_to_mount(mountpoint, path).map(|rel| (core.clone(), rel))
 }
 
-/// [`route_to_mount`] for a conflict copy. The listing names a copy inside a
-/// synced folder by its absolute local path (`docs/BUGS.md` B99), so the
-/// resolve has to run against the on-demand mount serving it. A mirror folder
-/// has no mount to run against: its copy is an ordinary local file.
-fn route_conflict(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
+/// [`route_to_mount`] for a request that changes what it names: trash, rename,
+/// create a folder, resolve a conflict. Each has to run against the on-demand
+/// mount serving the path, and `pdfs rm ~/Downloads/x` answered "is not under
+/// the mountpoint" while `pdfs move` took the same path. The conflict listing
+/// names a copy in a synced folder by its absolute local path (`docs/BUGS.md`
+/// B99), so resolving one needs this too. A mirror folder has no mount to run
+/// against: a file there is an ordinary local file.
+fn route_change(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
     let routed = route_to_mount(core, mountpoint, path).map_err(|e| {
         let p = Path::new(path);
         let mirrored = core
@@ -200,7 +203,7 @@ fn route_conflict(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Cor
             .any(|folder| folder.mode == "mirror" && p.starts_with(&folder.local_path));
         if mirrored {
             CoreError::invalid(format!(
-                "{path} is in a mirrored folder; rename or delete the local file there"
+                "{path} is in a mirrored folder; change the local file there instead"
             ))
         } else {
             e
@@ -215,6 +218,27 @@ fn route_conflict(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Cor
     } else {
         Err(CoreError::invalid(format!("{path} escapes the mountpoint")))
     }
+}
+
+/// [`route_change`] for a request that trashes or renames the node it names.
+/// A mount's root is My files or a whole synced folder. An on-demand folder's
+/// root has a parent on Drive, so nothing further down would stop `pdfs rm
+/// ~/Downloads` from trashing the folder out from under its own mount.
+fn route_node(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
+    let routed = route_change(core, mountpoint, path)?;
+    if below_root(&routed.1) {
+        Ok(routed)
+    } else {
+        Err(CoreError::invalid(format!(
+            "{path} is the root of a synced location and cannot be changed"
+        )))
+    }
+}
+
+/// Whether a mount-relative path names something below the mount's root.
+fn below_root(rel: &Path) -> bool {
+    rel.components()
+        .any(|component| matches!(component, Component::Normal(_)))
 }
 
 /// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
@@ -959,8 +983,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::Rename { path, new_name }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.rename(&rel, &new_name) {
+        Ok(CtlRequest::Rename { path, new_name }) => match route_node(core, mountpoint, &path) {
+            Ok((core, rel)) => match core.rename(&rel, &new_name) {
                 Ok(name) => {
                     core.log_activity(ActivityKind::Rename, &name, format!("was {path}"), true);
                     CtlResponse::Ok {
@@ -1017,8 +1041,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 (Err(e), _) | (_, Err(e)) => CtlResponse::error(e),
             }
         }
-        Ok(CtlRequest::Delete { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.delete(&rel) {
+        Ok(CtlRequest::Delete { path }) => match route_node(core, mountpoint, &path) {
+            Ok((core, rel)) => match core.delete(&rel) {
                 Ok(name) => {
                     core.log_activity(ActivityKind::Trash, &name, "", true);
                     CtlResponse::Ok {
@@ -1032,21 +1056,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::CreateFolder { parent, name }) => match rel_to_mount(mountpoint, &parent) {
-            Ok(parent_rel) => match core.create_folder(&parent_rel, &name) {
-                Ok(name) => {
-                    core.log_activity(ActivityKind::CreateFolder, &name, "", true);
-                    CtlResponse::Ok {
-                        message: format!("created folder {name}"),
+        Ok(CtlRequest::CreateFolder { parent, name }) => {
+            match route_change(core, mountpoint, &parent) {
+                Ok((core, parent_rel)) => match core.create_folder(&parent_rel, &name) {
+                    Ok(name) => {
+                        core.log_activity(ActivityKind::CreateFolder, &name, "", true);
+                        CtlResponse::Ok {
+                            message: format!("created folder {name}"),
+                        }
                     }
-                }
-                Err(e) => {
-                    core.log_activity(ActivityKind::CreateFolder, &name, &e, false);
-                    CtlResponse::error(e)
-                }
-            },
-            Err(e) => CtlResponse::error(e),
-        },
+                    Err(e) => {
+                        core.log_activity(ActivityKind::CreateFolder, &name, &e, false);
+                        CtlResponse::error(e)
+                    }
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::UploadPaths { parent, sources }) => {
             match rel_to_mount(mountpoint, &parent) {
                 // Ack immediately and upload on a background thread: a directory tree
@@ -1363,7 +1389,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ResolveConflict { path, keep }) => {
-            match route_conflict(core, mountpoint, &path) {
+            match route_change(core, mountpoint, &path) {
                 Ok((core, rel)) => match core.resolve_conflict(&rel, &keep) {
                     Ok(message) => CtlResponse::Ok { message },
                     Err(e) => CtlResponse::error(e),
@@ -1863,6 +1889,18 @@ mod request_limit_tests {
         assert!(rel_to_mount(mountpoint, "../escape").is_err());
         assert!(rel_to_mount(mountpoint, "Photos/../../escape").is_err());
         assert!(rel_to_mount(mountpoint, "/mnt/elsewhere").is_err());
+    }
+
+    /// `pdfs rm` and `pdfs rename` reach on-demand mounts, whose root is a whole
+    /// synced folder with a parent on Drive. Only a path below a root may get
+    /// through to the trash or rename call.
+    #[test]
+    fn only_a_path_below_a_mount_root_names_a_node() {
+        assert!(below_root(Path::new("Photos")));
+        assert!(below_root(Path::new("./Photos/2026")));
+        assert!(!below_root(Path::new("")));
+        assert!(!below_root(Path::new(".")));
+        assert!(!below_root(Path::new("./.")));
     }
 }
 
