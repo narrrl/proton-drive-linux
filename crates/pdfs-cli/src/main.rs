@@ -20,6 +20,39 @@ use pdfs_core::control::{
 use pdfs_core::db::Db;
 use pdfs_core::service;
 
+/// `println!` for this binary, shadowing std's, which panics when stdout is
+/// closed: `pdfs ls | head` ended in a "Broken pipe" panic once `head` had its
+/// lines. This one hands the failure to [`stdout_written`] instead.
+///
+/// Restoring the default `SIGPIPE` would also stop the panic, but the same
+/// binary runs the daemon, which must not die when a socket's peer goes away.
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        $crate::stdout_written(writeln!(std::io::stdout(), $($arg)*))
+    }};
+}
+
+/// [`println!`] without the newline.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        $crate::stdout_written(write!(std::io::stdout(), $($arg)*))
+    }};
+}
+
+/// Exit on a failed write to stdout. A closed pipe means the reader has all it
+/// wanted, so that exit is a success.
+fn stdout_written(result: std::io::Result<()>) {
+    if let Err(error) = result {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("Error: writing to stdout: {error}");
+        std::process::exit(1);
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "pdfs",
