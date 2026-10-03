@@ -103,6 +103,8 @@ mod relocate;
 mod revisions;
 mod sharing;
 mod shutdown;
+#[cfg(test)]
+mod sim;
 mod state;
 mod supervisor;
 mod sweep;
