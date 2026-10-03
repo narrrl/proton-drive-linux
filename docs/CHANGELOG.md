@@ -11,6 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+Schema: **36**. Every node row gets a local id that never changes; existing rows keep their
+row number as that id. Going back to 2.9 means rebuilding the cache.
+
+### Changed
+- **A file keeps its inode number across daemon restarts.** Inodes are now the node's local id
+  instead of a counter that started over on every run.
+- **Every mount serves from one tree.** An on-demand sync folder used to keep its own copy of the
+  nodes it showed, which background work had to visit one by one and could miss (B74). It now
+  shares the tree with My files; only the root it starts at is its own.
+
 ### Fixed
 - **A file renamed or moved while its first upload is on the wire keeps its new name and folder.**
   It landed under the old name and the rename was lost (B136).

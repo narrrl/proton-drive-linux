@@ -175,10 +175,9 @@ impl Core {
                 return;
             }
         }
-        // Every mount, not just the primary: a conflict copy inside a sync
-        // folder lives in that fork's inode space, and leaving it hooked up
-        // there keeps a node we have just trashed remotely visible and
-        // readable there (`docs/BUGS.md` B74).
+        // Leaving a conflict copy hooked up in the tree keeps a node we have
+        // just trashed remotely visible and readable in whichever mount shows
+        // it (`docs/BUGS.md` B74).
         self.for_each_state(|st| {
             st.forget_or_unlink(uid);
         });

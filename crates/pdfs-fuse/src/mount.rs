@@ -276,13 +276,14 @@ pub(super) fn spawn_session(
     info!(mountpoint = %mountpoint.display(), "mounting Proton Drive location");
     let fs = ProtonFs::new(core.clone(), root);
     if core.primary {
-        // Only My Files rehydrates the daemon-wide node cache. A secondary
-        // inode space is rooted at one device subtree and must not import every
-        // unrelated persisted node.
+        // Only My Files rehydrates the daemon-wide node cache, once. A
+        // secondary mount shares the tree it fills.
         core.hydrate();
     }
     let session = Session::new(fs, mountpoint, &config)?.spawn()?;
-    let _ = core.notifier.set(session.notifier());
+    let _ = core
+        .notifier
+        .set(KernelChannel::new(session.notifier(), core.root_ino()));
     core.session_live.store(true, Ordering::Release);
     Ok(session)
 }
@@ -410,6 +411,7 @@ pub(crate) fn mount_with(
         primary_root_uid: root.uid.clone(),
         primary: true,
         state: Arc::new(Mutex::new(State::new(db.clone(), share_access))),
+        root: Arc::new(OnceLock::new()),
         cache: Arc::new(cache),
         readers: Arc::new(Mutex::new(HashMap::new())),
         block_ring: Arc::new(Mutex::new(BlockRing::default())),
@@ -467,7 +469,7 @@ pub(crate) fn mount_with(
         states: Arc::new(StateRegistry::default()),
     };
     // Before anything can queue work against it: the drain thread below reaches
-    // every mount's inode space through this registry, not through `core.state`.
+    // every mount's session through this registry.
     core.register_state(mountpoint);
     core.transfers.set_limits(upload_limit, download_limit);
 

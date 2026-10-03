@@ -17,7 +17,7 @@ use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonApiError, ProtonError};
 use tracing::{debug, info, warn};
 
-use crate::{Core, ONLINE_PROBE_MAX, ONLINE_PROBE_MIN, ROOT_INO};
+use crate::{Core, ONLINE_PROBE_MAX, ONLINE_PROBE_MIN};
 
 /// How long a remote call a FUSE handler is waiting on may take before the link
 /// is treated as down.
@@ -258,8 +258,9 @@ impl Core {
             match probe {
                 Ok(root) => {
                     {
+                        let root_ino = self.root_ino();
                         let mut st = self.state();
-                        if let Some(e) = st.entries.get_mut(&ROOT_INO) {
+                        if let Some(e) = st.entries.get_mut(&root_ino) {
                             e.node = root.clone();
                         }
                     }

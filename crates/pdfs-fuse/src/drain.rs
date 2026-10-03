@@ -44,7 +44,7 @@ use super::state::{Intervals, PendingRevision};
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
-    DRAIN_REVISION_DEBOUNCE_MAX, ROOT_INO, UPLOAD_TIME_MEMORY, WriteAuthority, conflict_name,
+    DRAIN_REVISION_DEBOUNCE_MAX, UPLOAD_TIME_MEMORY, WriteAuthority, conflict_name,
     is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
     now_millis, now_secs, parse_node_uid,
 };
@@ -1155,13 +1155,10 @@ impl Core {
     /// The inode is deliberately kept, so anything already holding the file open
     /// keeps working across the drain.
     ///
-    /// Applied to **every** live inode space, not just this Core's. A node
-    /// created inside an on-demand sync folder lives in that fork's `state`,
-    /// while the drain that lands its create belongs to the primary mount — so
-    /// reaching for `self.state` here found nothing and left the fork's entry on
-    /// its `local~` uid, which reads as an empty file for as long as the daemon
-    /// runs (`docs/BUGS.md` B74). A uid is unique across mounts, so at most one
-    /// of them matches and the others are no-ops.
+    /// Applied to the tree every mount shares. A node created inside an
+    /// on-demand sync folder once lived in that fork's own state, where the
+    /// primary mount's drain never looked, and stayed on its `local~` uid —
+    /// an empty file for as long as the daemon ran (`docs/BUGS.md` B74).
     ///
     /// `adopt` sees the node as Drive made it, before anything is rebased onto
     /// it.
@@ -1559,25 +1556,13 @@ impl Core {
 
     /// A node's parent uid and name, as the tree currently has them.
     pub(crate) fn node_place(&self, uid: &NodeUid) -> Option<(NodeUid, String)> {
-        // Across every mount: the drain runs on the primary Core, but a node
-        // written inside a sync folder is interned in that fork's inode space,
-        // so asking `self.state` alone always missed it and fell through to the
-        // DB. That still gave the right answer — the fallback below exists for
-        // exactly this shape of miss — but it went to disk for something already
-        // in memory, and only *because* of the fallback was it not a bug.
-        let mut found = None;
-        self.for_each_state(|st| {
-            if found.is_some() {
-                return;
-            }
+        {
+            let st = self.state();
             if let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))
                 && let Some(parent) = entry.node.parent_uid.clone()
             {
-                found = Some((parent, entry.node.name.clone()));
+                return Some((parent, entry.node.name.clone()));
             }
-        });
-        if found.is_some() {
-            return found;
         }
         // The in-memory tree only holds what has been walked to since the daemon
         // started, and the drain routinely runs before anything has walked to
@@ -1612,8 +1597,8 @@ impl Core {
     /// root yet, which is not where the drain runs; the drain must not panic
     /// over it regardless, since that would stop the queue for good.
     pub(crate) fn root_uid(&self) -> Option<NodeUid> {
-        let st = self.state();
-        st.entries.get(&ROOT_INO).map(|e| e.uid.clone())
+        let root = self.root_ino();
+        self.state().entries.get(&root).map(|e| e.uid.clone())
     }
 
     /// Upload a staged revision of a file the server already knows about.

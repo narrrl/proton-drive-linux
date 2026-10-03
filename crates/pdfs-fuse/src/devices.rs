@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use super::sync::{self, base_name};
 use super::{
-    Core, SecondaryInsertRejection, SecondaryMount, State, SwitchBlocked, clear_stale_mount,
+    Core, SecondaryInsertRejection, SecondaryMount, SwitchBlocked, clear_stale_mount,
     device_type_str, dir_is_empty, evict_dir_contents, fuse_connection_id, is_stale_mount,
     now_secs, parse_uid, spawn_session, sync_folder_info, this_hostname,
 };
@@ -616,23 +616,16 @@ impl Core {
         };
     }
 
-    /// A sibling Core that shares this one's client/rt/cache/db (and transfer,
-    /// activity, mount registries) but gets a **fresh, empty `State`** — its own
-    /// inode space starting at [`ROOT_INO`]. Used to root a secondary FUSE session
-    /// at an `ondemand` sync folder without colliding with the main mount's inodes
-    /// (devices.md Phase 3).
+    /// A sibling Core for a secondary FUSE session rooted at an `ondemand` sync
+    /// folder (devices.md Phase 3). It shares everything with this one,
+    /// the tree included, except what belongs to a session: its root and its
+    /// kernel channel, both filled in when the session is built.
     pub(crate) fn fork_state(&self) -> Core {
         let mut fork = self.clone();
         fork.primary = false;
-        let share_access = self.state().share_access.clone();
-        fork.state = Arc::new(Mutex::new(State::new(self.db.clone(), share_access)));
-        // A fresh inode space needs a fresh notification channel: this fork's
-        // session is the only one that knows these inodes, so it must be the one
-        // notified about them. Filled in by `spawn_ondemand_mount`.
+        fork.root = Arc::new(OnceLock::new());
         fork.notifier = Arc::new(OnceLock::new());
         fork.session_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Size upgrades are keyed by inode, which is per-fork too.
-        fork.size_upgrades = Arc::new(Mutex::new(HashMap::new()));
         fork
     }
 
@@ -934,8 +927,8 @@ impl Core {
         }
     }
 
-    /// Spawn a secondary FUSE session rooted at `root` over `local` on a forked
-    /// inode space. Clears any stale kernel mount first (a crashed run can leave
+    /// Spawn a secondary FUSE session rooted at `root` over `local` from a
+    /// [`Core::fork_state`] sibling. Clears any stale kernel mount first (a crashed run can leave
     /// one, which would fail the fresh mount with EBUSY).
     pub(crate) fn spawn_ondemand_mount(
         &self,

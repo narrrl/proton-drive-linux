@@ -72,7 +72,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let parent = parent.0;
+        let parent = self.tree(parent).0;
         let name = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -95,11 +95,13 @@ impl Filesystem for ProtonFs {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        let ino = self.tree(ino);
         let mut st = self.core.state();
         st.forget_lookup(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = self.tree(ino);
         let (attr, provisional_in) = {
             let st = self.core.state();
             match st.entries.get(&ino.0) {
@@ -175,7 +177,7 @@ impl Filesystem for ProtonFs {
     /// Enumerating a cold folder is a remote call, so it goes to a worker for
     /// the same reason `lookup` and `readdir` do.
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let ino = ino.0;
+        let ino = self.tree(ino).0;
         if self.core.children_cached(ino) {
             self.serve_opendir(ino, reply);
             return;
@@ -194,13 +196,13 @@ impl Filesystem for ProtonFs {
         offset: u64,
         reply: ReplyDirectory,
     ) {
-        let ino = ino.0;
+        let ino = self.tree(ino).0;
         // The snapshot is the whole point: served from it, this is a pure
         // in-memory walk with no chance of a remote call, so it never needs a
         // worker. Only a handle whose `opendir` failed to snapshot (or a kernel
         // that issued `readdir` without one) falls back to the live path.
         if let Some(listing) = self.core.state().dir_snapshots.get(&fh.0).cloned() {
-            reply_listing(&listing, offset, reply);
+            reply_listing(&listing, offset, self.root, reply);
             return;
         }
         // Same split as `lookup`: only the cold, remote-enumerating path pays
@@ -232,6 +234,7 @@ impl Filesystem for ProtonFs {
     /// a blob that is the whole file — so it is served from a worker rather than
     /// stalling every other request on the mount behind it.
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let ino = self.tree(ino);
         if flags.acc_mode() == OpenAccMode::O_RDONLY {
             self.serve_open(ino, flags, reply);
             return;
@@ -253,6 +256,7 @@ impl Filesystem for ProtonFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino = self.tree(ino);
         // A file open for writing is served from its handle so reads see the
         // in-flight (possibly unsaved) content: authored bytes come from the
         // scratch file, untouched bytes from the base.
@@ -364,7 +368,7 @@ impl Filesystem for ProtonFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let parent = parent.0;
+        let parent = self.tree(parent).0;
         if let Err(error) = self.core.require_writable(parent) {
             reply.error(error);
             return;
@@ -400,6 +404,7 @@ impl Filesystem for ProtonFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let ino = self.tree(ino);
         if let Err(error) = self.core.require_writable(ino.0) {
             reply.error(error);
             return;
@@ -477,6 +482,7 @@ impl Filesystem for ProtonFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let ino = self.tree(ino);
         if let Err(error) = self.core.require_writable(ino.0) {
             reply.error(error);
             return;
@@ -544,6 +550,7 @@ impl Filesystem for ProtonFs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let ino = self.tree(ino);
         if let Err(error) = self.core.require_writable(ino.0) {
             reply.error(error);
             return;
@@ -640,16 +647,17 @@ impl Filesystem for ProtonFs {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = self.tree(ino);
         let (handle, unlinked_uid) = {
             let mut st = self.core.state();
-            let unlinked_uid = release_unlinked_entry(&mut st, _ino.0);
+            let unlinked_uid = release_unlinked_entry(&mut st, ino.0);
             let ino = st.handles.remove(&fh.0);
             let h = ino.and_then(|i| {
                 let aw = st.active_writes.get_mut(&i)?;
@@ -680,7 +688,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let parent = parent.0;
+        let parent = self.tree(parent).0;
         if let Err(error) = self.core.require_writable(parent) {
             reply.error(error);
             return;
@@ -700,7 +708,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let parent = parent.0;
+        let parent = self.tree(parent).0;
         if let Err(error) = self.core.require_writable(parent) {
             reply.error(error);
             return;
@@ -729,7 +737,7 @@ impl Filesystem for ProtonFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let parent = parent.0;
+        let parent = self.tree(parent).0;
         if let Err(error) = self.core.require_writable(parent) {
             reply.error(error);
             return;
@@ -760,8 +768,8 @@ impl Filesystem for ProtonFs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let parent = parent.0;
-        let newparent = newparent.0;
+        let parent = self.tree(parent).0;
+        let newparent = self.tree(newparent).0;
         if let Err(error) = self
             .core
             .require_writable(parent)
@@ -794,6 +802,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let ino = self.tree(ino);
         let state = self.core.state();
         let Some(entry) = state.entries.get(&ino.0) else {
             reply.error(Errno::ENOENT);
@@ -807,6 +816,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let ino = self.tree(ino);
         // Always off the dispatch loop: a miss goes to the wire, and a lister
         // that stats a directory issues one of these per file per advertised
         // name — inline, that serialized the whole mount behind ~186 ms of
@@ -819,6 +829,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let ino = self.tree(ino);
         self.serve_listxattr(ino, size, reply);
     }
 
@@ -968,6 +979,9 @@ pub struct ProtonFs {
     core: Core,
     uid: u32,
     gid: u32,
+    /// The tree inode of this session's root, which the kernel knows as
+    /// [`ROOT_INO`].
+    root: u64,
 }
 
 /// How many times a write `open` will re-read its base after a `release`
@@ -1008,18 +1022,24 @@ fn build_listing(st: &State, ino: u64) -> DirListing {
 /// The cookie handed back is the index of the *next* entry, so a resumed call
 /// continues exactly where the last one stopped — which is only true because
 /// the listing behind those indexes is a snapshot (bugs.md B43).
-fn reply_listing(listing: &DirListing, offset: u64, mut reply: ReplyDirectory) {
+fn reply_listing(listing: &DirListing, offset: u64, root: u64, mut reply: ReplyDirectory) {
     for (i, (ino, is_dir, name)) in listing.iter().enumerate().skip(offset as usize) {
         let ft = if *is_dir {
             FileType::Directory
         } else {
             FileType::RegularFile
         };
-        if reply.add(INodeNo(*ino), (i + 1) as u64, ft, name) {
+        if reply.add(kernel_ino(root, *ino), (i + 1) as u64, ft, name) {
             break;
         }
     }
     reply.ok();
+}
+
+/// The inode the kernel knows tree inode `ino` by, in a session rooted at
+/// `root`. The inverse of [`ProtonFs::tree`].
+pub(crate) fn kernel_ino(root: u64, ino: u64) -> INodeNo {
+    INodeNo(if ino == root { ROOT_INO } else { ino })
 }
 
 pub(crate) fn access_allowed(is_dir: bool, access: Access, mask: AccessFlags) -> bool {
@@ -1028,39 +1048,29 @@ pub(crate) fn access_allowed(is_dir: bool, access: Access, mask: AccessFlags) ->
 }
 
 impl ProtonFs {
-    /// Build the filesystem rooted at `root` (the user's My Files folder).
+    /// Build the filesystem rooted at `root` (the user's My Files folder, or
+    /// the folder an on-demand location shows).
     pub(super) fn new(core: Core, root: Node) -> Self {
-        {
-            let mut st = core.state();
-            if let Err(e) = st.db.upsert_node(&root) {
-                warn!(uid = %root.uid, error = %e, "db upsert root failed");
-            }
-            st.by_uid.insert(root.uid.clone(), ROOT_INO);
-            // The filesystem root is always owned — it must never be
-            // classified as a shared root, even when the API returns
-            // membership data (which happens when the owner shares the
-            // folder with someone else).  Clean up any stale share_access
-            // row that a previous downgrade_all_share_access may have
-            // written for this uid, so hydrate_access cannot pick it up.
-            let access = Access::Owner;
-            st.share_access.remove(&root.uid);
-            let _ = st.db.delete_share_access(&root.uid);
-            st.entries.insert(
-                ROOT_INO,
-                Entry {
-                    uid: root.uid.clone(),
-                    parent: ROOT_INO,
-                    node: root,
-                    access,
-                    lookup_count: 1,
-                    open_count: 0,
-                    unlinked: false,
-                },
-            );
-        }
+        let root = core.state().install_root(root);
+        let _ = core.root.set(root);
         // SAFETY: geteuid/getegid are infallible and have no preconditions.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        Self { core, uid, gid }
+        Self {
+            core,
+            uid,
+            gid,
+            root,
+        }
+    }
+
+    /// The tree inode the kernel means by `ino`: this session's root for
+    /// [`ROOT_INO`], and every other inode as it is.
+    fn tree(&self, ino: INodeNo) -> INodeNo {
+        if ino.0 == ROOT_INO {
+            INodeNo(self.root)
+        } else {
+            ino
+        }
     }
 
     /// The body of [`Filesystem::lookup`], on whichever thread ends up serving it.
@@ -1169,7 +1179,7 @@ impl ProtonFs {
         let st = self.core.state();
         let listing = build_listing(&st, ino);
         drop(st);
-        reply_listing(&listing, offset, reply);
+        reply_listing(&listing, offset, self.root, reply);
     }
 
     fn attr(&self, ino: u64, node: &Node, access: Access) -> FileAttr {
@@ -1182,7 +1192,7 @@ impl ProtonFs {
         let mtime = unix_secs(node.modification_time);
         let crtime = unix_secs(node.creation_time);
         FileAttr {
-            ino: INodeNo(ino),
+            ino: kernel_ino(self.root, ino),
             size,
             blocks: size.div_ceil(512),
             atime: mtime,
@@ -1994,11 +2004,11 @@ impl ProtonFs {
                     // and retain an empty destination readdir page.
                     reply.ok();
                     if let Some(notifier) = self.core.notifier.get() {
-                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
-                        let _ = notifier.inval_entry(INodeNo(newparent), OsStr::new(&newname));
-                        let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
+                        let _ = notifier.inval_entry(parent, OsStr::new(&name));
+                        let _ = notifier.inval_entry(newparent, OsStr::new(&newname));
+                        let _ = notifier.inval_inode(parent);
                         if newparent != parent {
-                            let _ = notifier.inval_inode(INodeNo(newparent), 0, 0);
+                            let _ = notifier.inval_inode(newparent);
                         }
                     }
                 }

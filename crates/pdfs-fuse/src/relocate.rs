@@ -35,7 +35,7 @@ const MIRROR_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// Where one side of a move lives.
 enum Place {
-    /// My files or an on-demand folder: a live inode space. `core` is rooted at
+    /// My files or an on-demand folder: a live FUSE mount. `core` is rooted at
     /// that mount and `rel` is relative to its mountpoint.
     Mounted { core: Box<Core>, rel: PathBuf },
     /// A mirror folder: a local directory kept in step by the sync engine.
@@ -141,7 +141,7 @@ impl Core {
     /// are absolute local paths and may be in different locations: My files,
     /// an on-demand folder, or a mirror folder. Returns the moved name.
     ///
-    /// Within one inode space this is [`Core::move_to`]. Across locations it
+    /// Within one mount this is [`Core::move_to`]. Across locations it
     /// is a server-side move followed by local bookkeeping; see the module
     /// documentation. Anything the move could lose is refused up front.
     pub(crate) fn move_between(&self, src: &Path, dest_parent: &Path) -> CoreResult<String> {
@@ -154,7 +154,7 @@ impl Core {
                 rel: dest_rel,
             },
         ) = (&source, &dest)
-            && Arc::ptr_eq(&core.state, &dest_core.state)
+            && Arc::ptr_eq(&core.root, &dest_core.root)
         {
             return core.move_to(rel, dest_rel);
         }

@@ -205,16 +205,19 @@ pub(crate) type DirListing = Vec<(u64, bool, String)>;
 /// out, so a fallback inode never names a node that has a row.
 pub(crate) const FALLBACK_INO: u64 = 1 << 48;
 
-/// The inode of the node with local id `lid` ([`Db::lids_for`]), except where
-/// it is a mount's root, which is always [`crate::ROOT_INO`]. One above the lid,
-/// so no other node takes the root's number. The same in every mount and after
-/// a restart.
+/// The inode of the node with local id `lid` ([`Db::lids_for`]). One above the
+/// lid, so no node takes [`crate::ROOT_INO`], which each session uses for its
+/// own root. The same in every mount and after a restart.
 pub(crate) fn lid_ino(lid: i64) -> u64 {
     lid.unsigned_abs() + crate::ROOT_INO
 }
 
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
 /// `Filesystem` trait through `&self`.
+///
+/// One tree for every mount of the daemon. Each FUSE session sees it from its
+/// own root ([`State::roots`]) and calls that root inode 1; `ProtonFs`
+/// translates at the kernel boundary.
 pub(crate) struct State {
     /// inode -> node metadata.
     pub(crate) entries: HashMap<u64, Entry>,
@@ -223,6 +226,10 @@ pub(crate) struct State {
     /// Cached directory listings: parent inode -> child inodes. Presence of a
     /// key means the directory has been enumerated.
     pub(crate) children: HashMap<u64, Vec<u64>>,
+    /// The inodes some session has been rooted at ([`State::install_root`]).
+    /// A root is its own parent. Kept after its session unmounts: the node is
+    /// still one of ours.
+    pub(crate) roots: HashSet<u64>,
     /// The next inode for a node the database could not give a local id, from
     /// a range lids never reach ([`FALLBACK_INO`]).
     pub(crate) next_ino: u64,
@@ -246,7 +253,7 @@ pub(crate) struct State {
     /// intern/root refresh. Core drains this set and notifies the matching
     /// kernel only after releasing the State lock.
     pub(crate) access_changes: HashSet<u64>,
-    /// Persisted shared-root authority, loaded once per inode space and updated
+    /// Persisted shared-root authority, loaded once and updated
     /// on every explicit role/tombstone change. Descendant inheritance reads
     /// this map instead of issuing one SQLite query per interned inode.
     pub(crate) share_access: HashMap<NodeUid, Access>,
@@ -312,15 +319,6 @@ impl DbWrite {
 pub(crate) struct StateGuard<'a> {
     guard: Option<parking_lot::MutexGuard<'a, State>>,
     db: &'a Arc<Db>,
-}
-
-/// Take a mount's inode lock through a [`StateGuard`], for the loops that walk
-/// every live mount rather than this `Core`'s own.
-pub(crate) fn lock_state<'a>(
-    state: &'a parking_lot::Mutex<State>,
-    db: &'a Arc<Db>,
-) -> StateGuard<'a> {
-    StateGuard::new(state.lock(), db)
 }
 
 impl<'a> StateGuard<'a> {
@@ -389,14 +387,14 @@ impl State {
         self.db.clone()
     }
 
-    /// A fresh, empty inode space over `db`. A node's inode comes from its
-    /// local id ([`lid_ino`]); a real mount puts its root at
-    /// [`crate::ROOT_INO`].
+    /// A fresh, empty tree over `db`. A node's inode comes from its local id
+    /// ([`lid_ino`]).
     pub(crate) fn new(db: Arc<Db>, share_access: HashMap<NodeUid, Access>) -> Self {
         Self {
             entries: HashMap::new(),
             by_uid: HashMap::new(),
             children: HashMap::new(),
+            roots: HashSet::new(),
             next_ino: FALLBACK_INO,
             active_writes: HashMap::new(),
             handles: HashMap::new(),
@@ -408,18 +406,55 @@ impl State {
             outbox: Vec::new(),
         }
     }
-    /// Whether `uid` names an owned node currently reachable from this mount's
-    /// root. Resident entries can outlive their dentries for open-handle and
-    /// access-revocation semantics, so `by_uid` membership alone is not proof
-    /// that a control-socket operation may address the node.
-    pub(crate) fn owns_visible_uid(&self, uid: &NodeUid) -> bool {
-        let Some(root) = self.entries.get(&crate::ROOT_INO) else {
-            return false;
-        };
-        if uid.volume_id != root.uid.volume_id {
-            return false;
+    /// Make `root` the root of a session and return its inode, which comes
+    /// from its local id like any other node's.
+    ///
+    /// The root is always owned. It must never be classified as a shared root,
+    /// even when the API returns membership data (which happens when the owner
+    /// shares the folder with someone else), so a stale share row a downgrade
+    /// may have left for it is dropped. A node already in the tree keeps its
+    /// inode and its lookups, and stops naming a parent: a session's `..` at
+    /// its root is the root.
+    pub(crate) fn install_root(&mut self, root: Node) -> u64 {
+        if let Err(e) = self.db.upsert_node(&root) {
+            warn!(uid = %root.uid, error = %e, "db upsert root failed");
         }
+        self.share_access.remove(&root.uid);
+        let _ = self.db.delete_share_access(&root.uid);
+        let ino = match self.by_uid.get(&root.uid) {
+            Some(&ino) => ino,
+            None => self.new_inos(&[&root])[&root.uid],
+        };
+        if let Some(old) = self.entries.get(&ino).map(|e| e.parent)
+            && old != ino
+            && let Some(kids) = self.children.get_mut(&old)
+        {
+            kids.retain(|&k| k != ino);
+        }
+        self.by_uid.insert(root.uid.clone(), ino);
+        let lookup_count = self.entries.get(&ino).map_or(1, |e| e.lookup_count.max(1));
+        self.entries.insert(
+            ino,
+            Entry {
+                uid: root.uid.clone(),
+                parent: ino,
+                node: root,
+                access: Access::Owner,
+                lookup_count,
+                open_count: 0,
+                unlinked: false,
+            },
+        );
+        self.roots.insert(ino);
+        ino
+    }
 
+    /// Whether `uid` names an owned node currently reachable from one of
+    /// `roots`, the roots of the sessions that are mounted. Resident entries
+    /// can outlive their dentries for open-handle and access-revocation
+    /// semantics, so `by_uid` membership alone is not proof that a
+    /// control-socket operation may address the node.
+    pub(crate) fn owns_visible_uid(&self, uid: &NodeUid, roots: &[u64]) -> bool {
         let Some(&target) = self.by_uid.get(uid) else {
             return false;
         };
@@ -432,7 +467,9 @@ impl State {
             let Some(entry) = self.entries.get(&current) else {
                 return false;
             };
-            if entry.uid.volume_id != root.uid.volume_id
+            // The node's root scopes it to its own volume, excluding foreign
+            // shared-with-me residents from uid-addressed sharing.
+            if entry.uid.volume_id != uid.volume_id
                 || entry.unlinked
                 || entry.node.trashed
                 || entry.uid != entry.node.uid
@@ -440,7 +477,7 @@ impl State {
             {
                 return false;
             }
-            if current == crate::ROOT_INO {
+            if roots.contains(&current) {
                 return true;
             }
 
@@ -482,15 +519,17 @@ impl State {
         self.access_changes.drain().collect()
     }
 
-    /// Whether `uid` lives on the volume this mount is rooted in.
+    /// Whether `uid` lives on a volume some mount is rooted in.
     ///
     /// Used to decide how a node with no resolvable parent is classified:
     /// our own volume fails open (it is owned content), a foreign volume
     /// fails closed (it can only be there because of a share).
     pub(crate) fn is_own_volume(&self, uid: &NodeUid) -> bool {
-        self.entries
-            .get(&crate::ROOT_INO)
-            .is_some_and(|root| root.uid.volume_id == uid.volume_id)
+        self.roots.iter().any(|ino| {
+            self.entries
+                .get(ino)
+                .is_some_and(|root| root.uid.volume_id == uid.volume_id)
+        })
     }
 
     fn stored_share_access(&self, uid: &NodeUid) -> Option<Access> {
@@ -1475,7 +1514,7 @@ mod tests {
         let root = uid("root").to_string();
         let state = parking_lot::Mutex::new(st);
         {
-            let mut guard = lock_state(&state, &db);
+            let mut guard = StateGuard::new(state.lock(), &db);
             guard.intern(0, node("root", "none", "My Files", true));
             assert!(
                 db.node_by_uid(&root).unwrap().is_none(),
@@ -1718,6 +1757,7 @@ mod tests {
             })
             .collect();
         st.next_ino = crate::ROOT_INO + nodes.len() as u64;
+        st.roots.insert(crate::ROOT_INO);
         // Reverse order so entries are inserted before their parents, matching
         // the hydration path's non-topological materialization.
         for (i, node) in nodes.iter().enumerate().rev() {

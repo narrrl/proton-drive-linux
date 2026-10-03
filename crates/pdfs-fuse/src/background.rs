@@ -97,15 +97,13 @@ fn event_serializes_shared_publication(event: &DriveEvent, own_volume: &VolumeId
 /// entry forces the next `lookup`/`readdir` to re-enumerate from the remote, so
 /// most events only need to invalidate listings rather than re-fetch eagerly.
 ///
-/// Applied to **every** mounted inode space, not just the primary one. This task
-/// is per-daemon while node state is per-mount, and a `DriveEvent` names a uid,
-/// not a mount — so a file trashed from another device has to be withdrawn from
-/// whichever of our sessions is showing it, which for anything under a sync
-/// folder is a [`Core::fork_state`] fork rather than `core.state`. Reaching for
-/// the primary state alone left forks serving a deleted file indefinitely, the
-/// read-side twin of `docs/BUGS.md` B74. Inode numbers are per-mount, so each
-/// mount must be notified through its **own** channel; that pairing is what
-/// [`Core::for_each_mount`] exists to preserve.
+/// Applied to the tree every mount shares, and told to **every** mounted
+/// session. A `DriveEvent` names a uid, not a mount, so a file trashed from
+/// another device has to be withdrawn from whichever of our sessions is showing
+/// it — which for anything under a sync folder is a [`Core::fork_state`] fork.
+/// Telling the primary session alone left forks serving a deleted file, the
+/// read-side twin of `docs/BUGS.md` B74. [`Core::for_each_mount`] sends what
+/// the kernel needs to hear to every session.
 fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdfs_core::Result<()> {
     let foreign_delete = is_foreign_node_delete(event, &core.primary_root_uid.volume_id);
     let serializes_shared_publication =
@@ -362,8 +360,8 @@ fn flush_dirty_parents(core: &Core, dirty: &DirtyParents) {
 /// only on fatal error.
 ///
 /// Takes the whole `Core` rather than the primary mount's pieces: an event has
-/// to be applied to every mounted inode space, and the registry that enumerates
-/// them lives on the `Core` (see [`apply_event`]).
+/// to reach every mounted session, and the registry that enumerates them lives
+/// on the `Core` (see [`apply_event`]).
 pub(super) async fn run_event_sync(
     client: Arc<dyn DriveApi>,
     scope: DriveEventScopeId,
