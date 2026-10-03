@@ -113,6 +113,15 @@ impl Core {
         self.online.load(Ordering::Relaxed)
     }
 
+    /// Whether a namespace change through the mount goes to Drive inside the
+    /// syscall. Only with [`AppConfig::local_first`] off, and only online;
+    /// otherwise it is queued and the drain sends it.
+    ///
+    /// [`AppConfig::local_first`]: pdfs_core::config::AppConfig::local_first
+    pub(crate) fn sends_inline(&self) -> bool {
+        !self.local_first && self.is_online()
+    }
+
     /// Run a remote call a caller is waiting on, giving up after
     /// [`INTERACTIVE_CALL_TIMEOUT`]. The timer is built inside the runtime: a
     /// FUSE worker has no reactor of its own.

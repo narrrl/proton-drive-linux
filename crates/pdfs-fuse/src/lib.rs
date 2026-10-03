@@ -569,6 +569,14 @@ struct Core {
     /// Nodes removed through this daemon which a briefly stale remote listing
     /// may still return. Uids are not reused; an explicit restore clears one.
     hidden: Arc<Mutex<HashSet<NodeUid>>>,
+    /// The folder and name each create on the wire was sent with, by op id.
+    /// Drive holds that name until the create lands and a rename or trash
+    /// queued behind it frees it again.
+    creating: Arc<Mutex<HashMap<i64, (NodeUid, String)>>>,
+    /// Creates that landed but could not be read back, by the uid Drive gave
+    /// them, with the placeholder's. The drain adopts one before it sends
+    /// anything else for it.
+    unadopted: Arc<Mutex<HashMap<NodeUid, NodeUid>>>,
     /// Nudges the drain workers: set true and notify to have them re-examine
     /// the queue instead of waiting out their backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
@@ -624,6 +632,10 @@ struct Core {
     /// ([`AppConfig::resolved_conflict_sweep`]); [`SweepMode::Off`] means the
     /// sweep thread is never spawned at all. See `docs/BUGS.md` B71.
     sweep_mode: SweepMode,
+    /// A mkdir, create, rename or delete through the mount is recorded and
+    /// queued, and the drain sends it; the syscall never waits for Drive. Off,
+    /// they go to Drive inline while online, as before 3.0.
+    local_first: bool,
     /// Photos whose missing thumbnail is being generated right now. A tile that is
     /// still on screen asks for its thumbnail again every few seconds, and each of
     /// those downloads is a full-size photo — so an in-flight uid is never started
@@ -2485,6 +2497,14 @@ impl Core {
                 return Err(Errno::EIO);
             }
         };
+        // Drive shows none of what is still queued for the folder (B132).
+        // A shared folder's listing is published as Drive has it.
+        if !foreign {
+            match self.db.queued_children(&folder_uid) {
+                Ok((queued, gone)) => overlay_queued(&mut nodes, queued, &gone),
+                Err(e) => warn!(%folder_uid, error = %e, "db queued_children failed"),
+            }
+        }
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
@@ -3100,6 +3120,33 @@ impl Core {
             Err(e) if is_gone(&e) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Point a handle closed while its file's create landed at the uid Drive
+    /// gave the node.
+    ///
+    /// `Core::retire_create` moves the row to that uid before it repoints the
+    /// open handles. A handle closed in between still named the placeholder,
+    /// which no row has any more, and its write was refused as if access had
+    /// changed. The inode is the row's local id, which finds it either way.
+    pub(crate) fn follow_landed_create(&self, h: &mut WriteHandle) {
+        if !is_local_uid(&h.uid) {
+            return;
+        }
+        if let Some(real) = self.landed_row_uid(h.ino) {
+            debug!(local = %h.uid, %real, "write handle closed as its create landed");
+            h.uid = real;
+        }
+    }
+
+    /// The uid Drive gave the node at `ino`, once its create has landed, or
+    /// `None` while it is still queued. Read from the row, which has it before
+    /// the tree does.
+    pub(crate) fn landed_row_uid(&self, ino: u64) -> Option<NodeUid> {
+        state::ino_lid(ino)
+            .and_then(|lid| self.db.uid_of_lid(lid).ok().flatten())
+            .and_then(|uid| parse_node_uid(&uid))
+            .filter(|uid| !is_local_uid(uid))
     }
 
     /// Accept a released write handle's bytes and queue their upload
@@ -4758,9 +4805,9 @@ impl Core {
             debug!(%uid, name, "replaced a node whose create was still queued");
             return Ok(());
         }
-        // Offline, or the network goes away under the call: queue the trash.
-        // The rename that follows queues as well, behind it.
-        if !self.is_online() {
+        // Local-first or offline, or the network goes away under the call:
+        // queue the trash. The rename that follows queues as well, behind it.
+        if !self.sends_inline() {
             return self.queue_trash(uid, name);
         }
         self.require_uid_writable(uid)?;
@@ -6223,17 +6270,17 @@ fn copy_pending_for_truncate(pending: &PendingRevision, destination: &File) -> s
 }
 
 /// Whether a rename must be represented as a durable desired end state.
-/// Offline operations and operations targeting a not-yet-uploaded directory
-/// cannot use the API immediately. Online remote-to-remote operations stay
-/// synchronous so a successful kernel reply means the remote namespace has
-/// already reached the same end state.
+/// Local-first, offline, or into a not-yet-uploaded directory, the API is not
+/// called in the syscall. Only remote-to-remote renames sent inline
+/// ([`Core::sends_inline`]) stay synchronous, so a successful kernel reply means
+/// the remote namespace has already reached the same end state.
 fn rename_needs_queue(
-    online: bool,
+    inline: bool,
     destination_is_local: bool,
     _parent_changed: bool,
     _name_changed: bool,
 ) -> bool {
-    !online || destination_is_local
+    !inline || destination_is_local
 }
 
 /// Convert one kernel pathname component into the UTF-8 name accepted by Drive.
@@ -6252,6 +6299,18 @@ fn fuse_name(name: &OsStr) -> Result<String, Errno> {
 
 fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
     !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
+}
+
+/// Lay what is queued for a folder over Drive's listing of it, from
+/// `Db::queued_children`: a node a queued rename moved away is dropped, and a
+/// node a queued create, mkdir or rename put there is listed as the DB has it.
+fn overlay_queued(nodes: &mut Vec<Node>, queued: Vec<Node>, gone: &HashSet<String>) {
+    let here: HashSet<String> = queued.iter().map(|node| node.uid.to_string()).collect();
+    nodes.retain(|node| {
+        let uid = node.uid.to_string();
+        !gone.contains(&uid) && !here.contains(&uid)
+    });
+    nodes.extend(queued);
 }
 
 /// Bytes rendered with a binary unit and one decimal place (e.g. `"1.2 GB"`),

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::Db;
+use super::ops::{OP_CREATE, OP_MKDIR, OP_RENAME, wake_ops_waiting_for_tx};
 use crate::{Access, Result};
 use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{Node, NodeKind};
@@ -266,10 +267,22 @@ impl Db {
     /// resolve its shared-tree access. Removing the op first could resurrect
     /// that row after a crash; removing the row first could strand a now
     /// unauthorizable op. One transaction closes both windows.
+    ///
+    /// An op that found the name still held by this trash failed with a
+    /// backoff, and the name is free now. It is made due at once
+    /// ([`Db::wake_ops_waiting_for`]).
     pub fn complete_trash_op(&self, op_id: i64, uid: &NodeUid) -> Result<()> {
         let uid = uid.to_string();
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+        let name: Option<String> = tx
+            .query_row(
+                "SELECT name FROM pending_op WHERE id = ?1",
+                params![op_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
         let rowid: Option<i64> = tx
             .query_row(
                 "SELECT rowid FROM nodes WHERE uid = ?1",
@@ -282,6 +295,9 @@ impl Db {
             tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
         }
         tx.execute("DELETE FROM pending_op WHERE id = ?1", params![op_id])?;
+        if let Some(name) = name {
+            wake_ops_waiting_for_tx(&tx, &name)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -549,6 +565,18 @@ impl Db {
         }
     }
 
+    /// The uid of the node with local id `lid`: `None` when it has no row, or
+    /// is not on Drive yet.
+    pub fn uid_of_lid(&self, lid: i64) -> Result<Option<String>> {
+        let conn = self.read();
+        Ok(conn
+            .query_row("SELECT uid FROM nodes WHERE lid = ?1", params![lid], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     /// The local id of the node stored under `uid`, or `None` when it has no
     /// row. It stays the same for as long as the row exists, including when a
     /// create lands and the row takes the uid Drive gave it.
@@ -636,6 +664,40 @@ impl Db {
         Ok(out)
     }
 
+    /// What a queued change does to `parent`'s listing, which Drive does not
+    /// show until it lands: the children made or moved in by a queued create,
+    /// mkdir or rename, as the DB holds them, and the nodes a queued rename
+    /// moves elsewhere.
+    ///
+    /// A listing read from Drive is laid over with these, or a folder listed
+    /// while a create in it is queued, after a restart say, loses the file
+    /// until the create lands (`docs/BUGS.md` B132).
+    pub fn queued_children(&self, parent: &NodeUid) -> Result<(Vec<Node>, HashSet<String>)> {
+        let conn = self.read();
+        let parent = parent.to_string();
+        let mut stmt = conn.prepare(
+            "SELECT n.node_json FROM nodes n
+             WHERE n.parent_uid = ?1 AND n.node_json IS NOT NULL AND n.trashed = 0
+               AND EXISTS (SELECT 1 FROM pending_op p
+                           WHERE p.uid = n.uid AND p.kind IN (?2, ?3, ?4))",
+        )?;
+        let rows = stmt.query_map(params![parent, OP_CREATE, OP_MKDIR, OP_RENAME], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut here = Vec::new();
+        for json in rows {
+            here.push(serde_json::from_str(&json?)?);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT p.uid FROM pending_op p JOIN nodes n ON n.uid = p.uid
+             WHERE p.kind = ?2 AND n.parent_uid IS NOT ?1",
+        )?;
+        let gone = stmt
+            .query_map(params![parent, OP_RENAME], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok((here, gone))
+    }
+
     // --- Content-cache LRU index (P4) -------------------------------------
     //
     // Replaces the per-eviction `read_dir` scans in `ContentCache`. Each cached
@@ -671,9 +733,18 @@ pub(super) fn adopt_placeholder_row_tx(
     local: &str,
     real: &str,
 ) -> Result<()> {
+    // The node a row holds names its parent too, and is what a restart builds
+    // the tree from: a folder that landed with no write to its children after
+    // left them under a parent no row has (`docs/BUGS.md` B140).
+    let real_json = parse_node_uid(real)
+        .map(|uid| serde_json::to_string(&uid))
+        .transpose()?;
     tx.execute(
-        "UPDATE nodes SET parent_uid = ?2 WHERE parent_uid = ?1",
-        params![local, real],
+        "UPDATE nodes SET parent_uid = ?2,
+           node_json = CASE WHEN ?3 IS NULL OR node_json IS NULL THEN node_json
+                            ELSE json_set(node_json, '$.parent_uid', json(?3)) END
+         WHERE parent_uid = ?1",
+        params![local, real, real_json],
     )?;
     let row: Option<(i64, Option<String>)> = tx
         .query_row(

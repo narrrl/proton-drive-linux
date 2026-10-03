@@ -244,6 +244,9 @@ pub struct MountOptions {
     /// Upload and download caps in bytes per second (`0` = no cap).
     pub upload_limit: u64,
     pub download_limit: u64,
+    /// Namespace changes through the mount are queued, not sent in the
+    /// syscall. See [`pdfs_core::config::AppConfig::local_first`].
+    pub local_first: bool,
 }
 
 /// Spawn one FUSE session rooted at an arbitrary remote node.
@@ -385,6 +388,7 @@ pub(crate) fn mount_with(
         sweep_mode,
         upload_limit,
         download_limit,
+        local_first,
     } = options;
     // Start the uptime clock here rather than at the first `pdfs diagnostics`,
     // so the age it reports is the daemon's own.
@@ -429,6 +433,8 @@ pub(crate) fn mount_with(
         sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
+        creating: Arc::new(Mutex::new(HashMap::new())),
+        unadopted: Arc::new(Mutex::new(HashMap::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         shutdown: Arc::new(crate::shutdown::Shutdown::default()),
         upload_times: Arc::new(Mutex::new(HashMap::new())),
@@ -442,6 +448,7 @@ pub(crate) fn mount_with(
         trash_progress: Arc::new(tokio::sync::Notify::new()),
         conflict_notified: Arc::new(Mutex::new(HashSet::new())),
         sweep_mode,
+        local_first,
         self_changes: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         thumb_gen_budget: Arc::new(tokio::sync::Semaphore::new(

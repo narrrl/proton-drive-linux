@@ -212,6 +212,12 @@ pub(crate) fn lid_ino(lid: i64) -> u64 {
     lid.unsigned_abs() + crate::ROOT_INO
 }
 
+/// The local id of the node at inode `ino`, the inverse of [`lid_ino`]:
+/// `None` for the root and a fallback inode.
+pub(crate) fn ino_lid(ino: u64) -> Option<i64> {
+    (ino > crate::ROOT_INO && ino < FALLBACK_INO).then(|| (ino - crate::ROOT_INO) as i64)
+}
+
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
 /// `Filesystem` trait through `&self`.
 ///
@@ -1324,6 +1330,13 @@ mod tests {
     use super::*;
     use proton_drive_rs::ShareMembership;
     use proton_drive_rs::proton_sdk::ids::{LinkId, ShareId, ShareMembershipId, VolumeId};
+
+    #[test]
+    fn an_inode_gives_back_the_lid_it_was_made_from() {
+        assert_eq!(ino_lid(lid_ino(7)), Some(7));
+        assert_eq!(ino_lid(crate::ROOT_INO), None);
+        assert_eq!(ino_lid(FALLBACK_INO + 3), None);
+    }
 
     fn uid(link: &str) -> NodeUid {
         NodeUid::new(VolumeId::from("vol"), LinkId::from(link))

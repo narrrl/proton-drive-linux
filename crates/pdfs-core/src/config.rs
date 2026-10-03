@@ -154,6 +154,13 @@ pub struct AppConfig {
     /// configs predating the field.
     #[serde(default)]
     pub online_map: bool,
+    /// Record a new folder, a new file, a rename or a delete through the mount
+    /// locally and send it from the queue, instead of waiting for Drive in the
+    /// syscall. `None` means on. `false` brings back the old path for one
+    /// release (docs/MILESTONE-3.0.0.md §10). Defaulted for configs predating
+    /// the field.
+    #[serde(default)]
+    pub local_first: Option<bool>,
 }
 
 /// The My Files page's view choices, remembered between runs.
@@ -228,6 +235,7 @@ impl Default for AppConfig {
             tray_hidden: false,
             language: None,
             online_map: false,
+            local_first: None,
         }
     }
 }
@@ -584,6 +592,7 @@ mod tests {
             tray_hidden: true,
             language: Some("de".to_string()),
             online_map: true,
+            local_first: Some(false),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();

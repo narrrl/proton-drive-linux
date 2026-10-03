@@ -1983,6 +1983,7 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
             sweep_mode: config.resolved_conflict_sweep(),
             upload_limit: config.upload_limit.unwrap_or(0),
             download_limit: config.download_limit.unwrap_or(0),
+            local_first: config.local_first.unwrap_or(true),
         },
     );
 

@@ -1514,7 +1514,7 @@ impl ProtonFs {
         //
         // A create that set out online and lost the network on the way lands in
         // the queue too, so a Wi-Fi drop costs the caller a wait, never an EIO.
-        let minted = if !transient && self.core.is_online() && !is_local_uid(&parent_uid) {
+        let minted = if !transient && self.core.sends_inline() && !is_local_uid(&parent_uid) {
             if let Err(error) = self.core.require_uid_writable(&parent_uid) {
                 reply.error(error);
                 return;
@@ -1620,7 +1620,7 @@ impl ProtonFs {
         // queued — the folder becomes a placeholder that the drain turns into a
         // real one (offline.md Phase 3b).
         // Losing the network on the way queues it the same way.
-        let minted = if self.core.is_online() && !is_local_uid(&parent_uid) {
+        let minted = if self.core.sends_inline() && !is_local_uid(&parent_uid) {
             if let Err(error) = self.core.require_uid_writable(&parent_uid) {
                 reply.error(error);
                 return;
@@ -1770,10 +1770,13 @@ impl ProtonFs {
                 self.core.cache.clear_scratch_durable(&h.path);
                 reply.ok();
             }
-            (Some(h), false) => match self.core.queue_revision(&h) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
-            },
+            (Some(mut h), false) => {
+                self.core.follow_landed_create(&mut h);
+                match self.core.queue_revision(&h) {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(e),
+                }
+            }
             (None, _) => reply.ok(),
         }
     }
@@ -1796,7 +1799,7 @@ impl ProtonFs {
             reply.error(error);
             return;
         }
-        let (ino, uid) = match self.core.lookup_child(parent, name) {
+        let (ino, mut uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,
             Err(e) => {
                 reply.error(e);
@@ -1921,6 +1924,8 @@ impl ProtonFs {
         // to rename: the queued op *is* the node, so rewriting its target is the
         // whole rename. Nothing reaches the API, which is why this works offline
         // (offline.md Phase 3b).
+        // A create that lands meanwhile leaves no op to rewrite; the node is
+        // then renamed by the uid Drive gave it (docs/BUGS.md B142).
         if is_local_uid(&uid) {
             match self.core.db.rewrite_op_target(
                 &uid.to_string(),
@@ -1931,6 +1936,8 @@ impl ProtonFs {
                     self.core
                         .state()
                         .rename_in_place(ino, newparent, &new_parent_uid, newname);
+                    // A create that failed on its old name is due again.
+                    self.core.wake_drain();
                     // Finalize: a transient scratch file (its create parked, bytes
                     // held back) renamed to a finished name is the moment the
                     // completed file is meant to reach Drive. Un-park the create so
@@ -1949,23 +1956,29 @@ impl ProtonFs {
                     }
                     debug!(%uid, newname, "renamed a node whose create is still queued");
                     reply.ok();
+                    return;
                 }
-                // The create drained underneath us, so the node has a real uid
-                // now and this handle's is stale. A retry resolves it.
-                Ok(false) => {
-                    warn!(%uid, name, newname, "queued create vanished under a rename");
-                    self.core
-                        .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
-                    reply.error(Errno::EBUSY);
-                }
+                Ok(false) => match self.core.landed_row_uid(ino) {
+                    Some(real) => {
+                        debug!(local = %uid, %real, newname, "create landed under a rename");
+                        uid = real;
+                    }
+                    None => {
+                        warn!(%uid, name, newname, "queued create vanished under a rename");
+                        self.core
+                            .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
+                        reply.error(Errno::EBUSY);
+                        return;
+                    }
+                },
                 Err(e) => {
                     error!(%uid, error = %e, "rewriting a queued create's target failed");
                     self.core
                         .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
                     reply.error(Errno::EIO);
+                    return;
                 }
             }
-            return;
         }
         // Offline, or into a folder that does not exist remotely yet: queue the
         // rename rather than 404 or fail. Online moves into a real parent still
@@ -2020,7 +2033,7 @@ impl ProtonFs {
             }
         };
         if rename_needs_queue(
-            self.core.is_online(),
+            self.core.sends_inline(),
             is_local_uid(&new_parent_uid),
             newparent != parent,
             newname != name,
@@ -2133,7 +2146,7 @@ impl ProtonFs {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         };
-        if !self.core.is_online() {
+        if !self.core.sends_inline() {
             queue_it(reply);
             return;
         }

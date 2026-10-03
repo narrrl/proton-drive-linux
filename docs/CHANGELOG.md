@@ -14,9 +14,30 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 Schema: **37**. The queue table is rebuilt so an id is never given out twice; queued changes
 are kept.
 
+### Changed
+- **Making, renaming and deleting through the mount no longer waits for Drive.** A new folder,
+  a new file, a rename or a delete is recorded locally and the call returns at once; the queue
+  sends it, as it does offline. `"local_first": false` in `config.json` brings back the old way
+  for this release.
+
 ### Fixed
+- **A file deleted while its first upload is on the wire no longer stays on Drive.** The node
+  the upload made is trashed as soon as it lands, so its name is free again (B129).
 - **A delete queued while a rename is sent is no longer lost.** The rename landing could remove
   the delete from the queue, leaving the file on Drive (B137).
+- **A file made where another one is leaving no longer lands as a conflict copy.** Its upload
+  waits for the rename or trash that frees the name (B138).
+- **A file closed just as its first upload lands keeps its last write.** The write was refused
+  and left in staging (B139).
+- **Files made in a new folder are still there after a restart.** A folder that landed as the
+  daemon stopped, or one listed from Drive while files in it were queued, came back empty
+  (B132, B140).
+- **A file renamed twice in quick succession ends up under the second name.** The first rename
+  could land after the second and undo it (B141).
+- **Renaming a new file just as its upload lands no longer fails with "Device or resource
+  busy".** The rename goes to the file Drive made (B142).
+- **A file whose upload landed just as the connection dropped no longer gets a conflict copy at
+  its next save.** The daemon reads the file back once the connection returns (B143).
 
 ## [2.10.0] — 2026-10-03
 

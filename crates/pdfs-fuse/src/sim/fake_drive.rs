@@ -330,6 +330,7 @@ impl FakeDrive {
             online: AtomicBool::new(true),
             requests: AtomicU64::new(0),
             hold: Mutex::new(None),
+            drop_after_create: AtomicBool::new(false),
         }))
     }
 
@@ -577,6 +578,8 @@ struct ClientInner {
     requests: AtomicU64,
     /// The read [`FakeClient::hold_next_read`] is waiting for.
     hold: Mutex<Option<Arc<HoldState>>>,
+    /// Set by [`FakeClient::drop_link_after_next_create`].
+    drop_after_create: AtomicBool,
 }
 
 struct HoldState {
@@ -614,6 +617,12 @@ impl FakeClient {
 
     pub(crate) fn set_faults(&self, faults: Faults) {
         *self.0.faults.lock() = faults;
+    }
+
+    /// Take the link down as soon as the next file create has been answered,
+    /// so whatever the daemon asks next goes unanswered.
+    pub(crate) fn drop_link_after_next_create(&self) {
+        self.0.drop_after_create.store(true, Ordering::SeqCst);
     }
 
     /// Hold the next read of `uid` alone, before it reaches Drive, until the
@@ -1038,16 +1047,21 @@ impl DriveApi for FakeClient {
         _aead: bool,
     ) -> Result<NodeUid> {
         let content = read_all(reader)?;
-        self.request(true, |server| {
-            server.new_file(
-                parent_uid,
-                name,
-                media_type,
-                content,
-                last_modification_time,
-            )
-        })
-        .await
+        let made = self
+            .request(true, |server| {
+                server.new_file(
+                    parent_uid,
+                    name,
+                    media_type,
+                    content,
+                    last_modification_time,
+                )
+            })
+            .await;
+        if made.is_ok() && self.0.drop_after_create.swap(false, Ordering::SeqCst) {
+            self.set_online(false);
+        }
+        made
     }
 
     async fn upload_file_replacing_draft_from_dyn(

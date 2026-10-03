@@ -92,6 +92,13 @@ pub fn op_supersedes(kind: &str) -> bool {
 /// Other ops are taken from the node tree only for revisions. A queued rename
 /// that moved a node *into* the folder has to land, or the node would stay
 /// where it was on the server instead of going to the trash with the folder.
+///
+/// A create already on the wire cannot be stopped, so its row is not deleted
+/// but turned into a trash of the node it is making, still claimed by the
+/// upload. [`Db::finish_create`] points it at the landed node. Until then it
+/// holds the name, as any queued trash does ([`Db::has_pending_trash_named`]):
+/// a rename over the file sent first found the name taken and landed under a
+/// conflict name (`docs/BUGS.md` B129).
 fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<String>> {
     const DOOMED: &str = "
         WITH RECURSIVE
@@ -124,10 +131,46 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     tx.execute(
-        &format!("{DOOMED} DELETE FROM pending_op WHERE id IN (SELECT id FROM doomed)"),
+        &format!(
+            "{DOOMED}
+             UPDATE pending_op
+             SET kind = 'trash', parent_uid = NULL, blob_path = NULL, meta_json = NULL
+             WHERE id IN (SELECT id FROM doomed)
+               AND kind IN ('create', 'mkdir') AND claimed_at <> 0"
+        ),
+        params![uid],
+    )?;
+    tx.execute(
+        &format!(
+            "{DOOMED}
+             DELETE FROM pending_op
+             WHERE id IN (SELECT id FROM doomed)
+               AND NOT (kind = 'trash' AND claimed_at <> 0 AND uid LIKE '{LOCAL_VOLUME}~%')"
+        ),
         params![uid],
     )?;
     Ok(blobs)
+}
+
+/// The `pending_op` rows, `?1` being [`OP_RENAME`], that move a node away from
+/// the name `?2`.
+const MOVES_FROM: &str = "kind = ?1
+     AND json_extract(meta_json, '$.original_name') = ?2
+     AND (name <> ?2 OR parent_uid <> json_extract(meta_json, '$.original_parent_uid'))";
+
+/// [`Db::wake_ops_waiting_for`] within a transaction.
+pub(super) fn wake_ops_waiting_for_tx(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<()> {
+    tx.execute(
+        &format!(
+            "UPDATE pending_op SET next_attempt_at = 0
+             WHERE name = ?2 AND kind IN (?3, ?4, ?1) AND attempts > 0
+               AND next_attempt_at < ?5
+               AND NOT EXISTS (SELECT 1 FROM pending_op WHERE kind = ?6 AND name = ?2)
+               AND NOT EXISTS (SELECT 1 FROM pending_op WHERE {MOVES_FROM})"
+        ),
+        params![OP_RENAME, name, OP_CREATE, OP_MKDIR, PARK_UNTIL, OP_TRASH],
+    )?;
+    Ok(())
 }
 
 /// The volume id given to a node that exists only on this machine, so far. A
@@ -242,6 +285,20 @@ pub struct CreateLanding<'a> {
     pub landed: (&'a str, &'a str),
 }
 
+/// What became of a queued create when it landed, from [`Db::finish_create`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateRetired {
+    /// Its row is gone and nothing of it is left queued.
+    Landed,
+    /// A newer write attached to it on the wire and is now queued as a
+    /// revision of the real node: its blob and its rewritten sidecar.
+    Newer { blob: String, meta: String },
+    /// Its row had been dropped while it was on the wire: the node was deleted,
+    /// or a rename replaced it. The node Drive just made is unwanted, and a
+    /// trash of it is queued under this id, claimed by the caller.
+    Withdrawn { trash: i64 },
+}
+
 struct CreateRow {
     blob: Option<String>,
     meta: Option<String>,
@@ -278,6 +335,32 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// Whether a queued rename moves a node away from `name`.
+    ///
+    /// Like a queued trash ([`Db::has_pending_trash_named`]) it frees the name
+    /// once it lands, so an op that wants the name can wait for it. A create
+    /// renamed while it was on the wire queues one (`Db::finish_create`).
+    pub fn has_pending_move_from(&self, name: &str) -> Result<bool> {
+        let conn = self.read();
+        conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pending_op WHERE {MOVES_FROM})"),
+            params![OP_RENAME, name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Make the ops that failed because `name` was held due at once, now that
+    /// what held it let go. Nothing changes while another queued trash or
+    /// rename still holds it, or for a parked op.
+    pub fn wake_ops_waiting_for(&self, name: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        wake_ops_waiting_for_tx(&tx, name)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Whether a specific desired-state operation is still queued for a node.
     pub fn has_pending_op(&self, uid: &str, kind: &str) -> Result<bool> {
         let conn = self.read();
@@ -304,21 +387,29 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// Queue `op`, returning its id and the staged blob of the op it replaced.
+    ///
+    /// A rename a drain worker holds is not replaced but queued behind: the
+    /// claim keeps the newer one from being sent until it retires, so the two
+    /// land in the order they were made (`docs/BUGS.md` B141). Should it fail,
+    /// [`Db::record_op_failure`] drops it.
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let superseded: Option<String> = if op_supersedes(&op.kind) {
             let blob: Option<String> = tx
                 .query_row(
-                    "SELECT blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
-                    params![op.uid, op.kind],
+                    "SELECT blob_path FROM pending_op
+                     WHERE uid = ?1 AND kind = ?2 AND (kind <> ?3 OR claimed_at = 0)",
+                    params![op.uid, op.kind, OP_RENAME],
                     |r| r.get(0),
                 )
                 .optional()?
                 .flatten();
             tx.execute(
-                "DELETE FROM pending_op WHERE uid = ?1 AND kind = ?2",
-                params![op.uid, op.kind],
+                "DELETE FROM pending_op
+                 WHERE uid = ?1 AND kind = ?2 AND (kind <> ?3 OR claimed_at = 0)",
+                params![op.uid, op.kind, OP_RENAME],
             )?;
             blob
         } else {
@@ -429,21 +520,28 @@ impl Db {
     /// row names another parent or name than `landing.sent`, a rename of `real`
     /// to that target is queued in the same transaction, or the move would be
     /// lost with the row.
+    ///
+    /// A delete while the create is on the wire cannot stop the upload. It
+    /// turns the row into a trash ([`Db::delete_ops_for_uid`]), which is
+    /// pointed at `real` here, still claimed by the caller, so the node is not
+    /// left on Drive holding the name (`docs/BUGS.md` B129). A row gone
+    /// altogether is queued as such a trash. The placeholder row is left to
+    /// the delete that withdrew it.
     pub fn finish_create(
         &self,
         id: i64,
         uploaded: Option<&str>,
         landing: &CreateLanding<'_>,
         rewrite: impl FnOnce(&str) -> Option<String>,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<CreateRetired> {
         let (local, real) = (landing.local, landing.real);
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let row: Option<CreateRow> = tx
             .query_row(
                 "SELECT blob_path, meta_json, parent_uid, name, created_at
-                 FROM pending_op WHERE id = ?1",
-                params![id],
+                 FROM pending_op WHERE id = ?1 AND kind <> ?2",
+                params![id, OP_TRASH],
                 |r| {
                     Ok(CreateRow {
                         blob: r.get(0)?,
@@ -455,6 +553,28 @@ impl Db {
                 },
             )
             .optional()?;
+        let withdrawn = tx.execute(
+            "UPDATE pending_op SET uid = ?2, name = ?3 WHERE id = ?1 AND kind = ?4",
+            params![id, real, landing.landed.1, OP_TRASH],
+        )?;
+        if withdrawn > 0 {
+            tx.commit()?;
+            return Ok(CreateRetired::Withdrawn { trash: id });
+        }
+        if row.is_none() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.as_millis() as i64);
+            tx.execute(
+                "INSERT INTO pending_op
+                   (kind, uid, parent_uid, name, created_at, next_attempt_at, claimed_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 0, ?4)",
+                params![OP_TRASH, real, landing.landed.1, now],
+            )?;
+            let trash = tx.last_insert_rowid();
+            tx.commit()?;
+            return Ok(CreateRetired::Withdrawn { trash });
+        }
         let newer = match &row {
             Some(CreateRow {
                 blob: Some(blob),
@@ -505,7 +625,10 @@ impl Db {
         )?;
         adopt_placeholder_row_tx(&tx, local, real)?;
         tx.commit()?;
-        Ok(newer)
+        Ok(match newer {
+            Some((blob, meta)) => CreateRetired::Newer { blob, meta },
+            None => CreateRetired::Landed,
+        })
     }
 
     /// Replace the sidecar of a queued op, for a baseline that has moved under
@@ -539,12 +662,17 @@ impl Db {
     /// *is* the rename. Returns false when the create has already drained, in
     /// which case the node has a real uid and the caller must rename it there
     /// instead (offline.md Phase 3b).
+    ///
+    /// A create backing off is made due: what it failed on may have been the
+    /// name it no longer wants, such as one held by a queued change. A parked
+    /// create stays parked.
     pub fn rewrite_op_target(&self, uid: &str, parent_uid: &str, name: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
-            "UPDATE pending_op SET parent_uid = ?2, name = ?3
+            "UPDATE pending_op SET parent_uid = ?2, name = ?3,
+               next_attempt_at = CASE WHEN next_attempt_at < ?6 THEN 0 ELSE next_attempt_at END
              WHERE uid = ?1 AND kind IN (?4, ?5)",
-            params![uid, parent_uid, name, OP_CREATE, OP_MKDIR],
+            params![uid, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL],
         )?;
         Ok(n > 0)
     }
@@ -978,8 +1106,22 @@ impl Db {
     /// Clears any access-deferral window: whatever the op was waiting for has
     /// now been reported, so the next uncleared deferral starts its own window
     /// rather than escalating again on the following recheck.
+    ///
+    /// A rename with a newer one queued behind it ([`Db::enqueue_op`]) is
+    /// dropped instead: retried, it could land after the newer one and undo it.
     pub fn record_op_failure(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
         let conn = self.conn.lock();
+        let dropped = conn.execute(
+            "DELETE FROM pending_op
+             WHERE id = ?1 AND kind = ?2
+               AND EXISTS (SELECT 1 FROM pending_op AS newer
+                           WHERE newer.uid = pending_op.uid AND newer.kind = ?2
+                             AND newer.id > ?1)",
+            params![id, OP_RENAME],
+        )?;
+        if dropped > 0 {
+            return Ok(());
+        }
         conn.execute(
             "UPDATE pending_op
              SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3,
@@ -988,6 +1130,27 @@ impl Db {
             params![id, error, next_attempt_at],
         )?;
         Ok(())
+    }
+
+    /// Make a create due again if it was renamed or moved
+    /// ([`Db::rewrite_op_target`]) while the attempt that just failed was on
+    /// the wire, `parent_uid` and `name` being what that attempt sent. What it
+    /// failed on may have been the target it no longer has. Returns whether it
+    /// was.
+    pub fn retry_if_retargeted(
+        &self,
+        id: i64,
+        parent_uid: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE pending_op SET next_attempt_at = 0
+             WHERE id = ?1 AND kind IN (?4, ?5) AND next_attempt_at < ?6
+               AND (parent_uid IS NOT ?2 OR name IS NOT ?3)",
+            params![id, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL],
+        )?;
+        Ok(n > 0)
     }
 
     /// Defer a due operation without recording a failed remote attempt.

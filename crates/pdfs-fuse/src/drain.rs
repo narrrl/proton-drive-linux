@@ -33,8 +33,8 @@ use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{
-    CreateLanding, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_EXPIRY_MS,
-    PendingOp, RenameMeta,
+    CreateLanding, CreateRetired, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH,
+    PARK_EXPIRY_MS, PendingOp, RenameMeta,
 };
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
@@ -203,6 +203,9 @@ fn pending_op_authorities(op: &PendingOp) -> Result<Vec<NodeUid>, Box<dyn std::e
         })
     };
     match op.kind.as_str() {
+        // What a withdrawn create that never landed leaves: nothing on Drive
+        // to ask about, and nothing to send (`Core::drain_trash`).
+        OP_TRASH if is_local_uid_str(&op.uid) => Ok(Vec::new()),
         OP_REVISION | OP_TRASH => Ok(vec![uid()?]),
         OP_CREATE | OP_MKDIR => Ok(vec![parent()?]),
         OP_RENAME => {
@@ -379,6 +382,19 @@ impl Core {
                     self.release_claim(&op);
                     self.wait_for_drain_work();
                     continue;
+                }
+                match self.db.retry_if_retargeted(
+                    op.id,
+                    op.parent_uid.as_deref(),
+                    op.name.as_deref(),
+                ) {
+                    Ok(true) => {
+                        debug!(uid = %op.uid, "create was renamed while it failed; retrying")
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        debug!(uid = %op.uid, error = %e, "checking a failed create's target failed")
+                    }
                 }
             }
             // Unconditionally, on every path: a handler that retired its own row
@@ -639,6 +655,7 @@ impl Core {
 
     /// Perform one queued op and retire it.
     pub(crate) fn drain_op(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        self.finish_adoption(op)?;
         match op.kind.as_str() {
             OP_REVISION => self.drain_revision(op),
             OP_CREATE | OP_MKDIR => self.drain_local_node(op),
@@ -646,6 +663,29 @@ impl Core {
             OP_TRASH => self.drain_trash(op),
             other => Err(format!("unknown pending op kind {other:?}").into()),
         }
+    }
+
+    /// Finish adopting the node `op` is for, if its create landed but could
+    /// not be read back.
+    ///
+    /// Until it is, the tree has the node as it was made locally, and a write
+    /// queued over it is based on that rather than on what Drive holds. Sent
+    /// so, the write found our own create's revision in its way and landed as
+    /// a conflict copy (`docs/BUGS.md` B143).
+    fn finish_adoption(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(real) = parse_node_uid(&op.uid) else {
+            return Ok(());
+        };
+        let Some(local) = self.unadopted.lock().get(&real).cloned() else {
+            return Ok(());
+        };
+        // A node gone since is the op's to deal with.
+        if self.fetch_node_remote(&real)?.is_some() {
+            self.adopt_real_uid(&local, &real, |_| {})?;
+        }
+        self.unadopted.lock().remove(&real);
+        debug!(%local, %real, "adopted a landed create");
+        Ok(())
     }
 
     /// Apply a queued rename/move to the remote.
@@ -675,17 +715,21 @@ impl Core {
                 return Ok(());
             }
         };
-        if let Some(meta) = op.meta_json.as_deref() {
-            let meta: RenameMeta = serde_json::from_str(meta)?;
-            if moved_elsewhere(&meta, &node, &parent, &name) {
-                // Someone moved or renamed it while ours was queued. Ours still
-                // wins, as the last change does on Drive.
-                info!(%uid, from = %node.name, to = %name,
-                      "node moved remotely while its rename was queued");
-            }
+        let meta: Option<RenameMeta> = op
+            .meta_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        if let Some(meta) = &meta
+            && moved_elsewhere(meta, &node, &parent, &name)
+        {
+            // Someone moved or renamed it while ours was queued. Ours still
+            // wins, as the last change does on Drive.
+            info!(%uid, from = %node.name, to = %name,
+                  "node moved remotely while its rename was queued");
         }
         let landed = if node.parent_uid.as_ref() == Some(&parent) {
-            self.drain_rename_in_place(&uid, &node.name, &name)?
+            self.drain_rename_in_place(op, &uid, Some(&parent), &node.name, &name)?
         } else {
             // Move and rename land as one request (`move-multiple` takes a
             // target name), so there is no half-applied state between them and
@@ -698,8 +742,8 @@ impl Core {
                 // *different* name is the non-destructive resolution: it neither
                 // clobbers their file nor drops ours, and it is visible.
                 Err(e) if is_already_exists(&e) => {
-                    if self.db.has_pending_trash_named(&name)? {
-                        return Err(held_by_queued_trash(&name));
+                    if self.name_is_held(op, Some(&parent), &name)? {
+                        return Err(held_by_queued_change(&name));
                     }
                     let alt = conflict_name(&name, now_secs());
                     warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
@@ -721,7 +765,13 @@ impl Core {
                 // wedge the queue.
                 Err(e) if is_gone(&e) => {
                     warn!(%uid, name, %parent, "move destination is gone; leaving the node where it is");
-                    let landed = match self.drain_rename_in_place(&uid, &node.name, &name) {
+                    let landed = match self.drain_rename_in_place(
+                        op,
+                        &uid,
+                        node.parent_uid.as_ref(),
+                        &node.name,
+                        &name,
+                    ) {
                         Ok(landed) => landed,
                         // The node went with it; nothing is left to rename.
                         Err(e) if is_gone(e.as_ref()) => node.name.clone(),
@@ -740,6 +790,13 @@ impl Core {
             }
         };
         self.db.delete_op(op.id)?;
+        // An op that wanted the name this node let go of waits no longer.
+        if let Some(from) = meta.and_then(|m| m.original_name)
+            && from != landed
+        {
+            self.db.wake_ops_waiting_for(&from)?;
+            self.wake_drain();
+        }
         info!(%uid, name = %landed, "pending rename landed");
         Ok(())
     }
@@ -749,7 +806,9 @@ impl Core {
     /// offline; the node then lands under a conflict name instead.
     fn drain_rename_in_place(
         &self,
+        op: &PendingOp,
         uid: &NodeUid,
+        parent: Option<&NodeUid>,
         current: &str,
         name: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -759,8 +818,8 @@ impl Core {
         match self.rename_remote(uid, name) {
             Ok(()) => Ok(name.to_string()),
             Err(e) if is_already_exists(&e) => {
-                if self.db.has_pending_trash_named(name)? {
-                    return Err(held_by_queued_trash(name));
+                if self.name_is_held(op, parent, name)? {
+                    return Err(held_by_queued_change(name));
                 }
                 let alt = conflict_name(name, now_secs());
                 warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
@@ -786,6 +845,13 @@ impl Core {
     pub(crate) fn drain_trash(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
         let uid = parse_node_uid(&op.uid).ok_or("trash op has an unparseable uid")?;
         let name = op.name.clone().unwrap_or_else(|| op.uid.clone());
+        // The trash a delete left of a create on the wire, which then failed:
+        // nothing was made, so nothing is trashed (`Db::delete_ops_for_uid`).
+        if is_local_uid_str(&op.uid) {
+            debug!(%uid, name, "withdrawn create never landed; trash op satisfied");
+            self.db.complete_trash_op(op.id, &uid)?;
+            return Ok(());
+        }
         match self
             .rt
             .block_on(self.drive.trash_nodes(std::slice::from_ref(&uid)))
@@ -832,6 +898,22 @@ impl Core {
         &self,
         op: &PendingOp,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Drive holds the name the create is sent with once it lands, whatever
+        // became of the file meanwhile, until the rename or trash queued
+        // behind it frees it (`Core::name_is_held`).
+        if let (Some(parent), Some(name)) = (op.parent_uid.as_deref(), op.name.as_deref())
+            && let Some(parent) = parse_node_uid(parent)
+        {
+            self.creating
+                .lock()
+                .insert(op.id, (parent, name.to_string()));
+        }
+        let created = self.create_local_node(op);
+        self.creating.lock().remove(&op.id);
+        created
+    }
+
+    fn create_local_node(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
         let local = parse_node_uid(&op.uid).ok_or("pending op has an unparseable uid")?;
         let parent_str = op.parent_uid.as_deref().ok_or("create op has no parent")?;
         // `run_pending_drain` will not offer an op whose parent is still a
@@ -863,9 +945,9 @@ impl Core {
             adopted = true;
         }
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
-            && self.db.has_pending_trash_named(&wanted)?
+            && self.name_is_held(op, Some(&parent), &wanted)?
         {
-            return Err(held_by_queued_trash(&wanted));
+            return Err(held_by_queued_change(&wanted));
         }
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref())) {
             name = conflict_name(&wanted, now_secs());
@@ -906,6 +988,12 @@ impl Core {
             }
         }
         let real = real?;
+        // Retiring the op makes the ops behind it due: a child created in a new
+        // folder, a rename made while the create was on the wire. Drive answers
+        // a create before it lists the node, and those ops sent before then
+        // found no folder or dropped the rename as gone. Best effort:
+        // `adopt_real_uid` reads it back again and reports the failure.
+        let _ = self.read_back(&real);
 
         // Retire the op before touching anything else: if we crash here the node
         // exists remotely and the local placeholder is reconciled by the event
@@ -919,7 +1007,12 @@ impl Core {
             sent: (parent_str, &wanted),
             landed: (&home.to_string(), &name),
         };
-        let newer = self.retire_create(op, uploaded, &landing, &local, &real)?;
+        let newer = match self.retire_create(op, uploaded, &landing, &local, &real)? {
+            CreateRetired::Withdrawn { trash } => {
+                return self.trash_withdrawn_create(op, trash, &local, &real, &name);
+            }
+            retired => matches!(retired, CreateRetired::Newer { .. }),
+        };
         // The uploaded blob is the new file's content, so it becomes the cached
         // content, as for a revision. A partial write fills its gaps from it;
         // without it the next write open was refused (`docs/BUGS.md` B123).
@@ -927,7 +1020,10 @@ impl Core {
             .filter(|_| !newer)
             .and(op.meta_json.as_deref())
             .and_then(|json| serde_json::from_str(json).ok());
-        self.adopt_real_uid(&local, &real, |node| {
+        // The op is gone, so the create has landed whatever the read-back
+        // says. One that fails is finished before anything else is sent for
+        // the node (`docs/BUGS.md` B143).
+        if let Err(e) = self.adopt_real_uid(&local, &real, |node| {
             if let (Some(blob), Some(meta)) = (uploaded, &landed)
                 && node_size(node) == meta.len
                 && keeps_landed_upload(self.cache.is_pinned(&real), meta.len, self.cache.budget())
@@ -936,7 +1032,10 @@ impl Core {
                     self.cache
                         .store_file(&real, node.modification_time, meta.len, Path::new(blob));
             }
-        })?;
+        }) {
+            warn!(%local, %real, error = %e, "reading back a landed create failed; adopting it later");
+            self.unadopted.lock().insert(real.clone(), local.clone());
+        }
         // The feed will report this create back to us; the tree already has it
         // under its real uid, so that event is ours to ignore (`Core::self_changes`).
         self.note_self_change(&real);
@@ -951,6 +1050,81 @@ impl Core {
         }
         self.log_activity(ActivityKind::Upload, &name, "created", true);
         info!(%local, %real, name, kind = %op.kind, "pending create landed");
+        Ok(())
+    }
+
+    /// Whether `name` is held on Drive by a change of ours that is to free it:
+    /// a queued trash, a queued rename away from it, or another create on the
+    /// wire that was sent with it in `parent`, which a rename or trash follows
+    /// (`Db::finish_create`). The op that wants the name waits for it rather
+    /// than land under a conflict name.
+    ///
+    /// A trash is waited for as long as it takes. The rest only for
+    /// [`NAME_HOLD_ATTEMPTS`]: two files swapping names each hold the name the
+    /// other wants.
+    fn name_is_held(
+        &self,
+        op: &PendingOp,
+        parent: Option<&NodeUid>,
+        name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.db.has_pending_trash_named(name)? {
+            return Ok(true);
+        }
+        if op.attempts >= NAME_HOLD_ATTEMPTS {
+            return Ok(false);
+        }
+        let creating = self
+            .creating
+            .lock()
+            .iter()
+            .any(|(id, (p, n))| *id != op.id && Some(p) == parent && n == name);
+        Ok(creating || self.db.has_pending_move_from(name)?)
+    }
+
+    /// Trash the node a create made after the file was deleted, or replaced by
+    /// a rename, while its upload was on the wire (`docs/BUGS.md` B129).
+    ///
+    /// `Db::finish_create` queued the trash, claimed, in the transaction that
+    /// found the create gone. It goes out now rather than behind the queue:
+    /// until it lands the node holds its name on Drive, and a file created
+    /// there again forks a conflict copy. A failure leaves it queued.
+    fn trash_withdrawn_create(
+        &self,
+        op: &PendingOp,
+        trash: i64,
+        local: &NodeUid,
+        real: &NodeUid,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.hidden.lock().insert(real.clone());
+        self.note_self_change(real);
+        let trash = PendingOp {
+            id: trash,
+            kind: OP_TRASH.to_string(),
+            uid: real.to_string(),
+            parent_uid: None,
+            name: Some(name.to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: op.created_at,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        info!(%local, %real, name, "a create landed after its file was deleted; trashing it");
+        if let Err(e) = self.drain_trash(&trash) {
+            warn!(%real, name, error = %e, "trashing a withdrawn create failed; queued");
+            if let Err(e) = self.db.record_op_failure(
+                trash.id,
+                &e.to_string(),
+                now_millis() + DRAIN_BACKOFF_MIN.as_millis() as i64,
+            ) {
+                error!(%real, error = %e, "recording a drain failure failed");
+            }
+            self.release_claim(&trash);
+            self.wake_drain();
+        }
         Ok(())
     }
 
@@ -1051,9 +1225,8 @@ impl Core {
         Ok(uid)
     }
 
-    /// Retire a landed create's op and move its queued state to the real uid.
-    /// True when a newer write attached to the create while it was uploading,
-    /// which is now queued as a revision of `real`.
+    /// Retire a landed create's op and move its queued state to the real uid,
+    /// unless the create was withdrawn while it was on the wire.
     ///
     /// Runs under the `pending` lock, which `Core::enqueue_staged_write` also
     /// holds from attaching a blob to a create until it records the pending
@@ -1068,17 +1241,22 @@ impl Core {
         landing: &CreateLanding<'_>,
         local: &NodeUid,
         real: &NodeUid,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let newer = {
+    ) -> Result<CreateRetired, Box<dyn std::error::Error>> {
+        let retired = {
             let mut pending = self.pending.lock();
-            let newer = self.db.finish_create(op.id, uploaded, landing, |json| {
+            let retired = self.db.finish_create(op.id, uploaded, landing, |json| {
                 let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
                 meta.uid = landing.real.to_string();
                 serde_json::to_string(&meta).ok()
             })?;
+            // A withdrawn create's placeholder is the delete's to clean up, and
+            // an open handle may still read its pending entry.
+            if let CreateRetired::Withdrawn { .. } = retired {
+                return Ok(retired);
+            }
             pending.remove(local);
-            if let Some((blob, json)) = &newer {
-                let meta: StagedWrite = serde_json::from_str(json)?;
+            if let CreateRetired::Newer { blob, meta } = &retired {
+                let meta: StagedWrite = serde_json::from_str(meta)?;
                 pending.insert(
                     real.clone(),
                     PendingRevision {
@@ -1087,16 +1265,21 @@ impl Core {
                     },
                 );
             }
-            newer.is_some()
+            retired
         };
-        if !newer && let Some(blob) = uploaded {
+        if retired == CreateRetired::Landed
+            && let Some(blob) = uploaded
+        {
             self.cache_created(op, local, real, blob);
         }
         self.for_each_state(|st| {
             if let Some(ino) = st.by_uid.remove(local) {
                 st.by_uid.insert(real.clone(), ino);
+                // The node too: the next write of it upserts the row by the
+                // node's uid, and would bring the placeholder row back.
                 if let Some(e) = st.entries.get_mut(&ino) {
                     e.uid = real.clone();
+                    e.node.uid = real.clone();
                 }
                 // Its children still name the placeholder as their parent, and
                 // the next write of one would put it back on the row.
@@ -1114,7 +1297,7 @@ impl Core {
                 }
             }
         });
-        Ok(newer)
+        Ok(retired)
     }
 
     /// Cache a landed create's uploaded `blob` under `real`, keyed as the tree
@@ -1179,6 +1362,13 @@ impl Core {
         // Before open handles are rebased onto the node, so one released in
         // between finds what `adopt` keeps (`docs/BUGS.md` B123).
         adopt(&node);
+        // What Drive holds is the base open handles and queued writes are
+        // rebased onto below. The tree shows a write queued over it, as a
+        // listing does: a write open sized from the landed node over a shorter
+        // queued blob left a gap that refused the next open (`docs/BUGS.md`
+        // B123).
+        let remote = node.clone();
+        self.stamp_pending_sizes(std::slice::from_mut(&mut node));
         // Repoints queued children and node rows, and readdresses the placeholder row.
         // A no-op after `retire_create`, which has already done both.
         self.db
@@ -1233,10 +1423,22 @@ impl Core {
         // write would land as a conflict copy of the empty file this create just
         // made (`docs/BUGS.md` B113). Rebased before the restamp below, so a
         // release that races this is caught there.
-        self.rebase_open_writes(real, &node);
+        //
+        // A release that took its base before the rebase and queues after the
+        // restamp is caught by neither. The revision this create sealed is
+        // ours, as one a revision upload sealed is, so the drain chains that
+        // write onto it instead of forking a conflict copy (B70 layer B).
+        if let Some(rev) = node_revision_id(&remote)
+            && let Err(e) = self
+                .db
+                .set_own_sealed_rev(&real.to_string(), &rev, now_millis())
+        {
+            warn!(%real, error = %e, "persisting our sealed revision failed");
+        }
+        self.rebase_open_writes(real, &remote);
         // A write carried over from the create was made against no revision at
         // all; the one just created is what it now replaces.
-        self.rebaseline_pending(real, &node);
+        self.rebaseline_pending(real, &remote);
         if node.is_folder() {
             // It was recorded as listed while local (it was empty and had nothing
             // to enumerate). That still holds: its queued children re-intern under
@@ -1828,16 +2030,25 @@ impl Core {
         if self.rebaseline_pending(uid, &node) {
             return Some(node);
         }
+        // A rename queued behind the upload has not reached Drive yet, and
+        // until it lands the tree keeps the name and folder the user gave the
+        // file, as `adopt_real_uid` does. Taking Drive's put the file back
+        // under its old name.
+        let renaming = self
+            .db
+            .has_pending_op(&uid.to_string(), OP_RENAME)
+            .unwrap_or(false);
         self.for_each_state(|st| {
-            let Some(parent) = st
-                .by_uid
-                .get(uid)
-                .and_then(|ino| st.entries.get(ino))
-                .map(|e| e.parent)
-            else {
+            let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino)) else {
                 return;
             };
-            st.intern(parent, node.clone());
+            let parent = entry.parent;
+            let mut node = node.clone();
+            if renaming {
+                node.name = entry.node.name.clone();
+                node.parent_uid = entry.node.parent_uid.clone();
+            }
+            st.intern(parent, node);
         });
         Some(node)
     }
@@ -1976,10 +2187,16 @@ fn park_verdict(created_at: i64, now: i64, open: bool) -> ParkVerdict {
     ParkVerdict::Release
 }
 
-/// The retryable error for an op whose name a queued trash has yet to free.
-fn held_by_queued_trash(name: &str) -> Box<dyn std::error::Error> {
-    format!("{name} is still held by a node whose trash is queued").into()
+/// The retryable error for an op whose name a change of ours has yet to free
+/// ([`Core::name_is_held`]).
+fn held_by_queued_change(name: &str) -> Box<dyn std::error::Error> {
+    format!("{name} is still held by a node whose trash or rename is queued").into()
 }
+
+/// How many attempts an op waits for a rename or a create on the wire to free
+/// the name it wants. Two files swapping names each wait for the other, so the
+/// wait has to end; a conflict name ends it.
+const NAME_HOLD_ATTEMPTS: i64 = 4;
 
 /// How much older than its op a remote node may be and still be the one an
 /// unanswered call made. The op is queued the moment the call gives up, so the
@@ -2076,6 +2293,11 @@ mod tests {
         assert_eq!(authorities.len(), 2);
         assert_eq!(authorities[0].to_string(), "v~node");
         assert_eq!(authorities[1].to_string(), "v~parent");
+        let withdrawn = PendingOp {
+            uid: "local~never-landed".to_string(),
+            ..pending(OP_TRASH)
+        };
+        assert!(pending_op_authorities(&withdrawn).unwrap().is_empty());
     }
 
     fn folder_node(link: &str, parent: Option<&str>) -> Node {

@@ -2474,6 +2474,125 @@ fn a_queued_trash_holds_its_name_until_it_lands() {
     assert!(!db.has_pending_trash_named("report.txt").unwrap());
 }
 
+/// A create that found its name held by a queued trash backed off. The trash
+/// landing frees the name, so the create is due at once instead of after the
+/// backoff; a parked create stays parked.
+#[test]
+fn a_landed_trash_makes_the_ops_waiting_for_its_name_due() {
+    let db = Db::open_in_memory().unwrap();
+    let old = uid("old");
+    db.upsert_node(&file("old", "root", "report.txt", 1))
+        .unwrap();
+    let (trash_id, _) = db
+        .replace_ops_with_trash(&old.to_string(), "report.txt", 1)
+        .unwrap();
+    let create = |name: &str, next_attempt_at: i64| {
+        let (id, _) = db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_CREATE.to_string(),
+                uid: format!("local~{name}-{next_attempt_at}"),
+                parent_uid: Some(uid("root").to_string()),
+                name: Some(name.to_string()),
+                blob_path: None,
+                meta_json: None,
+                created_at: 2,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at,
+            })
+            .unwrap();
+        db.record_op_failure(id, "report.txt is still held", next_attempt_at)
+            .unwrap();
+        id
+    };
+    let waiting = create("report.txt", 9_000);
+    let parked = create("report.txt", PARK_UNTIL);
+    let other = create("other.txt", 9_000);
+
+    db.complete_trash_op(trash_id, &old).unwrap();
+
+    let due = |id| {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(waiting), 0);
+    assert_eq!(due(parked), PARK_UNTIL);
+    assert_eq!(due(other), 9_000);
+}
+
+#[test]
+fn a_queued_rename_away_from_a_name_holds_it_until_it_lands() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    let rename = |node: &str, from: &str, to: &str| {
+        let meta = serde_json::to_string(&RenameMeta {
+            original_parent_uid: root.clone(),
+            original_name: Some(from.to_string()),
+        })
+        .unwrap();
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: uid(node).to_string(),
+            parent_uid: Some(root.clone()),
+            name: Some(to.to_string()),
+            blob_path: None,
+            meta_json: Some(meta),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap()
+        .0
+    };
+    let away = rename("away", "c.bin", "d");
+    rename("back", "e.md", "e.md");
+    let (waiting, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~waiting".to_string(),
+            parent_uid: Some(root.clone()),
+            name: Some("c.bin".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 2,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.record_op_failure(waiting, "c.bin is still held", 9_000)
+        .unwrap();
+
+    assert!(db.has_pending_move_from("c.bin").unwrap());
+    assert!(!db.has_pending_move_from("d").unwrap());
+    assert!(
+        !db.has_pending_move_from("e.md").unwrap(),
+        "a rename that keeps the name in its folder frees nothing"
+    );
+    db.wake_ops_waiting_for("c.bin").unwrap();
+    let due = || {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == waiting)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(), 9_000, "the rename still holds the name");
+
+    db.delete_op(away).unwrap();
+    db.wake_ops_waiting_for("c.bin").unwrap();
+    assert_eq!(due(), 0);
+}
+
 #[test]
 fn failed_atomic_trash_insert_keeps_prior_revision_and_blob_ownership() {
     let db = Db::open_in_memory().unwrap();
@@ -2796,6 +2915,106 @@ fn renaming_a_queued_create_rewrites_its_target() {
     );
 }
 
+/// A create that failed on a name held by a queued change waits out a
+/// backoff. Renamed away from that name, it is due again at once; parked, it
+/// stays parked.
+#[test]
+fn renaming_a_backing_off_create_makes_it_due() {
+    let db = Db::open_in_memory().unwrap();
+    let create = |local: &str| PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: local.to_string(),
+        parent_uid: Some(uid("dir").to_string()),
+        name: Some("a.txt".to_string()),
+        blob_path: Some(format!("/staging/{local}")),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (failed, _) = db.enqueue_op(&create("local~failed")).unwrap();
+    db.record_op_failure(failed, "a.txt is still held", 10_000)
+        .unwrap();
+    db.enqueue_op(&create("local~parked")).unwrap();
+    db.set_create_hold("local~parked", true).unwrap();
+
+    db.rewrite_op_target("local~failed", &uid("dir").to_string(), "d")
+        .unwrap();
+    db.rewrite_op_target("local~parked", &uid("dir").to_string(), "e.tmp")
+        .unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    let op = |local: &str| ops.iter().find(|o| o.uid == local).unwrap();
+    assert_eq!(op("local~failed").next_attempt_at, 0);
+    assert_eq!(op("local~failed").attempts, 1);
+    assert_eq!(op("local~parked").next_attempt_at, PARK_UNTIL);
+
+    // Renamed while an attempt was on the wire, which then failed: the
+    // failure is recorded after the rename, and the create is still due.
+    let sent = op("local~failed").clone();
+    db.rewrite_op_target("local~failed", &uid("dir").to_string(), "f")
+        .unwrap();
+    db.record_op_failure(sent.id, "d is still held", 10_000)
+        .unwrap();
+    assert!(
+        db.retry_if_retargeted(sent.id, sent.parent_uid.as_deref(), sent.name.as_deref())
+            .unwrap()
+    );
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(
+        ops.iter()
+            .find(|o| o.id == sent.id)
+            .unwrap()
+            .next_attempt_at,
+        0
+    );
+    assert!(
+        !db.retry_if_retargeted(sent.id, sent.parent_uid.as_deref(), Some("f"))
+            .unwrap()
+    );
+}
+
+/// A rename queued while an older one is on the wire waits for it. The older
+/// one, if it fails, is dropped rather than retried after the newer one.
+#[test]
+fn a_rename_on_the_wire_lands_before_the_one_that_replaces_it() {
+    let db = Db::open_in_memory().unwrap();
+    let file = uid("file").to_string();
+    let rename = |parent: &str| PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: file.clone(),
+        parent_uid: Some(uid(parent).to_string()),
+        name: Some("e.md".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (first, _) = db.enqueue_op(&rename("x")).unwrap();
+    assert_eq!(db.claim_next_due_op(1).unwrap().unwrap().id, first);
+
+    let (second, _) = db.enqueue_op(&rename("c0")).unwrap();
+    assert!(db.claim_next_due_op(1).unwrap().is_none());
+
+    db.record_op_failure(first, "original hash is out of date", 10_000)
+        .unwrap();
+    db.release_op_claim(first).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [second]);
+    assert_eq!(db.claim_next_due_op(1).unwrap().unwrap().id, second);
+
+    // Unclaimed, a queued rename is replaced as before.
+    db.release_op_claim(second).unwrap();
+    let (third, _) = db.enqueue_op(&rename("x")).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [third]);
+}
+
 #[test]
 fn a_write_folds_into_a_queued_create_instead_of_superseding_it() {
     let db = Db::open_in_memory().unwrap();
@@ -2885,10 +3104,10 @@ fn a_write_attached_while_its_create_uploads_becomes_a_revision() {
 
     assert_eq!(
         newer,
-        Some((
-            "/staging/written".to_string(),
-            "{\"uid\":\"vol~real\"}".to_string()
-        ))
+        CreateRetired::Newer {
+            blob: "/staging/written".to_string(),
+            meta: "{\"uid\":\"vol~real\"}".to_string()
+        }
     );
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops.len(), 1, "the write is still queued");
@@ -2943,7 +3162,7 @@ fn a_create_whose_blob_landed_is_retired() {
         )
         .unwrap();
 
-    assert_eq!(newer, None);
+    assert_eq!(newer, CreateRetired::Landed);
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops.len(), 1, "only the child is left");
     assert_eq!(ops[0].parent_uid.as_deref(), Some(real.as_str()));
@@ -3102,6 +3321,60 @@ fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
     assert_eq!(found[0].path, "New folder/inside.txt");
 }
 
+/// A file deleted while its create was on the wire still lands: nothing stops
+/// an upload in flight. The node it made is unwanted, so a trash of it is
+/// queued in the same transaction, already claimed by the drain that landed it
+/// (`docs/BUGS.md` B129).
+#[test]
+fn a_create_withdrawn_while_it_uploads_queues_a_trash_of_the_landed_node() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~gone";
+    let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("d".to_string()),
+            blob_path: Some("/staging/sent".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.claim_next_due_op(10)
+        .unwrap()
+        .expect("the drain takes the create");
+    db.delete_ops_for_uid(local).unwrap();
+
+    let retired = db
+        .finish_create(
+            id,
+            Some("/staging/sent"),
+            &landing(local, &real, &parent, "d"),
+            |_| None,
+        )
+        .unwrap();
+
+    let CreateRetired::Withdrawn { trash } = retired else {
+        panic!("a withdrawn create is not landed: {retired:?}");
+    };
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].id, trash);
+    assert_eq!(ops[0].kind, OP_TRASH);
+    assert_eq!(ops[0].uid, real);
+    assert_eq!(ops[0].name.as_deref(), Some("d"));
+    assert!(
+        db.claim_next_due_op(i64::MAX / 2).unwrap().is_none(),
+        "the trash is the landing drain's to send"
+    );
+}
+
 #[test]
 fn a_landed_placeholder_never_overwrites_the_server_copy() {
     let db = Db::open_in_memory().unwrap();
@@ -3194,6 +3467,7 @@ fn a_landed_placeholder_keeps_its_lid() {
 
         assert_eq!(db.lid_of(&local.to_string()).unwrap(), None);
         assert_eq!(db.lid_of(&real.to_string()).unwrap(), Some(lid));
+        assert_eq!(db.uid_of_lid(lid).unwrap(), Some(real.to_string()));
         let name = if known {
             "New folder (1)"
         } else {
@@ -3205,6 +3479,85 @@ fn a_landed_placeholder_keeps_its_lid() {
         );
         assert_eq!(db.search(name, 10).unwrap().len(), 1, "{name}");
     }
+}
+
+/// Drive lists none of what is queued for a folder, so a listing read from
+/// it is laid over with what the queue made, moved in and moved away (B132).
+#[test]
+fn queued_children_are_what_drive_does_not_list_yet() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("dir", Some("root"), "dir")).unwrap();
+    db.upsert_node(&folder("other", Some("root"), "other"))
+        .unwrap();
+    let op = |kind: &str, uid: &str, parent: &str, name: &str| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid.to_string(),
+        parent_uid: Some(parent.to_string()),
+        name: Some(name.to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let dir = uid("dir").to_string();
+    let other = uid("other").to_string();
+
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("new"));
+    let mut made = file("x", "dir", "made.txt", 3);
+    made.uid = local.clone();
+    db.upsert_node(&made).unwrap();
+    db.enqueue_op(&op(OP_CREATE, &local.to_string(), &dir, "made.txt"))
+        .unwrap();
+    db.upsert_node(&file("in", "dir", "in.txt", 3)).unwrap();
+    db.enqueue_op(&op(OP_RENAME, &uid("in").to_string(), &dir, "in.txt"))
+        .unwrap();
+    db.upsert_node(&file("out", "other", "out.txt", 3)).unwrap();
+    db.enqueue_op(&op(OP_RENAME, &uid("out").to_string(), &other, "out.txt"))
+        .unwrap();
+    db.upsert_node(&file("still", "dir", "still.txt", 3))
+        .unwrap();
+
+    let (here, gone) = db.queued_children(&uid("dir")).unwrap();
+    let mut names: Vec<_> = here.iter().map(|n| n.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["in.txt", "made.txt"]);
+    assert_eq!(
+        gone,
+        std::collections::HashSet::from([uid("out").to_string()])
+    );
+}
+
+/// A restart builds the tree from the node each row holds. A folder that
+/// landed handed its children to the real uid in the row's column only, so
+/// they came back under a parent no row has (B140).
+#[test]
+fn a_landed_folder_hands_its_children_over_in_the_stored_node_too() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("x", Some("root"), "dir");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let mut child = file("child", "x", "a.txt", 3);
+    child.parent_uid = Some(local.clone());
+    db.upsert_node(&child).unwrap();
+
+    db.remap_local_uid(&local.to_string(), &uid("dir").to_string())
+        .unwrap();
+
+    let stored = db.node_by_uid(&uid("child").to_string()).unwrap().unwrap();
+    assert_eq!(stored.parent_uid, Some(uid("dir")));
+    let names: Vec<_> = db
+        .known_children(&uid("dir"))
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, ["a.txt"]);
 }
 
 #[test]

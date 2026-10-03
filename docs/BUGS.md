@@ -12,6 +12,145 @@ Conventions:
 
 ---
 
+## B143 — A write to a file whose create landed as the link went down lands as a conflict copy
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation runs (`sim::run`, profile three-clients, seed 1).
+Client 0 made `y/z/b.txt` while the link was down. When the link came back, the create landed and
+the link went down again right after it. A write to the file was then kept as
+`b (sync-conflict …).txt`: "expected 56 bytes at mtime 1791068288, found 56 at 1791068289". Only
+client 0 writes that file.
+
+**Where:** `Core::drain_local_node`, `Core::drain_op` and `Core::finish_adoption` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The gap B131 closed, for a link that drops instead of a lookup that is late.
+`Core::read_back` asks again only while Drive answers that it does not list the node yet. When
+the link is down it gives up, and `adopt_real_uid` fails after the create's op has retired. The
+tree keeps the placeholder's node under the real uid, and nothing reads it back later. A write
+opened after that takes the local clock's mtime as its base. Drive stamped the create with the
+second it arrived, so the drain saw a revision it did not know and kept the client's own write as
+a conflict copy.
+
+**Fix.** A create whose read-back fails is remembered, under the uid Drive gave it. Before the
+drain sends the next op for that uid, it reads the node back and rebases handles and queued writes
+onto it, as `adopt_real_uid` would have done. If the read-back fails again, the op is retried
+later, as for any other failed request.
+
+**Test:** the daemon test `a_write_over_a_create_whose_read_back_failed_is_not_a_conflict`. The
+fake Drive takes the link down as soon as it has answered the create. Without the fix, the test
+fails on the conflict copy.
+
+## B142 — Renaming a new file as its upload lands can fail with "Device or resource busy"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation runs (`sim::run`, profile three-clients, seed 3).
+Client 1 renamed `c.bin`, a file whose create was still queued, to `f.txt`, and got `EBUSY`.
+
+**Where:** `serve_rename` in `crates/pdfs-fuse/src/filesystem.rs`.
+
+**Cause.** A file whose create is queued is renamed by rewriting the name in the create op. When
+the create landed between the lookup and the rewrite, the op was gone, and the rename answered
+`EBUSY` as if the create had vanished.
+
+**Fix.** When the op is gone, the rename looks up the node's row. If the create has landed, the
+row already holds the uid Drive gave the file, and the rename is queued against that uid, as for
+any other file.
+
+**Test:** seed 3 of three-clients passes repeatedly. The window is too narrow to hit on purpose.
+
+## B141 — A file renamed twice in a row can end up under the first name
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation runs (`sim::run`, profile one-client-echoes, seed 2).
+`e.md` was moved into `x`, and right after that into the client folder. Drive kept it in `x`,
+and the liveness check found it in a different place on Drive than in the mount. In about one of
+three replays.
+
+**Where:** `Db::enqueue_op` and `Db::claim_next_due_op` in `crates/pdfs-core/src/db/ops.rs`.
+
+**Cause.** A rename replaces the rename queued before it, by deleting that row. When a drain
+worker had already taken the older row, deleting it also lifted the rule that one node has one op
+in flight. A second worker sent the newer rename at once, while the first was still retrying its
+own after Drive called it out of date (B111). The older one landed last.
+
+**Fix.** A rename a worker holds stays queued, and the newer one waits behind it. If the older one
+fails, it is dropped instead of being retried after the newer one.
+
+**Test:** the unit test `a_rename_on_the_wire_lands_before_the_one_that_replaces_it`. Seed 2 of
+one-client-echoes passes repeatedly.
+
+## B140 — Files in a folder that lands as the daemon stops are gone after a restart
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation runs (`sim::run`, profile one-client-flaky, seed 4),
+replaying B132. The client folder `c0` was made with files in it, and its mkdir landed after the
+mount had stopped. Right after the restart, a write to `c0/a.txt` failed with `ENOENT`, and the
+listing of `c0` was empty. In about half of the replays.
+
+**Where:** `adopt_placeholder_row_tx` in `crates/pdfs-core/src/db/nodes.rs` and `Core::hydrate` in
+`crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** When a folder lands, the rows below it are handed to the real uid by their
+`parent_uid` column only. The node each row holds (`node_json`) still named the placeholder. A
+running daemon rewrites the rows from its tree on the next change, so this did not show. A restart
+builds the tree from `node_json`, found no row for the placeholder and left the children out of the
+folder.
+
+**Fix.** The landing rewrites the parent in `node_json` as well, in the same statement.
+
+**Test:** the unit test `a_landed_folder_hands_its_children_over_in_the_stored_node_too`. Seed 4
+of one-client-flaky passes ten replays in a row.
+
+## B139 — A file closed while its first upload lands keeps its last write in staging
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 1), at the
+end check for lost data. A file made through the mount was written and renamed while its create
+was queued. Its handle was closed just as the create landed. The daemon logged "cannot queue
+write; bytes kept in staging" with "access changed before the write could be queued", and Drive
+kept the bytes from before the last write.
+
+**Where:** `Core::queue_revision` in `crates/pdfs-fuse/src/lib.rs` and `release` in
+`crates/pdfs-fuse/src/filesystem.rs`.
+
+**Cause.** A write handle keeps the uid the node had when it was opened. When the create lands,
+`finish_create` retires the op and the placeholder row becomes the real node's, before the tree
+moves the open handle over. A handle closed in that gap still named the placeholder, which no
+longer had a row, so the access check refused it and the bytes went to staging instead of the
+queue.
+
+**Fix.** On close, a handle that names a placeholder looks up the node by its inode's local id,
+which survives the landing, and queues the write against the real uid when the node has one.
+
+**Test:** the unit tests `a_landed_placeholder_keeps_its_lid` and
+`an_inode_gives_back_the_lid_it_was_made_from`. Seed 1 of three-clients passes.
+
+## B138 — A file created where another is leaving lands as a conflict copy
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seed 9).
+`c.bin` was created and renamed to `d` while its create was on the wire, and a new `c.bin` was
+made at once. The new file landed on Drive under a conflict name.
+
+**Where:** `drain_local_node`, `drain_rename` and `drain_rename_in_place` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** When Drive refuses a name, the drain waits only if a queued trash holds it
+(`has_pending_trash_named`); otherwise it lands the op under a conflict name. A create on the wire
+holds the name it was sent with until the rename queued behind it lands, and a queued rename away
+from a name holds it until it lands. Several workers drain at once, so the new create could reach
+Drive first.
+
+**Fix.** The drain also waits while another create on the wire was sent with that name in that
+folder, or a queued rename moves a node away from it. Those waits end after a few attempts, as two
+files swapping names each hold the name the other wants. When a rename or trash frees a name, the
+ops that failed on it are made due at once, and so is a create renamed away from a name it failed
+on, whether the rename came before the failure was recorded or after.
+
+**Test:** the unit test `a_queued_rename_away_from_a_name_holds_it_until_it_lands`. Seed 9 of
+one-client-lan passes.
+
 ## B137 — A queued change can be deleted by an older one landing
 
 **Status:** Fixed (unverified).
@@ -135,7 +274,7 @@ fails on it in every seed.
 
 ## B132 — A folder whose mkdir is still queued is gone after a restart
 
-**Status:** Open.
+**Status:** Fixed (unverified).
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 4).
 The first listing of the Drive root failed with the link down, and the client's folder `c0` was
 made offline. The link came back, and the client restarted with 8 ops still queued, `c0`'s
@@ -154,9 +293,13 @@ records it as complete, without the queued node's placeholder. Every path throug
 with `ENOENT` until something lists the folder again. The same may happen without a restart
 whenever a folder holding a queued create is listed on Drive.
 
-**Test:** the simulation runs count an `ENOENT` after a restart that restored queued ops, in a
-seed that lost the link, and end the seed there. With `PDFS_SIM_KNOWN=fail`, seed 4 of
-one-client-flaky fails on it when the mkdir is still queued, which depends on timing.
+**Fix.** A listing read from Drive is laid over with what the queue holds for the folder
+(`Db::queued_children`): a node a queued create, mkdir or rename put there is listed as the DB has
+it, and one a queued rename moved away is left out. Replays of the seed after this fix turned up a
+second cause, B140.
+
+**Test:** the unit test `queued_children_are_what_drive_does_not_list_yet`. Seed 4 of
+one-client-flaky passes ten replays in a row.
 
 ## B131 — A write to a file whose create could not be read back lands as a conflict copy
 
@@ -224,7 +367,7 @@ state `D` inside `NotifyBatch::flush`), count it and end the seed there. With
 
 ## B129 — A file deleted or replaced while its create is on the wire stays on Drive
 
-**Status:** Open.
+**Status:** Fixed (unverified).
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seed 4).
 `a.txt` was created, renamed to `b.txt` and then to `e.md` while its create was still queued.
 A moment later `rename f.txt -> e.md` failed with `EIO`, and the daemon logged "rename failed"
@@ -241,6 +384,13 @@ of a create has no cancel flag. The create lands anyway. `finish_create` finds n
 retire, and the tree has already forgotten the local uid, so nothing trashes the new node.
 Drive keeps a file that the mount no longer shows. Its name stays taken: an online rename onto
 it, as here, fails with `EIO`, and a later create with that name lands as a conflict copy.
+
+**Fix.** A delete or replacing rename no longer drops a create the drain has taken. It turns
+the row into a trash of the placeholder, still claimed by the upload, which holds the name as any
+queued trash does. When the create lands, `finish_create` points that trash at the landed node in
+the same transaction, and the drain sends it at once; if that fails it stays queued with the usual
+backoff. A create whose row is gone altogether gets such a trash too. A trash of a placeholder
+whose create never landed is done without asking Drive.
 
 **Test:** the simulation runs count a rename it fails and end the seed there. With
 `PDFS_SIM_KNOWN=fail`, seed 4 of one-client-lan fails on it when it comes up, which depends

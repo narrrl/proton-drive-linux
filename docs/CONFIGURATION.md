@@ -80,6 +80,7 @@ fix it.
 | `ignore_patterns` | list | see below | — | Global ignore rules for synced folders |
 | `device_uid` | string | none | Computers → Continue This Backup Here… | The computer this machine continues. Unset means "match by hostname" |
 | `conflict_sweep` | `off` / `report` / `enforce` | `report` | — | See [`conflict_sweep`](#conflict_sweep) |
+| `local_first` | bool | `true` | — | See [`local_first`](#local_first) |
 | `language` | gettext code | system | General → Appearance | Language of the app, tray and prompt, such as `de` or `pt_BR` |
 | `proton_theme` | bool | follow system | General → Appearance | Proton's colours instead of the system theme |
 | `online_map` | bool | `false` | General → Appearance | Street map for Places from OpenFreeMap |
@@ -115,6 +116,15 @@ were copied from.
 | `enforce` | Move copies proven identical (same size and SHA-1) to the Trash. |
 
 `PDFS_CONFLICT_SWEEP` overrides the setting for one run of the service.
+
+### `local_first`
+
+A new folder, a new file, a rename or a delete made through the mount is recorded locally and the
+call returns at once. The change goes to Drive from the queue, the same way it does offline, and
+`pdfs status` counts it until it lands.
+
+Set it to `false` to have these calls wait for Drive again, as before 3.0.0. The switch is there
+for one release, in case the queued path misbehaves for you; please report it if it does.
 
 ### `open_with`
 

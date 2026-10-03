@@ -91,6 +91,7 @@ impl Daemon {
                             sweep_mode: AppConfig::default().resolved_conflict_sweep(),
                             upload_limit: 0,
                             download_limit: 0,
+                            local_first: AppConfig::default().local_first.unwrap_or(true),
                         },
                         Host::Simulation(stopped),
                     )
@@ -412,10 +413,54 @@ mod tests {
 
         std::fs::rename(mount.join("x/f.txt"), mount.join("z/d")).unwrap();
         assert_eq!(std::fs::read(mount.join("z/d")).unwrap(), b"moved");
-        let tree = drive.tree();
-        assert_eq!(tree.get("z/d").cloned(), file(b"moved"));
-        assert_eq!(tree.get("x/d").cloned(), file(b"sibling"));
-        assert!(!tree.contains_key("x/f.txt"));
+        // The rename is recorded locally and sent from the queue.
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                let tree = drive.tree();
+                tree.get("z/d").cloned() == file(b"moved")
+                    && tree.get("x/d").cloned() == file(b"sibling")
+                    && !tree.contains_key("x/f.txt")
+            }),
+            "{:?}",
+            drive.tree().keys().collect::<Vec<_>>()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_write_over_a_create_whose_read_back_failed_is_not_a_conflict() {
+        // The create landed and the link went down before it was read back.
+        // The next write was based on the file as it was made locally, and
+        // landed as a conflict copy of it (B143).
+        let drive = FakeDrive::new();
+        let dir = scratch("unadopted");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+        let path = daemon.mountpoint.join("f.txt");
+
+        // Drive stamps a create with the second it arrives, so it has to land
+        // a second after the file was made here for the two to differ.
+        daemon.client.set_online(false);
+        std::fs::write(&path, b"first").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        daemon.client.drop_link_after_next_create();
+        daemon.client.set_online(true);
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().get("f.txt").cloned() == file(b"first")
+        }));
+        write_at(&path, 5, b" and second").unwrap();
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                drive.tree().get("f.txt").cloned() == file(b"first and second")
+            }),
+            "{:?}",
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
 
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
