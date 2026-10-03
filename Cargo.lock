@@ -3474,7 +3474,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pdfs-cli"
-version = "2.8.2"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3489,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-core"
-version = "2.8.2"
+version = "2.9.0"
 dependencies = [
  "async-trait",
  "dbus-secret-service-keyring-store",
@@ -3513,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-fuse"
-version = "2.8.2"
+version = "2.9.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-gui"
-version = "2.8.2"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-channel",

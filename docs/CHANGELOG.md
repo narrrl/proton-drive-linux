@@ -11,6 +11,63 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.9.0] — 2026-10-03
+
+Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.2**.
+
+### Added
+- **Seeded simulation runs.** `cargo test -p pdfs-fuse --lib sim:: -- --ignored
+  --test-threads=1` mounts one or more real FUSE daemons against an in-memory Drive that lags,
+  drops, reorders and echoes like the real one. Each seed draws syscalls, link flaps and restarts,
+  checks every answer against a POSIX model, and at the end checks that nothing was lost and the
+  clients converged. CI runs them on pushes to main. They found B122 to B135.
+- **More acceptance cases.** Regressions for B48, B80, B86, B88, B94, B95, B98, B102, B111, B113
+  and B114 to B121, and a check that `pdfs` output into a closed pipe stays quiet. The console
+  report has one line per case and a summary table, and `--journal-check` also fails on a
+  conflict copy, a FUSE job held for long, or an authority re-read.
+
+### Fixed
+- **A new file moved or renamed before its first upload no longer lands as a conflict copy**
+  next to its own empty original (B113).
+- **`pdfs rm`, `pdfs rename` and `pdfs mkdir` take paths in on-demand folders.** They answered
+  "is not under the mountpoint" for a path `pdfs move` took. `rm` and `rename` refuse a path that
+  names a mount's root (B88).
+- **`pdfs ls | head` no longer panics** with "Broken pipe". A closed stdout exits 0; any other
+  write error exits 1.
+- **A file removed, renamed or moved with `pdfs` stops resolving under its old name at once**,
+  instead of for up to 30 seconds (B114).
+- **`pdfs ls` and the app's file browser show a file's real size**, not its encrypted one
+  (B115).
+- **Trashing a folder also drops the creates queued in its subfolders.** One could stay queued
+  with its bytes, or land in the root (B116).
+- **An upload queued for a file `pdfs move` moved keeps its path** in `pdfs sync queue` and is
+  no longer put off once after the resume (B117).
+- **Creating a file or folder through the mount no longer fails with `ENOENT`** when Drive is
+  slow to list what it made. The mount asks again, and queues the create if it still cannot see
+  it (B118).
+- **A file just written can be read without the network.** Its uploaded bytes stay cached, and
+  `pdfs status` counts the upload as pending until they are (B119).
+- **A file queued inside a folder that just landed is no longer put off** for five seconds
+  (B120).
+- **A move right after a rename lands.** It failed with `Input/output error` through the mount
+  and with "out of date" from `pdfs move`, and a rename across folders took up to 10 seconds
+  (B111, B121).
+- **A rename across folders no longer fails with `Input/output error`** when the source folder
+  holds the new name (B122).
+- **A second write open on a file just written no longer fails** with `Input/output error`
+  (B123).
+- **After a replacing rename fails, the file it was replacing stays in the mount** (B124).
+- **A write to a file whose create could not be read back no longer lands as a conflict copy**
+  (B131).
+- **A file just moved is found by its new path.** A lookup right after the rename could miss it
+  (B135).
+
+### Notes
+- The simulation runs found bugs that are still open: B125 to B130 and B132 to B134 in
+  `docs/BUGS.md`. The worst are B127 and B128 (a file created offline can land twice, or be lost
+  when created over one deleted offline), B129 (a file deleted while its create is on the wire
+  stays on Drive) and B130 (a read that a remote change invalidates can hang the daemon).
+
 ## [2.8.2] — 2026-10-01
 
 Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.2**.
@@ -1364,6 +1421,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.9.0
 [2.8.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.2
 [2.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.1
 [2.8.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.0
