@@ -11,8 +11,17 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [2.10.0] — 2026-10-03
+
 Schema: **36**. Every node row gets a local id that never changes; existing rows keep their
-row number as that id. Going back to 2.9 means rebuilding the cache.
+row number as that id. Going back to 2.9 means rebuilding the cache. Requires `proton-drive-rs`
+**0.7.2**.
+
+### Added
+- **Migration tests on real databases.** A database 2.8.2 wrote, with queued changes due,
+  parked, failing, waiting for access and in flight, migrates with every change intact.
+  `PDFS_MIGRATE_DB=<path> cargo test -p pdfs-core a_copy_of_a_real_database -- --ignored` runs
+  the same check on a read-only copy of any database.
 
 ### Changed
 - **A file keeps its inode number across daemon restarts.** Inodes are now the node's local id
@@ -1435,6 +1444,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[2.10.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.10.0
 [2.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.9.0
 [2.8.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.2
 [2.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.8.1
