@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppConfig;
+use pdfs_core::control::{self, PendingOpInfo, Request, Response};
 use pdfs_core::db::Db;
 use proton_drive_rs::ProtonDriveClient;
 use proton_drive_rs::proton_sdk::config::ProtonClientConfiguration;
@@ -26,9 +27,14 @@ use crate::mount::{Host, MountOptions, MountOutcome, mount_with};
 /// How long a mount may take to come up.
 const MOUNT_DEADLINE: Duration = Duration::from_secs(20);
 
+/// How long a restart may wait for the last run to let go of its database.
+const LAST_RUN_DEADLINE: Duration = Duration::from_secs(30);
+
 pub(crate) struct Daemon {
     pub(crate) client: FakeClient,
     pub(crate) mountpoint: PathBuf,
+    dir: PathBuf,
+    socket: PathBuf,
     stop: SyncSender<()>,
     mount: Option<JoinHandle<io::Result<MountOutcome>>>,
     rt: Option<tokio::runtime::Runtime>,
@@ -41,8 +47,22 @@ impl Daemon {
     pub(crate) fn start(dir: &Path, client: FakeClient) -> io::Result<Self> {
         log_to_test_output();
         let mountpoint = dir.join("mnt");
+        let socket = dir.join("control.sock");
         std::fs::create_dir_all(&mountpoint)?;
-        let db = Arc::new(Db::open(&dir.join("pdfs.db")).map_err(io::Error::other)?);
+        // A thread of the last run that is still in a request holds the
+        // database, and with it the single-writer lock, until it returns. A
+        // real restart waits for the old process to exit in the same way.
+        let mut db = Db::open(&dir.join("pdfs.db"));
+        let deadline = Instant::now() + LAST_RUN_DEADLINE;
+        while db
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("already using"))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            db = Db::open(&dir.join("pdfs.db"));
+        }
+        let db = Arc::new(db.map_err(io::Error::other)?);
         let cache = ContentCache::open(dir.join("cache"), dir.join("pins.json"), 0, db.clone())
             .map_err(io::Error::other)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -54,7 +74,7 @@ impl Daemon {
             let drive = Arc::new(client.clone());
             let handle = rt.handle().clone();
             let mountpoint = mountpoint.clone();
-            let socket = dir.join("control.sock");
+            let socket = socket.clone();
             std::thread::Builder::new()
                 .name("sim-mount".into())
                 .spawn(move || {
@@ -92,10 +112,26 @@ impl Daemon {
         Ok(Self {
             client,
             mountpoint,
+            dir: dir.to_path_buf(),
+            socket,
             stop,
             mount: Some(mount),
             rt: Some(rt),
         })
+    }
+
+    /// What the daemon still owes Drive, as `pdfs sync queue` shows it.
+    pub(crate) fn pending(&self) -> io::Result<Vec<PendingOpInfo>> {
+        match control::send(&self.socket, &Request::ListPendingOps).map_err(io::Error::other)? {
+            Response::PendingOps { items } => Ok(items),
+            other => Err(io::Error::other(format!("unexpected answer {other:?}"))),
+        }
+    }
+
+    /// Stop the daemon and start it again on the same state and link.
+    pub(crate) fn restart(mut self) -> io::Result<Self> {
+        self.shut_down()?;
+        Self::start(&self.dir.clone(), self.client.clone())
     }
 
     /// Stop the daemon the way `systemctl --user stop` does.
@@ -134,11 +170,48 @@ fn is_mounted(path: &Path) -> bool {
 }
 
 /// The daemons' logs, filtered by `RUST_LOG` and shown with `--nocapture`.
+/// What they log at `INFO` and above is also kept for [`take_logged`],
+/// whatever the filter.
 fn log_to_test_output() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
+    use tracing_subscriber::prelude::*;
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+        )
+        .with(KeepLogged.with_filter(tracing_subscriber::filter::LevelFilter::INFO))
         .try_init();
+}
+
+/// What the daemons logged at `INFO` and above since the last call, each as
+/// its message followed by its fields: `message key=value ...`.
+pub(crate) fn take_logged() -> Vec<String> {
+    std::mem::take(&mut *LOGGED.lock())
+}
+
+static LOGGED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+struct KeepLogged;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for KeepLogged {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        LOGGED.lock().push(message.0);
+    }
+}
+
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.insert_str(0, &format!("{value:?}"));
+        } else {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
 }
 
 /// A client for what `DriveApi` does not cover (sharing, Photos, devices),

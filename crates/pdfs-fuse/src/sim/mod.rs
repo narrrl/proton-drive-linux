@@ -3,4 +3,7 @@
 
 pub(crate) mod daemon;
 pub(crate) mod fake_drive;
+pub(crate) mod model;
 pub(crate) mod rng;
+pub(crate) mod run;
+pub(crate) mod watchdog;

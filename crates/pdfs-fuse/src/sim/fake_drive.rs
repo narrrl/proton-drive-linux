@@ -9,12 +9,17 @@
 //! The faults are the ones Drive is known to have:
 //!
 //! - **Listing lag.** A read returns a node as it was [`Faults::listing_lag`]
-//!   ago, so a create or rename is not listed at once (B118, B48).
+//!   ago, so a create is not listed at once and a trashed node still is (B118,
+//!   B48). A rename, move or new revision can lag by [`Faults::update_lag`],
+//!   which Drive has not been seen doing; the presets leave it at zero.
 //! - **Stale name hash.** A rename or move sends the name the client's entity
 //!   cache holds, and Drive refuses it with `InvalidRequirements` when the node
 //!   has been renamed or moved since. Like the real SDK, the cache is filled by
 //!   reads and only emptied by `invalidate_caches_for_event`, not by the
 //!   client's own rename (B111, B121).
+//! - **Re-stamped modification time.** A rename or move sets a node's
+//!   modification time to the time it happened, though its revision stays
+//!   (B113).
 //! - **No atomic replace.** A name that is taken refuses a create, upload,
 //!   rename, move or restore with `AlreadyExists` (B13, B104, B106).
 //! - **Events** delayed, duplicated or reordered, and our own changes echoed
@@ -104,13 +109,23 @@ impl Server {
     }
 
     /// The node as a read `lag` behind the present sees it.
-    fn visible(&self, uid: &NodeUid, lag: Duration, now: Instant) -> Option<Remote> {
+    fn visible(&self, uid: &NodeUid, lag: Lag, now: Instant) -> Option<Remote> {
         let versions = self.nodes.get(uid)?;
-        versions
-            .iter()
+        let live = |remote: &Option<Remote>| remote.as_ref().is_some_and(|r| !r.trashed);
+        let update = |i: usize| i > 0 && live(&versions[i - 1].1) && live(&versions[i].1);
+        let passed =
+            |i: usize| versions[i].0 + if update(i) { lag.update } else { lag.appear } <= now;
+        // An update shows only once the node it updates has appeared.
+        let appeared = |mut i: usize| {
+            while update(i) {
+                i -= 1;
+            }
+            passed(i)
+        };
+        (0..versions.len())
             .rev()
-            .find(|(at, _)| *at + lag <= now)
-            .and_then(|(_, remote)| remote.clone())
+            .find(|&i| passed(i) && appeared(i))
+            .and_then(|i| versions[i].1.clone())
     }
 
     fn live_child_named(&self, parent: &NodeUid, name: &str) -> Option<NodeUid> {
@@ -449,8 +464,16 @@ impl Device<'_> {
         let mut server = self.0.server.lock();
         let mut remote = server.current(&uid).cloned().expect("live node");
         remote.name = new_name.to_owned();
+        remote.modified = now_secs();
         server.put(&uid, Some(remote));
     }
+}
+
+/// How far behind the present a read is, by the kind of change.
+#[derive(Clone, Copy, Debug)]
+struct Lag {
+    appear: Duration,
+    update: Duration,
 }
 
 /// The faults and timing of one connection. See the module documentation.
@@ -458,8 +481,12 @@ impl Device<'_> {
 pub(crate) struct Faults {
     /// Each request takes a time drawn from this range, in milliseconds.
     pub(crate) latency_ms: (u64, u64),
-    /// How far behind the present reads are.
+    /// How far behind the present reads are about a node appearing or going
+    /// to the trash.
     pub(crate) listing_lag: Duration,
+    /// How far behind the present reads are about a live node's name, folder
+    /// or revision.
+    pub(crate) update_lag: Duration,
     /// How long a change takes to reach the event feed.
     pub(crate) event_delay: Duration,
     /// Chance that an event is delivered twice.
@@ -483,6 +510,7 @@ impl Faults {
         Self {
             latency_ms: (0, 0),
             listing_lag: Duration::ZERO,
+            update_lag: Duration::ZERO,
             event_delay: Duration::ZERO,
             duplicate_events: 0.0,
             reorder_events: 0.0,
@@ -590,8 +618,12 @@ impl FakeClient {
         outcome
     }
 
-    fn lag(&self) -> Duration {
-        self.0.faults.lock().listing_lag
+    fn lag(&self) -> Lag {
+        let faults = self.0.faults.lock();
+        Lag {
+            appear: faults.listing_lag,
+            update: faults.update_lag,
+        }
     }
 
     /// The `(parent, name)` a rename or move of `uid` sends as its original
@@ -664,6 +696,7 @@ impl FakeClient {
         }
         remote.parent = parent;
         remote.name = name;
+        remote.modified = now_secs();
         server.put(uid, Some(remote));
         Ok(())
     }
@@ -1240,6 +1273,7 @@ fn io_error(error: std::io::Error) -> ProtonError {
 }
 
 fn api(code: ResponseCode, message: &str) -> ProtonError {
+    tracing::debug!(?code, message, "fake drive refused a request");
     let http_status = match code {
         ResponseCode::DoesNotExist => 404,
         ResponseCode::AlreadyExists | ResponseCode::InvalidRequirements => 422,
@@ -1422,6 +1456,35 @@ mod tests {
                     .unwrap(),
                 vec![file]
             );
+        });
+    }
+
+    #[test]
+    fn a_rename_lags_only_by_the_update_lag() {
+        rt().block_on(async {
+            let drive = FakeDrive::new();
+            let client = drive.client(1, Faults::none());
+            let file = drive.device().write("a", b"1");
+            client.rename_node(&file, "b", None).await.unwrap();
+            let names = || async {
+                let nodes = client
+                    .enumerate_nodes_light(std::slice::from_ref(&file))
+                    .await
+                    .unwrap();
+                nodes.into_iter().map(|n| n.name).collect::<Vec<_>>()
+            };
+            let lagging = |listing_lag, update_lag| Faults {
+                listing_lag,
+                update_lag,
+                ..Faults::none()
+            };
+            let minute = Duration::from_secs(60);
+            client.set_faults(lagging(minute, Duration::ZERO));
+            assert!(names().await.is_empty());
+            client.set_faults(lagging(Duration::ZERO, Duration::ZERO));
+            assert_eq!(names().await, ["b"]);
+            client.set_faults(lagging(Duration::ZERO, minute));
+            assert_eq!(names().await, ["a"]);
         });
     }
 
