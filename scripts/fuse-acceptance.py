@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -405,6 +406,28 @@ def time_limit(seconds: int, label: str):
         signal.setitimer(signal.ITIMER_REAL, 0)
         faulthandler.cancel_dump_traceback_later()
         signal.signal(signal.SIGALRM, previous)
+
+
+def answers(root: Path, seconds: float = 15) -> bool:
+    """Whether a stat and a listing of `root` come back, and in time.
+
+    The probe runs on a thread the run can leave behind, since a wedged FUSE
+    call cannot be interrupted.
+    """
+    outcome: list[bool] = []
+
+    def probe() -> None:
+        try:
+            os.stat(root)
+            os.listdir(root)
+            outcome.append(True)
+        except OSError:
+            outcome.append(False)
+
+    thread = threading.Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return outcome == [True]
 
 
 # --------------------------------------------------------------------------
@@ -1660,7 +1683,7 @@ def test_regression_b113_move_before_upload(ctx: Context) -> None:
         os.rename(root / "renamed.bin", root / "renamed later.bin")
         os.rename(root / "moved.bin", moved / "moved.bin")
         os.rename(root / "both.bin", moved / "both moved.bin")
-        held = [item for item in daemon.queue() if item["id"] not in PREEXISTING_OPS]
+        held = [item for item in daemon.queue() if not preexisting(item)]
         check(bool(held), "nothing was queued while sync was paused, so the moves raced nothing")
         creates = [item["path"] for item in held if item["kind"] == "create"]
         check(not creates, f"creates were queued, not minted on Drive, so B113 was not replayed: {creates}")
@@ -1688,6 +1711,245 @@ def test_regression_b113_move_before_upload(ctx: Context) -> None:
         sorted(os.listdir(root)) == ["moved here", "renamed later.bin"],
         f"old names are still listed: {sorted(os.listdir(root))}",
     )
+
+
+def test_regression_b102_removed_folder_takes_its_uploads(ctx: Context) -> None:
+    """Removing a folder drops the uploads queued for the files inside it (B102).
+
+    Only creates and mkdirs carry a parent in the queue, so removing a folder
+    kept the revisions of files that were already on Drive. They held their
+    staged bytes and retried against the trash for good, and `pdfs rm` dropped
+    nothing at all. Sync is paused so the revisions are still queued when the
+    folders go, one with `pdfs rm` and one through the mount.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder uploads in its own passes, not through the queue")
+    if (daemon.status().get("mount") or {}).get("paused"):
+        raise Skip("sync is paused already; this case has to pause and resume it itself")
+    files = {}
+    for how in ("by pdfs rm", "through the mount"):
+        inner = ctx.root / f"b102 {how}" / "inner"
+        inner.mkdir(parents=True)
+        files[how] = inner / "queued.bin"
+        write_durable(files[how], b"b102 first version\n")
+    daemon.wait_for_queue()
+    daemon.command("sync", "pause", "--for", "10m")
+    try:
+        for how, path in files.items():
+            write_durable(path, pattern(BLOCK + 102, f"b102-{how}"))
+        held = {
+            item["id"]
+            for item in daemon.queued(
+                lambda item: item["kind"] == "revision" and not preexisting(item), len(files)
+            )
+        }
+        check(
+            len(held) >= len(files),
+            f"the rewrites queued {plural(len(held), 'revision')}, not {len(files)}, so B102 was not replayed",
+        )
+        daemon.command("rm", str(files["by pdfs rm"].parent.parent))
+        shutil.rmtree(files["through the mount"].parent.parent)
+        left = [f"{item['kind']} {item['path']}" for item in daemon.queue() if item["id"] in held]
+        check(not left, f"uploads queued in a removed folder are still queued: {', '.join(left)}")
+    finally:
+        daemon.command("sync", "resume")
+    daemon.wait_for_queue()
+    listed = os.listdir(ctx.root)
+    back = [path.parent.parent.name for path in files.values() if path.parent.parent.name in listed]
+    check(not back, f"a removed folder is listed again: {back}")
+
+
+def test_regression_b94_deleted_transient_file_leaves_nothing_queued(ctx: Context) -> None:
+    """A `*.part` file deleted before its rename leaves nothing queued (B94).
+
+    A transient name parks its create until a rename gives the file its final
+    name (B70). That rename was the park's only exit, so a temp file that was
+    deleted instead stayed queued for good, with its bytes. The sweep that lets
+    an hour-old park through is not driven here.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder parks nothing; it only puts off a transient name")
+    path = ctx.root / "b94 abandoned.part"
+    write_durable(path, pattern(4096 + 94, "b94"))
+    parked = {item["id"] for item in daemon.queue() if item["parked"] and item["path"].endswith(path.name)}
+    check(bool(parked), "the .part file's create was not parked, so B94 was not replayed")
+    os.unlink(path)
+    deadline = time.monotonic() + 30
+    while left := [f"{item['kind']} {item['path']}" for item in daemon.queue() if item["id"] in parked]:
+        check(time.monotonic() < deadline, f"the deleted temp file is still queued: {', '.join(left)}")
+        time.sleep(1)
+    check(path.name not in os.listdir(ctx.root), "the deleted temp file is listed again")
+
+
+def test_regression_b95_tmp_name_uploads(ctx: Context) -> None:
+    """A file whose final name ends in `.tmp` or `.temp` uploads at once (B95).
+
+    Both suffixes counted as transient, so such a file waited for a rename that
+    never came. A Takeout import left dozens of `index.tmp` files parked.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder uploads in its own passes, so the queue cannot show a park")
+    folder = ctx.root / "b95"
+    folder.mkdir()
+    payloads = {
+        name: pattern(4096 + index, f"b95-{name}") for index, name in enumerate(("index.tmp", "preview.temp"))
+    }
+    for name, payload in payloads.items():
+        write_durable(folder / name, payload)
+    # Fails at once on a parked op, naming it.
+    daemon.wait_for_queue()
+    listed = {entry["name"] for entry in daemon.listing(folder)}
+    check(set(payloads) <= listed, f"pdfs ls lists {sorted(listed)}")
+    for name, payload in payloads.items():
+        check_bytes(read(folder / name), payload, f"{name} after the upload")
+
+
+def test_regression_b111_rename_back_at_once(ctx: Context) -> None:
+    """A file renamed and straight back keeps working, every time (B111).
+
+    Right after a rename, Drive can still hand out the old name hash, and a
+    rename sent with that hash was refused as out of date. The daemon answered
+    with `EIO`, about once a run. On a mount, `pdfs rename` is driven too.
+    """
+    folder = ctx.root / "b111"
+    folder.mkdir()
+    original = folder / "b111 original.txt"
+    other = folder / "b111 other.txt"
+    payload = b"b111 rename back\n" * 64
+    write_durable(original, payload)
+    live = ctx.is_live and ctx.daemon is not None and is_fuse(ctx.root)
+    if live:
+        # The renames should race nothing but Drive.
+        ctx.daemon.wait_for_queue()
+    for _ in range(8):
+        os.rename(original, other)
+        os.rename(other, original)
+    names = sorted(os.listdir(folder))
+    check(names == [original.name], f"after renaming there and back: {names}")
+    check_bytes(read(original), payload, "the file after renaming it there and back")
+    ctx.record("names", names)
+    if not live:
+        return
+    for _ in range(3):
+        ctx.daemon.command("rename", str(original), other.name)
+        ctx.daemon.command("rename", str(other), original.name)
+    listed = sorted(entry["name"] for entry in ctx.daemon.listing(folder))
+    check(listed == [original.name], f"pdfs ls lists {listed} after pdfs rename there and back")
+    check_bytes(read(original), payload, "the file after pdfs rename there and back")
+
+
+def _uploads_named(daemon: Daemon, name: str) -> list[dict]:
+    transfers = json.loads(daemon.command("transfers", json_output=True))
+    return [
+        item for item in transfers.get("items", []) if item["direction"] == "Upload" and item["name"] == name
+    ]
+
+
+def _describe_uploads(items: list[dict]) -> str:
+    return ", ".join(f"{item['bytes_completed']} of {item['bytes_total']} bytes" for item in items)
+
+
+def test_regression_b98_superseded_upload_ends(ctx: Context) -> None:
+    """An upload that a new write supersedes ends, and the new bytes land (B98).
+
+    A write while a revision is on the wire cancels that upload. The cancel was
+    reported as a read to retry, and the SDK retried it forever: the drain
+    thread spun at full CPU and the transfer stayed listed at 0 bytes. A
+    browser download, which keeps growing, triggers it.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder uploads in its own passes, not through the drain")
+    path = ctx.root / "b98 growing.bin"
+    first = pattern(64 * MIB, "b98-first")
+    write_durable(path, first)
+    deadline = time.monotonic() + 60
+    while not _uploads_named(daemon, path.name):
+        if time.monotonic() >= deadline:
+            raise Skip("the upload was never seen on the wire, so nothing could supersede it")
+        time.sleep(0.2)
+    tail = pattern(MIB + 3, "b98-tail")
+    with open(path, "ab") as handle:
+        handle.write(tail)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        daemon.wait_for_queue()
+    except TimeoutError as error:
+        raise AssertionError(f"{error}; still uploading: {_describe_uploads(_uploads_named(daemon, path.name))}") from error
+    deadline = time.monotonic() + 15
+    while stuck := _uploads_named(daemon, path.name):
+        check(
+            time.monotonic() < deadline,
+            f"the superseded upload is still listed after the queue drained: {_describe_uploads(stuck)}",
+        )
+        time.sleep(1)
+    expected = first + tail
+    size = os.lstat(path).st_size
+    check(size == len(expected), f"{path.name} is {size} bytes after the drain, expected {len(expected)}")
+    check_bytes(read(path), expected, f"{path.name} after the drain")
+    check(not _conflict_copies(ctx.root), "superseding an upload made conflict copies")
+
+
+def test_regression_b80_new_file_is_searchable(ctx: Context) -> None:
+    """A new file is found by `pdfs search`, also after it is rewritten (B80).
+
+    A node was indexed only when its parents led up to the My files root. A
+    device folder's root is no node row, so everything in a synced folder fell
+    out of the index the first time it was rewritten. The name carries a unique
+    token, so the search cannot find anything else.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("the case checks what a mount indexes as it writes; a mirror folder writes in its own passes")
+    token = f"b80x{uuid.uuid4().hex[:12]}"
+    folder = ctx.root / "b80"
+    folder.mkdir()
+    path = folder / f"findable {token}.txt"
+    write_durable(path, b"b80 first version\n")
+    daemon.wait_for_queue()
+    write_durable(path, b"b80 rewritten\n")
+    daemon.wait_for_queue()
+    deadline = time.monotonic() + 30
+    while path.name not in (found := daemon.command("search", token)):
+        check(time.monotonic() < deadline, f"pdfs search {token} does not find the file: {found.strip()}")
+        time.sleep(2)
+
+
+def test_regression_b48_emptied_folder_removes_at_once(ctx: Context) -> None:
+    """A folder whose children were all just unlinked can be removed at once (B48).
+
+    A listing right after the unlinks could bring the trashed children back from
+    Drive, and a child moved into a folder the kernel had listed was missing
+    from that cached listing. `rmdir` then failed with `ENOTEMPTY` for as long
+    as anyone retried. On a mount, `pdfs refresh` asks Drive for the listing.
+    """
+    folder = ctx.root / "b48"
+    elsewhere = ctx.root / "b48 elsewhere"
+    folder.mkdir()
+    elsewhere.mkdir()
+    for index in range(12):
+        write_durable(folder / f"child-{index:02}.txt", f"b48 child {index}\n".encode())
+    live = ctx.is_live and ctx.daemon is not None and is_fuse(ctx.root)
+    if live:
+        ctx.daemon.wait_for_queue()
+    # Listed, so the kernel caches the folder before the move into it.
+    os.listdir(folder)
+    write_durable(elsewhere / "moved in.txt", b"b48 moved in\n")
+    os.rename(elsewhere / "moved in.txt", folder / "moved in.txt")
+    names = sorted(os.listdir(folder))
+    ctx.record("names", names)
+    for name in names:
+        os.unlink(folder / name)
+    if live:
+        ctx.daemon.command("refresh", str(folder))
+    left = sorted(os.listdir(folder))
+    check(not left, f"unlinked children are listed again: {left}")
+    os.rmdir(folder)
+    check(folder.name not in os.listdir(ctx.root), "the removed folder is still listed")
 
 
 def _refused(daemon: Daemon, *args: str) -> str:
@@ -1804,12 +2066,13 @@ def test_cli_output_into_a_closed_pipe(ctx: Context) -> None:
         check(not result.stderr.strip(), f"{command} into a closed pipe wrote: {result.stderr.strip()}")
 
 
-def test_open_b114_removed_name_stops_resolving(ctx: Context) -> None:
-    """A name `pdfs rm` or `pdfs rename` took away stops resolving at once (B114, open).
+def test_regression_b114_removed_name_stops_resolving(ctx: Context) -> None:
+    """A name `pdfs rm` or `pdfs rename` took away stops resolving at once (B114).
 
-    The FUSE handlers tell the kernel when a name goes; the control requests do
-    not. The kernel then keeps answering for the old name from its entry cache
-    for up to 30 seconds (`TTL` in lib.rs), while the listing no longer has it.
+    The FUSE handlers tell the kernel when a name goes, and the control requests
+    did not. The kernel then kept answering for the old name from its entry
+    cache for up to 30 seconds (`TTL` in lib.rs), while the listing no longer
+    had it.
     """
     daemon = ctx.require_daemon()
     if not is_fuse(ctx.root):
@@ -1831,15 +2094,14 @@ def test_open_b114_removed_name_stops_resolving(ctx: Context) -> None:
         for path, command in ((removed, "pdfs rm"), (renamed, "pdfs rename"))
         if os.path.lexists(path)
     ]
-    if stale:
-        verb = "resolves" if len(stale) == 1 else "resolve"
-        raise KnownIssue(f"B114: {' and '.join(stale)} still {verb}, though no longer listed")
+    verb = "resolves" if len(stale) == 1 else "resolve"
+    check(not stale, f"{' and '.join(stale)} still {verb}, though no longer listed")
 
 
-def test_open_b115_ls_reports_the_real_size(ctx: Context) -> None:
-    """`pdfs ls` reports a file's real size, not the size Drive stores (B115, open).
+def test_regression_b115_ls_reports_the_real_size(ctx: Context) -> None:
+    """`pdfs ls` reports a file's real size, not the size Drive stores (B115).
 
-    The listing falls back to the encrypted size on storage when a node has no
+    The listing fell back to the encrypted size on storage when a node had no
     claimed size, which showed a 6-byte file as 57 bytes. `pdfs refresh` brings
     back such a listing on purpose (see B100), so both are checked.
     """
@@ -1868,8 +2130,155 @@ def test_open_b115_ls_reports_the_real_size(ctx: Context) -> None:
             wrong.append(f"{name}: {next(iter(shown.values()))} bytes, not {size}, {' and '.join(shown)}")
         elif shown:
             wrong.append(f"{name}: not {size} bytes but " + ", ".join(f"{n} {when}" for when, n in shown.items()))
-    if wrong:
-        raise KnownIssue("B115: pdfs ls shows the wrong size\n" + "\n".join(wrong))
+    check(not wrong, "pdfs ls shows the wrong size\n" + "\n".join(wrong))
+
+
+def test_regression_b116_trashed_folder_drops_deeper_creates(ctx: Context) -> None:
+    """Trashing a folder drops the creates queued in its subfolders (B116).
+
+    Only the ops chained to the folder through the queue, and the revisions of
+    the files below it, went with the folder. A queued create in a subfolder
+    that was already on Drive stayed, and once due the drain put the file in
+    the root. A `*.part` file renamed while sync is paused makes such a create.
+    The folder is restored before sync resumes, so a create that wrongly stays
+    lands where it was written rather than in the root.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder uploads in its own passes, not through the queue")
+    if (daemon.status().get("mount") or {}).get("paused"):
+        raise Skip("sync is paused already; this case has to pause and resume it itself")
+    folder = ctx.root / "b116"
+    deeper = folder / "sub" / "deeper"
+    deeper.mkdir(parents=True)
+    daemon.wait_for_queue()
+    uid = daemon.child_uid(ctx.root, folder.name)
+    check(uid is not None, f"pdfs ls does not list {folder.name}")
+    path = deeper / "b116 held.bin"
+    payload = pattern(4096 + 116, "b116")
+    stray = daemon.enclosing_mount(ctx.root) / path.name
+    survived: list[str] = []
+    in_root = False
+    try:
+        daemon.command("sync", "pause", "--for", "10m")
+        try:
+            partial = path.with_name(path.name + ".part")
+            write_durable(partial, payload)
+            # The rename to a final name lets the parked create go, but sync is paused.
+            os.rename(partial, path)
+            held = {
+                item["id"]
+                for item in daemon.queue()
+                if item["kind"] == "create" and not item["parked"] and item["path"].endswith(path.name)
+            }
+            check(bool(held), "the renamed file's create was not queued, so B116 was not replayed")
+            daemon.command("rm", str(folder))
+            survived = [f"{item['kind']} #{item['id']}" for item in daemon.queue() if item["id"] in held]
+            daemon.command("restore", uid)
+        finally:
+            daemon.command("sync", "resume")
+        daemon.wait_for_queue()
+    finally:
+        # Only a create that drained while its folder was trashed lands there.
+        if stray.is_file() and read(stray) == payload:
+            os.unlink(stray)
+            in_root = True
+            ctx.info(f"the drain put {path.name} in {stray.parent}; it is in the trash now")
+    check(
+        not survived,
+        f"the create of {path.relative_to(ctx.root)} ({', '.join(survived)}) "
+        f"stayed queued after pdfs rm {folder.name}",
+    )
+    check(not in_root, f"the drain put {path.name} in the root, although its folder was restored first")
+
+
+def test_regression_b117_moved_upload_keeps_its_path(ctx: Context) -> None:
+    """A queued upload of a file `pdfs move` moved keeps its path and goes at once (B117).
+
+    `pdfs move` and `pdfs rename` forgot the node, and that deleted its row.
+    Until a listing brought the row back, `pdfs sync queue` showed the upload by
+    its raw id, and the drain found no node, re-read it and put the upload off
+    by one recheck. Sync is paused so the upload is queued during the move.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder uploads in its own passes, not through the queue")
+    if (daemon.status().get("mount") or {}).get("paused"):
+        raise Skip("sync is paused already; this case has to pause and resume it itself")
+    folder = ctx.root / "b117"
+    target = folder / "moved here"
+    target.mkdir(parents=True)
+    path = folder / "b117 moved.bin"
+    write_durable(path, b"b117 first version\n")
+    daemon.wait_for_queue()
+    uid = daemon.child_uid(folder, path.name)
+    check(uid is not None, f"pdfs ls does not list {path.name}")
+    payload = pattern(BLOCK + 117, "b117")
+    started = time.time()
+    daemon.command("sync", "pause", "--for", "10m")
+    try:
+        write_durable(path, payload)
+        # Waited for before the move: an upload queued after it would race nothing.
+        held = {
+            item["id"]
+            for item in daemon.queued(
+                lambda item: item["kind"] == "revision"
+                and not preexisting(item)
+                and item["path"].endswith(path.name),
+                1,
+            )
+        }
+        check(bool(held), "the rewrite queued no revision, so B117 was not replayed")
+        daemon.command("move", str(path), str(target))
+        shown = [item["path"] for item in daemon.queue() if item["id"] in held]
+        check(bool(shown), "the queued revision left the queue while sync was paused")
+    finally:
+        daemon.command("sync", "resume")
+    daemon.wait_for_queue()
+    time.sleep(3)
+    daemon.wait_for_queue()
+
+    moved = target / path.name
+    check_bytes(read(moved), payload, f"{path.name} after the move and the drain")
+    check(path.name not in os.listdir(folder), f"{path.name} is still listed where it was")
+    conflicts = _conflict_copies(folder) + _conflict_copies(target)
+    check(not conflicts, f"moving a file with a queued upload made conflict copies: {conflicts}")
+    symptoms = [
+        f"pdfs sync queue listed its upload as {shown_path}"
+        for shown_path in shown
+        if not shown_path.endswith(f"{target.name}/{path.name}")
+    ]
+    lines = read_journal(daemon.unit, started)
+    deferred = [line for line in lines or [] if uid in line and "pending operation deferred" in line]
+    if deferred:
+        symptoms.append(f"its upload was put off: {deferred[0]}")
+    check(not symptoms, "after pdfs move\n" + "\n".join(symptoms))
+    if lines is None:
+        ctx.info("journalctl is unavailable, so a put-off upload could not be seen")
+
+
+def test_regression_b119_uploaded_file_stays_cached(ctx: Context) -> None:
+    """A file written through the mount stays cached once its upload lands (B119).
+
+    The drain threw the staged bytes away after the upload, so the first read
+    of a file just written downloaded it again. With the link down that read
+    failed with EIO, which is how the end-of-run read-back crashed.
+    """
+    daemon = ctx.require_daemon()
+    if not is_fuse(ctx.root):
+        raise Skip("a mirror folder keeps its files on local storage")
+    folder = ctx.root / "b119"
+    folder.mkdir()
+    sizes = {"small.txt": 119, "block.bin": BLOCK + 119}
+    for name, size in sizes.items():
+        write_durable(folder / name, pattern(size, f"b119-{name}"))
+    daemon.wait_for_queue()
+    listed = {entry["name"]: entry for entry in daemon.listing(folder)}
+    check(set(listed) == set(sizes), f"pdfs ls lists {sorted(listed)}")
+    uncached = [name for name in sizes if not listed[name].get("cached")]
+    check(not uncached, f"{', '.join(uncached)} not cached after the upload, so reading it needs the network")
+    for name, size in sizes.items():
+        check_bytes(read(folder / name), pattern(size, f"b119-{name}"), f"{name} after the upload")
 
 
 SHARED_DIR_NAME = "Shared with me"
@@ -2178,9 +2587,11 @@ TESTS = [
     Case("allocation, punched holes, and hole-seeking", test_allocation_and_holes),
     Case("unsupported operations refuse cleanly", test_unsupported_operations),
     Case("independent and shared-file concurrency", test_concurrency),
-    Case("application workloads (editor, tar, sqlite, git, rsync)", test_application_workloads),
+    # Each change and each first read is a network round trip on a mount, and
+    # these two make many.
+    Case("application workloads (editor, tar, sqlite, git, rsync)", test_application_workloads, budget_scale=2),
     Case("block boundaries and overwrites that change the block count", test_block_boundaries_and_overwrites),
-    Case("unusual but legal names", test_unusual_names),
+    Case("unusual but legal names", test_unusual_names, budget_scale=2),
     Case("a deep tree", test_deep_tree),
     Case("a wide directory", test_wide_directory, budget_scale=2),
     Case("rename patterns: swap, chain, rotation, replace under a reader", test_rename_patterns),
@@ -2197,10 +2608,20 @@ TESTS = [
     Case("regression B100: a copied tree reads back at its exact sizes", test_regression_b100_copied_tree_exact_sizes),
     Case("regression B101: a write during its create's upload reaches Drive", test_regression_b101_write_during_create_upload, (LIVE,)),
     Case("regression B113: moving a file before its upload makes no conflict", test_regression_b113_move_before_upload, (LIVE,)),
+    Case("regression B102: removing a folder drops the uploads queued inside it", test_regression_b102_removed_folder_takes_its_uploads, (LIVE,)),
+    Case("regression B94: a deleted .part file leaves nothing queued", test_regression_b94_deleted_transient_file_leaves_nothing_queued, (LIVE,)),
+    Case("regression B95: a .tmp file uploads at once", test_regression_b95_tmp_name_uploads, (LIVE,)),
+    Case("regression B111: renaming a file straight back works", test_regression_b111_rename_back_at_once),
+    Case("regression B98: an upload superseded by a write ends", test_regression_b98_superseded_upload_ends, (LIVE,), budget_scale=2),
+    Case("regression B80: pdfs search finds a new file after a rewrite", test_regression_b80_new_file_is_searchable, (LIVE,)),
+    Case("regression B48: an emptied folder can be removed at once", test_regression_b48_emptied_folder_removes_at_once),
     Case("regression B88: pdfs mkdir, rename and rm by local path", test_regression_b88_cli_changes_by_local_path, (LIVE,)),
     Case("pdfs output into a closed pipe ends quietly", test_cli_output_into_a_closed_pipe, (LIVE,)),
-    Case("open B114: a name pdfs rm or rename took away stops resolving", test_open_b114_removed_name_stops_resolving, (LIVE,)),
-    Case("open B115: pdfs ls reports a file's real size", test_open_b115_ls_reports_the_real_size, (LIVE,)),
+    Case("regression B114: a name pdfs rm or rename took away stops resolving", test_regression_b114_removed_name_stops_resolving, (LIVE,)),
+    Case("regression B115: pdfs ls reports a file's real size", test_regression_b115_ls_reports_the_real_size, (LIVE,)),
+    Case("regression B116: trashing a folder drops the creates queued in its subfolders", test_regression_b116_trashed_folder_drops_deeper_creates, (LIVE,)),
+    Case("regression B117: a moved file's queued upload keeps its path", test_regression_b117_moved_upload_keeps_its_path, (LIVE,)),
+    Case("regression B119: an uploaded file stays cached", test_regression_b119_uploaded_file_stays_cached, (LIVE,)),
     Case("durability across a daemon restart", test_durability_across_restart, (LIVE,)),
 ]
 
@@ -2461,20 +2882,22 @@ def print_result(head: str, indent: int, result: Result) -> None:
 
 
 def select_cases(kind: str, pool: list[Case] | None = None) -> list[Case]:
-    selected = os.environ.get("PDFS_ACCEPTANCE_ONLY")
+    """The cases of `kind` whose name contains any comma-separated part of the filter."""
+    selected = os.environ.get("PDFS_ACCEPTANCE_ONLY", "")
     cases = [case for case in (TESTS if pool is None else pool) if kind in case.kinds]
-    if not selected:
+    needles = [part.strip().lower() for part in selected.split(",") if part.strip()]
+    if not needles:
         return cases
-    needle = selected.lower()
     # A filter that names a live-only case (every regression case is one) matches
     # nothing in the reference run, which is not an error — the reference target
-    # simply has nothing to do. Only a filter that matches *no case at all* is a
+    # simply has nothing to do. Only a part that matches *no case at all* is a
     # typo worth failing on.
-    check(
-        any(needle in case.name.lower() for case in TESTS + MOVE_CASES),
-        f"PDFS_ACCEPTANCE_ONLY={selected!r} matched no tests",
-    )
-    return [case for case in cases if needle in case.name.lower()]
+    for needle in needles:
+        check(
+            any(needle in case.name.lower() for case in TESTS + MOVE_CASES),
+            f"PDFS_ACCEPTANCE_ONLY: {needle!r} matched no tests",
+        )
+    return [case for case in cases if any(needle in case.name.lower() for needle in needles)]
 
 
 def reap_stale_roots(parent: Path, max_age: int) -> None:
@@ -2506,8 +2929,9 @@ def reap_stale_roots(parent: Path, max_age: int) -> None:
 def run_cases(run: Run, cases: list[Case], context_for, timeout: int, fail_fast: bool) -> None:
     """Run `cases` into `run`, one console line each.
 
-    A timeout ends the loop: the mount may be wedged, so later cases would only
-    produce noise, and cleanup already has to fight for it.
+    A timeout ends the loop when the mount no longer answers: later cases would
+    only produce noise, and cleanup already has to fight for it. A mount that
+    still answers was only slow, as on a poor link, and the run goes on.
     """
     width = min(max((len(case.name) for case in cases), default=0), max(CONSOLE.columns - 32, 40))
     for index, case in enumerate(cases, 1):
@@ -2544,9 +2968,11 @@ def run_cases(run: Run, cases: list[Case], context_for, timeout: int, fail_fast:
         print_result(head, len(counter) + 3, result)
         if status == "pass":
             run.ran.add(case.name)
-        if status == "timeout":
-            if left := len(cases) - index:
-                print(CONSOLE.paint(f"  {plural(left, 'later case')} not run after the timeout", DIM))
+        if status == "timeout" and (left := len(cases) - index):
+            if answers(context.root):
+                print(CONSOLE.paint("  the mount still answers, so the run goes on", DIM))
+                continue
+            print(CONSOLE.paint(f"  {plural(left, 'later case')} not run: the mount stopped answering", DIM))
             break
         if failure is not None and fail_fast:
             raise failure
@@ -2602,7 +3028,13 @@ def run_contract(
         run.noted = dict(obs.noted)
         digest_path = root / "positioned.bin"
         if digest_path.exists():
-            run.digest = hashlib.sha256(read(digest_path)).hexdigest()
+            try:
+                run.digest = hashlib.sha256(read(digest_path)).hexdigest()
+            except OSError as error:
+                # Reported, not raised: the results and the cleanup are owed.
+                run.results.append(
+                    Result("a file of this run reads back at the end", run.label, "fail", 0.0, failure_detail(error))
+                )
         if reference is not None:
             summarize_divergence(reference, run)
         CONSOLE.fact("result", tally(run.counts(), run.wall))
@@ -2716,12 +3148,52 @@ def report_timings(budget: float) -> list[str]:
     return slow
 
 
+# Warnings that mean the daemon got something wrong, though it carried on. A
+# conflict copy of a run's own write is B69, B105 or B113 come back; a FUSE job
+# held for minutes is the shape of B107 and B110. A queued op whose authority
+# had to be re-read lost its row to a control move (B117) or to a folder that
+# had just landed (B120); nothing in a run takes a row away on purpose.
+JOURNAL_WARNINGS = (
+    "queued write conflicts; keeping a conflict copy",
+    "a fuse worker has held the same job for a long time",
+    "re-interned an authority missing from the local tree",
+)
+
+
+def read_journal(unit: str, since: float) -> list[str] | None:
+    """The unit's journal lines since `since`, or None without journalctl.
+
+    Tracing colours its output when it thinks it has a terminal, so the ANSI
+    codes are stripped. Raises RuntimeError when journalctl fails.
+    """
+    if shutil.which("journalctl") is None:
+        return None
+    result = subprocess.run(
+        [
+            "journalctl",
+            "--user",
+            "-u",
+            unit,
+            "--since",
+            f"@{int(since)}",
+            "--no-pager",
+            "-o",
+            "cat",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        raise RuntimeError(f"journalctl failed: {result.stderr.strip()}")
+    return [ANSI.sub("", line).strip() for line in result.stdout.splitlines()]
+
+
 class JournalWatch:
     """Fail a run that leaves errors in the daemon's journal.
 
     A suite can pass every assertion while the daemon logs a stream of failures
     behind it; that has happened here before, and it was only noticed by reading
-    the journal by hand.
+    the journal by hand. The warnings in `JOURNAL_WARNINGS` count as errors.
     """
 
     def __init__(self, unit: str = "proton-drive.service") -> None:
@@ -2738,33 +3210,18 @@ class JournalWatch:
     def errors(self) -> list[str]:
         if not self.since:
             return []
-        result = subprocess.run(
-            [
-                "journalctl",
-                "--user",
-                "-u",
-                self.unit,
-                "--since",
-                f"@{int(self.since)}",
-                "--no-pager",
-                "-o",
-                "cat",
-            ],
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode:
-            return [f"journalctl failed: {result.stderr.strip()}"]
+        try:
+            lines = read_journal(self.unit, self.since) or []
+        except RuntimeError as error:
+            return [str(error)]
         # Filtering on syslog priority (`-p err`) finds nothing: the daemon writes
         # tracing levels as text on stdout, which journald files at the unit's
-        # default priority. Match the level token instead, after stripping the
-        # ANSI colouring tracing emits when it thinks it has a terminal.
-        errors = []
-        for line in result.stdout.splitlines():
-            plain = ANSI.sub("", line)
-            if ERROR_LEVEL.search(plain):
-                errors.append(plain.strip())
-        return errors
+        # default priority. Match the level token instead.
+        return [
+            line
+            for line in lines
+            if ERROR_LEVEL.search(line) or any(warning in line for warning in JOURNAL_WARNINGS)
+        ]
 
 
 # --------------------------------------------------------------------------
@@ -2772,21 +3229,28 @@ class JournalWatch:
 # --------------------------------------------------------------------------
 
 
-# Queue ops that were already there when the run started, by id. They belong
-# to the user, or to an earlier run that died, and may never drain: a run that
-# waited for an empty queue would time out on every sync case. Waits skip them.
-PREEXISTING_OPS: set[int] = set()
+# Queue ops that were already there when a target started. They belong
+# to the user, to an earlier run that died, or to an earlier target of this run
+# that timed out, and may never drain: a target that waited for an empty queue
+# would time out on every sync case. Waits skip them. The id alone does not
+# name an op: the daemon numbers them afresh once its queue has emptied.
+PREEXISTING_OPS: set[tuple[int, int]] = set()
+
+
+def preexisting(item: dict) -> bool:
+    return (item["id"], item["queued_at"]) in PREEXISTING_OPS
 
 
 def remember_preexisting_ops(queue: list[dict]) -> None:
-    if PREEXISTING_OPS:
+    new = [item for item in queue if not preexisting(item)]
+    if not new:
         return
-    PREEXISTING_OPS.update(item["id"] for item in queue)
-    for item in queue:
-        print(
-            f"NOTE: queued {item['kind']} #{item['id']} for {item['path']} predates this run; "
-            "queue waits ignore it"
-        )
+    PREEXISTING_OPS.update((item["id"], item["queued_at"]) for item in new)
+    paths = sorted({item["path"] for item in new})
+    shown = ", ".join(paths[:3])
+    if len(paths) > 3:
+        shown += f" and {len(paths) - 3} more"
+    print(f"NOTE: {plural(len(new), 'queued op')} predate this target, for {shown}; queue waits ignore them")
 
 
 def queue_settled(mount: dict, queue) -> bool:
@@ -2795,7 +3259,7 @@ def queue_settled(mount: dict, queue) -> bool:
         return True
     if not PREEXISTING_OPS:
         return False
-    return all(item["id"] in PREEXISTING_OPS for item in queue())
+    return all(preexisting(item) for item in queue())
 
 
 class Daemon:
@@ -2854,7 +3318,7 @@ class Daemon:
                 parked = [
                     f"{item['kind']} {item['path']}"
                     for item in self.queue()
-                    if item["parked"] and item["id"] not in PREEXISTING_OPS
+                    if item["parked"] and not preexisting(item)
                 ]
                 check(not parked, f"the queue holds parked ops that never drain: {', '.join(parked)}")
             time.sleep(1)
@@ -2863,6 +3327,22 @@ class Daemon:
     def queue(self) -> list[dict]:
         """The daemon's queued uploads and changes, each with its path."""
         return json.loads(self.command("sync", "queue", json_output=True)).get("items", [])
+
+    def queued(self, wanted, count: int, seconds: float = 10) -> list[dict]:
+        """The queued ops `wanted` picks, once there are `count` of them.
+
+        A write is queued when the kernel releases the file, and `close(2)` does
+        not wait for the release. A queue read over the control socket right
+        after a close can therefore miss the last write: "regression B102" saw
+        one revision of two that way. Gives up after `seconds` and returns what
+        there is.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            items = [item for item in self.queue() if wanted(item)]
+            if len(items) >= count or time.monotonic() >= deadline:
+                return items
+            time.sleep(0.2)
 
     def sync_folders(self) -> list[dict]:
         return json.loads(self.command("sync", "list", json_output=True))["items"]
@@ -3281,6 +3761,9 @@ def wait_for_copy(root: Path, relative: Path, digest: str, timeout: int) -> None
     raise AssertionError(f"{target} did not converge byte-for-byte within {timeout}s")
 
 
+MODE_SWITCH_FILE = "pdfs-mode-switch.bin"
+
+
 class ManagedSyncPair:
     """Two sync registrations created by this run and removed on exit."""
 
@@ -3294,6 +3777,10 @@ class ManagedSyncPair:
             * 4096
             for path in self.paths
         }
+        # What the mirror engine uploaded right before a switch to on-demand,
+        # by folder, and one result per such switch (B86).
+        self.switch_payloads: dict[Path, bytes] = {}
+        self.switches = Run("mode switches", LIVE, self.paths[0].parent)
 
     def command(self, *args: str, json_output: bool = False) -> str:
         command = [self.pdfs]
@@ -3427,27 +3914,136 @@ class ManagedSyncPair:
         raise TimeoutError(f"forced sync for {path} did not complete: {last}")
 
     def set_modes(self, modes: tuple[str, str]) -> None:
-        changed_to_mirror: set[Path] = set()
+        switched: set[Path] = set()
         for path, mode in zip(self.paths, modes, strict=True):
             current = self.wait_for(path)
             if current["mode"] != mode:
+                if mode == "ondemand":
+                    # Uploaded after the mount's last listing of the folder, if
+                    # an earlier pairing had it on-demand: that listing is stale.
+                    payload = pattern(4096 + 86, f"b86-{path}-{uuid.uuid4()}")
+                    write_durable(path / MODE_SWITCH_FILE, payload)
+                    self.switch_payloads[path] = payload
+                    self.force_sync(path)
                 print(f"[setup] switching {path} to {mode}")
                 self.command("sync", "mode", str(self.ids[path]), mode)
-                if mode == "mirror":
-                    changed_to_mirror.add(path)
+                switched.add(path)
         for path, mode in zip(self.paths, modes, strict=True):
             self.wait_for(path, mode=mode)
             # The mode row flips before the asynchronous restore pass starts,
             # and its prior idle/last_sync values remain visible meanwhile.
             # Demand a completed pass before inspecting restored local bytes.
-            if path in changed_to_mirror:
+            if path in switched and mode == "mirror":
                 self.force_sync(path)
             mounted = is_mountpoint(path)
             check(mounted == (mode == "ondemand"), f"{path}: mode is {mode}, mounted={mounted}")
-            check(
-                read(path / "pdfs-mode-preservation.bin") == self.sentinels[path],
-                f"{path}: preservation sentinel changed or vanished after switch to {mode}",
+            self.check_sentinel(path, mode, path in switched)
+            if mode == "ondemand" and path in self.switch_payloads:
+                self.check_switch_file(path)
+
+    def online(self) -> bool:
+        try:
+            status = json.loads(self.command("status", json_output=True))
+        except (RuntimeError, ValueError):
+            return False
+        return bool((status.get("mount") or {}).get("online"))
+
+    def through_outage(self, action, what: str, info: list[str]):
+        """`action()`, and once more if it failed with EIO.
+
+        The switch to on-demand frees the mirror's local copy, so the folder is
+        read from Drive. When the link drops meanwhile, the daemon fails the
+        read with EIO once its read budget runs out. That is right, and says
+        nothing about the switch, so wait for the daemon to be back online and
+        let the second try decide.
+        """
+        try:
+            return action()
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            first = failure_detail(error)
+        deadline = time.monotonic() + self.timeout
+        waited = False
+        while not self.online():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{what}: {first}; the daemon stayed offline for {self.timeout}s")
+            waited = True
+            time.sleep(2)
+        info.append(
+            f"{what} failed with EIO while the daemon was offline; tried again once it was back"
+            if waited
+            else f"{what} failed with EIO; tried once more"
+        )
+        return action()
+
+    def record_switch(self, name: str, started: float, message: str, info: list[str]) -> None:
+        result = Result(
+            name,
+            self.switches.label,
+            "fail" if message else "pass",
+            time.monotonic() - started,
+            message,
+            info,
+        )
+        self.switches.results.append(result)
+        print_result(f"  {result.name} ", 4, result)
+
+    def check_sentinel(self, path: Path, mode: str, switched: bool) -> None:
+        """Record whether the file written at setup is still there, byte for byte."""
+        started = time.monotonic()
+        sentinel = path / "pdfs-mode-preservation.bin"
+        info: list[str] = []
+        message = ""
+        try:
+            check_bytes(
+                self.through_outage(lambda: read(sentinel), f"reading {sentinel.name}", info),
+                self.sentinels[path],
+                f"{sentinel.name} in {mode}",
             )
+        except (AssertionError, OSError) as error:
+            message = failure_detail(error)
+        which = ("first", "second")[self.paths.index(path)]
+        shown = "on-demand" if mode == "ondemand" else mode
+        self.record_switch(
+            f"the {which} folder keeps its file across the switch to {shown}"
+            if switched
+            else f"the {which} folder keeps its file while it stays {shown}",
+            started,
+            message,
+            info,
+        )
+
+    def check_switch_file(self, path: Path) -> None:
+        """Record whether the mount lists what the mirror uploaded just before (B86).
+
+        The mount used to serve the folder's listing from before the mirror
+        engine's uploads, so the files were missing until the next listing.
+        """
+        started = time.monotonic()
+        switched = path / MODE_SWITCH_FILE
+        info: list[str] = []
+        message = ""
+        try:
+            listed = self.through_outage(lambda: os.listdir(path), "listing the folder", info)
+            check(switched.name in listed, f"{switched.name} is not listed after the switch: {sorted(listed)}")
+            check_bytes(
+                self.through_outage(lambda: read(switched), f"reading {switched.name}", info),
+                self.switch_payloads[path],
+                f"{switched.name} after the switch",
+            )
+        except (AssertionError, OSError) as error:
+            message = failure_detail(error)
+        which = ("first", "second")[self.paths.index(path)]
+        self.record_switch(
+            f"regression B86: the {which} folder lists the mirror's last upload once on-demand",
+            started,
+            message,
+            info,
+        )
+        with contextlib.suppress(OSError):
+            switched.unlink()
+            del self.switch_payloads[path]
 
     def cleanup(self) -> None:
         # An async add can create its row and then time out before create() has
@@ -3471,12 +4067,16 @@ class ManagedSyncPair:
             # Remove only the sentinel owned by this harness so the next run's
             # strict empty-directory precondition remains meaningful. Unknown
             # survivors are left untouched and will fail validate() next time.
-            sentinel = path / "pdfs-mode-preservation.bin"
-            try:
-                if sentinel.exists() and read(sentinel) == self.sentinels[path]:
-                    sentinel.unlink()
-            except OSError as error:
-                print(f"WARNING: could not remove managed sentinel {sentinel}: {error}")
+            owned = {"pdfs-mode-preservation.bin": self.sentinels[path]}
+            if path in self.switch_payloads:
+                owned[MODE_SWITCH_FILE] = self.switch_payloads[path]
+            for name, payload in owned.items():
+                sentinel = path / name
+                try:
+                    if sentinel.exists() and read(sentinel) == payload:
+                        sentinel.unlink()
+                except OSError as error:
+                    print(f"WARNING: could not remove managed sentinel {sentinel}: {error}")
 
 
 # --------------------------------------------------------------------------
@@ -3897,6 +4497,8 @@ def run_managed_matrix(
                 if mode == "mirror":
                     pair.force_sync(path)
     finally:
+        if pair.switches.results:
+            REPORT.append(pair.switches)
         if janitor is None:
             with shielded():
                 for root in roots:
@@ -4194,7 +4796,7 @@ def finish(args, journal: JournalWatch, seconds: float) -> int:
             print(f"  - {result.name}  {CONSOLE.paint(run.label, DIM)}")
             print(indented(result.message, 6))
     if journal_errors:
-        CONSOLE.heading(f"The daemon logged {plural(len(journal_errors), 'error')} during the run")
+        CONSOLE.heading(f"The daemon logged {plural(len(journal_errors), 'problem')} during the run")
         for line in journal_errors[:20]:
             print(f"  ! {line}")
         if len(journal_errors) > 20:
@@ -4218,7 +4820,7 @@ def finish(args, journal: JournalWatch, seconds: float) -> int:
     if failures or journal_errors:
         verdict = CONSOLE.paint("FAIL:", RED)
         if journal_errors and not failures:
-            verdict += f" the daemon logged {plural(len(journal_errors), 'error')};"
+            verdict += f" the daemon logged {plural(len(journal_errors), 'problem')};"
         print(f"{verdict} {tally(totals, seconds)}")
         return 1
     print(f"{CONSOLE.paint('PASS:', GREEN)} {tally(totals, seconds)}")

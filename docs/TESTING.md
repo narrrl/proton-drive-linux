@@ -37,7 +37,10 @@ An account run does this, in order:
 
 1. Runs the account-free contract as the reference.
 2. Runs the contract in a fresh `pdfs-acceptance-<id>` folder in My files and
-   diffs it against the reference.
+   diffs it against the reference. After the last case it reads back a file
+   the run wrote and records its digest. A read that fails there, as one did
+   with the link down (B119), is a failed result named "a file of this run
+   reads back at the end", and the cleanup still runs.
 3. Registers two new sync folders under `~/.cache/pdfs-acceptance/run-<id>/`
    and runs the contract and the move cases in every on-demand/mirror pairing.
 4. Removes everything it created, locally and remotely, and reports a
@@ -50,6 +53,17 @@ It only counts a folder as gone once a fresh trash listing no longer shows it.
 It then reads `pdfs sync queue` and counts any queued op that still names one
 of its folders as left behind too, since such an op keeps its staged bytes and
 retries forever (B102).
+
+Ops that were queued before a target starts are not the run's. The run prints
+one `NOTE` line naming them, and the queue waits ignore them. They are told
+apart by id and queue time together, since SQLite can give a new op the id of
+one that has drained.
+
+A write is queued when the kernel releases the file, and `close(2)` returns
+without waiting for that. A case that reads `pdfs sync queue` right after
+writing therefore waits for the ops it expects (`Daemon.queued`) instead of
+reading once. "regression B102" saw one revision of two before it did.
+
 Cleanup also runs on a failure, Ctrl-C, `SIGTERM` or `SIGHUP`. While it runs,
 two more interrupts are ignored; a third abandons it.
 
@@ -86,16 +100,15 @@ talks to and how many cases it runs, followed by one line per case:
   -> root      /mnt/testmount/pdfs-acceptance-…
   -> storage   FUSE mount /mnt/testmount (fuse.protondrive)
   -> daemon    pdfs 2.8.3, user@proton.me, online, 0 queued ops
-  -> cases     37 of 37
-  [ 1/37] creation and open flags .................................. ok       0.41s
+  -> cases     45 of 45
+  [ 1/45] creation and open flags .................................. ok       0.41s
   …
-  [21/37] throughput floors ........................................ ok      48.20s
+  [21/45] throughput floors ........................................ ok      48.20s
           write 31 MiB/s, read 54 MiB/s, 4 KiB writes 12.0 MiB/s, metadata 9 ops/s
   …
-  [36/37] open B115: pdfs ls reports a file's real size ............ known    6.12s
-          B115: pdfs ls shows …
+  [43/45] regression B115: pdfs ls reports a file's real size ...... ok       6.12s
   -> reference matches the ordinary filesystem in 412 compared observations
-  -> result    35 passed, 1 skipped, 1 known issue in 9m41s
+  -> result    44 passed, 1 skipped in 11m02s
 ```
 
 A case ends as `ok`, `FAIL`, `TIMEOUT`, `skip` when it does not apply to the
@@ -208,6 +221,67 @@ refused instead, and nothing may change.
 `pdfs status` with stdout on a pipe whose reader is already gone. Each must exit
 0 with nothing on stderr, as `pdfs ls | head -1` needs.
 
+**B102** (removing a folder drops the uploads queued inside it) uploads a file
+into each of two nested folders, pauses sync and rewrites both. While the
+revisions are held, it removes one folder with `pdfs rm` and the other through
+the mount. Neither revision may stay queued, and neither folder may come back
+after the resume. It skips when sync was already paused.
+
+**B94** (a deleted `.part` file leaves nothing queued) writes a `.part` file,
+checks that its create is parked, and unlinks it. The parked op must leave the
+queue within 30 seconds. The sweep that lets an hour-old park through is not
+driven.
+
+**B95** (a `.tmp` file uploads at once) writes `index.tmp` and `preview.temp`
+and waits for the queue, which fails at once on a parked op. `pdfs ls` must
+list both, and their bytes must read back.
+
+**B111** (renaming a file straight back works) renames a file there and back
+eight times through the mount. On a mount it also does so three times with
+`pdfs rename`, after the queue is empty, so the renames race nothing but Drive.
+It runs against the reference too.
+
+**B98** (an upload superseded by a write ends) writes 64 MiB and waits for its
+upload to show in `pdfs transfers`, then appends to the file. The queue must
+drain, the old upload must leave the transfer list, and the file must hold
+every byte with no conflict copy. It skips when the upload is never seen on
+the wire, and it gets twice the per-case timeout.
+
+**B80** (`pdfs search` finds a new file after a rewrite) writes a file whose
+name carries a unique token, waits for the queue, rewrites it and waits again.
+`pdfs search` must find it within 30 seconds.
+
+**B48** (an emptied folder can be removed at once) writes twelve files into a
+folder, lists it, and moves one more in from elsewhere. It unlinks every
+child, runs `pdfs refresh` on a mount, and checks that nothing is listed and
+that `rmdir` works. It runs against the reference too.
+
+**B114** (a name `pdfs rm` or `rename` took away stops resolving) looks up two
+files, removes one with `pdfs rm` and renames the other with `pdfs rename`. At
+once, neither old name may be listed or resolve.
+
+**B115** (`pdfs ls` reports a file's real size) writes files of 6 bytes, 4097
+bytes and one block plus 7, and compares the sizes `pdfs ls` lists with the
+written ones, after the upload and again after `pdfs refresh`.
+
+**B116** (trashing a folder drops the creates queued in its subfolders) makes
+`b116/sub/deeper` and waits for Drive. With sync paused, it writes a `.part`
+file there and renames it to its final name, so its create is due but held.
+It then runs `pdfs rm b116`, and the create must be gone from the queue. It
+restores the folder with `pdfs restore` before it resumes sync. If the file
+ends up in the mount's root anyway, the case fails and moves the file to the
+trash.
+
+**B117** (a moved file's queued upload keeps its path) rewrites an uploaded
+file with sync paused and moves it with `pdfs move`. `pdfs sync queue` must
+list the upload under its new path, and the journal must not show the upload
+put off with "pending operation deferred". The bytes must arrive at the new
+path with no conflict copy. Without `journalctl`, only the queue is checked.
+
+**B119** (an uploaded file stays cached) writes a small file and one of a block
+plus 119 bytes, waits for the queue, and expects `pdfs ls` to list both as
+cached, so reading them does not need the network.
+
 B74 was found by exactly this mechanism: the B70 case failed, and narrowing it
 produced a smaller reproduction that got its own case. The defect is fixed and
 live-validated (2026-07-26); the case now guards against its return.
@@ -249,16 +323,55 @@ Cases named `open B<n>` check a bug that `docs/BUGS.md` still lists as open.
 While the bug reproduces, the case ends as `known`: it is listed at the end of
 the run, but does not fail it. So a known bug does not hide new failures, and
 the run notices when a fix lands, because the case then passes. Rename it to
-`regression B<n>` then. **B114** (a name `pdfs rm` or `rename` took away stops
-resolving) and **B115** (`pdfs ls` reports a file's real size) are of this kind.
+`regression B<n>` then, and fail it with `check` instead of `KnownIssue`. No
+bug is open at the moment. B114 to B117 started as such cases.
+
+### What a run verifies
+
+A full account run with `--journal-check` checks these `docs/BUGS.md` entries,
+many of them fixed but not yet verified:
+
+- B48, B80, B94, B95, B98, B100, B101, B102, B111, B114, B115, B116, B117 and
+  B119, each with its own `regression B<n>` case.
+- B118, with "application workloads" and "block boundaries", which failed on
+  it. It needs Drive to be slow to list a new node, so a clean run is weak
+  evidence.
+- B120, with `--journal-check`, but only in a run that goes offline while it
+  writes. A mkdir made online goes to Drive at once, so only then does a
+  folder land from the queue.
+- B86, with the mode-switch check in the full matrix.
+- B104, B106, B108 and B109, with the cases that found them: "rename
+  patterns", "application workloads" and the account run's own setup.
+
+B105, B107 and B110 are races. The suite hit each of them once, so a clean run
+is weak evidence for them. `--journal-check` reports B110's stall warning, and
+every case that writes checks for B105's conflict copies.
+
+The suite does not drive:
+
+- the GUI and the photo gallery (B81, B92, B93, B97);
+- states it cannot set up: a `parent_uid` cycle (B82), staged bytes that name
+  no node (B96), a stuck trash refresh (B103), conflict copies left from an
+  earlier start (B99), a foreign FUSE mount in the local-file index (B90),
+  revisions without 4 MiB blocks (B85), and several shares from one owner
+  (B112);
+- B94's hour-long expiry of a park;
+- load and failure injection (B22, B27, B30, B37, B42).
+
+Check those by hand, or with the unit tests their entries name.
 
 ### Timeouts, reports, and hung mounts
 
 A wedged FUSE operation cannot be interrupted from Python, so each case runs
 under a soft alarm (`--timeout`, default 180s) that reports the case and lets
 cleanup run, backed by a hard stop that dumps every thread's stack and exits.
-That backstop is the only way to learn *where* a mount hung. A timeout ends the
-run: later cases against a wedged mount produce noise, not information.
+That backstop is the only way to learn *where* a mount hung. After a timeout the
+run checks whether the mount still answers a `stat` and a listing within 15
+seconds. If it does, the target goes on with its next case, so one slow stretch
+of the link does not cost every later case. If it does not, the target's later
+cases are not run: against a wedged mount they produce noise, not information.
+Cases that make many round trips by design ("application workloads", "unusual
+but legal names", "a wide directory" and "regression B98") get twice the limit.
 
 ```console
 scripts/fuse-acceptance.sh --live /mnt/testmount \
@@ -275,6 +388,9 @@ stops at the first failure.
 `--journal-check` fails the run if `proton-drive.service` logged any error while
 it ran. A suite can pass every assertion while the daemon logs failures behind
 it; that has happened, and it was caught only by reading the journal by hand.
+Two warnings count as errors too: "queued write conflicts; keeping a conflict
+copy" (how B113 showed) and "a fuse worker has held the same job for a long
+time" (how B110 showed).
 
 With `--live`, abandoned `pdfs-acceptance-*` roots from a crashed run are
 removed at startup, but only if they match the exact generated name and are
@@ -320,6 +436,21 @@ The My files case writes a test folder into your real My files and removes it
 afterwards. It skips when the daemon reports no My files mount, or when the
 locations are on different volumes.
 
+Before a mirror folder switches to on-demand, the runner writes a new file into
+it and syncs. Once the folder is mounted, the file must be listed with its
+bytes (B86). Each switch reports a `regression B86` result under a separate
+`mode switches` target. The bug only shows in a folder that was mounted in an
+earlier pairing, because that mount's listing is stale. That happens in the
+third pairing, so `--quick` runs the check but does not replay the bug.
+
+In every pairing, each folder must still hold the file the runner wrote into it
+at setup, byte for byte. These checks report under `mode switches` as well. A
+switch to on-demand frees the local copy, so these reads go to Drive. If the
+link drops, the daemon fails such a read with EIO once its two-minute read
+budget runs out. That is correct, so the runner waits until the daemon reports
+online again, tries once more and notes the retry under the result. Only the
+second try decides the result.
+
 ### Durability drill
 
 `--durability` restarts `proton-drive.service` in the middle of the suite and
@@ -331,7 +462,9 @@ interrupts a running daemon; `PDFS_ACCEPTANCE_UNIT` selects a different unit.
 ### Selecting cases
 
 During development, `PDFS_ACCEPTANCE_ONLY` runs tests whose descriptive name
-contains the supplied text (for example `PDFS_ACCEPTANCE_ONLY=namespace`). A
+contains the supplied text, ignoring case (for example
+`PDFS_ACCEPTANCE_ONLY=namespace`). Separate several texts with commas to run
+every case that matches any of them (`PDFS_ACCEPTANCE_ONLY=B116,B117`). A
 release acceptance run must leave it unset so the complete contract executes.
 
 A filter naming a live-only case (every `regression B<n>` is one) selects nothing
