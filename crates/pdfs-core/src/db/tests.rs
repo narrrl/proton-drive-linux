@@ -3304,6 +3304,129 @@ fn migration_v36_gives_every_node_its_rowid_as_lid() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The same migration over a copy of a database a released build wrote, which
+/// the fixture above cannot stand in for: years of rows, every kind of op, and
+/// whatever shapes real use left behind. The copy is taken with `VACUUM INTO`
+/// over a read-only connection, so the database named is never written.
+///
+/// `PDFS_MIGRATE_DB=~/.local/state/proton-drive-linux/cache.db cargo test -p
+/// pdfs-core a_copy_of_a_real_database -- --ignored`
+#[test]
+#[ignore = "needs a real database: set PDFS_MIGRATE_DB"]
+fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
+    let source = std::env::var("PDFS_MIGRATE_DB").expect("set PDFS_MIGRATE_DB");
+    let path = std::env::temp_dir().join(format!("pdfs-db-real-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    type Op = (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+    );
+    let (version, nodes, ops) = {
+        let conn = rusqlite::Connection::open_with_flags(
+            &source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.execute("VACUUM INTO ?1", rusqlite::params![path.to_str().unwrap()])
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let nodes: Vec<(String, i64)> = conn
+            .prepare("SELECT uid, rowid FROM nodes")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let ops: Vec<Op> = conn
+            .prepare(
+                "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, attempts
+                 FROM pending_op ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        (version, nodes, ops)
+    };
+    eprintln!(
+        "schema {version}: {} nodes, {} queued ops",
+        nodes.len(),
+        ops.len()
+    );
+
+    let db = Db::open(&path).unwrap();
+    let migrated: Vec<Op> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| {
+            (
+                op.id,
+                op.kind,
+                op.uid,
+                op.parent_uid,
+                op.name,
+                op.blob_path,
+                op.meta_json,
+                op.attempts,
+            )
+        })
+        .collect();
+    assert_eq!(migrated, ops, "every queued op survives as it was");
+    if version.parse::<i64>().unwrap() < 36 {
+        for (uid, rowid) in &nodes {
+            assert_eq!(db.lid_of(uid).unwrap(), Some(*rowid), "{uid}");
+        }
+    } else {
+        for (uid, _) in &nodes {
+            assert!(db.lid_of(uid).unwrap().is_some(), "{uid}");
+        }
+    }
+    drop(db);
+
+    let db = Db::open(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count as usize, nodes.len(), "no node is lost or doubled");
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION.to_string());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_failed_op_stays_queued_with_backoff() {
     let db = Db::open_in_memory().unwrap();
