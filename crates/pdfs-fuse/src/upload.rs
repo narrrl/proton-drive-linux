@@ -73,7 +73,7 @@ async fn run_uploads(
                 .upload_thumbnails_async(t.path.clone(), t.name.clone())
                 .await;
             match core
-                .client
+                .drive
                 .upload_file_from(
                     &t.parent_uid,
                     &t.name,
@@ -238,10 +238,7 @@ impl Core {
             .map_err(|error| self.errno_error(error, "upload destination"))?;
         let new_uid = self
             .rt
-            .block_on(
-                self.client
-                    .create_folder(parent_uid, name, Some(now_secs())),
-            )
+            .block_on(self.drive.create_folder(parent_uid, name, Some(now_secs())))
             .map_err(|e| CoreError::from_api(&e, &format!("create folder {name}")))?;
         let node = self
             .fetch_minted_node(&new_uid, name)

@@ -370,7 +370,7 @@ impl Core {
             HashMap::new()
         } else {
             self.rt
-                .block_on(self.client.enumerate_nodes_light(&check))
+                .block_on(self.drive.enumerate_nodes_light(&check))
                 .map_err(|e| format!("resolve changed nodes: {e}"))?
                 .into_iter()
                 .filter(|n| !n.trashed)
@@ -525,7 +525,7 @@ impl Core {
             };
             if let Err(e) = self
                 .rt
-                .block_on(self.client.trash_nodes(&[uid]))
+                .block_on(self.drive.trash_nodes(&[uid]))
                 .and_then(batch::into_unit)
             {
                 warn!(rel, error = %e, "sync: trash remote failed");
@@ -776,7 +776,7 @@ impl Core {
                     let remote = r.expect("remote deletion requires a remote file");
                     if let Err(e) = self
                         .rt
-                        .block_on(self.client.trash_nodes(std::slice::from_ref(&remote.uid)))
+                        .block_on(self.drive.trash_nodes(std::slice::from_ref(&remote.uid)))
                         .and_then(batch::into_unit)
                     {
                         warn!(rel, error = %e, "sync: trash remote failed");
@@ -839,7 +839,7 @@ impl Core {
         for (rel, uid) in delete_remote_dirs {
             if let Err(e) = self
                 .rt
-                .block_on(self.client.trash_nodes(&[uid]))
+                .block_on(self.drive.trash_nodes(&[uid]))
                 .and_then(batch::into_unit)
             {
                 warn!(rel, error = %e, "sync: trash remote folder failed");
@@ -894,14 +894,14 @@ impl Core {
     ) -> Result<(), String> {
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(folder))
+            .block_on(self.drive.enumerate_folder_children_node_uids(folder))
             .map_err(|e| format!("enumerate {folder}: {e}"))?;
         if uids.is_empty() {
             return Ok(());
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes_light(&uids))
+            .block_on(self.drive.enumerate_nodes_light(&uids))
             .map_err(|e| format!("resolve nodes: {e}"))?;
         for node in nodes {
             if node.trashed || !node.is_folder() {
@@ -946,14 +946,14 @@ impl Core {
         }
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(folder))
+            .block_on(self.drive.enumerate_folder_children_node_uids(folder))
             .map_err(|e| format!("enumerate {folder}: {e}"))?;
         if uids.is_empty() {
             return Ok(());
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes_light(&uids))
+            .block_on(self.drive.enumerate_nodes_light(&uids))
             .map_err(|e| format!("resolve nodes: {e}"))?;
 
         // Files whose recorded mtime no longer matches: their size has to be
@@ -971,7 +971,7 @@ impl Core {
             HashMap::new()
         } else {
             self.rt
-                .block_on(self.client.enumerate_nodes(&stale))
+                .block_on(self.drive.enumerate_nodes(&stale))
                 .map_err(|e| format!("resolve nodes: {e}"))?
                 .iter()
                 .map(|n| (n.uid.to_string(), remote_file_sig(n).1))
@@ -1139,7 +1139,7 @@ impl Core {
         match op {
             Pending::CreateDir { rel, parent } => {
                 let uid = self
-                    .client
+                    .drive
                     .create_folder(parent, base_name(rel), Some(now_secs()))
                     .await
                     .map_err(|e| format!("create remote folder {rel}: {e}"))?;
@@ -1240,7 +1240,7 @@ impl Core {
                 .begin(name, "", TransferDirection::Upload, meta.len()),
         );
         let uid = self
-            .client
+            .drive
             // Mirror push: the local file is authoritative. If a prior attempt was
             // interrupted mid-upload it left an unsealed draft of this name; recover
             // it even across a daemon restart (which rotates our client uid), so the
@@ -1294,7 +1294,7 @@ impl Core {
                 meta.len(),
             ),
         );
-        self.client
+        self.drive
             .upload_new_revision_from(uid, reader, meta.len() as i64, thumbnails, Some(mtime))
             .await
             .map_err(|e| format!("upload revision {rel}: {e}"))?;
@@ -1359,7 +1359,7 @@ impl Core {
                 size.max(0) as u64,
             );
             let mut out = CountingWriter::new(out, &guard);
-            self.client
+            self.drive
                 .download_file_to(uid, &mut out)
                 .await
                 .map_err(|e| {
@@ -1424,7 +1424,7 @@ impl Core {
         let (lmtime, lsize) = (local.mtime, local.size);
         // Re-fetch the node so the stored remote signature is exactly what a walk
         // will report next time.
-        let (rmtime, rsize) = match self.client.enumerate_nodes(std::slice::from_ref(uid)).await {
+        let (rmtime, rsize) = match self.drive.enumerate_nodes(std::slice::from_ref(uid)).await {
             Ok(nodes) => nodes
                 .first()
                 .map(remote_file_sig)

@@ -75,7 +75,7 @@ use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_drive_rs::{
     DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, ProtonDriveClient,
-    ProtonPhotosClient, RevisionReader, SharedWithMeItem, ThumbnailType,
+    ProtonPhotosClient, SharedWithMeItem, ThumbnailType,
 };
 
 mod albums;
@@ -86,6 +86,8 @@ use control::run_control_socket;
 mod devices;
 mod diagnostics;
 mod drain;
+mod drive;
+use drive::{DriveApi, RevisionRead};
 mod events;
 mod filesystem;
 mod link;
@@ -484,6 +486,12 @@ fn relative_to<'a>(root: &str, path: &'a str) -> Option<&'a str> {
 
 #[derive(Clone)]
 struct Core {
+    /// Drive as the sync core uses it: listings, events, creates, uploads,
+    /// downloads, renames, moves and trashes. The real client in production, an
+    /// in-memory Drive in the simulation tests. See [`drive`].
+    drive: Arc<dyn DriveApi>,
+    /// The concrete client, for what [`DriveApi`] does not cover: sharing,
+    /// Photos, devices, invitations and public links.
     client: ProtonDriveClient,
     rt: tokio::runtime::Handle,
     /// The daemon's My Files root. Forked on-demand sessions retain this value
@@ -1618,14 +1626,14 @@ impl Core {
     /// name hash. See [`retry_out_of_date`].
     pub(crate) fn rename_remote(&self, uid: &NodeUid, name: &str) -> Result<(), ProtonError> {
         self.change_remote(uid, || {
-            self.block_on_bounded(self.client.rename_node(uid, name, None))
+            self.block_on_bounded(self.drive.rename_node(uid, name, None))
         })
     }
 
     /// Move `uid` into the folder `parent` on Drive, like [`Core::rename_remote`].
     pub(crate) fn move_remote(&self, uid: &NodeUid, parent: &NodeUid) -> Result<(), ProtonError> {
         self.change_remote(uid, || {
-            self.block_on_bounded(self.client.move_node(uid, parent))
+            self.block_on_bounded(self.drive.move_node(uid, parent))
         })
     }
 
@@ -1657,7 +1665,7 @@ impl Core {
             is_trashed: false,
             is_shared: false,
         };
-        if let Err(error) = self.block_on_bounded(self.client.invalidate_caches_for_event(&changed))
+        if let Err(error) = self.block_on_bounded(self.drive.invalidate_caches_for_event(&changed))
         {
             debug!(%uid, %error, "could not drop the SDK's cached node");
         }
@@ -2239,7 +2247,7 @@ impl Core {
             Vec::new()
         } else {
             self.rt
-                .block_on(self.client.enumerate_nodes_light(&accepted.uids))
+                .block_on(self.drive.enumerate_nodes_light(&accepted.uids))
                 .map_err(|error| {
                     error!(%error, "materializing shared roots failed");
                     Errno::EIO
@@ -2445,7 +2453,7 @@ impl Core {
             refresh_foreign.then(|| self.shared_generation.load(Ordering::SeqCst));
         let uids = match self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(&folder_uid))
+            .block_on(self.drive.enumerate_folder_children_node_uids(&folder_uid))
         {
             Ok(uids) => uids,
             Err(e) if self.lost_link(&e, "list folder") => {
@@ -2465,7 +2473,7 @@ impl Core {
         // The price is that files come back without a `claimed_size`, so
         // `node_size` falls back to the *ciphertext* size until
         // `spawn_size_upgrade` below fills the real one in.
-        let mut nodes = match self.rt.block_on(self.client.enumerate_nodes_light(&uids)) {
+        let mut nodes = match self.rt.block_on(self.drive.enumerate_nodes_light(&uids)) {
             Ok(nodes) => nodes,
             Err(e) if self.lost_link(&e, "list folder") => {
                 return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
@@ -2732,7 +2740,7 @@ impl Core {
         let (mut key, mut uids, mut slot) = (key, uids, slot);
         loop {
             for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
-                let result = self.rt.block_on(self.client.enumerate_nodes(chunk));
+                let result = self.rt.block_on(self.drive.enumerate_nodes(chunk));
                 self.apply_size_upgrade(key, result);
                 slot.chunk_done();
             }
@@ -2763,7 +2771,7 @@ impl Core {
         if !self.is_online() {
             return None;
         }
-        let result = self.block_on_bounded(self.client.enumerate_nodes(std::slice::from_ref(uid)));
+        let result = self.block_on_bounded(self.drive.enumerate_nodes(std::slice::from_ref(uid)));
         if let Err(e) = &result {
             self.lost_link(e, "settle a provisional size");
         }
@@ -3068,7 +3076,7 @@ impl Core {
     /// resolving a conflict turns on *why* a call failed, and "the node is not
     /// there" (`Ok(None)`) is a different outcome from "we could not ask".
     fn fetch_node_remote(&self, uid: &NodeUid) -> Result<Option<Node>, ProtonError> {
-        match self.block_on_bounded(self.client.enumerate_nodes(std::slice::from_ref(uid))) {
+        match self.block_on_bounded(self.drive.enumerate_nodes(std::slice::from_ref(uid))) {
             Ok(nodes) => Ok(nodes.into_iter().next()),
             // An unknown uid is reported either as an empty result or as an
             // outright refusal, depending on the endpoint.
@@ -3897,7 +3905,7 @@ impl Core {
             .begin(name, uid.to_string(), TransferDirection::Download, total);
         let mut out = CountingWriter::new(Vec::with_capacity(total as usize), &guard);
         self.rt
-            .block_on(self.client.download_file_to(uid, &mut out))?;
+            .block_on(self.drive.download_file_to(uid, &mut out))?;
         Ok(out.into_inner())
     }
 
@@ -3906,7 +3914,7 @@ impl Core {
     /// [`Core::download_file_tracked`], and preserves the same transfer
     /// accounting while allowing callers that only need an on-disk file to
     /// keep memory use independent of file size.
-    fn download_file_tracked_to<W: Write>(
+    fn download_file_tracked_to<W: Write + Send>(
         &self,
         uid: &NodeUid,
         name: &str,
@@ -3918,7 +3926,7 @@ impl Core {
             .begin(name, uid.to_string(), TransferDirection::Download, total);
         let mut out = CountingWriter::new(out, &guard);
         self.rt
-            .block_on(self.client.download_file_to(uid, &mut out))?;
+            .block_on(self.drive.download_file_to(uid, &mut out))?;
         Ok(out.into_inner())
     }
 
@@ -4447,7 +4455,7 @@ impl Core {
                 Some(node) => node,
                 None => self
                     .rt
-                    .block_on(self.client.get_node(&uid))
+                    .block_on(self.drive.get_node(&uid))
                     .map_err(|e| CoreError::from_api(&e, "get node"))?
                     .ok_or_else(|| CoreError::not_found("node vanished"))?,
             },
@@ -4685,7 +4693,7 @@ impl Core {
         )
         .map_err(|error| self.errno_error(error, "trash access"))?;
         self.rt
-            .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
+            .block_on(self.drive.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
             .map_err(|e| CoreError::from_api(&e, "trash"))?;
         // Uploads queued for the node or anything below it would now only fail
@@ -4738,7 +4746,7 @@ impl Core {
         }
         self.require_uid_writable(uid)?;
         if let Err(e) = self
-            .block_on_bounded(self.client.trash_nodes(std::slice::from_ref(uid)))
+            .block_on_bounded(self.drive.trash_nodes(std::slice::from_ref(uid)))
             .and_then(batch::into_unit)
         {
             if self.lost_link(&e, "trash a replaced node") {
@@ -4811,7 +4819,7 @@ impl Core {
         }
         match self
             .rt
-            .block_on(self.client.restore_nodes(std::slice::from_ref(uid)))
+            .block_on(self.drive.restore_nodes(std::slice::from_ref(uid)))
             .and_then(batch::into_unit)
         {
             Ok(()) => {
@@ -4893,7 +4901,7 @@ impl Core {
     /// end. Every batch is a usable listing.
     async fn refresh_trash(&self) -> CoreResult<()> {
         let started = Instant::now();
-        let uids = within_trash_call("enumerate trash", self.client.enumerate_trash_node_uids())
+        let uids = within_trash_call("enumerate trash", self.drive.enumerate_trash_node_uids())
             .await?
             .map_err(|e| CoreError::from_api(&e, "enumerate trash"))?;
         info!(
@@ -4920,7 +4928,7 @@ impl Core {
         let mut items: Vec<StoredTrash> = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(TRASH_MATERIALIZE_CHUNK) {
             let chunk_started = Instant::now();
-            let nodes = within_trash_call("enumerate nodes", self.client.enumerate_nodes(chunk))
+            let nodes = within_trash_call("enumerate nodes", self.drive.enumerate_nodes(chunk))
                 .await?
                 .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
             items.extend(nodes.into_iter().map(|node| StoredTrash {
@@ -5082,7 +5090,7 @@ impl Core {
         let all: Vec<NodeUid> = waves.iter().flatten().cloned().collect();
         let parents: Vec<NodeUid> = self
             .rt
-            .block_on(self.client.enumerate_nodes(&all))
+            .block_on(self.drive.enumerate_nodes(&all))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?
             .into_iter()
             .filter_map(|n| n.parent_uid)
@@ -5098,7 +5106,7 @@ impl Core {
         for wave in &waves {
             self.rt
                 .block_on(async {
-                    let mut outcomes = std::pin::pin!(self.client.restore_nodes_streaming(wave));
+                    let mut outcomes = std::pin::pin!(self.drive.restore_nodes_streaming(wave));
                     while let Some(item) = outcomes.next().await {
                         let (uid, outcome) = item?;
                         match outcome {
@@ -5146,7 +5154,7 @@ impl Core {
         let mut first_error: Option<ProtonError> = None;
         self.rt
             .block_on(async {
-                let mut outcomes = std::pin::pin!(self.client.delete_nodes_streaming(&parsed));
+                let mut outcomes = std::pin::pin!(self.drive.delete_nodes_streaming(&parsed));
                 while let Some(item) = outcomes.next().await {
                     let (uid, outcome) = item?;
                     match outcome {
@@ -5178,7 +5186,7 @@ impl Core {
     fn empty_trash(&self) -> CoreResult<usize> {
         let uids = self
             .rt
-            .block_on(self.client.enumerate_trash_node_uids())
+            .block_on(self.drive.enumerate_trash_node_uids())
             .map_err(|e| CoreError::from_api(&e, "enumerate trash"))?;
         self.rt
             .block_on(self.client.empty_trash())
@@ -5220,7 +5228,7 @@ impl Core {
         let new_uid = self
             .rt
             .block_on(
-                self.client
+                self.drive
                     .create_folder(&parent_uid, name, Some(now_secs())),
             )
             .map_err(|e| CoreError::from_api(&e, "create folder"))?;
@@ -8529,12 +8537,12 @@ mod tests {
             include_str!("relocate.rs"),
         ] {
             assert_eq!(
-                source.matches(concat!("client.rename_node", "(")).count(),
+                source.matches(concat!("drive.rename_node", "(")).count(),
                 usize::from(source.contains("fn rename_remote(")),
                 "call Core::rename_remote instead of the SDK rename directly"
             );
             assert_eq!(
-                source.matches(concat!("client.move_node", "(")).count(),
+                source.matches(concat!("drive.move_node", "(")).count(),
                 usize::from(source.contains("fn move_remote(")),
                 "call Core::move_remote instead of the SDK move directly"
             );

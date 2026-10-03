@@ -364,6 +364,7 @@ pub fn mount(
 
     let paused_until = pause::load_paused_until(&db);
     let core = Core {
+        drive: Arc::new(client.clone()),
         client: client.clone(),
         rt: rt.clone(),
         maintenance: Arc::new(Mutex::new(Default::default())),
@@ -625,7 +626,7 @@ pub fn mount(
             }
         }
     };
-    rt.spawn(run_event_sync(client, scope, core.clone()));
+    rt.spawn(run_event_sync(core.drive.clone(), scope, core.clone()));
     // The photos volume has its own event stream; without it the gallery only
     // learns about a phone-side deletion when the timeline goes stale.
     rt.spawn(run_photos_event_sync(core.clone()));

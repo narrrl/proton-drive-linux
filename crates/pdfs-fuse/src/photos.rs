@@ -1038,7 +1038,7 @@ impl Core {
         }
         let outcomes = self
             .rt
-            .block_on(self.client.trash_nodes(uids))
+            .block_on(self.drive.trash_nodes(uids))
             .map_err(|e| CoreError::from_api(&e, "trash"))?;
         let (trashed, failed) = pdfs_core::batch::split(outcomes);
 

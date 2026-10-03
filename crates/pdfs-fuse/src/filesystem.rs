@@ -1511,7 +1511,7 @@ impl ProtonFs {
             }
             // Create an empty file on the remote so it has a real uid immediately;
             // written bytes are buffered and sealed as a new revision on close.
-            match self.core.block_on_bounded(self.core.client.upload_file(
+            match self.core.block_on_bounded(self.core.drive.upload_file(
                 &parent_uid,
                 name,
                 media_type_for(name),
@@ -1617,7 +1617,7 @@ impl ProtonFs {
             }
             match self
                 .core
-                .block_on_bounded(self.core.client.create_folder(&parent_uid, name, now))
+                .block_on_bounded(self.core.drive.create_folder(&parent_uid, name, now))
             {
                 Ok(new_uid) => self.core.fetch_minted_node(&new_uid, name),
                 Err(e) if self.core.lost_link(&e, "mkdir") => None,
@@ -2143,7 +2143,7 @@ impl ProtonFs {
         }
         if let Err(e) = self
             .core
-            .block_on_bounded(self.core.client.trash_nodes(std::slice::from_ref(&uid)))
+            .block_on_bounded(self.core.drive.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
         {
             if self.core.lost_link(&e, "trash") {

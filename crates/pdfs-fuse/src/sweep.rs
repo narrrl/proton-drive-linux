@@ -165,7 +165,7 @@ impl Core {
         }
         match self
             .rt
-            .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
+            .block_on(self.drive.trash_nodes(std::slice::from_ref(uid)))
             .and_then(batch::into_unit)
         {
             Ok(()) => {}

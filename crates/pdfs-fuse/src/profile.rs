@@ -101,7 +101,7 @@ impl Core {
         match existing {
             Some(uid) => self
                 .rt
-                .block_on(self.client.upload_new_revision_from(
+                .block_on(self.drive.upload_new_revision_from(
                     &uid,
                     Cursor::new(bytes),
                     len,
@@ -112,7 +112,7 @@ impl Core {
                 .map_err(|e| CoreError::from_api(&e, "upload profile revision"))?,
             None => {
                 self.rt
-                    .block_on(self.client.upload_file_replacing_draft_from(
+                    .block_on(self.drive.upload_file_replacing_draft_from(
                         &dir_uid,
                         PROFILE_FILE_NAME,
                         "application/json",
@@ -182,14 +182,14 @@ impl Core {
     ) -> CoreResult<Option<NodeUid>> {
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(parent_uid))
+            .block_on(self.drive.enumerate_folder_children_node_uids(parent_uid))
             .map_err(|e| CoreError::from_api(&e, "list device root"))?;
         if uids.is_empty() {
             return Ok(None);
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(self.drive.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "resolve device root children"))?;
         Ok(nodes
             .into_iter()
@@ -210,7 +210,7 @@ impl Core {
         let uid = self
             .rt
             .block_on(
-                self.client
+                self.drive
                     .create_folder(root_uid, PROFILE_DIR_NAME, Some(now_secs())),
             )
             .map_err(|e| CoreError::from_api(&e, "create profile folder"))?;
@@ -241,7 +241,7 @@ impl Core {
         };
         let mut buf: Vec<u8> = Vec::new();
         self.rt
-            .block_on(self.client.download_file_to(&uid, &mut buf))
+            .block_on(self.drive.download_file_to(&uid, &mut buf))
             .map_err(|e| CoreError::from_api(&e, "download profile"))?;
         Profile::parse(&buf).map(Some).map_err(CoreError::invalid)
     }
@@ -277,13 +277,13 @@ impl Core {
 
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(&root_uid))
+            .block_on(self.drive.enumerate_folder_children_node_uids(&root_uid))
             .map_err(|e| CoreError::from_api(&e, "list device root"))?;
         let nodes = if uids.is_empty() {
             Vec::new()
         } else {
             self.rt
-                .block_on(self.client.enumerate_nodes(&uids))
+                .block_on(self.drive.enumerate_nodes(&uids))
                 .map_err(|e| CoreError::from_api(&e, "resolve device root children"))?
         };
 

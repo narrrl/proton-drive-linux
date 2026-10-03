@@ -232,7 +232,7 @@ impl Core {
         let mut out = std::io::BufWriter::new(file);
         let written = match self
             .rt
-            .block_on(self.client.download_revision_to(uid, revision_id, &mut out))
+            .block_on(self.drive.download_revision_to(uid, revision_id, &mut out))
             .map_err(|e| CoreError::from_api(&e, "download revision"))
             .and_then(|()| {
                 use std::io::Write as _;

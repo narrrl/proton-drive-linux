@@ -15,6 +15,7 @@ zip.workspace = true
 sha1.workspace = true
 proton-drive-rs.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 fuser.workspace = true

@@ -248,10 +248,7 @@ impl Core {
 
         let outcomes = self
             .rt
-            .block_on(
-                self.client
-                    .trash_nodes(std::slice::from_ref(&candidate.uid)),
-            )
+            .block_on(self.drive.trash_nodes(std::slice::from_ref(&candidate.uid)))
             .map_err(|e| CoreError::from_api(&e, "trash the mis-dated original"))?;
         if let Some((_, Err(e))) = outcomes.into_iter().next() {
             return Err(CoreError::from_api(&e, "trash the mis-dated original"));

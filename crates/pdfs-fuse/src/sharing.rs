@@ -463,7 +463,7 @@ impl Core {
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(self.drive.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
         Ok(nodes
             .into_iter()
@@ -481,14 +481,14 @@ impl Core {
             parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
         let child_uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(&uid))
+            .block_on(self.drive.enumerate_folder_children_node_uids(&uid))
             .map_err(|e| CoreError::from_api(&e, "enumerate shared children"))?;
         if child_uids.is_empty() {
             return Ok(Vec::new());
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&child_uids))
+            .block_on(self.drive.enumerate_nodes(&child_uids))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
         Ok(nodes
             .into_iter()
@@ -509,7 +509,7 @@ impl Core {
             parse_uid(uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {uid}")))?;
         let node = self
             .rt
-            .block_on(self.client.get_node(&uid))
+            .block_on(self.drive.get_node(&uid))
             .map_err(|e| CoreError::from_api(&e, "get shared node"))?
             .ok_or_else(|| CoreError::not_found("shared node not found"))?;
         if !node.is_file() {
@@ -669,7 +669,7 @@ impl Core {
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(self.drive.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
         let mut items = Vec::with_capacity(nodes.len());
         for n in nodes {

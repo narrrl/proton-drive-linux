@@ -250,7 +250,7 @@ impl Core {
                 return false;
             }
             let probe = self.rt.block_on(async {
-                match tokio::time::timeout(PROBE_TIMEOUT, self.client.get_my_files_folder()).await {
+                match tokio::time::timeout(PROBE_TIMEOUT, self.drive.get_my_files_folder()).await {
                     Ok(result) => result,
                     Err(_) => Err(no_answer(PROBE_TIMEOUT)),
                 }

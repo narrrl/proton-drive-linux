@@ -70,7 +70,7 @@ const MAX_OPEN_READERS: usize = 64;
 /// `(mtime, size)` — the same validity pair the content cache uses (a new
 /// revision bumps mtime). On a mismatch the reader is dropped and reopened.
 pub(super) struct CachedReader {
-    reader: Arc<RevisionReader>,
+    reader: Arc<dyn RevisionRead>,
     mtime: i64,
     size: u64,
     /// For LRU eviction.
@@ -101,7 +101,7 @@ pub(super) struct PendingOpen {
     /// must not join this open — it would get a reader for the wrong bytes.
     mtime: i64,
     size: u64,
-    rx: tokio::sync::watch::Receiver<Option<Result<Arc<RevisionReader>, Errno>>>,
+    rx: tokio::sync::watch::Receiver<Option<Result<Arc<dyn RevisionRead>, Errno>>>,
 }
 
 /// Distinguishes `PendingOpen`s. Only uniqueness matters, so a plain counter
@@ -313,16 +313,16 @@ impl Core {
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
-    ) -> Result<Arc<RevisionReader>, Errno> {
+    ) -> Result<Arc<dyn RevisionRead>, Errno> {
         loop {
             // Decide under the lock, act outside it — network I/O must never run
             // under a std `Mutex`, and an await must never hold one.
             enum Act {
-                Hit(Arc<RevisionReader>),
-                Join(tokio::sync::watch::Receiver<Option<Result<Arc<RevisionReader>, Errno>>>),
+                Hit(Arc<dyn RevisionRead>),
+                Join(tokio::sync::watch::Receiver<Option<Result<Arc<dyn RevisionRead>, Errno>>>),
                 Lead(
                     u64,
-                    tokio::sync::watch::Sender<Option<Result<Arc<RevisionReader>, Errno>>>,
+                    tokio::sync::watch::Sender<Option<Result<Arc<dyn RevisionRead>, Errno>>>,
                 ),
             }
             let act = {
@@ -376,8 +376,8 @@ impl Core {
                 }
                 Act::Lead(id, tx) => {
                     debug!(%uid, mtime, fsize, "opening revision");
-                    let result = match self.client.open_revision(uid).await {
-                        Ok(reader) => Ok(Arc::new(reader)),
+                    let result = match self.drive.open_revision(uid).await {
+                        Ok(reader) => Ok(reader),
                         Err(e) => {
                             self.lost_link(&e, "open a revision");
                             warn!(%uid, error = %e, "open_revision failed");
@@ -568,7 +568,7 @@ impl Core {
     /// leader's claim is gone by then, so this cannot recurse.
     async fn fetch_block(
         &self,
-        reader: &Arc<RevisionReader>,
+        reader: &Arc<dyn RevisionRead>,
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
@@ -634,7 +634,7 @@ impl Core {
     /// download, or the read fails. See [`Core::repair_block`] (bugs.md B84).
     async fn read_block(
         &self,
-        reader: &Arc<RevisionReader>,
+        reader: &Arc<dyn RevisionRead>,
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
@@ -778,7 +778,7 @@ impl Core {
             error!(%uid, %error, "creating a scratch file for a repair download failed");
             Errno::EIO
         })?;
-        let outcome = self.client.download_file_to(uid, &mut file).await;
+        let outcome = self.drive.download_file_to(uid, &mut file).await;
         let stored = (|| {
             outcome.map_err(|error| {
                 warn!(%uid, %error, "repair download failed");

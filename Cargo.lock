@@ -3515,6 +3515,7 @@ dependencies = [
 name = "pdfs-fuse"
 version = "2.8.2"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "fuser",
  "futures",

@@ -363,14 +363,14 @@ impl Core {
     ) -> CoreResult<Option<NodeUid>> {
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(root_uid))
+            .block_on(self.drive.enumerate_folder_children_node_uids(root_uid))
             .map_err(|e| CoreError::from_api(&e, "list device root"))?;
         if uids.is_empty() {
             return Ok(None);
         }
         let nodes = self
             .rt
-            .block_on(self.client.enumerate_nodes(&uids))
+            .block_on(self.drive.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "resolve device root children"))?;
         Ok(nodes
             .into_iter()
@@ -446,10 +446,7 @@ impl Core {
             }
             None => self
                 .rt
-                .block_on(
-                    self.client
-                        .create_folder(&root_uid, &name, Some(now_secs())),
-                )
+                .block_on(self.drive.create_folder(&root_uid, &name, Some(now_secs())))
                 .map_err(|e| CoreError::from_api(&e, &format!("create device folder {name}")))?,
         };
 
@@ -603,7 +600,7 @@ impl Core {
             && let Some(uid) = parse_uid(&folder.remote_uid)
             && let Err(e) = self
                 .rt
-                .block_on(self.client.trash_nodes(&[uid]))
+                .block_on(self.drive.trash_nodes(&[uid]))
                 .and_then(batch::into_unit)
         {
             warn!(id, error = %e, "delete remote device folder failed");
@@ -858,7 +855,7 @@ impl Core {
                 })?;
                 let root = self
                     .rt
-                    .block_on(self.client.enumerate_nodes(std::slice::from_ref(&root_uid)))
+                    .block_on(self.drive.enumerate_nodes(std::slice::from_ref(&root_uid)))
                     .map_err(|e| SwitchBlocked::Failed(format!("fetch remote root: {e}")))?
                     .into_iter()
                     .next()
@@ -1017,7 +1014,7 @@ impl Core {
             };
             let root = match self
                 .rt
-                .block_on(self.client.enumerate_nodes(std::slice::from_ref(&root_uid)))
+                .block_on(self.drive.enumerate_nodes(std::slice::from_ref(&root_uid)))
             {
                 Ok(v) => match v.into_iter().next() {
                     Some(n) => n,

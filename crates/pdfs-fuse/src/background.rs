@@ -323,7 +323,7 @@ fn flush_dirty_parents(core: &Core, dirty: &DirtyParents) {
 /// to be applied to every mounted inode space, and the registry that enumerates
 /// them lives on the `Core` (see [`apply_event`]).
 pub(super) async fn run_event_sync(
-    client: ProtonDriveClient,
+    client: Arc<dyn DriveApi>,
     scope: DriveEventScopeId,
     core: Core,
 ) {

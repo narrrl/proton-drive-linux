@@ -786,7 +786,7 @@ impl Core {
         self.rt
             .block_on(async {
                 let mut outcomes =
-                    std::pin::pin!(self.client.move_nodes_streaming(vec![item], parent.clone()));
+                    std::pin::pin!(self.drive.move_nodes_streaming(vec![item], parent.clone()));
                 match outcomes.next().await {
                     Some(Ok((_, outcome))) => outcome,
                     Some(Err(e)) => Err(e),
@@ -808,7 +808,7 @@ impl Core {
         let name = op.name.clone().unwrap_or_else(|| op.uid.clone());
         match self
             .rt
-            .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
+            .block_on(self.drive.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
         {
             Ok(()) => {}
@@ -965,8 +965,8 @@ impl Core {
     ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(parent))?;
-        let children = self.rt.block_on(self.client.enumerate_nodes_light(&uids))?;
+            .block_on(self.drive.enumerate_folder_children_node_uids(parent))?;
+        let children = self.rt.block_on(self.drive.enumerate_nodes_light(&uids))?;
         let Some(twin) = children
             .into_iter()
             .find(|node| node.name == name && !node.trashed)
@@ -1000,7 +1000,7 @@ impl Core {
             true => {
                 Ok(self
                     .rt
-                    .block_on(self.client.create_folder(parent, name, Some(now_secs())))?)
+                    .block_on(self.drive.create_folder(parent, name, Some(now_secs())))?)
             }
             false => self.upload_created_file(op, parent, name),
         }
@@ -1015,7 +1015,7 @@ impl Core {
         name: &str,
     ) -> Result<NodeUid, Box<dyn std::error::Error>> {
         let Some(blob) = op.blob_path.as_deref() else {
-            return Ok(self.rt.block_on(self.client.upload_file(
+            return Ok(self.rt.block_on(self.drive.upload_file(
                 parent,
                 name,
                 media_type_for(name),
@@ -1035,7 +1035,7 @@ impl Core {
             .transfers
             .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
-        let uid = self.rt.block_on(self.client.upload_file_from(
+        let uid = self.rt.block_on(self.drive.upload_file_from(
             parent,
             name,
             media_type_for(name),
@@ -1306,7 +1306,7 @@ impl Core {
             self.transfers
                 .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
-        self.rt.block_on(self.client.upload_file_from(
+        self.rt.block_on(self.drive.upload_file_from(
             &parent,
             &alt,
             media_type_for(&alt),
@@ -1626,7 +1626,7 @@ impl Core {
         }
         let reader = CountingReader::new(File::open(&blob)?, &guard).with_cancel(cancel.flag());
         let started = Instant::now();
-        let sent = self.rt.block_on(self.client.upload_new_revision_from(
+        let sent = self.rt.block_on(self.drive.upload_new_revision_from(
             &uid,
             reader,
             meta.len as i64,
