@@ -22,6 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
+use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::error::Result;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid};
 use proton_drive_rs::{
@@ -149,6 +150,9 @@ pub(crate) trait DriveApi: Send + Sync {
     fn delete_nodes_streaming<'a>(&'a self, uids: &[NodeUid]) -> OutcomeStream<'a>;
 
     async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>>;
+
+    /// The account's storage, across every Proton product.
+    async fn quota(&self) -> Result<Quota>;
 }
 
 /// The generic signatures of the client, over the object-safe ones above.
@@ -454,5 +458,9 @@ impl DriveApi for ProtonDriveClient {
 
     async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>> {
         ProtonDriveClient::enumerate_trash_node_uids(self).await
+    }
+
+    async fn quota(&self) -> Result<Quota> {
+        ProtonDriveClient::quota(self).await
     }
 }

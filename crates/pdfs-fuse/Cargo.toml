@@ -25,3 +25,6 @@ base64.workspace = true
 image.workspace = true
 notify = "8"
 parking_lot.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

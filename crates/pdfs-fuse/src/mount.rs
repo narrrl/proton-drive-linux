@@ -207,11 +207,11 @@ const ROOT_UID_KEY: &str = "root_uid";
 /// means an empty tree, and mounting that would show the user an empty Drive
 /// rather than an honest error.
 fn fetch_or_recall_root(
-    client: &ProtonDriveClient,
+    drive: &dyn DriveApi,
     rt: &tokio::runtime::Handle,
     db: &Db,
 ) -> std::io::Result<(Node, bool)> {
-    let err = match rt.block_on(client.get_my_files_folder()) {
+    let err = match rt.block_on(drive.get_my_files_folder()) {
         Ok(root) => {
             if let Err(e) = db.set_state_str(ROOT_UID_KEY, &root.uid.to_string()) {
                 warn!(error = %e, "persist root uid failed");
@@ -340,6 +340,45 @@ pub fn mount(
     db: Arc<Db>,
     options: MountOptions,
 ) -> std::io::Result<MountOutcome> {
+    let drive = Arc::new(client.clone());
+    mount_with(
+        client,
+        drive,
+        rt,
+        mountpoint,
+        cache,
+        control_socket,
+        db,
+        options,
+        Host::Daemon,
+    )
+}
+
+/// What a mount runs in.
+pub(crate) enum Host {
+    /// The daemon: stopped by SIGTERM or SIGINT, and indexing the user's home
+    /// for the launcher prompt.
+    Daemon,
+    /// One of several simulated daemons in a test process (`sim`): stopped by
+    /// a message on this channel, and with no home to index.
+    #[cfg(test)]
+    Simulation(std::sync::mpsc::Receiver<()>),
+}
+
+/// [`mount`], reaching Drive through `drive` and hosted by `host`; `client`
+/// serves only what [`DriveApi`] does not cover.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mount_with(
+    client: ProtonDriveClient,
+    drive: Arc<dyn DriveApi>,
+    rt: tokio::runtime::Handle,
+    mountpoint: &Path,
+    cache: ContentCache,
+    control_socket: &Path,
+    db: Arc<Db>,
+    options: MountOptions,
+    host: Host,
+) -> std::io::Result<MountOutcome> {
     let MountOptions {
         username,
         sweep_mode,
@@ -349,7 +388,7 @@ pub fn mount(
     // Start the uptime clock here rather than at the first `pdfs diagnostics`,
     // so the age it reports is the daemon's own.
     super::diagnostics::start_clock();
-    let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
+    let (root, online) = fetch_or_recall_root(drive.as_ref(), &rt, &db)?;
     let scope = root.tree_event_scope_id();
     db.mount_upsert_my_files(&mountpoint.to_string_lossy(), &root.uid.to_string(), None)
         .map_err(|error| std::io::Error::other(format!("project My Files mount: {error}")))?;
@@ -364,8 +403,8 @@ pub fn mount(
 
     let paused_until = pause::load_paused_until(&db);
     let core = Core {
-        drive: Arc::new(client.clone()),
-        client: client.clone(),
+        drive,
+        client,
         rt: rt.clone(),
         maintenance: Arc::new(Mutex::new(Default::default())),
         primary_root_uid: root.uid.clone(),
@@ -502,7 +541,7 @@ pub fn mount(
 
     // Keep the launcher prompt's "This computer" index fresh. Its own thread:
     // the walk is I/O-heavy and must never sit in front of a FUSE callback.
-    {
+    if matches!(host, Host::Daemon) {
         let db = core.db.clone();
         let indexing = core.indexing.clone();
         let transfers = core.transfers.clone();
@@ -645,30 +684,11 @@ pub fn mount(
     // are delivered onto the async runtime; bridge them onto a sync channel so
     // the loop below can react without blocking a worker thread. A bounded
     // channel of 1 is enough — we only need to know that *a* stop arrived.
-    let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    rt.spawn(async move {
-        let mut sigterm =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "install SIGTERM handler failed");
-                    return;
-                }
-            };
-        let mut sigint =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "install SIGINT handler failed");
-                    return;
-                }
-            };
-        tokio::select! {
-            _ = sigterm.recv() => info!("received SIGTERM"),
-            _ = sigint.recv() => info!("received SIGINT"),
-        }
-        let _ = sig_tx.try_send(());
-    });
+    let sig_rx = match host {
+        Host::Daemon => signal_stop(&rt),
+        #[cfg(test)]
+        Host::Simulation(rx) => rx,
+    };
 
     // Wait for whichever happens first: a stop signal (→ we unmount ourselves
     // via the lazy MNT_DETACH path, clean even mid-download), or the kernel
@@ -723,6 +743,35 @@ pub fn mount(
     // nothing they can still do is harmful once the mounts are down.
     stop_workers(&core, control_socket, workers);
     Ok(outcome)
+}
+
+/// A channel that receives once SIGTERM or SIGINT arrives.
+fn signal_stop(rt: &tokio::runtime::Handle) -> std::sync::mpsc::Receiver<()> {
+    let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    rt.spawn(async move {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "install SIGTERM handler failed");
+                    return;
+                }
+            };
+        let mut sigint =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "install SIGINT handler failed");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM"),
+            _ = sigint.recv() => info!("received SIGINT"),
+        }
+        let _ = sig_tx.try_send(());
+    });
+    sig_rx
 }
 
 /// How long teardown waits for the FUSE worker pool before proceeding without

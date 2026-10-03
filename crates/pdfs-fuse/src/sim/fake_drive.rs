@@ -23,6 +23,8 @@
 //!   then loses its reply (B107, B121's half state).
 //! - **Latency** per request, from a range ([`Faults::lan`], [`Faults::wifi`]).
 //! - **Non-uniform blocks** ([`FakeDrive::set_block_pattern`]; B84, B85, B87).
+//! - **A full account** ([`FakeDrive::set_quota`]) refusing uploads with
+//!   `InsufficientQuota`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -34,6 +36,7 @@ use async_trait::async_trait;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use parking_lot::Mutex;
+use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonApiError, ProtonError, Result};
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
@@ -91,6 +94,8 @@ struct Server {
     events: Vec<Logged>,
     /// Plaintext block sizes of new content, cycled; the last one repeats.
     block_pattern: Vec<u64>,
+    /// The account's storage limit in bytes.
+    max_space: i64,
 }
 
 impl Server {
@@ -186,6 +191,27 @@ impl Server {
         });
     }
 
+    /// Bytes stored: every revision of every node not deleted, trashed or not,
+    /// as Drive counts them.
+    fn used_space(&self) -> i64 {
+        self.nodes
+            .values()
+            .filter_map(|versions| versions.last()?.1.as_ref()?.file.as_ref())
+            .flat_map(|file| &file.revisions)
+            .map(|(_, content)| content.len() as i64)
+            .sum()
+    }
+
+    fn make_room(&self, bytes: usize) -> Result<()> {
+        if self.used_space() + bytes as i64 > self.max_space {
+            return Err(api(
+                ResponseCode::InsufficientQuota,
+                "storage quota exceeded",
+            ));
+        }
+        Ok(())
+    }
+
     fn new_file(
         &mut self,
         parent: &NodeUid,
@@ -203,6 +229,7 @@ impl Server {
                 "a file or folder with that name already exists",
             ));
         }
+        self.make_room(content.len())?;
         let uid = self.mint_uid();
         let revision = self.mint_revision();
         let content = Arc::new(content);
@@ -252,6 +279,7 @@ impl FakeDrive {
             next_revision: 0,
             events: Vec::new(),
             block_pattern: vec![pdfs_core::cache::BLOCK_SIZE],
+            max_space: 1 << 40,
         };
         let now = now_secs();
         server.nodes.insert(
@@ -290,6 +318,12 @@ impl FakeDrive {
     pub(crate) fn set_block_pattern(&self, pattern: Vec<u64>) {
         assert!(!pattern.is_empty() && pattern.iter().all(|&size| size > 0));
         self.server.lock().block_pattern = pattern;
+    }
+
+    /// The account's storage limit; a limit below what is stored refuses every
+    /// upload until something is deleted.
+    pub(crate) fn set_quota(&self, max_space: i64) {
+        self.server.lock().max_space = max_space;
     }
 
     pub(crate) fn root(&self) -> NodeUid {
@@ -954,6 +988,7 @@ impl DriveApi for FakeClient {
             if remote.file.is_none() {
                 return Err(api(ResponseCode::InvalidRequirements, "not a file"));
             }
+            server.make_room(content.len())?;
             let revision = server.mint_revision();
             let blocks = server.blocks_of(content.len() as u64);
             let file = remote.file.as_mut().expect("checked above");
@@ -1079,6 +1114,16 @@ impl DriveApi for FakeClient {
 
     fn delete_nodes_streaming<'a>(&'a self, uids: &[NodeUid]) -> OutcomeStream<'a> {
         outcome_stream(self.batch(uids, delete_one))
+    }
+
+    async fn quota(&self) -> Result<Quota> {
+        self.request(false, |server| {
+            Ok(Quota {
+                max_space: server.max_space,
+                used_space: server.used_space(),
+            })
+        })
+        .await
     }
 
     async fn enumerate_trash_node_uids(&self) -> Result<Vec<NodeUid>> {
@@ -1444,6 +1489,30 @@ mod tests {
                 .unwrap_err();
             assert!(is_network_error(&error));
             assert!(drive.lookup("x").is_none());
+        });
+    }
+
+    #[test]
+    fn an_exhausted_quota_refuses_uploads_until_space_is_freed() {
+        rt().block_on(async {
+            let drive = FakeDrive::new();
+            let client = drive.client(1, Faults::none());
+            let root = drive.root();
+            let big = client.upload_file(&root, "big", "", &[0; 8]).await.unwrap();
+            drive.set_quota(10);
+            let full = client
+                .upload_file(&root, "more", "", &[0; 4])
+                .await
+                .unwrap_err();
+            assert_eq!(code(&full), Some(ResponseCode::InsufficientQuota));
+            assert_eq!(client.quota().await.unwrap().used_space, 8);
+            let mut deleted = client.delete_nodes_streaming(std::slice::from_ref(&big));
+            assert!(deleted.next().await.unwrap().unwrap().1.is_ok());
+            drop(deleted);
+            client
+                .upload_file(&root, "more", "", &[0; 4])
+                .await
+                .unwrap();
         });
     }
 

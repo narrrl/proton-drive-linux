@@ -610,7 +610,7 @@ impl Core {
     /// Proton products (not Drive-only). A remote round-trip; nothing here is
     /// cached.
     pub(crate) fn account_quota(&self) -> CoreResult<(i64, i64)> {
-        let q = self.block_on_bounded(self.client.quota()).map_err(|e| {
+        let q = self.block_on_bounded(self.drive.quota()).map_err(|e| {
             self.lost_link(&e, "account quota");
             CoreError::from_api(&e, "account quota")
         })?;
