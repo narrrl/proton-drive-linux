@@ -544,6 +544,18 @@ impl Db {
         }
     }
 
+    /// The local id of the node stored under `uid`, or `None` when it has no
+    /// row. It stays the same for as long as the row exists, including when a
+    /// create lands and the row takes the uid Drive gave it.
+    pub fn lid_of(&self, uid: &str) -> Result<Option<i64>> {
+        let conn = self.read();
+        Ok(conn
+            .query_row("SELECT lid FROM nodes WHERE uid = ?1", params![uid], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     /// Read the persisted incremental-sync cursor (a `DriveEventId`), if any.
     /// The daemon resumes from this on restart instead of reseeding to the
     /// server head, so changes made while unmounted are still applied (P2).
@@ -608,7 +620,8 @@ struct PriorRow {
 /// and was deferred five seconds behind a folder that had just landed
 /// (`docs/BUGS.md` B120). The placeholder's own node, readdressed, stands in
 /// until the server's copy is upserted over it. A row the real uid already
-/// has is newer than the placeholder and is kept.
+/// has is newer than the placeholder, so its node is kept, under the
+/// placeholder's `lid`: the node was known by that one first.
 pub(super) fn adopt_placeholder_row_tx(
     tx: &Transaction<'_>,
     local: &str,
@@ -620,22 +633,31 @@ pub(super) fn adopt_placeholder_row_tx(
     )?;
     let row: Option<(i64, Option<String>)> = tx
         .query_row(
-            "SELECT rowid, node_json FROM nodes WHERE uid = ?1",
+            "SELECT lid, node_json FROM nodes WHERE uid = ?1",
             params![local],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some((rowid, json)) = row else {
+    let Some((lid, json)) = row else {
         return Ok(());
     };
-    tx.execute("DELETE FROM nodes WHERE uid = ?1", params![local])?;
-    tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
-    let known: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM nodes WHERE uid = ?1)",
-        params![real],
-        |row| row.get(0),
+    let known: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT lid, node_json FROM nodes WHERE uid = ?1",
+            params![real],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((known_lid, _)) = known {
+        tx.execute("DELETE FROM nodes WHERE lid = ?1", params![known_lid])?;
+        tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![known_lid])?;
+    }
+    tx.execute(
+        "UPDATE nodes SET uid = ?2 WHERE lid = ?1",
+        params![lid, real],
     )?;
-    let (false, Some(json), Some(real)) = (known, json, parse_node_uid(real)) else {
+    let json = known.and_then(|(_, known_json)| known_json).or(json);
+    let (Some(json), Some(real)) = (json, parse_node_uid(real)) else {
         return Ok(());
     };
     let mut node: Node = serde_json::from_str(&json)?;

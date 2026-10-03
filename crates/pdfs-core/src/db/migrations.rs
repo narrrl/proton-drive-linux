@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 35;
+pub(super) const SCHEMA_VERSION: i64 = 36;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -330,6 +330,22 @@ impl Db {
             )? > 0;
             if has_trash && !has_column {
                 tx.execute_batch(MIGRATION_V35)?;
+            }
+        }
+        if current < 36 {
+            // Same guards as V26-V35.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'lid'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_nodes: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_nodes && !has_column {
+                tx.execute_batch(MIGRATION_V36)?;
             }
         }
         tx.execute(
@@ -1058,4 +1074,41 @@ ALTER TABLE photos ADD COLUMN similar_hash INTEGER;
 /// complete one, which may have been in the trash for a long time already.
 const MIGRATION_V35: &str = "
 ALTER TABLE trash ADD COLUMN trashed_at INTEGER;
+";
+
+/// Schema v36: every node row has a local id (`lid`), phase 2 of
+/// docs/MILESTONE-3.0.0.md.
+///
+/// The `uid` was the row's key, so a node had no identity until Drive minted
+/// one, and a create that landed moved its row to a new key. The `lid` is given
+/// when the row is first written and never changes or comes back, which is what
+/// `AUTOINCREMENT` adds over a plain rowid. It takes the old rowid, so the
+/// search index, keyed by rowid since v15, stays valid. The `uid` becomes
+/// nullable for a node that is not on Drive yet.
+const MIGRATION_V36: &str = "
+CREATE TABLE nodes_v36 (
+  lid           INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid           TEXT UNIQUE,
+  parent_uid    TEXT,
+  name          TEXT NOT NULL,
+  is_dir        INTEGER NOT NULL,
+  size          INTEGER,
+  mtime         INTEGER NOT NULL,
+  revision_hash TEXT,
+  trashed       INTEGER NOT NULL DEFAULT 0,
+  node_json     TEXT,
+  listed        INTEGER NOT NULL DEFAULT 0,
+  path          TEXT
+);
+INSERT INTO nodes_v36
+  (lid, uid, parent_uid, name, is_dir, size, mtime, revision_hash, trashed, node_json, listed,
+   path)
+  SELECT rowid, uid, parent_uid, name, is_dir, size, mtime, revision_hash, trashed, node_json,
+         listed, path
+    FROM nodes;
+DROP TABLE nodes;
+ALTER TABLE nodes_v36 RENAME TO nodes;
+CREATE INDEX idx_nodes_parent ON nodes(parent_uid);
+CREATE INDEX idx_nodes_name_nocase ON nodes(name COLLATE NOCASE);
+CREATE INDEX idx_nodes_parent_live ON nodes(parent_uid) WHERE trashed = 0;
 ";

@@ -3057,6 +3057,159 @@ fn a_landed_placeholder_never_overwrites_the_server_copy() {
 }
 
 #[test]
+fn a_node_keeps_its_lid_across_updates_and_a_new_one_never_reuses_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("a", "root", "a.txt", 1)).unwrap();
+    db.upsert_node(&file("b", "root", "b.txt", 1)).unwrap();
+    let a = db.lid_of(&uid("a").to_string()).unwrap().unwrap();
+    let b = db.lid_of(&uid("b").to_string()).unwrap().unwrap();
+
+    db.upsert_node(&file("a", "root", "renamed.txt", 2))
+        .unwrap();
+    assert_eq!(db.lid_of(&uid("a").to_string()).unwrap(), Some(a));
+
+    db.delete_node(&uid("b")).unwrap();
+    db.upsert_node(&file("c", "root", "c.txt", 1)).unwrap();
+    let c = db.lid_of(&uid("c").to_string()).unwrap().unwrap();
+    assert!(c > b, "lid {c} reuses one a deleted row had");
+}
+
+#[test]
+fn a_landed_placeholder_keeps_its_lid() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    for known in [false, true] {
+        let local = NodeUid::new(VolumeId::from("local"), LinkId::from(format!("{known}")));
+        let real = uid(&format!("real-{known}"));
+        let mut placeholder = folder("dir", Some("root"), "New folder");
+        placeholder.uid = local.clone();
+        db.upsert_node(&placeholder).unwrap();
+        let lid = db.lid_of(&local.to_string()).unwrap().unwrap();
+        if known {
+            // The event stream reported the folder before the drain got round
+            // to it.
+            let mut listed = folder("x", Some("root"), "New folder (1)");
+            listed.uid = real.clone();
+            db.upsert_node(&listed).unwrap();
+        }
+
+        db.remap_local_uid(&local.to_string(), &real.to_string())
+            .unwrap();
+
+        assert_eq!(db.lid_of(&local.to_string()).unwrap(), None);
+        assert_eq!(db.lid_of(&real.to_string()).unwrap(), Some(lid));
+        let name = if known {
+            "New folder (1)"
+        } else {
+            "New folder"
+        };
+        assert_eq!(
+            db.node_by_uid(&real.to_string()).unwrap().map(|n| n.name),
+            Some(name.to_string())
+        );
+        assert_eq!(db.search(name, 10).unwrap().len(), 1, "{name}");
+    }
+}
+
+#[test]
+fn migration_v36_gives_every_node_its_rowid_as_lid() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v35-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    {
+        let db = Db::open(&path).unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        let mut placeholder = folder("dir", Some("root"), "Offline folder");
+        placeholder.uid = local.clone();
+        db.upsert_node(&placeholder).unwrap();
+        db.upsert_node(&file("gone", "root", "gone.txt", 1))
+            .unwrap();
+        db.upsert_node(&file("kept", "root", "kept-report.txt", 1))
+            .unwrap();
+        db.delete_node(&uid("gone")).unwrap();
+        let (id, _) = db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_MKDIR.to_string(),
+                uid: local.to_string(),
+                parent_uid: Some(uid("root").to_string()),
+                name: Some("Offline folder".to_string()),
+                blob_path: None,
+                meta_json: None,
+                created_at: 1,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            })
+            .unwrap();
+        db.record_op_failure(id, "network unreachable", 5_000)
+            .unwrap();
+    }
+    {
+        // Put the file back in the state a released V35 database was in:
+        // keyed by uid, with the rowids of the rows it held.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes_v35 (
+               uid TEXT PRIMARY KEY, parent_uid TEXT, name TEXT NOT NULL,
+               is_dir INTEGER NOT NULL, size INTEGER, mtime INTEGER NOT NULL,
+               revision_hash TEXT, trashed INTEGER NOT NULL DEFAULT 0, node_json TEXT,
+               listed INTEGER NOT NULL DEFAULT 0, path TEXT
+             );
+             INSERT INTO nodes_v35 (rowid, uid, parent_uid, name, is_dir, size, mtime,
+                                    revision_hash, trashed, node_json, listed, path)
+               SELECT lid, uid, parent_uid, name, is_dir, size, mtime, revision_hash,
+                      trashed, node_json, listed, path FROM nodes;
+             DROP TABLE nodes;
+             ALTER TABLE nodes_v35 RENAME TO nodes;
+             CREATE INDEX idx_nodes_parent ON nodes(parent_uid);
+             CREATE INDEX idx_nodes_name_nocase ON nodes(name COLLATE NOCASE);
+             CREATE INDEX idx_nodes_parent_live ON nodes(parent_uid) WHERE trashed = 0;
+             DELETE FROM sqlite_sequence WHERE name = 'nodes';
+             UPDATE sync_state SET value = '35' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+    let rowids: Vec<(String, i64)> = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT uid, rowid FROM nodes ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    assert_eq!(rowids.len(), 3);
+
+    let db = Db::open(&path).unwrap();
+    for (uid, rowid) in &rowids {
+        assert_eq!(db.lid_of(uid).unwrap(), Some(*rowid), "{uid}");
+    }
+    let found = db.search("report", 10).unwrap();
+    assert_eq!(found.len(), 1, "the search index still finds the node");
+    assert_eq!(found[0].node.uid, uid("kept"));
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].uid, local.to_string());
+    assert_eq!(ops[0].attempts, 1);
+    assert_eq!(ops[0].last_error.as_deref(), Some("network unreachable"));
+
+    db.upsert_node(&file("new", "root", "new.txt", 1)).unwrap();
+    let newest = db.lid_of(&uid("new").to_string()).unwrap().unwrap();
+    assert!(newest > rowids.last().unwrap().1);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_failed_op_stays_queued_with_backoff() {
     let db = Db::open_in_memory().unwrap();
     db.enqueue_op(&PendingOp {
