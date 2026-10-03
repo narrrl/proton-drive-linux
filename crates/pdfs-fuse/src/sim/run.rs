@@ -3,14 +3,16 @@
 //! A run starts one or more daemons on a shared [`FakeDrive`], each owning a
 //! folder `c<n>` that only it writes, so there is one writer per file. A seed
 //! draws a sequence of steps: syscalls through a client's mount, the link of a
-//! client going down or up, a client restarting, a pause, or a settle (every
-//! queue must drain within a budget). Every syscall is checked against the
+//! client going down or up, a client restarting, a pause, a settle (every
+//! queue must drain within a budget), or a file deleted while the drain holds
+//! a write to it. Every syscall is checked against the
 //! client's [`Model`] as it happens. After the sequence every link comes up
 //! and the run checks:
 //!
 //! 1. **No loss** and **POSIX**: Drive's copy of each client's folder is what
 //!    its model says.
-//! 2. **No false conflicts**: no conflict copy anywhere.
+//! 2. **No false conflicts**: no conflict copy anywhere, and the drain never
+//!    takes a client's own delete for another device's.
 //! 3. **Convergence**: each mount shows Drive's tree.
 //! 4. **Liveness**: no syscall took longer than its budget, settles drained in
 //!    theirs, and every queue drained once the links were up. A call that
@@ -42,9 +44,11 @@ use std::time::{Duration, Instant};
 
 use std::collections::BTreeMap;
 
+use proton_drive_rs::proton_sdk::ids::NodeUid;
+
 use super::daemon::{Daemon, scratch, take_logged, wait_until};
 use super::fake_drive::{Entry, FakeDrive, Faults};
-use super::model::{FsOp, Model, Tree, join, name_of, parent_of};
+use super::model::{FsOp, Model, Tree, data, join, name_of, parent_of};
 use super::rng::Rng;
 use super::watchdog::{Hung, Watchdog};
 
@@ -52,9 +56,9 @@ use super::watchdog::{Hung, Watchdog};
 struct Known {
     bug: &'static str,
     /// Whether a call that answered `errno` against the model's word, with
-    /// lines `logged` at `INFO` and above meanwhile, is this bug. `model` is from
-    /// before the call.
-    is: fn(model: &Model, op: &FsOp, errno: i32, logged: &[String]) -> bool,
+    /// lines `logged` at `INFO` and above meanwhile and `before` it, is this
+    /// bug. `model` is from before the call.
+    is: fn(model: &Model, op: &FsOp, errno: i32, logged: &[String], before: &[String]) -> bool,
     /// Whether it also left the mount where the model cannot follow, so the
     /// seed ends there.
     ends_seed: fn(model: &Model, op: &FsOp) -> bool,
@@ -65,7 +69,7 @@ const KNOWN: &[Known] = &[
     // sibling there with the new name refuses it.
     Known {
         bug: "B122",
-        is: |model, op, errno, _| {
+        is: |model, op, errno, _, _| {
             let FsOp::Rename { from, to } = op else {
                 return false;
             };
@@ -85,7 +89,7 @@ const KNOWN: &[Known] = &[
     // the replaced file landed after its op was dropped.
     Known {
         bug: "B129",
-        is: |model, op, errno, logged| {
+        is: |model, op, errno, logged, _| {
             let FsOp::Rename { to, .. } = op else {
                 return false;
             };
@@ -101,7 +105,7 @@ const KNOWN: &[Known] = &[
     // A write over a queued revision whose gaps are not filled yet is refused.
     Known {
         bug: "B123",
-        is: |_, _, errno, logged| {
+        is: |_, _, errno, logged, _| {
             errno == libc::EIO
                 && logged
                     .iter()
@@ -115,7 +119,7 @@ const KNOWN: &[Known] = &[
     // gone.
     Known {
         bug: "B125",
-        is: |_, _, errno, logged| {
+        is: |_, _, errno, logged, _| {
             matches!(errno, libc::EIO | libc::ENOENT)
                 && logged.iter().any(|line| {
                     line.starts_with("enumerate folder children failed")
@@ -124,6 +128,23 @@ const KNOWN: &[Known] = &[
         },
         // The folder keeps failing to list, and what is in it can come back
         // as gone, so the mount no longer follows the model.
+        ends_seed: |_, _| true,
+    },
+    // A restart forgets the listings served offline, so the first lookup
+    // lists a folder on Drive, which does not hold what is still queued for
+    // it.
+    Known {
+        bug: "B132",
+        is: |_, _, errno, _, before| {
+            errno == libc::ENOENT
+                && before
+                    .iter()
+                    .any(|line| line.starts_with("lost the connection to Proton"))
+                && before
+                    .iter()
+                    .any(|line| line.starts_with("restored pending ops"))
+        },
+        // The listing stays without it until something relists the folder.
         ends_seed: |_, _| true,
     },
 ];
@@ -159,6 +180,8 @@ pub(crate) struct Profile {
     /// Whether links go down and come back during the sequence.
     pub(crate) link_flaps: bool,
     pub(crate) restarts: bool,
+    /// Whether files are deleted while the drain holds a write to them.
+    pub(crate) deletes_mid_upload: bool,
     /// How long a settle may take; `None` leaves settles out.
     pub(crate) settle_budget: Option<Duration>,
     /// How long one syscall may take.
@@ -170,6 +193,10 @@ pub(crate) struct Profile {
 /// How long the mounts may take to show Drive's tree at the end: one event
 /// poll (`POLL_INTERVAL`) and change.
 const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long the drain may take to pick up a write: its debounce, and then
+/// some.
+const PICKUP_BUDGET: Duration = Duration::from_secs(8);
 
 /// Steps shown before a failure. All of them are written to `steps.log` in
 /// the state the failure keeps.
@@ -221,6 +248,10 @@ struct Run {
     ended_by: Option<&'static str>,
     /// What the daemons logged at `INFO` and above so far.
     logged: Vec<String>,
+    /// Files deleted while the drain held a write to them.
+    held: Vec<NodeUid>,
+    /// Those of them made again before it went on.
+    remade: Vec<NodeUid>,
     watchdog: Watchdog,
 }
 
@@ -243,6 +274,8 @@ pub(crate) fn run(
         known: BTreeMap::new(),
         ended_by: None,
         logged: Vec::new(),
+        held: Vec::new(),
+        remade: Vec::new(),
         watchdog: Watchdog::new(&dir),
     };
     let outcome = run.execute(&dir, &mut rng);
@@ -343,22 +376,97 @@ impl Run {
                 if let Some(budget) = self.profile.settle_budget
                     && self.clients.iter().all(|client| client.online)
                 {
-                    self.note("settle".into());
-                    let start = Instant::now();
-                    if !wait_until(budget, || self.landed()) {
-                        return Err(format!(
-                            "liveness: the queues did not drain within {budget:?}\n{}",
-                            self.difference()
-                        ));
-                    }
-                    self.note(format!("settled in {:?}", start.elapsed()));
+                    self.settle(budget)?;
                 }
             }
+            15..25 if self.profile.deletes_mid_upload => self.delete_mid_upload(index, rng)?,
             _ => {
                 let op = self.clients[index].model.next_op(rng);
                 self.syscall(index, op)?;
             }
         }
+        Ok(())
+    }
+
+    /// Wait until every queue is empty and Drive holds what the models say.
+    fn settle(&mut self, budget: Duration) -> Result<(), String> {
+        self.note("settle".into());
+        let start = Instant::now();
+        if !wait_until(budget, || self.landed()) {
+            return Err(format!(
+                "liveness: the queues did not drain within {budget:?}\n{}",
+                self.difference()
+            ));
+        }
+        self.note(format!("settled in {:?}", start.elapsed()));
+        Ok(())
+    }
+
+    /// Write a file Drive holds and delete it once the drain has picked the
+    /// write up. The drain's read of the node is held until the delete has
+    /// landed and a read shows it, so the drain finds the file trashed while
+    /// it holds a write that is no longer queued (B105). Half the time the
+    /// file is made again meanwhile, which queues a write under the op id the
+    /// delete freed (B133).
+    fn delete_mid_upload(&mut self, index: usize, rng: &mut Rng) -> Result<(), String> {
+        let file = rng
+            .pick(&self.clients[index].model.files())
+            .map(|path| (*path).clone());
+        let (Some(path), Some(budget), true) = (
+            file,
+            self.profile.settle_budget,
+            self.clients.iter().all(|client| client.online),
+        ) else {
+            let op = self.clients[index].model.next_op(rng);
+            return self.syscall(index, op);
+        };
+        self.settle(budget)?;
+        let Some(uid) = self.drive.lookup(&join(&owned_folder(index), &path)) else {
+            return Err(format!(
+                "no loss: client {index}'s {path} is not on Drive after a settle"
+            ));
+        };
+        let held = self.clients[index].daemon().client.hold_next_read(&uid);
+        self.note(format!("client {index}: hold the next read of {path}"));
+        let mut bytes = data(rng);
+        bytes.push(b'.');
+        self.syscall(
+            index,
+            FsOp::Write {
+                path: path.clone(),
+                offset: 0,
+                data: bytes,
+            },
+        )?;
+        if self.ended_by.is_some() {
+            return Ok(());
+        }
+        if !wait_until(PICKUP_BUDGET, || held.reached()) {
+            self.note(format!("client {index}: nothing read {path} back"));
+            return Ok(());
+        }
+        self.syscall(index, FsOp::Unlink { path: path.clone() })?;
+        if self.ended_by.is_some() {
+            return Ok(());
+        }
+        self.held.push(uid.clone());
+        if rng.chance(0.5) {
+            self.syscall(
+                index,
+                FsOp::Create {
+                    path: path.clone(),
+                    data: data(rng),
+                },
+            )?;
+            self.remade.push(uid);
+        }
+        let faults = (self.profile.faults)();
+        let latency = Duration::from_millis(faults.latency_ms.1);
+        std::thread::sleep(faults.listing_lag + latency);
+        drop(held);
+        self.note(format!("client {index}: the read of {path} goes on"));
+        // Nothing else is queued before the drain has answered.
+        std::thread::sleep(2 * latency + Duration::from_millis(50));
         Ok(())
     }
 
@@ -369,6 +477,7 @@ impl Run {
         let before = client.model.content(target(&op)).cloned();
         let expected = client.model.apply(&op);
         self.logged.extend(take_logged());
+        let logged_before = self.logged.len();
         let start = Instant::now();
         let actual = perform(&root, &op, before.as_deref());
         let took = start.elapsed();
@@ -383,9 +492,9 @@ impl Run {
         if actual != expected
             && let Err(errno) = actual
             && tolerate_known()
-            && let Some(known) = KNOWN
-                .iter()
-                .find(|known| (known.is)(&model, &op, errno, &logged))
+            && let Some(known) = KNOWN.iter().find(|known| {
+                (known.is)(&model, &op, errno, &logged, &self.logged[..logged_before])
+            })
         {
             *self.known.entry(known.bug).or_default() += 1;
             if (known.ends_seed)(&model, &op) {
@@ -430,6 +539,45 @@ impl Run {
                 self.profile.drain_budget,
                 self.difference()
             ));
+        }
+        // Each client's folder is its own, so a file of it gone from Drive was
+        // deleted by the client.
+        let own_deletes: Vec<String> = self
+            .logged
+            .iter()
+            .filter(|line| is_own_delete_kept(line))
+            .cloned()
+            .collect();
+        for line in own_deletes {
+            let bug = if self
+                .remade
+                .iter()
+                .any(|uid| line.contains(&format!(" uid={uid} ")))
+            {
+                // Made again while the drain held its write: the new file's
+                // write took the freed op id.
+                "B133"
+            } else if !self
+                .held
+                .iter()
+                .any(|uid| line.contains(&format!(" uid={uid} ")))
+                && !line.contains(" name=\"recovered-")
+            {
+                // The tree still placed the file, so the drain looked before
+                // the unlink had dropped its write.
+                "B134"
+            } else {
+                return Err(format!(
+                    "no false conflicts: the drain took a client's own delete for another device's: {line}"
+                ));
+            };
+            if !tolerate_known() {
+                return Err(format!(
+                    "no false conflicts: the drain took a client's own delete for another device's: {line}"
+                ));
+            }
+            *self.known.entry(bug).or_default() += 1;
+            self.note(format!("known bug {bug}: {line}"));
         }
         let drive = self.drive_tree();
         let mut explained = Vec::new();
@@ -507,6 +655,13 @@ impl Run {
     ///
     /// - B131: the tree kept the create's placeholder, so a write based on it
     ///   found Drive's copy changed.
+    ///
+    /// A conflict copy of a file the client deleted takes the drain saying it
+    /// kept that file's write as the copy, because Drive had the file in the
+    /// trash while the tree still placed it:
+    ///
+    /// - B134: the unlink trashed the file on Drive before it dropped the
+    ///   write.
     fn known_damage(&self, index: usize, drive: &Tree) -> Vec<KnownDamage> {
         if !tolerate_known() {
             return Vec::new();
@@ -548,24 +703,43 @@ impl Run {
                 line.starts_with("queued write landed as a conflict copy") && line.ends_with(&alt)
             })
         };
+        let kept_deleted = |copy: &str| {
+            let alt = format!(" alt={:?}", name_of(copy));
+            self.logged.iter().any(|line| {
+                line.starts_with("queued write landed as a conflict copy")
+                    && line.ends_with(&alt)
+                    && line.split(' ').any(|field| {
+                        field.starts_with("uid=")
+                            && self.logged.iter().any(|kept| {
+                                is_own_delete_kept(kept)
+                                    && !kept.contains(" name=\"recovered-")
+                                    && kept.split(' ').any(|other| other == field)
+                            })
+                    })
+            })
+        };
         let mut damage = Vec::new();
         for (copy, content) in &drive {
-            if let Some(content) = content
-                && is_conflict_copy(copy)
-                && !model.contains_key(copy)
-                && unread_create
-                && kept_write(copy)
-            {
-                damage.push(KnownDamage {
-                    bug: "B131",
-                    path: copy.clone(),
-                    copy: Some(copy.clone()),
-                    change: FsOp::Create {
-                        path: copy.clone(),
-                        data: content.clone(),
-                    },
-                });
+            let Some(content) = content else { continue };
+            if !is_conflict_copy(copy) || model.contains_key(copy) {
+                continue;
             }
+            let bug = if unread_create && kept_write(copy) {
+                "B131"
+            } else if kept_deleted(copy) {
+                "B134"
+            } else {
+                continue;
+            };
+            damage.push(KnownDamage {
+                bug,
+                path: copy.clone(),
+                copy: Some(copy.clone()),
+                change: FsOp::Create {
+                    path: copy.clone(),
+                    data: content.clone(),
+                },
+            });
         }
         for (path, content) in model {
             let Some(content) = content else { continue };
@@ -775,6 +949,14 @@ fn owned_folder(index: usize) -> String {
     format!("c{index}")
 }
 
+/// Whether `line` is the drain keeping a queued write as a conflict copy
+/// because Drive no longer holds the file, or holds it in the trash.
+fn is_own_delete_kept(line: &str) -> bool {
+    line.starts_with("queued write conflicts; keeping a conflict copy")
+        && (line.contains(" reason=\"the file was trashed remotely\"")
+            || line.contains(" reason=\"the file no longer exists remotely\""))
+}
+
 fn is_conflict_copy(path: &str) -> bool {
     path.split('/')
         .any(|name| name.contains("(sync-conflict") || name.starts_with("recovered-"))
@@ -867,6 +1049,20 @@ mod tests {
         faults: Faults::lan,
         link_flaps: false,
         restarts: false,
+        deletes_mid_upload: false,
+        settle_budget: Some(Duration::from_secs(4)),
+        syscall_budget: Duration::from_secs(2),
+        drain_budget: Duration::from_secs(20),
+    };
+
+    static ONE_CLIENT_DELETES: Profile = Profile {
+        name: "one-client-deletes",
+        clients: 1,
+        steps: 30,
+        faults: Faults::lan,
+        link_flaps: false,
+        restarts: false,
+        deletes_mid_upload: true,
         settle_budget: Some(Duration::from_secs(4)),
         syscall_budget: Duration::from_secs(2),
         drain_budget: Duration::from_secs(20),
@@ -879,6 +1075,7 @@ mod tests {
         faults: Faults::wifi,
         link_flaps: true,
         restarts: true,
+        deletes_mid_upload: false,
         settle_budget: None,
         syscall_budget: Duration::from_secs(10),
         drain_budget: Duration::from_secs(120),
@@ -891,6 +1088,7 @@ mod tests {
         faults: Faults::lan,
         link_flaps: true,
         restarts: true,
+        deletes_mid_upload: false,
         settle_budget: Some(Duration::from_secs(4)),
         syscall_budget: Duration::from_secs(2),
         drain_budget: Duration::from_secs(60),
@@ -900,6 +1098,12 @@ mod tests {
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse --lib sim::run -- --ignored`"]
     fn one_client_on_a_good_link() {
         run_seeds(&ONE_CLIENT_LAN, 12);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse --lib sim::run -- --ignored`"]
+    fn one_client_deleting_files_as_they_upload() {
+        run_seeds(&ONE_CLIENT_DELETES, 3);
     }
 
     #[test]
@@ -919,6 +1123,19 @@ mod tests {
         assert!(is_conflict_copy("c0/x/a (sync-conflict 1790000000).txt"));
         assert!(is_conflict_copy("recovered-XrPUSW5W"));
         assert!(!is_conflict_copy("c0/x/a.txt"));
+    }
+
+    #[test]
+    fn a_write_kept_because_its_file_is_gone_is_recognised() {
+        let kept = "queued write conflicts; keeping a conflict copy uid=simvol~L10 \
+                    name=\"f.txt\" reason=\"the file was trashed remotely\"";
+        assert!(is_own_delete_kept(kept));
+        assert!(is_own_delete_kept(
+            &kept.replace("was trashed", "no longer exists")
+        ));
+        assert!(!is_own_delete_kept(
+            &kept.replace("the file was trashed remotely", "revision changed")
+        ));
     }
 
     #[test]

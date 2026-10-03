@@ -224,7 +224,7 @@ impl Model {
         self.tree.keys().any(|other| is_below(other, path))
     }
 
-    fn files(&self) -> Vec<&String> {
+    pub(crate) fn files(&self) -> Vec<&String> {
         self.tree
             .iter()
             .filter(|(_, entry)| entry.is_some())
@@ -318,7 +318,7 @@ impl Model {
 }
 
 /// Content for a write: short and recognisable, now and then empty.
-fn data(rng: &mut Rng) -> Vec<u8> {
+pub(crate) fn data(rng: &mut Rng) -> Vec<u8> {
     let len = if rng.chance(0.1) {
         0
     } else {

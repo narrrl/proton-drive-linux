@@ -30,6 +30,10 @@
 //! - **Non-uniform blocks** ([`FakeDrive::set_block_pattern`]; B84, B85, B87).
 //! - **A full account** ([`FakeDrive::set_quota`]) refusing uploads with
 //!   `InsufficientQuota`.
+//!
+//! A test can also hold the next read of one node on its way to Drive
+//! ([`FakeClient::hold_next_read`]), to make a change while the daemon waits
+//! for the answer.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -325,6 +329,7 @@ impl FakeDrive {
             entity_cache: Mutex::new(HashMap::new()),
             online: AtomicBool::new(true),
             requests: AtomicU64::new(0),
+            hold: Mutex::new(None),
         }))
     }
 
@@ -559,6 +564,31 @@ struct ClientInner {
     entity_cache: Mutex<HashMap<NodeUid, Node>>,
     online: AtomicBool,
     requests: AtomicU64,
+    /// The read [`FakeClient::hold_next_read`] is waiting for.
+    hold: Mutex<Option<Arc<HoldState>>>,
+}
+
+struct HoldState {
+    uid: NodeUid,
+    reached: AtomicBool,
+    released: AtomicBool,
+}
+
+/// A read held on its way to Drive, from [`FakeClient::hold_next_read`]. It
+/// goes on when this is dropped.
+pub(crate) struct Held(Arc<HoldState>);
+
+impl Held {
+    /// Whether the read has come and is being held.
+    pub(crate) fn reached(&self) -> bool {
+        self.0.reached.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.released.store(true, Ordering::SeqCst);
+    }
 }
 
 /// One daemon's connection to a [`FakeDrive`]. Cheap to clone; clones share
@@ -573,6 +603,34 @@ impl FakeClient {
 
     pub(crate) fn set_faults(&self, faults: Faults) {
         *self.0.faults.lock() = faults;
+    }
+
+    /// Hold the next read of `uid` alone, before it reaches Drive, until the
+    /// answer is dropped. Only one read is held at a time.
+    pub(crate) fn hold_next_read(&self, uid: &NodeUid) -> Held {
+        let state = Arc::new(HoldState {
+            uid: uid.clone(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Wait here if `uids` is the read a [`Held`] is for.
+    async fn wait_if_held(&self, uids: &[NodeUid]) {
+        let state = {
+            let mut hold = self.0.hold.lock();
+            match hold.as_ref() {
+                Some(state) if uids == std::slice::from_ref(&state.uid) => hold.take(),
+                _ => None,
+            }
+        };
+        let Some(state) = state else { return };
+        state.reached.store(true, Ordering::SeqCst);
+        while !state.released.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Requests made through this client so far.
@@ -799,6 +857,7 @@ impl DriveApi for FakeClient {
     }
 
     async fn enumerate_nodes(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
+        self.wait_if_held(uids).await;
         let lag = self.lag();
         let nodes: Vec<Node> = self
             .request(false, |server| {
@@ -1456,6 +1515,31 @@ mod tests {
                     .unwrap(),
                 vec![file]
             );
+        });
+    }
+
+    #[test]
+    fn a_held_read_answers_with_what_drive_holds_when_released() {
+        rt().block_on(async {
+            let drive = FakeDrive::new();
+            let client = drive.client(1, Faults::none());
+            let root = drive.root();
+            let file = client.upload_file(&root, "a", "", b"1").await.unwrap();
+            let held = client.hold_next_read(&file);
+            let read = tokio::spawn({
+                let client = client.clone();
+                let file = file.clone();
+                async move { client.enumerate_nodes(std::slice::from_ref(&file)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(held.reached());
+            assert!(!read.is_finished());
+            drive.device().trash("a");
+            drop(held);
+            let nodes = read.await.unwrap().unwrap();
+            assert!(nodes[0].trashed);
+            // Only the next read is held.
+            assert_eq!(client.enumerate_nodes(&[file]).await.unwrap().len(), 1);
         });
     }
 
