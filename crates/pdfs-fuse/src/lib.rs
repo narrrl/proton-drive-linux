@@ -1754,21 +1754,23 @@ impl Core {
         let hidden = self.hidden.lock().clone();
         let mut st = self.state();
 
-        // Pass 1: assign a stable inode to every uid (root is already mapped).
+        // Pass 1: give every uid its inode from its local id (the root is
+        // already mapped).
         for sn in &stored {
             if hidden.contains(&sn.node.uid) || st.by_uid.contains_key(&sn.node.uid) {
                 continue;
             }
-            let ino = st.next_ino;
-            st.next_ino += 1;
-            st.by_uid.insert(sn.node.uid.clone(), ino);
+            st.by_uid
+                .insert(sn.node.uid.clone(), state::lid_ino(sn.lid));
         }
 
         // Pass 2: materialize entries, resolving each parent's inode by uid.
         // Track folders flagged complete so their listings rebuild in pass 3.
         let mut listed_dirs: Vec<u64> = Vec::new();
         for sn in stored {
-            let StoredNode { mut node, listed } = sn;
+            let StoredNode {
+                mut node, listed, ..
+            } = sn;
             if hidden.contains(&node.uid) {
                 continue;
             }
@@ -8868,16 +8870,27 @@ mod tests {
         std::fs::create_dir_all(&dir_path).unwrap();
         let db = pdfs_core::db::Db::open(&dir_path.join("cache.db")).unwrap();
         let share_access = db.all_share_access().unwrap();
-        let st = crate::state::State::new(std::sync::Arc::new(db), share_access, 1);
+        let st = crate::state::State::new(std::sync::Arc::new(db), share_access);
         (st, TestDir(dir_path))
     }
 
     fn rooted_state(volume: &str, root_link: &str) -> (crate::state::State, TestDir) {
         let (mut state, dir) = state_test_helper();
         let root = node_helper_in_volume(volume, root_link, None, "root", true);
-        let root_ino = state.intern(0, root);
-        assert_eq!(root_ino, super::ROOT_INO);
-        state.entries.get_mut(&root_ino).unwrap().parent = root_ino;
+        // At the root inode, as `ProtonFs::new` puts it.
+        state.by_uid.insert(root.uid.clone(), super::ROOT_INO);
+        state.entries.insert(
+            super::ROOT_INO,
+            crate::state::Entry {
+                uid: root.uid.clone(),
+                parent: super::ROOT_INO,
+                node: root,
+                access: Access::Owner,
+                lookup_count: 1,
+                open_count: 0,
+                unlinked: false,
+            },
+        );
         (state, dir)
     }
 

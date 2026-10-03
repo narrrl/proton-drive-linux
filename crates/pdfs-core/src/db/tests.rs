@@ -3146,6 +3146,31 @@ fn a_node_keeps_its_lid_across_updates_and_a_new_one_never_reuses_it() {
 }
 
 #[test]
+fn a_lid_handed_out_before_the_node_is_stored_reads_as_no_node() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.set_share_access(&uid("root"), crate::Access::Owner)
+        .unwrap();
+    let stub = file("stub", "root", "stub.txt", 1);
+    let [lid] = db.lids_for(&[&stub]).unwrap()[..] else {
+        panic!("one lid per node");
+    };
+
+    assert_eq!(db.lid_of(&uid("stub").to_string()).unwrap(), Some(lid));
+    assert_eq!(db.lids_for(&[&stub]).unwrap(), vec![lid]);
+    assert!(db.node_by_uid(&uid("stub").to_string()).unwrap().is_none());
+    assert!(db.effective_node_access(&uid("stub")).unwrap().is_none());
+    assert!(db.node_path(&uid("stub").to_string()).unwrap().is_none());
+    assert!(!db.has_children(&uid("root")).unwrap());
+    assert!(db.search("stub", 10).unwrap().is_empty());
+    assert!(db.load_all().unwrap().iter().all(|n| n.lid != lid));
+
+    db.upsert_node(&stub).unwrap();
+    assert_eq!(db.lid_of(&uid("stub").to_string()).unwrap(), Some(lid));
+    assert!(db.has_children(&uid("root")).unwrap());
+}
+
+#[test]
 fn a_landed_placeholder_keeps_its_lid() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("root", None, "My Files")).unwrap();

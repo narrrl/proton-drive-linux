@@ -409,7 +409,7 @@ pub(crate) fn mount_with(
         maintenance: Arc::new(Mutex::new(Default::default())),
         primary_root_uid: root.uid.clone(),
         primary: true,
-        state: Arc::new(Mutex::new(State::new(db.clone(), share_access, 2))),
+        state: Arc::new(Mutex::new(State::new(db.clone(), share_access))),
         cache: Arc::new(cache),
         readers: Arc::new(Mutex::new(HashMap::new())),
         block_ring: Arc::new(Mutex::new(BlockRing::default())),

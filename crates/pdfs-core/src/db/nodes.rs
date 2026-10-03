@@ -17,6 +17,8 @@ use super::utils::{
 pub struct StoredNode {
     pub node: Node,
     pub listed: bool,
+    /// The row's local id ([`Db::lid_of`]).
+    pub lid: i64,
 }
 
 /// One full-text search match: the stored [`Node`] plus its mountpoint-relative
@@ -289,7 +291,8 @@ impl Db {
         let uid_str = parent_uid.to_string();
         let conn = self.read();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE parent_uid = ?1 AND trashed = 0",
+            "SELECT COUNT(*) FROM nodes
+             WHERE parent_uid = ?1 AND trashed = 0 AND node_json IS NOT NULL",
             params![uid_str],
             |row| row.get(0),
         )?;
@@ -305,9 +308,11 @@ impl Db {
     pub fn node_path(&self, uid: &str) -> Result<Option<String>> {
         let conn = self.read();
         let exists: Option<i64> = conn
-            .query_row("SELECT 1 FROM nodes WHERE uid = ?1", params![uid], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT 1 FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL",
+                params![uid],
+                |r| r.get(0),
+            )
             .optional()?;
         if exists.is_none() {
             return Ok(None);
@@ -511,17 +516,17 @@ impl Db {
     pub fn load_all(&self) -> Result<Vec<StoredNode>> {
         let conn = self.read();
         let mut stmt =
-            conn.prepare("SELECT node_json, listed FROM nodes WHERE node_json IS NOT NULL")?;
+            conn.prepare("SELECT node_json, listed, lid FROM nodes WHERE node_json IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
             let json: String = row.get(0)?;
             let listed: i64 = row.get(1)?;
-            Ok((json, listed != 0))
+            Ok((json, listed != 0, row.get(2)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (json, listed) = row?;
+            let (json, listed, lid) = row?;
             let node: Node = serde_json::from_str(&json)?;
-            out.push(StoredNode { node, listed });
+            out.push(StoredNode { node, listed, lid });
         }
         Ok(out)
     }
@@ -554,6 +559,45 @@ impl Db {
                 r.get(0)
             })
             .optional()?)
+    }
+
+    /// The local id of each node, in order, giving a row to each that has none.
+    ///
+    /// A new row is only a stub: it has no `node_json`, so no listing or search
+    /// returns it until the node is upserted, which the caller still owes. That
+    /// keeps this cheap enough to call with the inode lock held, which is
+    /// where an inode number is first needed.
+    pub fn lids_for(&self, nodes: &[&Node]) -> Result<Vec<i64>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut lids = Vec::with_capacity(nodes.len());
+        {
+            let mut known = tx.prepare_cached("SELECT lid FROM nodes WHERE uid = ?1")?;
+            let mut stub = tx.prepare_cached(
+                "INSERT INTO nodes (uid, parent_uid, name, is_dir, mtime, trashed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for node in nodes {
+                let uid = node.uid.to_string();
+                let lid = match known.query_row(params![uid], |r| r.get(0)).optional()? {
+                    Some(lid) => lid,
+                    None => {
+                        stub.execute(params![
+                            uid,
+                            node.parent_uid.as_ref().map(ToString::to_string),
+                            node.name,
+                            node.is_folder() as i64,
+                            node.modification_time,
+                            node.trashed as i64,
+                        ])?;
+                        tx.last_insert_rowid()
+                    }
+                };
+                lids.push(lid);
+            }
+        }
+        tx.commit()?;
+        Ok(lids)
     }
 
     /// Read the persisted incremental-sync cursor (a `DriveEventId`), if any.
@@ -816,8 +860,10 @@ fn reindex_subtree_tx(
     let mut set_path = tx.prepare("UPDATE nodes SET path = ?2 WHERE rowid = ?1")?;
     let mut unindex = tx.prepare("DELETE FROM nodes_fts WHERE rowid = ?1")?;
     let mut index = tx.prepare(
+        // Not a stub row (`Db::lids_for`): it is indexed when its node is
+        // written.
         "INSERT INTO nodes_fts (rowid, name, path)
-         SELECT rowid, name, ?2 FROM nodes WHERE rowid = ?1",
+         SELECT rowid, name, ?2 FROM nodes WHERE rowid = ?1 AND node_json IS NOT NULL",
     )?;
     for (rowid, path, blocked) in descendants {
         set_path.execute(params![rowid, path])?;

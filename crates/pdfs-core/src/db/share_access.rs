@@ -98,7 +98,7 @@ impl Db {
     pub fn effective_node_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
         let conn = self.read();
         let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nodes WHERE uid = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL)",
             [uid.to_string()],
             |row| row.get(0),
         )?;

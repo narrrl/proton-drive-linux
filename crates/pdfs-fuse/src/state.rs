@@ -201,6 +201,18 @@ pub(crate) struct PendingRevision {
 /// time so this module stays free of `fuser`.
 pub(crate) type DirListing = Vec<(u64, bool, String)>;
 
+/// Where [`State::next_ino`] starts: far above any local id a database hands
+/// out, so a fallback inode never names a node that has a row.
+pub(crate) const FALLBACK_INO: u64 = 1 << 48;
+
+/// The inode of the node with local id `lid` ([`Db::lids_for`]), except where
+/// it is a mount's root, which is always [`crate::ROOT_INO`]. One above the lid,
+/// so no other node takes the root's number. The same in every mount and after
+/// a restart.
+pub(crate) fn lid_ino(lid: i64) -> u64 {
+    lid.unsigned_abs() + crate::ROOT_INO
+}
+
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
 /// `Filesystem` trait through `&self`.
 pub(crate) struct State {
@@ -211,6 +223,8 @@ pub(crate) struct State {
     /// Cached directory listings: parent inode -> child inodes. Presence of a
     /// key means the directory has been enumerated.
     pub(crate) children: HashMap<u64, Vec<u64>>,
+    /// The next inode for a node the database could not give a local id, from
+    /// a range lids never reach ([`FALLBACK_INO`]).
     pub(crate) next_ino: u64,
     /// Shared write state keyed by inode. Concurrent writers share the scratch file.
     pub(crate) active_writes: HashMap<u64, WriteHandle>,
@@ -349,9 +363,6 @@ impl Drop for StateGuard<'_> {
 impl State {
     /// A fresh, empty inode space over `db`.
     ///
-    /// `next_ino` differs by caller: a real mount hands out [`crate::ROOT_INO`]
-    /// to its root and starts allocating above it, while a bare state under test
-    /// has no root and starts at 1.
     /// Apply the write-throughs this state owes SQLite, here and now.
     ///
     /// Production code never calls this: [`StateGuard`] releases the inode lock
@@ -378,12 +389,15 @@ impl State {
         self.db.clone()
     }
 
-    pub(crate) fn new(db: Arc<Db>, share_access: HashMap<NodeUid, Access>, next_ino: u64) -> Self {
+    /// A fresh, empty inode space over `db`. A node's inode comes from its
+    /// local id ([`lid_ino`]); a real mount puts its root at
+    /// [`crate::ROOT_INO`].
+    pub(crate) fn new(db: Arc<Db>, share_access: HashMap<NodeUid, Access>) -> Self {
         Self {
             entries: HashMap::new(),
             by_uid: HashMap::new(),
             children: HashMap::new(),
-            next_ino,
+            next_ino: FALLBACK_INO,
             active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
@@ -881,7 +895,19 @@ impl State {
         self.intern_mem_with_access(parent, node, access)
     }
 
-    fn intern_mem_with_access(&mut self, parent: u64, mut node: Node, access: Access) -> u64 {
+    fn intern_mem_with_access(&mut self, parent: u64, node: Node, access: Access) -> u64 {
+        self.intern_mem_at(parent, node, access, None)
+    }
+
+    /// [`State::intern_mem_with_access`], with the inode a new entry takes when
+    /// the caller already has it ([`State::new_inos`]).
+    fn intern_mem_at(
+        &mut self,
+        parent: u64,
+        mut node: Node,
+        access: Access,
+        ino: Option<u64>,
+    ) -> u64 {
         if let Some(&ino) = self.by_uid.get(&node.uid) {
             let changed = self
                 .entries
@@ -900,8 +926,13 @@ impl State {
             }
             return ino;
         }
-        let ino = self.next_ino;
-        self.next_ino += 1;
+        let ino = match ino {
+            Some(ino) => ino,
+            None => self
+                .new_inos(&[&node])
+                .remove(&node.uid)
+                .unwrap_or_default(),
+        };
         self.by_uid.insert(node.uid.clone(), ino);
         self.entries.insert(
             ino,
@@ -916,6 +947,41 @@ impl State {
             },
         );
         ino
+    }
+
+    /// The inodes for nodes that have no entry yet, from their local ids, in
+    /// one transaction. Should the database fail, they come from
+    /// [`State::next_ino`] instead, so the mount keeps working, with inodes
+    /// that last only this run. So do the inodes of virtual folders, which are
+    /// never stored.
+    fn new_inos(&mut self, nodes: &[&Node]) -> HashMap<NodeUid, u64> {
+        let (virtual_nodes, stored): (Vec<&Node>, Vec<&Node>) = nodes
+            .iter()
+            .partition(|node| crate::r#virtual::is_virtual_uid(&node.uid));
+        let mut inos = match self.db.lids_for(&stored) {
+            Ok(lids) => stored
+                .iter()
+                .zip(lids)
+                .map(|(node, lid)| (node.uid.clone(), lid_ino(lid)))
+                .collect(),
+            Err(error) => {
+                warn!(%error, "no local ids for new inodes; numbering them for this run");
+                self.run_inos(&stored)
+            }
+        };
+        inos.extend(self.run_inos(&virtual_nodes));
+        inos
+    }
+
+    fn run_inos(&mut self, nodes: &[&Node]) -> HashMap<NodeUid, u64> {
+        nodes
+            .iter()
+            .map(|node| {
+                let ino = self.next_ino;
+                self.next_ino += 1;
+                (node.uid.clone(), ino)
+            })
+            .collect()
     }
 
     /// Decrement lookup count for an inode and prune if lookup_count == 0 && open_count == 0 && unlinked.
@@ -963,9 +1029,22 @@ impl State {
             self.keep_revision_mtime(node);
         }
         self.outbox.push(DbWrite::Upsert(nodes.clone()));
+        let fresh: Vec<&Node> = nodes
+            .iter()
+            .filter(|node| !self.by_uid.contains_key(&node.uid))
+            .collect();
+        let mut inos = if fresh.is_empty() {
+            HashMap::new()
+        } else {
+            self.new_inos(&fresh)
+        };
         nodes
             .into_iter()
-            .map(|node| self.intern_mem(parent, node))
+            .map(|node| {
+                let access = self.access_for_node(parent, &node);
+                let ino = inos.remove(&node.uid);
+                self.intern_mem_at(parent, node, access, ino)
+            })
             .collect()
     }
 
@@ -1283,7 +1362,7 @@ mod tests {
         let dir = TempDir::new();
         let db = Db::open(&dir.0.join("cache.db")).unwrap();
         let share_access = db.all_share_access().unwrap();
-        let st = State::new(Arc::new(db), share_access, 1);
+        let st = State::new(Arc::new(db), share_access);
         (st, dir)
     }
 
@@ -1299,6 +1378,36 @@ mod tests {
         st.flushed_db().set_listed(&uid("src"), true).unwrap();
         st.flushed_db().set_listed(&uid("dst"), true).unwrap();
         (st, dir, src, dst)
+    }
+
+    /// A node's inode comes from its row's local id, so it is the same in
+    /// every mount, after the hot cache drops it, and after a restart.
+    #[test]
+    fn a_node_keeps_its_inode_across_mounts_evictions_and_restarts() {
+        let (mut st, _dir) = state();
+        let inos = st.intern_batch(
+            0,
+            vec![
+                node("a", "root", "a.txt", false),
+                node("b", "root", "b.txt", false),
+            ],
+        );
+        st.flush_outbox();
+        let db = st.db.clone();
+        assert_ne!(inos[0], inos[1]);
+        assert!(!inos.contains(&crate::ROOT_INO));
+
+        let mut other = State::new(db.clone(), HashMap::new());
+        assert_eq!(other.intern(0, node("b", "root", "b.txt", false)), inos[1]);
+
+        st.forget_mem(&uid("a"));
+        assert_eq!(st.intern(0, node("a", "root", "a.txt", false)), inos[0]);
+
+        let mut restarted = State::new(db, HashMap::new());
+        assert_eq!(
+            restarted.intern_batch(0, vec![node("a", "root", "a.txt", false)]),
+            [inos[0]]
+        );
     }
 
     /// Audit A5. Moving a file out of a folder leaves that folder's DB row

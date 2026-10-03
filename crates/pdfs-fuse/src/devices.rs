@@ -625,7 +625,7 @@ impl Core {
         let mut fork = self.clone();
         fork.primary = false;
         let share_access = self.state().share_access.clone();
-        fork.state = Arc::new(Mutex::new(State::new(self.db.clone(), share_access, 2)));
+        fork.state = Arc::new(Mutex::new(State::new(self.db.clone(), share_access)));
         // A fresh inode space needs a fresh notification channel: this fork's
         // session is the only one that knows these inodes, so it must be the one
         // notified about them. Filled in by `spawn_ondemand_mount`.
