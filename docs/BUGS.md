@@ -12,6 +12,233 @@ Conventions:
 
 ---
 
+## B131 — A write to a file whose create could not be read back lands as a conflict copy
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 1).
+`a.txt` was created while the link was down, and the link came back right after. The create
+landed, and the drain logged "pending upload failed; will retry" for its placeholder with
+"fetch node: no such file or folder". Half a second later a write to `a.txt` queued a revision.
+The drain kept it as `a (sync-conflict …).txt`: "expected 19 bytes at mtime 1791005792, found
+19 at 1791005793". No other device had touched the file.
+
+**Where:** `Core::drain_local_node` and `Core::adopt_real_uid` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** `drain_local_node` retires the create's op (`retire_create`) before
+`adopt_real_uid` reads the new node back. Drive can answer a create before a lookup finds the
+node (B118), and then the read-back fails. By then the op is gone, so the "will retry" never
+happens. The tree's entry has the real uid but still holds the placeholder's node: the local
+clock's mtime and no revision id. `rebase_open_writes` and `rebaseline_pending` never run. A
+write opened afterwards takes that node as its base. Drive stamped the file when the create
+landed, and if that was in a later second than the placeholder's mtime, the drain sees the
+remote revision changed and keeps the client's own write as a conflict copy.
+
+**Test:** the simulation runs count a conflict copy that the drain kept for a queued write, when
+a landed create could not be read back. With `PDFS_SIM_KNOWN=fail`, seed 1 of three-clients
+fails on it when the create lands in a later second than it was made, which depends on timing.
+
+## B130 — A read of a file that a remote change invalidates can hang the daemon
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 1).
+After the last step, a read of `c0/z/f.txt` never returned. The watchdog's stacks showed the
+read's worker in `read_range_remote`, waiting in `block_on` for its fetch, and a runtime worker
+running `run_event_sync` blocked in the kernel in `inval_inode`, waiting for a page lock. The
+read had started at 05:13:38. Its 120 s timeout, a 20 s `bounded` call and every other timer
+of the runtime all fired at 05:17:24, the moment the watchdog aborted the mount.
+
+**Where:** `apply_event` in `crates/pdfs-fuse/src/background.rs`, which runs on the runtime and
+flushes its invalidations through `Core::for_each_mount` and `NotifyBatch::flush` in
+`crates/pdfs-fuse/src/lib.rs`, and `Core::read_range_remote` in `crates/pdfs-fuse/src/reads.rs`.
+
+**Cause.** The kernel holds the page lock of the pages a FUSE read fills until the daemon
+answers. `inval_inode` on the same file waits for that lock, so it waits as long as the read.
+The event sync sends it from a runtime worker, which blocks that worker in the kernel. If that
+worker was the one parked on the runtime's driver, nothing drives the timers or the I/O any
+more: tokio hands the driver on only when a parked worker is woken for new work, and the others
+sleep on a condvar. The read's fetch waits on a timer (here the fake's latency, on Drive an
+HTTP response), so it never finishes and never lets go of the page lock. The daemon stays stuck
+until some other work wakes a worker, and on an idle machine that may never happen.
+
+**Test:** the simulation runs recognise it in the watchdog's stacks (a `tokio-rt-worker` in
+state `D` inside `NotifyBatch::flush`), count it and end the seed there. With
+`PDFS_SIM_KNOWN=fail`, seed 1 of one-client-flaky fails on it.
+
+## B129 — A file deleted or replaced while its create is on the wire stays on Drive
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seed 4).
+`a.txt` was created, renamed to `b.txt` and then to `e.md` while its create was still queued.
+A moment later `rename f.txt -> e.md` failed with `EIO`, and the daemon logged "rename failed"
+with Drive's `AlreadyExists`.
+
+**Where:** `Core::remove_replaced` and `Core::discard_queued_ops` in `crates/pdfs-fuse/src/lib.rs`,
+`trash_child` in `crates/pdfs-fuse/src/filesystem.rs`, and `drain_local_node` and
+`upload_created_file` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A node whose create is still queued has no node on Drive, so deleting it or renaming
+another file over it only drops the queued op (`discard_queued_ops`). That cannot stop a drain
+worker that has already claimed the op. `cancel_upload` only reaches revisions, and the upload
+of a create has no cancel flag. The create lands anyway. `finish_create` finds no op row to
+retire, and the tree has already forgotten the local uid, so nothing trashes the new node.
+Drive keeps a file that the mount no longer shows. Its name stays taken: an online rename onto
+it, as here, fails with `EIO`, and a later create with that name lands as a conflict copy.
+
+**Test:** the simulation runs count a rename it fails and end the seed there. With
+`PDFS_SIM_KNOWN=fail`, seed 4 of one-client-lan fails on it when it comes up, which depends
+on timing.
+
+## B128 — A file created offline over one deleted offline can be lost
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 3).
+While the link was down, `f.txt` was deleted and a new `f.txt` was made. Its first version had
+not landed yet, so Drive held it empty. When the link came back, the drain logged "the name is
+held by our own unanswered create; adopting it" with the old file's uid, then "pending trash
+landed" for that uid. The queue drained empty, and Drive held no `f.txt`, only the trashed old
+one.
+
+**Where:** `drain_local_node` and `adoptable_twin` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** Several workers drain at once, so the new file's create can run before the trash of
+the old one has landed, and Drive refuses the name. On that refusal the drain first looks for a
+node its own unanswered create made: one with that name, made within `ADOPT_WINDOW_MS`, and
+empty for a file. The old file matched, because it was made a moment earlier and its bytes were
+still queued. The drain adopted it, so the new bytes went to it as a revision, and the queued
+trash then trashed it. Only after the adoption check does the drain ask whether a queued trash
+holds the name (`has_pending_trash_named`), and the adoption does not exclude a node that has
+one.
+
+**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the three-client
+profile fails on it when it comes up, which depends on timing.
+
+## B127 — A file created offline lands twice when the answer to its upload is lost
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 1).
+The upload of a queued create timed out after Drive had made the file. On the next attempt the
+drain logged "name is taken remotely; creating under a conflict name". Drive ended with the file
+and with a conflict copy of the same bytes next to it.
+
+**Where:** `drain_local_node` and `adoptable` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** When a create finds its name taken, the drain adopts the node only if it looks like
+one its own unanswered create made (`adoptable_twin`). It must be made within `ADOPT_WINDOW_MS`
+and, for a file, be empty. A queued create uploads its bytes in the same call, though
+(`upload_created_file`). So the node a lost answer leaves behind holds those bytes, is not
+adopted, and the file is uploaded a second time under a conflict name.
+
+**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the flaky profile
+fails on it when it comes up, which depends on timing.
+
+## B126 — A file created offline under a name an offline rename freed lands as a conflict copy
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 3).
+While the link was down, `b.txt` was renamed to `c.bin`, and a new `b.txt` was made. When the link
+came back, the drain logged "name is taken remotely; creating under a conflict name" for
+`b.txt`. The new file ended up only as `b (sync-conflict …).txt`.
+
+**Where:** `drain_local_node` in `crates/pdfs-fuse/src/drain.rs`, and the claim order in
+`Db::claim_next_due_op` in `crates/pdfs-core/src/db/ops.rs`.
+
+**Cause.** The drain serialises the ops of one node, but not ops on different nodes that share a
+name. Several workers drain at once, so the create of the new `b.txt` can reach Drive before the
+rename that frees the name has landed. Drive then refuses it as taken. `drain_local_node` waits
+when the name is held by a node whose trash is queued (`has_pending_trash_named`), but not when a
+queued rename is about to move it away. It treats the name as someone else's file and lands the
+new one under a conflict name.
+
+**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the three-client
+profile fails on it when it comes up, which depends on timing.
+
+## B125 — A folder made offline fails with `EIO` once its listing is invalidated
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seeds 3
+and 4). Right after a restart, `rmdir y` (seed 3), and a write to a file in the client's folder
+(seed 4), failed with `EIO`. The daemon logged "enumerate folder children failed" with Drive's
+404 for a `local~` folder uid. Each folder had been made while its create was being queued:
+offline, or, as for the client's own folder, through B118's fallback when the read-back missed.
+
+**Where:** `Core::ensure_children` in `crates/pdfs-fuse/src/lib.rs`, and everything that calls
+`State::invalidate_listing`.
+
+**Cause.** A folder whose mkdir is still queued exists only here, so `serve_mkdir` records it as
+listed and empty, and `ensure_children` never asks Drive about it. `State::invalidate_listing`
+clears that flag for any folder, though, and so do its callers: `relocate` after a rename, and
+`relist_offline_listings` when the link comes back. The next access asks Drive to list a `local~`
+uid. Drive answers 404, and every lookup in the folder fails with `EIO` until its mkdir lands.
+Right after it lands, Drive may not list the new folder yet (the lag of B118). Then the listing
+fails with a 404 for the real uid too.
+
+**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the flaky profile
+fails on it.
+
+## B124 — After a replacing rename fails, the file it was replacing is gone from the mount
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seed 1). A
+rename `x/f.txt -> z/d` over an existing `z/d` failed with `EIO` (B122). Then `create z/d`
+failed with `ENOENT`, although `z/d` was back on Drive.
+
+**Where:** `Core::remove_replaced` and `Core::restore_replaced` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** Before the rename, `remove_replaced` trashes the destination on Drive, drops it from
+every mount's state and adds it to `hidden`, which filters listings. When the rename then fails,
+`restore_replaced` restores the node on Drive but does not take it out of `hidden` or put it back
+in the state, as the ordinary restore does. Until the daemon restarts, the file is on Drive but
+missing from the mount, and a create by its name fails.
+
+**Test:** the simulation runs end a seed on it. With `PDFS_SIM_KNOWN=fail`, seed 1 of
+`cargo test -p pdfs-fuse --lib sim::run::tests::one_client_on_a_good_link -- --ignored
+--test-threads=1` fails on it.
+
+## B123 — A second write open on a file just written fails with `EIO`
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seeds 5 and
+9). A write at an offset (seed 5) or a create over an existing file (seed 9) failed with `EIO`.
+The daemon logged "refusing write over incomplete queued revision".
+
+**Where:** the write open in `crates/pdfs-fuse/src/filesystem.rs`, and the `complete` flag that
+`queue_revision` in `crates/pdfs-fuse/src/lib.rs` stamps on a queued revision.
+
+**Cause.** A write open over a queued revision that is not complete is refused by design, because
+a second partial edit on top of one with gaps cannot be represented. Two ordinary cases leave a
+revision incomplete, though:
+
+- A file closed empty never counts as complete. `queue_revision` compares the authored ranges with
+  `[(0, len)]`, which for a length of 0 is `[(0, 0)]`, while the authored ranges are empty. The
+  truncate path already treats a size of 0 as complete.
+- The gaps of a partial edit are filled from the content cache, and the cache can be empty
+  then. One way is our own rename: `rename_remote` and `move_remote` do not call
+  `note_self_change`, so the echo of the rename evicts the cached bytes.
+
+Either way, the next write open on the file within the drain debounce (`DRAIN_REVISION_DEBOUNCE`,
+2 s) fails, until the revision has landed.
+
+**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail`, seeds 5 and 9 of
+one-client-lan fail on it.
+
+## B122 — A rename across folders fails with `EIO` when the source folder holds the new name
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seeds 1, 7
+and 10). A `rename(2)` like `x/f.txt -> z/d` failed with `EIO` while `x/d` existed. The daemon
+logged "rename failed" with Drive's `AlreadyExists`.
+
+**Where:** `serve_rename` in `crates/pdfs-fuse/src/filesystem.rs`.
+
+**Cause.** Online, a rename that changes both the folder and the name is done in two calls. It
+renames in the source folder first, then moves (`rename_remote`, then `move_remote`). A sibling in
+the source folder with the new name makes Drive refuse the first call, although the destination
+is free. B46's follow-up already notes that this path was not converted to the single
+`move-multiple` request the drain uses. If the rename was replacing a file, B124 follows.
+
+**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail`, seed 1 of
+one-client-lan fails on it.
+
 ## B121 — A move right after a rename fails with `EIO`, and a rename across folders takes seconds
 
 **Status:** Fixed (unverified).
