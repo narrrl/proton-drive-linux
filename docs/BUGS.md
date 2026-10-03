@@ -12,6 +12,35 @@ Conventions:
 
 ---
 
+## B136 — A file renamed while its first upload is on the wire goes back to its old name
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 3), at
+the end check for lost data. A file made offline was renamed after the drain had taken its create.
+The create landed under the old name and the new name was gone. Every replay of the seed.
+
+**Where:** `Db::finish_create` in `crates/pdfs-core/src/db/ops.rs`, `drain_local_node` and
+`adopt_real_uid` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A rename of a node whose create is still queued rewrites the create's parent and name
+(`Db::rewrite_op_target`) instead of queuing a rename. The drain copies the op when it takes it,
+so a rewrite while the create was on the wire changed only the row. When the create landed,
+`finish_create` deleted the row without looking at it again, and `adopt_real_uid` put the node
+back where Drive had it. The move was lost on Drive and in the tree.
+
+The same seed showed a second fault. When a folder made offline landed, the nodes in it still
+named the folder's placeholder uid as their parent in memory. The next write of one of them put
+the placeholder back on its row.
+
+**Fix.** The drain passes where it sent the create and where it landed (a conflict name, or the
+root when the folder was gone) to `finish_create`. When the row names another parent or name than
+it was sent with, the same transaction queues a rename of the real uid to it, with the landed
+parent and name as the original ones. `adopt_real_uid` keeps the tree's name and parent while
+that rename is queued. When a node lands, its children's parent is changed to its real uid.
+
+**Test:** the unit test `a_rename_made_while_its_create_uploads_is_queued_for_the_landed_node`.
+Seed 3 of one-client-flaky passes.
+
 ## B135 — A file just moved is sometimes not found by its new path
 
 **Status:** Fixed (unverified).

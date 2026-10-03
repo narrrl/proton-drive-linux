@@ -33,7 +33,8 @@ use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{
-    OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_EXPIRY_MS, PendingOp, RenameMeta,
+    CreateLanding, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_EXPIRY_MS,
+    PendingOp, RenameMeta,
 };
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
@@ -851,6 +852,7 @@ impl Core {
         // create was queued because nobody heard back, so adopt it. And a node
         // whose trash is still queued is about to let go of it.
         let mut name = wanted.clone();
+        let mut home = parent.clone();
         let mut adopted = false;
         let mut real = self.create_drained_node(op, &parent, &name);
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
@@ -893,6 +895,7 @@ impl Core {
                 name = conflict_name(&wanted, now_secs());
                 real = self.create_drained_node(op, &root, &name);
             }
+            home = root;
             if real.is_ok() {
                 self.log_activity(
                     ActivityKind::Upload,
@@ -910,7 +913,13 @@ impl Core {
         // An adopted node was made empty, so a blob this op carries has not been
         // uploaded: it goes on as a revision of the node instead.
         let uploaded = (!adopted).then_some(op.blob_path.as_deref()).flatten();
-        let newer = self.retire_create(op, uploaded, &local, &real)?;
+        let landing = CreateLanding {
+            local: &local.to_string(),
+            real: &real.to_string(),
+            sent: (parent_str, &wanted),
+            landed: (&home.to_string(), &name),
+        };
+        let newer = self.retire_create(op, uploaded, &landing, &local, &real)?;
         // The uploaded blob is the new file's content, so it becomes the cached
         // content, as for a revision. A partial write fills its gaps from it;
         // without it the next write open was refused (`docs/BUGS.md` B123).
@@ -1056,19 +1065,17 @@ impl Core {
         &self,
         op: &PendingOp,
         uploaded: Option<&str>,
+        landing: &CreateLanding<'_>,
         local: &NodeUid,
         real: &NodeUid,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let real_str = real.to_string();
         let newer = {
             let mut pending = self.pending.lock();
-            let newer =
-                self.db
-                    .finish_create(op.id, uploaded, &local.to_string(), &real_str, |json| {
-                        let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
-                        meta.uid = real_str.clone();
-                        serde_json::to_string(&meta).ok()
-                    })?;
+            let newer = self.db.finish_create(op.id, uploaded, landing, |json| {
+                let mut meta: StagedWrite = serde_json::from_str(json).ok()?;
+                meta.uid = landing.real.to_string();
+                serde_json::to_string(&meta).ok()
+            })?;
             pending.remove(local);
             if let Some((blob, json)) = &newer {
                 let meta: StagedWrite = serde_json::from_str(json)?;
@@ -1090,6 +1097,15 @@ impl Core {
                 st.by_uid.insert(real.clone(), ino);
                 if let Some(e) = st.entries.get_mut(&ino) {
                     e.uid = real.clone();
+                }
+                // Its children still name the placeholder as their parent, and
+                // the next write of one would put it back on the row.
+                for kid in st.children.get(&ino).cloned().unwrap_or_default() {
+                    if let Some(e) = st.entries.get_mut(&kid)
+                        && e.node.parent_uid.as_ref() == Some(local)
+                    {
+                        e.node.parent_uid = Some(real.clone());
+                    }
                 }
             }
             for aw in st.active_writes.values_mut() {
@@ -1156,9 +1172,13 @@ impl Core {
         adopt: impl FnOnce(&Node),
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Drive answers a create before it lists the new node.
-        let node = self
+        let mut node = self
             .read_back(real)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
+        // A rename made while the create was on the wire is queued against the
+        // real uid (`Db::finish_create`). Until it lands, the tree keeps the
+        // name and folder the user gave it.
+        let renaming = self.db.has_pending_op(&real.to_string(), OP_RENAME)?;
         // Before open handles are rebased onto the node, so one released in
         // between finds what `adopt` keeps (`docs/BUGS.md` B123).
         adopt(&node);
@@ -1174,6 +1194,10 @@ impl Core {
             let Some(&ino) = st.by_uid.get(real) else {
                 return;
             };
+            if renaming && let Some(e) = st.entries.get(&ino) {
+                node.name = e.node.name.clone();
+                node.parent_uid = e.node.parent_uid.clone();
+            }
             let mut landed = node.clone();
             st.keep_open_write_size(ino, &mut landed);
             if let Some(e) = st.entries.get_mut(&ino) {

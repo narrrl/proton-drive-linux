@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **A file renamed or moved while its first upload is on the wire keeps its new name and folder.**
+  It landed under the old name and the rename was lost (B136).
+
 ## [2.9.0] — 2026-10-03
 
 Schema: **35** (unchanged). Requires `proton-drive-rs` **0.7.2**.

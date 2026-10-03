@@ -2853,6 +2853,7 @@ fn a_write_attached_while_its_create_uploads_becomes_a_revision() {
     let db = Db::open_in_memory().unwrap();
     let local = "local~abc";
     let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
     let create = |blob: Option<&str>| PendingOp {
         id: 0,
         kind: OP_CREATE.to_string(),
@@ -2874,9 +2875,12 @@ fn a_write_attached_while_its_create_uploads_becomes_a_revision() {
         .expect("create is still queued");
 
     let newer = db
-        .finish_create(id, None, local, &real, |json| {
-            Some(json.replace("local~abc", "vol~real"))
-        })
+        .finish_create(
+            id,
+            None,
+            &landing(local, &real, &parent, "new.txt"),
+            |json| Some(json.replace("local~abc", "vol~real")),
+        )
         .unwrap();
 
     assert_eq!(
@@ -2899,6 +2903,7 @@ fn a_create_whose_blob_landed_is_retired() {
     let db = Db::open_in_memory().unwrap();
     let local = "local~abc";
     let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
     let (id, _) = db
         .enqueue_op(&PendingOp {
             id: 0,
@@ -2930,15 +2935,76 @@ fn a_create_whose_blob_landed_is_retired() {
     .unwrap();
 
     let newer = db
-        .finish_create(id, Some("/staging/sent"), local, &real, |_| {
-            panic!("an unchanged create has no sidecar to rewrite")
-        })
+        .finish_create(
+            id,
+            Some("/staging/sent"),
+            &landing(local, &real, &parent, "new.txt"),
+            |_| panic!("an unchanged create has no sidecar to rewrite"),
+        )
         .unwrap();
 
     assert_eq!(newer, None);
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops.len(), 1, "only the child is left");
     assert_eq!(ops[0].parent_uid.as_deref(), Some(real.as_str()));
+}
+
+/// The parent and name a create was sent with, landing where it was sent.
+fn landing<'a>(local: &'a str, real: &'a str, parent: &'a str, name: &'a str) -> CreateLanding<'a> {
+    CreateLanding {
+        local,
+        real,
+        sent: (parent, name),
+        landed: (parent, name),
+    }
+}
+
+#[test]
+fn a_rename_made_while_its_create_uploads_is_queued_for_the_landed_node() {
+    let db = Db::open_in_memory().unwrap();
+    let local = "local~abc";
+    let real = uid("real").to_string();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("parent").to_string()),
+            name: Some("new.txt".to_string()),
+            blob_path: Some("/staging/sent".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    // The drain took the create; the user moves the file into a folder that
+    // is itself still queued.
+    db.rewrite_op_target(local, "local~dir", "moved.txt")
+        .unwrap();
+
+    let mut landed = landing(local, &real, &parent, "new.txt");
+    landed.landed.1 = "new (conflict).txt";
+    db.finish_create(id, Some("/staging/sent"), &landed, |_| None)
+        .unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "the move outlives the create");
+    assert_eq!(ops[0].kind, OP_RENAME);
+    assert_eq!(ops[0].uid, real);
+    assert_eq!(ops[0].parent_uid.as_deref(), Some("local~dir"));
+    assert_eq!(ops[0].name.as_deref(), Some("moved.txt"));
+    let meta: RenameMeta = serde_json::from_str(ops[0].meta_json.as_deref().unwrap()).unwrap();
+    assert_eq!(meta.original_parent_uid, uid("parent").to_string());
+    assert_eq!(meta.original_name.as_deref(), Some("new (conflict).txt"));
+
+    // The folder lands next and the move follows it.
+    db.remap_local_uid("local~dir", &uid("dir").to_string())
+        .unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops[0].parent_uid, Some(uid("dir").to_string()));
 }
 
 #[test]
@@ -3002,8 +3068,12 @@ fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
     db.finish_create(
         id,
         None,
-        &local.to_string(),
-        &uid("real").to_string(),
+        &landing(
+            &local.to_string(),
+            &uid("real").to_string(),
+            &uid("root").to_string(),
+            "New folder",
+        ),
         |_| None,
     )
     .unwrap();

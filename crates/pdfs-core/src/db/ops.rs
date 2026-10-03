@@ -228,6 +228,28 @@ pub struct PendingCounts {
 /// is retrying at the slowest rate it ever will and has been for minutes.
 pub const FAILING_ATTEMPTS: i64 = 6;
 
+/// A queued create that has landed, for [`Db::finish_create`].
+#[derive(Debug, Clone, Copy)]
+pub struct CreateLanding<'a> {
+    /// The placeholder the node was known by.
+    pub local: &'a str,
+    /// The uid Drive gave it.
+    pub real: &'a str,
+    /// The parent and name the op held when the drain took it.
+    pub sent: (&'a str, &'a str),
+    /// The parent and name the node has on Drive. They differ from `sent`
+    /// when the name was taken or the folder was gone.
+    pub landed: (&'a str, &'a str),
+}
+
+struct CreateRow {
+    blob: Option<String>,
+    meta: Option<String>,
+    parent_uid: Option<String>,
+    name: Option<String>,
+    created_at: i64,
+}
+
 /// The outcome of folding freshly written bytes into a queued create.
 #[derive(Debug, Clone)]
 pub struct AttachedBlob {
@@ -401,27 +423,44 @@ impl Db {
     /// becomes a revision of `real` instead, with its sidecar passed through
     /// `rewrite` so it names the real node. Returns that blob and sidecar, or
     /// `None` when the create is simply done.
+    ///
+    /// A rename while the create is on the wire rewrites the row's target
+    /// ([`Db::rewrite_op_target`]), which the create no longer reads. When the
+    /// row names another parent or name than `landing.sent`, a rename of `real`
+    /// to that target is queued in the same transaction, or the move would be
+    /// lost with the row.
     pub fn finish_create(
         &self,
         id: i64,
         uploaded: Option<&str>,
-        local: &str,
-        real: &str,
+        landing: &CreateLanding<'_>,
         rewrite: impl FnOnce(&str) -> Option<String>,
     ) -> Result<Option<(String, String)>> {
+        let (local, real) = (landing.local, landing.real);
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let row: Option<(Option<String>, Option<String>)> = tx
+        let row: Option<CreateRow> = tx
             .query_row(
-                "SELECT blob_path, meta_json FROM pending_op WHERE id = ?1",
+                "SELECT blob_path, meta_json, parent_uid, name, created_at
+                 FROM pending_op WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    Ok(CreateRow {
+                        blob: r.get(0)?,
+                        meta: r.get(1)?,
+                        parent_uid: r.get(2)?,
+                        name: r.get(3)?,
+                        created_at: r.get(4)?,
+                    })
+                },
             )
             .optional()?;
-        let newer = match row {
-            Some((Some(blob), Some(meta))) if uploaded != Some(blob.as_str()) => {
-                rewrite(&meta).map(|meta| (blob, meta))
-            }
+        let newer = match &row {
+            Some(CreateRow {
+                blob: Some(blob),
+                meta: Some(meta),
+                ..
+            }) if uploaded != Some(blob.as_str()) => rewrite(meta).map(|meta| (blob.clone(), meta)),
             _ => None,
         };
         match &newer {
@@ -437,6 +476,28 @@ impl Db {
             None => {
                 tx.execute("DELETE FROM pending_op WHERE id = ?1", params![id])?;
             }
+        }
+        if let Some(CreateRow {
+            parent_uid: Some(parent),
+            name: Some(name),
+            created_at,
+            ..
+        }) = &row
+            && (parent.as_str(), name.as_str()) != landing.sent
+        {
+            let meta = serde_json::to_string(&RenameMeta {
+                original_parent_uid: landing.landed.0.to_string(),
+                original_name: Some(landing.landed.1.to_string()),
+            })?;
+            tx.execute(
+                "DELETE FROM pending_op WHERE uid = ?1 AND kind = ?2",
+                params![real, OP_RENAME],
+            )?;
+            tx.execute(
+                "INSERT INTO pending_op (kind, uid, parent_uid, name, meta_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![OP_RENAME, real, parent, name, meta, created_at],
+            )?;
         }
         tx.execute(
             "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
