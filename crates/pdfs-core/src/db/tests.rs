@@ -3304,8 +3304,37 @@ fn migration_v36_gives_every_node_its_rowid_as_lid() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A database as 2.8.2 wrote it (`sqlite3 .dump`, schema 35), with queued ops
+/// in every state the drain leaves them in: due, parked, failing, deferred for
+/// access, and claimed by a worker when the daemon stopped. The creates below
+/// a folder made offline still name their parent by its `local~` placeholder.
+#[test]
+fn a_2_8_database_migrates_with_every_node_and_op_intact() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-2.8.2-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/v2.8.2.sql"))
+        .unwrap();
+    let (nodes, ops) = migrates_intact(&path);
+    assert_eq!((nodes, ops), (8, 6));
+    let db = Db::open(&path).unwrap();
+    let queued = db.pending_ops().unwrap();
+    let inner = queued.iter().find(|op| op.uid == "local~inner").unwrap();
+    assert_eq!(inner.parent_uid.as_deref(), Some("local~dir"));
+    let parked = db.parked_create_ops().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].name.as_deref(), Some("movie.part"));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The same migration over a copy of a database a released build wrote, which
-/// the fixture above cannot stand in for: years of rows, every kind of op, and
+/// the fixtures above cannot stand in for: years of rows, every kind of op, and
 /// whatever shapes real use left behind. The copy is taken with `VACUUM INTO`
 /// over a read-only connection, so the database named is never written.
 ///
@@ -3317,25 +3346,20 @@ fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
     let source = std::env::var("PDFS_MIGRATE_DB").expect("set PDFS_MIGRATE_DB");
     let path = std::env::temp_dir().join(format!("pdfs-db-real-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    type Op = (
-        i64,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-    );
-    let (version, nodes, ops) = {
-        let conn = rusqlite::Connection::open_with_flags(
-            &source,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
+    rusqlite::Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+        .execute("VACUUM INTO ?1", rusqlite::params![path.to_str().unwrap()])
         .unwrap();
-        conn.execute("VACUUM INTO ?1", rusqlite::params![path.to_str().unwrap()])
-            .unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
+    let (nodes, ops) = migrates_intact(&path);
+    eprintln!("{nodes} nodes, {ops} queued ops");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Opens the database at `path` and checks that the migration kept every node
+/// on its row id and every queued op as it was. Returns how many of each.
+fn migrates_intact(path: &std::path::Path) -> (usize, usize) {
+    let (version, nodes, ops, sealed) = {
+        let conn = rusqlite::Connection::open(path).unwrap();
         let version: String = conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = 'schema_version'",
@@ -3350,54 +3374,32 @@ fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
             .unwrap()
             .map(|row| row.unwrap())
             .collect();
-        let ops: Vec<Op> = conn
-            .prepare(
-                "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, attempts
-                 FROM pending_op ORDER BY id",
-            )
-            .unwrap()
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            })
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        (version, nodes, ops)
+        let ops = rows(&conn, QUEUED);
+        let sealed = rows(&conn, "SELECT * FROM own_sealed_rev ORDER BY uid");
+        (version, nodes, ops, sealed)
     };
-    eprintln!(
-        "schema {version}: {} nodes, {} queued ops",
-        nodes.len(),
-        ops.len()
-    );
-
-    let db = Db::open(&path).unwrap();
-    let migrated: Vec<Op> = db
-        .pending_ops()
-        .unwrap()
-        .into_iter()
-        .map(|op| {
-            (
-                op.id,
-                op.kind,
-                op.uid,
-                op.parent_uid,
-                op.name,
-                op.blob_path,
-                op.meta_json,
-                op.attempts,
+    let db = Db::open(path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(
+            rows(&conn, QUEUED),
+            ops,
+            "every queued op survives as it was, parked, failing or deferred"
+        );
+        // A claim names a drain worker of the daemon that wrote the file.
+        let claimed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_op WHERE claimed_at <> 0",
+                [],
+                |r| r.get(0),
             )
-        })
-        .collect();
-    assert_eq!(migrated, ops, "every queued op survives as it was");
+            .unwrap();
+        assert_eq!(claimed, 0, "a stopped daemon's claims are released");
+        assert_eq!(
+            rows(&conn, "SELECT * FROM own_sealed_rev ORDER BY uid"),
+            sealed
+        );
+    }
     if version.parse::<i64>().unwrap() < 36 {
         for (uid, rowid) in &nodes {
             assert_eq!(db.lid_of(uid).unwrap(), Some(*rowid), "{uid}");
@@ -3409,8 +3411,8 @@ fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
     }
     drop(db);
 
-    let db = Db::open(&path).unwrap();
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    let db = Db::open(path).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
         .unwrap();
@@ -3424,7 +3426,22 @@ fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION.to_string());
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    (nodes.len(), ops.len())
+}
+
+/// Every column of the queue but the drain's claim.
+const QUEUED: &str = "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                             attempts, last_error, next_attempt_at, access_deferred_since
+                      FROM pending_op ORDER BY id";
+
+/// Every row `query` returns, every column.
+fn rows(conn: &rusqlite::Connection, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut stmt = conn.prepare(query).unwrap();
+    let columns = stmt.column_count();
+    stmt.query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
 }
 
 #[test]
