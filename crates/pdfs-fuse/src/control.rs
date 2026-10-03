@@ -315,6 +315,9 @@ impl Drop for RefreshGuard {
 pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) -> CtlResponse {
     let pins = core.cache.list_pins();
     let queued = core.db.pending_op_counts().unwrap_or_default();
+    // Read after the queue: the drain counts an upload as landing before it
+    // retires the op, so one of the two always has it (B119).
+    let landing = core.landing_uploads.load(Ordering::SeqCst);
     let staging = core.cache.staging_usage();
     CtlResponse::Status {
         parked_uploads: queued.parked.max(0) as u64,
@@ -331,7 +334,7 @@ pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) ->
         budget: core.cache.budget(),
         pins,
         online: core.online.load(Ordering::Relaxed),
-        pending_uploads: queued.uploads.max(0) as u64,
+        pending_uploads: queued.uploads.max(0) as u64 + landing,
         pending_changes: queued.changes.max(0) as u64,
     }
 }

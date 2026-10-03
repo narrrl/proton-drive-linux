@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -110,6 +110,23 @@ impl Drop for UploadCancel {
         {
             registry.remove(&self.uid);
         }
+    }
+}
+
+/// One upload counted in [`Core::landing_uploads`] from its op's retirement
+/// until its bytes are cached, and uncounted when dropped, early return or not.
+struct LandingUpload(Arc<AtomicU64>);
+
+impl LandingUpload {
+    fn begin(count: &Arc<AtomicU64>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for LandingUpload {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1635,6 +1652,14 @@ impl Core {
         // is what the next write's debounce is scaled from.
         self.record_upload_time(&uid, took);
 
+        // Still pending to whoever asks until the bytes are cached below, and
+        // counted before the op goes so the status never reads empty in between.
+        // An empty queue is how a script or the app knows a written file reads
+        // without the network; retiring the op alone left the read-back's round
+        // trip in which it did not (B119). The op itself has to go first: one
+        // restored after a crash would re-send a revision this daemon has not
+        // yet recorded as its own, and come back as a conflict copy.
+        let _landing = LandingUpload::begin(&self.landing_uploads);
         // Retire the op before dropping the blob: a crash between the two leaves
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
@@ -2335,6 +2360,22 @@ mod tests {
         // the cache has no cap.
         assert!(keeps_landed_upload(true, 4 * GIB, budget));
         assert!(keeps_landed_upload(false, 4 * GIB, 0));
+    }
+
+    #[test]
+    fn a_landing_upload_counts_until_its_guard_goes() {
+        let count = Arc::new(AtomicU64::new(0));
+        let first = LandingUpload::begin(&count);
+        let landed = || -> Result<(), ()> {
+            let _second = LandingUpload::begin(&count);
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+            Err(())
+        };
+        // Uncounted on an early return too, or the queue never reads empty.
+        assert!(landed().is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     fn baseline(mtime: i64, size: u64, rev: Option<&str>) -> Baseline {

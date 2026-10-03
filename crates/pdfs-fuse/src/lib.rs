@@ -575,6 +575,12 @@ struct Core {
     /// replaces. Read by the upload's own reader ([`CountingReader`]), which is
     /// the one thing the SDK calls often enough to notice.
     upload_cancel: Arc<Mutex<HashMap<NodeUid, Arc<AtomicBool>>>>,
+    /// Uploads whose op is retired but whose bytes the content cache has not
+    /// adopted yet, because the revision just sealed is still being read back.
+    /// The status counts them as pending, so an empty queue means every file
+    /// written through the mount reads without the network (`docs/BUGS.md`
+    /// B119).
+    landing_uploads: Arc<AtomicU64>,
     /// True while a background refresh of the photos timeline (resp. the trash) is
     /// already running, so a burst of page requests against a stale listing kicks
     /// off one refresh rather than one per request.
@@ -8622,6 +8628,24 @@ mod tests {
         let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
         let upload = &drain[drain.find("begin_cancellable_upload").unwrap()..];
         assert_before(upload, "self.db.op_exists(op.id)", "File::open(&blob)");
+    }
+
+    #[test]
+    fn a_landed_upload_stays_pending_until_its_bytes_are_cached() {
+        let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
+        assert_before(
+            drain,
+            "let _landing = LandingUpload::begin(&self.landing_uploads)",
+            "self.db.delete_op(op.id)",
+        );
+        assert_before(drain, "self.db.delete_op(op.id)", ".store_file(&uid,");
+        let status = function_source(include_str!("control.rs"), "fn status_response(");
+        assert_before(
+            status,
+            "core.db.pending_op_counts()",
+            "core.landing_uploads.load(",
+        );
+        assert!(status.contains("queued.uploads.max(0) as u64 + landing"));
     }
 
     #[test]

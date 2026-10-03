@@ -75,7 +75,8 @@ offline catches this race, and B117, if either comes back.
 
 ## B119 — Reading a file just written through the mount needs the network
 
-**Status:** Fixed (verified 2026-10-03: "regression B119" passed in My files on the account run).
+**Status:** Fixed (unverified since the second fix below; "regression B119" passed on one account
+run of 2026-10-03 and failed on the next).
 **Found:** 2026-10-02, by the account run on flaky Wi-Fi, which crashed at its very end. The
 run's last step reads back a file it wrote to compare digests. The Wi-Fi had dropped, the read
 waited for `open_revision` for 120 seconds and then failed with `EIO`, and the suite stopped with
@@ -96,9 +97,25 @@ discarded unless it is pinned, so one large upload cannot push the rest of the c
 is kept when the read-back fails or reports a different size. The suite records a failed end-of-run
 read-back as a failed check instead of crashing.
 
-**Test:** the drain test `a_landed_upload_stays_cached_unless_it_would_crowd_the_cache_out`, and
-the acceptance case "regression B119", which writes two files, waits for the queue and expects
-`pdfs ls` to list both as cached.
+**Found again** on 2026-10-03, by "regression B119" on an account run over a slow link (uploads of
+a few bytes took 1.4 seconds). The case failed with "block.bin not cached after the upload" at the
+same second the journal logged that upload as landed.
+
+**Cause, second part.** The drain retired the op first, and only then read the node back and
+linked the blob into the cache. For that one round trip the status reported an empty queue for a
+file that was not yet cached. Anything that waits for an empty queue before reading could still
+need the network.
+
+**Fix, second part.** `Core::landing_uploads` counts an upload from just before its op is retired
+until its bytes are cached, and the status adds it to `pending_uploads`. The status reads the
+queue before the count, so it always sees the upload in one of them. The op still goes first: an
+op restored after a crash would re-send a revision this daemon has not yet recorded as its own,
+and `revision_conflict` would keep it as a conflict copy.
+
+**Test:** the drain tests `a_landed_upload_stays_cached_unless_it_would_crowd_the_cache_out` and
+`a_landing_upload_counts_until_its_guard_goes`, `a_landed_upload_stays_pending_until_its_bytes_are_cached`
+in `lib.rs`, and the acceptance case "regression B119", which writes two files, waits for the
+queue and expects `pdfs ls` to list both as cached.
 
 ## B118 — Creating a file or folder through the mount can fail with `ENOENT` although it was made
 

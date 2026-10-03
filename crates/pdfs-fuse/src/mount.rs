@@ -391,6 +391,7 @@ pub fn mount(
         shutdown: Arc::new(crate::shutdown::Shutdown::default()),
         upload_times: Arc::new(Mutex::new(HashMap::new())),
         upload_cancel: Arc::new(Mutex::new(HashMap::new())),
+        landing_uploads: Arc::new(AtomicU64::new(0)),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         timeline_progress: Arc::new(Mutex::new(None)),
         similar_hashing: Arc::new(AtomicBool::new(false)),
