@@ -99,7 +99,7 @@ jobs:
           save-if: false
 
       - name: Simulation runs
-        run: cargo test -p pdfs-fuse --lib --locked sim:: -- --ignored --test-threads=1
+        run: 'cargo test -p pdfs-fuse --lib --locked sim:: -- --ignored --test-threads=1'
 
   # Keeps the release-profile dependencies cached on main, where the release
   # workflow can restore them; a tag cannot reuse the caches of earlier tags.
