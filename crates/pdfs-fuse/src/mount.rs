@@ -440,7 +440,6 @@ pub(crate) fn mount_with(
         trash_progress: Arc::new(tokio::sync::Notify::new()),
         conflict_notified: Arc::new(Mutex::new(HashSet::new())),
         sweep_mode,
-        own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),
         self_changes: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         thumb_gen_budget: Arc::new(tokio::sync::Semaphore::new(

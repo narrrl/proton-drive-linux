@@ -620,18 +620,6 @@ struct Core {
     /// ([`AppConfig::resolved_conflict_sweep`]); [`SweepMode::Off`] means the
     /// sweep thread is never spawned at all. See `docs/BUGS.md` B71.
     sweep_mode: SweepMode,
-    /// The latest server revision id this daemon has itself sealed, keyed by
-    /// node. A queued write whose baseline names an *earlier* revision would
-    /// normally fork into a `(sync-conflict)` copy when the drain finds the
-    /// remote already moved on — but if the remote sits at a revision *we*
-    /// sealed, no other device touched the file: it is a single-writer
-    /// stall→resume (a browser download that closed and reopened its fd, then
-    /// rewrote the whole file). [`Core::revision_conflict`] consults this to
-    /// adopt our own revision as the base and supersede instead of forking
-    /// (docs/BUGS.md B70, layer B). One entry per written node, overwritten as
-    /// the node advances and dropped when it is trashed; lost on restart, which
-    /// only widens the (already narrow) fork window across a daemon bounce.
-    own_sealed_revs: Arc<Mutex<HashMap<NodeUid, String>>>,
     /// Photos whose missing thumbnail is being generated right now. A tile that is
     /// still on screen asks for its thumbnail again every few seconds, and each of
     /// those downloads is a full-size photo — so an in-flight uid is never started
@@ -3650,23 +3638,27 @@ impl Core {
         new_parent_uid: &NodeUid,
         new_name: &str,
     ) -> Result<(), Errno> {
-        let original_parent_uid = match self.db.pending_op_meta(&uid.to_string(), OP_RENAME) {
-            Ok(Some(json)) => serde_json::from_str::<RenameMeta>(&json)
-                .map(|meta| meta.original_parent_uid)
-                .map_err(|error| {
-                    error!(%uid, %error, "queued rename authority metadata is invalid");
-                    Errno::EIO
-                })?,
-            Ok(None) => old_parent_uid.to_string(),
+        // A rename that replaces a queued one keeps where the node started.
+        let meta = match self.db.pending_op_meta(&uid.to_string(), OP_RENAME) {
+            Ok(Some(json)) => serde_json::from_str::<RenameMeta>(&json).map_err(|error| {
+                error!(%uid, %error, "queued rename authority metadata is invalid");
+                Errno::EIO
+            })?,
+            Ok(None) => RenameMeta {
+                original_parent_uid: old_parent_uid.to_string(),
+                original_name: self
+                    .state
+                    .lock()
+                    .entries
+                    .get(&ino)
+                    .map(|entry| entry.node.name.clone()),
+            },
             Err(error) => {
                 error!(%uid, %error, "reading queued rename authority failed");
                 return Err(Errno::EIO);
             }
         };
-        let meta_json = serde_json::to_string(&RenameMeta {
-            original_parent_uid,
-        })
-        .map_err(|error| {
+        let meta_json = serde_json::to_string(&meta).map_err(|error| {
             error!(%uid, %error, "serializing queued rename authority failed");
             Errno::EIO
         })?;

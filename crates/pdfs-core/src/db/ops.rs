@@ -45,6 +45,12 @@ pub const OP_RENAME: &str = "rename";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenameMeta {
     pub original_parent_uid: String,
+    /// The node's name on Drive when the first of its queued renames was made,
+    /// kept across the renames that replace the row, like the parent. With it
+    /// the drain knows where the node should still be when the op lands.
+    /// `None` on a row queued before this field existed.
+    #[serde(default)]
+    pub original_name: Option<String>,
 }
 
 /// The `kind` of a [`PendingOp`] that trashes a node the server knows about

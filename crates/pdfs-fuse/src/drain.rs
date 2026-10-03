@@ -676,6 +676,15 @@ impl Core {
                 return Ok(());
             }
         };
+        if let Some(meta) = op.meta_json.as_deref() {
+            let meta: RenameMeta = serde_json::from_str(meta)?;
+            if moved_elsewhere(&meta, &node, &parent, &name) {
+                // Someone moved or renamed it while ours was queued. Ours still
+                // wins, as the last change does on Drive.
+                info!(%uid, from = %node.name, to = %name,
+                      "node moved remotely while its rename was queued");
+            }
+        }
         let landed = if node.parent_uid.as_ref() == Some(&parent) {
             self.drain_rename_in_place(&uid, &node.name, &name)?
         } else {
@@ -818,7 +827,6 @@ impl Core {
             Err(e) => return Err(e.into()),
         }
         self.db.complete_trash_op(op.id, &uid)?;
-        self.own_sealed_revs.lock().remove(&uid);
         if let Err(e) = self.db.clear_own_sealed_rev(&uid.to_string()) {
             debug!(%uid, error = %e, "clearing the sealed-revision record failed");
         }
@@ -1227,16 +1235,11 @@ impl Core {
         // instead of forking — so the finished bytes win the name rather than
         // being exiled to a `(sync-conflict)` copy.
         let remote_rev = node_revision_id(&node);
-        // In memory first, then the table it is written through to: the map is
-        // this process's cache of it, and after a restart only the table has
-        // the answer (which is the whole reason it is persisted).
-        let own_rev = match self.own_sealed_revs.lock().get(uid).cloned() {
-            Some(rev) => Some(rev),
-            None => self
-                .db
-                .own_sealed_rev(&uid.to_string(), now_millis())
-                .unwrap_or_default(),
-        };
+        // The table, so the answer survives a restart (`own_sealed_rev`).
+        let own_rev = self
+            .db
+            .own_sealed_rev(&uid.to_string(), now_millis())
+            .unwrap_or_default();
         if is_own_self_supersede(meta.complete, remote_rev.as_deref(), own_rev.as_deref()) {
             debug!(%uid, ?remote_rev,
                    "queued write chains onto our own sealed revision; not a conflict");
@@ -1753,10 +1756,9 @@ impl Core {
             // change and does not fork (B70 layer B; consulted in
             // `revision_conflict`).
             if let Some(rev) = node_revision_id(&node) {
-                self.own_sealed_revs.lock().insert(uid.clone(), rev.clone());
-                // Write through: losing this at shutdown reopened the fork
-                // window B70 layer B closed, for the first drain after a
-                // restart.
+                // In the table, not in memory: losing it at shutdown reopened
+                // the fork window B70 layer B closed, for the first drain
+                // after a restart.
                 if let Err(e) = self
                     .db
                     .set_own_sealed_rev(&uid.to_string(), &rev, now_millis())
@@ -1886,6 +1888,20 @@ fn revision_changed(base: &Baseline, node: &Node) -> Option<String> {
 /// (there is nothing to prove it was ours), so absence falls through to a fork.
 fn is_own_self_supersede(complete: bool, remote_rev: Option<&str>, own_rev: Option<&str>) -> bool {
     complete && remote_rev.is_some() && remote_rev == own_rev
+}
+
+/// Whether Drive has `node` neither where its queued rename found it nor where
+/// the rename takes it (`parent`, `name`), so someone else moved or renamed it
+/// in between. Unknown on a row without the original name.
+fn moved_elsewhere(meta: &RenameMeta, node: &Node, parent: &NodeUid, name: &str) -> bool {
+    let Some(original_name) = meta.original_name.as_deref() else {
+        return false;
+    };
+    let at = |parent: &str, name: &str| {
+        node.parent_uid.as_ref().map(ToString::to_string).as_deref() == Some(parent)
+            && node.name == name
+    };
+    !at(&meta.original_parent_uid, original_name) && !at(&parent.to_string(), name)
 }
 
 /// What the park sweep does with one parked create whose node still exists.
@@ -2059,6 +2075,7 @@ mod tests {
         op.meta_json = Some(
             serde_json::to_string(&RenameMeta {
                 original_parent_uid: source.uid.to_string(),
+                original_name: Some(moved.name.clone()),
             })
             .unwrap(),
         );
