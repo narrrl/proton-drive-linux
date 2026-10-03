@@ -766,17 +766,19 @@ impl Core {
             uid: uid.clone(),
             target_name: target_name.map(str::to_string),
         };
-        self.rt.block_on(async {
-            let mut outcomes =
-                std::pin::pin!(self.client.move_nodes_streaming(vec![item], parent.clone()));
-            match outcomes.next().await {
-                Some(Ok((_, outcome))) => outcome,
-                Some(Err(e)) => Err(e),
-                None => Err(ProtonError::invalid_operation(format!(
-                    "move of {uid} reported no outcome"
-                ))),
-            }
-        })
+        self.rt
+            .block_on(async {
+                let mut outcomes =
+                    std::pin::pin!(self.client.move_nodes_streaming(vec![item], parent.clone()));
+                match outcomes.next().await {
+                    Some(Ok((_, outcome))) => outcome,
+                    Some(Err(e)) => Err(e),
+                    None => Err(ProtonError::invalid_operation(format!(
+                        "move of {uid} reported no outcome"
+                    ))),
+                }
+            })
+            .inspect(|()| self.forget_sdk_node(uid))
     }
 
     /// Apply a queued trash to the remote.

@@ -241,6 +241,12 @@ eight times through the mount. On a mount it also does so three times with
 `pdfs rename`, after the queue is empty, so the renames race nothing but Drive.
 It runs against the reference too.
 
+**B121** (a file renamed and moved at once lands) renames a file, moves it into
+a subfolder and renames it back across folders through the mount, with no pause
+between the steps. On a mount it then runs `pdfs rename` and `pdfs move` back to
+back. The file must end up where it was sent, with its bytes, and the case
+reports how long each half took. It runs against the reference too.
+
 **B98** (an upload superseded by a write ends) writes 64 MiB and waits for its
 upload to show in `pdfs transfers`, then appends to the file. The queue must
 drain, the old upload must leave the transfer list, and the file must hold
@@ -331,8 +337,8 @@ bug is open at the moment. B114 to B117 started as such cases.
 A full account run with `--journal-check` checks these `docs/BUGS.md` entries,
 many of them fixed but not yet verified:
 
-- B48, B80, B94, B95, B98, B100, B101, B102, B111, B114, B115, B116, B117 and
-  B119, each with its own `regression B<n>` case.
+- B48, B80, B94, B95, B98, B100, B101, B102, B111, B114, B115, B116, B117, B119
+  and B121, each with its own `regression B<n>` case.
 - B118, with "application workloads" and "block boundaries", which failed on
   it. It needs Drive to be slow to list a new node, so a clean run is weak
   evidence.

@@ -1608,13 +1608,53 @@ fn prepare_shared_roots(
 }
 
 impl Core {
-    /// Rename `uid` on Drive, riding out a stale "out of date" answer that
-    /// follows an earlier rename of the same node. See [`retry_stale_rename`].
+    /// Rename `uid` on Drive, riding out an "out of date" answer from a stale
+    /// name hash. See [`retry_out_of_date`].
     pub(crate) fn rename_remote(&self, uid: &NodeUid, name: &str) -> Result<(), ProtonError> {
-        retry_stale_rename(
-            || self.block_on_bounded(self.client.rename_node(uid, name, None)),
-            || std::thread::sleep(RENAME_RETRY_DELAY),
-        )
+        self.change_remote(uid, || {
+            self.block_on_bounded(self.client.rename_node(uid, name, None))
+        })
+    }
+
+    /// Move `uid` into the folder `parent` on Drive, like [`Core::rename_remote`].
+    pub(crate) fn move_remote(&self, uid: &NodeUid, parent: &NodeUid) -> Result<(), ProtonError> {
+        self.change_remote(uid, || {
+            self.block_on_bounded(self.client.move_node(uid, parent))
+        })
+    }
+
+    /// Run a rename or move of `uid`, then drop the SDK's now stale copy of it.
+    fn change_remote(
+        &self,
+        uid: &NodeUid,
+        call: impl FnMut() -> Result<(), ProtonError>,
+    ) -> Result<(), ProtonError> {
+        retry_out_of_date(call, || {
+            self.forget_sdk_node(uid);
+            std::thread::sleep(OUT_OF_DATE_RETRY_DELAY);
+        })
+        .inspect(|()| self.forget_sdk_node(uid))
+    }
+
+    /// Drop the SDK's cached copy of `uid` after this daemon renamed or moved it.
+    ///
+    /// The SDK sends a node's name hash from its entity cache, and nothing but
+    /// the event feed's echo of the change refreshes that entry. Until the next
+    /// poll, up to [`POLL_INTERVAL`] later, each rename or move of the node would
+    /// send the old hash and Drive would refuse it as out of date (docs/BUGS.md
+    /// B121). Feeding the SDK the echo now makes the next call read the link.
+    pub(crate) fn forget_sdk_node(&self, uid: &NodeUid) {
+        let changed = DriveEvent::NodeUpdated {
+            id: DriveEventId::from("pdfs-local-change"),
+            node_uid: uid.clone(),
+            parent_node_uid: None,
+            is_trashed: false,
+            is_shared: false,
+        };
+        if let Err(error) = self.block_on_bounded(self.client.invalidate_caches_for_event(&changed))
+        {
+            debug!(%uid, %error, "could not drop the SDK's cached node");
+        }
     }
 
     /// Record that this daemon just changed `uid` on the remote, so the event
@@ -4619,8 +4659,7 @@ impl Core {
             .get(&ino)
             .map(|entry| entry.node.name.clone())
             .unwrap_or_default();
-        self.rt
-            .block_on(self.client.move_node(&uid, &new_parent_uid))
+        self.move_remote(&uid, &new_parent_uid)
             .map_err(|e| CoreError::from_api(&e, "move"))?;
         self.relocate_everywhere(&uid, &new_parent_uid, &name);
         self.invalidate_parent_listing(rel);
@@ -5505,30 +5544,32 @@ fn api_code(e: &(dyn std::error::Error + 'static)) -> Option<ResponseCode> {
     }
 }
 
-/// How often a rename that Drive calls out of date is retried, and how long
-/// apart. Twenty half-second waits match the move retry in the FUSE `rename`.
-const RENAME_RETRIES: u32 = 20;
-const RENAME_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// How often a rename or move that Drive calls out of date is retried, and how
+/// long apart.
+const OUT_OF_DATE_RETRIES: u32 = 20;
+const OUT_OF_DATE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Run a remote rename, retrying while Drive answers `InvalidRequirements`.
+/// Run a remote rename or move, retrying while Drive answers
+/// `InvalidRequirements`.
 ///
-/// A rename sends the node's current name hash, read from the server just
-/// before. Right after an earlier rename of the same node that read can still
-/// return the old hash, and Drive rejects the request as "out of date" until
-/// its reads catch up (docs/BUGS.md B111). Any other error returns at once.
-fn retry_stale_rename(
-    mut rename: impl FnMut() -> Result<(), ProtonError>,
+/// Both send the node's current name hash. The SDK takes it from its entity
+/// cache, which still holds the old hash when the node changed since it was
+/// cached, and Drive then rejects the request as "out of date" (docs/BUGS.md
+/// B111, B121). `wait` drops that entry before the next attempt. Any other
+/// error returns at once.
+fn retry_out_of_date(
+    mut call: impl FnMut() -> Result<(), ProtonError>,
     mut wait: impl FnMut(),
 ) -> Result<(), ProtonError> {
     let mut attempts = 0u32;
     loop {
-        match rename() {
+        match call() {
             Err(e)
                 if api_code(&e) == Some(ResponseCode::InvalidRequirements)
-                    && attempts < RENAME_RETRIES =>
+                    && attempts < OUT_OF_DATE_RETRIES =>
             {
                 attempts += 1;
-                debug!(attempts, error = %e, "rename was out of date; retrying");
+                debug!(attempts, error = %e, "Drive called the request out of date; retrying");
                 wait();
             }
             result => return result,
@@ -8350,7 +8391,7 @@ mod tests {
             (
                 "fn move_to(&self, rel: &Path",
                 "require_rename_access",
-                ".move_node",
+                ".move_remote",
                 "self.relocate_everywhere(&uid",
             ),
             (
@@ -8433,7 +8474,7 @@ mod tests {
     fn a_rename_called_out_of_date_is_retried_until_it_lands() {
         let mut calls = 0;
         let mut waits = 0;
-        let result = super::retry_stale_rename(
+        let result = super::retry_out_of_date(
             || {
                 calls += 1;
                 if calls < 3 {
@@ -8451,7 +8492,7 @@ mod tests {
     #[test]
     fn a_rename_gives_up_on_other_errors_and_after_its_retries() {
         let mut calls = 0;
-        let taken = super::retry_stale_rename(
+        let taken = super::retry_out_of_date(
             || {
                 calls += 1;
                 Err(api_error(super::ResponseCode::AlreadyExists))
@@ -8462,7 +8503,7 @@ mod tests {
         assert_eq!(calls, 1, "a taken name is not a stale read");
 
         let mut calls = 0;
-        let stale = super::retry_stale_rename(
+        let stale = super::retry_out_of_date(
             || {
                 calls += 1;
                 Err(api_error(super::ResponseCode::InvalidRequirements))
@@ -8470,22 +8511,42 @@ mod tests {
             || {},
         );
         assert!(stale.is_err());
-        assert_eq!(calls, super::RENAME_RETRIES + 1);
+        assert_eq!(calls, super::OUT_OF_DATE_RETRIES + 1);
     }
 
     #[test]
-    fn every_remote_rename_rides_out_a_stale_read() {
+    fn every_remote_rename_and_move_rides_out_a_stale_hash() {
         for source in [
             include_str!("lib.rs"),
             include_str!("filesystem.rs"),
             include_str!("drain.rs"),
+            include_str!("relocate.rs"),
         ] {
             assert_eq!(
                 source.matches(concat!("client.rename_node", "(")).count(),
                 usize::from(source.contains("fn rename_remote(")),
                 "call Core::rename_remote instead of the SDK rename directly"
             );
+            assert_eq!(
+                source.matches(concat!("client.move_node", "(")).count(),
+                usize::from(source.contains("fn move_remote(")),
+                "call Core::move_remote instead of the SDK move directly"
+            );
         }
+    }
+
+    #[test]
+    fn a_rename_or_move_drops_the_sdk_copy_of_the_node() {
+        // The SDK would send the old name hash with the node's next rename or
+        // move until the event poll caught up (B121).
+        let change = function_source(include_str!("lib.rs"), "fn change_remote(");
+        assert_eq!(
+            change.matches("self.forget_sdk_node(uid)").count(),
+            2,
+            "forget the node before each retry and once the change landed"
+        );
+        let drained = function_source(include_str!("drain.rs"), "fn move_renaming(");
+        assert!(drained.contains("self.forget_sdk_node(uid)"));
     }
 
     #[test]

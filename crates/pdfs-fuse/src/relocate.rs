@@ -254,7 +254,7 @@ impl Core {
             )));
         }
 
-        if let Err(e) = self.rt.block_on(self.client.move_node(&src_uid, &dest_uid)) {
+        if let Err(e) = self.move_remote(&src_uid, &dest_uid) {
             if let Some((from, to)) = &renamed
                 && let Err(back) = std::fs::rename(to, from)
             {

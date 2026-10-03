@@ -12,6 +12,38 @@ Conventions:
 
 ---
 
+## B121 — A move right after a rename fails with `EIO`, and a rename across folders takes seconds
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-03, in the journal of the account run on flaky Wi-Fi. Each change answered
+correctly, but slowly. One rename and move through the mount collected 13 `operation failed …
+method=PUT status=422` warnings over 8.2 seconds, and another collected 7 over 3.9 seconds. Each
+one was a request that Drive refused as out of date and the daemon tried again half a second
+later.
+
+**Where:** every remote rename and move: `serve_rename` in `crates/pdfs-fuse/src/filesystem.rs`,
+the control `rename` and `move_to` in `crates/pdfs-fuse/src/lib.rs`, `move_between` in
+`crates/pdfs-fuse/src/relocate.rs`, and the drain's renames and `move_renaming` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A rename or move sends the node's current name hash as `OriginalHash`. The SDK takes
+it from its entity cache before the hash in the link it has just fetched. Its own rename and move
+do not update that cache entry. Only the event feed's echo of the change drops it, and the daemon
+polls the feed every 10 seconds (`POLL_INTERVAL`). Until then, each rename or move of the same
+node sent the old hash. A rename across folders, which is a rename and then a move, was refused
+until the next poll, and the retries from B111 hid that as latency. A plain move was not retried
+at all. When it came within the poll interval, `mv a b && mv b dir/` through the mount failed with
+`EIO`, and `pdfs rename` followed by `pdfs move` failed with Drive's "out of date" error.
+
+**Fix.** `Core::forget_sdk_node` passes the SDK the event its own change will echo, which drops
+the cached node. Every rename, and every move but the drain's, goes through `Core::rename_remote`
+or `Core::move_remote`. Both drop the entry once the change has landed, and before each retry of a
+request Drive called out of date. The drain's `move_renaming` drops it once its move lands.
+
+**Test:** the unit tests `a_rename_or_move_drops_the_sdk_copy_of_the_node` and
+`every_remote_rename_and_move_rides_out_a_stale_hash`. On the account run, "regression B111" and
+"regression B113" should show no `status=422` warnings.
+
 ## B120 — A file queued in a folder that has just landed is put off by five seconds
 
 **Status:** Fixed (unverified).
@@ -285,10 +317,10 @@ InvalidRequirements (http 422): This file or folder was out of date, rename fail
 `drain_rename_in_place` in `crates/pdfs-fuse/src/drain.rs`, and the control `rename` in
 `crates/pdfs-fuse/src/lib.rs`.
 
-**Cause.** The SDK's `rename_node` reads the node's details from the server and sends its current
-name hash as `OriginalHash`. Right after a rename of the same node, that read can still return the
-old hash. Drive then refuses the request as out of date. The daemon reported this at once as
-`EIO`, although the same request succeeds a moment later.
+**Cause.** The SDK's `rename_node` sends the node's current name hash as `OriginalHash`. Right
+after a rename of the same node, it still sent the old one. Drive then refuses the request as out
+of date. The daemon reported this at once as `EIO`, although the same request succeeds a moment
+later. The old hash comes from the SDK's entity cache, not from the server (see B121).
 
 **Fix.** All remote renames go through `Core::rename_remote`. It retries a rename that fails with
 `InvalidRequirements` up to 20 times, half a second apart, the same window the move after a

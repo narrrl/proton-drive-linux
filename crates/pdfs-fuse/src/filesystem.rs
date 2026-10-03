@@ -2015,8 +2015,8 @@ impl ProtonFs {
             queue_it(reply);
             return;
         }
-        // Rename first if both halves change. Moving first makes the encrypted
-        // name requirements stale and repeatedly failed with InvalidRequirements.
+        // Rename first if both halves change; a move that then fails leaves the
+        // node renamed in its source folder, which the tree is told below.
         // A failure past this point has already trashed any node the rename was
         // replacing, so put it back rather than leaving the caller with neither
         // the source moved nor the destination intact.
@@ -2042,48 +2042,28 @@ impl ProtonFs {
             reply.error(Errno::EIO);
             return;
         }
-        if newparent != parent {
-            let mut attempts = 0u32;
-            let moved = loop {
-                match self
-                    .core
-                    .block_on_bounded(self.core.client.move_node(&uid, &new_parent_uid))
-                {
-                    Ok(()) => break Ok(()),
-                    Err(e)
-                        if newname != name
-                            && api_code(&e) == Some(ResponseCode::InvalidRequirements)
-                            && attempts < 20 =>
-                    {
-                        attempts += 1;
-                        // Requirement propagation routinely takes longer than
-                        // three seconds. Keep a bounded ten-second window; a
-                        // successful POSIX reply must mean both remote halves
-                        // landed, not merely that the second half was queued.
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                    Err(e) => break Err(e),
-                }
-            };
-            if let Err(e) = moved {
-                if self.core.lost_link(&e, "move") {
-                    queue_it(reply);
-                    return;
-                }
-                error!(%uid, attempts, error = %e, "move after rename failed");
-                // The rename half landed in the source directory.
-                let mut state = self.core.state();
-                let old_parent_uid = state
-                    .entries
-                    .get(&parent)
-                    .map(|entry| entry.uid.clone())
-                    .unwrap_or_else(|| uid.clone());
-                state.rename_in_place(ino, parent, &old_parent_uid, newname);
-                drop(state);
-                self.core.restore_replaced(victim.as_ref(), newname);
-                reply.error(Errno::EIO);
+        // A successful reply must mean both remote halves landed, not merely
+        // that the second half was queued.
+        if newparent != parent
+            && let Err(e) = self.core.move_remote(&uid, &new_parent_uid)
+        {
+            if self.core.lost_link(&e, "move") {
+                queue_it(reply);
                 return;
             }
+            error!(%uid, error = %e, "move after rename failed");
+            // The rename half landed in the source directory.
+            let mut state = self.core.state();
+            let old_parent_uid = state
+                .entries
+                .get(&parent)
+                .map(|entry| entry.uid.clone())
+                .unwrap_or_else(|| uid.clone());
+            state.rename_in_place(ino, parent, &old_parent_uid, newname);
+            drop(state);
+            self.core.restore_replaced(victim.as_ref(), newname);
+            reply.error(Errno::EIO);
+            return;
         }
         self.core
             .state

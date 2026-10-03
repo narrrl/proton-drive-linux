@@ -1810,9 +1810,9 @@ def test_regression_b95_tmp_name_uploads(ctx: Context) -> None:
 def test_regression_b111_rename_back_at_once(ctx: Context) -> None:
     """A file renamed and straight back keeps working, every time (B111).
 
-    Right after a rename, Drive can still hand out the old name hash, and a
-    rename sent with that hash was refused as out of date. The daemon answered
-    with `EIO`, about once a run. On a mount, `pdfs rename` is driven too.
+    Right after a rename, the SDK still sent the old name hash, and Drive
+    refused the next rename as out of date. The daemon answered with `EIO`,
+    about once a run. On a mount, `pdfs rename` is driven too.
     """
     folder = ctx.root / "b111"
     folder.mkdir()
@@ -1839,6 +1839,49 @@ def test_regression_b111_rename_back_at_once(ctx: Context) -> None:
     listed = sorted(entry["name"] for entry in ctx.daemon.listing(folder))
     check(listed == [original.name], f"pdfs ls lists {listed} after pdfs rename there and back")
     check_bytes(read(original), payload, "the file after pdfs rename there and back")
+
+
+def test_regression_b121_move_right_after_rename(ctx: Context) -> None:
+    """A file renamed and moved at once lands where it was sent (B121).
+
+    The SDK kept a node's old name hash until the next event poll, up to ten
+    seconds after the daemon's own rename. A move in that window was refused
+    as out of date: `EIO` through the mount, an error from `pdfs move`. A
+    rename across folders landed only after seconds of retries. On a mount,
+    `pdfs rename` and `pdfs move` are driven too.
+    """
+    folder = ctx.root / "b121"
+    inner = folder / "inner"
+    inner.mkdir(parents=True)
+    path = folder / "b121 first.txt"
+    payload = b"b121 move right after rename\n" * 64
+    write_durable(path, payload)
+    live = ctx.is_live and ctx.daemon is not None and is_fuse(ctx.root)
+    if live:
+        # The changes should race nothing but Drive.
+        ctx.daemon.wait_for_queue()
+    started = time.monotonic()
+    renamed = folder / "b121 renamed.txt"
+    os.rename(path, renamed)
+    os.rename(renamed, inner / renamed.name)
+    # A rename across folders is a rename and then a move of the same node.
+    back = folder / "b121 back.txt"
+    os.rename(inner / renamed.name, back)
+    ctx.info(f"renamed, moved and renamed back through the mount in {time.monotonic() - started:.1f}s")
+    names = sorted(os.listdir(folder))
+    check(names == sorted([back.name, inner.name]), f"after the rename and moves: {names}")
+    check(not os.listdir(inner), f"inner still lists {sorted(os.listdir(inner))}")
+    check_bytes(read(back), payload, "the file after the rename and moves")
+    ctx.record("names", names)
+    if not live:
+        return
+    started = time.monotonic()
+    ctx.daemon.command("rename", str(back), path.name)
+    ctx.daemon.command("move", str(path), str(inner))
+    ctx.info(f"pdfs rename and pdfs move took {time.monotonic() - started:.1f}s")
+    listed = sorted(entry["name"] for entry in ctx.daemon.listing(inner))
+    check(listed == [path.name], f"pdfs ls lists {listed} in inner after pdfs rename and move")
+    check_bytes(read(inner / path.name), payload, "the file after pdfs rename and move")
 
 
 def _uploads_named(daemon: Daemon, name: str) -> list[dict]:
@@ -2612,6 +2655,7 @@ TESTS = [
     Case("regression B94: a deleted .part file leaves nothing queued", test_regression_b94_deleted_transient_file_leaves_nothing_queued, (LIVE,)),
     Case("regression B95: a .tmp file uploads at once", test_regression_b95_tmp_name_uploads, (LIVE,)),
     Case("regression B111: renaming a file straight back works", test_regression_b111_rename_back_at_once),
+    Case("regression B121: a file renamed and moved at once lands", test_regression_b121_move_right_after_rename),
     Case("regression B98: an upload superseded by a write ends", test_regression_b98_superseded_upload_ends, (LIVE,), budget_scale=2),
     Case("regression B80: pdfs search finds a new file after a rewrite", test_regression_b80_new_file_is_searchable, (LIVE,)),
     Case("regression B48: an emptied folder can be removed at once", test_regression_b48_emptied_folder_removes_at_once),
