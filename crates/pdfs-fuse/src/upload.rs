@@ -244,8 +244,8 @@ impl Core {
             )
             .map_err(|e| CoreError::from_api(&e, &format!("create folder {name}")))?;
         let node = self
-            .fetch_node(&new_uid)
-            .map_err(|e| self.errno_error(e, "fetch node"))?;
+            .fetch_minted_node(&new_uid, name)
+            .ok_or_else(|| minted_but_unlisted(name))?;
         let mut st = self.state();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)

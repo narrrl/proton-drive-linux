@@ -12,9 +12,121 @@ Conventions:
 
 ---
 
+## B120 — A file queued in a folder that has just landed is put off by five seconds
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-02, in the journal of the account run on flaky Wi-Fi. A folder made while the
+link was down was queued as a mkdir. When it landed, the journal logged `pending create landed …
+kind=mkdir`, and right after it `re-interned an authority missing from the local tree; retrying`
+and `pending operation deferred … reason="the node was missing locally and has been re-read"` for
+a file queued inside it. The file landed on the next recheck. No bytes were lost.
+
+**Where:** `Db::finish_create` and `Db::remap_local_uid` in `crates/pdfs-core/src/db/ops.rs`, and
+`adopt_real_uid` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** When a queued create landed, `finish_create` repointed the queued children at the real
+uid and deleted the placeholder's row in one transaction. The real node's row was only written
+later, by `adopt_real_uid`, after it had read the node back from Drive. A drain worker that picked
+up a child in between found no row for its parent. It read the folder again from Drive and put
+the child off by one recheck (`DRAIN_ACCESS_RECHECK`, 5 seconds).
+
+**Fix.** `adopt_placeholder_row_tx` in `crates/pdfs-core/src/db/nodes.rs` hands the placeholder's
+row to the real uid in the same transaction, along with the rows below it, and drops the old row
+from the search index. `adopt_real_uid` writes the server's copy over it later. A row that the
+real uid already has, from the event stream, is newer and is kept.
+
+**Test:** the db tests `a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it` and
+`a_landed_placeholder_never_overwrites_the_server_copy`. The suite cannot queue a mkdir on demand,
+because a mkdir online is made at once even while sync is paused. Instead, `--journal-check`
+now counts `re-interned an authority missing from the local tree` as an error, so a run that goes
+offline catches this race, and B117, if either comes back.
+
+## B119 — Reading a file just written through the mount needs the network
+
+**Status:** Fixed (verified 2026-10-03: "regression B119" passed in My files on the account run).
+**Found:** 2026-10-02, by the account run on flaky Wi-Fi, which crashed at its very end. The
+run's last step reads back a file it wrote to compare digests. The Wi-Fi had dropped, the read
+waited for `open_revision` for 120 seconds and then failed with `EIO`, and the suite stopped with
+an `OSError` traceback.
+
+**Where:** the landed-upload path of the drain in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** Once an upload landed, the drain kept the staged bytes as cached content only for a
+pinned file. For any other file it discarded them, and then dropped the reader too. The next read
+of a file that had just been written therefore downloaded it again, and without a link it could
+not.
+
+**Fix.** After the upload, `refresh_after_upload` reads the node back and now returns it. The
+staged blob becomes the file's cached content, linked rather than copied, and stamped with the
+mtime and size of the revision just read back, so the cache treats it as current. A file larger
+than a sixteenth of the cache budget (`LANDED_KEEP_SHARE`, 320 MiB of the default 5 GiB) is still
+discarded unless it is pinned, so one large upload cannot push the rest of the cache out. Nothing
+is kept when the read-back fails or reports a different size. The suite records a failed end-of-run
+read-back as a failed check instead of crashing.
+
+**Test:** the drain test `a_landed_upload_stays_cached_unless_it_would_crowd_the_cache_out`, and
+the acceptance case "regression B119", which writes two files, waits for the queue and expects
+`pdfs ls` to list both as cached.
+
+## B118 — Creating a file or folder through the mount can fail with `ENOENT` although it was made
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-02, by the account run on flaky Wi-Fi. In the first on-demand folder, case 14
+failed in its sqlite step with "unable to open database file", and case 15 failed in `mkdir`
+with `FileNotFoundError`. In both, the file or folder had been made on Drive.
+
+**Where:** `serve_create` and `serve_mkdir` in `crates/pdfs-fuse/src/filesystem.rs`.
+
+**Cause.** After a create or mkdir succeeds, the mount reads the new node back to answer the
+kernel. Drive can answer the create before its listing returns the new node. The read-back then
+came back empty, which `fetch_node` reports as `ENOENT`, and the mount passed that on with nothing
+in the log. The program saw its create fail for something that existed.
+
+**Fix.** `Core::fetch_minted_node` asks again after 250 ms and after one more second
+(`MINTED_READ_BACK_DELAYS`). If the node still cannot be read, the mount queues the create as it
+does offline (`queue_local_node`), and the drain adopts the existing node by its name. The program
+gets its file or folder either way. `pdfs mkdir` uses the same read-back, and when it still misses
+it says that the folder was made but is not listed yet, instead of reporting that it does not
+exist.
+
+**Test:** none that replays it on demand, since the gap depends on Drive. The affected acceptance
+cases ("application workloads" and "block boundaries") fail when it comes back.
+
+## B117 — An upload queued for a file `pdfs move` moved is listed by its raw id and put off once
+
+**Status:** Fixed (verified 2026-10-03: "regression B117" passed in My files on the account run,
+and its journal had no deferral).
+**Found:** 2026-10-02, while verifying B113 live. Three files were moved with `pdfs move` while
+their uploads were queued. Until each upload landed, `pdfs sync queue` listed it by its node id
+instead of its new path. After the resume, the first attempt of each logged `pending operation
+deferred … reason="the node was missing locally and has been re-read"`, and the upload landed on
+the next recheck, about 8 seconds later. No bytes were lost.
+
+**Where:** `settle_source` in `crates/pdfs-fuse/src/relocate.rs` and `Core::rename` in
+`crates/pdfs-fuse/src/lib.rs`, which forget the node. `pending_op_infos` in
+`crates/pdfs-fuse/src/queue.rs`, and `resolve_unknown_authority` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** `State::forget` deletes the node's row as well as its entry in memory, so the mounts
+re-listed it under its new path. Until a listing brought the row back, nothing local knew the
+node. `pending_op_infos` then had no path for the queued op and fell back to its name, or to the
+raw uid. The drain's access check found no node either. It re-read the node from Drive, stored it
+and put the op off to the next recheck instead of going on with it. `pdfs rename` forgot the node
+the same way.
+
+**Fix.** `pdfs move` and `pdfs rename` move the node instead of forgetting it
+(`Core::relocate_everywhere`). Each mount that has the destination folder moves the node in place
+with `State::relocate`, which keeps its inode and writes its row through. A mount without the
+destination drops the node from memory only and keeps the row. When no mount had the node, its
+row is moved directly. Both names are invalidated in the kernel, as B114 needs.
+
+**Test:** the fuse test `a_control_move_keeps_the_node_and_its_row_and_drops_the_old_name`, and
+the acceptance case "regression B117". It pauses sync, rewrites an uploaded file and moves it with
+`pdfs move`. It checks the path `pdfs sync queue` shows for the upload, and looks in the journal
+for a deferral of the node after the resume.
+
 ## B116 — Trashing a folder keeps the queued creates in its subfolders
 
-**Status:** Open.
+**Status:** Fixed (verified 2026-10-03: "regression B116" passed in My files on the account run).
 **Found:** 2026-10-02, by the first live run of the acceptance case "regression B113". That
 version wrote `*.part` files, which park their create until a rename instead of minting the file
 (B70). It moved one of them, still named `moved.part`, into the subfolder `b113/moved here` and
@@ -36,13 +148,19 @@ drain then re-homes it to the root (`parent folder is gone remotely; creating in
 instead`), so the file would reappear in My files after its folder was trashed. Only the parked
 case has been seen.
 
-**Required fix/test:** take queued creates and mkdirs from the node tree too, as revisions are.
-Test: a db test that trashes a folder holding a real subfolder with a queued create below it, and
-expects the create and its blob gone.
+**Fix.** `drop_doomed_ops` also takes the queued creates and mkdirs whose parent is anywhere in
+the node tree below the folder, together with everything queued below those.
+
+**Test:** the db test `trashing_a_folder_drops_the_queued_creates_in_its_subfolders`, and the
+acceptance case "regression B116", which replays the due case. With sync paused, it writes a
+`*.part` file two folders below a new folder and renames it to its final name, so its create is
+queued and due. It then trashes the folder with `pdfs rm` and expects the create gone. It restores
+the folder before sync resumes, so a create that wrongly stayed lands where the file was written,
+and fails if the file shows up in the root anyway.
 
 ## B115 — `pdfs ls` shows a file's encrypted size
 
-**Status:** Open.
+**Status:** Fixed (verified 2026-10-03: "regression B115" passed in My files on the account run).
 **Found:** 2026-10-02, while verifying B88 live. `pdfs ls ~/Downloads/pdfs-b88-test` listed the
 6-byte `note.txt` as 57 bytes, and listed `tickets.pdf` as 202316 bytes where the mount's `stat`
 said 202257. The acceptance case "open B115" then showed it for every file it wrote, in My files
@@ -52,17 +170,25 @@ sizes throughout.
 
 **Where:** `node_size` in `crates/pdfs-fuse/src/lib.rs` and `crates/pdfs-core/src/db/nodes.rs`.
 
-**Cause (suspected).** `node_size` reports the node's `claimed_size` and falls back to
+**Cause.** `node_size` reports the node's `claimed_size` and falls back to
 `total_size_on_storage` when it has none. That is the size on Drive's storage: encrypted blocks
-plus their signatures. A node decoded without a claimed size therefore lists at its encrypted size.
-The sizes seen fit that: 51 to 55 bytes more per 4 MiB block.
+plus their signatures. A folder is first listed without claimed sizes, to be quick, and the real
+sizes are fetched for the whole listing in the background. `stat` through the mount waits for that
+fetch. `pdfs ls` and the app's file browser read the listing straight away, so they showed the
+encrypted sizes until it landed.
 
-**Test:** the acceptance case "open B115" compares the sizes `pdfs ls` reports with the written
-ones, after the upload and again after `pdfs refresh`. It reports a known issue while they differ.
+**Fix.** `Core::list_dir`, which serves both, waits for the listing's size fetch first
+(`settle_listing_sizes`), for at most `SizeUpgrade::WAIT` (10 seconds), as `stat` does. Offline it
+does not wait, since the fetch cannot succeed.
+
+**Test:** the fuse tests `a_listing_for_the_cli_settles_sizes_before_reading_them` and
+`a_listing_waits_for_the_whole_size_batch_but_not_forever`, and the acceptance case
+"regression B115". It compares the sizes `pdfs ls` reports with the written ones, after the upload
+and again after `pdfs refresh`.
 
 ## B114 — A name `pdfs rm` or `pdfs rename` took away still resolves for up to 30 seconds
 
-**Status:** Open.
+**Status:** Fixed (verified 2026-10-03: "regression B114" passed in My files on the account run).
 **Found:** 2026-10-02, while verifying B88 live. After `pdfs rm ~/Downloads/pdfs-b88-test` the
 folder was gone from `ls ~/Downloads`, but `ls -d ~/Downloads/pdfs-b88-test` still found it for
 up to 30 seconds. `~/ProtonDrive` behaves the same, so B88's routing did not cause it.
@@ -76,9 +202,18 @@ until it expires. A rename or unlink through the mount has no such gap, because 
 that change itself. `pdfs move` already sends `inval_entry` for its destination
 (`settle_dest` in `crates/pdfs-fuse/src/relocate.rs`); its source was not checked.
 
-**Test:** the acceptance case "open B114" removes one file with `pdfs rm` and renames another with
-`pdfs rename`, then checks at once that neither old name resolves. It reports a known issue while
-one does. It reproduced in My files and in an on-demand folder.
+The account run on flaky Wi-Fi on 2026-10-02 hit it in another place. "regression B111" renamed
+a file with `pdfs rename` and straight back, and then failed with `FileNotFoundError`: the
+kernel still pointed the first name at the inode the rename had forgotten.
+
+**Fix.** `pdfs rm` forgets the node in every mount and sends each kernel session a delete notice
+for the name (`Core::forget_everywhere`). `pdfs rename` and `pdfs move` invalidate the old and the
+new name (`Core::relocate_everywhere`, see B117). The notices go out after the mount's lock is
+released.
+
+**Test:** the acceptance case "regression B114" removes one file with `pdfs rm` and renames another
+with `pdfs rename`, then checks at once that neither old name resolves. It reproduced in My files
+and in an on-demand folder before the fix.
 
 ## B113 — A new file moved before its upload drains lands as a conflict copy of itself
 
@@ -112,9 +247,10 @@ into a subfolder while their uploads were queued. After the resume all three log
 landed`, with no conflict warning or copy, and they read back at their exact sizes. Each upload was
 put off once after the move (`the node is missing locally and was re-read`) and landed on the
 retry about 8 seconds later. Meanwhile `pdfs sync queue` showed raw ids instead of the new paths.
-Not verified live: a file created offline that is still open when its create lands. Only the unit
-test covers that half. The acceptance case "regression B113" replays the online order through the
-mount, with a rename and a move, and passed in My files and in an on-demand folder.
+Both are filed as B117. Not verified live: a file created offline that is still open when its
+create lands. Only the unit test covers that half. The acceptance case "regression B113" replays
+the online order through the mount, with a rename and a move, and passed in My files and in an
+on-demand folder.
 
 ## B112 — Folders shared by the same person disappear from Shared with me
 
@@ -157,6 +293,9 @@ old hash. Drive then refuses the request as out of date. The daemon reported thi
 **Fix.** All remote renames go through `Core::rename_remote`. It retries a rename that fails with
 `InvalidRequirements` up to 20 times, half a second apart, the same window the move after a
 rename already uses. Any other error still returns at once.
+
+**Test:** the acceptance case "regression B111" renames a file there and back eight times through
+the mount, and three times with `pdfs rename`, and checks its name and content after each round.
 
 ## B110 — A read that settles a provisional size deadlocks on its own page lock
 
@@ -376,6 +515,9 @@ the trash with it. `pdfs rm` now drops the queued ops once the remote trash succ
 acceptance janitor lists the daemon queue after cleanup and reports any op still naming one of its
 roots as a leftover.
 Regression test: `trashing_a_folder_drops_the_queued_revisions_of_files_below_it`.
+The acceptance case "regression B102" pauses sync, rewrites a file two folders down in each of
+two folders, and removes one folder with `pdfs rm` and the other with `rm -r` through the mount.
+Neither revision may stay queued.
 
 ---
 
@@ -523,6 +665,9 @@ so each new write supersedes the upload of the previous one.
 **Fix.** The cancel is reported as `ErrorKind::Other`, which the SDK turns into an error.
 `drain_revision` already recognises a cancelled upload and returns without counting a failure.
 Regression test: `a_cancelled_upload_fails_its_read_instead_of_asking_for_a_retry`.
+The acceptance case "regression B98" appends to a 64 MiB file while its upload is on the wire. The
+superseded transfer has to end, and the file has to land at its full size. The case skips when the
+upload finishes before it is seen.
 
 ---
 
@@ -607,6 +752,9 @@ forever and the bytes never go up.
 rename. A `.tmp` write from a program that does rename is still handled — by the rename itself,
 which supersedes the create.
 
+**Test:** the acceptance case "regression B95" writes `index.tmp` and `preview.temp` and waits for
+the queue, which fails at once on a parked op.
+
 ---
 
 ## B94 — A parked create has no exit but the rename, so an abandoned one is stuck forever
@@ -632,6 +780,10 @@ the database has its queued ops discarded. One whose node still exists, that is 
 invariant 1 says staged bytes are only dropped once their op has landed, so the sweep lets the
 bytes through under the transient name instead of destroying them. An open node is left parked
 whatever its age: it is still being written.
+
+**Test:** the acceptance case "regression B94" deletes a `*.part` file whose create is parked and
+waits for the create to leave the queue. That is the delete exit. The hour-long expiry is not
+driven.
 
 ---
 
@@ -931,7 +1083,8 @@ folder. `pdfs rename` of a file whose upload was still queued reached Drive unde
 `pdfs rename ~/Downloads …` and `pdfs rm ~/ProtonDrive` were refused as the root of a synced
 location, and a path outside every mount as not under the mountpoint. `mkdir` and `rm` in
 `~/ProtonDrive` still work. Not verified: the refusal in a mirrored folder, because the account has
-none. The acceptance case "regression B88" repeats this on every location of a run.
+none. The acceptance case "regression B88" repeats this on every location of a run, and an
+`--account` run checks the refusal in the mirror folders it registers.
 
 ---
 
@@ -1029,6 +1182,12 @@ blocked the repro.
 Test: `covering_parts_route_a_path_to_the_mount_that_owns_it` covers the routing rule (nested
 mount wins, suffix relative to it, its own inode space and upgrade batches, a path under no mount
 routes nowhere). The listing-invalidation half is the live repro, which is what is still pending.
+
+**Test:** the managed matrix of an `--account` run replays the repro. Before it switches a mirror
+folder to on-demand, it writes `pdfs-mode-switch.bin` there and forces a pass. After the switch it
+checks that the mount lists the file with its bytes, as "regression B86" under "mode switches".
+Only the third pairing of the full matrix switches a folder that an earlier pairing had
+on-demand, which is the stale case. `--quick` does not get there.
 
 ---
 
@@ -1443,6 +1602,10 @@ before a real one was considered — for "test", 367 of the 500 best-ranked
 candidates came from `go/pkg/mod`. `SKIP_DIRS` gained `dist`/`build`, a new
 `SKIP_PATH_SUFFIXES` covers `go/pkg/mod`, and both candidate functions gained a
 whole-query prefix lane ahead of the existing single-character one.
+
+**Test:** the acceptance case "regression B80" writes a file with a unique token in its name,
+rewrites it, and waits for `pdfs search` to find it. In an on-demand sync folder, that file sits in
+the device-folder subtree the index used to lose.
 
 ## B79 — Every write in an on-demand device-folder mount fails EACCES
 
@@ -3659,6 +3822,10 @@ the FUSE handler invalidates both exact dentries and both directory inodes; the
 ordering matters because an invalidation sent before the rename reply is
 overwritten by the kernel's response processing. Uids are immutable and never
 reused, making a session-long tombstone safe.
+
+**Test:** the acceptance case "regression B48" lists a folder of 12 files, moves one more in,
+unlinks them all, and on a mount asks Drive for the listing with `pdfs refresh`. The listing has to
+be empty, and `rmdir` has to succeed at once.
 
 ---
 

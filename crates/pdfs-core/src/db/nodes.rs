@@ -599,6 +599,50 @@ struct PriorRow {
     trashed: bool,
 }
 
+/// Hand a drained placeholder's row, and the rows below it, to the real uid it
+/// landed as.
+///
+/// Dropping the placeholder row and waiting for the server's copy of the real
+/// node left a window with no row for either uid. A queued child drained in
+/// that window found no authority for its parent, re-read it over the network
+/// and was deferred five seconds behind a folder that had just landed
+/// (`docs/BUGS.md` B120). The placeholder's own node, readdressed, stands in
+/// until the server's copy is upserted over it. A row the real uid already
+/// has is newer than the placeholder and is kept.
+pub(super) fn adopt_placeholder_row_tx(
+    tx: &Transaction<'_>,
+    local: &str,
+    real: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE nodes SET parent_uid = ?2 WHERE parent_uid = ?1",
+        params![local, real],
+    )?;
+    let row: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT rowid, node_json FROM nodes WHERE uid = ?1",
+            params![local],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((rowid, json)) = row else {
+        return Ok(());
+    };
+    tx.execute("DELETE FROM nodes WHERE uid = ?1", params![local])?;
+    tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
+    let known: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes WHERE uid = ?1)",
+        params![real],
+        |row| row.get(0),
+    )?;
+    let (false, Some(json), Some(real)) = (known, json, parse_node_uid(real)) else {
+        return Ok(());
+    };
+    let mut node: Node = serde_json::from_str(&json)?;
+    node.uid = real;
+    upsert_node_tx(tx, &node)
+}
+
 fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
     let json = serde_json::to_string(node)?;
     let uid = node.uid.to_string();

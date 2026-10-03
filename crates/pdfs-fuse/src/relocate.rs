@@ -25,7 +25,6 @@ use proton_drive_rs::NodeKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{info, warn};
 
-use super::background::forget_and_notify;
 use super::sync::mirror_subtree_unsynced;
 use super::{Core, is_local_uid, parse_uid};
 
@@ -265,7 +264,15 @@ impl Core {
             return Err(CoreError::from_api(&e, "move"));
         }
 
-        self.settle_source(&source, &src_uid, renamed.is_some(), &dest, &name, src);
+        self.settle_source(
+            &source,
+            &src_uid,
+            renamed.is_some(),
+            &dest,
+            &dest_uid,
+            &name,
+            src,
+        );
         self.settle_dest(&dest, &dest_uid, &name);
         drop(guards);
         if renamed.is_none()
@@ -429,22 +436,23 @@ impl Core {
     }
 
     /// Bring the source location level with a move Drive has made.
+    #[allow(clippy::too_many_arguments)]
     fn settle_source(
         &self,
         source: &Place,
         uid: &NodeUid,
         renamed: bool,
         dest: &Place,
+        dest_uid: &NodeUid,
         name: &str,
         src: &Path,
     ) {
         match source {
             Place::Mounted { core, rel } => {
-                // Forget it everywhere, so no mount keeps serving it under the
-                // old path. The content cache is keyed by uid and stays valid.
-                self.for_each_mount(|st, notify| {
-                    forget_and_notify(st, notify, uid);
-                });
+                // Moved everywhere, so no mount keeps serving it under the old
+                // path and its row stays (`docs/BUGS.md` B117). The content
+                // cache is keyed by uid and stays valid.
+                self.relocate_everywhere(uid, dest_uid, name);
                 core.invalidate_parent_listing(rel);
             }
             Place::Mirror { folder, rel } if renamed => {

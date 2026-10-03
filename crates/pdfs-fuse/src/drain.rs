@@ -1106,7 +1106,7 @@ impl Core {
         let node = self
             .fetch_node(real)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
-        // Repoints queued children and node rows, and drops the placeholder row.
+        // Repoints queued children and node rows, and readdresses the placeholder row.
         // A no-op after `retire_create`, which has already done both.
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
@@ -1638,18 +1638,25 @@ impl Core {
         // op pointing at nothing.
         self.db.delete_op(op.id)?;
         self.release_pending(&uid, &blob);
+        self.evict_reader(&uid);
+        let landed = self.refresh_after_upload(&uid);
 
-        // The staged blob now matches the sealed revision, so a pinned file keeps
-        // it as its cached content rather than re-downloading what we just sent.
-        // Adopted by link, not by value: the blob is the whole file, and a pinned
-        // video read into a `Vec` here is an OOM. `discard_staged` below drops the
-        // staging name only — the cache keeps the inode.
-        if self.cache.is_pinned(&uid) {
-            let _ = self.cache.store_file(&uid, now_secs(), meta.len, &blob);
+        // The staged blob now matches the sealed revision, so it becomes the
+        // file's cached content, stamped like the revision just read back.
+        // Reading the file again then needs no network, which an editor or a
+        // build does at once and a flaky link cannot always give (`docs/BUGS.md`
+        // B119). Adopted by link, not by value: the blob is the whole file, and
+        // a video read into a `Vec` here is an OOM. `discard_staged` below drops
+        // the staging name only — the cache keeps the inode.
+        if let Some(node) = landed
+            && node_size(&node) == meta.len
+            && keeps_landed_upload(self.cache.is_pinned(&uid), meta.len, self.cache.budget())
+        {
+            let _ = self
+                .cache
+                .store_file(&uid, node.modification_time, meta.len, &blob);
         }
         self.cache.discard_staged(&blob);
-        self.evict_reader(&uid);
-        self.refresh_after_upload(&uid);
         self.log_activity(ActivityKind::Upload, &name, "uploaded", true);
         // Both times, so a slow drain shows whether the upload itself or the
         // checks and gap-fill around it are where the time goes.
@@ -1684,18 +1691,19 @@ impl Core {
     /// that conflicted with itself and left a full-size duplicate behind.
     ///
     /// Best effort: a failure here costs a spurious conflict copy on the next
-    /// write, not this upload, which has already landed.
-    pub(crate) fn refresh_after_upload(&self, uid: &NodeUid) {
+    /// write, not this upload, which has already landed. Returns the node as
+    /// the server now has it, or `None` when it could not be read back.
+    pub(crate) fn refresh_after_upload(&self, uid: &NodeUid) -> Option<Node> {
         let node = match self.fetch_node_remote(uid) {
             Ok(Some(node)) => node,
             // Trashed or deleted under us: the tree will hear it from the event
             // sync, which is better placed to unhook the inode than we are.
-            Ok(None) => return,
+            Ok(None) => return None,
             Err(e) => {
                 warn!(%uid, error = %e,
                       "refreshing metadata after an upload failed; \
                        the next write to this file may conflict with itself");
-                return;
+                return None;
             }
         };
         // This function's whole job is to bring the tree level with the revision
@@ -1735,7 +1743,7 @@ impl Core {
         // caught: it took its baseline from the node's optimistic stamp, and
         // this overwrites it with the revision the server actually holds.
         if self.rebaseline_pending(uid, &node) {
-            return;
+            return Some(node);
         }
         self.for_each_state(|st| {
             let Some(parent) = st
@@ -1748,6 +1756,7 @@ impl Core {
             };
             st.intern(parent, node.clone());
         });
+        Some(node)
     }
 
     /// Rebase every write handle open on `uid` onto `node`, a revision this
@@ -1893,6 +1902,19 @@ fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64) -> bool {
         NodeKind::Folder => is_dir,
         NodeKind::File { claimed_size, .. } => !is_dir && *claimed_size == Some(0),
     }
+}
+
+/// What share of the cache budget an unpinned upload may take and still be kept
+/// as cached content once it lands: a sixteenth, 320 MiB of the default 5 GiB.
+/// A larger file would push out much of what the user read lately, for bytes
+/// they may never read back.
+const LANDED_KEEP_SHARE: u64 = 16;
+
+/// Whether an upload of `len` bytes that just landed stays as the file's cached
+/// content. A pinned file always does, and so does any file when the budget is
+/// unlimited (`0`).
+fn keeps_landed_upload(pinned: bool, len: u64, budget: u64) -> bool {
+    pinned || budget == 0 || len <= budget / LANDED_KEEP_SHARE
 }
 
 #[cfg(test)]
@@ -2296,6 +2318,21 @@ mod tests {
             &made(folder_node("d", None), 990),
             queued
         ));
+    }
+
+    #[test]
+    fn a_landed_upload_stays_cached_unless_it_would_crowd_the_cache_out() {
+        const GIB: u64 = 1 << 30;
+        let budget = 5 * GIB;
+        // An edited document or a source file: read back from disk, not Drive.
+        assert!(keeps_landed_upload(false, 40_000, budget));
+        assert!(keeps_landed_upload(false, budget / 16, budget));
+        // A video the user copied in would push out what they read lately.
+        assert!(!keeps_landed_upload(false, budget / 16 + 1, budget));
+        // Pinned content is kept whatever its size, and so is everything when
+        // the cache has no cap.
+        assert!(keeps_landed_upload(true, 4 * GIB, budget));
+        assert!(keeps_landed_upload(false, 4 * GIB, 0));
     }
 
     fn baseline(mtime: i64, size: u64, rev: Option<&str>) -> Baseline {

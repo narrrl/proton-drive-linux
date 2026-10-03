@@ -111,7 +111,7 @@ mod transfers;
 mod upload;
 mod r#virtual;
 mod workers;
-use background::{run_event_sync, run_local_index, run_photos_event_sync};
+use background::{forget_and_notify, run_event_sync, run_local_index, run_photos_event_sync};
 pub(crate) use mount::is_stale_mount;
 pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
@@ -169,6 +169,9 @@ const DRAIN_IDLE_POLL: Duration = Duration::from_secs(30);
 /// its inode (`Core::landed_uid`): 200 polls of 10 ms, two seconds in all.
 const LANDED_UID_POLLS: u32 = 200;
 const LANDED_UID_POLL: Duration = Duration::from_millis(10);
+/// How long the mount waits before asking again for a node it has just created
+/// when Drive does not list it yet (`Core::fetch_minted_node`).
+const MINTED_READ_BACK_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 /// Grace period before a queued revision becomes eligible for draining.
 ///
 /// Tools like aria2c preallocate a file (truncate to target size) and then write
@@ -1272,6 +1275,41 @@ fn uid_write_authority(db: &Db, uid: &NodeUid, live_access: &[Access]) -> WriteA
         WriteAuthority::Writable
     } else {
         WriteAuthority::Denied
+    }
+}
+
+/// Move `uid` to `name` in `new_parent` within one mount, for a rename or move
+/// Drive has made, and record what the kernel has to forget. Returns the name
+/// the mount knew the node by, and whether the node was moved rather than
+/// forgotten, which writes its row through. `None` when the mount does not
+/// hold the node.
+///
+/// The inode is kept wherever the mount shows the new parent, as the mount's
+/// own rename keeps it (`State::relocate`). A mount that does not show the new
+/// parent only forgets the node; to it, the node is gone. The row stays either
+/// way (`docs/BUGS.md` B117).
+fn relocate_in_mount(
+    st: &mut State,
+    notify: &mut NotifyBatch,
+    uid: &NodeUid,
+    new_parent: &NodeUid,
+    name: &str,
+) -> Option<(String, bool)> {
+    let ino = *st.by_uid.get(uid)?;
+    let entry = st.entries.get(&ino)?;
+    let (from_parent, from_name) = (entry.parent, entry.node.name.clone());
+    match st.by_uid.get(new_parent).copied() {
+        Some(to_parent) => {
+            st.relocate(ino, from_parent, to_parent, new_parent, name);
+            notify.inval_entry(from_parent, from_name.clone());
+            notify.inval_entry(to_parent, name.to_string());
+            Some((from_name, true))
+        }
+        None => {
+            st.forget_mem(uid);
+            notify.delete(from_parent, ino, from_name.clone());
+            Some((from_name, false))
+        }
     }
 }
 
@@ -2694,6 +2732,46 @@ impl Core {
         }
     }
 
+    /// Wait, up to [`SizeUpgrade::WAIT`] as a `stat` would, for the real size
+    /// of every file in `ino`'s listing that still carries a provisional one.
+    ///
+    /// For callers that read a whole listing's sizes straight from `state` and
+    /// do not run on a FUSE thread: `pdfs ls` and the app's file browser. A
+    /// listing just fetched has the ciphertext size of every file in it until
+    /// its upgrade lands, and they showed those (`docs/BUGS.md` B115).
+    fn settle_listing_sizes(&self, ino: u64) {
+        // Offline the fetch cannot succeed; the wait would only delay the
+        // answer it ends up giving anyway.
+        if !self.is_online() {
+            return;
+        }
+        let missing: Vec<NodeUid> = {
+            let st = self.state();
+            st.children
+                .get(&ino)
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|k| st.entries.get(k))
+                        .filter(|e| {
+                            !is_local_uid(&e.uid)
+                                && matches!(
+                                    &e.node.kind,
+                                    NodeKind::File {
+                                        claimed_size: None,
+                                        ..
+                                    }
+                                )
+                        })
+                        .map(|e| e.uid.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if let Some(slot) = self.upgrade_sizes(ino, missing) {
+            slot.wait_finished(Instant::now() + SizeUpgrade::WAIT);
+        }
+    }
+
     /// Whether `ino` has a real size — the condition a waiter is waiting on.
     /// A node that vanished counts as resolved; there is nothing left to wait
     /// for, and its caller will find the `ENOENT` for itself.
@@ -2915,6 +2993,29 @@ impl Core {
                 Err(Errno::EIO)
             }
         }
+    }
+
+    /// Read back a node just created on the remote.
+    ///
+    /// Drive can answer a create before a lookup lists the new node, so an
+    /// empty answer is asked again for a moment. `None` means the node exists
+    /// but could not be read back. The mount then queues the create, and the
+    /// drain finds the node by name and adopts it: the application gets its
+    /// file or folder either way, never an `ENOENT` for something that exists.
+    fn fetch_minted_node(&self, uid: &NodeUid, name: &str) -> Option<Node> {
+        let mut delays = MINTED_READ_BACK_DELAYS.iter();
+        loop {
+            match self.fetch_node(uid) {
+                Ok(node) => return Some(node),
+                Err(e) if e == Errno::ENOENT => match delays.next() {
+                    Some(delay) => std::thread::sleep(*delay),
+                    None => break,
+                },
+                Err(_) => break,
+            }
+        }
+        warn!(%uid, name, "Drive made the node but did not hand it back");
+        None
     }
 
     /// [`Core::fetch_node`] without the collapse to an `Errno`, for the drain:
@@ -3964,6 +4065,7 @@ impl Core {
         let (ino, _uid) = self.resolve(rel)?;
         self.ensure_children(ino)
             .map_err(|e| self.errno_error(e, "enumerate"))?;
+        self.settle_listing_sizes(ino);
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
         let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
@@ -4401,9 +4503,9 @@ impl Core {
     }
 
     /// Rename a file or folder to `new_name`. `rel` is mountpoint-relative.
-    /// Mirrors the FUSE `rename` write path: rename on the remote, forget the
-    /// node so it re-interns under its new name, and drop the parent listing so
-    /// the next `ListDir` re-enumerates.
+    /// Mirrors the FUSE `rename` write path: rename on the remote, then move the
+    /// node to its new name in every mount and drop the parent listing so the
+    /// next `ListDir` re-enumerates.
     fn rename(&self, rel: &Path, new_name: &str) -> CoreResult<String> {
         if new_name.is_empty() || new_name.contains('/') {
             return Err(CoreError::invalid(format!("invalid name: {new_name:?}")));
@@ -4419,18 +4521,85 @@ impl Core {
         .map_err(|error| self.errno_error(error, "rename access"))?;
         self.rename_remote(&uid, new_name)
             .map_err(|e| CoreError::from_api(&e, "rename"))?;
-        // Every mount, so a fork showing the same node re-interns it under the
-        // new name instead of keeping the old one (`docs/BUGS.md` B74).
-        self.for_each_state(|st| {
-            st.forget(&uid);
-        });
+        self.relocate_everywhere(&uid, &old_parent_uid, new_name);
         self.invalidate_parent_listing(rel);
         Ok(new_name.to_string())
     }
 
+    /// Bring every mount level with a rename or move Drive has made of `uid`,
+    /// to `name` in `new_parent`, and have each kernel session drop the name it
+    /// cached for it. Returns the name a mount knew the node by.
+    ///
+    /// For changes that do not come through the mount. The kernel made a
+    /// rename through the mount itself, but one made over the control socket
+    /// leaves the old name cached for [`TTL`] (`docs/BUGS.md` B114).
+    ///
+    /// The node is moved, not forgotten, and so is its row. Forgetting it, as
+    /// this used to, deleted the row, and until a listing brought it back
+    /// nothing local knew the node: `pdfs sync queue` showed its queued upload
+    /// by raw id, and the drain re-read the node and put the upload off
+    /// (`docs/BUGS.md` B117).
+    fn relocate_everywhere(
+        &self,
+        uid: &NodeUid,
+        new_parent: &NodeUid,
+        name: &str,
+    ) -> Option<String> {
+        let mut old_name = None;
+        let mut moved_row = false;
+        self.for_each_mount(|st, notify| {
+            if let Some((from_name, relocated)) =
+                relocate_in_mount(st, notify, uid, new_parent, name)
+            {
+                old_name = Some(from_name);
+                moved_row |= relocated;
+            }
+        });
+        if !moved_row {
+            self.move_row(uid, new_parent, name);
+        }
+        old_name
+    }
+
+    /// Point the persisted row of `uid` at `name` in `new_parent`, for a node
+    /// no mount holds where it now is.
+    fn move_row(&self, uid: &NodeUid, new_parent: &NodeUid, name: &str) {
+        let moved = self.db.node_by_uid(&uid.to_string()).and_then(|node| {
+            let Some(mut node) = node else {
+                return Ok(());
+            };
+            node.name = name.to_string();
+            node.parent_uid = Some(new_parent.clone());
+            self.db.upsert_node(&node)
+        });
+        if let Err(error) = moved {
+            warn!(%uid, ?error, "could not move the node's row along with it");
+        }
+    }
+
+    /// Forget `uid` in every mount, and have each kernel session drop the name
+    /// it cached for it. Returns the name a mount knew the node by.
+    ///
+    /// For a removal that does not come through the mount. The kernel made an
+    /// unlink through the mount itself, but one made over the control socket
+    /// leaves the old name cached for [`TTL`], pointing at an inode the mount no
+    /// longer has (`docs/BUGS.md` B114). Every mount, not only this one, so a
+    /// fork showing the same node does not keep serving it (`docs/BUGS.md`
+    /// B74).
+    fn forget_everywhere(&self, uid: &NodeUid) -> Option<String> {
+        let mut name = None;
+        self.for_each_mount(|st, notify| {
+            if let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino)) {
+                name = Some(entry.node.name.clone());
+            }
+            forget_and_notify(st, notify, uid);
+        });
+        name
+    }
+
     /// Move a file or folder into the folder at `new_parent_rel`. Both paths are
-    /// mountpoint-relative. Forgets the node and invalidates both the source and
-    /// destination listings so each re-enumerates on next access.
+    /// mountpoint-relative. Moves the node in every mount and invalidates both
+    /// the source and destination listings so each re-enumerates on next access.
     fn move_to(&self, rel: &Path, new_parent_rel: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let old_parent_uid = self.source_parent_uid(ino, rel)?;
@@ -4444,15 +4613,16 @@ impl Core {
             &new_parent_uid,
         )
         .map_err(|error| self.errno_error(error, "move access"))?;
+        let name = self
+            .state()
+            .entries
+            .get(&ino)
+            .map(|entry| entry.node.name.clone())
+            .unwrap_or_default();
         self.rt
             .block_on(self.client.move_node(&uid, &new_parent_uid))
             .map_err(|e| CoreError::from_api(&e, "move"))?;
-        let name = self
-            .state
-            .lock()
-            .forget(&uid)
-            .map(|(_, n)| n)
-            .unwrap_or_default();
+        self.relocate_everywhere(&uid, &new_parent_uid, &name);
         self.invalidate_parent_listing(rel);
         self.state().invalidate_listing(pino);
         Ok(name)
@@ -4478,12 +4648,7 @@ impl Core {
         if let Err(error) = self.discard_queued_ops(&uid) {
             warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
         }
-        let name = self
-            .state
-            .lock()
-            .forget(&uid)
-            .map(|(_, n)| n)
-            .unwrap_or_default();
+        let name = self.forget_everywhere(&uid).unwrap_or_default();
         self.cache.evict(&uid);
         self.evict_reader(&uid);
         self.invalidate_parent_listing(rel);
@@ -5015,8 +5180,8 @@ impl Core {
             )
             .map_err(|e| CoreError::from_api(&e, "create folder"))?;
         let node = self
-            .fetch_node(&new_uid)
-            .map_err(|e| self.errno_error(e, "fetch node"))?;
+            .fetch_minted_node(&new_uid, name)
+            .ok_or_else(|| minted_but_unlisted(name))?;
         let mut st = self.state();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
@@ -5381,6 +5546,15 @@ fn is_already_exists(e: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// Whether a call failed because the node it addressed is not there.
+/// The error for a folder Drive created but did not hand back, where there is
+/// no queue to adopt it later. Saying it was created keeps the caller from
+/// taking a retry's "already exists" for someone else's folder.
+fn minted_but_unlisted(name: &str) -> CoreError {
+    CoreError::remote(format!(
+        "created folder {name}, but Drive did not list it yet; it shows on the next refresh"
+    ))
+}
+
 fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
     api_code(e) == Some(ResponseCode::DoesNotExist)
 }
@@ -5624,6 +5798,18 @@ impl SizeUpgrade {
     fn chunk_done(&self) {
         self.inner.lock().generation += 1;
         self.ready.notify_all();
+    }
+
+    /// Block until the batch has ended or `deadline` has passed. Only for a
+    /// caller that is not on a FUSE or [`Workers`] thread; those park their
+    /// reply with [`Core::await_size`] instead.
+    fn wait_finished(&self, deadline: Instant) {
+        let mut progress = self.inner.lock();
+        while !progress.done {
+            if self.ready.wait_until(&mut progress, deadline).timed_out() {
+                return;
+            }
+        }
     }
 
     /// Release every waiter for good. The worker must reach this on all paths.
@@ -6268,6 +6454,32 @@ mod size_upgrade_tests {
         // Released by the first chunk, not the last.
         assert!(started.elapsed() < Duration::from_millis(200));
         t.join().unwrap();
+    }
+
+    /// `pdfs ls` waits for the whole batch, so it lists no ciphertext size
+    /// (`docs/BUGS.md` B115), but no longer than a `stat` would.
+    #[test]
+    fn a_listing_waits_for_the_whole_size_batch_but_not_forever() {
+        let slot = Arc::new(SizeUpgrade::default());
+        let worker = slot.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            worker.chunk_done();
+            std::thread::sleep(Duration::from_millis(60));
+            worker.finish();
+        });
+        let started = Instant::now();
+        slot.wait_finished(started + Duration::from_secs(5));
+        // Past the first chunk, up to the end of the batch.
+        assert!(started.elapsed() >= Duration::from_millis(90));
+        assert!(slot.is_finished());
+        t.join().unwrap();
+
+        let stuck = SizeUpgrade::default();
+        let started = Instant::now();
+        stuck.wait_finished(started + Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!stuck.is_finished());
     }
 
     /// A chunk that does not resolve this waiter must not answer it.
@@ -8128,26 +8340,32 @@ mod tests {
             "require_uid_writable",
             ".create_folder(&parent_uid",
         );
-        for (signature, gate, remote_call) in [
+        for (signature, gate, remote_call, settle) in [
             (
                 "fn rename(&self, rel: &Path",
                 "require_rename_access",
                 ".rename_remote",
+                "self.relocate_everywhere(&uid",
             ),
             (
                 "fn move_to(&self, rel: &Path",
                 "require_rename_access",
                 ".move_node",
+                "self.relocate_everywhere(&uid",
             ),
             (
                 "fn delete(&self, rel: &Path",
                 "require_node_parent_access",
                 ".trash_nodes",
+                "self.forget_everywhere(&uid)",
             ),
         ] {
             let function = function_source(source, signature);
             assert_before(function, "source_parent_uid", gate);
             assert_before(function, gate, remote_call);
+            // The kernel did not see this change, so it has to be told the
+            // old name is gone (`docs/BUGS.md` B114).
+            assert_before(function, remote_call, settle);
         }
 
         let upload = include_str!("upload.rs");
@@ -8157,6 +8375,19 @@ mod tests {
         assert_before(bulk, "require_uid_writable", "collect_uploads");
         let folder = function_source(upload, "fn ensure_remote_folder(");
         assert_before(folder, "require_uid_writable(parent_uid)", ".create_folder");
+    }
+
+    #[test]
+    fn a_listing_for_the_cli_settles_sizes_before_reading_them() {
+        // A fresh listing holds ciphertext sizes until its upgrade lands
+        // (`docs/BUGS.md` B115).
+        let list = function_source(include_str!("lib.rs"), "fn list_dir(&self, rel: &Path)");
+        assert_before(
+            list,
+            "self.ensure_children(ino)",
+            "self.settle_listing_sizes(ino)",
+        );
+        assert_before(list, "self.settle_listing_sizes(ino)", "node_size(&e.node)");
     }
 
     #[test]
@@ -8473,6 +8704,60 @@ mod tests {
         node.parent_uid =
             parent.map(|parent| NodeUid::new(VolumeId::from(volume), LinkId::from(parent)));
         node
+    }
+
+    /// A rename or move made over the control socket keeps the node and its
+    /// row, so the queue and the drain still know it (`docs/BUGS.md` B117),
+    /// and tells the kernel the old name is gone (`docs/BUGS.md` B114).
+    #[test]
+    fn a_control_move_keeps_the_node_and_its_row_and_drops_the_old_name() {
+        use super::{KernelNotice, NotifyBatch, relocate_in_mount};
+
+        let (mut state, _dir) = state_test_helper();
+        let src = state.intern(0, node_helper("src", "none", "src", true));
+        let dst = state.intern(0, node_helper("dst", "none", "dst", true));
+        let moved = node_helper("moved", "src", "a.txt", false);
+        let uid = moved.uid.clone();
+        let ino = state.intern(src, moved);
+        state.children.insert(src, vec![ino]);
+        state.children.insert(dst, vec![]);
+        let dst_uid = state.entries[&dst].uid.clone();
+
+        let mut notify = NotifyBatch::default();
+        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &dst_uid, "b.txt");
+        assert_eq!(outcome, Some(("a.txt".to_string(), true)));
+        assert_eq!(state.by_uid.get(&uid), Some(&ino), "the inode survives");
+        assert_eq!(state.entries[&ino].parent, dst);
+        let row = state
+            .flushed_db()
+            .node_by_uid(&uid.to_string())
+            .unwrap()
+            .expect("the row survives the move");
+        assert_eq!(row.name, "b.txt");
+        assert_eq!(row.parent_uid.as_ref(), Some(&dst_uid));
+        assert!(notify.0.iter().any(|notice| matches!(
+            notice,
+            KernelNotice::InvalEntry { parent, name } if *parent == src && name == "a.txt"
+        )));
+
+        // A mount that does not show the new parent forgets the node, and the
+        // kernel the name, but the row stays for the caller to move.
+        let elsewhere = node_helper("elsewhere", "none", "elsewhere", true).uid;
+        let mut notify = NotifyBatch::default();
+        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &elsewhere, "c.txt");
+        assert_eq!(outcome, Some(("b.txt".to_string(), false)));
+        assert!(!state.by_uid.contains_key(&uid));
+        assert!(notify.0.iter().any(|notice| matches!(
+            notice,
+            KernelNotice::Delete { parent, child, name } if *parent == dst && *child == ino && name == "b.txt"
+        )));
+        assert!(
+            state
+                .flushed_db()
+                .node_by_uid(&uid.to_string())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

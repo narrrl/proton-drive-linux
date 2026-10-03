@@ -6,6 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::Db;
+use super::nodes::adopt_placeholder_row_tx;
 use crate::Result;
 
 /// The `kind` of a [`PendingOp`] that uploads a staged file as a new revision.
@@ -75,21 +76,32 @@ pub fn op_supersedes(kind: &str) -> bool {
 /// a removed folder: the upload outlived the folder, failed forever against a
 /// trashed node, and kept its blob on disk (`docs/BUGS.md` B102).
 ///
-/// Only revisions are taken from the node tree. A queued rename that moved a
-/// node *into* the folder has to land, or the node would stay where it was
-/// on the server instead of going to the trash with the folder.
+/// "Queued beneath it" starts from every folder the node tree places there,
+/// not only from `uid`. A create in a subfolder that already exists on Drive
+/// names that subfolder as its parent, so following the queue from `uid` alone
+/// missed it: a parked one kept its blob for good, and a due one would have
+/// been made in the root once its folder turned out trashed (`docs/BUGS.md`
+/// B116).
+///
+/// Other ops are taken from the node tree only for revisions. A queued rename
+/// that moved a node *into* the folder has to land, or the node would stay
+/// where it was on the server instead of going to the trash with the folder.
 fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<String>> {
     const DOOMED: &str = "
         WITH RECURSIVE
-          queued(uid) AS (
-            SELECT ?1
-            UNION
-            SELECT p.uid FROM pending_op p JOIN queued q ON p.parent_uid = q.uid
-          ),
           below(uid) AS (
             SELECT ?1
             UNION
             SELECT n.uid FROM nodes n JOIN below b ON n.parent_uid = b.uid
+          ),
+          queued(uid) AS (
+            SELECT ?1
+            UNION
+            SELECT p.uid FROM pending_op p
+            WHERE p.kind IN ('create', 'mkdir')
+              AND p.parent_uid IN (SELECT uid FROM below)
+            UNION
+            SELECT p.uid FROM pending_op p JOIN queued q ON p.parent_uid = q.uid
           ),
           doomed(id) AS (
             SELECT id FROM pending_op
@@ -424,11 +436,7 @@ impl Db {
             "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
             params![local, real],
         )?;
-        tx.execute(
-            "UPDATE nodes SET parent_uid = ?2 WHERE parent_uid = ?1",
-            params![local, real],
-        )?;
-        tx.execute("DELETE FROM nodes WHERE uid = ?1", params![local])?;
+        adopt_placeholder_row_tx(&tx, local, real)?;
         tx.commit()?;
         Ok(newer)
     }
@@ -547,7 +555,8 @@ impl Db {
 
     /// Rewrite every queued op that points at a placeholder parent, once that
     /// parent has drained and has a real uid. Also moves the node rows whose
-    /// parent column still names the placeholder, so listings keep resolving.
+    /// parent column still names the placeholder, so listings keep resolving,
+    /// and readdresses the placeholder's own row.
     pub fn remap_local_uid(&self, local: &str, real: &str) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -555,11 +564,7 @@ impl Db {
             "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
             params![local, real],
         )?;
-        tx.execute(
-            "UPDATE nodes SET parent_uid = ?2 WHERE parent_uid = ?1",
-            params![local, real],
-        )?;
-        tx.execute("DELETE FROM nodes WHERE uid = ?1", params![local])?;
+        adopt_placeholder_row_tx(&tx, local, real)?;
         tx.commit()?;
         Ok(())
     }

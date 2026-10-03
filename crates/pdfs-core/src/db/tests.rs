@@ -2579,6 +2579,74 @@ fn trashing_a_folder_drops_the_queued_revisions_of_files_below_it() {
     );
 }
 
+/// A create in a subfolder that already exists on Drive names that subfolder,
+/// not the folder being trashed, as its parent. It has to go with the folder
+/// all the same, along with whatever is queued inside it, or a parked one
+/// keeps its bytes for good and a due one is made in the root (B116).
+#[test]
+fn trashing_a_folder_drops_the_queued_creates_in_its_subfolders() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("doomed", Some("root"), "doomed"),
+        folder("sub", Some("doomed"), "sub"),
+        folder("other", Some("root"), "other"),
+    ])
+    .unwrap();
+    let op = |kind: &str, node: &str, parent: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: node.to_string(),
+        parent_uid: Some(parent.to_string()),
+        name: Some(format!("{node}.bin")),
+        blob_path: blob.map(str::to_string),
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let sub = uid("sub").to_string();
+    db.enqueue_op(&op(OP_CREATE, "local~deep", &sub, Some("/staging/deep")))
+        .unwrap();
+    db.enqueue_op(&op(OP_MKDIR, "local~dir", &sub, None))
+        .unwrap();
+    db.enqueue_op(&op(
+        OP_CREATE,
+        "local~deeper",
+        "local~dir",
+        Some("/staging/deeper"),
+    ))
+    .unwrap();
+    db.enqueue_op(&op(
+        OP_CREATE,
+        "local~kept",
+        &uid("other").to_string(),
+        Some("/staging/kept"),
+    ))
+    .unwrap();
+
+    let doomed = uid("doomed").to_string();
+    let (_, mut blobs) = db.replace_ops_with_trash(&doomed, "doomed", 2).unwrap();
+    blobs.sort();
+    assert_eq!(blobs, vec!["/staging/deep", "/staging/deeper"]);
+
+    let mut left: Vec<(String, String)> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| (op.kind, op.uid))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            (OP_CREATE.to_string(), "local~kept".to_string()),
+            (OP_TRASH.to_string(), doomed),
+        ]
+    );
+}
+
 /// Deleting a folder that was created offline must take the ops queued
 /// underneath it with it: they name a placeholder parent that will now never
 /// become real, so nothing could ever drain them and nothing is left to
@@ -2900,6 +2968,92 @@ fn draining_a_folder_repoints_its_queued_children() {
     // upload would address `local~dir` and 404.
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops[0].parent_uid.as_deref(), Some(real_dir.as_str()));
+}
+
+/// B120: a child queued inside a folder that has just landed is checked
+/// against the folder's real uid before the server's copy of it arrives.
+#[test]
+fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let mut child = file("child", "root", "inside.txt", 1);
+    child.parent_uid = Some(local.clone());
+    db.upsert_node(&child).unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_MKDIR.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("root").to_string()),
+            name: Some("New folder".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+    db.finish_create(
+        id,
+        None,
+        &local.to_string(),
+        &uid("real").to_string(),
+        |_| None,
+    )
+    .unwrap();
+
+    assert!(db.node_by_uid(&local.to_string()).unwrap().is_none());
+    let landed = db
+        .node_by_uid(&uid("real").to_string())
+        .unwrap()
+        .expect("the landed folder has a row before the server's copy is read");
+    assert_eq!(landed.uid, uid("real"));
+    assert_eq!(landed.name, "New folder");
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(crate::Access::Owner),
+        "the child's authority resolves without a network re-read"
+    );
+    let names: Vec<_> = db
+        .known_children(&uid("real"))
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert_eq!(names, ["inside.txt"]);
+    let found = db.search("inside", 10).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, "New folder/inside.txt");
+}
+
+#[test]
+fn a_landed_placeholder_never_overwrites_the_server_copy() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    // The event stream reported the folder before the drain got round to it.
+    db.upsert_node(&folder("real", Some("root"), "New folder (1)"))
+        .unwrap();
+
+    db.remap_local_uid(&local.to_string(), &uid("real").to_string())
+        .unwrap();
+
+    assert!(db.node_by_uid(&local.to_string()).unwrap().is_none());
+    assert_eq!(
+        db.node_by_uid(&uid("real").to_string())
+            .unwrap()
+            .map(|n| n.name),
+        Some("New folder (1)".to_string())
+    );
 }
 
 #[test]

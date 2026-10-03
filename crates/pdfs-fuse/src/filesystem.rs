@@ -1517,16 +1517,9 @@ impl ProtonFs {
                 media_type_for(name),
                 b"",
             )) {
-                Ok(new_uid) => match self.core.fetch_node(&new_uid) {
-                    Ok(n) => Some(n),
-                    // The file exists remotely but we could not read it back.
-                    // The queued create finds it by name and adopts it.
-                    Err(e) if e == Errno::EIO && !self.core.is_online() => None,
-                    Err(e) => {
-                        reply.error(e);
-                        return;
-                    }
-                },
+                // A file that exists remotely but could not be read back is
+                // queued, and the queued create finds it by name and adopts it.
+                Ok(new_uid) => self.core.fetch_minted_node(&new_uid, name),
                 Err(e) if self.core.lost_link(&e, "create") => None,
                 Err(e) => {
                     error!(%parent_uid, name, error = %e, "create file failed");
@@ -1626,14 +1619,7 @@ impl ProtonFs {
                 .core
                 .block_on_bounded(self.core.client.create_folder(&parent_uid, name, now))
             {
-                Ok(new_uid) => match self.core.fetch_node(&new_uid) {
-                    Ok(n) => Some(n),
-                    Err(e) if e == Errno::EIO && !self.core.is_online() => None,
-                    Err(e) => {
-                        reply.error(e);
-                        return;
-                    }
-                },
+                Ok(new_uid) => self.core.fetch_minted_node(&new_uid, name),
                 Err(e) if self.core.lost_link(&e, "mkdir") => None,
                 Err(e) => {
                     error!(%parent_uid, name, error = %e, "create folder failed");
