@@ -233,6 +233,48 @@ fn acknowledge_applied_event(
     Ok(id)
 }
 
+/// How many applied node-update ids [`RecentEvents`] remembers. Far more than a
+/// replay can reach back: one comes from a batch whose last event was not its
+/// newest, so it repeats at most what that batch held.
+const RECENT_EVENTS: usize = 4096;
+
+/// The node updates applied lately, by event id, so one that comes round again
+/// is skipped rather than applied twice.
+///
+/// The feed can deliver the same event twice in a batch, and a batch whose
+/// events come out of order leaves the cursor short of its newest event, so the
+/// next poll replays what lay past it. An update applied twice is not harmless:
+/// the first copy of our own change claims the echo [`Core::note_self_change`]
+/// recorded, and the second, unclaimed, reads as someone else's edit and evicts
+/// the bytes a partial write is about to gap-fill from (docs/BUGS.md B123).
+///
+/// Only node updates: a delete is idempotent, and a continuity loss names the
+/// cursor it lost, which is an id already applied.
+#[derive(Default)]
+struct RecentEvents {
+    ids: HashSet<DriveEventId>,
+    order: VecDeque<DriveEventId>,
+}
+
+impl RecentEvents {
+    /// Record `event` as applied, reporting whether it was already.
+    fn repeat(&mut self, event: &DriveEvent) -> bool {
+        let DriveEvent::NodeUpdated { id, .. } = event else {
+            return false;
+        };
+        if !self.ids.insert(id.clone()) {
+            return true;
+        }
+        self.order.push_back(id.clone());
+        if self.order.len() > RECENT_EVENTS
+            && let Some(old) = self.order.pop_front()
+        {
+            self.ids.remove(&old);
+        }
+        false
+    }
+}
+
 /// The folders one batch of events changed, collected so the listings are
 /// dropped once at the end of the batch rather than once per event.
 ///
@@ -377,6 +419,7 @@ pub(super) async fn run_event_sync(
     };
     info!(?cursor, "event sync started");
 
+    let mut recent = RecentEvents::default();
     loop {
         core.next_poll(POLL_INTERVAL).await;
         let events = match link::bounded(client.enumerate_events(&scope, cursor.as_ref())).await {
@@ -397,6 +440,11 @@ pub(super) async fn run_event_sync(
         // did apply.
         let mut dirty = DirtyParents::default();
         for event in &events {
+            if recent.repeat(event) {
+                debug!(id = %event.id().as_str(), "skipping an event already applied");
+                cursor = Some(event.id().clone());
+                continue;
+            }
             // Converge the SDK's own caches (folder keys, entity cache) on the
             // server before applying the event to our tree. Without this, a node
             // re-keyed/moved by another client keeps a stale key in the SDK for
@@ -715,6 +763,43 @@ mod tests {
             direct_role: None,
             share_id: None,
         }
+    }
+
+    #[test]
+    fn a_node_update_seen_again_is_skipped_but_other_events_are_not() {
+        let update = |id: &str| DriveEvent::NodeUpdated {
+            id: DriveEventId::from(id),
+            node_uid: uid("file"),
+            parent_node_uid: None,
+            is_trashed: false,
+            is_shared: false,
+        };
+        let mut recent = RecentEvents::default();
+        assert!(!recent.repeat(&update("e1")));
+        assert!(!recent.repeat(&update("e2")));
+        assert!(recent.repeat(&update("e1")), "a duplicate or replay");
+        let lost = DriveEvent::ContinuityLost {
+            id: DriveEventId::from("e2"),
+        };
+        assert!(!recent.repeat(&lost), "names the cursor, which was applied");
+    }
+
+    #[test]
+    fn recent_events_forget_the_oldest_past_their_bound() {
+        let update = |n: usize| DriveEvent::NodeUpdated {
+            id: DriveEventId::from(format!("e{n}")),
+            node_uid: uid("file"),
+            parent_node_uid: None,
+            is_trashed: false,
+            is_shared: false,
+        };
+        let mut recent = RecentEvents::default();
+        for n in 0..=RECENT_EVENTS {
+            assert!(!recent.repeat(&update(n)));
+        }
+        assert_eq!(recent.ids.len(), RECENT_EVENTS);
+        assert!(!recent.repeat(&update(0)), "the oldest was forgotten");
+        assert!(recent.repeat(&update(RECENT_EVENTS)));
     }
 
     #[test]

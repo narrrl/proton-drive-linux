@@ -1435,7 +1435,7 @@ impl ProtonFs {
             len,
             base_size,
             base_mtime,
-            complete: authored == [(0, len)],
+            complete: StagedWrite::covers(&authored, len),
             authored,
             based_on: self
                 .core
@@ -1944,12 +1944,14 @@ impl ProtonFs {
                 // now and this handle's is stale. A retry resolves it.
                 Ok(false) => {
                     warn!(%uid, name, newname, "queued create vanished under a rename");
-                    self.core.restore_replaced(victim.as_ref(), newname);
+                    self.core
+                        .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
                     reply.error(Errno::EBUSY);
                 }
                 Err(e) => {
                     error!(%uid, error = %e, "rewriting a queued create's target failed");
-                    self.core.restore_replaced(victim.as_ref(), newname);
+                    self.core
+                        .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
                     reply.error(Errno::EIO);
                 }
             }
@@ -2001,7 +2003,8 @@ impl ProtonFs {
                     }
                 }
                 Err(e) => {
-                    self.core.restore_replaced(victim.as_ref(), newname);
+                    self.core
+                        .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
                     reply.error(e);
                 }
             }
@@ -2015,8 +2018,6 @@ impl ProtonFs {
             queue_it(reply);
             return;
         }
-        // Rename first if both halves change; a move that then fails leaves the
-        // node renamed in its source folder, which the tree is told below.
         // A failure past this point has already trashed any node the rename was
         // replacing, so put it back rather than leaving the caller with neither
         // the source moved nor the destination intact.
@@ -2026,48 +2027,37 @@ impl ProtonFs {
             &old_parent_uid,
             &new_parent_uid,
         ) {
-            self.core.restore_replaced(victim.as_ref(), newname);
+            self.core
+                .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
             reply.error(error);
             return;
         }
-        if newname != name
-            && let Err(e) = self.core.rename_remote(&uid, newname)
-        {
+        // A move that also renames is one request, so the name only has to be
+        // free in the destination, and the reply never stands for half of it.
+        let renamed = if newparent != parent {
+            let target = (newname != name).then_some(newname);
+            self.core.move_rename_remote(&uid, &new_parent_uid, target)
+        } else if newname != name {
+            self.core.rename_remote(&uid, newname)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = renamed {
             if self.core.lost_link(&e, "rename") {
                 queue_it(reply);
                 return;
             }
             error!(%uid, error = %e, "rename failed");
-            self.core.restore_replaced(victim.as_ref(), newname);
+            self.core
+                .restore_replaced(victim.as_ref(), &new_parent_uid, newname);
             reply.error(Errno::EIO);
             return;
         }
-        // A successful reply must mean both remote halves landed, not merely
-        // that the second half was queued.
-        if newparent != parent
-            && let Err(e) = self.core.move_remote(&uid, &new_parent_uid)
-        {
-            if self.core.lost_link(&e, "move") {
-                queue_it(reply);
-                return;
-            }
-            error!(%uid, error = %e, "move after rename failed");
-            // The rename half landed in the source directory.
-            let mut state = self.core.state();
-            let old_parent_uid = state
-                .entries
-                .get(&parent)
-                .map(|entry| entry.uid.clone())
-                .unwrap_or_else(|| uid.clone());
-            state.rename_in_place(ino, parent, &old_parent_uid, newname);
-            drop(state);
-            self.core.restore_replaced(victim.as_ref(), newname);
-            reply.error(Errno::EIO);
-            return;
-        }
+        // Through the guard, so the database has both folders unlisted before
+        // the reply. The next lookup rebuilds a folder still marked listed from
+        // the database, which did not have the move yet (docs/BUGS.md B135).
         self.core
-            .state
-            .lock()
+            .state()
             .relocate(ino, parent, newparent, &new_parent_uid, newname);
         reply.ok();
     }

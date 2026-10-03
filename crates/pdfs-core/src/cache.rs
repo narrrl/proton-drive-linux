@@ -365,6 +365,14 @@ pub struct StagedWrite {
     pub based_on: Option<Baseline>,
 }
 
+impl StagedWrite {
+    /// Whether `authored` ranges cover a file of `len` bytes, so the staged
+    /// bytes are its complete new content. An empty file has nothing to cover.
+    pub fn covers(authored: &[(u64, u64)], len: u64) -> bool {
+        len == 0 || authored == [(0, len)]
+    }
+}
+
 /// The identity of a remote revision, as far as we can observe it.
 ///
 /// `revision_id` is the authoritative identity when present: the server assigns a
@@ -2054,6 +2062,17 @@ mod tests {
 
     fn uid(link: &str) -> NodeUid {
         NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    #[test]
+    fn an_empty_write_covers_the_file_and_a_gap_does_not() {
+        assert!(
+            StagedWrite::covers(&[], 0),
+            "an empty file has nothing to cover"
+        );
+        assert!(StagedWrite::covers(&[(0, 7)], 7));
+        assert!(!StagedWrite::covers(&[(0, 3), (4, 7)], 7));
+        assert!(!StagedWrite::covers(&[], 7));
     }
 
     /// A unique temp directory removed on drop; avoids a dev-dependency.

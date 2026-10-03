@@ -29,16 +29,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use futures::StreamExt;
 use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{
     OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_EXPIRY_MS, PendingOp, RenameMeta,
 };
-use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{Node, NodeKind, NodeMoveItem};
+use proton_drive_rs::{Node, NodeKind};
 use tracing::{debug, error, info, warn};
 
 use super::state::{Intervals, PendingRevision};
@@ -693,7 +691,7 @@ impl Core {
             // no window for the requirements to go stale between two calls —
             // the race B46 queued this op to get away from.
             let target = (node.name != name).then_some(name.as_str());
-            match self.move_renaming(&uid, &parent, target) {
+            match self.move_rename_remote(&uid, &parent, target) {
                 Ok(()) => name.clone(),
                 // The destination holds that name already. Landing under a
                 // *different* name is the non-destructive resolution: it neither
@@ -704,7 +702,7 @@ impl Core {
                     }
                     let alt = conflict_name(&name, now_secs());
                     warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
-                    self.move_renaming(&uid, &parent, Some(&alt))?;
+                    self.move_rename_remote(&uid, &parent, Some(&alt))?;
                     self.adopt_drained_name(&uid, &alt);
                     self.log_activity(
                         ActivityKind::Rename,
@@ -741,7 +739,6 @@ impl Core {
             }
         };
         self.db.delete_op(op.id)?;
-        self.note_self_change(&uid);
         info!(%uid, name = %landed, "pending rename landed");
         Ok(())
     }
@@ -778,33 +775,6 @@ impl Core {
             }
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Move `uid` under `parent` in one request, renaming it to `target_name` on
-    /// the way when one is given.
-    fn move_renaming(
-        &self,
-        uid: &NodeUid,
-        parent: &NodeUid,
-        target_name: Option<&str>,
-    ) -> Result<(), ProtonError> {
-        let item = NodeMoveItem {
-            uid: uid.clone(),
-            target_name: target_name.map(str::to_string),
-        };
-        self.rt
-            .block_on(async {
-                let mut outcomes =
-                    std::pin::pin!(self.drive.move_nodes_streaming(vec![item], parent.clone()));
-                match outcomes.next().await {
-                    Some(Ok((_, outcome))) => outcome,
-                    Some(Err(e)) => Err(e),
-                    None => Err(ProtonError::invalid_operation(format!(
-                        "move of {uid} reported no outcome"
-                    ))),
-                }
-            })
-            .inspect(|()| self.forget_sdk_node(uid))
     }
 
     /// Apply a queued trash to the remote.
@@ -941,7 +911,23 @@ impl Core {
         // uploaded: it goes on as a revision of the node instead.
         let uploaded = (!adopted).then_some(op.blob_path.as_deref()).flatten();
         let newer = self.retire_create(op, uploaded, &local, &real)?;
-        self.adopt_real_uid(&local, &real)?;
+        // The uploaded blob is the new file's content, so it becomes the cached
+        // content, as for a revision. A partial write fills its gaps from it;
+        // without it the next write open was refused (`docs/BUGS.md` B123).
+        let landed: Option<StagedWrite> = uploaded
+            .filter(|_| !newer)
+            .and(op.meta_json.as_deref())
+            .and_then(|json| serde_json::from_str(json).ok());
+        self.adopt_real_uid(&local, &real, |node| {
+            if let (Some(blob), Some(meta)) = (uploaded, &landed)
+                && node_size(node) == meta.len
+                && keeps_landed_upload(self.cache.is_pinned(&real), meta.len, self.cache.budget())
+            {
+                let _ =
+                    self.cache
+                        .store_file(&real, node.modification_time, meta.len, Path::new(blob));
+            }
+        })?;
         // The feed will report this create back to us; the tree already has it
         // under its real uid, so that event is ours to ignore (`Core::self_changes`).
         self.note_self_change(&real);
@@ -1096,6 +1082,9 @@ impl Core {
             }
             newer.is_some()
         };
+        if !newer && let Some(blob) = uploaded {
+            self.cache_created(op, local, real, blob);
+        }
         self.for_each_state(|st| {
             if let Some(ino) = st.by_uid.remove(local) {
                 st.by_uid.insert(real.clone(), ino);
@@ -1112,6 +1101,38 @@ impl Core {
         Ok(newer)
     }
 
+    /// Cache a landed create's uploaded `blob` under `real`, keyed as the tree
+    /// has the file.
+    ///
+    /// A write handle open on the file is repointed at `real` right after this,
+    /// and a release fills its gaps from the cache by the size and mtime it
+    /// opened over. Drive lists the new node a moment after the create, so
+    /// `adopt_real_uid` caches the bytes only once it can read the node back.
+    /// A release in between found nothing to fill from, and the next write open
+    /// was refused (docs/BUGS.md B131).
+    fn cache_created(&self, op: &PendingOp, local: &NodeUid, real: &NodeUid, blob: &str) {
+        let Some(meta) = op
+            .meta_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<StagedWrite>(json).ok())
+        else {
+            return;
+        };
+        let mut mtime = None;
+        self.for_each_state(|st| {
+            if let Some(entry) = st.by_uid.get(local).and_then(|ino| st.entries.get(ino)) {
+                mtime = Some(entry.node.modification_time);
+            }
+        });
+        if let Some(mtime) = mtime
+            && keeps_landed_upload(self.cache.is_pinned(real), meta.len, self.cache.budget())
+        {
+            let _ = self
+                .cache
+                .store_file(real, mtime, meta.len, Path::new(blob));
+        }
+    }
+
     /// Swap a placeholder uid for the real one across everything that keyed off
     /// it: queued children, the DB, the in-memory tree, and the caches.
     ///
@@ -1125,14 +1146,22 @@ impl Core {
     /// its `local~` uid, which reads as an empty file for as long as the daemon
     /// runs (`docs/BUGS.md` B74). A uid is unique across mounts, so at most one
     /// of them matches and the others are no-ops.
+    ///
+    /// `adopt` sees the node as Drive made it, before anything is rebased onto
+    /// it.
     pub(crate) fn adopt_real_uid(
         &self,
         local: &NodeUid,
         real: &NodeUid,
+        adopt: impl FnOnce(&Node),
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Drive answers a create before it lists the new node.
         let node = self
-            .fetch_node(real)
+            .read_back(real)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
+        // Before open handles are rebased onto the node, so one released in
+        // between finds what `adopt` keeps (`docs/BUGS.md` B123).
+        adopt(&node);
         // Repoints queued children and node rows, and readdresses the placeholder row.
         // A no-op after `retire_create`, which has already done both.
         self.db
@@ -1667,10 +1696,7 @@ impl Core {
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
         self.db.delete_op(op.id)?;
-        self.release_pending(&uid, &blob);
         self.evict_reader(&uid);
-        let landed = self.refresh_after_upload(&uid);
-
         // The staged blob now matches the sealed revision, so it becomes the
         // file's cached content, stamped like the revision just read back.
         // Reading the file again then needs no network, which an editor or a
@@ -1678,14 +1704,15 @@ impl Core {
         // B119). Adopted by link, not by value: the blob is the whole file, and
         // a video read into a `Vec` here is an OOM. `discard_staged` below drops
         // the staging name only — the cache keeps the inode.
-        if let Some(node) = landed
-            && node_size(&node) == meta.len
-            && keeps_landed_upload(self.cache.is_pinned(&uid), meta.len, self.cache.budget())
-        {
-            let _ = self
-                .cache
-                .store_file(&uid, node.modification_time, meta.len, &blob);
-        }
+        self.refresh_after_upload(&uid, &blob, |node| {
+            if node_size(node) == meta.len
+                && keeps_landed_upload(self.cache.is_pinned(&uid), meta.len, self.cache.budget())
+            {
+                let _ = self
+                    .cache
+                    .store_file(&uid, node.modification_time, meta.len, &blob);
+            }
+        });
         self.cache.discard_staged(&blob);
         self.log_activity(ActivityKind::Upload, &name, "uploaded", true);
         // Both times, so a slow drain shows whether the upload itself or the
@@ -1720,11 +1747,27 @@ impl Core {
     /// we just sealed. Skipping both, as this used to, is what produced a file
     /// that conflicted with itself and left a full-size duplicate behind.
     ///
+    /// `blob` is the revision that landed, which stays the pending one until
+    /// open write handles are rebased off it, and `adopt` gets the node read
+    /// back before that, so the uploaded bytes can be cached under its
+    /// revision first. A handle released in between fills its gaps from one
+    /// or the other; with the blob let go first and the cache filled last, it
+    /// found neither, and the next write open was refused (docs/BUGS.md B123).
+    ///
     /// Best effort: a failure here costs a spurious conflict copy on the next
     /// write, not this upload, which has already landed. Returns the node as
     /// the server now has it, or `None` when it could not be read back.
-    pub(crate) fn refresh_after_upload(&self, uid: &NodeUid) -> Option<Node> {
-        let node = match self.fetch_node_remote(uid) {
+    pub(crate) fn refresh_after_upload(
+        &self,
+        uid: &NodeUid,
+        blob: &Path,
+        adopt: impl FnOnce(&Node),
+    ) -> Option<Node> {
+        let fetched = self.fetch_node_remote(uid);
+        if !matches!(fetched, Ok(Some(_))) {
+            self.release_pending(uid, blob);
+        }
+        let node = match fetched {
             Ok(Some(node)) => node,
             // Trashed or deleted under us: the tree will hear it from the event
             // sync, which is better placed to unhook the inode than we are.
@@ -1736,6 +1779,7 @@ impl Core {
                 return None;
             }
         };
+        adopt(&node);
         // This function's whole job is to bring the tree level with the revision
         // we just sealed, so the feed's report of that revision has nothing left
         // to tell us. Claimed here rather than at the upload call so it is only
@@ -1768,6 +1812,7 @@ impl Core {
             }
             self.rebase_open_writes(uid, &node);
         }
+        self.release_pending(uid, blob);
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
         // this overwrites it with the revision the server actually holds.

@@ -537,6 +537,17 @@ impl Faults {
         }
     }
 
+    /// A good link whose event feed is slow and untidy: every echo of our own
+    /// changes comes late, often twice, often out of order.
+    pub(crate) fn echoes() -> Self {
+        Self {
+            event_delay: Duration::from_secs(1),
+            duplicate_events: 0.3,
+            reorder_events: 0.3,
+            ..Self::lan()
+        }
+    }
+
     /// The Wi-Fi of the 2026-10 account runs: slow and lossy, with listings
     /// and events well behind.
     pub(crate) fn wifi() -> Self {

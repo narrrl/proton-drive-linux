@@ -309,4 +309,115 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Write `bytes` at `offset` into an existing file, without truncating it.
+    fn write_at(path: &Path, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .write_all_at(bytes, offset)
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_closed_empty_takes_a_second_write_at_once() {
+        // The empty revision never counted as complete, so the next write
+        // open before it drained was refused with EIO (B123).
+        let drive = FakeDrive::new();
+        let dir = scratch("empty-rewrite");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        let path = daemon.mountpoint.join("empty.txt");
+        std::fs::write(&path, b"old").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().contains_key("empty.txt")
+        }));
+        std::fs::write(&path, b"").unwrap();
+        write_at(&path, 0, b"filled").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                drive.tree().get("empty.txt") == Some(&Entry::File(Arc::new(b"filled".to_vec())))
+            }),
+            "the second write landed: {:?}",
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn the_echo_of_our_own_rename_keeps_the_cached_bytes() {
+        // The echo read as someone else's change and evicted the bytes, so a
+        // partial write could not gap-fill, and the next write open on the
+        // file was refused with EIO (B123).
+        let drive = FakeDrive::new();
+        let dir = scratch("rename-echo");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        let before = daemon.mountpoint.join("a.txt");
+        std::fs::write(&before, b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().contains_key("a.txt")
+        }));
+        assert_eq!(std::fs::read(&before).unwrap(), b"0123456789");
+        let after = daemon.mountpoint.join("b.txt");
+        std::fs::rename(&before, &after).unwrap();
+        // Long enough for the next event poll to bring the echo.
+        std::thread::sleep(crate::POLL_INTERVAL + Duration::from_secs(3));
+
+        write_at(&after, 3, b"x").unwrap();
+        write_at(&after, 5, b"y").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                drive.tree().get("b.txt") == Some(&Entry::File(Arc::new(b"012x4y6789".to_vec())))
+            }),
+            "both writes landed: {:?}",
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_rename_across_folders_ignores_the_new_name_in_the_old_folder() {
+        // The rename went to Drive as a rename in the old folder and then a
+        // move, so a sibling there with the new name failed it with EIO
+        // (B122).
+        let drive = FakeDrive::new();
+        let dir = scratch("rename-across");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        let mount = &daemon.mountpoint;
+        std::fs::create_dir(mount.join("x")).unwrap();
+        std::fs::create_dir(mount.join("z")).unwrap();
+        std::fs::write(mount.join("x/f.txt"), b"moved").unwrap();
+        std::fs::write(mount.join("x/d"), b"sibling").unwrap();
+        std::fs::write(mount.join("z/d"), b"replaced").unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+        assert!(wait_until(Duration::from_secs(30), || {
+            let tree = drive.tree();
+            [
+                ("x/f.txt", b"moved".as_slice()),
+                ("x/d", b"sibling"),
+                ("z/d", b"replaced"),
+            ]
+            .iter()
+            .all(|(path, bytes)| tree.get(*path).cloned() == file(bytes))
+        }));
+
+        std::fs::rename(mount.join("x/f.txt"), mount.join("z/d")).unwrap();
+        assert_eq!(std::fs::read(mount.join("z/d")).unwrap(), b"moved");
+        let tree = drive.tree();
+        assert_eq!(tree.get("z/d").cloned(), file(b"moved"));
+        assert_eq!(tree.get("x/d").cloned(), file(b"sibling"));
+        assert!(!tree.contains_key("x/f.txt"));
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

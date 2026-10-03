@@ -825,9 +825,52 @@ impl State {
         }
     }
 
-    pub(crate) fn intern(&mut self, parent: u64, node: Node) -> u64 {
+    pub(crate) fn intern(&mut self, parent: u64, mut node: Node) -> u64 {
+        self.keep_revision_mtime(&mut node);
         self.outbox.push(DbWrite::Upsert(vec![node.clone()]));
         self.intern_mem(parent, node)
+    }
+
+    /// Keep what is already known of a file whose content has not changed.
+    ///
+    /// Drive stamps a link's `ModifyTime` on a rename or a move as well, while
+    /// POSIX leaves a file's mtime alone there. The content cache is keyed by
+    /// it, too: taking the new stamp made the cached bytes unreachable, so the
+    /// next partial write could not fill its gaps (docs/BUGS.md B123). The
+    /// active revision id says whether the content is still the same, and so
+    /// whether the size and digest a listing left out are still the ones known.
+    fn keep_revision_mtime(&self, node: &mut Node) {
+        let Some(entry) = self
+            .by_uid
+            .get(&node.uid)
+            .and_then(|ino| self.entries.get(ino))
+        else {
+            return;
+        };
+        if let (
+            NodeKind::File {
+                active_revision_id: Some(now),
+                claimed_size,
+                content_sha1,
+                ..
+            },
+            NodeKind::File {
+                active_revision_id: Some(was),
+                claimed_size: size_was,
+                content_sha1: sha1_was,
+                ..
+            },
+        ) = (&mut node.kind, &entry.node.kind)
+            && now == was
+        {
+            node.modification_time = entry.node.modification_time;
+            if claimed_size.is_none() {
+                *claimed_size = *size_was;
+            }
+            if content_sha1.is_none() {
+                content_sha1.clone_from(sha1_was);
+            }
+        }
     }
 
     /// Allocate (or reuse) a stable inode for a node, updating the hot-cache maps
@@ -915,7 +958,10 @@ impl State {
     ///
     /// This is what keeps `ls` on a large folder quick: one commit for the
     /// listing, rather than one autocommit — and one fsync — per child.
-    pub(crate) fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
+    pub(crate) fn intern_batch(&mut self, parent: u64, mut nodes: Vec<Node>) -> Vec<u64> {
+        for node in &mut nodes {
+            self.keep_revision_mtime(node);
+        }
         self.outbox.push(DbWrite::Upsert(nodes.clone()));
         nodes
             .into_iter()
@@ -1935,6 +1981,51 @@ mod tests {
         shared.membership = Some(membership(38));
         let shared = st.intern(owned_root, shared);
         assert_eq!(st.entries[&shared].access, Access::Viewer);
+    }
+
+    fn at_revision(mut node: Node, revision: &str, mtime: i64) -> Node {
+        node.modification_time = mtime;
+        if let NodeKind::File {
+            active_revision_id, ..
+        } = &mut node.kind
+        {
+            *active_revision_id = Some(revision.into());
+        }
+        node
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_mtime_until_its_content_changes() {
+        let (mut st, _dir) = state();
+        let root = st.intern(0, node("root", "none", "My Files", true));
+        let mut file = node("file", "root", "a.txt", false);
+        if let NodeKind::File {
+            claimed_size,
+            total_size_on_storage,
+            ..
+        } = &mut file.kind
+        {
+            *claimed_size = Some(7);
+            *total_size_on_storage = 519;
+        }
+        let ino = st.intern(root, at_revision(file.clone(), "r1", 100));
+        // Drive stamps the link on a rename; the content is still r1.
+        let mut renamed = at_revision(file.clone(), "r1", 160);
+        renamed.name = "b.txt".into();
+        st.intern_batch(root, vec![renamed]);
+        assert_eq!(st.entries[&ino].node.modification_time, 100);
+        assert_eq!(st.entries[&ino].node.name, "b.txt");
+        // A listing that leaves the size out still describes revision r1.
+        let mut bare = at_revision(file.clone(), "r1", 170);
+        assert_eq!(crate::node_size(&st.entries[&ino].node), 7);
+        if let NodeKind::File { claimed_size, .. } = &mut bare.kind {
+            *claimed_size = None;
+        }
+        st.intern(root, bare);
+        assert_eq!(st.entries[&ino].node.modification_time, 100);
+        assert_eq!(crate::node_size(&st.entries[&ino].node), 7);
+        st.intern(root, at_revision(file, "r2", 200));
+        assert_eq!(st.entries[&ino].node.modification_time, 200);
     }
 
     fn handle(len: u64, base_size: u64) -> WriteHandle {

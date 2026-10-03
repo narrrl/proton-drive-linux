@@ -65,25 +65,6 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    // A rename across folders renames in the source folder first, so a
-    // sibling there with the new name refuses it.
-    Known {
-        bug: "B122",
-        is: |model, op, errno, _, _| {
-            let FsOp::Rename { from, to } = op else {
-                return false;
-            };
-            errno == libc::EIO
-                && parent_of(from) != parent_of(to)
-                && name_of(from) != name_of(to)
-                && model
-                    .tree()
-                    .contains_key(&join(parent_of(from), name_of(to)))
-        },
-        // The destination it was replacing is restored on Drive but stays
-        // gone from the mount (B124).
-        ends_seed: |model, op| matches!(op, FsOp::Rename { to, .. } if model.tree().contains_key(to)),
-    },
     // A replacing rename trashes what it replaces first, so Drive refuses the
     // name only when it holds a node the mount has forgotten: the create of
     // the replaced file landed after its op was dropped.
@@ -99,19 +80,9 @@ const KNOWN: &[Known] = &[
                     .iter()
                     .any(|line| line.starts_with("rename failed") && line.contains("AlreadyExists"))
         },
-        // The file it was replacing is gone from the mount (B124).
+        // The model made the rename, and Drive holds a node the mount does
+        // not know.
         ends_seed: |_, _| true,
-    },
-    // A write over a queued revision whose gaps are not filled yet is refused.
-    Known {
-        bug: "B123",
-        is: |_, _, errno, logged, _| {
-            errno == libc::EIO
-                && logged
-                    .iter()
-                    .any(|line| line.starts_with("refusing write over incomplete queued revision"))
-        },
-        ends_seed: |_, _| false,
     },
     // A folder made offline is listed on Drive once its listing has been
     // invalidated, and Drive does not know it, or does not list it yet. Only
@@ -649,13 +620,6 @@ impl Run {
     /// - B128: the file's queued create ran into the name of the file it
     ///   replaced and took that over, trash and all.
     ///
-    /// A conflict copy of an earlier version, which the model no longer
-    /// holds, takes the drain saying it kept a queued write as that copy
-    /// after a landed create could not be read back:
-    ///
-    /// - B131: the tree kept the create's placeholder, so a write based on it
-    ///   found Drive's copy changed.
-    ///
     /// A conflict copy of a file the client deleted takes the drain saying it
     /// kept that file's write as the copy, because Drive had the file in the
     /// trash while the tree still placed it:
@@ -693,16 +657,6 @@ impl Run {
                     })
             })
         };
-        let unread_create = self.logged.iter().any(|line| {
-            line.starts_with("pending upload failed; will retry uid=local~")
-                && line.ends_with("error=fetch node: no such file or folder")
-        });
-        let kept_write = |copy: &str| {
-            let alt = format!("alt={:?}", name_of(copy));
-            self.logged.iter().any(|line| {
-                line.starts_with("queued write landed as a conflict copy") && line.ends_with(&alt)
-            })
-        };
         let kept_deleted = |copy: &str| {
             let alt = format!(" alt={:?}", name_of(copy));
             self.logged.iter().any(|line| {
@@ -724,15 +678,11 @@ impl Run {
             if !is_conflict_copy(copy) || model.contains_key(copy) {
                 continue;
             }
-            let bug = if unread_create && kept_write(copy) {
-                "B131"
-            } else if kept_deleted(copy) {
-                "B134"
-            } else {
+            if !kept_deleted(copy) {
                 continue;
-            };
+            }
             damage.push(KnownDamage {
-                bug,
+                bug: "B134",
                 path: copy.clone(),
                 copy: Some(copy.clone()),
                 change: FsOp::Create {
@@ -1068,6 +1018,19 @@ mod tests {
         drain_budget: Duration::from_secs(20),
     };
 
+    static ONE_CLIENT_ECHOES: Profile = Profile {
+        name: "one-client-echoes",
+        clients: 1,
+        steps: 60,
+        faults: Faults::echoes,
+        link_flaps: false,
+        restarts: false,
+        deletes_mid_upload: false,
+        settle_budget: Some(Duration::from_secs(6)),
+        syscall_budget: Duration::from_secs(2),
+        drain_budget: Duration::from_secs(20),
+    };
+
     static ONE_CLIENT_FLAKY: Profile = Profile {
         name: "one-client-flaky",
         clients: 1,
@@ -1104,6 +1067,12 @@ mod tests {
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse --lib sim::run -- --ignored`"]
     fn one_client_deleting_files_as_they_upload() {
         run_seeds(&ONE_CLIENT_DELETES, 3);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse --lib sim::run -- --ignored`"]
+    fn one_client_with_stale_hashes_and_reordered_echoes() {
+        run_seeds(&ONE_CLIENT_ECHOES, 6);
     }
 
     #[test]

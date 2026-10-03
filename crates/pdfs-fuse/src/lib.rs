@@ -74,7 +74,7 @@ use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_drive_rs::{
-    DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, ProtonDriveClient,
+    DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, NodeMoveItem, ProtonDriveClient,
     ProtonPhotosClient, SharedWithMeItem, ThumbnailType,
 };
 
@@ -1477,7 +1477,7 @@ fn merge_over_pending(
         .filter(|&(_, _, authored)| authored)
         .map(|(s, e, _)| (s, e))
         .collect();
-    meta.complete = meta.authored == [(0, meta.len)];
+    meta.complete = StagedWrite::covers(&meta.authored, meta.len);
     Ok(())
 }
 
@@ -1627,6 +1627,38 @@ impl Core {
         })
     }
 
+    /// Move `uid` into the folder `parent` on Drive, renaming it to
+    /// `target_name` on the way when one is given, in one request.
+    ///
+    /// Done as a rename and then a move, a sibling in the source folder that
+    /// held the new name made Drive refuse the first half, although the
+    /// destination was free (docs/BUGS.md B122). One request also leaves no
+    /// half-applied state between the two.
+    pub(crate) fn move_rename_remote(
+        &self,
+        uid: &NodeUid,
+        parent: &NodeUid,
+        target_name: Option<&str>,
+    ) -> Result<(), ProtonError> {
+        self.change_remote(uid, || {
+            let item = NodeMoveItem {
+                uid: uid.clone(),
+                target_name: target_name.map(str::to_string),
+            };
+            self.block_on_bounded(async {
+                let mut outcomes =
+                    std::pin::pin!(self.drive.move_nodes_streaming(vec![item], parent.clone()));
+                match outcomes.next().await {
+                    Some(Ok((_, outcome))) => outcome,
+                    Some(Err(e)) => Err(e),
+                    None => Err(ProtonError::invalid_operation(format!(
+                        "move of {uid} reported no outcome"
+                    ))),
+                }
+            })
+        })
+    }
+
     /// Run a rename or move of `uid`, then drop the SDK's now stale copy of it.
     fn change_remote(
         &self,
@@ -1637,7 +1669,16 @@ impl Core {
             self.forget_sdk_node(uid);
             std::thread::sleep(OUT_OF_DATE_RETRY_DELAY);
         })
-        .inspect(|()| self.forget_sdk_node(uid))
+        .inspect(|()| self.changed_remote(uid))
+    }
+
+    /// Bookkeeping after a rename or move of `uid` landed: the SDK's copy of it
+    /// is stale, and the feed will echo the change back. Without the second,
+    /// that echo reads as someone else's edit and evicts the cached bytes a
+    /// partial write is about to gap-fill from (docs/BUGS.md B123).
+    pub(crate) fn changed_remote(&self, uid: &NodeUid) {
+        self.forget_sdk_node(uid);
+        self.note_self_change(uid);
     }
 
     /// Drop the SDK's cached copy of `uid` after this daemon renamed or moved it.
@@ -3047,19 +3088,32 @@ impl Core {
     /// drain finds the node by name and adopts it: the application gets its
     /// file or folder either way, never an `ENOENT` for something that exists.
     fn fetch_minted_node(&self, uid: &NodeUid, name: &str) -> Option<Node> {
+        // The feed echoes the create. Unclaimed, it would take the echo the
+        // upload of the file's bytes records, and that one would then evict
+        // the bytes just uploaded (docs/BUGS.md B123).
+        self.note_self_change(uid);
+        let node = self.read_back(uid).ok();
+        if node.is_none() {
+            warn!(%uid, name, "Drive made the node but did not hand it back");
+        }
+        node
+    }
+
+    /// [`Core::fetch_node`] for a node Drive has just made, asked again for a
+    /// moment while Drive does not list it yet.
+    pub(crate) fn read_back(&self, uid: &NodeUid) -> Result<Node, Errno> {
         let mut delays = MINTED_READ_BACK_DELAYS.iter();
         loop {
             match self.fetch_node(uid) {
-                Ok(node) => return Some(node),
-                Err(e) if e == Errno::ENOENT => match delays.next() {
-                    Some(delay) => std::thread::sleep(*delay),
-                    None => break,
-                },
-                Err(_) => break,
+                Err(e)
+                    if e == Errno::ENOENT
+                        && let Some(delay) = delays.next() =>
+                {
+                    std::thread::sleep(*delay);
+                }
+                fetched => return fetched,
             }
         }
-        warn!(%uid, name, "Drive made the node but did not hand it back");
-        None
     }
 
     /// [`Core::fetch_node`] without the collapse to an `Errno`, for the drain:
@@ -3160,7 +3214,7 @@ impl Core {
             len: h.len,
             base_size: h.base_size,
             base_mtime: h.base_mtime,
-            complete: authored == [(0, h.len)],
+            complete: StagedWrite::covers(&authored, h.len),
             authored,
             based_on: self.remote_baseline(
                 &h.uid,
@@ -3193,7 +3247,7 @@ impl Core {
             len: h.len,
             base_size: h.base_size,
             base_mtime: h.base_mtime,
-            complete: authored == [(0, h.len)],
+            complete: StagedWrite::covers(&authored, h.len),
             authored,
             based_on: self.remote_baseline(
                 &h.uid,
@@ -4803,7 +4857,11 @@ impl Core {
     /// further to try, and the node is still in the trash where `pdfs restore`
     /// can reach it. Says so loudly in that case, because the alternative is a
     /// file the user believes was only renamed quietly sitting in the trash.
-    fn restore_replaced(&self, victim: Option<&(u64, NodeUid)>, name: &str) {
+    ///
+    /// A restored node comes back to the mount as the ordinary restore brings
+    /// it: out of `hidden`, and through a fresh listing of `parent` in every
+    /// mount that shows it (`docs/BUGS.md` B124).
+    fn restore_replaced(&self, victim: Option<&(u64, NodeUid)>, parent: &NodeUid, name: &str) {
         let Some((_, uid)) = victim else { return };
         if is_local_uid(uid) {
             // Its queued create was discarded and cannot be reconstructed from
@@ -4817,6 +4875,13 @@ impl Core {
             .and_then(batch::into_unit)
         {
             Ok(()) => {
+                self.hidden.lock().remove(uid);
+                self.for_each_mount(|st, notify| {
+                    if let Some(&ino) = st.by_uid.get(parent) {
+                        st.invalidate_listing(ino);
+                        notify.inval_entry(ino, name.to_string());
+                    }
+                });
                 self.invalidate_trash();
                 debug!(%uid, name, "restored the node a failed rename had replaced");
             }
@@ -6301,7 +6366,7 @@ mod merge_over_pending_tests {
             len,
             base_size,
             base_mtime: 100,
-            complete: authored == [(0, len)],
+            complete: StagedWrite::covers(authored, len),
             authored: authored.to_vec(),
             based_on: Some(Baseline {
                 mtime: 100,
@@ -8459,6 +8524,20 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_node_put_back_shows_in_the_mount_again() {
+        // The restore after a failed rename left the node hidden and out of
+        // the listing, so a create by its name failed with ENOENT (B124).
+        let restore = function_source(include_str!("lib.rs"), "fn restore_replaced(");
+        assert_before(
+            restore,
+            "self.drive.restore_nodes(",
+            "self.hidden.lock().remove(uid)",
+        );
+        assert!(restore.contains("st.invalidate_listing(ino)"));
+        assert!(restore.contains("notify.inval_entry(ino, name.to_string())"));
+    }
+
+    #[test]
     fn a_size_upgrade_leaves_the_page_cache_alone() {
         // Reads resolve provisional sizes inline, while the kernel holds the
         // page lock of that read; dropping pages here waited on it forever.
@@ -8540,21 +8619,32 @@ mod tests {
                 usize::from(source.contains("fn move_remote(")),
                 "call Core::move_remote instead of the SDK move directly"
             );
+            assert_eq!(
+                source
+                    .matches(concat!("drive.move_nodes_streaming", "("))
+                    .count(),
+                usize::from(source.contains("fn move_rename_remote(")),
+                "call Core::move_rename_remote instead of the SDK move directly"
+            );
         }
     }
 
     #[test]
-    fn a_rename_or_move_drops_the_sdk_copy_of_the_node() {
+    fn a_rename_or_move_drops_the_sdk_copy_and_expects_its_echo() {
         // The SDK would send the old name hash with the node's next rename or
-        // move until the event poll caught up (B121).
+        // move until the event poll caught up (B121), and the echo of the
+        // change, taken for someone else's, evicted the cached bytes (B123).
         let change = function_source(include_str!("lib.rs"), "fn change_remote(");
-        assert_eq!(
-            change.matches("self.forget_sdk_node(uid)").count(),
-            2,
-            "forget the node before each retry and once the change landed"
+        assert!(
+            change.contains("self.forget_sdk_node(uid)"),
+            "forget the node before each retry"
         );
-        let drained = function_source(include_str!("drain.rs"), "fn move_renaming(");
-        assert!(drained.contains("self.forget_sdk_node(uid)"));
+        assert!(change.contains("self.changed_remote(uid)"));
+        let moved = function_source(include_str!("lib.rs"), "fn move_rename_remote(");
+        assert!(moved.contains("self.change_remote(uid"));
+        let changed = function_source(include_str!("lib.rs"), "fn changed_remote(");
+        assert!(changed.contains("self.forget_sdk_node(uid)"));
+        assert!(changed.contains("self.note_self_change(uid)"));
     }
 
     #[test]
@@ -8630,6 +8720,18 @@ mod tests {
         let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
         let upload = &drain[drain.find("begin_cancellable_upload").unwrap()..];
         assert_before(upload, "self.db.op_exists(op.id)", "File::open(&blob)");
+    }
+
+    #[test]
+    fn an_online_rename_writes_the_move_through_before_it_answers() {
+        // Through the raw lock, the move stayed in the state's outbox, and the
+        // next lookup rebuilt the destination from a database without it
+        // (B135).
+        let rename: String = function_source(include_str!("filesystem.rs"), "fn serve_rename(")
+            .split_whitespace()
+            .collect();
+        assert!(rename.contains("self.core.state().relocate("));
+        assert!(!rename.contains(".lock().relocate("));
     }
 
     #[test]
