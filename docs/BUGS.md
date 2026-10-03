@@ -12,6 +12,79 @@ Conventions:
 
 ---
 
+## B134 — A file deleted online while the drain checks its write is kept as a conflict copy
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 3).
+`c.bin` was written, renamed to `f.txt` and deleted, all online. The drain logged "queued write
+conflicts; keeping a conflict copy" for `f.txt`, with "the file was trashed remotely". The copy
+was named after the file, not `recovered-…`, so the tree still placed the file when the drain
+looked. It did not come up again in five replays with debug logs.
+
+**Where:** `trash_child` in `crates/pdfs-fuse/src/filesystem.rs`, and `Core::drain_revision` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** An online `unlink` trashes the node on Drive first, and only then forgets it in the
+tree and drops its queued write (`discard_queued_ops`, or `withdraw_queued_ops` for an open
+file). A drain worker that has claimed the write and reads the node in between finds it trashed.
+B105's check asks whether the op is still queued, and it still is, so the drain keeps the write
+as a conflict copy of a file the user deleted. When the copy runs before the unlink discards the
+staged blob, it lands next to where the file was.
+
+**Test:** the simulation runs count such a conflict when the copy is named after the file, and
+count a copy that lands. With `PDFS_SIM_KNOWN=fail`, seed 3 of three-clients fails on it when it
+comes up, which depends on timing.
+
+## B133 — A file deleted while its upload is in flight can still come back as a recovered copy
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-deletes, seed 3).
+`y/e.md` was written, and the drain picked the write up. The step held the drain's read of the
+node, deleted the file, and released the read. The next step wrote `a.txt`. The drain then logged
+"queued write conflicts; keeping a conflict copy" for `y/e.md` as `recovered-L4`, with "the file
+was trashed remotely". It is B105 again, though B105's fix was in place. Here the copy failed
+because the blob was already gone.
+
+**Where:** `Core::drain_revision` in `crates/pdfs-fuse/src/drain.rs`, `Db::op_exists` in
+`crates/pdfs-core/src/db/ops.rs`, and the `pending_op` table in
+`crates/pdfs-core/src/db/migrations.rs`.
+
+**Cause.** B105's fix asks whether the op the worker holds is still queued, by id. `pending_op.id`
+is an `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, so SQLite gives a new row the largest id
+in the table plus one, or 1 when the table is empty. The delete dropped the newest row, so the
+next op queued took the same id. `op_exists` found that other op and said the write was still
+wanted. A SQLite workload queues a write to the database right after deleting its journal, so
+this is the usual case there, not a rare one.
+
+**Test:** the simulation runs make the file again, or not, while the drain's read is held. When
+they did, they count the drain's conflict copy of it. With `PDFS_SIM_KNOWN=fail` one-client-deletes
+fails on it in every seed.
+
+## B132 — A folder whose mkdir is still queued is gone after a restart
+
+**Status:** Open.
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 4).
+The first listing of the Drive root failed with the link down, and the client's folder `c0` was
+made offline. The link came back, and the client restarted with 8 ops still queued, `c0`'s
+mkdir among them. Right after the restart, a write to `c0/a.txt` failed with `ENOENT`. The kernel's
+lookup of `c0` in the root had answered `ENOENT`. A moment later the mkdir landed.
+
+**Where:** `Core::ensure_children` in `crates/pdfs-fuse/src/lib.rs`, with
+`Core::relist_offline_listings` and `State::invalidate_listing`.
+
+**Cause.** A listing served offline is invalidated when the link comes back
+(`relist_offline_listings`), which also clears its `listed` row. The running daemon does not
+notice: the kernel still holds the dentries. After a restart, the first lookup in the folder
+lists it on Drive. Drive does not hold a node whose create is still queued, or does not list a
+fresh one yet (the lag of B118). `ensure_children` takes Drive's listing as the whole folder and
+records it as complete, without the queued node's placeholder. Every path through that node fails
+with `ENOENT` until something lists the folder again. The same may happen without a restart
+whenever a folder holding a queued create is listed on Drive.
+
+**Test:** the simulation runs count an `ENOENT` after a restart that restored queued ops, in a
+seed that lost the link, and end the seed there. With `PDFS_SIM_KNOWN=fail`, seed 4 of
+one-client-flaky fails on it when the mkdir is still queued, which depends on timing.
+
 ## B131 — A write to a file whose create could not be read back lands as a conflict copy
 
 **Status:** Open.
@@ -713,7 +786,7 @@ the blob still on disk the copy would land.
 
 **Fix.** Before keeping a conflict copy, the drain checks that its op is still queued. When the
 op is gone, the write was withdrawn by the delete, or superseded, while the worker held it, and
-it is dropped.
+it is dropped. The check goes by op id, which the next op queued can take over (B133).
 
 ---
 
