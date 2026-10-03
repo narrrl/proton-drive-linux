@@ -5,11 +5,13 @@
 //! is already on disk somewhere, so a change here would silently diverge from
 //! what an existing install actually has. Add a new one instead.
 
+use rusqlite::OptionalExtension;
+
 use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 36;
+pub(super) const SCHEMA_VERSION: i64 = 37;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -346,6 +348,19 @@ impl Db {
             )? > 0;
             if has_nodes && !has_column {
                 tx.execute_batch(MIGRATION_V36)?;
+            }
+        }
+        if current < 37 {
+            // Same guards as V26-V36.
+            let sql: Option<String> = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if sql.is_some_and(|sql| !sql.contains("AUTOINCREMENT")) {
+                tx.execute_batch(MIGRATION_V37)?;
             }
         }
         tx.execute(
@@ -1111,4 +1126,41 @@ ALTER TABLE nodes_v36 RENAME TO nodes;
 CREATE INDEX idx_nodes_parent ON nodes(parent_uid);
 CREATE INDEX idx_nodes_name_nocase ON nodes(name COLLATE NOCASE);
 CREATE INDEX idx_nodes_parent_live ON nodes(parent_uid) WHERE trashed = 0;
+";
+
+/// Schema v37: a `pending_op` id is never given out twice.
+///
+/// A plain rowid is the largest one plus one, so an op queued right after the
+/// newest one was dropped took its id. The drain retires the op it is
+/// working on by id, and so deleted the new op: a trash queued over a rename
+/// on the wire was lost when the rename landed. `AUTOINCREMENT` never reuses
+/// an id. Ids are kept, as is every index.
+const MIGRATION_V37: &str = "
+CREATE TABLE pending_op_v37 (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind                  TEXT NOT NULL,
+  uid                   TEXT NOT NULL,
+  blob_path             TEXT,
+  meta_json             TEXT,
+  created_at            INTEGER NOT NULL,
+  attempts              INTEGER NOT NULL DEFAULT 0,
+  last_error            TEXT,
+  next_attempt_at       INTEGER NOT NULL DEFAULT 0,
+  parent_uid            TEXT,
+  name                  TEXT,
+  claimed_at            INTEGER NOT NULL DEFAULT 0,
+  access_deferred_since INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO pending_op_v37
+  (id, kind, uid, blob_path, meta_json, created_at, attempts, last_error, next_attempt_at,
+   parent_uid, name, claimed_at, access_deferred_since)
+  SELECT id, kind, uid, blob_path, meta_json, created_at, attempts, last_error,
+         next_attempt_at, parent_uid, name, claimed_at, access_deferred_since
+    FROM pending_op;
+DROP TABLE pending_op;
+ALTER TABLE pending_op_v37 RENAME TO pending_op;
+CREATE INDEX pending_op_uid ON pending_op(uid);
+CREATE INDEX pending_op_parent ON pending_op(parent_uid);
+CREATE INDEX idx_pending_op_claimed
+    ON pending_op(uid) WHERE claimed_at <> 0;
 ";

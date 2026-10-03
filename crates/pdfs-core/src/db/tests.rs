@@ -3538,6 +3538,39 @@ fn access_deferral_does_not_unpark_a_transient_create() {
     assert_eq!(db.pending_ops().unwrap()[0].next_attempt_at, PARK_UNTIL);
 }
 
+/// The drain retires the op it worked on by id. An id given out again let
+/// a rename that landed delete the trash queued over it.
+#[test]
+fn a_dropped_op_id_is_never_given_out_again() {
+    let db = Db::open_in_memory().unwrap();
+    let rename = |name: &str| PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: uid("node").to_string(),
+        parent_uid: Some(uid("root").to_string()),
+        name: Some(name.to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    let (renamed, _) = db.enqueue_op(&rename("b.txt")).unwrap();
+    let in_flight = db.claim_next_due_op(10).unwrap().unwrap();
+    assert_eq!(in_flight.id, renamed);
+
+    let (trash, _) = db
+        .replace_ops_with_trash(&uid("node").to_string(), "b.txt", 2)
+        .unwrap();
+    assert_ne!(trash, renamed);
+    db.delete_op(in_flight.id).unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, OP_TRASH);
+}
+
 #[test]
 fn migrate_is_idempotent() {
     let db = Db::open_in_memory().unwrap();

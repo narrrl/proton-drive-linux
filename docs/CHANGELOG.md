@@ -11,6 +11,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+Schema: **37**. The queue table is rebuilt so an id is never given out twice; queued changes
+are kept.
+
+### Fixed
+- **A delete queued while a rename is sent is no longer lost.** The rename landing could remove
+  the delete from the queue, leaving the file on Drive (B137).
+
 ## [2.10.0] — 2026-10-03
 
 Schema: **36**. Every node row gets a local id that never changes; existing rows keep their

@@ -12,6 +12,26 @@ Conventions:
 
 ---
 
+## B137 — A queued change can be deleted by an older one landing
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seed 9), at the
+end check for lost data. A file renamed and then deleted stayed on Drive, and the queue was
+empty.
+
+**Where:** the `pending_op` table (`crates/pdfs-core/src/db/migrations.rs`) and `Db::delete_op`
+in `crates/pdfs-core/src/db/ops.rs`.
+
+**Cause.** `pending_op.id` was a plain `INTEGER PRIMARY KEY`, so SQLite hands out the largest id
+plus one, and an id comes back once the newest row is deleted. Deleting a node drops its queued
+ops and queues a trash in one transaction, so the trash could take the id of the rename the drain
+was sending. When that rename landed, the drain deleted its row by id, which was now the trash.
+
+**Fix.** Schema 37 rebuilds `pending_op` with `AUTOINCREMENT`, so an id is never given out
+again.
+
+**Test:** the unit test `a_dropped_op_id_is_never_given_out_again`.
+
 ## B136 — A file renamed while its first upload is on the wire goes back to its old name
 
 **Status:** Fixed (unverified).
