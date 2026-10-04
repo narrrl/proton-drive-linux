@@ -680,7 +680,9 @@ pub(crate) fn mount_with(
     // The photos volume has its own event stream; without it the gallery only
     // learns about a phone-side deletion when the timeline goes stale.
     rt.spawn(run_photos_event_sync(core.clone()));
-    if online {
+    // Not in a simulation: `client` there reaches no API, and the thread, still
+    // waiting on it after the stop, held the database a test opens next.
+    if online && matches!(host, Host::Daemon) {
         let repair_core = core.clone();
         let root_uid = core.primary_root_uid.clone();
         if let Err(error) = std::thread::Builder::new()
