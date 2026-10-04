@@ -1806,7 +1806,7 @@ impl ProtonFs {
             }
             (Some(mut h), false) => {
                 self.core.follow_landed_create(&mut h);
-                match self.core.queue_revision(&h) {
+                match self.core.queue_revision(&mut h) {
                     Ok(()) => reply.ok(),
                     Err(e) => reply.error(e),
                 }

@@ -3242,7 +3242,7 @@ impl Core {
     ///
     /// The scratch file is *moved* into staging, never copied: it is the only
     /// copy of what the user wrote.
-    fn queue_revision(&self, h: &WriteHandle) -> Result<(), Errno> {
+    fn queue_revision(&self, h: &mut WriteHandle) -> Result<(), Errno> {
         // Closing an untouched writable handle is not a mutation. It remains
         // valid after a downgrade and only owes cleanup of its empty scratch.
         if !h.dirty {
@@ -3266,9 +3266,15 @@ impl Core {
         // recovery a second, stale copy of the same write.
         self.cache.clear_scratch_durable(&h.path);
         if is_local_uid(&h.uid) && !self.db.has_create_op(&h.uid.to_string()).unwrap_or(true) {
-            debug!(uid = %h.uid, "local node was unlinked before creation; dropping revision");
-            let _ = std::fs::remove_file(&h.path);
-            return Ok(());
+            // A create that landed since the handle last looked left no op
+            // either. It moved the row to its uid in the same transaction, so
+            // the row says which it was (`docs/BUGS.md` B176).
+            self.follow_landed_create(h);
+            if is_local_uid(&h.uid) {
+                debug!(uid = %h.uid, "local node was unlinked before creation; dropping revision");
+                let _ = std::fs::remove_file(&h.path);
+                return Ok(());
+            }
         }
         // Materialize as much of the full content as is free to materialize. A
         // complete blob is uploadable without the network and lets a later write
@@ -8778,6 +8784,26 @@ mod tests {
         // ...but its queued ops go at once, open or not: a revision drained
         // after the trash landed on the trashed node and kept its name taken.
         assert_eq!(replaced.matches("self.withdraw_queued_ops(uid)").count(), 2);
+    }
+
+    #[test]
+    fn a_write_closed_as_its_create_lands_is_queued() {
+        // The release followed a landing create, found none, and the create
+        // landed before it asked for the create op. Finding none, it took the
+        // file for one unlinked before it was created and dropped the write
+        // (B176). The landing removes the op and moves the row at once, so a
+        // missing op is checked against the row.
+        let revision = function_source(include_str!("lib.rs"), "fn queue_revision(");
+        assert_before(
+            revision,
+            "self.db.has_create_op(",
+            "self.follow_landed_create(h)",
+        );
+        assert_before(
+            revision,
+            "self.follow_landed_create(h)",
+            "dropping revision",
+        );
     }
 
     #[test]

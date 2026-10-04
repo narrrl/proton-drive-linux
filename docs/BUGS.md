@@ -12,6 +12,27 @@ Conventions:
 
 ---
 
+## B176 — A write closed just as its file's create lands is dropped
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by `one_client_on_a_good_link` (seed 12) on 378667f, run three at a time
+in a loop. A write at offset 6 to a file whose create was landing never reached Drive; Drive
+ended with the file's first bytes and the later truncate only.
+
+**Where:** `Core::queue_revision` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** A write handle closed on a file not yet on Drive first checks whether the create has
+landed and, if so, follows it to the uid Drive gave it. It then checks that the create is still
+queued; a file with neither was unlinked before it was created, and its write is dropped. A
+create that landed between the two checks looked like that, and the write was dropped.
+
+**Fix.** The landing removes the create op and gives the row its uid in one transaction. So a
+missing create op is checked against the row, and a landed file's write is queued for its uid.
+
+**Test:** `a_write_closed_as_its_create_lands_is_queued` in `crates/pdfs-fuse/src/lib.rs`.
+
+---
+
 ## B175 — A file replaced by a rename just as its create lands stays on Drive
 
 **Status:** Fixed (unverified).
