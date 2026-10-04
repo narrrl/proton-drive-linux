@@ -75,8 +75,8 @@ use pdfs_core::control::{
     DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, MappingProgress, PendingOpInfo,
     PhotoItem, PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope, Request, Response,
     RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
-    SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, Topic, TransferDirection,
-    TransferItem, send,
+    SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress, ThumbnailBuildStatus, Topic,
+    TransferDirection, TransferItem, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};

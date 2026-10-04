@@ -1404,6 +1404,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(items) => CtlResponse::PendingOps { items },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::ExportPendingOp { id, dest }) => {
+            match core.export_pending_op(id, Path::new(&dest)) {
+                Ok(written) => CtlResponse::Ok {
+                    message: format!("wrote {} to {dest}", human_bytes(written)),
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::RetryPendingOp { id }) => match core.retry_pending_ops(id) {
             Ok(0) if id.is_some() => CtlResponse::Ok {
                 message: "nothing to retry: the operation is already due or waiting for a rename"

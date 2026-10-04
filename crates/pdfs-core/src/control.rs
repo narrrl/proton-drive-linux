@@ -477,6 +477,10 @@ pub enum Request {
     /// Retry a backed-off queued op now instead of waiting out its backoff;
     /// every failed op when `id` is `None`. Replies with [`Response::Ok`].
     RetryPendingOp { id: Option<i64> },
+    /// Copy the content of a queued upload (`id` from
+    /// [`Request::ListPendingOps`]) to `dest`, an absolute path that must not
+    /// exist yet. The op stays queued. Replies with [`Response::Ok`].
+    ExportPendingOp { id: i64, dest: String },
     /// List the `(sync-conflict …)` copies under My Files and in synced
     /// folders. Replies with
     /// [`Response::Conflicts`].
@@ -880,6 +884,59 @@ pub struct PendingOpInfo {
     pub parked: bool,
     /// Failed often enough to count as stuck.
     pub failing: bool,
+    /// Why Drive refused it, when it did; such an op needs attention at once.
+    #[serde(default)]
+    pub issue: Option<SyncIssue>,
+    /// Carries file content that [`Request::ExportPendingOp`] can save.
+    #[serde(default)]
+    pub exportable: bool,
+}
+
+/// Why Drive refused a queued change (in [`PendingOpInfo`]). The change stays
+/// queued and keeps being retried; nothing is deleted.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncIssue {
+    /// The account's storage is full.
+    Quota,
+    /// The account may no longer change the file or its folder, for example
+    /// because a share was revoked.
+    Access,
+    /// The file or the folder it goes into is gone from Drive.
+    Missing,
+    /// The folder holds too many items, or is nested too deep.
+    Limit,
+    /// Drive rejected the change, for example a name it does not accept.
+    Rejected,
+    /// An issue from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+impl SyncIssue {
+    /// The name stored in the database and sent on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncIssue::Quota => "quota",
+            SyncIssue::Access => "access",
+            SyncIssue::Missing => "missing",
+            SyncIssue::Limit => "limit",
+            SyncIssue::Rejected => "rejected",
+            SyncIssue::Unknown => "unknown",
+        }
+    }
+
+    /// The issue stored as `name`.
+    pub fn parse(name: &str) -> Self {
+        match name {
+            "quota" => SyncIssue::Quota,
+            "access" => SyncIssue::Access,
+            "missing" => SyncIssue::Missing,
+            "limit" => SyncIssue::Limit,
+            "rejected" => SyncIssue::Rejected,
+            _ => SyncIssue::Unknown,
+        }
+    }
 }
 
 /// One synced local folder on this machine's device (in [`Response::SyncFolders`]).
@@ -3290,12 +3347,38 @@ mod tests {
                 },
                 r#"{"SaveRevisionAsByUid":{"uid":"vol~link","revision_id":"rev-3","dest":"/tmp/out.bin"}}"#,
             ),
+            (
+                Request::ExportPendingOp {
+                    id: 7,
+                    dest: "/tmp/out.bin".into(),
+                },
+                r#"{"ExportPendingOp":{"id":7,"dest":"/tmp/out.bin"}}"#,
+            ),
         ];
         for (request, wire) in cases {
             assert_eq!(serde_json::to_string(&request).unwrap(), wire);
             let decoded: Request = serde_json::from_str(wire).unwrap();
             assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
         }
+    }
+
+    /// A daemon that predates sync issues sends neither field, and a newer one
+    /// may send an issue this build does not know.
+    #[test]
+    fn a_queued_op_from_another_daemon_version_still_decodes() {
+        let old = r#"{"id":1,"kind":"create","path":"a.txt","attempts":0,"last_error":null,
+            "queued_at":5,"next_attempt_at":5,"parked":false,"failing":false}"#;
+        let op: PendingOpInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(op.issue, None);
+        assert!(!op.exportable);
+
+        let newer = old.replace(r#""failing":false"#, r#""failing":true,"issue":"embargo""#);
+        let op: PendingOpInfo = serde_json::from_str(&newer).unwrap();
+        assert_eq!(op.issue, Some(SyncIssue::Unknown));
+        assert_eq!(
+            SyncIssue::parse(SyncIssue::Quota.as_str()),
+            SyncIssue::Quota
+        );
     }
 
     /// A front-end that predates the favorites filter sends no `favorites`

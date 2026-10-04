@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 37;
+pub(super) const SCHEMA_VERSION: i64 = 38;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -361,6 +361,22 @@ impl Db {
                 .optional()?;
             if sql.is_some_and(|sql| !sql.contains("AUTOINCREMENT")) {
                 tx.execute_batch(MIGRATION_V37)?;
+            }
+        }
+        if current < 38 {
+            // Same guards as V26-V37.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_op') WHERE name = 'issue'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops && !has_column {
+                tx.execute_batch(MIGRATION_V38)?;
             }
         }
         tx.execute(
@@ -1163,4 +1179,10 @@ CREATE INDEX pending_op_uid ON pending_op(uid);
 CREATE INDEX pending_op_parent ON pending_op(parent_uid);
 CREATE INDEX idx_pending_op_claimed
     ON pending_op(uid) WHERE claimed_at <> 0;
+";
+
+/// Schema v38: why Drive refused a queued op, when it did (a sync issue).
+/// `NULL` for an op that has not been refused, which is every op migrated.
+const MIGRATION_V38: &str = "
+ALTER TABLE pending_op ADD COLUMN issue TEXT;
 ";

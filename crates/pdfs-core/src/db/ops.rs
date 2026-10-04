@@ -2,6 +2,8 @@
 //! the remote has not yet seen. Rebuilt into memory on mount and drained in row
 //! order, so a child never drains before the parent that gives it a real uid.
 
+use std::collections::HashMap;
+
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -257,7 +259,8 @@ pub struct PendingCounts {
     /// never drain on their own, so counting them as "waiting to upload" would
     /// have the front-end promise progress that is not coming.
     pub parked: i64,
-    /// Ops that have failed at least [`FAILING_ATTEMPTS`] times. A permanently
+    /// Ops that have failed at least [`FAILING_ATTEMPTS`] times, or that Drive
+    /// refused ([`Db::set_op_issue`]). A permanently
     /// failing op never wedges the queue — the backoff sees to that — which is
     /// exactly why it needs surfacing: it retries forever, invisibly.
     pub failing: i64,
@@ -1028,15 +1031,15 @@ impl Db {
             |r| r.get(0),
         )?;
         let failing = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE attempts >= ?1",
+            "SELECT COUNT(*) FROM pending_op WHERE attempts >= ?1 OR issue IS NOT NULL",
             params![FAILING_ATTEMPTS],
             |r| r.get(0),
         )?;
         let last_error = conn
             .query_row(
                 "SELECT last_error FROM pending_op
-                  WHERE attempts >= ?1 AND last_error IS NOT NULL
-                  ORDER BY attempts DESC LIMIT 1",
+                  WHERE (attempts >= ?1 OR issue IS NOT NULL) AND last_error IS NOT NULL
+                  ORDER BY issue IS NULL, attempts DESC LIMIT 1",
                 params![FAILING_ATTEMPTS],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -1130,6 +1133,26 @@ impl Db {
             params![id, error, next_attempt_at],
         )?;
         Ok(())
+    }
+
+    /// Record why Drive refused op `id`, or that the latest failure was not a
+    /// refusal (`None`). An op with an issue counts as failing at once.
+    pub fn set_op_issue(&self, id: i64, issue: Option<&str>) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE pending_op SET issue = ?2 WHERE id = ?1",
+            params![id, issue],
+        )?;
+        Ok(())
+    }
+
+    /// The issue of every op Drive refused, by op id.
+    pub fn op_issues(&self) -> Result<HashMap<i64, String>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare("SELECT id, issue FROM pending_op WHERE issue IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Make a create due again if it was renamed or moved

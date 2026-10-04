@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-09-29 00:18+0200\n"
+"POT-Creation-Date: 2026-10-04 03:16+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Spanish\n"
@@ -64,7 +64,7 @@ msgstr "%A, %-d de %B de %Y, %H:%M"
 #: crates/pdfs-gui/src/app/pages/browser.rs:1217
 #: crates/pdfs-gui/src/app/pages/browser.rs:2090
 #: crates/pdfs-gui/src/app/pages/browser.rs:2167
-#: crates/pdfs-gui/src/app/pages/locations.rs:1471
+#: crates/pdfs-gui/src/app/pages/locations.rs:1554
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:252
 #: crates/pdfs-gui/src/app/pages/trash.rs:191 crates/pdfs-gui/src/prompt.rs:171
 msgid "My files"
@@ -269,9 +269,9 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/devices.rs:979
 #: crates/pdfs-gui/src/app/pages/devices.rs:1031
 #: crates/pdfs-gui/src/app/pages/devices.rs:1075
-#: crates/pdfs-gui/src/app/pages/locations.rs:860
-#: crates/pdfs-gui/src/app/pages/locations.rs:1335
-#: crates/pdfs-gui/src/app/pages/locations.rs:1385
+#: crates/pdfs-gui/src/app/pages/locations.rs:943
+#: crates/pdfs-gui/src/app/pages/locations.rs:1418
+#: crates/pdfs-gui/src/app/pages/locations.rs:1468
 #: crates/pdfs-gui/src/app/pages/login.rs:312
 #: crates/pdfs-gui/src/app/pages/photos.rs:2055
 #: crates/pdfs-gui/src/app/pages/shared.rs:946
@@ -475,8 +475,8 @@ msgstr "Nada del registro reciente coincide con este filtro."
 #: crates/pdfs-gui/src/app/pages/activity.rs:186
 #: crates/pdfs-gui/src/app/pages/browser.rs:281
 #: crates/pdfs-gui/src/app/pages/devices.rs:114
-#: crates/pdfs-gui/src/app/pages/locations.rs:183
-#: crates/pdfs-gui/src/app/pages/locations.rs:680
+#: crates/pdfs-gui/src/app/pages/locations.rs:184
+#: crates/pdfs-gui/src/app/pages/locations.rs:685
 #: crates/pdfs-gui/src/app/pages/photos.rs:465
 #: crates/pdfs-gui/src/app/pages/shared.rs:183
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:94
@@ -513,8 +513,8 @@ msgstr "Opciones de vista"
 #: crates/pdfs-gui/src/app/pages/browser.rs:2635
 #: crates/pdfs-gui/src/app/pages/browser.rs:2639
 #: crates/pdfs-gui/src/app/pages/devices.rs:325
-#: crates/pdfs-gui/src/app/pages/locations.rs:191
-#: crates/pdfs-gui/src/app/pages/locations.rs:970
+#: crates/pdfs-gui/src/app/pages/locations.rs:192
+#: crates/pdfs-gui/src/app/pages/locations.rs:1053
 #: crates/pdfs-gui/src/app/pages/shared.rs:422
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:347
 #: crates/pdfs-gui/src/app/pages/trash.rs:284
@@ -1018,7 +1018,7 @@ msgstr ""
 
 #. Translators: {name} is the file the conflicting copy was made from.
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:346
-#: crates/pdfs-gui/src/app/pages/locations.rs:795
+#: crates/pdfs-gui/src/app/pages/locations.rs:878
 #, rust-format
 msgid "Differs from {name}"
 msgstr "Difiere de {name}"
@@ -1205,11 +1205,12 @@ msgstr "No se pudieron cargar los álbumes"
 #: crates/pdfs-gui/src/app/pages/devices.rs:884
 #: crates/pdfs-gui/src/app/pages/devices.rs:1120
 #: crates/pdfs-gui/src/app/pages/duplicates.rs:220
-#: crates/pdfs-gui/src/app/pages/locations.rs:535
-#: crates/pdfs-gui/src/app/pages/locations.rs:710
-#: crates/pdfs-gui/src/app/pages/locations.rs:929
-#: crates/pdfs-gui/src/app/pages/locations.rs:1427
-#: crates/pdfs-gui/src/app/pages/locations.rs:1447
+#: crates/pdfs-gui/src/app/pages/locations.rs:536
+#: crates/pdfs-gui/src/app/pages/locations.rs:769
+#: crates/pdfs-gui/src/app/pages/locations.rs:793
+#: crates/pdfs-gui/src/app/pages/locations.rs:1012
+#: crates/pdfs-gui/src/app/pages/locations.rs:1510
+#: crates/pdfs-gui/src/app/pages/locations.rs:1530
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1425
 #: crates/pdfs-gui/src/app/pages/photos.rs:1420
 #: crates/pdfs-gui/src/app/pages/photos.rs:2140
@@ -2152,7 +2153,7 @@ msgid "Add Folder to Sync"
 msgstr "Añadir carpeta para sincronizar"
 
 #: crates/pdfs-gui/src/app/pages/devices.rs:686
-#: crates/pdfs-gui/src/app/pages/locations.rs:1440
+#: crates/pdfs-gui/src/app/pages/locations.rs:1523
 msgid "Syncing folder…"
 msgstr "Sincronizando la carpeta…"
 
@@ -2509,21 +2510,21 @@ msgstr[1] "Mover {n} fotos a la papelera"
 msgid "Keep"
 msgstr "Conservar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:125
+#: crates/pdfs-gui/src/app/pages/locations.rs:126
 msgid "Add Folder"
 msgstr "Añadir carpeta"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:130
+#: crates/pdfs-gui/src/app/pages/locations.rs:131
 msgid "Back a local folder up to this computer's Proton Drive device"
 msgstr ""
 "Hacer copia de seguridad de una carpeta local en el dispositivo de Proton "
 "Drive de este equipo"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:140
+#: crates/pdfs-gui/src/app/pages/locations.rs:141
 msgid "Conflicts"
 msgstr "Conflictos"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:142
+#: crates/pdfs-gui/src/app/pages/locations.rs:143
 msgid ""
 "Files changed in two places at once. Both versions were kept; choose which "
 "one stays."
@@ -2531,7 +2532,7 @@ msgstr ""
 "Archivos modificados en dos lugares a la vez. Se conservaron ambas "
 "versiones; elija cuál se queda."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:158
+#: crates/pdfs-gui/src/app/pages/locations.rs:159
 msgid ""
 "Synced folders keep a full copy on this computer. Online-only folders fetch "
 "each file when you open it."
@@ -2539,136 +2540,136 @@ msgstr ""
 "Las carpetas sincronizadas guardan una copia completa en este equipo. Las "
 "carpetas solo en línea descargan cada archivo al abrirlo."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:169
+#: crates/pdfs-gui/src/app/pages/locations.rs:170
 msgid "About Sync Modes"
 msgstr "Acerca de los modos de sincronización"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:178
+#: crates/pdfs-gui/src/app/pages/locations.rs:179
 #: crates/pdfs-gui/src/prompt.rs:65
 msgid "Folders"
 msgstr "Carpetas"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:213
+#: crates/pdfs-gui/src/app/pages/locations.rs:214
 msgctxt "sync view"
 msgid "Overview"
 msgstr "Resumen"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:219
+#: crates/pdfs-gui/src/app/pages/locations.rs:220
 msgctxt "sync view"
 msgid "Folders"
 msgstr "Carpetas"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:225
+#: crates/pdfs-gui/src/app/pages/locations.rs:226
 msgctxt "sync view"
 msgid "History"
 msgstr "Historial"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:232
+#: crates/pdfs-gui/src/app/pages/locations.rs:233
 #: crates/pdfs-gui/src/app/pages/shared.rs:210
 msgid "Review"
 msgstr "Revisar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:363
+#: crates/pdfs-gui/src/app/pages/locations.rs:364
 #, rust-format
 msgid "{n} change couldn't be uploaded"
 msgid_plural "{n} changes couldn't be uploaded"
 msgstr[0] "No se pudo subir {n} cambio"
 msgstr[1] "No se pudieron subir {n} cambios"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:369
+#: crates/pdfs-gui/src/app/pages/locations.rs:370
 #, rust-format
 msgid "{n} file was changed in two places at once"
 msgid_plural "{n} files were changed in two places at once"
 msgstr[0] "{n} archivo se modificó en dos lugares a la vez"
 msgstr[1] "{n} archivos se modificaron en dos lugares a la vez"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:374
+#: crates/pdfs-gui/src/app/pages/locations.rs:375
 msgid "Some files need your attention"
 msgstr "Algunos archivos requieren su atención"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:391
+#: crates/pdfs-gui/src/app/pages/locations.rs:392
 msgid "Checking…"
 msgstr "Comprobando…"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:419
+#: crates/pdfs-gui/src/app/pages/locations.rs:420
 msgid "Pause for 1 Hour"
 msgstr "Pausar durante 1 hora"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:423
+#: crates/pdfs-gui/src/app/pages/locations.rs:424
 msgid "Pause for 8 Hours"
 msgstr "Pausar durante 8 horas"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:427
+#: crates/pdfs-gui/src/app/pages/locations.rs:428
 msgid "Pause for 24 Hours"
 msgstr "Pausar durante 24 horas"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:431
-#: crates/pdfs-gui/src/app/pages/locations.rs:467
+#: crates/pdfs-gui/src/app/pages/locations.rs:432
+#: crates/pdfs-gui/src/app/pages/locations.rs:468
 msgctxt "verb"
 msgid "Pause"
 msgstr "Pausar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:435
-#: crates/pdfs-gui/src/app/pages/locations.rs:472
+#: crates/pdfs-gui/src/app/pages/locations.rs:436
+#: crates/pdfs-gui/src/app/pages/locations.rs:473
 msgid "Stop uploading until you resume. Files still open as usual."
 msgstr ""
 "Dejar de subir hasta que reanude. Los archivos se siguen abriendo como "
 "siempre."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:437
+#: crates/pdfs-gui/src/app/pages/locations.rs:438
 msgid "Pause for a while"
 msgstr "Pausar durante un tiempo"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:465
+#: crates/pdfs-gui/src/app/pages/locations.rs:466
 msgctxt "verb"
 msgid "Resume"
 msgstr "Reanudar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:470
+#: crates/pdfs-gui/src/app/pages/locations.rs:471
 msgid "Upload everything that waited while sync was paused"
 msgstr ""
 "Subir todo lo que quedó en espera mientras la sincronización estaba en pausa"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:518
+#: crates/pdfs-gui/src/app/pages/locations.rs:519
 msgid "Couldn't pause sync"
 msgstr "No se pudo pausar la sincronización"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:520
+#: crates/pdfs-gui/src/app/pages/locations.rs:521
 msgid "Couldn't resume sync"
 msgstr "No se pudo reanudar la sincronización"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:526
+#: crates/pdfs-gui/src/app/pages/locations.rs:527
 msgid "Sync resumed"
 msgstr "Sincronización reanudada"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:527
+#: crates/pdfs-gui/src/app/pages/locations.rs:528
 msgid "Sync paused until you resume"
 msgstr "Sincronización en pausa hasta que la reanude"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:528
+#: crates/pdfs-gui/src/app/pages/locations.rs:529
 #: crates/pdfs-gui/src/app/pages/status.rs:1323 crates/pdfs-gui/src/main.rs:237
 msgid "Sync paused"
 msgstr "Sincronización en pausa"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:546
+#: crates/pdfs-gui/src/app/pages/locations.rs:547
 msgid "Retry All"
 msgstr "Reintentar todo"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:548
+#: crates/pdfs-gui/src/app/pages/locations.rs:549
 msgid "Try every failed change again now"
 msgstr "Volver a intentar ahora todos los cambios fallidos"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:553
+#: crates/pdfs-gui/src/app/pages/locations.rs:554
 msgid "Waiting to Upload"
 msgstr "En espera de subida"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:555
-#: crates/pdfs-gui/src/app/pages/locations.rs:614
+#: crates/pdfs-gui/src/app/pages/locations.rs:556
+#: crates/pdfs-gui/src/app/pages/locations.rs:615
 msgid "Changes made on this computer that are not on Proton Drive yet."
 msgstr "Cambios hechos en este equipo que todavía no están en Proton Drive."
 
 #. Translators: {shown} is how many rows are listed (50), {n} the total number of queued changes.
-#: crates/pdfs-gui/src/app/pages/locations.rs:612
+#: crates/pdfs-gui/src/app/pages/locations.rs:613
 #, rust-format
 msgid ""
 "Changes made on this computer that are not on Proton Drive yet. Showing the "
@@ -2683,89 +2684,153 @@ msgstr[1] ""
 "Cambios hechos en este equipo que todavía no están en Proton Drive. Se "
 "muestran los primeros {shown} de {n}."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:629
+#: crates/pdfs-gui/src/app/pages/locations.rs:630
 msgid "Upload changes"
 msgstr "Subir cambios"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:630
+#: crates/pdfs-gui/src/app/pages/locations.rs:631
 msgid "Upload new file"
 msgstr "Subir archivo nuevo"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:631
+#: crates/pdfs-gui/src/app/pages/locations.rs:632
 msgid "Create folder"
 msgstr "Crear carpeta"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:632
+#: crates/pdfs-gui/src/app/pages/locations.rs:633
 msgid "Rename or move"
 msgstr "Renombrar o mover"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:633
+#: crates/pdfs-gui/src/app/pages/locations.rs:634
 msgid "Move to trash"
 msgstr "Mover a la papelera"
 
 #. Translators: a queued change of an unknown kind.
-#: crates/pdfs-gui/src/app/pages/locations.rs:635
+#: crates/pdfs-gui/src/app/pages/locations.rs:636
 msgctxt "noun"
 msgid "Change"
 msgstr "Cambio"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:638
+#: crates/pdfs-gui/src/app/pages/locations.rs:639
 msgid "waiting for the app writing it to finish"
 msgstr "esperando a que termine la aplicación que lo escribe"
 
 #. Translators: {time} is when the next attempt happens, such as "14:30".
-#: crates/pdfs-gui/src/app/pages/locations.rs:641
+#: crates/pdfs-gui/src/app/pages/locations.rs:642
 #, rust-format
 msgid "retrying {time}"
 msgstr "reintento a las {time}"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:643
+#: crates/pdfs-gui/src/app/pages/locations.rs:644
 msgid "waiting for sync to resume"
 msgstr "esperando a que se reanude la sincronización"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:644
+#: crates/pdfs-gui/src/app/pages/locations.rs:645
 msgid "up next"
 msgstr "el siguiente"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:648
+#: crates/pdfs-gui/src/app/pages/locations.rs:649
 #, rust-format
 msgid "{action} · {state}"
 msgstr "{action} · {state}"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:655
+#: crates/pdfs-gui/src/app/pages/locations.rs:660
 #, rust-format
 msgid "Failed {n} time: {error}"
 msgid_plural "Failed {n} times: {error}"
 msgstr[0] "Falló {n} vez: {error}"
 msgstr[1] "Falló {n} veces: {error}"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:681
+#: crates/pdfs-gui/src/app/pages/locations.rs:686
 msgid "Retry now"
 msgstr "Reintentar ahora"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:700
+#: crates/pdfs-gui/src/app/pages/locations.rs:697
+msgid "Export"
+msgstr "Exportar"
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:698
+msgid "Save a copy of this file's content elsewhere"
+msgstr "Guardar una copia del contenido de este archivo en otro lugar"
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:719
+msgid ""
+"Your Proton Drive storage is full. Free up space or upgrade your plan, and "
+"this change uploads on its own."
+msgstr ""
+"Su almacenamiento de Proton Drive está lleno. Libere espacio o mejore su "
+"plan, y este cambio se subirá por sí solo."
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:722
+msgid ""
+"You can no longer change this on Proton Drive. Ask the owner for edit "
+"access, or export the file to keep your version."
+msgstr ""
+"Ya no puede modificar esto en Proton Drive. Pida al propietario permiso de "
+"edición o exporte el archivo para conservar su versión."
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:725
+msgid ""
+"The folder this change belongs in is gone from Proton Drive. Export the file "
+"to keep your version."
+msgstr ""
+"La carpeta a la que pertenece este cambio ya no está en Proton Drive. "
+"Exporte el archivo para conservar su versión."
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:728
+msgid ""
+"Proton Drive's limit on items in a folder or on folder depth is reached. "
+"Make room in the folder, then retry."
+msgstr ""
+"Se alcanzó el límite de Proton Drive de elementos por carpeta o de "
+"profundidad de carpetas. Haga espacio en la carpeta y vuelva a intentarlo."
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:731
+msgid "Proton Drive refused this change. It stays queued and is tried again."
+msgstr ""
+"Proton Drive rechazó este cambio. Sigue en la cola y se volverá a intentar."
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:741
+msgid "Export File"
+msgstr "Exportar archivo"
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:750
+#: crates/pdfs-gui/src/app/pages/locations.rs:764
+#: crates/pdfs-gui/src/app/pages/locations.rs:768
+msgid "Couldn't export the file"
+msgstr "No se pudo exportar el archivo"
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:751
+#: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:351
+msgid "That location isn't a local file."
+msgstr "Esa ubicación no es un archivo local."
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:762
+msgid "File exported"
+msgstr "Archivo exportado"
+
+#: crates/pdfs-gui/src/app/pages/locations.rs:783
 msgid "Retrying now…"
 msgstr "Reintentando ahora…"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:705
-#: crates/pdfs-gui/src/app/pages/locations.rs:709
+#: crates/pdfs-gui/src/app/pages/locations.rs:788
+#: crates/pdfs-gui/src/app/pages/locations.rs:792
 msgid "Couldn't retry"
 msgstr "No se pudo reintentar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:779
+#: crates/pdfs-gui/src/app/pages/locations.rs:862
 #, rust-format
 msgid "{size}, changed {time}"
 msgstr "{size}, modificado {time}"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:789
+#: crates/pdfs-gui/src/app/pages/locations.rs:872
 msgid "The original is gone; only this copy is left"
 msgstr "El original ya no existe; solo queda esta copia"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:791
+#: crates/pdfs-gui/src/app/pages/locations.rs:874
 msgid "Same content as the original"
 msgstr "Mismo contenido que el original"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:832
+#: crates/pdfs-gui/src/app/pages/locations.rs:915
 #, rust-format
 msgid ""
 "“{name}” was changed here and elsewhere at the same time.\n"
@@ -2782,7 +2847,7 @@ msgstr ""
 "\n"
 "Lo que no se conserve va a la papelera, desde donde se puede restaurar."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:844
+#: crates/pdfs-gui/src/app/pages/locations.rs:927
 #, rust-format
 msgid ""
 "The original “{name}” no longer exists; only the copy is left ({copy}).\n"
@@ -2793,111 +2858,111 @@ msgstr ""
 "\n"
 "Conserve la copia para devolverle el nombre original."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:850
+#: crates/pdfs-gui/src/app/pages/locations.rs:933
 msgid "Resolve Conflict"
 msgstr "Resolver conflicto"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:855
+#: crates/pdfs-gui/src/app/pages/locations.rs:938
 msgid "Name for the copy, if keeping both"
 msgstr "Nombre de la copia, si se conservan ambos"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:862
+#: crates/pdfs-gui/src/app/pages/locations.rs:945
 msgid "Keep Original"
 msgstr "Conservar original"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:863
+#: crates/pdfs-gui/src/app/pages/locations.rs:946
 msgid "Keep Both"
 msgstr "Conservar ambos"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:865
+#: crates/pdfs-gui/src/app/pages/locations.rs:948
 msgid "Keep Copy"
 msgstr "Conservar copia"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:922
-#: crates/pdfs-gui/src/app/pages/locations.rs:928
+#: crates/pdfs-gui/src/app/pages/locations.rs:1005
+#: crates/pdfs-gui/src/app/pages/locations.rs:1011
 msgid "Couldn't resolve the conflict"
 msgstr "No se pudo resolver el conflicto"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:971
+#: crates/pdfs-gui/src/app/pages/locations.rs:1054
 msgid "Reading this computer's Proton Drive locations."
 msgstr "Leyendo las ubicaciones de Proton Drive de este equipo."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:992
+#: crates/pdfs-gui/src/app/pages/locations.rs:1075
 msgid "Unavailable"
 msgstr "No disponible"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1075
+#: crates/pdfs-gui/src/app/pages/locations.rs:1158
 msgid "No folders yet"
 msgstr "Todavía no hay carpetas"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1077
+#: crates/pdfs-gui/src/app/pages/locations.rs:1160
 msgid "The Proton Drive service hasn't reported its folder yet."
 msgstr "El servicio de Proton Drive todavía no ha informado de su carpeta."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1100
+#: crates/pdfs-gui/src/app/pages/locations.rs:1183
 #, rust-format
 msgid "{path} · {state}"
 msgstr "{path} · {state}"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1143
+#: crates/pdfs-gui/src/app/pages/locations.rs:1226
 msgid "Read-only"
 msgstr "Solo lectura"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1159
+#: crates/pdfs-gui/src/app/pages/locations.rs:1242
 msgid "Open in Files"
 msgstr "Abrir en Archivos"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1164
+#: crates/pdfs-gui/src/app/pages/locations.rs:1247
 msgid "Change Location…"
 msgstr "Cambiar ubicación…"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1216
+#: crates/pdfs-gui/src/app/pages/locations.rs:1299
 msgid "Choose whether this folder keeps a full copy on this computer"
 msgstr "Elegir si esta carpeta guarda una copia completa en este equipo"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1232
+#: crates/pdfs-gui/src/app/pages/locations.rs:1315
 msgid "Keep every file on this computer and in Proton Drive."
 msgstr "Conservar todos los archivos en este equipo y en Proton Drive."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1237
+#: crates/pdfs-gui/src/app/pages/locations.rs:1320
 msgid "Keep the files in Proton Drive and download each one when you open it."
 msgstr ""
 "Conservar los archivos en Proton Drive y descargar cada uno al abrirlo."
 
 #. Translators: a folder mode: files are kept in Proton Drive and fetched when opened.
-#: crates/pdfs-gui/src/app/pages/locations.rs:1291
+#: crates/pdfs-gui/src/app/pages/locations.rs:1374
 msgctxt "folder mode"
 msgid "Online only"
 msgstr "Solo en línea"
 
 #. Translators: a folder mode: a full copy is kept on this computer.
-#: crates/pdfs-gui/src/app/pages/locations.rs:1294
+#: crates/pdfs-gui/src/app/pages/locations.rs:1377
 msgctxt "folder mode"
 msgid "Synced"
 msgstr "Sincronizada"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1305
+#: crates/pdfs-gui/src/app/pages/locations.rs:1388
 msgid "Sync Now"
 msgstr "Sincronizar ahora"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1309
+#: crates/pdfs-gui/src/app/pages/locations.rs:1392
 msgid "Resume Syncing"
 msgstr "Reanudar la sincronización"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1311
+#: crates/pdfs-gui/src/app/pages/locations.rs:1394
 msgid "Pause Syncing"
 msgstr "Pausar la sincronización"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1322
+#: crates/pdfs-gui/src/app/pages/locations.rs:1405
 msgid "Stop Syncing…"
 msgstr "Dejar de sincronizar…"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1331
+#: crates/pdfs-gui/src/app/pages/locations.rs:1414
 msgid "Make Folder Online Only?"
 msgstr "¿Hacer la carpeta solo en línea?"
 
 #. Translators: {path} is a local folder path.
-#: crates/pdfs-gui/src/app/pages/locations.rs:1333
+#: crates/pdfs-gui/src/app/pages/locations.rs:1416
 #, rust-format
 msgid ""
 "Files in {path} will be removed from this computer and kept in Proton Drive "
@@ -2906,11 +2971,11 @@ msgstr ""
 "Los archivos de {path} se quitarán de este equipo y se conservarán solo en "
 "Proton Drive. Cada archivo se vuelve a descargar al abrirlo."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1336
+#: crates/pdfs-gui/src/app/pages/locations.rs:1419
 msgid "Make Online Only"
 msgstr "Hacer solo en línea"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1372
+#: crates/pdfs-gui/src/app/pages/locations.rs:1455
 #, rust-format
 msgid ""
 "Every file in {path} will download to this computer and stay synced. {free} "
@@ -2919,61 +2984,61 @@ msgstr ""
 "Todos los archivos de {path} se descargarán en este equipo y se mantendrán "
 "sincronizados. Hay {free} libres en este disco."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1377
+#: crates/pdfs-gui/src/app/pages/locations.rs:1460
 #, rust-format
 msgid "Every file in {path} will download to this computer and stay synced."
 msgstr ""
 "Todos los archivos de {path} se descargarán en este equipo y se mantendrán "
 "sincronizados."
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1382
+#: crates/pdfs-gui/src/app/pages/locations.rs:1465
 msgid "Download Folder?"
 msgstr "¿Descargar la carpeta?"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1386
+#: crates/pdfs-gui/src/app/pages/locations.rs:1469
 msgid "Download"
 msgstr "Descargar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1410
+#: crates/pdfs-gui/src/app/pages/locations.rs:1493
 msgid "Couldn't pause the folder"
 msgstr "No se pudo pausar la carpeta"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1411
+#: crates/pdfs-gui/src/app/pages/locations.rs:1494
 msgid "Couldn't resume the folder"
 msgstr "No se pudo reanudar la carpeta"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1417
+#: crates/pdfs-gui/src/app/pages/locations.rs:1500
 msgid "Folder paused"
 msgstr "Carpeta en pausa"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1418
+#: crates/pdfs-gui/src/app/pages/locations.rs:1501
 msgid "Folder resumed"
 msgstr "Carpeta reanudada"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1442
-#: crates/pdfs-gui/src/app/pages/locations.rs:1446
+#: crates/pdfs-gui/src/app/pages/locations.rs:1525
+#: crates/pdfs-gui/src/app/pages/locations.rs:1529
 msgid "Couldn't sync"
 msgstr "No se pudo sincronizar"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1472
+#: crates/pdfs-gui/src/app/pages/locations.rs:1555
 msgid "Shared folder"
 msgstr "Carpeta compartida"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1474
+#: crates/pdfs-gui/src/app/pages/locations.rs:1557
 msgid "Going online only"
 msgstr "Pasando a solo en línea"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1475
+#: crates/pdfs-gui/src/app/pages/locations.rs:1558
 msgid "Switching to synced"
 msgstr "Pasando a sincronizada"
 
-#: crates/pdfs-gui/src/app/pages/locations.rs:1485
+#: crates/pdfs-gui/src/app/pages/locations.rs:1568
 msgctxt "state"
 msgid "paused"
 msgstr "en pausa"
 
 #. Translators: a folder's files can't be opened right now.
-#: crates/pdfs-gui/src/app/pages/locations.rs:1496
+#: crates/pdfs-gui/src/app/pages/locations.rs:1579
 msgid "not available"
 msgstr "no disponible"
 
@@ -5471,10 +5536,6 @@ msgstr "Guardar versión"
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:359
 msgid "Couldn't save that version"
 msgstr "No se pudo guardar esa versión"
-
-#: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:351
-msgid "That location isn't a local file."
-msgstr "Esa ubicación no es un archivo local."
 
 #: crates/pdfs-gui/src/app/widgets/versions_dialog.rs:358
 msgid "Version saved"

@@ -70,8 +70,9 @@ pub(crate) struct LocationRow {
     progress: gtk4::ProgressBar,
 }
 
-/// What a queue row shows that can change: id, attempts, next attempt, parked.
-pub(crate) type QueueKey = (i64, i64, Option<i64>, bool);
+/// What a queue row shows that can change: id, attempts, next attempt, parked,
+/// issue.
+pub(crate) type QueueKey = (i64, i64, Option<i64>, bool, Option<SyncIssue>);
 
 /// The "Waiting to Upload" list: the daemon's pending-op queue.
 pub(crate) struct QueueState {
@@ -591,7 +592,7 @@ fn repaint_queue(ui: &Rc<Ui>, items: &[PendingOpInfo]) {
     items.sort_by_key(|op| (!op.failing, op.attempts == 0, op.id));
     let key: Vec<QueueKey> = items
         .iter()
-        .map(|op| (op.id, op.attempts, op.next_attempt_at, op.parked))
+        .map(|op| (op.id, op.attempts, op.next_attempt_at, op.parked, op.issue))
         .collect();
     if *queue.painted.borrow() == key {
         return;
@@ -648,6 +649,10 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
         "{action} · {state}",
         &[("action", &action), ("state", &state)],
     );
+    if let Some(issue) = op.issue {
+        subtitle.push('\n');
+        subtitle.push_str(&issue_text(issue));
+    }
     if let Some(error) = &op.last_error {
         subtitle.push('\n');
         // Translators: {n} is how many attempts failed, {error} the last error message.
@@ -662,7 +667,7 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
         .title(glib::markup_escape_text(&op.path).as_str())
         .subtitle(glib::markup_escape_text(&subtitle).as_str())
         .title_lines(1)
-        .subtitle_lines(3)
+        .subtitle_lines(if op.issue.is_some() { 5 } else { 3 })
         .tooltip_text(&op.path)
         .build();
     let image = gtk4::Image::from_icon_name(if op.failing {
@@ -687,7 +692,85 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
         retry.connect_clicked(move |_| retry_queued(&ui, Some(id)));
         row.add_suffix(&retry);
     }
+    if op.failing && op.exportable {
+        let export = gtk4::Button::builder()
+            .label(gettext("Export"))
+            .tooltip_text(gettext("Save a copy of this file's content elsewhere"))
+            .valign(gtk4::Align::Center)
+            .build();
+        export.add_css_class("flat");
+        let ui = ui.clone();
+        let id = op.id;
+        let name = Path::new(&op.path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        export.connect_clicked(move |_| prompt_export_queued(&ui, id, &name));
+        row.add_suffix(&export);
+    }
     row
+}
+
+/// What a sync issue means and what the user can do about it. The change stays
+/// queued either way.
+fn issue_text(issue: SyncIssue) -> String {
+    match issue {
+        SyncIssue::Quota => gettext(
+            "Your Proton Drive storage is full. Free up space or upgrade your plan, and this change uploads on its own.",
+        ),
+        SyncIssue::Access => gettext(
+            "You can no longer change this on Proton Drive. Ask the owner for edit access, or export the file to keep your version.",
+        ),
+        SyncIssue::Missing => gettext(
+            "The folder this change belongs in is gone from Proton Drive. Export the file to keep your version.",
+        ),
+        SyncIssue::Limit => gettext(
+            "Proton Drive's limit on items in a folder or on folder depth is reached. Make room in the folder, then retry.",
+        ),
+        SyncIssue::Rejected | SyncIssue::Unknown => {
+            gettext("Proton Drive refused this change. It stays queued and is tried again.")
+        }
+    }
+}
+
+/// Ask where to save a copy of a queued file's content, then have the daemon
+/// write it there. The change itself stays queued.
+fn prompt_export_queued(ui: &Rc<Ui>, id: i64, name: &str) {
+    let window = ui_window(ui);
+    let dialog = gtk4::FileDialog::builder()
+        .title(gettext("Export File"))
+        .initial_name(name)
+        .build();
+    let ui = ui.clone();
+    dialog.save(window.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Ok(file) = res else { return };
+        let Some(dest) = file.path().and_then(|p| p.to_str().map(str::to_string)) else {
+            toast_error(
+                &ui,
+                &gettext("Couldn't export the file"),
+                &gettext("That location isn't a local file."),
+            );
+            return;
+        };
+        let rx = spawn_request(
+            ui.dirs.control_socket(),
+            Request::ExportPendingOp { id, dest },
+        );
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => toast(&ui, &gettext("File exported")),
+                Ok(Ok(Response::Error { message, kind })) => {
+                    toast_failure(&ui, &gettext("Couldn't export the file"), &message, kind)
+                }
+                _ => toast_error(
+                    &ui,
+                    &gettext("Couldn't export the file"),
+                    &gettext("The Proton Drive service didn't respond."),
+                ),
+            }
+        });
+    });
 }
 
 /// Ask the daemon to stop waiting out one op's backoff, or every failed op's.

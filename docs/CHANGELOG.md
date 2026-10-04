@@ -11,8 +11,18 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **37**. The queue table is rebuilt so an id is never given out twice; queued changes
-are kept.
+Schema: **38**. The queue table is rebuilt so an id is never given out twice; queued changes
+are kept. Queued changes get a column for the reason Drive refused them.
+
+### Added
+- **Sync issues.** A change Drive refuses because the storage is full, access was taken away,
+  its folder is gone, a folder limit is reached or Drive rejected it shows up at once as needing
+  attention, with what it means and what to do, instead of after six failed attempts. The
+  change stays queued and is still retried.
+- **Export a queued file.** The Sync page's Export button and `pdfs sync export <id> <dest>`
+  save a copy of a queued upload's content. The upload stays queued.
+- **`pdfs sync issues`** lists the changes that need attention; `pdfs sync queue` shows the
+  issue next to each change.
 
 ### Changed
 - **Making, renaming and deleting through the mount no longer waits for Drive.** A new folder,

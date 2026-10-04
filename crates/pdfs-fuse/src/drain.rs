@@ -31,7 +31,7 @@ use parking_lot::Mutex;
 
 use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
-use pdfs_core::control::{ActivityKind, TransferDirection};
+use pdfs_core::control::{ActivityKind, SyncIssue, TransferDirection};
 use pdfs_core::db::{
     CreateLanding, CreateRetired, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH,
     PARK_EXPIRY_MS, PendingOp, RenameMeta,
@@ -40,6 +40,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 use tracing::{debug, error, info, warn};
 
+use super::link::is_network_error;
 use super::state::{Intervals, PendingRevision};
 use super::transfers::CountingReader;
 use super::{
@@ -48,6 +49,8 @@ use super::{
     is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
     now_millis, now_secs, parse_node_uid,
 };
+use proton_drive_rs::proton_sdk::api::ResponseCode;
+use proton_drive_rs::proton_sdk::error::ProtonError;
 
 const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
 
@@ -383,6 +386,11 @@ impl Core {
                     self.wait_for_drain_work();
                     continue;
                 }
+                // A failure to reach Drive says nothing about an earlier refusal,
+                // so it keeps the issue that refusal recorded.
+                if let Some(issue) = refusal(e.as_ref()) {
+                    self.record_issue(&op, issue);
+                }
                 match self.db.retry_if_retargeted(
                     op.id,
                     op.parent_uid.as_deref(),
@@ -464,6 +472,9 @@ impl Core {
             {
                 error!(uid = %op.uid, %error, "recording an access-deferral failure failed");
             }
+            if reason != AccessDeferral::RemoteUnreachable {
+                self.record_issue(op, Some(SyncIssue::Access));
+            }
         } else {
             debug!(
                 uid = %op.uid,
@@ -525,6 +536,7 @@ impl Core {
                 ) {
                     error!(uid = %op.uid, %error, "recording a missing-authority failure failed");
                 }
+                self.record_issue(op, Some(SyncIssue::Missing));
                 self.release_claim(op);
             }
             Err(error) => {
@@ -532,6 +544,13 @@ impl Core {
                        "could not ask the remote about a missing authority");
                 self.defer_for_access(op, AccessDeferral::RemoteUnreachable);
             }
+        }
+    }
+
+    /// Store why Drive refused `op`, or that its latest failure was no refusal.
+    fn record_issue(&self, op: &PendingOp, issue: Option<SyncIssue>) {
+        if let Err(error) = self.db.set_op_issue(op.id, issue.map(SyncIssue::as_str)) {
+            error!(uid = %op.uid, %error, "recording a sync issue failed");
         }
     }
 
@@ -2217,6 +2236,30 @@ fn moved_elsewhere(meta: &RenameMeta, node: &Node, parent: &NodeUid, name: &str)
     !at(&meta.original_parent_uid, original_name) && !at(&parent.to_string(), name)
 }
 
+/// What a failed attempt says about its op's sync issue: `None` when Drive
+/// could not be reached, which says nothing; otherwise the issue Drive's answer
+/// is, or `Some(None)` for a failure that is not a refusal.
+fn refusal(e: &(dyn std::error::Error + 'static)) -> Option<Option<SyncIssue>> {
+    let proton = std::iter::successors(Some(e), |e| e.source())
+        .find_map(|e| e.downcast_ref::<ProtonError>())?;
+    if is_network_error(proton) {
+        return None;
+    }
+    let ProtonError::Api(api) = proton else {
+        return Some(None);
+    };
+    Some(match api.code {
+        ResponseCode::InsufficientQuota
+        | ResponseCode::InsufficientSpace
+        | ResponseCode::InsufficientVolumeQuota => Some(SyncIssue::Quota),
+        ResponseCode::Forbidden | ResponseCode::NotEnoughPermissions => Some(SyncIssue::Access),
+        ResponseCode::DoesNotExist => Some(SyncIssue::Missing),
+        ResponseCode::TooManyChildren | ResponseCode::NestingTooDeep => Some(SyncIssue::Limit),
+        ResponseCode::InvalidValue | ResponseCode::IncompatibleState => Some(SyncIssue::Rejected),
+        _ => None,
+    })
+}
+
 /// What the park sweep does with one parked create.
 #[derive(Debug, PartialEq, Eq)]
 enum ParkVerdict {
@@ -2348,6 +2391,57 @@ mod tests {
     /// A transient create is queued a moment before its node is written. A
     /// sweep in between dropped it, and the rename to the finished name then
     /// failed with `EBUSY` (B145).
+    #[test]
+    fn a_refusal_from_drive_is_sorted_into_an_issue_and_the_network_is_not() {
+        use proton_drive_rs::proton_sdk::error::ProtonApiError;
+        let api = |code, http_status| {
+            ProtonError::Api(ProtonApiError {
+                code,
+                http_status,
+                message: String::new(),
+                details: None,
+            })
+        };
+        let issue = |e: ProtonError| refusal(&e);
+        assert_eq!(
+            issue(api(ResponseCode::InsufficientQuota, 422)),
+            Some(Some(SyncIssue::Quota))
+        );
+        assert_eq!(
+            issue(api(ResponseCode::NotEnoughPermissions, 403)),
+            Some(Some(SyncIssue::Access))
+        );
+        assert_eq!(
+            issue(api(ResponseCode::DoesNotExist, 404)),
+            Some(Some(SyncIssue::Missing))
+        );
+        assert_eq!(
+            issue(api(ResponseCode::TooManyChildren, 422)),
+            Some(Some(SyncIssue::Limit))
+        );
+        // A refusal nobody sorted clears an earlier issue; the network keeps it.
+        assert_eq!(issue(api(ResponseCode::AlreadyExists, 422)), Some(None));
+        assert_eq!(issue(api(ResponseCode::RequestTimeout, 408)), None);
+        // An error that is no refusal from Drive at all is no issue either.
+        assert_eq!(refusal(&std::io::Error::other("disk")), None);
+
+        // The drain sees Drive's error wrapped by whatever called it.
+        #[derive(Debug)]
+        struct Wrapped(ProtonError);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("uploading")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let wrapped = Wrapped(api(ResponseCode::InsufficientSpace, 422));
+        assert_eq!(refusal(&wrapped), Some(Some(SyncIssue::Quota)));
+    }
+
     #[test]
     fn a_parked_create_is_dropped_only_once_its_file_is_gone_and_closed() {
         let now = PARK_EXPIRY_MS * 10;

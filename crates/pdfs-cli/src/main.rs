@@ -14,7 +14,7 @@ use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ConflictKeep, ErrorKind, MountKind, RefreshScope, Request as CtlRequest,
-    Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase,
+    Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncIssue, SyncPhase,
     pending_summary,
 };
 use pdfs_core::db::Db;
@@ -677,6 +677,15 @@ enum SyncCmd {
     },
     /// List uploads and changes not yet on Proton Drive.
     Queue,
+    /// List queued changes Proton Drive refused or that keep failing, and what to do.
+    Issues,
+    /// Save the content of a queued upload (by id from `sync queue`) to a file.
+    Export {
+        /// Queue id.
+        id: i64,
+        /// Where to save it: a new file, or an existing folder to save it in.
+        dest: PathBuf,
+    },
     /// Retry a queued operation now (by id from `sync queue`), or every failed one.
     Retry {
         /// Queue id; omit to retry every failed operation.
@@ -1028,6 +1037,8 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Queue => return cmd_sync_queue(),
+        SyncCmd::Issues => return cmd_sync_issues(),
+        SyncCmd::Export { id, dest } => return cmd_sync_export(id, &dest),
         SyncCmd::Limit { up, down } => return cmd_sync_limit(up, down),
         SyncCmd::Retry { id } => ok_or_bail(control_request(CtlRequest::RetryPendingOp { id })?)?,
         SyncCmd::Resume { folder: None } => {
@@ -1106,6 +1117,9 @@ fn cmd_sync_queue() -> Result<()> {
                     (false, _) => "due now".to_string(),
                 };
                 println!("[{}]  {}  {}  ({state})", op.id, op.kind, op.path);
+                if let Some(issue) = op.issue {
+                    println!("      needs attention: {}", issue_text(issue));
+                }
                 if let Some(error) = &op.last_error {
                     println!("      failed {} time(s): {error}", op.attempts);
                 }
@@ -1115,6 +1129,91 @@ fn cmd_sync_queue() -> Result<()> {
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+/// `pdfs sync issues`: the queued changes that need the user, and what to do.
+fn cmd_sync_issues() -> Result<()> {
+    let response = control_request(CtlRequest::ListPendingOps)?;
+    let items = match response {
+        CtlResponse::PendingOps { items } => items,
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let issues: Vec<_> = items.into_iter().filter(|op| op.failing).collect();
+    if json_enabled() {
+        println!("{}", serde_json::to_string_pretty(&issues)?);
+        return Ok(());
+    }
+    if issues.is_empty() {
+        println!("No sync issues.");
+        return Ok(());
+    }
+    for op in issues {
+        println!("[{}]  {}  {}", op.id, op.kind, op.path);
+        match op.issue {
+            Some(issue) => println!("      {}", issue_text(issue)),
+            None => println!("      keeps failing; it is retried."),
+        }
+        if let Some(error) = &op.last_error {
+            println!("      last error: {error}");
+        }
+        if op.exportable {
+            println!(
+                "      save a copy: pdfs sync export {} <file or folder>",
+                op.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What a sync issue means, and what the user can do about it.
+fn issue_text(issue: SyncIssue) -> &'static str {
+    match issue {
+        SyncIssue::Quota => {
+            "Proton Drive storage is full. Free up space or upgrade; the change is retried."
+        }
+        SyncIssue::Access => {
+            "you can no longer change this on Proton Drive, for example because a share was \
+             revoked. Save a copy to keep the content."
+        }
+        SyncIssue::Missing => {
+            "the file or its folder is gone from Proton Drive. Save a copy to keep the content."
+        }
+        SyncIssue::Limit => {
+            "the folder holds too many items or is nested too deep. Move the file to another \
+             folder."
+        }
+        SyncIssue::Rejected => {
+            "Proton Drive rejected the change, for example the name. Rename the file."
+        }
+        SyncIssue::Unknown => "Proton Drive refused the change.",
+    }
+}
+
+/// `pdfs sync export`: save a queued upload's content. A folder as `dest`
+/// gets the file under its own name.
+fn cmd_sync_export(id: i64, dest: &Path) -> Result<()> {
+    let mut dest =
+        std::path::absolute(dest).with_context(|| format!("resolving {}", dest.display()))?;
+    if dest.is_dir() {
+        let items = match control_request(CtlRequest::ListPendingOps)? {
+            CtlResponse::PendingOps { items } => items,
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        };
+        let Some(op) = items.iter().find(|op| op.id == id) else {
+            bail!("no queued change {id}; see `pdfs sync queue`");
+        };
+        let name = Path::new(&op.path)
+            .file_name()
+            .with_context(|| format!("{} has no file name", op.path))?;
+        dest.push(name);
+    }
+    ok_or_bail(control_request(CtlRequest::ExportPendingOp {
+        id,
+        dest: dest.display().to_string(),
+    })?)
 }
 
 /// `pdfs sync restore`: list what this machine's device holds, confirm where

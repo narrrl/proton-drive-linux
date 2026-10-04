@@ -6138,6 +6138,33 @@ fn retry_now_makes_a_backed_off_op_due_but_leaves_parked_ops_parked() {
     assert_eq!(due(parked), ops::PARK_UNTIL);
 }
 
+/// A change Drive refused needs the user now, not after six more failures, and
+/// its refusal is the error the status leads with.
+#[test]
+fn an_op_with_an_issue_counts_as_failing_at_once() {
+    let db = Db::open_in_memory().unwrap();
+    queued_op(&db, "vol~a", 1, 90_000);
+    let refused = queued_op(&db, "vol~b", 1, 90_000);
+    assert_eq!(db.pending_op_counts().unwrap().failing, 0);
+
+    db.record_op_failure(refused, "storage quota exceeded", 90_000)
+        .unwrap();
+    db.set_op_issue(refused, Some("quota")).unwrap();
+    let counts = db.pending_op_counts().unwrap();
+    assert_eq!(counts.failing, 1);
+    assert_eq!(counts.last_error.as_deref(), Some("storage quota exceeded"));
+    assert_eq!(
+        db.op_issues().unwrap(),
+        std::collections::HashMap::from([(refused, "quota".to_string())])
+    );
+
+    // The op stays queued with its bytes; clearing the issue is all it takes.
+    db.set_op_issue(refused, None).unwrap();
+    assert_eq!(db.pending_op_counts().unwrap().failing, 0);
+    assert!(db.op_issues().unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 2);
+}
+
 #[test]
 fn retry_all_touches_only_ops_that_have_failed() {
     let db = Db::open_in_memory().unwrap();
