@@ -4161,12 +4161,21 @@ class MoveContext:
         self.pair = first.pair
 
     def move(self, *paths: Path) -> subprocess.CompletedProcess:
-        """`pdfs move`, bounded: a wedged mount must not hang the harness."""
+        """`pdfs move`, bounded: a wedged mount must not hang the harness.
+
+        A mirror's sync pass holds the folder, and the daemon refuses a move
+        that waited 5 s for it. A periodic pass over a folder earlier runs
+        filled can take longer, so the move is tried again until it ends."""
         command = [self.pair.pdfs, "move", *(str(path) for path in paths)]
-        result = subprocess.run(
-            command, text=True, capture_output=True, timeout=self.pair.timeout
-        )
-        detail = result.stderr.strip() or result.stdout.strip()
+        deadline = time.monotonic() + self.pair.timeout
+        while True:
+            result = subprocess.run(
+                command, text=True, capture_output=True, timeout=self.pair.timeout
+            )
+            detail = result.stderr.strip() or result.stdout.strip()
+            if not (result.returncode and "busy syncing" in detail) or time.monotonic() > deadline:
+                break
+            time.sleep(2)
         if result.returncode and "different Proton Drive volumes" in detail:
             raise Skip(f"the locations are on different volumes: {detail}")
         return result
