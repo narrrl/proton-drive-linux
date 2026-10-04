@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## B172 — A file renamed while its upload is read back shows its old name
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by `one_client_on_a_good_link` (seed 8) on 2502af6, run three at a time
+in a loop: two of nine runs failed. In one, a write to `f.txt` answered `ENOENT`; in the other,
+a rename of `f.txt`. The mount showed the file as `a.txt` again.
+
+**Where:** `refresh_after_upload` and `place_landed` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** `a.txt` was renamed to `f.txt` while its create was on the wire, with a write behind
+it. The create landed, and its op became a revision with a rename queued after it. The upload
+retires its op before it reads the node back, so the rename went out while Drive answered the
+read-back, and that answer still had the old name. The drain asked whether a rename was queued
+only after the answer came, found none, and put `a.txt` back into the tree. The create's
+read-back already asks first (B161); the upload's did not.
+
+**Fix.** The upload's read-back notes whether a rename is queued, and where the tree has the
+file, before it asks Drive. The tree keeps the name and folder the user gave the file if a
+rename was queued then or is now, or if the file moved meanwhile.
+
+**Test:** `a_file_renamed_while_its_upload_is_read_back_keeps_its_new_name` in
+`crates/pdfs-fuse/src/sim/daemon.rs`.
+
+---
+
 ## B171 — A file deleted while its upload fails stays on Drive for the upload's backoff
 
 **Status:** Fixed (unverified).

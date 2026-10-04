@@ -73,7 +73,8 @@ by its local id, in the queue, the stored tree and pins alike.
 - **A file deleted while its upload was retrying is removed from Drive right away.** It no
   longer waits for the upload's next retry (B171).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
-  the old name, and a second rename no longer failed with "No such file or directory" (B152).
+  the old name, and a second rename no longer failed with "No such file or directory" (B152,
+  B172).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or
   upload over a file being deleted goes out as soon as the delete lands (B153).
 - **A file deleted right after it was made no longer stays on Drive when the link lost Drive's

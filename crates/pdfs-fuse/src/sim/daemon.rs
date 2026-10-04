@@ -465,6 +465,68 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_renamed_while_its_upload_is_read_back_keeps_its_new_name() {
+        // The rename landed while the drain read the uploaded file back. The
+        // answer still had the old name, and the drain found no rename queued,
+        // so the mount showed the file under its old name and the new one
+        // answered ENOENT (B172).
+        let drive = FakeDrive::new();
+        let dir = scratch("renamed-while-read-back");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        std::fs::write(mnt.join("a.txt"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("a.txt").cloned() == file(b"first")
+        }));
+        let uid = drive.lookup("a.txt").unwrap();
+        let mut held = daemon.client.hold_answer_to_next_read(&uid);
+        std::fs::write(mnt.join("a.txt"), b"second").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || held.reached()));
+        std::fs::rename(mnt.join("a.txt"), mnt.join("f.txt")).unwrap();
+        // Each read is answered in turn until the upload's op is retired; the
+        // answer to the read-back after it is held until the rename has landed.
+        let reading_back = loop {
+            if daemon
+                .pending()
+                .is_ok_and(|items| items.iter().all(|op| op.kind != "revision"))
+            {
+                break held;
+            }
+            let next = daemon.client.hold_answer_to_next_read(&uid);
+            drop(held);
+            assert!(wait_until(Duration::from_secs(30), || next.reached()));
+            held = next;
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || drive.lookup("f.txt").is_some()),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        drop(reading_back);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"second")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        // Long enough for the drain to have put the read-back into the tree.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(std::fs::read(mnt.join("f.txt")).unwrap(), b"second");
+        assert!(!mnt.join("a.txt").exists());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name() {
         // The move queued behind the create landed while the drain read the
         // new node back. The answer still had the old name, and the drain no

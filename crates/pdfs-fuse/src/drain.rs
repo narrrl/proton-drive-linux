@@ -2294,6 +2294,14 @@ impl Core {
         blob: &Path,
         adopt: impl FnOnce(i64, u64),
     ) -> Option<Node> {
+        // Asked before the read-back: the op went before it, so a rename queued
+        // behind the upload can land while Drive answers, and the answer may
+        // still have the old name (`docs/BUGS.md` B172).
+        let placed = self.placement(uid);
+        let renaming = self
+            .db
+            .has_pending_op(&uid.to_string(), OP_RENAME)
+            .unwrap_or(false);
         let fetched = self.fetch_node_remote(uid);
         if fetched.is_ok() {
             self.sealed_unread.lock().remove(uid);
@@ -2376,37 +2384,42 @@ impl Core {
         self.release_pending(uid, blob);
         #[cfg(test)]
         self.drive.landing(uid);
-        self.place_landed(uid, &node);
+        self.place_landed(uid, &node, placed, renaming);
         self.landed.lock().remove(uid);
         Some(node)
     }
 
     /// Put a node whose upload just landed into the tree, unless a newer write
-    /// is queued for it.
-    fn place_landed(&self, uid: &NodeUid, node: &Node) {
+    /// is queued for it. `before` is where the tree had the node and
+    /// `renaming` whether a rename of it was queued, both from before the
+    /// read-back.
+    fn place_landed(
+        &self,
+        uid: &NodeUid,
+        node: &Node,
+        before: Option<(String, Option<NodeUid>)>,
+        renaming: bool,
+    ) {
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
         // this overwrites it with the revision the server actually holds.
         if self.rebaseline_pending(uid, node) {
             return;
         }
-        // A rename queued behind the upload has not reached Drive yet, and
-        // until it lands the tree keeps the name and folder the user gave the
-        // file, as `adopt_real_uid` does. Taking Drive's put the file back
-        // under its old name. A rename queued after the check below has
-        // already moved the entry when the tree is updated, so a name that
-        // changed in between is the user's too (docs/BUGS.md B146).
-        let placed = |st: &crate::state::State| {
-            let entry = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))?;
-            Some((entry.node.name.clone(), entry.node.parent_uid.clone()))
-        };
-        let before = placed(&self.state());
-        let renaming = self
-            .db
-            .has_pending_op(&uid.to_string(), OP_RENAME)
-            .unwrap_or(false);
+        // A rename queued behind the upload has not reached Drive yet, or
+        // landed after Drive read the node back, and the tree keeps the name
+        // and folder the user gave the file, as `adopt_real_uid` does. Taking
+        // Drive's put the file back under its old name. A rename queued since
+        // the read-back began has already moved the entry when the tree is
+        // updated, so a name that changed in between is the user's too
+        // (docs/BUGS.md B146, B172).
+        let renaming = renaming
+            || self
+                .db
+                .has_pending_op(&uid.to_string(), OP_RENAME)
+                .unwrap_or(false);
         self.for_each_state(|st| {
-            let moved = placed(st) != before;
+            let moved = placed_in(st, uid) != before;
             let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino)) else {
                 return;
             };
@@ -2418,6 +2431,11 @@ impl Core {
             }
             st.intern(parent, node);
         });
+    }
+
+    /// Where the tree has `uid`: its name and parent.
+    fn placement(&self, uid: &NodeUid) -> Option<(String, Option<NodeUid>)> {
+        placed_in(&self.state(), uid)
     }
 
     /// Rebase every write handle open on `uid` onto `node`, a revision this
@@ -2673,6 +2691,12 @@ const LANDED_KEEP_SHARE: u64 = 16;
 /// unlimited (`0`).
 fn keeps_landed_upload(pinned: bool, len: u64, budget: u64) -> bool {
     pinned || budget == 0 || len <= budget / LANDED_KEEP_SHARE
+}
+
+/// Where `st` has `uid`: its name and parent.
+fn placed_in(st: &crate::state::State, uid: &NodeUid) -> Option<(String, Option<NodeUid>)> {
+    let entry = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))?;
+    Some((entry.node.name.clone(), entry.node.parent_uid.clone()))
 }
 
 #[cfg(test)]
