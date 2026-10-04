@@ -38,6 +38,12 @@ are kept.
   busy".** The rename goes to the file Drive made (B142).
 - **A file whose upload landed just as the connection dropped no longer gets a conflict copy at
   its next save.** The daemon reads the file back once the connection returns (B143).
+- **A rename whose target name was just freed no longer lands as a conflict copy.** The rename
+  is sent once more under the name it asked for (B144).
+- **Saving a download under its final name no longer fails with "Device or resource busy".**
+  A file made a moment before was taken for deleted and dropped from the queue (B145).
+- **A file renamed just as its upload lands keeps its new name.** The tree could take back the
+  name Drive still had (B146).
 
 ## [2.10.0] — 2026-10-03
 

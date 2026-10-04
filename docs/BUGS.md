@@ -12,6 +12,67 @@ Conventions:
 
 ---
 
+## B146 — A file renamed just as its upload lands can go back to its old name
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the CI simulation run (`sim::run`, profile one-client-echoes, seed 4).
+Client 0 renamed `a.txt` to `b.txt`, and a millisecond later renaming `b.txt` to `e.md` failed
+with `ENOENT`. Not reproduced locally.
+
+**Where:** `Core::refresh_after_upload` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** After an upload lands, the drain reads the node back and puts Drive's metadata in the
+tree. It keeps the tree's name only while a rename is queued, and it asked the queue before taking
+the tree's lock. A rename queued between the two had already renamed the entry, and Drive's
+metadata, which still had the old name, put it back.
+
+**Fix.** The drain notes the entry's name and folder before it asks the queue. If either changed
+by the time it holds the lock, a rename came in between, and the tree keeps it.
+
+**Test:** none. The window is between two statements and is not hit on purpose.
+
+## B145 — Renaming a just-made download to its final name can fail with "Device or resource busy"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the account acceptance run (B70 check). The browser-style rename
+`b70-download.zip.crdownload` → `b70-download.zip` failed with `EBUSY`. The journal shows
+`swept parked creates released=0 dropped=1` 3 ms after the create was queued, then
+`queued create vanished under a rename`.
+
+**Where:** `Core::sweep_parked_creates` and `park_verdict` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A transient file's create is parked until the rename that gives it its final name.
+`queue_local_node` queues the create before the caller writes the node's row. The park sweep
+reads a parked create with no row as a file that was deleted and drops it. A sweep that ran
+between the two steps dropped a live file's create, and the rename found nothing to rename.
+
+**Fix.** A parked create with no row is dropped only once it is a minute old and not open.
+Before that it is kept, like any other park.
+
+**Test:** the unit test `a_parked_create_is_dropped_only_once_its_file_is_gone_and_closed`. The
+window is a few milliseconds wide and is not hit on purpose.
+
+## B144 — A rename can land under a conflict name although its target was freed
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation runs (`sim::run`, profile one-client-echoes, seed 4).
+Client 0 renamed `d` to `c.bin` while the trash of the old `c.bin` was queued. The rename landed
+as `c (sync-conflict …).bin`, and the client's tree and Drive disagreed.
+
+**Where:** `Core::drain_rename_in_place`, `Core::drain_rename` and `Core::create_local_node` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** When Drive answers that the name is taken, the drain asks whether a queued trash or
+rename still holds it, and if so waits for that to land. The trash landed between Drive's answer
+and the check. Nothing held the name any more, so the drain took the answer as a real clash and
+fell back to a conflict name.
+
+**Fix.** When nothing holds the name, the drain sends the request once more under the wanted name
+before falling back to a conflict name.
+
+**Test:** seed 4 of one-client-echoes passes repeatedly. The window is too narrow to hit on
+purpose.
+
 ## B143 — A write to a file whose create landed as the link went down lands as a conflict copy
 
 **Status:** Fixed (unverified).

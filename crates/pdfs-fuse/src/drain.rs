@@ -745,17 +745,25 @@ impl Core {
                     if self.name_is_held(op, Some(&parent), &name)? {
                         return Err(held_by_queued_change(&name));
                     }
-                    let alt = conflict_name(&name, now_secs());
-                    warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
-                    self.move_rename_remote(&uid, &parent, Some(&alt))?;
-                    self.adopt_drained_name(&uid, &alt);
-                    self.log_activity(
-                        ActivityKind::Rename,
-                        &name,
-                        format!("destination already had that name; moved as {alt}"),
-                        false,
-                    );
-                    alt
+                    // What held it may have let go since Drive answered
+                    // (docs/BUGS.md B144).
+                    match self.move_rename_remote(&uid, &parent, target) {
+                        Ok(()) => name.clone(),
+                        Err(e) if is_already_exists(&e) => {
+                            let alt = conflict_name(&name, now_secs());
+                            warn!(%uid, name, alt, "destination already holds that name; using a conflict name");
+                            self.move_rename_remote(&uid, &parent, Some(&alt))?;
+                            self.adopt_drained_name(&uid, &alt);
+                            self.log_activity(
+                                ActivityKind::Rename,
+                                &name,
+                                format!("destination already had that name; moved as {alt}"),
+                                false,
+                            );
+                            alt
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 // The destination folder is gone. Leaving the node in its current
                 // parent is the honest outcome: it is not where the user asked for
@@ -820,6 +828,13 @@ impl Core {
             Err(e) if is_already_exists(&e) => {
                 if self.name_is_held(op, parent, name)? {
                     return Err(held_by_queued_change(name));
+                }
+                // What held it may have let go since Drive answered
+                // (docs/BUGS.md B144).
+                match self.rename_remote(uid, name) {
+                    Ok(()) => return Ok(name.to_string()),
+                    Err(e) if is_already_exists(&e) => {}
+                    Err(e) => return Err(e.into()),
                 }
                 let alt = conflict_name(name, now_secs());
                 warn!(%uid, name, alt, "rename target name is taken; using a conflict name");
@@ -948,6 +963,11 @@ impl Core {
             && self.name_is_held(op, Some(&parent), &wanted)?
         {
             return Err(held_by_queued_change(&wanted));
+        }
+        // What held it may have let go since Drive answered (docs/BUGS.md
+        // B144).
+        if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref())) {
+            real = self.create_drained_node(op, &parent, &wanted);
         }
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref())) {
             name = conflict_name(&wanted, now_secs());
@@ -1688,7 +1708,7 @@ impl Core {
                 continue;
             };
             let name = op.name.as_deref().unwrap_or("?");
-            let known = match self.db.node_by_uid(&op.uid) {
+            let listed = match self.db.node_by_uid(&op.uid) {
                 Ok(known) => known.is_some(),
                 // Never infer "deleted" from a failed read: that would discard
                 // the bytes over a transient database error.
@@ -1697,17 +1717,18 @@ impl Core {
                     continue;
                 }
             };
-            if !known {
-                if let Err(error) = self.discard_queued_ops(&uid) {
-                    warn!(%uid, name, ?error, "dropping a deleted transient's parked create failed");
+            match park_verdict(op.created_at, now, self.uid_is_open(&uid), listed) {
+                ParkVerdict::Keep => continue,
+                ParkVerdict::Drop => {
+                    if let Err(error) = self.discard_queued_ops(&uid) {
+                        warn!(%uid, name, ?error, "dropping a deleted transient's parked create failed");
+                        continue;
+                    }
+                    dropped += 1;
+                    debug!(%uid, name, "dropped a parked create whose file was deleted");
                     continue;
                 }
-                dropped += 1;
-                debug!(%uid, name, "dropped a parked create whose file was deleted");
-                continue;
-            }
-            if park_verdict(op.created_at, now, self.uid_is_open(&uid)) != ParkVerdict::Release {
-                continue;
+                ParkVerdict::Release => {}
             }
             match self.db.set_create_hold(&op.uid, false) {
                 Ok(true) => {
@@ -2033,18 +2054,26 @@ impl Core {
         // A rename queued behind the upload has not reached Drive yet, and
         // until it lands the tree keeps the name and folder the user gave the
         // file, as `adopt_real_uid` does. Taking Drive's put the file back
-        // under its old name.
+        // under its old name. A rename queued after the check below has
+        // already moved the entry when the tree is updated, so a name that
+        // changed in between is the user's too (docs/BUGS.md B146).
+        let placed = |st: &crate::state::State| {
+            let entry = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))?;
+            Some((entry.node.name.clone(), entry.node.parent_uid.clone()))
+        };
+        let before = placed(&self.state());
         let renaming = self
             .db
             .has_pending_op(&uid.to_string(), OP_RENAME)
             .unwrap_or(false);
         self.for_each_state(|st| {
+            let moved = placed(st) != before;
             let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino)) else {
                 return;
             };
             let parent = entry.parent;
             let mut node = node.clone();
-            if renaming {
+            if renaming || moved {
                 node.name = entry.node.name.clone();
                 node.parent_uid = entry.node.parent_uid.clone();
             }
@@ -2169,22 +2198,40 @@ fn moved_elsewhere(meta: &RenameMeta, node: &Node, parent: &NodeUid, name: &str)
     !at(&meta.original_parent_uid, original_name) && !at(&parent.to_string(), name)
 }
 
-/// What the park sweep does with one parked create whose node still exists.
+/// What the park sweep does with one parked create.
 #[derive(Debug, PartialEq, Eq)]
 enum ParkVerdict {
     /// Leave it parked: the rename it waits for can still come.
     Keep,
     /// Un-park it: nothing will rename it now, so the bytes go up as they are.
     Release,
+    /// Drop it: the file was deleted, so the create is no longer wanted.
+    Drop,
 }
 
-/// Judge one parked create by age alone. An open node is kept whatever its age
-/// — it is still being written, and the rename is the writer's last step.
-fn park_verdict(created_at: i64, now: i64, open: bool) -> ParkVerdict {
-    if open || now - created_at < PARK_EXPIRY_MS {
-        return ParkVerdict::Keep;
+/// How long a parked create whose node is not `listed` is kept anyway. The
+/// create is queued before its node is written, and a sweep in between took the
+/// file for deleted (docs/BUGS.md B145).
+const PARK_UNLISTED_GRACE_MS: i64 = 60 * 1000;
+
+/// Judge one parked create by its age and whether its node is `listed`. An open
+/// node is kept whatever its age — it is still being written, and the rename is
+/// the writer's last step.
+fn park_verdict(created_at: i64, now: i64, open: bool, listed: bool) -> ParkVerdict {
+    let age = now - created_at;
+    if open {
+        ParkVerdict::Keep
+    } else if !listed {
+        if age < PARK_UNLISTED_GRACE_MS {
+            ParkVerdict::Keep
+        } else {
+            ParkVerdict::Drop
+        }
+    } else if age < PARK_EXPIRY_MS {
+        ParkVerdict::Keep
+    } else {
+        ParkVerdict::Release
     }
-    ParkVerdict::Release
 }
 
 /// The retryable error for an op whose name a change of ours has yet to free
@@ -2264,18 +2311,38 @@ mod tests {
         let now = PARK_EXPIRY_MS * 10;
         // Fresh: the writer may still rename it.
         assert_eq!(
-            park_verdict(now - PARK_EXPIRY_MS + 1, now, false),
+            park_verdict(now - PARK_EXPIRY_MS + 1, now, false, true),
             ParkVerdict::Keep
         );
         // Old, but still open: a slow write is not an abandoned one.
         assert_eq!(
-            park_verdict(now - PARK_EXPIRY_MS, now, true),
+            park_verdict(now - PARK_EXPIRY_MS, now, true, true),
             ParkVerdict::Keep
         );
         // Old and closed: no rename is coming.
         assert_eq!(
-            park_verdict(now - PARK_EXPIRY_MS, now, false),
+            park_verdict(now - PARK_EXPIRY_MS, now, false, true),
             ParkVerdict::Release
+        );
+    }
+
+    /// A transient create is queued a moment before its node is written. A
+    /// sweep in between dropped it, and the rename to the finished name then
+    /// failed with `EBUSY` (B145).
+    #[test]
+    fn a_parked_create_is_dropped_only_once_its_file_is_gone_and_closed() {
+        let now = PARK_EXPIRY_MS * 10;
+        // Just queued, its node not written yet.
+        assert_eq!(park_verdict(now - 3, now, false, false), ParkVerdict::Keep);
+        // Still open: the writer has not let go of it.
+        assert_eq!(
+            park_verdict(now - PARK_UNLISTED_GRACE_MS, now, true, false),
+            ParkVerdict::Keep
+        );
+        // Gone for a while and closed: the file was deleted.
+        assert_eq!(
+            park_verdict(now - PARK_UNLISTED_GRACE_MS, now, false, false),
+            ParkVerdict::Drop
         );
     }
 
