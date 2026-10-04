@@ -33,6 +33,10 @@ folder by local id too.
   for this release.
 
 ### Fixed
+- **A file deleted right after it was made no longer stays on Drive when the link lost Drive's
+  answer.** The node Drive made is trashed (B151).
+- **A new file no longer lands twice when the link loses Drive's answer to its upload.** The
+  file Drive made is taken as it is, instead of a second upload as a conflict copy (B127).
 - **A change to a file deleted elsewhere, together with its folder, no longer retries forever.**
   The conflict copy that keeps it now lands in the location's root (B150).
 - **`pdfs rename` and `pdfs move` right after a change through the mount are no longer undone.**

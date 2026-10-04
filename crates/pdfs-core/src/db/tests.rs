@@ -3581,6 +3581,59 @@ fn a_create_withdrawn_while_it_uploads_queues_a_trash_of_the_landed_node() {
     );
 }
 
+/// A file deleted after its create was sent and failed may still have been
+/// made: the answer can be lost after Drive made it. Its trash keeps the
+/// create's folder and blob to find that node by, and holds the name in the
+/// folder until it is done (`docs/BUGS.md` B151). A create never sent goes,
+/// blob and all.
+#[test]
+fn a_create_withdrawn_after_it_failed_queues_a_trash_that_keeps_its_blob() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let create = |local: &str, blob: &str| {
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("f.txt".to_string()),
+            blob_path: Some(blob.to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap()
+        .0
+    };
+    let sent = create("local~sent", "/staging/sent");
+    create("local~unsent", "/staging/unsent");
+    db.record_op_failure(sent, "no answer", 0).unwrap();
+
+    assert!(db.delete_ops_for_uid("local~sent").unwrap().is_empty());
+    assert_eq!(
+        db.delete_ops_for_uid("local~unsent").unwrap(),
+        vec!["/staging/unsent".to_string()]
+    );
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, OP_TRASH);
+    assert_eq!(ops[0].uid, "local~sent");
+    assert_eq!(ops[0].parent_uid.as_deref(), Some(parent.as_str()));
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/sent"));
+    assert!(db.has_withdrawn_create(&parent, "f.txt").unwrap());
+    assert!(!db.has_withdrawn_create(&parent, "g.txt").unwrap());
+
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("sent"));
+    assert_eq!(
+        db.complete_trash_op(sent, &local).unwrap().as_deref(),
+        Some("/staging/sent")
+    );
+    assert!(db.pending_ops().unwrap().is_empty());
+}
+
 #[test]
 fn a_landed_placeholder_never_overwrites_the_server_copy() {
     let db = Db::open_in_memory().unwrap();

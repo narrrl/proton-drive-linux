@@ -101,6 +101,12 @@ pub fn op_supersedes(kind: &str) -> bool {
 /// holds the name, as any queued trash does ([`Db::has_pending_trash_named`]):
 /// a rename over the file sent first found the name taken and landed under a
 /// conflict name (`docs/BUGS.md` B129).
+///
+/// So does a create that was sent before and failed. Its answer may have been
+/// lost after Drive made the node, which would then keep the deleted file's
+/// name and bytes (`docs/BUGS.md` B151). Such a trash keeps the create's
+/// parent and blob, which the drain looks for the node by, and which it
+/// discards once the trash is done ([`Db::complete_trash_op`]).
 fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<String>> {
     const DOOMED: &str = "
         WITH RECURSIVE
@@ -123,11 +129,13 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
             WHERE uid IN (SELECT uid FROM queued)
                OR (kind = 'revision' AND uid IN (SELECT uid FROM below))
           )";
+    const SENT: &str = "kind IN ('create', 'mkdir') AND (claimed_at <> 0 OR attempts > 0)";
     let blobs: Vec<String> = {
         let mut stmt = tx.prepare(&format!(
             "{DOOMED}
              SELECT blob_path FROM pending_op
-             WHERE id IN (SELECT id FROM doomed) AND blob_path IS NOT NULL"
+             WHERE id IN (SELECT id FROM doomed) AND blob_path IS NOT NULL
+               AND NOT ({SENT})"
         ))?;
         let rows = stmt.query_map(params![uid], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -136,9 +144,10 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
         &format!(
             "{DOOMED}
              UPDATE pending_op
-             SET kind = 'trash', parent_uid = NULL, blob_path = NULL, meta_json = NULL
-             WHERE id IN (SELECT id FROM doomed)
-               AND kind IN ('create', 'mkdir') AND claimed_at <> 0"
+             SET kind = 'trash', issue = NULL,
+                 parent_uid = CASE WHEN parent_uid LIKE '{LOCAL_VOLUME}~%' THEN NULL
+                                   ELSE parent_uid END
+             WHERE id IN (SELECT id FROM doomed) AND {SENT}"
         ),
         params![uid],
     )?;
@@ -147,7 +156,7 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
             "{DOOMED}
              DELETE FROM pending_op
              WHERE id IN (SELECT id FROM doomed)
-               AND NOT (kind = 'trash' AND claimed_at <> 0 AND uid LIKE '{LOCAL_VOLUME}~%')"
+               AND NOT (kind = 'trash' AND uid LIKE '{LOCAL_VOLUME}~%')"
         ),
         params![uid],
     )?;
@@ -353,6 +362,28 @@ impl Db {
                 SELECT 1 FROM pending_op WHERE kind = ?1 AND name = ?2
              )",
             params![OP_TRASH, name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Whether the trash of a create a delete withdrew after it was sent is
+    /// queued for `name` in `parent_uid` ([`drop_doomed_ops`]).
+    ///
+    /// The drain looks for the node that create may have made by its folder
+    /// and name, so a create of that name there waits for the trash: sent
+    /// first, it made a node the trash took for the withdrawn one.
+    pub fn has_withdrawn_create(&self, parent_uid: &str, name: &str) -> Result<bool> {
+        let conn = self.read();
+        conn.query_row(
+            &format!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pending_op
+                    WHERE kind = ?1 AND parent_uid = ?2 AND name = ?3
+                      AND uid LIKE '{LOCAL_VOLUME}~%'
+                 )"
+            ),
+            params![OP_TRASH, parent_uid, name],
             |row| row.get(0),
         )
         .map_err(Into::into)

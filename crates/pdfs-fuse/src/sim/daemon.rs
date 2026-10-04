@@ -478,6 +478,65 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_create_whose_answer_was_lost_lands_once() {
+        // Drive made the file, but its answer was lost. The retry found the
+        // name taken by a node holding the file's bytes, which was not empty
+        // and so not adopted, and uploaded the file again as a conflict copy
+        // (B127).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-create-reply");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        daemon.client.lose_reply_to_next_create();
+        std::fs::write(daemon.mountpoint.join("f.txt"), b"once").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"once")
+            }),
+            "{:?}",
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_deleted_after_its_create_lost_its_answer_leaves_drive() {
+        // Drive made the file, but its answer was lost, and the file was
+        // deleted before the retry. The delete dropped the queued create and
+        // left the node Drive had made in place (B151).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-create-reply-deleted");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+
+        daemon.client.lose_reply_to_next_create();
+        std::fs::write(&path, b"gone").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().contains_key("f.txt")
+        }));
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.tree().is_empty()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert!(!path.exists());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_pdfs_rename_after_a_queued_rename_is_not_undone() {
         // `pdfs rename` and `pdfs move` went straight to Drive, and the
         // mount's own rename, still queued, landed after them and put the old

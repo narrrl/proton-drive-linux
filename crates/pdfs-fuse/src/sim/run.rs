@@ -363,7 +363,11 @@ impl Run {
     fn settle(&mut self, budget: Duration) -> Result<(), String> {
         self.note("settle".into());
         let start = Instant::now();
-        if !wait_until(budget, || self.landed()) {
+        // What the drain logs meanwhile is what explains a known bug's damage.
+        if !wait_until(budget, || {
+            self.logged.extend(take_logged());
+            self.landed()
+        }) {
             return Err(format!(
                 "liveness: the queues did not drain within {budget:?}\n{}",
                 self.difference()

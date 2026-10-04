@@ -331,6 +331,7 @@ impl FakeDrive {
             requests: AtomicU64::new(0),
             hold: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
+            lose_create_reply: AtomicBool::new(false),
         }))
     }
 
@@ -580,6 +581,8 @@ struct ClientInner {
     hold: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::drop_link_after_next_create`].
     drop_after_create: AtomicBool,
+    /// Set by [`FakeClient::lose_reply_to_next_create`].
+    lose_create_reply: AtomicBool,
 }
 
 struct HoldState {
@@ -623,6 +626,12 @@ impl FakeClient {
     /// so whatever the daemon asks next goes unanswered.
     pub(crate) fn drop_link_after_next_create(&self) {
         self.0.drop_after_create.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the next file create on Drive and lose its answer, as a link that
+    /// drops it on the way back does.
+    pub(crate) fn lose_reply_to_next_create(&self) {
+        self.0.lose_create_reply.store(true, Ordering::SeqCst);
     }
 
     /// Hold the next read of `uid` alone, before it reaches Drive, until the
@@ -1060,6 +1069,9 @@ impl DriveApi for FakeClient {
             .await;
         if made.is_ok() && self.0.drop_after_create.swap(false, Ordering::SeqCst) {
             self.set_online(false);
+        }
+        if made.is_ok() && self.0.lose_create_reply.swap(false, Ordering::SeqCst) {
+            return Err(no_answer());
         }
         made
     }

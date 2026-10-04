@@ -530,7 +530,7 @@ fn open_archive(
 
 /// The lowercase-hex SHA-1 of everything `reader` yields — the digest Proton's
 /// photo duplicate detection is keyed on.
-fn sha1_of(reader: &mut (dyn Read + Send)) -> CoreResult<String> {
+pub(crate) fn sha1_of(reader: &mut (dyn Read + Send)) -> CoreResult<String> {
     let mut hasher = Sha1::new();
     let mut buffer = vec![0u8; 256 * 1024];
     loop {

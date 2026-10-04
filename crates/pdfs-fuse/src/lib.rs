@@ -1851,9 +1851,11 @@ impl Core {
             restored += 1;
             // Only a revision must have a blob. A create carries none until
             // something is written to it (`touch` offline is a legitimate op
-            // with nothing to serve), and a rename or trash never has one. All
-            // still have to be replayed, so only the blob — if any — is checked.
-            if op.blob_path.is_none() && op.kind != OP_REVISION {
+            // with nothing to serve), and a rename never has one. A trash keeps
+            // the blob of a create it withdrew only to find the node by, not
+            // to serve. All still have to be replayed, so only the blob — if
+            // any — is checked.
+            if op.kind == OP_TRASH || (op.blob_path.is_none() && op.kind != OP_REVISION) {
                 continue;
             }
             let parsed = op

@@ -271,18 +271,21 @@ impl Db {
     /// An op that found the name still held by this trash failed with a
     /// backoff, and the name is free now. It is made due at once
     /// ([`Db::wake_ops_waiting_for`]).
-    pub fn complete_trash_op(&self, op_id: i64, uid: &NodeUid) -> Result<()> {
+    ///
+    /// Returns the staged blob of the create the trash withdrew, if it kept
+    /// one, for the caller to discard.
+    pub fn complete_trash_op(&self, op_id: i64, uid: &NodeUid) -> Result<Option<String>> {
         let uid = uid.to_string();
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let name: Option<String> = tx
+        let (name, blob): (Option<String>, Option<String>) = tx
             .query_row(
-                "SELECT name FROM pending_op WHERE id = ?1",
+                "SELECT name, blob_path FROM pending_op WHERE id = ?1",
                 params![op_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .flatten();
+            .unwrap_or_default();
         let rowid: Option<i64> = tx
             .query_row(
                 "SELECT rowid FROM nodes WHERE uid = ?1",
@@ -299,7 +302,7 @@ impl Db {
             wake_ops_waiting_for_tx(&tx, &name)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(blob)
     }
 
     /// Check if a folder node has any non-trashed children in the database.

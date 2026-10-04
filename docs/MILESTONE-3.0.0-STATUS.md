@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B141 to B150.
+- Fixes from the simulation and account runs since then: B127 and B141 to B151.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -43,12 +43,14 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    and 100 folders on Wi-Fi against LAN (target: within 10 %).
    - [x] The measurement: `a_thousand_files_drain_as_fast_on_wifi_as_on_lan` in `sim/daemon.rs`,
          run with `PDFS_SIM_MEASURE=1`. It prints the times and asserts nothing yet.
-   - [ ] Baseline numbers, taken once the account run is done.
+   - [x] Baseline on eb1c105, three drain threads: the syscalls take 3.7 s on LAN and 4.3 s on
+         Wi-Fi; the drain takes 138 s on LAN and 938 s on Wi-Fi, 6.8 times as long.
 4. **Done-when checks**:
-   - [ ] Simulation passes on the Wi-Fi profile: `one_client_on_a_slow_link` is added, not yet
-         run.
-   - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B129 and B132 fixed but
-         unconfirmed.
+   - [ ] Simulation passes on the Wi-Fi profile: `one_client_on_a_slow_link` failed in CI on
+         seeds 2 and 3. Two bugs (B127, B151) and a harness gap: a settle did not read the log, so
+         it could not explain a known bug's damage. All three fixed; not yet confirmed in CI.
+   - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B127, B129 and B132 fixed
+         but unconfirmed.
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)
          failed B113 and B121 on every on-demand mount, two mirror-to-mirror move cases, and
          the journal check. B121 was a bug (B149, fixed); B113's case still expected creates

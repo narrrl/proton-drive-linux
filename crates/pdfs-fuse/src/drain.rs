@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 use super::link::{self, is_network_error};
 use super::state::{Intervals, PendingRevision};
+use super::takeout::sha1_of;
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
@@ -206,9 +207,13 @@ fn pending_op_authorities(op: &PendingOp) -> Result<Vec<NodeUid>, Box<dyn std::e
         })
     };
     match op.kind.as_str() {
-        // What a withdrawn create that never landed leaves: nothing on Drive
-        // to ask about, and nothing to send (`Core::drain_trash`).
-        OP_TRASH if is_local_uid_str(&op.uid) => Ok(Vec::new()),
+        // What a withdrawn create leaves: nothing on Drive to ask about but
+        // the folder it was sent to, where the node it may have made is
+        // trashed (`Core::drain_trash`).
+        OP_TRASH if is_local_uid_str(&op.uid) => match op.parent_uid.as_deref() {
+            Some(folder) if !is_local_uid_str(folder) => Ok(vec![parent()?]),
+            _ => Ok(Vec::new()),
+        },
         OP_REVISION | OP_TRASH => Ok(vec![uid()?]),
         OP_CREATE | OP_MKDIR => Ok(vec![parent()?]),
         OP_RENAME => {
@@ -879,11 +884,28 @@ impl Core {
     pub(crate) fn drain_trash(&self, op: &PendingOp) -> Result<(), Box<dyn std::error::Error>> {
         let uid = parse_node_uid(&op.uid).ok_or("trash op has an unparseable uid")?;
         let name = op.name.clone().unwrap_or_else(|| op.uid.clone());
-        // The trash a delete left of a create on the wire, which then failed:
-        // nothing was made, so nothing is trashed (`Db::delete_ops_for_uid`).
+        // The trash a delete left of a create that was sent, on the wire or
+        // before, and failed (`Db::delete_ops_for_uid`). A create that failed
+        // may still have made the node and lost only its answer, and the node
+        // would keep the deleted file's name and bytes (docs/BUGS.md B151).
         if is_local_uid_str(&op.uid) {
-            debug!(%uid, name, "withdrawn create never landed; trash op satisfied");
-            self.db.complete_trash_op(op.id, &uid)?;
+            match self.withdrawn_twin(op)? {
+                Some(twin) => {
+                    self.hidden.lock().insert(twin.clone());
+                    match self
+                        .block_on_bounded(self.drive.trash_nodes(std::slice::from_ref(&twin)))
+                        .and_then(batch::into_unit)
+                    {
+                        Ok(()) => {}
+                        Err(e) if is_gone(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    self.invalidate_trash();
+                    info!(%uid, %twin, name, "a withdrawn create had landed unanswered; trashed it");
+                }
+                None => debug!(%uid, name, "withdrawn create never landed; trash op satisfied"),
+            }
+            self.retire_trash_op(op, &uid)?;
             return Ok(());
         }
         match self
@@ -896,7 +918,7 @@ impl Core {
             }
             Err(e) => return Err(e.into()),
         }
-        self.db.complete_trash_op(op.id, &uid)?;
+        self.retire_trash_op(op, &uid)?;
         if let Err(e) = self.db.clear_own_sealed_rev(&uid.to_string()) {
             debug!(%uid, error = %e, "clearing the sealed-revision record failed");
         }
@@ -904,6 +926,82 @@ impl Core {
         self.log_activity(ActivityKind::Trash, &name, "trashed", true);
         info!(%uid, name, "pending trash landed");
         Ok(())
+    }
+
+    /// Remove a trash op that landed, and the blob of a create it withdrew.
+    fn retire_trash_op(
+        &self,
+        op: &PendingOp,
+        uid: &NodeUid,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(blob) = self.db.complete_trash_op(op.id, uid)? {
+            self.cache.discard_staged(Path::new(&blob));
+        }
+        Ok(())
+    }
+
+    /// The node a create that a trash withdrew made on Drive although its
+    /// answer was lost: in the create's folder under its name, and one the
+    /// create would have adopted had it been retried ([`adoptable`]). A node
+    /// with a change of ours queued is one the user is still working on.
+    fn withdrawn_twin(
+        &self,
+        op: &PendingOp,
+    ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
+        let (Some(parent), Some(name)) = (
+            op.parent_uid
+                .as_deref()
+                .filter(|parent| !is_local_uid_str(parent))
+                .and_then(parse_node_uid),
+            op.name.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let uids =
+            match self.block_on_bounded(self.drive.enumerate_folder_children_node_uids(&parent)) {
+                Ok(uids) => uids,
+                Err(e) if is_gone(&e) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+        let children = self.block_on_bounded(self.drive.enumerate_nodes_light(&uids))?;
+        let Some(twin) = children
+            .into_iter()
+            .find(|node| node.name == name && !node.trashed)
+        else {
+            return Ok(None);
+        };
+        let queued = twin.uid.to_string();
+        for kind in [OP_RENAME, OP_REVISION, OP_TRASH] {
+            if self.db.has_pending_op(&queued, kind)? {
+                return Ok(None);
+            }
+        }
+        let is_dir = match twin.kind {
+            // A folder made by a create that never answered has nothing in
+            // it: what was queued inside waited for its uid.
+            NodeKind::Folder => {
+                let inside = self
+                    .block_on_bounded(self.drive.enumerate_folder_children_node_uids(&twin.uid))?;
+                if !inside.is_empty() {
+                    return Ok(None);
+                }
+                true
+            }
+            NodeKind::File { .. } => false,
+        };
+        let twin = match is_dir {
+            true => twin,
+            false => match self.fetch_node_remote(&twin.uid)? {
+                Some(node) => node,
+                None => return Ok(None),
+            },
+        };
+        // A blob gone from staging matches nothing, and leaves the node be.
+        let sent = match op.blob_path.as_deref() {
+            Some(blob) if node_size(&twin) > 0 => staged_sha1(Path::new(blob)).ok(),
+            _ => None,
+        };
+        Ok(adoptable(is_dir, &twin, op.created_at, sent.as_deref()).then_some(twin.uid))
     }
 
     /// Record the name the remote actually gave a node, after a conflict forced
@@ -956,6 +1054,9 @@ impl Core {
         }
         let parent = parse_node_uid(parent_str).ok_or("create op has an unparseable parent")?;
         let wanted = op.name.clone().ok_or("create op has no name")?;
+        if self.db.has_withdrawn_create(parent_str, &wanted)? {
+            return Err(held_by_queued_change(&wanted));
+        }
 
         // Someone else may have taken the name while this sat in the queue —
         // reachable only because the op waited, which is the whole point of the
@@ -968,14 +1069,14 @@ impl Core {
         // whose trash is still queued is about to let go of it.
         let mut name = wanted.clone();
         let mut home = parent.clone();
-        let mut adopted = false;
+        let mut blob_landed = true;
         let mut real = self.create_drained_node(op, &parent, &name);
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
-            && let Some(twin) = self.adoptable_twin(op, &parent, &wanted)?
+            && let Some((twin, holds_blob)) = self.adoptable_twin(op, &parent, &wanted)?
         {
             info!(%local, %twin, wanted, "the name is held by our own unanswered create; adopting it");
             real = Ok(twin);
-            adopted = true;
+            blob_landed = holds_blob;
         }
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
             && self.name_is_held(op, Some(&parent), &wanted)?
@@ -1036,9 +1137,9 @@ impl Core {
         // Retire the op before touching anything else: if we crash here the node
         // exists remotely and the local placeholder is reconciled by the event
         // sync, whereas a surviving op would create the file a second time.
-        // An adopted node was made empty, so a blob this op carries has not been
+        // An adopted node made empty has not had a blob this op carries
         // uploaded: it goes on as a revision of the node instead.
-        let uploaded = (!adopted).then_some(op.blob_path.as_deref()).flatten();
+        let uploaded = blob_landed.then_some(op.blob_path.as_deref()).flatten();
         let landing = CreateLanding {
             local: &local.to_string(),
             real: &real.to_string(),
@@ -1167,7 +1268,8 @@ impl Core {
     }
 
     /// The node already holding `name` under `parent`, if it is the one an
-    /// earlier attempt at this op made before its answer was lost.
+    /// earlier attempt at this op made before its answer was lost, and whether
+    /// it holds the op's blob already.
     ///
     /// A create that timed out may still have landed; the op was queued because
     /// the caller never heard back. Without this, its replay forked a
@@ -1177,7 +1279,7 @@ impl Core {
         op: &PendingOp,
         parent: &NodeUid,
         name: &str,
-    ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<(NodeUid, bool)>, Box<dyn std::error::Error>> {
         // A second file queued under the same name, after the first was
         // renamed away, finds the first one's node fresh and empty while its
         // create is on the wire. Taking it put both files on one node, and the
@@ -1205,8 +1307,7 @@ impl Core {
         if self.state().by_uid.contains_key(&twin.uid) {
             return Ok(None);
         }
-        // The light listing carries no file size, and an adoptable file is
-        // exactly an empty one.
+        // The light listing carries no file size or digest.
         let twin = match twin.kind {
             NodeKind::Folder => twin,
             NodeKind::File { .. } => match self.fetch_node_remote(&twin.uid)? {
@@ -1214,7 +1315,16 @@ impl Core {
                 None => return Ok(None),
             },
         };
-        Ok(adoptable(op.kind == OP_MKDIR, &twin, op.created_at).then_some(twin.uid))
+        // A create uploads its bytes in the same call, so the node a lost
+        // answer leaves holds them (docs/BUGS.md B127).
+        let sent = match op.blob_path.as_deref() {
+            Some(blob) if node_size(&twin) > 0 => Some(staged_sha1(Path::new(blob))?),
+            _ => None,
+        };
+        Ok(
+            adoptable(op.kind == OP_MKDIR, &twin, op.created_at, sent.as_deref())
+                .then(|| (twin.uid, sent.is_some())),
+        )
     }
 
     /// Make one queued `create`/`mkdir` real under a given name, and hand back
@@ -2323,15 +2433,33 @@ const ADOPT_WINDOW_MS: i64 = 2 * 60 * 1000;
 /// Whether `twin`, found holding the name a queued create wants, is the node an
 /// earlier, unanswered attempt at that create made: the same kind, created
 /// around when the op was queued, and for a file still empty, as the mount's
-/// create leaves it.
-fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64) -> bool {
+/// create leaves it, or holding exactly the bytes the op uploads, whose SHA-1
+/// is `sent`.
+fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64, sent: Option<&str>) -> bool {
     if twin.creation_time.saturating_mul(1000) < op_created_ms - ADOPT_WINDOW_MS {
         return false;
     }
     match &twin.kind {
         NodeKind::Folder => is_dir,
-        NodeKind::File { claimed_size, .. } => !is_dir && *claimed_size == Some(0),
+        NodeKind::File {
+            claimed_size,
+            content_sha1,
+            ..
+        } => {
+            !is_dir
+                && (*claimed_size == Some(0)
+                    || sent.is_some_and(|sent| {
+                        content_sha1
+                            .as_deref()
+                            .is_some_and(|sha| sha.eq_ignore_ascii_case(sent))
+                    }))
+        }
     }
+}
+
+/// The lowercase-hex SHA-1 of a staged blob, as Drive reports a file's.
+fn staged_sha1(blob: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(sha1_of(&mut File::open(blob)?)?)
 }
 
 /// What share of the cache budget an unpinned upload may take and still be kept
@@ -2483,6 +2611,13 @@ mod tests {
         let withdrawn = PendingOp {
             uid: "local~never-landed".to_string(),
             ..pending(OP_TRASH)
+        };
+        let authorities = pending_op_authorities(&withdrawn).unwrap();
+        assert_eq!(authorities.len(), 1);
+        assert_eq!(authorities[0].to_string(), "v~parent");
+        let withdrawn = PendingOp {
+            parent_uid: None,
+            ..withdrawn
         };
         assert!(pending_op_authorities(&withdrawn).unwrap().is_empty());
     }
@@ -2812,19 +2947,61 @@ mod tests {
             node.creation_time = secs;
             node
         };
-        assert!(adoptable(false, &made(file_node(0, 0, None), 990), queued));
-        assert!(adoptable(true, &made(folder_node("d", None), 990), queued));
+        assert!(adoptable(
+            false,
+            &made(file_node(0, 0, None), 990),
+            queued,
+            None
+        ));
+        assert!(adoptable(
+            true,
+            &made(folder_node("d", None), 990),
+            queued,
+            None
+        ));
         // Made long before the op: someone else's file, not our lost create.
-        assert!(!adoptable(false, &made(file_node(0, 0, None), 800), queued));
-        // Our create leaves a file empty; one with content is someone else's.
-        assert!(!adoptable(false, &made(file_node(0, 5, None), 990), queued));
+        assert!(!adoptable(
+            false,
+            &made(file_node(0, 0, None), 800),
+            queued,
+            None
+        ));
+        // Our create leaves a file empty; one with other content is someone
+        // else's.
+        assert!(!adoptable(
+            false,
+            &made(file_node(0, 5, None), 990),
+            queued,
+            None
+        ));
         // The kind has to match what the op makes.
-        assert!(!adoptable(true, &made(file_node(0, 0, None), 990), queued));
+        assert!(!adoptable(
+            true,
+            &made(file_node(0, 0, None), 990),
+            queued,
+            None
+        ));
         assert!(!adoptable(
             false,
             &made(folder_node("d", None), 990),
-            queued
+            queued,
+            None
         ));
+    }
+
+    #[test]
+    fn a_twin_holding_the_bytes_the_create_sent_is_adopted() {
+        // The create uploaded its bytes and lost the answer (B127).
+        let queued = 1_000_000;
+        let mut twin = file_node(0, 5, None);
+        twin.creation_time = 990;
+        if let NodeKind::File { content_sha1, .. } = &mut twin.kind {
+            *content_sha1 = Some("AA55".into());
+        }
+        assert!(adoptable(false, &twin, queued, Some("aa55")));
+        assert!(!adoptable(false, &twin, queued, Some("bb66")));
+        assert!(!adoptable(false, &twin, queued, None));
+        assert!(!adoptable(true, &twin, queued, Some("aa55")));
     }
 
     #[test]

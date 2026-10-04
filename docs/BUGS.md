@@ -12,6 +12,29 @@ Conventions:
 
 ---
 
+## B151 — A file deleted after its create lost its answer stays on Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's Wi-Fi profile in CI (`one_client_on_a_slow_link`,
+seed 2). `x/a.txt` was made, written and deleted within a third of a second. The queues never
+drained, and Drive kept `x/a.txt` with the bytes of its create.
+
+**Where:** `drop_doomed_ops` in `crates/pdfs-core/src/db/ops.rs`, and `Core::drain_trash` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A create that times out may still have made the file; only its answer was lost (as in
+B127). The create stays queued with a backoff. A delete before the retry dropped the queued create
+as if nothing had been sent, so the node Drive had made kept the deleted file's name and bytes.
+Only a create on the wire at the time of the delete was turned into a trash (B129), and when that
+create failed, the trash took it as never made.
+
+**Fix.** A create that was sent, on the wire or before, becomes a trash that keeps the create's
+folder and blob. The drain looks in that folder for a node under the create's name that the
+create would have adopted (B127): made around when it was queued, and empty or holding the
+blob's bytes. It trashes that node, and then discards the blob. A new create of the same name in
+that folder waits for the trash. Sim test
+`a_file_deleted_after_its_create_lost_its_answer_leaves_drive`.
+
 ## B150 — A conflict copy whose folder is gone retries forever
 
 **Status:** Fixed (unverified).
@@ -559,7 +582,7 @@ profile fails on it when it comes up, which depends on timing.
 
 ## B127 — A file created offline lands twice when the answer to its upload is lost
 
-**Status:** Open.
+**Status:** Fixed (unverified).
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 1).
 The upload of a queued create timed out after Drive had made the file. On the next attempt the
 drain logged "name is taken remotely; creating under a conflict name". Drive ended with the file
@@ -572,6 +595,10 @@ one its own unanswered create made (`adoptable_twin`). It must be made within `A
 and, for a file, be empty. A queued create uploads its bytes in the same call, though
 (`upload_created_file`). So the node a lost answer leaves behind holds those bytes, is not
 adopted, and the file is uploaded a second time under a conflict name.
+
+**Fix.** A file is also adopted when Drive's SHA-1 of its content is that of the op's blob. The
+blob then counts as uploaded. Sim test `a_create_whose_answer_was_lost_lands_once`. A write that
+replaced the blob after the lost upload still forks a copy: the node holds the older bytes.
 
 **Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the flaky profile
 fails on it when it comes up, which depends on timing.
