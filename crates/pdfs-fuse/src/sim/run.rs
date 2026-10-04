@@ -1044,6 +1044,21 @@ mod tests {
         drain_budget: Duration::from_secs(120),
     };
 
+    /// Wi-Fi's latency, lag and lost replies without the outages: the queue
+    /// has to drain within a settle, not merely by the end.
+    static ONE_CLIENT_WIFI: Profile = Profile {
+        name: "one-client-wifi",
+        clients: 1,
+        steps: 80,
+        faults: Faults::wifi,
+        link_flaps: false,
+        restarts: false,
+        deletes_mid_upload: false,
+        settle_budget: Some(Duration::from_secs(30)),
+        syscall_budget: Duration::from_secs(10),
+        drain_budget: Duration::from_secs(120),
+    };
+
     static THREE_CLIENTS: Profile = Profile {
         name: "three-clients",
         clients: 3,
@@ -1079,6 +1094,12 @@ mod tests {
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse --lib sim::run -- --ignored`"]
     fn one_client_on_a_flaky_link() {
         run_seeds(&ONE_CLIENT_FLAKY, 4);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse --lib sim::run -- --ignored`"]
+    fn one_client_on_a_slow_link() {
+        run_seeds(&ONE_CLIENT_WIFI, 4);
     }
 
     #[test]

@@ -465,4 +465,49 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Make 100 folders of 10 empty files each through a mount on `faults`, and
+    /// time the syscalls and then the drain until Drive holds all of it.
+    fn time_a_thousand_files(faults: Faults) -> (Duration, Duration) {
+        let drive = FakeDrive::new();
+        let dir = scratch("thousand");
+        let daemon = Daemon::start(&dir, drive.client(1, faults)).unwrap();
+        let start = Instant::now();
+        for folder in 0..100 {
+            let folder = daemon.mountpoint.join(format!("d{folder:03}"));
+            std::fs::create_dir(&folder).unwrap();
+            for file in 0..10 {
+                std::fs::File::create(folder.join(format!("f{file}"))).unwrap();
+            }
+        }
+        let syscalls = start.elapsed();
+        let start = Instant::now();
+        assert!(
+            wait_until(Duration::from_secs(1800), || {
+                drive.tree().len() == 1100 && daemon.pending().is_ok_and(|ops| ops.is_empty())
+            }),
+            "the drain did not finish: {} of 1100 on Drive",
+            drive.tree().len()
+        );
+        let drain = start.elapsed();
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+        (syscalls, drain)
+    }
+
+    /// The milestone's speed target: a thousand files reach Drive as fast on
+    /// Wi-Fi as on a LAN. It only measures for now, and takes minutes, so it
+    /// runs when `PDFS_SIM_MEASURE` is set.
+    #[test]
+    #[ignore = "mounts FUSE: run with `PDFS_SIM_MEASURE=1 cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_thousand_files_drain_as_fast_on_wifi_as_on_lan() {
+        if std::env::var_os("PDFS_SIM_MEASURE").is_none() {
+            eprintln!("skipped: set PDFS_SIM_MEASURE to measure the drain");
+            return;
+        }
+        let (lan_syscalls, lan_drain) = time_a_thousand_files(Faults::lan());
+        let (wifi_syscalls, wifi_drain) = time_a_thousand_files(Faults::wifi());
+        eprintln!("lan:  syscalls {lan_syscalls:?}, drain {lan_drain:?}");
+        eprintln!("wifi: syscalls {wifi_syscalls:?}, drain {wifi_drain:?}");
+    }
 }

@@ -32,13 +32,17 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    `finish_create` and `adopt_real_uid`; a landing create sets `remote_uid` on its row.
 3. **Speed (§7)**: run independent ops in parallel, batch trashes and moves; measure 1,000 files
    and 100 folders on Wi-Fi against LAN (target: within 10 %).
+   - [x] The measurement: `a_thousand_files_drain_as_fast_on_wifi_as_on_lan` in `sim/daemon.rs`,
+         run with `PDFS_SIM_MEASURE=1`. It prints the times and asserts nothing yet.
+   - [ ] Baseline numbers, taken once the account run is done.
 4. **Done-when checks**:
-   - [ ] Simulation passes on the Wi-Fi profile.
+   - [ ] Simulation passes on the Wi-Fi profile: `one_client_on_a_slow_link` is added, not yet
+         run.
    - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B129 and B132 fixed but
          unconfirmed.
    - [ ] A clean account run. The last one (2026-10-04) failed on B70 (fixed as B145) and
          mirror/mirror "busy syncing" (the script now retries); not confirmed yet.
-5. **Release**: the 2.9.0 and 2.10.0 tags still wait for the user's go-ahead.
+5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0
 
