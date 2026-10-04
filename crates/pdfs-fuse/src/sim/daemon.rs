@@ -496,6 +496,66 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_read_back_before_drive_committed_it_keeps_its_bytes() {
+        // Drive listed the new file a moment before its create was committed,
+        // with no revision and no size. The drain took that answer for the
+        // file, and a read right after the create landed found it empty
+        // (B163).
+        let drive = FakeDrive::new();
+        let dir = scratch("read-back-unrevised");
+        // The feed reports the file as it is long after the read.
+        let faults = Faults {
+            event_delay: Duration::from_secs(60),
+            ..Faults::lan()
+        };
+        let daemon = Daemon::start(&dir, drive.client(1, faults)).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        // A folder made here is listed from the tree, not from Drive.
+        std::fs::create_dir(mnt.join("x")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("x").is_some()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        take_logged();
+
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        let uid = drive.lookup("x/c.bin").unwrap();
+        // The read-back after the create, the one adopting it, and the size
+        // fetch a listing makes.
+        daemon.client.answer_reads_unrevised(&uid, 3);
+        drop(create);
+        let mut logged = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                logged.extend(take_logged());
+                logged
+                    .iter()
+                    .any(|line| line.starts_with("pending create landed") && line.contains("c.bin"))
+            }),
+            "{logged:?}"
+        );
+
+        // A listing refreshes the size the kernel holds, as the account run's
+        // did before it read the file.
+        let sizes: Vec<_> = std::fs::read_dir(mnt.join("x"))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [3]);
+        assert_eq!(std::fs::read(mnt.join("x/c.bin")).unwrap(), b"abc");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_folder_made_again_while_the_old_one_is_trashed_is_a_new_folder() {
         // A folder removed and made again at once: the new one's create met
         // the old folder, its trash still on the wire, and took it for the

@@ -34,7 +34,9 @@
 //! A test can also hold the next read of one node on its way to Drive
 //! ([`FakeClient::hold_next_read`]), to make a change while the daemon waits
 //! for the answer, or on its way back ([`FakeClient::hold_answer_to_next_read`]),
-//! so the daemon gets an answer a change made meanwhile has overtaken.
+//! so the daemon gets an answer a change made meanwhile has overtaken. It can
+//! also have a new file's next reads answered as Drive lists it before its
+//! create is committed ([`FakeClient::answer_reads_unrevised`]; B163).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -339,6 +341,7 @@ impl FakeDrive {
             lose_revision_reply: AtomicBool::new(false),
             lose_revision_read_back: AtomicBool::new(false),
             lose_read: Mutex::new(None),
+            unrevised_reads: Mutex::new(None),
         }))
     }
 
@@ -602,6 +605,9 @@ struct ClientInner {
     lose_revision_read_back: AtomicBool,
     /// The file whose next read goes unanswered, once its revision is made.
     lose_read: Mutex<Option<NodeUid>>,
+    /// Set by [`FakeClient::answer_reads_unrevised`]: the file and how many
+    /// more of its reads are answered without an active revision.
+    unrevised_reads: Mutex<Option<(NodeUid, usize)>>,
 }
 
 struct HoldState {
@@ -721,6 +727,13 @@ impl FakeClient {
     /// upload meets on a link that drops it.
     pub(crate) fn lose_read_back_of_next_revision(&self) {
         self.0.lose_revision_read_back.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer the next `reads` reads of file `uid` alone that find it as Drive
+    /// lists a file whose create it has not committed yet: no active revision,
+    /// no size.
+    pub(crate) fn answer_reads_unrevised(&self, uid: &NodeUid, reads: usize) {
+        *self.0.unrevised_reads.lock() = Some((uid.clone(), reads));
     }
 
     /// Wait here if `uids` is the read a [`Held`] in `slot` is for.
@@ -982,6 +995,36 @@ impl DriveApi for FakeClient {
             })
             .await?;
         self.wait_if_held(&self.0.hold_answer, uids).await;
+        let mut nodes = nodes;
+        {
+            let mut unrevised = self.0.unrevised_reads.lock();
+            if let Some((uid, left)) = unrevised.as_mut()
+                && uids == std::slice::from_ref(uid)
+                && !nodes.is_empty()
+            {
+                *left -= 1;
+                if *left == 0 {
+                    *unrevised = None;
+                }
+                for node in &mut nodes {
+                    if let NodeKind::File {
+                        total_size_on_storage,
+                        active_revision_state,
+                        active_revision_id,
+                        claimed_size,
+                        content_sha1,
+                        ..
+                    } = &mut node.kind
+                    {
+                        *total_size_on_storage = 0;
+                        *active_revision_state = None;
+                        *active_revision_id = None;
+                        *claimed_size = None;
+                        *content_sha1 = None;
+                    }
+                }
+            }
+        }
         self.cache(&nodes);
         Ok(nodes)
     }

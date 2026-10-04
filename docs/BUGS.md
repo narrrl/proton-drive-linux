@@ -12,6 +12,39 @@ Conventions:
 
 ---
 
+## B163 — A file read right after its create landed is empty
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the account run on 2.10.0 ("unusual but legal names", on-demand
+pairing). The case wrote some twenty files into a new folder, listed it and read each back.
+`-starts-with-dash` read 0 bytes for 17. Its create had landed with the bytes a moment before.
+No revision was queued for it and nothing was logged.
+
+**Where:** `Core::read_back` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** After a create, the drain reads the new node back and adopts that answer into the
+tree. Drive can answer a read before it lists a node it has just made, so an empty answer is
+asked again (B143). It can also list the node before the create's revision is committed, as a
+file with no active revision: no claimed size and nothing on storage, so its size reads as 0.
+The adoption took that answer, and the tree showed the new file as empty. The folder was made
+here, so its listing came from the tree. The size fetch the listing starts met the same answer
+and left the 0. The kernel capped the read at it.
+
+The run logged nothing for the file, so the stale answer is inferred, not observed. It is the
+one path found that leaves a landed file empty with no op queued.
+
+**Fix.** `read_back` treats a file without an active revision like a node Drive does not list
+yet: it asks again after 250 ms and 1 s. If both answers are still without a revision, it
+reports the node as not found, and the drain adopts it later, as it does for a node Drive
+never lists in that time.
+
+**Test:** simulation test `a_file_read_back_before_drive_committed_it_keeps_its_bytes` (failed
+before the fix: the listing showed the file with 0 bytes). The fake Drive can now answer a
+file's next reads as Drive lists a file that is not committed yet
+(`FakeClient::answer_reads_unrevised`).
+
+---
+
 ## B162 — A folder removed and made again at once loses what goes into it
 
 **Status:** Fixed.

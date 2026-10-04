@@ -53,6 +53,8 @@ by its local id, in the queue, the stored tree and pins alike.
   link (B161).
 - **A folder removed and made again at once keeps what goes into it.** It used to be created
   inside the removed folder and was trashed along with it (B162).
+- **A new file no longer reads as empty just after it is uploaded.** Drive can list it a moment
+  before its contents are committed, and the mount took that answer (B163).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

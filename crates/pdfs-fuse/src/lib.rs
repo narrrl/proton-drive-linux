@@ -3130,10 +3130,19 @@ impl Core {
 
     /// [`Core::fetch_node`] for a node Drive has just made, asked again for a
     /// moment while Drive does not list it yet.
+    ///
+    /// A file Drive lists without an active revision is not listed yet either:
+    /// the create commits one before it answers, so this answer is from before
+    /// the commit, with no size. Taken, it emptied the new file in the tree,
+    /// and a read of it right after found nothing (`docs/BUGS.md` B163).
     pub(crate) fn read_back(&self, uid: &NodeUid) -> Result<Node, Errno> {
         let mut delays = MINTED_READ_BACK_DELAYS.iter();
         loop {
-            match self.fetch_node(uid) {
+            let fetched = match self.fetch_node(uid) {
+                Ok(node) if is_unrevised(&node) => Err(Errno::ENOENT),
+                fetched => fetched,
+            };
+            match fetched {
                 Err(e)
                     if e == Errno::ENOENT
                         && let Some(delay) = delays.next() =>
@@ -6257,6 +6266,18 @@ fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<()
         (true, true) if !dst_empty => Err(Errno::ENOTEMPTY),
         _ => Ok(()),
     }
+}
+
+/// Whether `node` is a file Drive lists without an active revision, as it does
+/// one whose create has not been committed.
+fn is_unrevised(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::File {
+            active_revision_id: None,
+            ..
+        }
+    )
 }
 
 fn node_size(node: &Node) -> u64 {
