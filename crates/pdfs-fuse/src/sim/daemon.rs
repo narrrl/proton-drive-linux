@@ -649,6 +649,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The database of a daemon just stopped, once the threads it left in a
+    /// request have let go of it, as [`Daemon::start`] waits for them.
+    fn reopen(dir: &Path) -> Db {
+        let mut db = None;
+        assert!(wait_until(LAST_RUN_DEADLINE, || {
+            db = Db::open(&dir.join("pdfs.db")).ok();
+            db.is_some()
+        }));
+        db.unwrap()
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_stop_ends_a_mirror_pass_after_the_uploads_it_is_sending() {
+        // A stop that came while a mirror pass was uploading waited for it,
+        // and the pass went on to the next level of folders until the stop
+        // gave up on it and ended the runtime under it (B169).
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-stop");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir(daemon.mountpoint.join("mirrored")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("mirrored").is_some()
+        }));
+        let remote = drive.lookup("mirrored").unwrap();
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+
+        let local = dir.join("local");
+        std::fs::create_dir_all(local.join("deeper")).unwrap();
+        std::fs::write(local.join("first"), b"abc").unwrap();
+        std::fs::write(local.join("deeper/second"), b"def").unwrap();
+        let folder = reopen(&dir)
+            .sync_folder_add(local.to_str().unwrap(), &remote.to_string(), "")
+            .unwrap();
+        let client = drive.client(1, Faults::lan());
+        let upload = client.hold_next_create();
+        let daemon = Daemon::start(&dir, client).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || upload.reached()));
+        let socket = daemon.socket.clone();
+        let stopping = std::thread::spawn(move || daemon.stop());
+        assert!(wait_until(Duration::from_secs(30), || !socket.exists()));
+        drop(upload);
+        assert!(matches!(
+            stopping.join().unwrap(),
+            Ok(MountOutcome::Shutdown)
+        ));
+
+        assert!(drive.lookup("mirrored/first").is_some());
+        assert!(drive.lookup("mirrored/deeper").is_some());
+        assert!(drive.lookup("mirrored/deeper/second").is_none());
+        let logged = take_logged();
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.contains("pass cut short by the stop"))
+        );
+        assert!(
+            !logged
+                .iter()
+                .any(|line| line.contains("did not finish in time")),
+            "{logged:#?}"
+        );
+        let db = reopen(&dir);
+        assert_ne!(
+            db.sync_folder_get(folder).unwrap().unwrap().state,
+            "syncing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_removed_with_its_folder_while_uploading_stays_removed() {

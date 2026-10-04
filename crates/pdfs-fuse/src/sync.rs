@@ -102,6 +102,9 @@ impl Core {
 
     /// One reconcile pass over a mirror folder, updating its `state` column.
     fn reconcile_pass(&self, folder: &StoredSyncFolder) {
+        if self.shutdown.is_stopping() {
+            return;
+        }
         // Hold the folder's lock for the whole pass so a mode switch can't evict the
         // local tree (and mount FUSE over it) while we walk and upload it.
         let lock = self.sync_lock(folder.id);
@@ -148,8 +151,6 @@ impl Core {
             self.push_pass(folder.id, &local_root, &remote_root, &rules)
         } else {
             match self.do_reconcile(folder.id, &local_root, &remote_root, &rules) {
-                Ok(outcome) => Ok(outcome),
-                Err(PassAbort::Failed(e)) => Err(e),
                 // The user asked for on-demand while this pass was running. Rather
                 // than make them wait out a walk-and-download whose results are
                 // about to be deleted, drop it here and do the only part that still
@@ -164,6 +165,7 @@ impl Core {
                     self.progress_begin(folder.id);
                     self.push_pass(folder.id, &local_root, &remote_root, &rules)
                 }
+                result => result,
             }
         };
         self.progress_end(folder.id);
@@ -216,7 +218,15 @@ impl Core {
                     );
                 }
             }
-            Err(e) => {
+            // A push pass is never interrupted, so only the stop gets here: the
+            // folder keeps the state it had, which the next start's pass updates.
+            Err(PassAbort::Stopped | PassAbort::Interrupted) => {
+                info!(id = folder.id, "sync: pass cut short by the stop");
+                let _ = self
+                    .db
+                    .sync_folder_set_state(folder.id, &current.state, current.last_sync);
+            }
+            Err(PassAbort::Failed(e)) => {
                 warn!(id = folder.id, error = %e, "sync: reconcile failed");
                 let _ = self
                     .db
@@ -294,7 +304,7 @@ impl Core {
         local_root: &Path,
         remote_root: &NodeUid,
         rules: &IgnoreRules,
-    ) -> Result<Outcome, String> {
+    ) -> Result<Outcome, PassAbort> {
         let baseline = self
             .db
             .sync_entries(folder_id)
@@ -400,7 +410,7 @@ impl Core {
                     &mut remote_dirs,
                     std::mem::take(&mut batch),
                     &mut outcome,
-                );
+                )?;
                 batch_depth = depth;
             }
             let item = &local[rel];
@@ -498,7 +508,7 @@ impl Core {
             &mut remote_dirs,
             std::mem::take(&mut batch),
             &mut outcome,
-        );
+        )?;
 
         // Paths the baseline knows that are no longer on disk: the user deleted them
         // locally, and the deletion has to reach Drive before the mount starts
@@ -625,7 +635,7 @@ impl Core {
                     &mut remote_dirs,
                     std::mem::take(&mut batch),
                     &mut outcome,
-                );
+                )?;
                 batch_depth = depth;
                 // A depth boundary is the pass's natural checkpoint — everything
                 // queued has been applied, so stopping here leaves nothing half done.
@@ -813,7 +823,7 @@ impl Core {
             &mut remote_dirs,
             std::mem::take(&mut batch),
             &mut outcome,
-        );
+        )?;
 
         // Deferred folder deletions, deepest first.
         delete_local_dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
@@ -941,6 +951,9 @@ impl Core {
         // is safe precisely because the walk has applied nothing — a *partial*
         // remote map, on the other hand, would be read as "the remote deleted
         // everything we haven't reached yet", so it must never reach the diff.
+        if self.shutdown.is_stopping() {
+            return Err(PassAbort::Stopped);
+        }
         if self.ondemand_queued(folder_id) {
             return Err(PassAbort::Interrupted);
         }
@@ -1051,6 +1064,9 @@ impl Core {
     /// `remote_dirs` (so deeper paths resolve their parent), and what each op did
     /// is tallied into `outcome`. Driven by `block_on` from the (non-runtime) sync
     /// engine thread, spawning the tasks onto the shared runtime.
+    ///
+    /// Fails with [`PassAbort::Stopped`] once the daemon is stopping, after the
+    /// ops already sending have finished.
     fn flush_batch(
         &self,
         folder_id: i64,
@@ -1058,9 +1074,9 @@ impl Core {
         remote_dirs: &mut HashMap<String, NodeUid>,
         batch: Vec<Pending>,
         outcome: &mut Outcome,
-    ) {
+    ) -> Result<(), PassAbort> {
         if batch.is_empty() {
-            return;
+            return Ok(());
         }
         self.progress_queued(folder_id, batch.len());
         let core = self.clone();
@@ -1074,14 +1090,22 @@ impl Core {
                 let root = root.clone();
                 set.spawn(async move {
                     let _permit = sem.acquire_owned().await.expect("semaphore not closed");
-                    core.apply_pending(folder_id, &root, op).await
+                    // An op still waiting for its turn when the stop comes is
+                    // not started; the ones already sending finish.
+                    if core.shutdown.is_stopping() {
+                        return None;
+                    }
+                    Some(core.apply_pending(folder_id, &root, op).await)
                 });
             }
             let mut out = Vec::new();
             let mut join_errors = 0usize;
             while let Some(joined) = set.join_next().await {
                 match joined {
-                    Ok(result) => out.push(result),
+                    Ok(Some(result)) => out.push(result),
+                    Ok(None) => {}
+                    // The runtime ends with the daemon and cancels what is left.
+                    Err(e) if e.is_cancelled() => {}
                     Err(e) => {
                         join_errors += 1;
                         warn!(error = %e, "sync: task panicked");
@@ -1106,6 +1130,13 @@ impl Core {
                 }
             }
         }
+        // The pass goes no further: the next depth's paths may need a folder
+        // this batch did not get to make, and went on to fail one by one
+        // (`docs/BUGS.md` B169).
+        if self.shutdown.is_stopping() {
+            return Err(PassAbort::Stopped);
+        }
+        Ok(())
     }
 
     /// Apply one [`Pending`] op (async, so it can run concurrently in a batch),

@@ -12,6 +12,32 @@ Conventions:
 
 ---
 
+## B169 — A stop lets a mirror pass go on until the runtime ends under it
+
+**Status:** Fixed.
+**Found:** 2026-10-04, in the journal of the account run on the working tree after B165. A
+stop that came while a mirror pass was uploading logged "background workers did not finish in
+time" for `pdfs-sync`, then "sync: task panicked … was cancelled" and a run of "no remote
+parent" warnings: the pass had gone on to deeper folders while the stop waited for it, and the
+runtime's end cancelled the uploads under it.
+
+**Where:** `flush_batch`, `walk_remote` and `reconcile_pass` in `crates/pdfs-fuse/src/sync.rs`.
+
+**Cause.** The mirror pass never asked whether the daemon was stopping. It sends its work a
+level of folders at a time and went on to the next level after the stop, until the stop gave up
+on it at its 10 s limit (B165).
+
+**Fix.** Once the daemon is stopping, a batch starts none of its ops still waiting for their
+turn, lets the ones already sending finish, and ends the pass. So do the remote walk and the
+start of a pass. The folder keeps the state it had before the pass; the next start's pass picks
+up from the baseline.
+
+**Test:** `a_stop_ends_a_mirror_pass_after_the_uploads_it_is_sending` in `sim/daemon.rs` holds a
+mirror upload, stops the daemon, then lets the upload through, and checks that the file in the
+deeper folder was not sent and the stop did not run into its limit.
+
+---
+
 ## B168 — A file removed with its folder while uploading is sent again, to the root
 
 **Status:** Fixed.

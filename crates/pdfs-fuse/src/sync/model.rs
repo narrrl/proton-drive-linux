@@ -227,6 +227,10 @@ pub(super) enum PassAbort {
     Interrupted,
     /// The pass could not establish its diff (a walk or the baseline load failed).
     Failed(String),
+    /// The daemon is stopping. What the pass sent before the stop has landed or
+    /// will be cancelled with the runtime; nothing more is sent, and the next
+    /// start's pass picks up from the baseline.
+    Stopped,
 }
 
 impl From<String> for PassAbort {
