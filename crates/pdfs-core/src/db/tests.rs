@@ -3376,6 +3376,67 @@ fn a_create_waits_for_its_folder_by_local_id() {
     assert_eq!(op.parent_uid, Some(uid("dir").to_string()));
 }
 
+fn parent_lid(db: &Db, uid: &NodeUid) -> Option<i64> {
+    db.conn
+        .lock()
+        .query_row(
+            "SELECT parent_lid FROM nodes WHERE uid = ?1",
+            [uid.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// A node stored before its folder, as an event can bring it, is linked to
+/// the folder by local id once the folder's row arrives.
+#[test]
+fn a_node_stored_before_its_folder_is_linked_when_the_folder_arrives() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("child", "dir", "inside.txt", 1))
+        .unwrap();
+    assert_eq!(parent_lid(&db, &uid("child")), None);
+
+    db.upsert_node(&folder("dir", Some("root"), "Folder"))
+        .unwrap();
+
+    assert_eq!(
+        parent_lid(&db, &uid("child")),
+        db.lid_of(&uid("dir").to_string()).unwrap()
+    );
+    assert_eq!(
+        parent_lid(&db, &uid("dir")),
+        db.lid_of(&uid("root").to_string()).unwrap()
+    );
+}
+
+/// A restart puts a node below the folder its row links to by local id, under
+/// the uid that row has now, whatever the node's own copy of it says.
+#[test]
+fn a_restart_finds_a_node_under_its_landed_folder() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let mut child = file("child", "root", "inside.txt", 1);
+    child.parent_uid = Some(local.clone());
+    db.upsert_node(&child).unwrap();
+    let dir = db.lid_of(&local.to_string()).unwrap().unwrap();
+    db.conn
+        .lock()
+        .execute(
+            "UPDATE nodes SET uid = ?2 WHERE lid = ?1",
+            rusqlite::params![dir, uid("dir").to_string()],
+        )
+        .unwrap();
+
+    let stored = db.load_all().unwrap();
+    let child = stored.iter().find(|s| s.node.uid == uid("child")).unwrap();
+    assert_eq!(child.node.parent_uid, Some(uid("dir")));
+}
+
 /// A rename queued against the row Drive listed for a folder still landing
 /// follows the folder when that row is merged into the landing one (B140).
 #[test]
@@ -3841,6 +3902,16 @@ fn a_2_8_database_migrates_with_every_node_and_op_intact() {
         ),
         "the migration names the op's node and parent by local id"
     );
+    let parent_lid: Option<i64> = db
+        .conn
+        .lock()
+        .query_row(
+            "SELECT parent_lid FROM nodes WHERE uid = 'local~inner'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_lid, db.lid_of("local~dir").unwrap());
     let parked = db.parked_create_ops().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].name.as_deref(), Some("movie.part"));

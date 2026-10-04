@@ -32,7 +32,11 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    `finish_create` and `adopt_real_uid`; a landing create sets `remote_uid` on its row.
    - [x] Queued ops carry `lid` and `parent_lid` (schema 39). The claim reads the parent's uid
          through `parent_lid`, and a landing folder rewrites the ops inside it by local id.
-   - [ ] The tree links by lid (`nodes.parent_lid`).
+   - [x] Node rows link to their parent by lid (`nodes.parent_lid`, schema 40), and a restart
+         places each node under its parent's row as it is now.
+   - [ ] Queries over children and subtrees by `parent_lid`, and no rewrite of the children's
+         `parent_uid` when a folder lands (R3). Both go with the placeholders: until then the
+         strings are kept in step.
    - [ ] No more placeholders: `nodes.uid` is `NULL` until a node lands.
    - [ ] An executor that runs ops in dependency order, many at once.
 3. **Speed (§7)**: run independent ops in parallel, batch trashes and moves; measure 1,000 files

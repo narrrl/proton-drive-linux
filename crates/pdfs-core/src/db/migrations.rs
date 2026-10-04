@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 39;
+pub(super) const SCHEMA_VERSION: i64 = 40;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -393,6 +393,22 @@ impl Db {
             )? > 0;
             if has_ops && !has_column {
                 tx.execute_batch(MIGRATION_V39)?;
+            }
+        }
+        if current < 40 {
+            // Same guards as V26-V39.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'parent_lid'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_nodes: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_nodes && !has_column {
+                tx.execute_batch(MIGRATION_V40)?;
             }
         }
         tx.execute(
@@ -1217,4 +1233,15 @@ UPDATE pending_op
        parent_lid = (SELECT lid FROM nodes WHERE nodes.uid = pending_op.parent_uid);
 CREATE INDEX pending_op_lid ON pending_op(lid);
 CREATE INDEX pending_op_parent_lid ON pending_op(parent_lid);
+";
+
+/// Schema v40: a node row names its parent by local id too.
+///
+/// The local id stays when a folder made here lands and its row takes the uid
+/// Drive gave it, so a child linked by it needs no rewrite. `NULL` while the
+/// parent has no row, as `parent_uid` then names nothing either.
+const MIGRATION_V40: &str = "
+ALTER TABLE nodes ADD COLUMN parent_lid INTEGER;
+UPDATE nodes SET parent_lid = (SELECT p.lid FROM nodes p WHERE p.uid = nodes.parent_uid);
+CREATE INDEX idx_nodes_parent_lid ON nodes(parent_lid);
 ";

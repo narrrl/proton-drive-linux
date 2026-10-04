@@ -529,19 +529,30 @@ impl Db {
     }
 
     /// Load every persisted node for cold-start hydration of the `State` maps.
+    ///
+    /// Each node names its parent as the parent's row has it now, found by
+    /// local id: a folder that landed has its new uid there, while the node
+    /// stored below it may still hold the placeholder.
     pub fn load_all(&self) -> Result<Vec<StoredNode>> {
         let conn = self.read();
-        let mut stmt =
-            conn.prepare("SELECT node_json, listed, lid FROM nodes WHERE node_json IS NOT NULL")?;
+        let mut stmt = conn.prepare(
+            "SELECT n.node_json, n.listed, n.lid, p.uid
+             FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+             WHERE n.node_json IS NOT NULL",
+        )?;
         let rows = stmt.query_map([], |row| {
             let json: String = row.get(0)?;
             let listed: i64 = row.get(1)?;
-            Ok((json, listed != 0, row.get(2)?))
+            let parent: Option<String> = row.get(3)?;
+            Ok((json, listed != 0, row.get(2)?, parent))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (json, listed, lid) = row?;
-            let node: Node = serde_json::from_str(&json)?;
+            let (json, listed, lid, parent) = row?;
+            let mut node: Node = serde_json::from_str(&json)?;
+            if let Some(parent) = parent.as_deref().and_then(parse_node_uid) {
+                node.parent_uid = Some(parent);
+            }
             out.push(StoredNode { node, listed, lid });
         }
         Ok(out)
@@ -602,8 +613,8 @@ impl Db {
         {
             let mut known = tx.prepare_cached("SELECT lid FROM nodes WHERE uid = ?1")?;
             let mut stub = tx.prepare_cached(
-                "INSERT INTO nodes (uid, parent_uid, name, is_dir, mtime, trashed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO nodes (uid, parent_uid, name, is_dir, mtime, trashed, parent_lid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT lid FROM nodes WHERE uid = ?2))",
             )?;
             for node in nodes {
                 let uid = node.uid.to_string();
@@ -618,7 +629,9 @@ impl Db {
                             node.modification_time,
                             node.trashed as i64,
                         ])?;
-                        tx.last_insert_rowid()
+                        let lid = tx.last_insert_rowid();
+                        adopt_children_tx(&tx, &uid, lid)?;
+                        lid
                     }
                 };
                 lids.push(lid);
@@ -791,6 +804,10 @@ pub(super) fn adopt_placeholder_row_tx(
             "UPDATE pending_op SET parent_lid = ?2 WHERE parent_lid = ?1",
             params![known_lid, lid],
         )?;
+        tx.execute(
+            "UPDATE nodes SET parent_lid = ?2 WHERE parent_lid = ?1",
+            params![known_lid, lid],
+        )?;
         tx.execute("DELETE FROM nodes WHERE lid = ?1", params![known_lid])?;
         tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![known_lid])?;
     }
@@ -805,6 +822,16 @@ pub(super) fn adopt_placeholder_row_tx(
     let mut node: Node = serde_json::from_str(&json)?;
     node.uid = real;
     upsert_node_tx(tx, &node)
+}
+
+/// Link the rows that name `uid` as their parent to its new row `lid`: they
+/// were stored before it, or under a row of the same uid since dropped.
+fn adopt_children_tx(tx: &Transaction<'_>, uid: &str, lid: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE nodes SET parent_lid = ?2 WHERE parent_uid = ?1 AND parent_lid IS NOT ?2",
+        params![uid, lid],
+    )?;
+    Ok(())
 }
 
 fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
@@ -831,26 +858,31 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
     // where resolving it from scratch is a recursive walk to the root. A node
     // whose parent is not cached (a device folder's root lives in `device`, never
     // in `nodes`) starts a path of its own, which is what the walk did too.
-    let path = match &parent_uid {
-        None => String::new(),
+    let (parent_lid, path) = match &parent_uid {
+        None => (None, String::new()),
         Some(parent) => {
-            let parent_path: Option<Option<String>> = tx
+            let parent_row: Option<(i64, Option<String>)> = tx
                 .query_row(
-                    "SELECT path FROM nodes WHERE uid = ?1",
+                    "SELECT lid, path FROM nodes WHERE uid = ?1",
                     params![parent],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            join_path(parent_path.flatten().as_deref().unwrap_or(""), &node.name)
+            let (lid, parent_path) = parent_row.unzip();
+            (
+                lid,
+                join_path(parent_path.flatten().as_deref().unwrap_or(""), &node.name),
+            )
         }
     };
 
     tx.execute(
         "INSERT INTO nodes
-           (uid, parent_uid, name, is_dir, size, mtime, trashed, node_json, path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+           (uid, parent_uid, name, is_dir, size, mtime, trashed, node_json, path, parent_lid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(uid) DO UPDATE SET
            parent_uid = excluded.parent_uid,
+           parent_lid = excluded.parent_lid,
            name       = excluded.name,
            is_dir     = excluded.is_dir,
            size       = excluded.size,
@@ -868,6 +900,7 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
             node.trashed as i64,
             json,
             path,
+            parent_lid,
         ],
     )?;
     let rowid: i64 = tx.query_row(
@@ -875,6 +908,9 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
         params![uid],
         |row| row.get(0),
     )?;
+    if prior.is_none() {
+        adopt_children_tx(tx, &uid, rowid)?;
+    }
 
     // FTS5 has no UPSERT, so the node's own row is always replaced.
     let indexable = node_is_indexable_tx(tx, &uid)?;
