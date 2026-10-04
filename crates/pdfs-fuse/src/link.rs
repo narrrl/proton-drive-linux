@@ -86,13 +86,32 @@ pub(crate) fn no_answer(after: Duration) -> ProtonError {
     })
 }
 
+/// The slowest upload rate an upload's deadline allows for, past the
+/// metadata budget it starts with. Far below any link that works, so only a
+/// transfer that has stopped moving runs into it.
+const SLOWEST_UPLOAD: u64 = 32 * 1024;
+
+/// How long an upload of `len` bytes may take before the link is treated as
+/// down: the budget of a metadata call, plus the bytes at [`SLOWEST_UPLOAD`].
+pub(crate) fn upload_deadline(len: u64) -> Duration {
+    INTERACTIVE_CALL_TIMEOUT + Duration::from_secs(len / SLOWEST_UPLOAD)
+}
+
 /// Run a remote call, giving up after [`INTERACTIVE_CALL_TIMEOUT`].
 pub(crate) async fn bounded<T>(
     call: impl Future<Output = Result<T, ProtonError>>,
 ) -> Result<T, ProtonError> {
-    match tokio::time::timeout(INTERACTIVE_CALL_TIMEOUT, call).await {
+    bounded_by(INTERACTIVE_CALL_TIMEOUT, call).await
+}
+
+/// Run a remote call, giving up after `limit`.
+pub(crate) async fn bounded_by<T>(
+    limit: Duration,
+    call: impl Future<Output = Result<T, ProtonError>>,
+) -> Result<T, ProtonError> {
+    match tokio::time::timeout(limit, call).await {
         Ok(result) => result,
-        Err(_) => Err(no_answer(INTERACTIVE_CALL_TIMEOUT)),
+        Err(_) => Err(no_answer(limit)),
     }
 }
 
@@ -130,6 +149,16 @@ impl Core {
         call: impl Future<Output = Result<T, ProtonError>>,
     ) -> Result<T, ProtonError> {
         self.rt.block_on(bounded(call))
+    }
+
+    /// Run a remote call, giving up after `limit`: an upload, whose budget
+    /// grows with its size ([`upload_deadline`]).
+    pub(crate) fn block_on_within<T>(
+        &self,
+        limit: Duration,
+        call: impl Future<Output = Result<T, ProtonError>>,
+    ) -> Result<T, ProtonError> {
+        self.rt.block_on(bounded_by(limit, call))
     }
 
     /// Report a failed remote call. Returns whether it failed for want of a
@@ -308,6 +337,26 @@ mod tests {
         assert!(!is_network_error(&api(ResponseCode::AlreadyExists)));
         assert!(!is_network_error(&api(ResponseCode::InvalidRequirements)));
         assert!(!is_network_error(&ProtonError::invalid_operation("bug")));
+    }
+
+    #[test]
+    fn an_upload_gets_longer_the_bigger_it_is() {
+        assert_eq!(upload_deadline(0), INTERACTIVE_CALL_TIMEOUT);
+        assert_eq!(
+            upload_deadline(1 << 30),
+            INTERACTIVE_CALL_TIMEOUT + Duration::from_secs(32_768)
+        );
+    }
+
+    #[test]
+    fn a_call_past_its_deadline_reads_as_a_lost_link() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let limit = Duration::from_millis(20);
+        let result: Result<(), _> = rt.block_on(bounded_by(limit, std::future::pending()));
+        assert!(result.is_err_and(|e| is_network_error(&e)));
     }
 
     #[test]

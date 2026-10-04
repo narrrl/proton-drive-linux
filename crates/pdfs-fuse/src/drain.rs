@@ -40,7 +40,7 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 use tracing::{debug, error, info, warn};
 
-use super::link::is_network_error;
+use super::link::{self, is_network_error};
 use super::state::{Intervals, PendingRevision};
 use super::transfers::CountingReader;
 use super::{
@@ -887,8 +887,7 @@ impl Core {
             return Ok(());
         }
         match self
-            .rt
-            .block_on(self.drive.trash_nodes(std::slice::from_ref(&uid)))
+            .block_on_bounded(self.drive.trash_nodes(std::slice::from_ref(&uid)))
             .and_then(batch::into_unit)
         {
             Ok(()) => {}
@@ -1192,10 +1191,8 @@ impl Core {
         if racing {
             return Ok(None);
         }
-        let uids = self
-            .rt
-            .block_on(self.drive.enumerate_folder_children_node_uids(parent))?;
-        let children = self.rt.block_on(self.drive.enumerate_nodes_light(&uids))?;
+        let uids = self.block_on_bounded(self.drive.enumerate_folder_children_node_uids(parent))?;
+        let children = self.block_on_bounded(self.drive.enumerate_nodes_light(&uids))?;
         let Some(twin) = children
             .into_iter()
             .find(|node| node.name == name && !node.trashed)
@@ -1232,11 +1229,11 @@ impl Core {
         name: &str,
     ) -> Result<NodeUid, Box<dyn std::error::Error>> {
         match op.kind == OP_MKDIR {
-            true => {
-                Ok(self
-                    .rt
-                    .block_on(self.drive.create_folder(parent, name, Some(now_secs())))?)
-            }
+            true => Ok(self.block_on_bounded(self.drive.create_folder(
+                parent,
+                name,
+                Some(now_secs()),
+            ))?),
             false => self.upload_created_file(op, parent, name),
         }
     }
@@ -1250,7 +1247,7 @@ impl Core {
         name: &str,
     ) -> Result<NodeUid, Box<dyn std::error::Error>> {
         let Some(blob) = op.blob_path.as_deref() else {
-            return Ok(self.rt.block_on(self.drive.upload_file(
+            return Ok(self.block_on_bounded(self.drive.upload_file(
                 parent,
                 name,
                 media_type_for(name),
@@ -1270,16 +1267,19 @@ impl Core {
             .transfers
             .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
-        let uid = self.rt.block_on(self.drive.upload_file_from(
-            parent,
-            name,
-            media_type_for(name),
-            reader,
-            meta.len as i64,
-            thumbnails,
-            None,
-            false,
-        ))?;
+        let uid = self.block_on_within(
+            link::upload_deadline(meta.len),
+            self.drive.upload_file_from(
+                parent,
+                name,
+                media_type_for(name),
+                reader,
+                meta.len as i64,
+                thumbnails,
+                None,
+                false,
+            ),
+        )?;
         Ok(uid)
     }
 
@@ -1619,16 +1619,19 @@ impl Core {
             self.transfers
                 .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
-        self.rt.block_on(self.drive.upload_file_from(
-            &parent,
-            &alt,
-            media_type_for(&alt),
-            reader,
-            meta.len as i64,
-            thumbnails,
-            None,
-            false,
-        ))?;
+        self.block_on_within(
+            link::upload_deadline(meta.len),
+            self.drive.upload_file_from(
+                &parent,
+                &alt,
+                media_type_for(&alt),
+                reader,
+                meta.len as i64,
+                thumbnails,
+                None,
+                false,
+            ),
+        )?;
         drop(guard);
 
         self.db.delete_op(op.id)?;
@@ -1928,13 +1931,11 @@ impl Core {
         }
         let reader = CountingReader::new(File::open(&blob)?, &guard).with_cancel(cancel.flag());
         let started = Instant::now();
-        let sent = self.rt.block_on(self.drive.upload_new_revision_from(
-            &uid,
-            reader,
-            meta.len as i64,
-            thumbnails,
-            None,
-        ));
+        let sent = self.block_on_within(
+            link::upload_deadline(meta.len),
+            self.drive
+                .upload_new_revision_from(&uid, reader, meta.len as i64, thumbnails, None),
+        );
         let took = started.elapsed();
         if let Err(e) = sent {
             if cancel.cancelled() {

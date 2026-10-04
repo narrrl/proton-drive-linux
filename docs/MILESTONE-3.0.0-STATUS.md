@@ -50,7 +50,8 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
   3.0.0).
 - **Phase 4**: one applier for remote changes.
 - **Phase 5**: mirror folders on the same planner and executor.
-- **Any time**: `Size` and block geometry as types; a `Deadline` on every remote call.
+- **Any time**: `Size` and block geometry as types; a deadline on the remote calls outside
+  the drain (the drain's have one: `link::upload_deadline`, `Core::block_on_within`).
 - Open questions in §12 of the milestone.
 - `PLAN.md`: the acceptance script notices network drops and reports `interrupted` instead of
   TIMEOUT.

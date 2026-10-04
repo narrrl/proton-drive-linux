@@ -31,6 +31,9 @@ are kept. Queued changes get a column for the reason Drive refused them.
   for this release.
 
 ### Fixed
+- **A queued change no longer holds up the queue forever on a link that stops answering.**
+  Sending a new folder, a delete or a file waits at most 20 seconds for Drive, plus time for
+  the file's size, and then the queue treats the link as down and tries again.
 - **A file deleted while its first upload is on the wire no longer stays on Drive.** The node
   the upload made is trashed as soon as it lands, so its name is free again (B129).
 - **A delete queued while a rename is sent is no longer lost.** The rename landing could remove
