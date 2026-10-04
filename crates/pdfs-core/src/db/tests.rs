@@ -2977,7 +2977,8 @@ fn renaming_a_backing_off_create_makes_it_due() {
 }
 
 /// A rename queued while an older one is on the wire waits for it. The older
-/// one, if it fails, is dropped rather than retried after the newer one.
+/// one, if it fails, is dropped rather than retried after the newer one, also
+/// when the newer one came after the failure was recorded.
 #[test]
 fn a_rename_on_the_wire_lands_before_the_one_that_replaces_it() {
     let db = Db::open_in_memory().unwrap();
@@ -3013,6 +3014,16 @@ fn a_rename_on_the_wire_lands_before_the_one_that_replaces_it() {
     let (third, _) = db.enqueue_op(&rename("x")).unwrap();
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [third]);
+
+    // Queued after the failure was recorded but before the claim went back:
+    // the older one goes then, rather than landing after the newer (B158).
+    assert_eq!(db.claim_next_due_op(1).unwrap().unwrap().id, third);
+    db.record_op_failure(third, "e.md is still held", 10_000)
+        .unwrap();
+    let (fourth, _) = db.enqueue_op(&rename("c0")).unwrap();
+    db.release_op_claim(third).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.iter().map(|o| o.id).collect::<Vec<_>>(), [fourth]);
 }
 
 #[test]

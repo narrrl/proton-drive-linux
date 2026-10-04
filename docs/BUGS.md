@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## B158 — A file renamed twice in a row ends up under the first name, again
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's Wi-Fi profile (`one_client_on_a_slow_link`, seed 3,
+four of ten runs on 4676a4e). A file was renamed to `b.txt`, whose name a create on the wire
+still held, and then to `e.md`. Drive renamed it to `e.md` and then back to `b.txt`. The
+liveness check found `b.txt` on Drive and `e.md` in the mount.
+
+**Where:** `Db::record_op_failure` and `Db::release_op_claim` in
+`crates/pdfs-core/src/db/ops.rs`.
+
+**Cause.** B141's fix drops a rename that fails while a newer one is queued behind it. The worker
+records the failure first and releases its claim after that. The second rename came in between:
+the first was still claimed, so the second queued behind it, but the failure had already been
+recorded with nothing behind it, so the first was kept with a backoff. Once released, it was not
+due and the second was, so the second landed first. More workers made the gap easier to hit.
+
+**Fix.** Releasing the claim of a rename drops it as well when a newer rename of the same node is
+queued behind it. Both checks match the node by local id as well as by uid.
+
+**Test:** unit test `a_rename_on_the_wire_lands_before_the_one_that_replaces_it`, extended.
+Seeds 2 and 3 of `one_client_on_a_slow_link` pass eight replays each.
+
+---
+
 ## B157 — A second write to a file whose upload was not read back fails with `EIO`
 
 **Status:** Fixed (unverified).

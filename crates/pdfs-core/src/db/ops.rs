@@ -222,6 +222,20 @@ fn on_node(n: usize) -> String {
     ON_NODE.replace("?L", &format!("?{n}"))
 }
 
+/// Delete op `id` if it is a rename with a newer rename of the same node queued
+/// behind it, which says where the node goes now. Returns whether it did.
+fn drop_replaced_rename(conn: &rusqlite::Connection, id: i64) -> Result<bool> {
+    let dropped = conn.execute(
+        "DELETE FROM pending_op
+         WHERE id = ?1 AND kind = ?2
+           AND EXISTS (SELECT 1 FROM pending_op AS newer
+                       WHERE (newer.uid = pending_op.uid OR newer.lid = pending_op.lid)
+                         AND newer.kind = ?2 AND newer.id > ?1)",
+        params![id, OP_RENAME],
+    )?;
+    Ok(dropped > 0)
+}
+
 /// The uid a queued op's node has now: the one its row holds, which a landing
 /// create has already moved to its real uid, or the one the op was queued with
 /// when the node has no row.
@@ -501,7 +515,7 @@ impl Db {
     /// A rename a drain worker holds is not replaced but queued behind: the
     /// claim keeps the newer one from being sent until it retires, so the two
     /// land in the order they were made (`docs/BUGS.md` B141). Should it fail,
-    /// [`Db::record_op_failure`] drops it.
+    /// [`Db::record_op_failure`] or [`Db::release_op_claim`] drops it.
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -1034,8 +1048,17 @@ impl Db {
     /// `UPDATE` matches nothing), and a handler that returns without retiring
     /// *and* without failing would otherwise leave the row claimed by a worker
     /// that has moved on — invisible to every worker, forever.
+    ///
+    /// A rename still here with a newer one queued behind it goes instead, as
+    /// in [`Db::record_op_failure`]. The newer one may have been queued after
+    /// the failure was recorded: kept, the older one sat out its backoff while
+    /// the newer one landed, and then put the old name back (`docs/BUGS.md`
+    /// B158).
     pub fn release_op_claim(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock();
+        if drop_replaced_rename(&conn, id)? {
+            return Ok(());
+        }
         conn.execute(
             "UPDATE pending_op SET claimed_at = 0 WHERE id = ?1",
             params![id],
@@ -1254,15 +1277,7 @@ impl Db {
     /// dropped instead: retried, it could land after the newer one and undo it.
     pub fn record_op_failure(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
         let conn = self.conn.lock();
-        let dropped = conn.execute(
-            "DELETE FROM pending_op
-             WHERE id = ?1 AND kind = ?2
-               AND EXISTS (SELECT 1 FROM pending_op AS newer
-                           WHERE newer.uid = pending_op.uid AND newer.kind = ?2
-                             AND newer.id > ?1)",
-            params![id, OP_RENAME],
-        )?;
-        if dropped > 0 {
+        if drop_replaced_rename(&conn, id)? {
             return Ok(());
         }
         conn.execute(
