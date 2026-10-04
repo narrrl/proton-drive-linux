@@ -6496,11 +6496,17 @@ fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) ->
 /// Lay what is queued for a folder over Drive's listing of it, from
 /// `Db::queued_children`: a node a queued rename moved away is dropped, and a
 /// node a queued create, mkdir or rename put there is listed as the DB has it.
+///
+/// That node holds its name here: a create Drive already has but whose answer
+/// is still on its way, or which the drain is still reading back, is listed by
+/// Drive under its new uid and by the queue under its stand-in. Both were
+/// listed, and a 128-file folder listed 129 (`docs/BUGS.md` B164).
 fn overlay_queued(nodes: &mut Vec<Node>, queued: Vec<Node>, gone: &HashSet<String>) {
     let here: HashSet<String> = queued.iter().map(|node| node.uid.to_string()).collect();
+    let names: HashSet<&str> = queued.iter().map(|node| node.name.as_str()).collect();
     nodes.retain(|node| {
         let uid = node.uid.to_string();
-        !gone.contains(&uid) && !here.contains(&uid)
+        !gone.contains(&uid) && !here.contains(&uid) && !names.contains(node.name.as_str())
     });
     nodes.extend(queued);
 }

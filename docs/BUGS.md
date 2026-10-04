@@ -12,6 +12,33 @@ Conventions:
 
 ---
 
+## B164 — A folder lists a new file twice while its create lands
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the account run on 2.10.0 ("a wide directory", on-demand pairing 2).
+Eight threads wrote 128 files into a new folder, and the listing that followed held 129
+entries. Each name was created on Drive once, and nothing was logged.
+
+**Where:** `overlay_queued` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** A listing from Drive shows what is still queued for the folder over what Drive has
+(B132). A create Drive has made but whose answer is still on its way, or which the drain is
+still reading back, is in both: Drive lists it under its new uid, the queue under its stand-in.
+That listing only happens when the folder's listing was dropped, and the feed's event for a
+new file does that when it comes before the drain has noted the create as its own. Both were
+listed under the same name.
+
+The run logged nothing for the folder, so the event is inferred, not observed. It is the one
+path found that lists a name twice.
+
+**Fix.** A node queued in the folder holds its name there: Drive's node of the same name is
+left out of the listing until the queued op lands.
+
+**Test:** simulation test `a_create_drive_lists_before_it_is_read_back_is_listed_once` (failed
+before the fix: the folder listed `c.bin` twice).
+
+---
+
 ## B163 — A file read right after its create landed is empty
 
 **Status:** Fixed.

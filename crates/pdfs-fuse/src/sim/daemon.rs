@@ -556,6 +556,47 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_create_drive_lists_before_it_is_read_back_is_listed_once() {
+        // The feed reported a new file while the drain still read it back, so
+        // the folder was listed from Drive again, and the file came twice: as
+        // Drive's node and as the queued create's stand-in. A 128-file folder
+        // listed 129 (B164).
+        let drive = FakeDrive::new();
+        let dir = scratch("listed-before-retired");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        std::fs::create_dir(mnt.join("x")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("x").is_some()
+        }));
+
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        let uid = drive.lookup("x/c.bin").unwrap();
+        let read_back = daemon.client.hold_next_read(&uid);
+        drop(create);
+        assert!(wait_until(Duration::from_secs(30), || read_back.reached()));
+        // Long enough for the next event poll to bring the file's event.
+        std::thread::sleep(crate::POLL_INTERVAL + Duration::from_secs(3));
+
+        let names: Vec<_> = std::fs::read_dir(mnt.join("x"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        drop(read_back);
+        assert_eq!(names, ["c.bin"]);
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        assert_eq!(std::fs::read(mnt.join("x/c.bin")).unwrap(), b"abc");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_folder_made_again_while_the_old_one_is_trashed_is_a_new_folder() {
         // A folder removed and made again at once: the new one's create met
         // the old folder, its trash still on the wire, and took it for the
