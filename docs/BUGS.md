@@ -12,6 +12,25 @@ Conventions:
 
 ---
 
+## B147 — A new file made under a name just renamed away can share the first file's node
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by `sim::run::tests::three_clients_one_writer_each`, seed 2, in about one
+run of eight. Client 1 made `a.txt`, renamed it to `b.txt`, and made `a.txt` again. Drive ended
+up without `b.txt`, and `e.md`, a later rename of the new `a.txt`, held `b.txt`'s bytes.
+
+**Where:** `Core::adoptable_twin` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The first file's create went out as `a.txt` and the rename was queued behind it. While
+that create was on the wire, the second file's create found `a.txt` taken by a fresh, empty file,
+which is how the node of an unanswered create of its own looks, and adopted it. Both local files
+landed on the one node, and the first file's rename took it to `b.txt`.
+
+**Fix.** A create no longer adopts a node another create is making under the same name and folder:
+it waits for that one to land, as for any name a queued change holds. Nor does it adopt a node
+already in the tree, which was answered for. An unanswered twin the tree has already listed
+lands as a conflict copy, which loses nothing.
+
 ## B146 — A file renamed just as its upload lands can go back to its old name
 
 **Status:** Fixed (unverified).

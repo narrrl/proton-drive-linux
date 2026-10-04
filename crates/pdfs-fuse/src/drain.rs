@@ -1160,6 +1160,19 @@ impl Core {
         parent: &NodeUid,
         name: &str,
     ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
+        // A second file queued under the same name, after the first was
+        // renamed away, finds the first one's node fresh and empty while its
+        // create is on the wire. Taking it put both files on one node, and the
+        // first one's rename took the second one's bytes along
+        // (docs/BUGS.md B147).
+        let racing = self
+            .creating
+            .lock()
+            .iter()
+            .any(|(id, (p, n))| *id != op.id && p == parent && n == name);
+        if racing {
+            return Ok(None);
+        }
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(parent))?;
@@ -1170,6 +1183,12 @@ impl Core {
         else {
             return Ok(None);
         };
+        // A node in the tree was answered for, by this mount or by a listing:
+        // the same race after the first create landed. Without the adoption,
+        // an unanswered twin forks a conflict copy, which loses nothing.
+        if self.state().by_uid.contains_key(&twin.uid) {
+            return Ok(None);
+        }
         // The light listing carries no file size, and an adoptable file is
         // exactly an empty one.
         let twin = match twin.kind {

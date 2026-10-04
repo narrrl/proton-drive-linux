@@ -44,6 +44,8 @@ are kept.
   A file made a moment before was taken for deleted and dropped from the queue (B145).
 - **A file renamed just as its upload lands keeps its new name.** The tree could take back the
   name Drive still had (B146).
+- **A new file made under a name another file just left no longer takes that file's place on
+  Drive.** Both could land on one node, and one file's content was lost (B147).
 
 ## [2.10.0] — 2026-10-03
 
