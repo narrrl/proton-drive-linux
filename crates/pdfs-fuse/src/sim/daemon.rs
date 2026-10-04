@@ -424,6 +424,78 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name() {
+        // The move queued behind the create landed while the drain read the
+        // new node back. The answer still had the old name, and the drain no
+        // longer found the move queued, so the mount showed the old name in
+        // the new folder (B161).
+        let drive = FakeDrive::new();
+        let dir = scratch("moved-while-created");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        std::fs::create_dir(mnt.join("x")).unwrap();
+        std::fs::create_dir(mnt.join("y")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("y").is_some()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        std::fs::rename(mnt.join("x/c.bin"), mnt.join("y/d")).unwrap();
+        let uid = drive.lookup("x/c.bin").unwrap();
+        // Each read-back is answered in turn until the create is retired; the
+        // answer to the next one is held until the move has landed. A new
+        // folder wakes the drain for the move.
+        let mut held = create;
+        let adopting = loop {
+            let next = daemon.client.hold_answer_to_next_read(&uid);
+            drop(held);
+            assert!(wait_until(Duration::from_secs(30), || next.reached()));
+            if daemon
+                .pending()
+                .is_ok_and(|items| items.iter().all(|op| op.kind != "create"))
+            {
+                break next;
+            }
+            held = next;
+        };
+        std::fs::create_dir(mnt.join("z")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || drive.lookup("y/d").is_some()),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        drop(adopting);
+
+        let file = Some(Entry::File(Arc::new(b"abc".to_vec())));
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("y/d").cloned() == file
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        let names: Vec<_> = std::fs::read_dir(mnt.join("y"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["d"]);
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn the_echo_of_our_own_rename_keeps_the_cached_bytes() {
         // The echo read as someone else's change and evicted the bytes, so a
         // partial write could not gap-fill, and the next write open on the

@@ -49,6 +49,8 @@ by its local id, in the queue, the stored tree and pins alike.
 - **Opening a file right after the daemon restarts no longer fails with "Resource temporarily
   unavailable"** (B159).
 - **A new folder reaches Drive at once**, not up to half a minute later (B160).
+- **A file moved while it was still being uploaded keeps its new name in the mount** on a slow
+  link (B161).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

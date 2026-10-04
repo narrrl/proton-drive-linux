@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## B161 — A file moved while it was being created shows up under its old name
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the simulation's slow-link profile (`one_client_on_a_slow_link`,
+seed 3). A file written and then moved at once ended up on Drive as `y/z/d`, but the mount
+showed it as `y/z/c.bin`, its name before the move, and `d` was missing.
+
+**Where:** `Core::adopt_real_uid` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A move made while a file's create is on the wire waits in the queue until the create
+lands. Once the create is retired, the drain reads the new node back from Drive and adopts it.
+The tree keeps the name the user gave only while the move is still queued. The drain asked
+about that after the read-back. On a slow link the move could land in between: the answer
+still had the old name, and the move was no longer queued, so the old name won.
+
+**Fix.** The drain asks whether a move is queued before it reads the node back. It still asks
+again under the tree's lock (B152).
+
+**Test:** simulation test `a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name`
+(failed before the fix: the new folder listed nothing). The fake Drive can now hold a read's
+answer, taken when the read arrives, until the test releases it
+(`FakeClient::hold_answer_to_next_read`).
+
+---
+
 ## B160 — A new folder reaches Drive only half a minute later
 
 **Status:** Fixed.

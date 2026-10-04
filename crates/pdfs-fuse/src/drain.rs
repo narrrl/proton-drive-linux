@@ -1587,15 +1587,17 @@ impl Core {
         real: &NodeUid,
         adopt: impl FnOnce(&Node),
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // A rename made while the create was on the wire is queued against the
+        // real uid (`Db::finish_create`). Until it lands, the tree keeps the
+        // name and folder the user gave it. Asked before the read-back: a
+        // rename that lands while Drive answers leaves no op behind, and the
+        // answer may still have the old name (`docs/BUGS.md` B161).
+        let real_key = real.to_string();
+        let renaming = self.db.has_pending_op(&real_key, OP_RENAME)?;
         // Drive answers a create before it lists the new node.
         let mut node = self
             .read_back(real)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
-        // A rename made while the create was on the wire is queued against the
-        // real uid (`Db::finish_create`). Until it lands, the tree keeps the
-        // name and folder the user gave it.
-        let real_key = real.to_string();
-        let renaming = self.db.has_pending_op(&real_key, OP_RENAME)?;
         // Before open handles are rebased onto the node, so one released in
         // between finds what `adopt` keeps (`docs/BUGS.md` B123).
         adopt(&node);
