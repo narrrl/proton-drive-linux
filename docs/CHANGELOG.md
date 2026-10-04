@@ -26,6 +26,9 @@ by its local id, in the queue, the stored tree and pins alike.
   save a copy of a queued upload's content. The upload stays queued.
 - **`pdfs sync issues`** lists the changes that need attention; `pdfs sync queue` shows the
   issue next to each change.
+- **Discard a queued change.** The Sync page's Discard button and `pdfs sync discard <id>` drop
+  a change Drive will not take and undo it here: a new file or folder goes, anything else goes
+  back to what Drive has. Export a file first to keep its content.
 
 ### Changed
 - **Making, renaming and deleting through the mount no longer waits for Drive.** A new folder,

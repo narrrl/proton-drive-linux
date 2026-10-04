@@ -377,6 +377,7 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
         | R::RestoreSyncFolders { .. }
         | R::RestoreDeviceFolders { .. } => &[Topic::Locations, Topic::Devices],
         R::RetryPendingOp { .. } => &[Topic::Queue],
+        R::DiscardPendingOp { .. } => &[Topic::Queue, Topic::Files],
         R::ResolveConflict { .. } => &[Topic::Files, Topic::Trash, Topic::Conflicts],
         R::ShareNode { .. }
         | R::ShareNodeByUid { .. }
@@ -1412,6 +1413,12 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::DiscardPendingOp { id }) => match core.discard_pending_op(id) {
+            Ok(path) => CtlResponse::Ok {
+                message: format!("discarded the queued change to {path}"),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::RetryPendingOp { id }) => match core.retry_pending_ops(id) {
             Ok(0) if id.is_some() => CtlResponse::Ok {
                 message: "nothing to retry: the operation is already due or waiting for a rename"

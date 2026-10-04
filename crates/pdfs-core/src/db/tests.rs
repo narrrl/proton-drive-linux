@@ -2633,6 +2633,58 @@ fn failed_atomic_trash_insert_keeps_prior_revision_and_blob_ownership() {
     );
 }
 
+/// Discarding a change to a node Drive has drops that node's ops and nothing
+/// queued below it, and nothing at all while one of them is on the wire.
+#[test]
+fn discarding_a_nodes_change_keeps_what_is_queued_inside_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        folder("dir", Some("root"), "dir"),
+        file("inner", "dir", "inner.bin", 1),
+    ])
+    .unwrap();
+    let op = |kind: &str, link: &str, blob: Option<&str>| PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid(link).to_string(),
+        parent_uid: None,
+        name: Some("renamed".to_string()),
+        blob_path: blob.map(str::to_string),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op(OP_RENAME, "dir", None)).unwrap();
+    db.enqueue_op(&op(OP_REVISION, "inner", Some("/staging/inner")))
+        .unwrap();
+
+    let dir = uid("dir").to_string();
+    assert_eq!(db.discard_ops_on_node(&dir).unwrap(), Some(vec![]));
+    let left: Vec<String> = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .map(|op| op.uid)
+        .collect();
+    assert_eq!(left, vec![uid("inner").to_string()]);
+
+    let inner = uid("inner").to_string();
+    let claimed = db.claim_next_due_op(2).unwrap().unwrap();
+    assert_eq!(claimed.uid, inner);
+    assert_eq!(db.discard_ops_on_node(&inner).unwrap(), None);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    db.record_op_failure(claimed.id, "no answer", 0).unwrap();
+    db.release_op_claim(claimed.id).unwrap();
+    assert_eq!(
+        db.discard_ops_on_node(&inner).unwrap(),
+        Some(vec!["/staging/inner".to_string()])
+    );
+    assert!(db.pending_ops().unwrap().is_empty());
+}
+
 /// A revision op names no parent, so the queue alone cannot see that its file
 /// sits inside a folder being removed. The node tree can: trashing the folder
 /// has to take the uploads of the files below it along, or they fail forever

@@ -82,6 +82,9 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs sync resume [--folder ID]` | Resume after a pause. |
 | `pdfs sync limit [--up RATE] [--down RATE]` | Cap bandwidth, for example `500K` or `2M` per second. `0` removes a cap. Without options, prints the current caps. |
 | `pdfs sync queue` | List changes that have not reached Proton Drive yet. |
+| `pdfs sync issues` | List queued changes Proton Drive refused or that keep failing, and what to do. |
+| `pdfs sync export ID DEST` | Save a copy of a queued upload's content. The upload stays queued. |
+| `pdfs sync discard ID [--yes]` | Drop a queued change and undo it here: a new file or folder goes, anything else goes back to what Proton Drive has. Content not exported first is lost. |
 | `pdfs sync retry [ID]` | Retry one queued operation, or every failed one. |
 | `pdfs sync restore [--device UID] [--yes]` | Re-attach this computer's backed-up folders to local folders and download them. `--device` restores another computer's folders. See [RECOVERY.md](RECOVERY.md). |
 

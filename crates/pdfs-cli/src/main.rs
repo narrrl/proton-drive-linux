@@ -686,6 +686,16 @@ enum SyncCmd {
         /// Where to save it: a new file, or an existing folder to save it in.
         dest: PathBuf,
     },
+    /// Drop a queued change (by id from `sync queue`) and undo it here: a new file
+    /// or folder goes, anything else goes back to what Proton Drive has. Its
+    /// content is lost unless saved with `sync export` first.
+    Discard {
+        /// Queue id.
+        id: i64,
+        /// Do not ask first.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Retry a queued operation now (by id from `sync queue`), or every failed one.
     Retry {
         /// Queue id; omit to retry every failed operation.
@@ -1040,6 +1050,14 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         SyncCmd::Issues => return cmd_sync_issues(),
         SyncCmd::Export { id, dest } => return cmd_sync_export(id, &dest),
         SyncCmd::Limit { up, down } => return cmd_sync_limit(up, down),
+        SyncCmd::Discard { id, yes } => {
+            if !yes {
+                confirm(&format!(
+                    "Discard queued change {id} and undo it here? Content not exported is lost."
+                ))?;
+            }
+            ok_or_bail(control_request(CtlRequest::DiscardPendingOp { id })?)?
+        }
         SyncCmd::Retry { id } => ok_or_bail(control_request(CtlRequest::RetryPendingOp { id })?)?,
         SyncCmd::Resume { folder: None } => {
             ok_or_bail(control_request(CtlRequest::SetSyncPaused {

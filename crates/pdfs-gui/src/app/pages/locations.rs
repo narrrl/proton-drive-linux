@@ -708,6 +708,20 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
         export.connect_clicked(move |_| prompt_export_queued(&ui, id, &name));
         row.add_suffix(&export);
     }
+    if op.failing {
+        let discard = gtk4::Button::builder()
+            .label(gettext("Discard"))
+            .tooltip_text(gettext("Undo this change here instead of sending it"))
+            .valign(gtk4::Align::Center)
+            .build();
+        discard.add_css_class("flat");
+        let ui = ui.clone();
+        let id = op.id;
+        let path = op.path.clone();
+        let exportable = op.exportable;
+        discard.connect_clicked(move |_| prompt_discard_queued(&ui, id, &path, exportable));
+        row.add_suffix(&discard);
+    }
     row
 }
 
@@ -770,6 +784,62 @@ fn prompt_export_queued(ui: &Rc<Ui>, id: i64, name: &str) {
                 ),
             }
         });
+    });
+}
+
+/// Confirm, then have the daemon drop a queued change and undo it here.
+fn prompt_discard_queued(ui: &Rc<Ui>, id: i64, path: &str, exportable: bool) {
+    let body = if exportable {
+        // Translators: {path} is the file whose queued change would be dropped.
+        gettext_f(
+            "Your changes to {path} are undone here and never reach Proton Drive. Export the file first to keep your version.",
+            &[("path", path)],
+        )
+    } else {
+        // Translators: {path} is the file or folder whose queued change would be dropped.
+        gettext_f(
+            "The change to {path} is undone here and never reaches Proton Drive.",
+            &[("path", path)],
+        )
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Discard Change?"))
+        .body(body)
+        .build();
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("discard", &gettext("Discard"));
+    dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let window = ui_window(ui);
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "discard" {
+            discard_queued(&ui, id);
+        }
+    });
+    dialog.present(window.as_ref());
+}
+
+fn discard_queued(ui: &Rc<Ui>, id: i64) {
+    let rx = spawn_request(ui.dirs.control_socket(), Request::DiscardPendingOp { id });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => {
+                toast(&ui, &gettext("Change discarded"));
+                ui.locations.queue.painted.borrow_mut().clear();
+                refresh_queue(&ui);
+            }
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &gettext("Couldn't discard the change"), &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                &gettext("Couldn't discard the change"),
+                &gettext("The Proton Drive service didn't respond."),
+            ),
+        }
     });
 }
 

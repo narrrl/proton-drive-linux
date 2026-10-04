@@ -908,6 +908,41 @@ impl Db {
         Ok(blobs)
     }
 
+    /// Drop the ops queued on the node `uid` names, and nothing else, returning
+    /// the staged blobs they held. `None`, dropping nothing, while one of them
+    /// is on the wire: it may land after the drop.
+    ///
+    /// For a change the user discards on a node Drive has. Unlike
+    /// [`Db::delete_ops_for_uid`], what is queued below the node stays: the
+    /// files made in a folder whose rename is discarded still go in it.
+    pub fn discard_ops_on_node(&self, uid: &str) -> Result<Option<Vec<String>>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let lid = node_lid(&tx, uid)?;
+        let on = on_node(2);
+        let sending: bool = tx.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM pending_op WHERE {on} AND claimed_at <> 0)"),
+            params![uid, lid],
+            |r| r.get(0),
+        )?;
+        if sending {
+            return Ok(None);
+        }
+        let blobs = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT blob_path FROM pending_op WHERE {on} AND blob_path IS NOT NULL"
+            ))?;
+            let rows = stmt.query_map(params![uid, lid], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            &format!("DELETE FROM pending_op WHERE {on}"),
+            params![uid, lid],
+        )?;
+        tx.commit()?;
+        Ok(Some(blobs))
+    }
+
     /// What [`Db::finish_create`] does to the node rows and pins when a create
     /// lands, without the op ([`adopt_placeholder_row_tx`]).
     #[cfg(test)]

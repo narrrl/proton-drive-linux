@@ -11,7 +11,8 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
 - Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B181.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
-  tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
+  tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`; Discard button and
+  `pdfs sync discard`.
 
 ## Phase 3: left for 3.0.0
 
@@ -27,8 +28,10 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    - [x] A name collision lands under a conflict name (create, rename, move, re-homed create)
          and goes in the activity log, as does a queued edit kept as a conflict copy. The app
          words each one in the user's language (the last one since B181).
-   - [ ] Discard an issue on purpose (after export, or for a change with no content), and
-         undo the local change it stood for. Not in the first cut.
+   - [x] Discard an issue on purpose (after export, or for a change with no content), and
+         undo the local change it stood for: a node made here goes, a node Drive has goes back
+         to what Drive has. Control request, `pdfs sync discard`, Discard button with a
+         confirmation; translated in every catalog.
    - [ ] Show the issue on the node itself (file browser emblem or status). Not in the first
          cut.
 2. **Planner and executor (§5.4, §5.5)**: ops keyed by local id; remove `mint_local_uid`,

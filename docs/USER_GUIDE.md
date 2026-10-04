@@ -167,6 +167,8 @@ The version you do not keep goes to the Trash, so a wrong choice can be undone.
 - **Limit bandwidth** under **Preferences → General → Network**, or with
   `pdfs sync limit --up 2M --down 10M`. `0` removes a limit.
 - **Retry** a failed upload from **Sync → Overview**, or with `pdfs sync retry`.
+- **Discard** a change Proton Drive refused from the same list, or with `pdfs sync discard`: it is
+  undone here and never sent. Export a file first to keep your version.
 
 ## Photos
 

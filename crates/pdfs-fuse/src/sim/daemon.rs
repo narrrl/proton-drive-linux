@@ -647,6 +647,59 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_discarded_change_is_undone_here_and_never_sent() {
+        let drive = FakeDrive::new();
+        for name in ["keep.txt", "edit.txt", "gone.txt"] {
+            drive.device().write(name, b"remote");
+        }
+        let before = drive.tree();
+        let dir = scratch("discard");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        std::fs::rename(mnt.join("keep.txt"), mnt.join("moved.txt")).unwrap();
+        std::fs::write(mnt.join("edit.txt"), b"local").unwrap();
+        std::fs::remove_file(mnt.join("gone.txt")).unwrap();
+        std::fs::write(mnt.join("new.txt"), b"new").unwrap();
+        std::fs::create_dir(mnt.join("dir")).unwrap();
+
+        // Discarding one change drops the others queued on its node.
+        for _ in 0..10 {
+            let Some(op) = daemon.pending().unwrap().into_iter().next() else {
+                break;
+            };
+            let reply = daemon.request(&Request::DiscardPendingOp { id: op.id });
+            assert!(
+                matches!(reply, Ok(Response::Ok { .. })),
+                "{op:?}: {reply:?}"
+            );
+        }
+        assert!(daemon.pending().unwrap().is_empty());
+        let mut names: Vec<_> = std::fs::read_dir(&mnt)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".txt") || name == "dir")
+            .collect();
+        names.sort();
+        assert_eq!(names, ["edit.txt", "gone.txt", "keep.txt"]);
+        for name in &names {
+            assert_eq!(std::fs::read(mnt.join(name)).unwrap(), b"remote", "{name}");
+        }
+
+        daemon.request(&paused(false)).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(drive.tree(), before);
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_folder_whose_mkdir_is_queued_lists_after_a_refresh() {
         // Once its listing was dropped, the folder was asked of Drive by its
         // stand-in, and every listing and lookup in it failed with EIO until

@@ -128,7 +128,13 @@ pdfs sync retry 42        # one operation
 ```
 
 The app shows the same list on **Sync → Overview**. An operation that keeps failing shows its
-error there.
+error there. A change Proton Drive will not take can be dropped instead, which undoes it here;
+save a file's content first if you want to keep it:
+
+```bash
+pdfs sync export 42 ~/Desktop/
+pdfs sync discard 42
+```
 
 **A file in a synced folder does not upload** — check that:
 

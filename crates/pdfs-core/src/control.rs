@@ -481,6 +481,11 @@ pub enum Request {
     /// [`Request::ListPendingOps`]) to `dest`, an absolute path that must not
     /// exist yet. The op stays queued. Replies with [`Response::Ok`].
     ExportPendingOp { id: i64, dest: String },
+    /// Drop a queued change (`id` from [`Request::ListPendingOps`]) and undo
+    /// it locally: a node made here goes, a node Drive has goes back to what
+    /// Drive has, along with every other change queued on it. Its content is
+    /// lost unless it was exported first. Replies with [`Response::Ok`].
+    DiscardPendingOp { id: i64 },
     /// List the `(sync-conflict …)` copies under My Files and in synced
     /// folders. Replies with
     /// [`Response::Conflicts`].
@@ -3353,6 +3358,10 @@ mod tests {
                     dest: "/tmp/out.bin".into(),
                 },
                 r#"{"ExportPendingOp":{"id":7,"dest":"/tmp/out.bin"}}"#,
+            ),
+            (
+                Request::DiscardPendingOp { id: 7 },
+                r#"{"DiscardPendingOp":{"id":7}}"#,
             ),
         ];
         for (request, wire) in cases {
