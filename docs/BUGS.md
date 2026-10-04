@@ -12,6 +12,33 @@ Conventions:
 
 ---
 
+## B166 — A folder drops a file whose create lands while it is listed
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the account run on the working tree after B165 (a wide directory, on
+My files and on on-demand pairing 1): "concurrent unlinks left the wrong entries". Every
+create and all 64 trashes landed as they should, so the drain was right and the listing was
+wrong. The run logs no names. The simulation lost files that were never unlinked.
+
+**Where:** `list_children` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** A folder whose listing was dropped is listed from Drive, then overlaid with what
+the queue still holds for it (B132). The queue was read after Drive answered. A create that
+landed in between was in neither: Drive had taken the listing before the node existed, and
+the queue had let go of it by the time it was read. The file was missing until the folder
+was listed again. On Wi-Fi, with 16 workers landing creates while the event feed drops the
+folder's listing, this happened in almost every run of the wide-directory case.
+
+**Fix.** The queued children are read before Drive is asked as well as after. A node queued
+before and gone from the queue after has landed meanwhile, and is listed as the DB has it
+now, under its name. One unlinked or moved away meanwhile is no longer a child of the folder
+in the DB, so it stays out.
+
+**Test:** `half_of_a_wide_folder_unlinked_at_once_leaves_the_other_half` in `sim/daemon.rs`
+(failed 4 of 4 runs before the fix, passed 8 of 8 after).
+
+---
+
 ## B165 — A stop waits on a stuck thread until systemd kills the daemon
 
 **Status:** Fixed (unverified).

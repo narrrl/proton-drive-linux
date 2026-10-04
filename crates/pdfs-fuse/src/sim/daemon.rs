@@ -1084,4 +1084,58 @@ mod tests {
         eprintln!("lan:  syscalls {lan_syscalls:?}, drain {lan_drain:?}");
         eprintln!("wifi: syscalls {wifi_syscalls:?}, drain {wifi_drain:?}");
     }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn half_of_a_wide_folder_unlinked_at_once_leaves_the_other_half() {
+        // The acceptance suite's wide directory on Wi-Fi. A create that landed
+        // while the folder's listing was on the wire was in neither Drive's
+        // answer nor the queue read after it, and a file that was never
+        // unlinked dropped out of the listing until the next one (B166).
+        let drive = FakeDrive::new();
+        let dir = scratch("wide-unlink");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::wifi())).unwrap();
+        let root = daemon.mountpoint.join("wide");
+        std::fs::create_dir(&root).unwrap();
+        let names: Vec<String> = (0..128).map(|i| format!("entry-{i:04}.txt")).collect();
+        let in_parallel = |op: &(dyn Fn(&str) + Sync), names: &[String]| {
+            std::thread::scope(|scope| {
+                for chunk in names.chunks(names.len().div_ceil(8)) {
+                    scope.spawn(move || chunk.iter().for_each(|name| op(name)));
+                }
+            });
+        };
+        in_parallel(
+            &|name| {
+                let mut file = std::fs::File::create(root.join(name)).unwrap();
+                std::io::Write::write_all(&mut file, name.as_bytes()).unwrap();
+                file.sync_all().unwrap();
+            },
+            &names,
+        );
+        let listed = |root: &std::path::Path| {
+            let mut names: Vec<String> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(listed(&root), names);
+        in_parallel(
+            &|name| std::fs::remove_file(root.join(name)).unwrap(),
+            &names[..64],
+        );
+        assert_eq!(listed(&root), names[64..]);
+        let mut settled = None;
+        while settled.is_none_or(|at: Instant| at.elapsed() < crate::POLL_INTERVAL * 2) {
+            assert_eq!(listed(&root), names[64..]);
+            if settled.is_none() && daemon.pending().is_ok_and(|ops| ops.is_empty()) {
+                settled = Some(Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -2340,6 +2340,39 @@ impl Core {
         Ok(())
     }
 
+    /// The nodes of `before`, queued in `folder_uid` when its listing was asked
+    /// of Drive, that are no longer queued in `after`, as the DB has them now.
+    ///
+    /// Their create landed while the listing was on the wire, after Drive took
+    /// it, and so is in neither. One unlinked or moved away meanwhile is not
+    /// under the folder by that name any more and stays out.
+    fn landed_meanwhile(
+        &self,
+        folder_uid: &NodeUid,
+        before: Vec<Node>,
+        after: &[Node],
+    ) -> Vec<Node> {
+        let still: HashSet<&str> = after.iter().map(|node| node.name.as_str()).collect();
+        let landed: HashSet<String> = before
+            .into_iter()
+            .map(|node| node.name)
+            .filter(|name| !still.contains(name.as_str()))
+            .collect();
+        if landed.is_empty() {
+            return Vec::new();
+        }
+        match self.db.known_children(folder_uid) {
+            Ok(known) => known
+                .into_iter()
+                .filter(|node| landed.contains(&node.name))
+                .collect(),
+            Err(e) => {
+                warn!(%folder_uid, error = %e, "db known_children failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// Serve a listing without the network: the one already in memory if any,
     /// else whatever children the DB still knows. The fallback only answers
     /// until the link is back, when [`Core::relist_offline_listings`] drops it:
@@ -2501,6 +2534,12 @@ impl Core {
 
         let refresh_generation =
             refresh_foreign.then(|| self.shared_generation.load(Ordering::SeqCst));
+        // What is queued before Drive is asked: a create that lands while the
+        // listing is on the wire is in neither Drive's answer nor the queue read
+        // after it (`docs/BUGS.md` B166).
+        let queued_before = (!foreign)
+            .then(|| self.db.queued_children(&folder_uid).ok())
+            .flatten();
         let uids = match self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(&folder_uid))
@@ -2537,7 +2576,12 @@ impl Core {
         // A shared folder's listing is published as Drive has it.
         if !foreign {
             match self.db.queued_children(&folder_uid) {
-                Ok((queued, gone)) => overlay_queued(&mut nodes, queued, &gone),
+                Ok((mut queued, gone)) => {
+                    if let Some((before, _)) = queued_before {
+                        queued.extend(self.landed_meanwhile(&folder_uid, before, &queued));
+                    }
+                    overlay_queued(&mut nodes, queued, &gone)
+                }
                 Err(e) => warn!(%folder_uid, error = %e, "db queued_children failed"),
             }
         }
