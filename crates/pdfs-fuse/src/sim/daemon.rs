@@ -129,6 +129,15 @@ impl Daemon {
         }
     }
 
+    /// Send one control request, as the `pdfs` CLI does, and fail on a
+    /// refusal.
+    pub(crate) fn request(&self, request: &Request) -> io::Result<Response> {
+        match control::send(&self.socket, request).map_err(io::Error::other)? {
+            Response::Error { message, .. } => Err(io::Error::other(message)),
+            response => Ok(response),
+        }
+    }
+
     /// Stop the daemon and start it again on the same state and link.
     pub(crate) fn restart(mut self) -> io::Result<Self> {
         self.shut_down()?;
@@ -461,6 +470,65 @@ mod tests {
             drive.tree()
         );
         assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_pdfs_rename_after_a_queued_rename_is_not_undone() {
+        // `pdfs rename` and `pdfs move` went straight to Drive, and the
+        // mount's own rename, still queued, landed after them and put the old
+        // name back (B149, the account run's B121 case).
+        let drive = FakeDrive::new();
+        let dir = scratch("pdfs-rename-after-queued");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        let mount = &daemon.mountpoint;
+        std::fs::create_dir_all(mount.join("b/inner")).unwrap();
+        std::fs::write(mount.join("b/first.txt"), b"moved").unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().get("b/first.txt").cloned() == file(b"moved")
+        }));
+
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        std::fs::rename(mount.join("b/first.txt"), mount.join("b/back.txt")).unwrap();
+        let path = |rel: &str| mount.join(rel).to_string_lossy().into_owned();
+        daemon
+            .request(&Request::Rename {
+                path: path("b/back.txt"),
+                new_name: "first.txt".into(),
+            })
+            .unwrap();
+        daemon
+            .request(&Request::Move {
+                path: path("b/first.txt"),
+                new_parent: path("b/inner"),
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(mount.join("b/inner/first.txt")).unwrap(),
+            b"moved"
+        );
+        daemon.request(&paused(false)).unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                let tree = drive.tree();
+                tree.get("b/inner/first.txt").cloned() == file(b"moved")
+                    && daemon.pending().is_ok_and(|ops| ops.is_empty())
+            }),
+            "{:?}",
+            drive.tree().keys().collect::<Vec<_>>()
+        );
+        let tree = drive.tree();
+        assert!(!tree.contains_key("b/back.txt") && !tree.contains_key("b/inner/back.txt"));
 
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);

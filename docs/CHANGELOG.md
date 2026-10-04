@@ -33,6 +33,8 @@ folder by local id too.
   for this release.
 
 ### Fixed
+- **`pdfs rename` and `pdfs move` right after a change through the mount are no longer undone.**
+  They are queued behind it, and they work on a file that has not reached Drive yet (B149).
 - **A folder kept offline before it reached Drive stays kept offline.** Its pin was lost when the
   folder landed (B148).
 - **A queued change no longer holds up the queue forever on a link that stops answering.**

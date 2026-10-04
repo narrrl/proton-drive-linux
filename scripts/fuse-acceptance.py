@@ -1658,6 +1658,10 @@ def test_regression_b113_move_before_upload(ctx: Context) -> None:
     to an empty original. Pausing sync holds the bytes back while the files
     move, which is the order the bug needs. The names must not be transient
     ones like `*.part`: those mint nothing and queue their create instead (B70).
+
+    Since changes through the mount are queued (local-first), the create is
+    queued as well and the moves rewrite it before anything reaches Drive. The
+    files must land where they were moved, without conflict copies, either way.
     """
     daemon = ctx.require_daemon()
     if not is_fuse(ctx.root):
@@ -1685,9 +1689,8 @@ def test_regression_b113_move_before_upload(ctx: Context) -> None:
         os.rename(root / "both.bin", moved / "both moved.bin")
         held = [item for item in daemon.queue() if not preexisting(item)]
         check(bool(held), "nothing was queued while sync was paused, so the moves raced nothing")
-        creates = [item["path"] for item in held if item["kind"] == "create"]
-        check(not creates, f"creates were queued, not minted on Drive, so B113 was not replayed: {creates}")
         ctx.note("held_ops", len(held))
+        ctx.note("held_creates", sum(item["kind"] == "create" for item in held))
     finally:
         daemon.command("sync", "resume")
     daemon.wait_for_queue()

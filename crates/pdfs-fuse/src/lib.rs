@@ -1240,13 +1240,24 @@ fn relocate_in_mount(
     uid: &NodeUid,
     new_parent: &NodeUid,
     name: &str,
+    queued: bool,
 ) -> Option<(String, bool)> {
     let ino = *st.by_uid.get(uid)?;
     let entry = st.entries.get(&ino)?;
     let (from_parent, from_name) = (entry.parent, entry.node.name.clone());
     match st.by_uid.get(new_parent).copied() {
         Some(to_parent) => {
-            st.relocate(ino, from_parent, to_parent, new_parent, name);
+            if queued {
+                // Listing again would ask Drive, which still has the old name;
+                // the kernel's pages of both folders go instead.
+                st.rename_in_place(ino, to_parent, new_parent, name);
+                notify.inval_inode(from_parent);
+                if to_parent != from_parent {
+                    notify.inval_inode(to_parent);
+                }
+            } else {
+                st.relocate(ino, from_parent, to_parent, new_parent, name);
+            }
             notify.inval_entry(from_parent, from_name.clone());
             notify.inval_entry(to_parent, name.to_string());
             Some((from_name, true))
@@ -3714,6 +3725,25 @@ impl Core {
         new_parent_uid: &NodeUid,
         new_name: &str,
     ) -> Result<(), Errno> {
+        self.enqueue_rename(ino, uid, old_parent_uid, new_parent_uid, new_name)?;
+        self.state
+            .lock()
+            .rename_in_place(ino, new_parent_ino, new_parent_uid, new_name);
+        self.wake_drain();
+        debug!(%uid, %new_parent_uid, new_name, "renamed offline; queued");
+        Ok(())
+    }
+
+    /// Record the queued rename op, and nothing else: the caller moves the node
+    /// in the tree, through the kernel or around it.
+    fn enqueue_rename(
+        &self,
+        ino: u64,
+        uid: &NodeUid,
+        old_parent_uid: &NodeUid,
+        new_parent_uid: &NodeUid,
+        new_name: &str,
+    ) -> Result<(), Errno> {
         // A rename that replaces a queued one keeps where the node started.
         let meta = match self.db.pending_op_meta(&uid.to_string(), OP_RENAME) {
             Ok(Some(json)) => serde_json::from_str::<RenameMeta>(&json).map_err(|error| {
@@ -3755,11 +3785,6 @@ impl Core {
             error!(%uid, new_name, error = %e, "queueing rename failed");
             Errno::EIO
         })?;
-        self.state
-            .lock()
-            .rename_in_place(ino, new_parent_ino, new_parent_uid, new_name);
-        self.wake_drain();
-        debug!(%uid, %new_parent_uid, new_name, "renamed offline; queued");
         Ok(())
     }
 
@@ -4625,9 +4650,10 @@ impl Core {
     }
 
     /// Rename a file or folder to `new_name`. `rel` is mountpoint-relative.
-    /// Mirrors the FUSE `rename` write path: rename on the remote, then move the
-    /// node to its new name in every mount and drop the parent listing so the
-    /// next `ListDir` re-enumerates.
+    /// Mirrors the FUSE `rename` write path: queued whenever the mount queues
+    /// ([`Core::queue_relocation`]), otherwise renamed on the remote, then
+    /// moved to its new name in every mount with the parent listing dropped
+    /// so the next `ListDir` re-enumerates.
     fn rename(&self, rel: &Path, new_name: &str) -> CoreResult<String> {
         if new_name.is_empty() || new_name.contains('/') {
             return Err(CoreError::invalid(format!("invalid name: {new_name:?}")));
@@ -4641,11 +4667,109 @@ impl Core {
             &old_parent_uid,
         )
         .map_err(|error| self.errno_error(error, "rename access"))?;
+        if self.queues_relocation(&uid, &old_parent_uid) {
+            self.queue_relocation(
+                ino,
+                &uid,
+                &old_parent_uid,
+                &old_parent_uid,
+                &rel.with_file_name(new_name),
+                new_name,
+            )?;
+            return Ok(new_name.to_string());
+        }
         self.rename_remote(&uid, new_name)
             .map_err(|e| CoreError::from_api(&e, "rename"))?;
         self.relocate_everywhere(&uid, &old_parent_uid, new_name);
         self.invalidate_parent_listing(rel);
         Ok(new_name.to_string())
+    }
+
+    /// Whether a rename or move asked for over the control socket goes
+    /// through the queue. It does whenever the same change through the mount
+    /// would, and whenever the node has anything queued: sent straight to
+    /// Drive, it would land first, and the queued change landing after it
+    /// would undo it (`docs/BUGS.md` B149).
+    fn queues_relocation(&self, uid: &NodeUid, new_parent_uid: &NodeUid) -> bool {
+        !self.sends_inline()
+            || is_local_uid(uid)
+            || is_local_uid(new_parent_uid)
+            || self.db.has_any_op(&uid.to_string()).unwrap_or(true)
+    }
+
+    /// Queue renaming or moving the node at `ino` to `dest`, whose last
+    /// component is `name`, and apply it to every mount now, as the mount's
+    /// own queued rename does.
+    ///
+    /// The listings stay: Drive has not been told yet, so listing either
+    /// folder again would bring back the old name.
+    fn queue_relocation(
+        &self,
+        ino: u64,
+        uid: &NodeUid,
+        old_parent_uid: &NodeUid,
+        new_parent_uid: &NodeUid,
+        dest: &Path,
+        name: &str,
+    ) -> CoreResult<()> {
+        // Drive refuses a taken name, but only once the queue sends the change.
+        match self.resolve_path(dest) {
+            Ok((found, _)) if found != ino => {
+                return Err(CoreError::conflict(format!(
+                    "{} already exists",
+                    dest.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.code() == libc::ENOENT => {}
+            Err(e) => {
+                return Err(self.errno_error(e, &format!("could not resolve {}", dest.display())));
+            }
+        }
+        let old_name = self
+            .state()
+            .entries
+            .get(&ino)
+            .map(|entry| entry.node.name.clone())
+            .unwrap_or_default();
+        let mut uid = uid.clone();
+        // A node whose create is still queued is that op: rewriting its target
+        // is the whole change, as through the mount.
+        if is_local_uid(&uid) {
+            match self
+                .db
+                .rewrite_op_target(&uid.to_string(), &new_parent_uid.to_string(), name)
+            {
+                Ok(true) => {
+                    self.relocate_queued_everywhere(&uid, new_parent_uid, name);
+                    // A parked transient file given a finished name is meant
+                    // to reach Drive now (`docs/BUGS.md` B70).
+                    if is_transient_name(&old_name)
+                        && !is_transient_name(name)
+                        && let Err(e) = self.db.set_create_hold(&uid.to_string(), false)
+                    {
+                        warn!(%uid, error = %e, "un-parking a finalized transient create failed");
+                    }
+                    self.wake_drain();
+                    return Ok(());
+                }
+                // The create landed meanwhile: rename what Drive made.
+                Ok(false) => {
+                    uid = self.landed_row_uid(ino).ok_or_else(|| {
+                        CoreError::conflict(format!(
+                            "{old_name} changed while it was being renamed; try again"
+                        ))
+                    })?;
+                }
+                Err(e) => return Err(CoreError::internal(format!("db: {e}"))),
+            }
+        }
+        self.enqueue_rename(ino, &uid, old_parent_uid, new_parent_uid, name)
+            .map_err(|e| self.errno_error(e, "queue the change"))?;
+        self.relocate_queued_everywhere(&uid, new_parent_uid, name);
+        self.wake_drain();
+        debug!(%uid, %new_parent_uid, name, "renamed over the control socket; queued");
+        Ok(())
     }
 
     /// Bring every mount level with a rename or move Drive has made of `uid`,
@@ -4667,11 +4791,28 @@ impl Core {
         new_parent: &NodeUid,
         name: &str,
     ) -> Option<String> {
+        self.relocate_with(uid, new_parent, name, false)
+    }
+
+    /// [`Core::relocate_everywhere`] for a change the queue has not sent yet.
+    /// Each mount keeps its listings, which Drive cannot bring up to date
+    /// until the change lands.
+    fn relocate_queued_everywhere(&self, uid: &NodeUid, new_parent: &NodeUid, name: &str) {
+        self.relocate_with(uid, new_parent, name, true);
+    }
+
+    fn relocate_with(
+        &self,
+        uid: &NodeUid,
+        new_parent: &NodeUid,
+        name: &str,
+        queued: bool,
+    ) -> Option<String> {
         let mut old_name = None;
         let mut moved_row = false;
         self.for_each_mount(|st, notify| {
             if let Some((from_name, relocated)) =
-                relocate_in_mount(st, notify, uid, new_parent, name)
+                relocate_in_mount(st, notify, uid, new_parent, name, queued)
             {
                 old_name = Some(from_name);
                 moved_row |= relocated;
@@ -4720,8 +4861,10 @@ impl Core {
     }
 
     /// Move a file or folder into the folder at `new_parent_rel`. Both paths are
-    /// mountpoint-relative. Moves the node in every mount and invalidates both
-    /// the source and destination listings so each re-enumerates on next access.
+    /// mountpoint-relative. Queued whenever the mount queues
+    /// ([`Core::queue_relocation`]); otherwise moved on the remote, then in
+    /// every mount, with both listings invalidated so each re-enumerates on
+    /// next access.
     fn move_to(&self, rel: &Path, new_parent_rel: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let old_parent_uid = self.source_parent_uid(ino, rel)?;
@@ -4741,6 +4884,20 @@ impl Core {
             .get(&ino)
             .map(|entry| entry.node.name.clone())
             .unwrap_or_default();
+        if self.queues_relocation(&uid, &new_parent_uid) {
+            if self.state().is_ancestor_of(ino, pino) {
+                return Err(CoreError::invalid("cannot move a folder into itself"));
+            }
+            self.queue_relocation(
+                ino,
+                &uid,
+                &old_parent_uid,
+                &new_parent_uid,
+                &new_parent_rel.join(&name),
+                &name,
+            )?;
+            return Ok(name);
+        }
         self.move_remote(&uid, &new_parent_uid)
             .map_err(|e| CoreError::from_api(&e, "move"))?;
         self.relocate_everywhere(&uid, &new_parent_uid, &name);
@@ -8912,7 +9069,7 @@ mod tests {
         let dst_uid = state.entries[&dst].uid.clone();
 
         let mut notify = NotifyBatch::default();
-        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &dst_uid, "b.txt");
+        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &dst_uid, "b.txt", false);
         assert_eq!(outcome, Some(("a.txt".to_string(), true)));
         assert_eq!(state.by_uid.get(&uid), Some(&ino), "the inode survives");
         assert_eq!(state.entries[&ino].parent, dst);
@@ -8932,7 +9089,7 @@ mod tests {
         // kernel the name, but the row stays for the caller to move.
         let elsewhere = node_helper("elsewhere", "none", "elsewhere", true).uid;
         let mut notify = NotifyBatch::default();
-        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &elsewhere, "c.txt");
+        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &elsewhere, "c.txt", false);
         assert_eq!(outcome, Some(("b.txt".to_string(), false)));
         assert!(!state.by_uid.contains_key(&uid));
         assert!(notify.0.iter().any(|notice| matches!(
@@ -8946,6 +9103,41 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A control-socket move that is queued keeps both listings: Drive still
+    /// has the old name, so listing again would bring it back (B149).
+    #[test]
+    fn a_queued_control_move_keeps_both_listings() {
+        use super::{KernelNotice, NotifyBatch, relocate_in_mount};
+
+        let (mut state, _dir) = state_test_helper();
+        let src = state.intern(0, node_helper("src", "none", "src", true));
+        let dst = state.intern(0, node_helper("dst", "none", "dst", true));
+        let moved = node_helper("moved", "src", "a.txt", false);
+        let uid = moved.uid.clone();
+        let ino = state.intern(src, moved);
+        state.children.insert(src, vec![ino]);
+        state.children.insert(dst, vec![]);
+        let dst_uid = state.entries[&dst].uid.clone();
+
+        let mut notify = NotifyBatch::default();
+        let outcome = relocate_in_mount(&mut state, &mut notify, &uid, &dst_uid, "b.txt", true);
+        assert_eq!(outcome, Some(("a.txt".to_string(), true)));
+        assert_eq!(state.children.get(&src), Some(&vec![]));
+        assert_eq!(state.children.get(&dst), Some(&vec![ino]));
+        assert_eq!(state.entries[&ino].node.name, "b.txt");
+        for folder in [src, dst] {
+            assert!(
+                notify.0.iter().any(
+                    |notice| matches!(notice, KernelNotice::InvalInode(ino) if *ino == folder)
+                )
+            );
+        }
+        assert!(notify.0.iter().any(|notice| matches!(
+            notice,
+            KernelNotice::InvalEntry { parent, name } if *parent == src && name == "a.txt"
+        )));
     }
 
     #[test]

@@ -12,6 +12,26 @@ Conventions:
 
 ---
 
+## B149 — `pdfs rename` or `pdfs move` right after a rename through the mount is undone
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the account run on a6f36d5: the B121 case failed on every on-demand
+mount. After renaming and moving a file through the mount, it ran `pdfs rename` and `pdfs move`,
+and `pdfs ls` then showed the file in the right folder under the name the mount had given it.
+
+**Where:** `Core::rename` and `Core::move_to` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** Since changes made through the mount are queued (local-first), the mount's rename was
+still in the queue when the CLI's requests came. Those went straight to Drive, landed first, and
+the queued rename landed after them and put its own name back. A file whose create was still
+queued could not be renamed by `pdfs` at all, since Drive does not know it yet.
+
+**Fix.** `pdfs rename` and `pdfs move` within a mount are queued whenever the mount would queue
+the same change, or the node has anything queued. The tree and the kernel are updated at once,
+as for a rename through the mount, and a taken name is refused up front. A node whose create is
+still queued has that create's target rewritten instead. A move between two locations still goes
+straight to Drive.
+
 ## B148 — A folder pinned before it has reached Drive loses its pin
 
 **Status:** Fixed (unverified).
