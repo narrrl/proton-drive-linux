@@ -338,6 +338,7 @@ impl FakeDrive {
             hold: Mutex::new(None),
             hold_answer: Mutex::new(None),
             hold_trash: Mutex::new(None),
+            hold_landing: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
             lose_create_reply: AtomicBool::new(false),
             hold_create_reply: Mutex::new(None),
@@ -615,6 +616,8 @@ struct ClientInner {
     hold_answer: Mutex<Option<Arc<HoldState>>>,
     /// The trash [`FakeClient::hold_next_trash`] is waiting for.
     hold_trash: Mutex<Option<Arc<HoldState>>>,
+    /// The landing [`FakeClient::hold_next_landing`] is waiting for.
+    hold_landing: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::drop_link_after_next_create`].
     drop_after_create: AtomicBool,
     /// Set by [`FakeClient::lose_reply_to_next_create`].
@@ -749,6 +752,19 @@ impl FakeClient {
             released: AtomicBool::new(false),
         });
         *self.0.hold_trash.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Hold the drain once the next upload to `uid` has landed and its blob
+    /// is let go of, before the tree has the node (`DriveApi::landing`), until
+    /// the answer is dropped.
+    pub(crate) fn hold_next_landing(&self, uid: &NodeUid) -> Held {
+        let state = Arc::new(HoldState {
+            uid: uid.clone(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_landing.lock() = Some(state.clone());
         Held(state)
     }
 
@@ -1463,6 +1479,21 @@ impl DriveApi for FakeClient {
 
     fn delete_nodes_streaming<'a>(&'a self, uids: &[NodeUid]) -> OutcomeStream<'a> {
         outcome_stream(self.batch(uids, delete_one))
+    }
+
+    fn landing(&self, uid: &NodeUid) {
+        let state = {
+            let mut hold = self.0.hold_landing.lock();
+            match hold.as_ref() {
+                Some(state) if state.uid == *uid => hold.take(),
+                _ => None,
+            }
+        };
+        let Some(state) = state else { return };
+        state.reached.store(true, Ordering::SeqCst);
+        while !state.released.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     async fn quota(&self) -> Result<Quota> {

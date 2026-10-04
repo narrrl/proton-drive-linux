@@ -424,6 +424,47 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_write_opened_as_an_upload_lands_takes_the_landed_revision_as_its_base() {
+        // An upload landed and the drain let go of its blob before the tree had
+        // the node. A partial write opened in between took the revision the
+        // upload replaced as its base, found none of its bytes cached, and
+        // queued an incomplete revision: the next write open failed with EIO
+        // (B170).
+        let drive = FakeDrive::new();
+        let dir = scratch("write-opened-as-upload-lands");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        std::fs::write(&path, b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("f.txt").cloned() == file(b"first")
+        }));
+        let uid = drive.lookup("f.txt").unwrap();
+        let landing = daemon.client.hold_next_landing(&uid);
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+        write_at(&path, 2, b"ab").unwrap();
+        drop(landing);
+        write_at(&path, 6, b"cd").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"01ab45cd89")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name() {
         // The move queued behind the create landed while the drain read the
         // new node back. The answer still had the old name, and the drain no

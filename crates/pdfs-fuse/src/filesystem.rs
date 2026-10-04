@@ -1217,7 +1217,7 @@ impl ProtonFs {
     /// open.
     fn serve_open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        let (uid, base_mtime, base_size, provisional, base_revision_id) = {
+        let (uid, mut base_mtime, mut base_size, mut provisional, mut base_revision_id) = {
             let mut st = self.core.state();
             match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
@@ -1283,22 +1283,24 @@ impl ProtonFs {
         // `reply` is consumed by whichever arm answers, so the loop yields an
         // outcome and the answer is sent once, after it.
         let outcome = 'install: {
-            // The handle starts at the base's size. A provisional one is the
-            // ciphertext size, so the file would grow by the encryption overhead
-            // and reading the base would fail (bugs.md B100). A queued revision
-            // stamps a real size, so this only goes to the network for a file
-            // the listing has not sized yet.
-            let base_size = match provisional && self.core.pending_blob(&uid).is_none() {
-                false => base_size,
-                true => match self.core.resolve_provisional_size(ino.0, &uid) {
-                    Some(size) => size,
-                    None => {
-                        error!(%uid, "could not settle the size of the base for a write open");
-                        break 'install Err(Errno::EIO);
-                    }
-                },
-            };
             for attempt in 0..OPEN_BASE_ATTEMPTS {
+                // The handle starts at the base's size. A provisional one is the
+                // ciphertext size, so the file would grow by the encryption
+                // overhead and reading the base would fail (bugs.md B100). A
+                // queued revision stamps a real size, so this only goes to the
+                // network for a file the listing has not sized yet.
+                if provisional && self.core.pending_blob(&uid).is_none() {
+                    match self.core.resolve_provisional_size(ino.0, &uid) {
+                        Some(size) => {
+                            base_size = size;
+                            provisional = false;
+                        }
+                        None => {
+                            error!(%uid, "could not settle the size of the base for a write open");
+                            break 'install Err(Errno::EIO);
+                        }
+                    }
+                }
                 let pending_base = self.core.pending.lock().get(&uid).cloned();
                 if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
                     error!(%uid, "refusing write over incomplete queued revision");
@@ -1332,16 +1334,48 @@ impl ProtonFs {
                 // a lock-tight comparison — against the multi-gigabyte copy
                 // above, which is the window that actually loses data.
                 let current = self.core.pending_blob(&uid);
+                let landed = self.core.landed.lock().get(&uid).cloned();
                 let mut st = self.core.state();
                 // Only a handle this open is about to *create* can carry a stale
                 // base; if one already exists, that handle is authoritative and
                 // the scratch prepared above is discarded either way.
                 let creating = !st.active_writes.contains_key(&ino.0);
-                if creating && current != pending_base.map(|p| p.path) {
+                if creating && current.as_ref() != pending_base.as_ref().map(|p| &p.path) {
                     drop(st);
                     let _ = std::fs::remove_file(&path);
                     warn!(%uid, attempt, "queued revision changed while opening for write; retrying");
                     continue;
+                }
+                // With no queued revision, the base's bytes come from the cache,
+                // keyed by the base's mtime and size. The ones sampled above can
+                // name a revision this daemon has since replaced: an upload that
+                // lands lets go of its blob before the tree has its node, and
+                // the cache holds its bytes under the node only. So the base is
+                // the landing node while there is one, and the tree's otherwise
+                // (docs/BUGS.md B170).
+                if creating && pending_base.is_none() {
+                    let now = landed.or_else(|| st.entries.get(&ino.0).map(|e| e.node.clone()));
+                    if let Some(node) = now
+                        && (node.modification_time != base_mtime
+                            || node_revision_id(&node) != base_revision_id)
+                    {
+                        base_mtime = node.modification_time;
+                        base_size = node_size(&node);
+                        base_revision_id = node_revision_id(&node);
+                        provisional = matches!(
+                            &node.kind,
+                            NodeKind::File {
+                                claimed_size: None,
+                                ..
+                            }
+                        );
+                        debug!(%uid, base_mtime, base_size, "write open took the base the file has now");
+                        if provisional {
+                            drop(st);
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                    }
                 }
                 let fh = st.next_fh;
                 st.next_fh += 1;

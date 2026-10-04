@@ -68,6 +68,8 @@ by its local id, in the queue, the stored tree and pins alike.
   to upload them to the top of your Drive instead (B168).
 - **Stopping the daemon during a folder sync no longer waits for the sync.** The uploads in
   progress finish, and the rest waits for the next start (B169).
+- **Writing to a file again just as its upload finishes no longer fails.** A write right after
+  it failed with "Input/output error" (B170).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

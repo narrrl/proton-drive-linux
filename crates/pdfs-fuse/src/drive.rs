@@ -153,6 +153,12 @@ pub(crate) trait DriveApi: Send + Sync {
 
     /// The account's storage, across every Proton product.
     async fn quota(&self) -> Result<Quota>;
+
+    /// Called by the drain once it has let go of the blob of an upload to
+    /// `uid` that landed, before the tree has the node, so a simulation can
+    /// hold it there. Blocks the drain worker it is called on.
+    #[cfg(test)]
+    fn landing(&self, _uid: &NodeUid) {}
 }
 
 /// The generic signatures of the client, over the object-safe ones above.

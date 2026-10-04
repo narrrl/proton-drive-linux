@@ -2365,14 +2365,29 @@ impl Core {
                     warn!(%uid, error = %e, "persisting our sealed revision failed");
                 }
             }
+            // A write open from here until the tree has the node takes it as
+            // its base: the blob it would have copied is let go of below, and
+            // the tree's stamp names the revision this one replaced
+            // (docs/BUGS.md B170).
+            self.landed.lock().insert(uid.clone(), node.clone());
             self.rebase_open_writes(uid, &node);
         }
         self.release_pending(uid, blob);
+        #[cfg(test)]
+        self.drive.landing(uid);
+        self.place_landed(uid, &node);
+        self.landed.lock().remove(uid);
+        Some(node)
+    }
+
+    /// Put a node whose upload just landed into the tree, unless a newer write
+    /// is queued for it.
+    fn place_landed(&self, uid: &NodeUid, node: &Node) {
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
         // this overwrites it with the revision the server actually holds.
-        if self.rebaseline_pending(uid, &node) {
-            return Some(node);
+        if self.rebaseline_pending(uid, node) {
+            return;
         }
         // A rename queued behind the upload has not reached Drive yet, and
         // until it lands the tree keeps the name and folder the user gave the
@@ -2402,7 +2417,6 @@ impl Core {
             }
             st.intern(parent, node);
         });
-        Some(node)
     }
 
     /// Rebase every write handle open on `uid` onto `node`, a revision this

@@ -579,6 +579,9 @@ struct Core {
     /// The SHA-1 of the last revision this daemon uploaded to a file and could
     /// not read back, so its revision id is not known (`docs/BUGS.md` B157).
     sealed_unread: Arc<Mutex<HashMap<NodeUid, String>>>,
+    /// The node an upload has just put on Drive, from when the drain lets go
+    /// of its blob until the tree has the node (`docs/BUGS.md` B170).
+    landed: Arc<Mutex<HashMap<NodeUid, Node>>>,
     /// Creates that landed but could not be read back, by the uid Drive gave
     /// them, with the placeholder's. The drain adopts one before it sends
     /// anything else for it.

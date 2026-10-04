@@ -12,6 +12,37 @@ Conventions:
 
 ---
 
+## B170 — A write opened as an upload lands fails the next write with `EIO`
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by CI on 9bbc994 and by three parallel copies of
+`one_client_on_a_good_link` (seed 4; seed 5 in the local suite). A write at an offset was
+refused with `EIO`, and the daemon logged "refusing write over incomplete queued revision".
+Just before, an open had retried with "queued revision changed while opening for write", and
+the queued write it then made was incomplete.
+
+**Where:** `serve_open` in `crates/pdfs-fuse/src/filesystem.rs`, and `Core::refresh_after_upload`
+in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** When an upload lands, the drain caches its bytes under the node as Drive has it,
+rebases the open write handles onto it, lets go of the blob, and then puts the node in the
+tree. A write open in between found no blob to copy and took the base it had sampled at its
+start: the mtime and size the tree had before the upload. The release of its partial write
+filled the gaps from the cache under that key, found nothing, and queued an incomplete
+revision, and a write open over one is refused (B123). Under load, the open retried because
+of the landing and met that window.
+
+**Fix.** From before the drain lets go of the blob until the tree has the node, the landing
+node is kept aside. A write open with no queued revision takes its base from that node, or
+else from the tree as it is when the handle goes in, not from its first sample.
+
+**Test:** `a_write_opened_as_an_upload_lands_takes_the_landed_revision_as_its_base` in
+`sim/daemon.rs` holds the drain in that window with the fake Drive's new `hold_next_landing`,
+writes at an offset, and writes again after it. Without the fix the second write fails with
+`EIO`.
+
+---
+
 ## B169 — A stop lets a mirror pass go on until the runtime ends under it
 
 **Status:** Fixed.
