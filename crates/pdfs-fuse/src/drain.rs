@@ -1337,9 +1337,14 @@ impl Core {
         }
         let uids = self.block_on_bounded(self.drive.enumerate_folder_children_node_uids(parent))?;
         let children = self.block_on_bounded(self.drive.enumerate_nodes_light(&uids))?;
+        // A node this mount trashed is not one an unanswered create made, even
+        // while its trash is on the wire or a listing still shows it. Taking a
+        // folder removed and made again put the new one's contents into the
+        // old one, and its trash took them along (docs/BUGS.md B162).
+        let hidden = self.hidden.lock().clone();
         let Some(twin) = children
             .into_iter()
-            .find(|node| node.name == name && !node.trashed)
+            .find(|node| node.name == name && !node.trashed && !hidden.contains(&node.uid))
         else {
             return Ok(None);
         };

@@ -332,6 +332,7 @@ impl FakeDrive {
             requests: AtomicU64::new(0),
             hold: Mutex::new(None),
             hold_answer: Mutex::new(None),
+            hold_trash: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
             lose_create_reply: AtomicBool::new(false),
             hold_create_reply: Mutex::new(None),
@@ -587,6 +588,8 @@ struct ClientInner {
     hold: Mutex<Option<Arc<HoldState>>>,
     /// The read [`FakeClient::hold_answer_to_next_read`] is waiting for.
     hold_answer: Mutex<Option<Arc<HoldState>>>,
+    /// The trash [`FakeClient::hold_next_trash`] is waiting for.
+    hold_trash: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::drop_link_after_next_create`].
     drop_after_create: AtomicBool,
     /// Set by [`FakeClient::lose_reply_to_next_create`].
@@ -681,6 +684,18 @@ impl FakeClient {
             released: AtomicBool::new(false),
         });
         *self.0.hold_answer.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Hold the next trash of `uid` alone, before it reaches Drive, until the
+    /// answer is dropped.
+    pub(crate) fn hold_next_trash(&self, uid: &NodeUid) -> Held {
+        let state = Arc::new(HoldState {
+            uid: uid.clone(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_trash.lock() = Some(state.clone());
         Held(state)
     }
 
@@ -1313,6 +1328,7 @@ impl DriveApi for FakeClient {
     }
 
     async fn trash_nodes(&self, uids: &[NodeUid]) -> Result<NodeOutcomes> {
+        self.wait_if_held(&self.0.hold_trash, uids).await;
         self.batch(uids, trash_one).await
     }
 

@@ -12,6 +12,32 @@ Conventions:
 
 ---
 
+## B162 — A folder removed and made again at once loses what goes into it
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the simulation's slow-link profile (`one_client_on_a_slow_link`,
+seed 4). The client removed folder `z` and made `z` again, with `z/x` and `z/x/y` inside. All
+three stayed in the mount but never reached Drive. The log showed the new `z` "adopting" the old
+one.
+
+**Where:** `Core::adoptable_twin` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A create that finds its name taken looks for a node an earlier, unanswered attempt
+of its own made (B127), and adopts it. The old folder's trash was still on the wire, so Drive
+refused the new folder's name, and the listing showed the old folder, not in the tree any more
+and made a moment ago. The new folder took it for its own twin. What went into the new folder
+was created in the old one, and the trash then took it all along.
+
+**Fix.** The twin search skips nodes this mount trashed (its `hidden` set), as listings already
+do. The create then waits for the trash to free the name (`name_is_held`), or takes the name
+at once if the trash has landed (B144).
+
+**Test:** simulation test `a_folder_made_again_while_the_old_one_is_trashed_is_a_new_folder`
+(failed before the fix: Drive ended up empty). The fake Drive can now hold a trash
+(`FakeClient::hold_next_trash`).
+
+---
+
 ## B161 — A file moved while it was being created shows up under its old name
 
 **Status:** Fixed.
