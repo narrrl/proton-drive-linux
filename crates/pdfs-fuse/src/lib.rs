@@ -2521,6 +2521,17 @@ impl Core {
             Ok(None) => {}
             Err(e) => warn!(%folder_uid, error = %e, "db children_if_listed failed"),
         }
+        // Drive knows nothing by a stand-in. Until its mkdir lands the folder
+        // is only here, and once it has, the DB holds what Drive does. A
+        // listing dropped meanwhile was asked of Drive, and every lookup in
+        // the folder failed with EIO (`docs/BUGS.md` B125).
+        if is_local_uid(&folder_uid) {
+            let nodes = self.db.known_children(&folder_uid).map_err(|e| {
+                warn!(%folder_uid, error = %e, "db known_children failed");
+                Errno::EIO
+            })?;
+            return self.adopt_db_listing(ino, &folder_uid, nodes, primary_root);
+        }
         if !self.is_online() {
             return self.adopt_stale_listing(ino, &folder_uid, cached, primary_root);
         }

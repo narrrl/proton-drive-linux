@@ -1344,7 +1344,7 @@ profile fails on it when it comes up, which depends on timing.
 
 ## B125 — A folder made offline fails with `EIO` once its listing is invalidated
 
-**Status:** Open.
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seeds 3
 and 4). Right after a restart, `rmdir y` (seed 3), and a write to a file in the client's folder
 (seed 4), failed with `EIO`. The daemon logged "enumerate folder children failed" with Drive's
@@ -1362,8 +1362,17 @@ uid. Drive answers 404, and every lookup in the folder fails with `EIO` until it
 Right after it lands, Drive may not list the new folder yet (the lag of B118). Then the listing
 fails with a 404 for the real uid too.
 
-**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the flaky profile
-fails on it.
+**Fix.** A folder still known by its stand-in is listed from the database and never asked of
+Drive. Until its mkdir lands the folder is only here; once it has, the database holds what Drive
+does. The second case, a listing by the real uid that Drive does not show yet, needs a create
+that landed without being read back: the read-back waits up to 1.25 s for Drive to list the
+folder, longer than the lag of any simulation profile. The runs keep counting both until they
+show neither again.
+
+**Test:** `a_folder_whose_mkdir_is_queued_lists_after_a_refresh` in
+`crates/pdfs-fuse/src/sim/daemon.rs`: with sync paused, a folder is made with a file in it, a
+refresh drops its listing, and it is listed again. With `PDFS_SIM_KNOWN=fail` the flaky profile
+fails on it in the simulation runs; seeds 3 and 4 no longer reach it since phase 3.
 
 ## B124 — After a replacing rename fails, the file it was replacing is gone from the mount
 

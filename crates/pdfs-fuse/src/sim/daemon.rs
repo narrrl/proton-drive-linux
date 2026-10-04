@@ -278,6 +278,7 @@ pub(crate) fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> boo
 mod tests {
     use super::*;
     use crate::sim::fake_drive::{Entry, FakeDrive, Faults};
+    use pdfs_core::control::RefreshScope;
     use std::collections::BTreeMap;
 
     #[test]
@@ -640,6 +641,49 @@ mod tests {
             drive.tree()
         );
 
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_folder_whose_mkdir_is_queued_lists_after_a_refresh() {
+        // Once its listing was dropped, the folder was asked of Drive by its
+        // stand-in, and every listing and lookup in it failed with EIO until
+        // its mkdir landed (B125).
+        let drive = FakeDrive::new();
+        let dir = scratch("queued-folder-refresh");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        std::fs::create_dir(mnt.join("d")).unwrap();
+        std::fs::write(mnt.join("d/f.txt"), b"queued").unwrap();
+        let path = mnt.join("d").to_string_lossy().into_owned();
+        let refresh = Request::Refresh {
+            scope: RefreshScope::Dir { path: path.clone() },
+        };
+        assert!(matches!(daemon.request(&refresh), Ok(Response::Ok { .. })));
+        let Ok(Response::Entries { entries }) = daemon.request(&Request::ListDir { path }) else {
+            panic!("the daemon did not list d");
+        };
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["f.txt"]);
+        assert_eq!(std::fs::read(mnt.join("d/f.txt")).unwrap(), b"queued");
+        daemon.request(&paused(false)).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("d/f.txt")
+                        == Some(&Entry::File(Arc::new(b"queued".to_vec())))
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
