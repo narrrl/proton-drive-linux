@@ -334,6 +334,8 @@ impl FakeDrive {
             lose_create_reply: AtomicBool::new(false),
             hold_create_reply: Mutex::new(None),
             lose_revision_reply: AtomicBool::new(false),
+            lose_revision_read_back: AtomicBool::new(false),
+            lose_read: Mutex::new(None),
         }))
     }
 
@@ -589,6 +591,10 @@ struct ClientInner {
     hold_create_reply: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::lose_reply_to_next_revision`].
     lose_revision_reply: AtomicBool,
+    /// Set by [`FakeClient::lose_read_back_of_next_revision`].
+    lose_revision_read_back: AtomicBool,
+    /// The file whose next read goes unanswered, once its revision is made.
+    lose_read: Mutex<Option<NodeUid>>,
 }
 
 struct HoldState {
@@ -676,6 +682,13 @@ impl FakeClient {
     /// Make the next revision of a file on Drive and lose its answer.
     pub(crate) fn lose_reply_to_next_revision(&self) {
         self.0.lose_revision_reply.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the next revision of a file on Drive and answer it, then lose the
+    /// answer to the next read of that file alone, as the read-back after an
+    /// upload meets on a link that drops it.
+    pub(crate) fn lose_read_back_of_next_revision(&self) {
+        self.0.lose_revision_read_back.store(true, Ordering::SeqCst);
     }
 
     /// Wait here if `uids` is the read a [`Held`] is for.
@@ -916,6 +929,16 @@ impl DriveApi for FakeClient {
 
     async fn enumerate_nodes(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
         self.wait_if_held(uids).await;
+        {
+            let mut lose = self.0.lose_read.lock();
+            if lose
+                .as_ref()
+                .is_some_and(|uid| uids == std::slice::from_ref(uid))
+            {
+                *lose = None;
+                return Err(no_answer());
+            }
+        }
         let lag = self.lag();
         let nodes: Vec<Node> = self
             .request(false, |server| {
@@ -1167,6 +1190,9 @@ impl DriveApi for FakeClient {
         .await?;
         if self.0.lose_revision_reply.swap(false, Ordering::SeqCst) {
             return Err(no_answer());
+        }
+        if self.0.lose_revision_read_back.swap(false, Ordering::SeqCst) {
+            *self.0.lose_read.lock() = Some(file_uid.clone());
         }
         Ok(())
     }

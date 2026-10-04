@@ -1752,6 +1752,22 @@ impl Core {
             debug!(%uid, ?remote_rev, "the remote already holds the queued write; not a conflict");
             return Ok(None);
         }
+        // An upload of ours landed and its read-back went unanswered, so its
+        // revision id was never recorded as ours. The bytes it sent say the
+        // same: the remote holds them, so no other device wrote since
+        // (docs/BUGS.md B157).
+        let sealed = self.sealed_unread.lock().get(uid).cloned();
+        if meta.complete
+            && let Some(sealed) = sealed
+            && let NodeKind::File {
+                content_sha1: Some(remote),
+                ..
+            } = &node.kind
+            && remote.eq_ignore_ascii_case(&sealed)
+        {
+            debug!(%uid, ?remote_rev, "queued write chains onto our own unread revision; not a conflict");
+            return Ok(None);
+        }
         Ok(Some(reason))
     }
 
@@ -2178,13 +2194,11 @@ impl Core {
         // B119). Adopted by link, not by value: the blob is the whole file, and
         // a video read into a `Vec` here is an OOM. `discard_staged` below drops
         // the staging name only — the cache keeps the inode.
-        self.refresh_after_upload(&uid, &blob, |node| {
-            if node_size(node) == meta.len
+        self.refresh_after_upload(&uid, &blob, |mtime, size| {
+            if size == meta.len
                 && keeps_landed_upload(self.cache.is_pinned(&uid), meta.len, self.cache.budget())
             {
-                let _ = self
-                    .cache
-                    .store_file(&uid, node.modification_time, meta.len, &blob);
+                let _ = self.cache.store_file(&uid, mtime, meta.len, &blob);
             }
         });
         self.cache.discard_staged(&blob);
@@ -2222,11 +2236,16 @@ impl Core {
     /// that conflicted with itself and left a full-size duplicate behind.
     ///
     /// `blob` is the revision that landed, which stays the pending one until
-    /// open write handles are rebased off it, and `adopt` gets the node read
-    /// back before that, so the uploaded bytes can be cached under its
-    /// revision first. A handle released in between fills its gaps from one
-    /// or the other; with the blob let go first and the cache filled last, it
-    /// found neither, and the next write open was refused (docs/BUGS.md B123).
+    /// open write handles are rebased off it, and `adopt` gets the mtime and
+    /// size of the node read back before that, so the uploaded bytes can be
+    /// cached under its revision first. A handle released in between fills its
+    /// gaps from one or the other; with the blob let go first and the cache
+    /// filled last, it found neither, and the next write open was refused
+    /// (docs/BUGS.md B123). When the node cannot be read back, `adopt` gets
+    /// the stamp the tree still has, which is the base a write opened next
+    /// takes: without it the blob went and nothing replaced it (B157). The
+    /// blob's digest then stands in for the revision id the read-back did
+    /// not bring, so the next write knows the revision as its own.
     ///
     /// Best effort: a failure here costs a spurious conflict copy on the next
     /// write, not this upload, which has already landed. Returns the node as
@@ -2235,25 +2254,50 @@ impl Core {
         &self,
         uid: &NodeUid,
         blob: &Path,
-        adopt: impl FnOnce(&Node),
+        adopt: impl FnOnce(i64, u64),
     ) -> Option<Node> {
         let fetched = self.fetch_node_remote(uid);
-        if !matches!(fetched, Ok(Some(_))) {
-            self.release_pending(uid, blob);
+        if fetched.is_ok() {
+            self.sealed_unread.lock().remove(uid);
         }
         let node = match fetched {
             Ok(Some(node)) => node,
             // Trashed or deleted under us: the tree will hear it from the event
             // sync, which is better placed to unhook the inode than we are.
-            Ok(None) => return None,
+            Ok(None) => {
+                self.release_pending(uid, blob);
+                return None;
+            }
             Err(e) => {
                 warn!(%uid, error = %e,
                       "refreshing metadata after an upload failed; \
                        the next write to this file may conflict with itself");
+                match staged_sha1(blob) {
+                    Ok(sha) => {
+                        self.sealed_unread.lock().insert(uid.clone(), sha);
+                    }
+                    Err(_) => {
+                        self.sealed_unread.lock().remove(uid);
+                    }
+                }
+                // No newer write took over, so the tree's stamp is this upload's.
+                if self.pending_blob(uid).as_deref() == Some(blob) {
+                    let mut stamp = None;
+                    self.for_each_state(|st| {
+                        if let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))
+                        {
+                            stamp = Some((entry.node.modification_time, node_size(&entry.node)));
+                        }
+                    });
+                    if let Some((mtime, size)) = stamp {
+                        adopt(mtime, size);
+                    }
+                }
+                self.release_pending(uid, blob);
                 return None;
             }
         };
-        adopt(&node);
+        adopt(node.modification_time, node_size(&node));
         // This function's whole job is to bring the tree level with the revision
         // we just sealed, so the feed's report of that revision has nothing left
         // to tell us. Claimed here rather than at the upload call so it is only

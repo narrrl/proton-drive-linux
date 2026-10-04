@@ -360,6 +360,46 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_whose_upload_was_not_read_back_takes_two_writes_at_once() {
+        // The read-back after an upload went unanswered, and the drain let go of
+        // the uploaded bytes without caching them. A partial write had nothing
+        // to fill its gaps from, and the next open was refused with EIO (B157).
+        let drive = FakeDrive::new();
+        let dir = scratch("upload-not-read-back");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        std::fs::write(&path, b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("f.txt").cloned() == file(b"first")
+        }));
+        daemon.client.lose_read_back_of_next_revision();
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("f.txt").cloned() == file(b"0123456789")
+        }));
+        write_at(&path, 2, b"ab").unwrap();
+        write_at(&path, 6, b"cd").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"01ab45cd89")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn the_echo_of_our_own_rename_keeps_the_cached_bytes() {
         // The echo read as someone else's change and evicted the bytes, so a
         // partial write could not gap-fill, and the next write open on the

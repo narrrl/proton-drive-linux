@@ -42,6 +42,8 @@ by its local id, in the queue, the stored tree and pins alike.
   answer to its upload** (B155).
 - **A file written again while its upload was being retried no longer lands as a conflict copy
   of itself when the link lost Drive's answer to the first try** (B156).
+- **Writing to a file twice in a row no longer fails with "Input/output error" when the link
+  lost Drive's answer to reading back the file's last upload** (B157).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

@@ -12,6 +12,36 @@ Conventions:
 
 ---
 
+## B157 — A second write to a file whose upload was not read back fails with `EIO`
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's Wi-Fi profile (`one_client_on_a_slow_link`, seed 4,
+every replay on 16fca10, none on dbc4d9a: sixteen drain workers changed the timing). After an
+upload of `c.bin` landed, the read-back of the node went unanswered. A write at an offset
+followed, and the next write to the file failed with `EIO`. The daemon logged "refusing write
+over incomplete queued revision".
+
+**Where:** `Core::refresh_after_upload` and `Core::revision_conflict` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The uploaded bytes are cached under the revision the read-back returns (B123). With no
+read-back, the drain let go of the staged blob and cached nothing. A partial write opened next had
+nothing to fill its gaps from, so it queued an incomplete revision, and a write open over one is
+refused. Had it been filled, the write would have landed as a conflict copy of itself: the
+revision id of the upload was never recorded as ours (`own_sealed_rev`).
+
+**Fix.** When the read-back fails, the uploaded bytes are cached under the size and mtime the
+tree still has for the file, which is the base a write opened next takes, unless a newer write
+has taken over. The SHA-1 of those bytes is kept in memory, and a queued write that finds the
+remote holding them chains onto it instead of forking. After a restart the write still forks a
+conflict copy, which loses nothing.
+
+**Test:** sim test `a_file_whose_upload_was_not_read_back_takes_two_writes_at_once`, with the
+fake Drive's new `lose_read_back_of_next_revision`. Without the fix the second write fails with
+`EIO`; with only the cache fix, it lands as a conflict copy.
+
+---
+
 ## B156 — A file written again after its create lost its answer lands as a conflict copy
 
 **Status:** Fixed (unverified).

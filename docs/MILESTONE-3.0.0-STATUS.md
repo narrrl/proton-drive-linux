@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B127 and B141 to B156.
+- Fixes from the simulation and account runs since then: B127 and B141 to B157.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -79,7 +79,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          a write whose answer was lost (B155). Both fixed. One slow-link run of seed 2 failed
          once with a rename answering `ENOENT` as a folder move landed. Not reproduced since;
          it may be B152. Replays of slow-link seed 4 failed two of six times on a file written
-         again after its create lost its answer (B156, fixed).
+         again after its create lost its answer (B156, fixed). With sixteen drain workers
+         (16fca10), seed 4 failed every replay on a write after an upload that was not read
+         back (B157, fixed).
    - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B127, B129 and B132 fixed
          but unconfirmed.
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)
