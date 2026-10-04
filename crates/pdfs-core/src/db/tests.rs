@@ -3244,6 +3244,45 @@ fn an_op_queued_under_a_stand_in_after_its_create_landed_goes_to_the_landed_node
 }
 
 #[test]
+fn a_stand_in_keeps_its_access_once_its_create_has_landed() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "new.txt", false, 1).unwrap();
+    let local = local_uid(lid);
+    let stand_in = NodeUid::new(VolumeId::from("local"), LinkId::from(lid.to_string()));
+    let mut node = file("new", "parent", "new.txt", 1);
+    node.uid = stand_in.clone();
+    db.upsert_node(&node).unwrap();
+    let real = uid("real").to_string();
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_CREATE, &local, Some(&parent)))
+        .unwrap();
+    assert_eq!(
+        db.effective_node_access(&stand_in).unwrap(),
+        Some(crate::Access::Owner)
+    );
+    db.claim_next_due_op(1).unwrap().unwrap();
+    db.finish_create(
+        id,
+        Some("/staging/create"),
+        &landing(&local, &real, &parent, "new.txt"),
+        |_| None,
+    )
+    .unwrap();
+
+    // The tree still names the file by its stand-in for a moment.
+    assert_eq!(
+        db.effective_node_access(&stand_in).unwrap(),
+        Some(crate::Access::Owner)
+    );
+    assert_eq!(
+        db.effective_node_access(&uid("real")).unwrap(),
+        Some(crate::Access::Owner)
+    );
+}
+
+#[test]
 fn a_node_queued_under_both_its_uids_is_sent_one_op_at_a_time() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("parent", None, "My Files")).unwrap();

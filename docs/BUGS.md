@@ -12,6 +12,27 @@ Conventions:
 
 ---
 
+## B174 — A file renamed just as its create lands is refused with "Permission denied"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation suite on 378667f (`one_client_on_a_good_link`, seed 6):
+`rename c.bin -> b.txt` answered `EACCES` right after a settle. Not reproduced in three replays.
+
+**Where:** `Db::effective_node_access` in `crates/pdfs-core/src/db/share_access.rs`.
+
+**Cause.** Every change on the mount first asks whether the node may be written, and a node
+with no row is refused. When a create lands, its row takes the uid Drive gave it before the
+tree does (B173's gap). A rename in between asked by the stand-in the tree still had, found no
+row under it, and was refused.
+
+**Fix.** A stand-in is looked up by its local id, so it finds its row before and after the
+create lands.
+
+**Test:** `a_stand_in_keeps_its_access_once_its_create_has_landed` in
+`crates/pdfs-core/src/db/tests.rs`.
+
+---
+
 ## B173 — A file deleted just as its create lands stays on Drive
 
 **Status:** Fixed (unverified).

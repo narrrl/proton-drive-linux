@@ -95,11 +95,27 @@ impl Db {
     /// Resolve a persisted node's effective access through its nearest recorded
     /// share root. `None` means the node itself is not persisted, which callers
     /// must not treat as owned: stale handles need to fail closed.
+    ///
+    /// A stand-in ([`local_uid`](super::local_uid)) finds its row by local id,
+    /// so it still does once its create has landed and the row has the uid
+    /// Drive gave it. The tree learns that uid a moment later, and a rename in
+    /// between was refused (`docs/BUGS.md` B174).
     pub fn effective_node_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
         let conn = self.read();
+        let key = uid.to_string();
+        let key = match super::local_lid(&key) {
+            Some(lid) => conn
+                .query_row("SELECT uid FROM nodes WHERE lid = ?1", [lid], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .flatten()
+                .unwrap_or(key),
+            None => key,
+        };
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL)",
-            [uid.to_string()],
+            [&key],
             |row| row.get(0),
         )?;
         if !exists {
@@ -126,7 +142,7 @@ impl Db {
                    FROM ancestors a JOIN share_access sa ON sa.root_uid = a.uid
                   ORDER BY a.depth ASC
                   LIMIT 1",
-                [uid.to_string()],
+                [&key],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
