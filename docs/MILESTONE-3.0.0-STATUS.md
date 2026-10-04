@@ -88,7 +88,12 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          drain's idle poll (B160, fixed). Slow-link seed 3 failed on a file moved while its
          create was on the wire, which the mount showed under its old name (B161, fixed).
          Seed 4 failed on a folder removed and made again, whose create adopted the removed
-         folder (B162, fixed). CI on 903452a passed every profile.
+         folder (B162, fixed). CI on 903452a passed every profile. CI on f9b1638 failed
+         slow-link seed 2: a step that unlinks an open file, appends and reads it back hung
+         for 150 s. The B130 matcher did not fire, and CI kept no stacks; one replay passed.
+         It may be a kernel notice sent from a runtime worker by another path than B130's,
+         which a68dae9 (not yet pushed then) also takes off the runtime. CI now keeps a hung
+         run's stacks.
    - [ ] Known-bug list in `sim/run.rs` is empty: none open; B125, B127, B129, B130 and B132
          fixed but not yet confirmed by the runs.
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)

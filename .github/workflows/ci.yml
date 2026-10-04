@@ -101,6 +101,16 @@ jobs:
       - name: Simulation runs
         run: 'cargo test -p pdfs-fuse --lib --locked sim:: -- --ignored --test-threads=1'
 
+      # A hung step writes every daemon thread's stack next to the run's
+      # state; without them a hang that does not replay cannot be told apart.
+      - name: Keep the stacks of a hung run
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulation-stacks
+          path: /tmp/pdfs-sim-*/stacks.txt
+          if-no-files-found: ignore
+
   # Keeps the release-profile dependencies cached on main, where the release
   # workflow can restore them; a tag cannot reuse the caches of earlier tags.
   release-cache:
