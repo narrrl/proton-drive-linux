@@ -38,7 +38,8 @@
 //! also have a new file's next reads answered as Drive lists it before its
 //! create is committed ([`FakeClient::answer_reads_unrevised`]; B163), and
 //! hold a folder's listing on its way back with one of its files listed that
-//! way ([`FakeClient::hold_answer_to_next_listing`]).
+//! way ([`FakeClient::hold_answer_to_next_listing`]), or hold a new file's
+//! create on its way to Drive ([`FakeClient::hold_next_create`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -340,6 +341,7 @@ impl FakeDrive {
             drop_after_create: AtomicBool::new(false),
             lose_create_reply: AtomicBool::new(false),
             hold_create_reply: Mutex::new(None),
+            hold_create: Mutex::new(None),
             lose_revision_reply: AtomicBool::new(false),
             lose_revision_read_back: AtomicBool::new(false),
             lose_read: Mutex::new(None),
@@ -403,6 +405,23 @@ impl FakeDrive {
             tree.insert(names.join("/"), entry);
         }
         tree
+    }
+
+    /// Every name a node has had in the root, trashed or not, as far back as
+    /// Drive keeps its versions.
+    pub(crate) fn names_ever_in_root(&self) -> Vec<String> {
+        let server = self.server.lock();
+        let mut names: Vec<String> = server
+            .nodes
+            .values()
+            .flatten()
+            .filter_map(|(_, remote)| remote.as_ref())
+            .filter(|remote| remote.parent.as_ref() == Some(&server.root))
+            .map(|remote| remote.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// The uid at `path` below the root, as Drive has it now.
@@ -602,6 +621,8 @@ struct ClientInner {
     lose_create_reply: AtomicBool,
     /// The create [`FakeClient::hold_reply_to_next_create`] is waiting for.
     hold_create_reply: Mutex<Option<Arc<HoldState>>>,
+    /// The create [`FakeClient::hold_next_create`] is waiting for.
+    hold_create: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::lose_reply_to_next_revision`].
     lose_revision_reply: AtomicBool,
     /// Set by [`FakeClient::lose_read_back_of_next_revision`].
@@ -740,6 +761,18 @@ impl FakeClient {
             released: AtomicBool::new(false),
         });
         *self.0.hold_create_reply.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Hold the next file create before it reaches Drive, until the answer
+    /// is dropped.
+    pub(crate) fn hold_next_create(&self) -> Held {
+        let state = Arc::new(HoldState {
+            uid: self.0.drive.root(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_create.lock() = Some(state.clone());
         Held(state)
     }
 
@@ -1225,6 +1258,10 @@ impl DriveApi for FakeClient {
         _aead: bool,
     ) -> Result<NodeUid> {
         let content = read_all(reader)?;
+        let held = self.0.hold_create.lock().take();
+        if let Some(state) = held {
+            wait_until_released(&state).await;
+        }
         let made = self
             .request(true, |server| {
                 server.new_file(

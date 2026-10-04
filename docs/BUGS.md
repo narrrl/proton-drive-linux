@@ -12,6 +12,38 @@ Conventions:
 
 ---
 
+## B168 — A file removed with its folder while uploading is sent again, to the root
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the journal check of the account run on the working tree after B165:
+"re-interned an authority missing from the local tree; retrying uid=local~151607". The wide
+directory case removed its folder while three of its files were still on their way to Drive.
+The folder's trash landed first, and Drive refused the three creates (422). The drain then
+logged "parent folder is gone remotely; creating in the root instead" for each, and failed
+only because the deleted files' bytes were gone. The trashes the deletes had queued then
+found the folder missing from the tree and read it back from Drive.
+
+**Where:** `create_local_node` and `resolve_unknown_authority` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A delete of a file whose create is on the wire turns the create's op into a trash,
+which later looks in the create's folder for a node the create may have made (B151). The
+create's own failure path did not look at that: a create refused because its folder is gone
+is re-homed in the root (for a folder trashed on another device), deleted file or not. And the
+trash's access check asks about that folder, whose row the folder's own trash had removed, so
+it read the trashed folder back into the cache, deferred, and only then found nothing to trash.
+
+**Fix.** A create a delete withdrew is not re-homed. A withdrawn create's trash whose folder
+is trashed or gone is done: Drive took the node it was looking for along with the folder. It
+used to record a sync issue when the folder was gone for good.
+
+**Test:** `a_file_removed_with_its_folder_while_uploading_stays_removed` in `sim/daemon.rs`
+holds the file's create on its way to Drive until the folder's trash has landed, then checks
+that nothing was sent to the root and the folder was not read back (each fails without its
+half of the fix). `FakeClient::hold_next_create` is new for it.
+
+---
+
 ## B167 — The mount takes seconds to come up on a large Drive
 
 **Status:** Fixed.

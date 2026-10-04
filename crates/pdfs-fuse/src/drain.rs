@@ -534,7 +534,32 @@ impl Core {
     ///   and `pdfs recover` is how they get them back.
     /// * we could not ask. Ordinary deferral; the network is the network.
     fn resolve_unknown_authority(&self, op: &PendingOp, authority: &NodeUid) {
-        match self.fetch_node_remote(authority) {
+        let fetched = self.fetch_node_remote(authority);
+        // The trash a withdrawn create left looks for the node it may have made
+        // in the folder it was sent to. A folder trashed or gone took that node
+        // with it, so there is nothing left to trash. Most often it is gone
+        // because the user removed it with the file, and its trash landed first
+        // (`docs/BUGS.md` B168).
+        let folder_gone = match &fetched {
+            Ok(None) => true,
+            Ok(Some(node)) => node.trashed,
+            Err(_) => false,
+        };
+        if op.kind == OP_TRASH
+            && is_local_uid_str(&op.uid)
+            && folder_gone
+            && let Some(uid) = parse_node_uid(&op.uid)
+        {
+            debug!(uid = %op.uid, %authority, "a withdrawn create's folder is gone; trash op satisfied");
+            if let Err(error) = self.retire_trash_op(op, &uid) {
+                error!(uid = %op.uid, %error, "retiring a withdrawn create's trash failed");
+                self.release_claim(op);
+                return;
+            }
+            self.create_sent.lock().remove(&op.id);
+            return;
+        }
+        match fetched {
             Ok(Some(node)) => {
                 if let Err(error) = self.db.upsert_node(&node) {
                     error!(uid = %op.uid, %authority, %error,
@@ -1139,8 +1164,13 @@ impl Core {
         // succeed as written and retrying it forever wedges the queue behind a
         // file that has bytes to save. Re-home it to the root: not where the
         // user put it, but it exists, it is visible, and the bytes are intact.
+        //
+        // Not for a create a delete withdrew while it was on the wire: the
+        // folder is most often gone because the user removed it, with this
+        // file, and the file would come back in the root (`docs/BUGS.md` B168).
         if let Some(root) = self.root_uid()
             && real.is_err()
+            && !self.db.has_pending_op(&op.uid, OP_TRASH)?
             && self.parent_is_gone(&parent)
         {
             warn!(%local, name, "parent folder is gone remotely; creating in the root instead");

@@ -651,6 +651,48 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_removed_with_its_folder_while_uploading_stays_removed() {
+        // A folder removed while a file in it was on its way to Drive: the
+        // folder's trash landed first, Drive refused the file's create, and
+        // the drain took the folder for trashed elsewhere and made the deleted
+        // file again in the root, failing only because its bytes were gone.
+        // Its queued trash then re-read the folder it had been sent to (B168).
+        let drive = FakeDrive::new();
+        let dir = scratch("removed-while-uploading");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        std::fs::create_dir(mnt.join("x")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("x").is_some()
+        }));
+        let folder = drive.lookup("x").unwrap();
+
+        let create = daemon.client.hold_next_create();
+        std::fs::write(mnt.join("x/removed-while-uploading"), b"abc").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        std::fs::remove_file(mnt.join("x/removed-while-uploading")).unwrap();
+        std::fs::remove_dir(mnt.join("x")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || drive
+            .lookup("x")
+            .is_none()));
+        drop(create);
+        assert!(wait_until(Duration::from_secs(60), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+
+        assert_eq!(drive.names_ever_in_root(), ["x"]);
+        assert!(drive.tree().is_empty());
+        let rehomed = take_logged().into_iter().find(|line| {
+            line.contains("creating in the root") && line.contains("removed-while-uploading")
+        });
+        assert_eq!(rehomed, None);
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let db = Db::open(&dir.join("pdfs.db")).unwrap();
+        assert!(db.node_by_uid(&folder.to_string()).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_folder_made_again_while_the_old_one_is_trashed_is_a_new_folder() {
         // A folder removed and made again at once: the new one's create met
         // the old folder, its trash still on the wire, and took it for the
