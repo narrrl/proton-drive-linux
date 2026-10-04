@@ -103,8 +103,8 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          while the daemon was restarting: the stop waited on a busy thread until systemd killed
          it (B165, bounded). The next run on the working tree (2026-10-04: 259 passed, 4
          failed) found a wide folder dropping files whose create landed while it was listed
-         (B166, fixed). Still open from it: a new file that read back empty again, and a
-         cleanup that found no control socket.
+         (B166, fixed), or listing one empty: the new file that read back empty again
+         (B166 too). Still open from it: a cleanup that found no control socket.
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0

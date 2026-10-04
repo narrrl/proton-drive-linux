@@ -12,13 +12,15 @@ Conventions:
 
 ---
 
-## B166 — A folder drops a file whose create lands while it is listed
+## B166 — A folder drops or empties a file whose create lands while it is listed
 
 **Status:** Fixed.
 **Found:** 2026-10-04, by the account run on the working tree after B165 (a wide directory, on
 My files and on on-demand pairing 1): "concurrent unlinks left the wrong entries". Every
 create and all 64 trashes landed as they should, so the drain was right and the listing was
-wrong. The run logs no names. The simulation lost files that were never unlinked.
+wrong. The run logs no names. The simulation lost files that were never unlinked. The same
+run read `-starts-with-dash`, 17 bytes, back as 0 bytes on on-demand pairing 1, just as its
+create landed, so B163's fix does not cover it.
 
 **Where:** `list_children` in `crates/pdfs-fuse/src/lib.rs`.
 
@@ -27,7 +29,10 @@ the queue still holds for it (B132). The queue was read after Drive answered. A 
 landed in between was in neither: Drive had taken the listing before the node existed, and
 the queue had let go of it by the time it was read. The file was missing until the folder
 was listed again. On Wi-Fi, with 16 workers landing creates while the event feed drops the
-folder's listing, this happened in almost every run of the wide-directory case.
+folder's listing, this happened in almost every run of the wide-directory case. When
+Drive's listing already had the node, but from before its create was committed, the node had
+no revision, and the file was listed at 0 bytes until its size was read again (the B163 state,
+reached through a listing instead of the read-back).
 
 **Fix.** The queued children are read before Drive is asked as well as after. A node queued
 before and gone from the queue after has landed meanwhile, and is listed as the DB has it
@@ -35,7 +40,10 @@ now, under its name. One unlinked or moved away meanwhile is no longer a child o
 in the DB, so it stays out.
 
 **Test:** `half_of_a_wide_folder_unlinked_at_once_leaves_the_other_half` in `sim/daemon.rs`
-(failed 4 of 4 runs before the fix, passed 8 of 8 after).
+(failed 4 of 4 runs before the fix, passed 8 of 8 after), and
+`a_listing_taken_before_a_create_commits_keeps_the_landed_file`, which holds Drive's answer to
+the listing until the create has landed (the daemon listed the file at 0 bytes before the
+fix).
 
 ---
 

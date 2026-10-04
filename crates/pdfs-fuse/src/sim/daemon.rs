@@ -597,6 +597,60 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_listing_taken_before_a_create_commits_keeps_the_landed_file() {
+        // Drive listed a new file before its create was committed, with no
+        // revision, and the answer came back after the create landed: the
+        // queue no longer held the file, so Drive's empty node was taken, and
+        // a 17-byte file read back as 0 bytes (B166). The size upgrade's read
+        // still finds it so, and the daemon's own listing is checked: the
+        // kernel still has the size the write left.
+        let drive = FakeDrive::new();
+        let dir = scratch("listed-before-commit");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        std::fs::create_dir(mnt.join("x")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("x").is_some()
+        }));
+
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        // Long enough for the next event poll to bring the file's event, which
+        // drops the folder's listing.
+        std::thread::sleep(crate::POLL_INTERVAL + Duration::from_secs(3));
+        let folder = drive.lookup("x").unwrap();
+        let uid = drive.lookup("x/c.bin").unwrap();
+        let listing = daemon.client.hold_answer_to_next_listing(&folder, &uid);
+        let lister = {
+            let x = mnt.join("x");
+            std::thread::spawn(move || std::fs::read_dir(x).unwrap().count())
+        };
+        assert!(wait_until(Duration::from_secs(30), || listing.reached()));
+        drop(create);
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        daemon.client.answer_reads_unrevised(&uid, 1);
+        drop(listing);
+        assert_eq!(lister.join().unwrap(), 1);
+
+        let path = mnt.join("x").to_string_lossy().into_owned();
+        let Ok(Response::Entries { entries }) = daemon.request(&Request::ListDir { path }) else {
+            panic!("the daemon did not list x");
+        };
+        let sizes: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.size))
+            .collect();
+        assert_eq!(sizes, [("c.bin", 3)]);
+        assert_eq!(std::fs::read(mnt.join("x/c.bin")).unwrap(), b"abc");
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_folder_made_again_while_the_old_one_is_trashed_is_a_new_folder() {
         // A folder removed and made again at once: the new one's create met
         // the old folder, its trash still on the wire, and took it for the

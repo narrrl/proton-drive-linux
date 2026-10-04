@@ -36,7 +36,9 @@
 //! for the answer, or on its way back ([`FakeClient::hold_answer_to_next_read`]),
 //! so the daemon gets an answer a change made meanwhile has overtaken. It can
 //! also have a new file's next reads answered as Drive lists it before its
-//! create is committed ([`FakeClient::answer_reads_unrevised`]; B163).
+//! create is committed ([`FakeClient::answer_reads_unrevised`]; B163), and
+//! hold a folder's listing on its way back with one of its files listed that
+//! way ([`FakeClient::hold_answer_to_next_listing`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -342,6 +344,7 @@ impl FakeDrive {
             lose_revision_read_back: AtomicBool::new(false),
             lose_read: Mutex::new(None),
             unrevised_reads: Mutex::new(None),
+            hold_listing: Mutex::new(None),
         }))
     }
 
@@ -608,6 +611,9 @@ struct ClientInner {
     /// Set by [`FakeClient::answer_reads_unrevised`]: the file and how many
     /// more of its reads are answered without an active revision.
     unrevised_reads: Mutex<Option<(NodeUid, usize)>>,
+    /// The listing [`FakeClient::hold_answer_to_next_listing`] is waiting
+    /// for, and the file it lists without an active revision.
+    hold_listing: Mutex<Option<(Arc<HoldState>, NodeUid)>>,
 }
 
 struct HoldState {
@@ -617,6 +623,26 @@ struct HoldState {
 }
 
 /// Wait while `state` holds a call.
+/// `node` as Drive lists a file whose create it has not committed yet: no
+/// active revision, no size.
+fn unrevise(node: &mut Node) {
+    if let NodeKind::File {
+        total_size_on_storage,
+        active_revision_state,
+        active_revision_id,
+        claimed_size,
+        content_sha1,
+        ..
+    } = &mut node.kind
+    {
+        *total_size_on_storage = 0;
+        *active_revision_state = None;
+        *active_revision_id = None;
+        *claimed_size = None;
+        *content_sha1 = None;
+    }
+}
+
 async fn wait_until_released(state: &HoldState) {
     state.reached.store(true, Ordering::SeqCst);
     while !state.released.load(Ordering::SeqCst) {
@@ -734,6 +760,23 @@ impl FakeClient {
     /// no size.
     pub(crate) fn answer_reads_unrevised(&self, uid: &NodeUid, reads: usize) {
         *self.0.unrevised_reads.lock() = Some((uid.clone(), reads));
+    }
+
+    /// Answer the next listing of `folder`'s nodes with what Drive holds now,
+    /// `unrevised` in it as Drive lists a file whose create it has not
+    /// committed yet, then hold the answer until it is dropped.
+    pub(crate) fn hold_answer_to_next_listing(
+        &self,
+        folder: &NodeUid,
+        unrevised: &NodeUid,
+    ) -> Held {
+        let state = Arc::new(HoldState {
+            uid: folder.clone(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_listing.lock() = Some((state.clone(), unrevised.clone()));
+        Held(state)
     }
 
     /// Wait here if `uids` is the read a [`Held`] in `slot` is for.
@@ -1006,23 +1049,7 @@ impl DriveApi for FakeClient {
                 if *left == 0 {
                     *unrevised = None;
                 }
-                for node in &mut nodes {
-                    if let NodeKind::File {
-                        total_size_on_storage,
-                        active_revision_state,
-                        active_revision_id,
-                        claimed_size,
-                        content_sha1,
-                        ..
-                    } = &mut node.kind
-                    {
-                        *total_size_on_storage = 0;
-                        *active_revision_state = None;
-                        *active_revision_id = None;
-                        *claimed_size = None;
-                        *content_sha1 = None;
-                    }
-                }
+                nodes.iter_mut().for_each(unrevise);
             }
         }
         self.cache(&nodes);
@@ -1031,14 +1058,28 @@ impl DriveApi for FakeClient {
 
     async fn enumerate_nodes_light(&self, uids: &[NodeUid]) -> Result<Vec<Node>> {
         let lag = self.lag();
-        self.request(false, |server| {
-            let now = Instant::now();
-            Ok(uids
+        let mut nodes: Vec<Node> = self
+            .request(false, |server| {
+                let now = Instant::now();
+                Ok(uids
+                    .iter()
+                    .filter_map(|uid| Some(to_node(uid, &server.visible(uid, lag, now)?, true)))
+                    .collect())
+            })
+            .await?;
+        let held = self.0.hold_listing.lock().take_if(|(state, _)| {
+            nodes
                 .iter()
-                .filter_map(|uid| Some(to_node(uid, &server.visible(uid, lag, now)?, true)))
-                .collect())
-        })
-        .await
+                .any(|node| node.parent_uid.as_ref() == Some(&state.uid))
+        });
+        if let Some((state, unrevised)) = held {
+            nodes
+                .iter_mut()
+                .filter(|node| node.uid == unrevised)
+                .for_each(unrevise);
+            wait_until_released(&state).await;
+        }
+        Ok(nodes)
     }
 
     async fn enumerate_folder_children_node_uids(
