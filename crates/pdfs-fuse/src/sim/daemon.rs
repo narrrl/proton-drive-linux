@@ -527,6 +527,41 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_deleted_as_its_create_lands_is_trashed_on_drive() {
+        // The drain had retired the create and the tree still had the file
+        // under its stand-in. The delete found no op left to drop and took the
+        // file for one Drive had never seen, so Drive kept it (B173).
+        let drive = FakeDrive::new();
+        let dir = scratch("deleted-as-create-lands");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("c.bin");
+
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(&path, b"abc").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        let uid = drive.lookup("c.bin").unwrap();
+        let landing = daemon.client.hold_next_landing(&uid);
+        drop(create);
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+        std::fs::remove_file(&path).unwrap();
+        drop(landing);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.lookup("c.bin").is_none()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert!(!path.exists());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name() {
         // The move queued behind the create landed while the drain read the
         // new node back. The answer still had the old name, and the drain no

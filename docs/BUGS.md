@@ -12,6 +12,28 @@ Conventions:
 
 ---
 
+## B173 — A file deleted just as its create lands stays on Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by `one_client_on_a_good_link` (seed 12) on d850265, run three at a time
+in a loop: one of nine runs failed. A deleted `c.bin` was still on Drive with its old bytes,
+and the next `c.bin` made on the mount landed as a conflict copy beside it.
+
+**Where:** `trash_child` in `crates/pdfs-fuse/src/filesystem.rs`.
+
+**Cause.** When a create lands, the drain retires its op and moves the node's row to the uid
+Drive gave it, then gives the tree that uid. In between, it caches the uploaded bytes. A delete
+in that gap still found the file under its stand-in, found no op left to drop, and took it for
+a file Drive had never seen. So nothing trashed it on Drive.
+
+**Fix.** After dropping a stand-in's ops, the delete checks whether the node's row has a real
+uid. If it has, the create landed first, and the file is trashed on Drive like any other.
+
+**Test:** `a_file_deleted_as_its_create_lands_is_trashed_on_drive` in
+`crates/pdfs-fuse/src/sim/daemon.rs`, which holds the drain between the two steps.
+
+---
+
 ## B172 — A file renamed while its upload is read back shows its old name
 
 **Status:** Fixed (unverified).

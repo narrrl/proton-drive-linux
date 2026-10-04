@@ -1539,6 +1539,8 @@ impl Core {
             }
             retired
         };
+        #[cfg(test)]
+        self.drive.landing(real);
         if retired == CreateRetired::Landed
             && let Some(blob) = uploaded
         {

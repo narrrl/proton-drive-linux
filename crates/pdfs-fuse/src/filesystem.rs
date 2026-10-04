@@ -2140,7 +2140,7 @@ impl ProtonFs {
             reply.error(error);
             return;
         }
-        let (ino, uid) = match self.core.lookup_child(parent, name) {
+        let (ino, mut uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,
             Err(e) => {
                 reply.error(e);
@@ -2168,9 +2168,20 @@ impl ProtonFs {
                 return;
             }
             self.core.state().forget_or_unlink(&uid);
-            debug!(%uid, name, "deleted a node that had not been created remotely yet");
-            reply.ok();
-            return;
+            // A create that landed before the ops were dropped left none: Drive
+            // has the node, and the tree had not taken its uid yet. It is
+            // trashed there like any other (docs/BUGS.md B173).
+            match self.core.landed_row_uid(ino) {
+                Some(real) => {
+                    debug!(local = %uid, %real, name, "create landed under a delete");
+                    uid = real;
+                }
+                None => {
+                    debug!(%uid, name, "deleted a node that had not been created remotely yet");
+                    reply.ok();
+                    return;
+                }
+            }
         }
         // Offline: queue it. Trashing is the one mutation a user expects to work
         // regardless — the file is gone from their point of view the moment the

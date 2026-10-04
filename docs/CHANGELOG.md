@@ -72,6 +72,8 @@ by its local id, in the queue, the stored tree and pins alike.
   it failed with "Input/output error" (B170).
 - **A file deleted while its upload was retrying is removed from Drive right away.** It no
   longer waits for the upload's next retry (B171).
+- **A file deleted just as it reached Drive is removed from Drive too.** It no longer stayed
+  there, and the next file with that name no longer became a conflict copy (B173).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).
