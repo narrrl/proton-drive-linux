@@ -11,8 +11,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **38**. The queue table is rebuilt so an id is never given out twice; queued changes
-are kept. Queued changes get a column for the reason Drive refused them.
+Schema: **39**. The queue table is rebuilt so an id is never given out twice; queued changes
+are kept. Queued changes get a column for the reason Drive refused them, and name their file
+and folder by local id as well as by Drive's id.
 
 ### Added
 - **Sync issues.** A change Drive refuses because the storage is full, access was taken away,

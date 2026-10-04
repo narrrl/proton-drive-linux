@@ -3321,6 +3321,104 @@ fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
     assert_eq!(found[0].path, "New folder/inside.txt");
 }
 
+/// A queued create names its folder by local id, so it is sent into the folder
+/// as soon as the folder's row has its real uid, whatever the op's own copy
+/// of the folder's uid still says.
+#[test]
+fn a_create_waits_for_its_folder_by_local_id() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    let dir = db.lid_of(&local.to_string()).unwrap().unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~child".to_string(),
+            parent_uid: Some(local.to_string()),
+            name: Some("inside.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    let parent_lid: Option<i64> = db
+        .conn
+        .lock()
+        .query_row(
+            "SELECT parent_lid FROM pending_op WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_lid, Some(dir));
+    assert!(
+        db.claim_next_due_op(1).unwrap().is_none(),
+        "nothing to send into a folder that has not landed"
+    );
+
+    db.conn
+        .lock()
+        .execute(
+            "UPDATE nodes SET uid = ?2 WHERE lid = ?1",
+            rusqlite::params![dir, uid("dir").to_string()],
+        )
+        .unwrap();
+
+    let op = db.claim_next_due_op(1).unwrap().expect("the create is due");
+    assert_eq!(op.id, id);
+    assert_eq!(op.parent_uid, Some(uid("dir").to_string()));
+}
+
+/// A rename queued against the row Drive listed for a folder still landing
+/// follows the folder when that row is merged into the landing one (B140).
+#[test]
+fn an_op_on_a_listed_twin_follows_the_folder_that_lands() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "New folder");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    db.upsert_node(&folder("real", Some("root"), "New folder"))
+        .unwrap();
+    let kept = db.lid_of(&local.to_string()).unwrap().unwrap();
+    let (rename, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: uid("real").to_string(),
+            parent_uid: Some(uid("root").to_string()),
+            name: Some("Renamed".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+    db.remap_local_uid(&local.to_string(), &uid("real").to_string())
+        .unwrap();
+
+    let lid: Option<i64> = db
+        .conn
+        .lock()
+        .query_row("SELECT lid FROM pending_op WHERE id = ?1", [rename], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(lid, Some(kept));
+    assert_eq!(db.lid_of(&uid("real").to_string()).unwrap(), Some(kept));
+}
+
 /// B148: a folder pinned before it landed is still pinned once it has.
 #[test]
 fn a_folder_pinned_before_it_landed_stays_pinned() {
@@ -3726,6 +3824,23 @@ fn a_2_8_database_migrates_with_every_node_and_op_intact() {
     let queued = db.pending_ops().unwrap();
     let inner = queued.iter().find(|op| op.uid == "local~inner").unwrap();
     assert_eq!(inner.parent_uid.as_deref(), Some("local~dir"));
+    let lids: (Option<i64>, Option<i64>) = db
+        .conn
+        .lock()
+        .query_row(
+            "SELECT lid, parent_lid FROM pending_op WHERE uid = 'local~inner'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        lids,
+        (
+            db.lid_of("local~inner").unwrap(),
+            db.lid_of("local~dir").unwrap()
+        ),
+        "the migration names the op's node and parent by local id"
+    );
     let parked = db.parked_create_ops().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].name.as_deref(), Some("movie.part"));

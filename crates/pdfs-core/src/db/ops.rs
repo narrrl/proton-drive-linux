@@ -175,6 +175,26 @@ pub(super) fn wake_ops_waiting_for_tx(tx: &rusqlite::Transaction<'_>, name: &str
     Ok(())
 }
 
+/// Point queued op `id` at its node and its parent by local id, from the uids
+/// it names (schema 39). A uid with no row leaves `NULL`, and the op is matched
+/// by uid, as before.
+fn fill_op_lids(conn: &rusqlite::Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_op
+         SET lid = (SELECT lid FROM nodes WHERE uid = pending_op.uid),
+             parent_lid = (SELECT lid FROM nodes WHERE uid = pending_op.parent_uid)
+         WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// The uid a queued op's parent has now: the one its row holds, which a
+/// landing folder has already moved to its real uid, or the one the op was
+/// queued with when the parent has no row.
+const PARENT_NOW: &str =
+    "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.parent_lid), parent_uid)";
+
 /// The volume id given to a node that exists only on this machine, so far. A
 /// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
 /// round-trips through the same `Display`/parse path as any other uid.
@@ -434,6 +454,7 @@ impl Db {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        fill_op_lids(&tx, id)?;
         tx.commit()?;
         Ok((id, superseded))
     }
@@ -460,6 +481,7 @@ impl Db {
             params![OP_TRASH, uid, name, created_at],
         )?;
         let id = tx.last_insert_rowid();
+        fill_op_lids(&tx, id)?;
         tx.commit()?;
         Ok((id, blobs))
     }
@@ -575,6 +597,7 @@ impl Db {
                 params![OP_TRASH, real, landing.landed.1, now],
             )?;
             let trash = tx.last_insert_rowid();
+            fill_op_lids(&tx, trash)?;
             tx.commit()?;
             return Ok(CreateRetired::Withdrawn { trash });
         }
@@ -590,7 +613,8 @@ impl Db {
             Some((_, meta)) => {
                 tx.execute(
                     "UPDATE pending_op
-                     SET kind = ?2, uid = ?3, parent_uid = NULL, name = NULL, meta_json = ?4,
+                     SET kind = ?2, uid = ?3, parent_uid = NULL, parent_lid = NULL, name = NULL,
+                         meta_json = ?4,
                          attempts = 0, last_error = NULL, next_attempt_at = 0
                      WHERE id = ?1",
                     params![id, OP_REVISION, real, meta],
@@ -621,11 +645,8 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![OP_RENAME, real, parent, name, meta, created_at],
             )?;
+            fill_op_lids(&tx, tx.last_insert_rowid())?;
         }
-        tx.execute(
-            "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
-            params![local, real],
-        )?;
         adopt_placeholder_row_tx(&tx, local, real)?;
         tx.commit()?;
         Ok(match newer {
@@ -672,7 +693,9 @@ impl Db {
     pub fn rewrite_op_target(&self, uid: &str, parent_uid: &str, name: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
-            "UPDATE pending_op SET parent_uid = ?2, name = ?3,
+            "UPDATE pending_op
+             SET parent_uid = ?2, name = ?3,
+               parent_lid = (SELECT lid FROM nodes WHERE uid = ?2),
                next_attempt_at = CASE WHEN next_attempt_at < ?6 THEN 0 ELSE next_attempt_at END
              WHERE uid = ?1 AND kind IN (?4, ?5)",
             params![uid, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL],
@@ -751,17 +774,12 @@ impl Db {
         Ok(blobs)
     }
 
-    /// Rewrite every queued op that points at a placeholder parent, once that
-    /// parent has drained and has a real uid. Also moves the node rows whose
-    /// parent column still names the placeholder, so listings keep resolving,
-    /// and readdresses the placeholder's own row.
+    /// Readdress a placeholder that has drained to its real uid: its row, the
+    /// rows below it, and the queued ops made inside it
+    /// ([`adopt_placeholder_row_tx`]).
     pub fn remap_local_uid(&self, local: &str, real: &str) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE pending_op SET parent_uid = ?2 WHERE parent_uid = ?1",
-            params![local, real],
-        )?;
         adopt_placeholder_row_tx(&tx, local, real)?;
         tx.commit()?;
         Ok(())
@@ -782,9 +800,10 @@ impl Db {
     /// materialized and rejected in Rust:
     ///
     /// * `next_attempt_at <= now` — the backoff.
-    /// * a `local~` parent is skipped. A node created inside a folder that was
-    ///   itself created offline cannot be sent anywhere until that folder is
-    ///   real. Ops replay in queue order so the parent normally drains first;
+    /// * a parent that has not landed is skipped, read through `parent_lid`
+    ///   from the parent's row ([`PARENT_NOW`]). A node created inside a folder
+    ///   that was itself created offline cannot be sent anywhere until that
+    ///   folder is real. Ops replay in queue order so the parent normally drains first;
     ///   this matters when the parent is backing off, where the child must wait
     ///   rather than burn its own retries.
     ///
@@ -795,11 +814,11 @@ impl Db {
     pub fn next_due_op(&self, now: i64) -> Result<Option<PendingOp>> {
         let conn = self.read();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+            "SELECT id, kind, uid, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
              FROM pending_op
              WHERE next_attempt_at <= ?1
-               AND (parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~')
+               AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')
              ORDER BY id LIMIT 1",
             v = LOCAL_VOLUME,
             n = LOCAL_VOLUME.len() + 1,
@@ -849,12 +868,12 @@ impl Db {
         let tx = conn.transaction()?;
         let op = {
             let mut stmt = tx.prepare_cached(&format!(
-                "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                "SELECT id, kind, uid, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                         attempts, last_error, next_attempt_at
                  FROM pending_op
                  WHERE next_attempt_at <= ?1
                    AND claimed_at = 0
-                   AND (parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~')
+                   AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')
                    AND uid NOT IN (SELECT uid FROM pending_op WHERE claimed_at <> 0)
                  ORDER BY id LIMIT 1",
                 v = LOCAL_VOLUME,
@@ -932,7 +951,7 @@ impl Db {
                 &format!(
                     "SELECT MIN(next_attempt_at) FROM pending_op \
                      WHERE claimed_at = 0 \
-                       AND (parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~')",
+                       AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')",
                     v = LOCAL_VOLUME,
                     n = LOCAL_VOLUME.len() + 1,
                 ),

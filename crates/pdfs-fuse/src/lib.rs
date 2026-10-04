@@ -3627,8 +3627,8 @@ impl Core {
     /// path returns the one the server minted.
     ///
     /// The parent may itself be a placeholder — `mkdir -p` offline, or `cp -r` of
-    /// a tree. That is fine: the op records the parent it was made under, and the
-    /// parent's own drain rewrites it to the real uid before this op can run.
+    /// a tree. That is fine: the op records the parent it was made under by local
+    /// id, and is not sent until the parent's row has the uid it landed as.
     fn queue_local_node(
         &self,
         parent_uid: &NodeUid,
@@ -3638,6 +3638,13 @@ impl Core {
     ) -> Result<Node, Errno> {
         self.require_uid_writable(parent_uid)?;
         let uid = mint_local_uid();
+        let node = local_node(uid.clone(), parent_uid.clone(), name.to_string(), is_dir);
+        // The row the tree would give it anyway, now, so the op is queued with
+        // the node's local id.
+        self.db.lids_for(&[&node]).map_err(|e| {
+            error!(%parent_uid, name, error = %e, "giving a local node its row failed");
+            Errno::EIO
+        })?;
         let op = PendingOp {
             id: 0,
             kind: if is_dir { OP_MKDIR } else { OP_CREATE }.to_string(),
@@ -3659,12 +3666,7 @@ impl Core {
             Errno::EIO
         })?;
         debug!(%uid, %parent_uid, name, is_dir, "created node offline; queued");
-        Ok(local_node(
-            uid,
-            parent_uid.clone(),
-            name.to_string(),
-            is_dir,
-        ))
+        Ok(node)
     }
 
     /// Queue giving a node a new parent and/or name, and apply it to the tree

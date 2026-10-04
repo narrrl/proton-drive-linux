@@ -30,6 +30,11 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          cut.
 2. **Planner and executor (§5.4, §5.5)**: ops keyed by local id; remove `mint_local_uid`,
    `finish_create` and `adopt_real_uid`; a landing create sets `remote_uid` on its row.
+   - [x] Queued ops carry `lid` and `parent_lid` (schema 39). The claim reads the parent's uid
+         through `parent_lid`, and a landing folder rewrites the ops inside it by local id.
+   - [ ] The tree links by lid (`nodes.parent_lid`).
+   - [ ] No more placeholders: `nodes.uid` is `NULL` until a node lands.
+   - [ ] An executor that runs ops in dependency order, many at once.
 3. **Speed (§7)**: run independent ops in parallel, batch trashes and moves; measure 1,000 files
    and 100 folders on Wi-Fi against LAN (target: within 10 %).
    - [x] The measurement: `a_thousand_files_drain_as_fast_on_wifi_as_on_lan` in `sim/daemon.rs`,

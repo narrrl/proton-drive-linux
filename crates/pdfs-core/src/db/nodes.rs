@@ -760,9 +760,20 @@ pub(super) fn adopt_placeholder_row_tx(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    // Ops queued before schema 39 have no `parent_lid`, nor do ops made
+    // under a placeholder that never had a row.
+    tx.execute(
+        "UPDATE pending_op SET parent_uid = ?2 WHERE parent_lid IS NULL AND parent_uid = ?1",
+        params![local, real],
+    )?;
     let Some((lid, json)) = row else {
         return Ok(());
     };
+    // The ops made inside the folder name it by its local id, which stays.
+    tx.execute(
+        "UPDATE pending_op SET parent_uid = ?2 WHERE parent_lid = ?1",
+        params![lid, real],
+    )?;
     let known: Option<(i64, Option<String>)> = tx
         .query_row(
             "SELECT lid, node_json FROM nodes WHERE uid = ?1",
@@ -771,6 +782,15 @@ pub(super) fn adopt_placeholder_row_tx(
         )
         .optional()?;
     if let Some((known_lid, _)) = known {
+        // Ops queued against the row Drive listed now name the landing one.
+        tx.execute(
+            "UPDATE pending_op SET lid = ?2 WHERE lid = ?1",
+            params![known_lid, lid],
+        )?;
+        tx.execute(
+            "UPDATE pending_op SET parent_lid = ?2 WHERE parent_lid = ?1",
+            params![known_lid, lid],
+        )?;
         tx.execute("DELETE FROM nodes WHERE lid = ?1", params![known_lid])?;
         tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![known_lid])?;
     }

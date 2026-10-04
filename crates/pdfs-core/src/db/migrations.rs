@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 38;
+pub(super) const SCHEMA_VERSION: i64 = 39;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -377,6 +377,22 @@ impl Db {
             )? > 0;
             if has_ops && !has_column {
                 tx.execute_batch(MIGRATION_V38)?;
+            }
+        }
+        if current < 39 {
+            // Same guards as V26-V38.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_op') WHERE name = 'lid'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops && !has_column {
+                tx.execute_batch(MIGRATION_V39)?;
             }
         }
         tx.execute(
@@ -1185,4 +1201,20 @@ CREATE INDEX idx_pending_op_claimed
 /// `NULL` for an op that has not been refused, which is every op migrated.
 const MIGRATION_V38: &str = "
 ALTER TABLE pending_op ADD COLUMN issue TEXT;
+";
+
+/// Schema v39: a queued op names its node and its parent by local id too.
+///
+/// A create made inside a folder that had not landed named the folder by its
+/// placeholder uid, and every landing had to find and rewrite those strings.
+/// The local id stays the same when the folder lands. An op whose node has no
+/// row keeps `NULL` and is matched by uid, as before.
+const MIGRATION_V39: &str = "
+ALTER TABLE pending_op ADD COLUMN lid INTEGER;
+ALTER TABLE pending_op ADD COLUMN parent_lid INTEGER;
+UPDATE pending_op
+   SET lid = (SELECT lid FROM nodes WHERE nodes.uid = pending_op.uid),
+       parent_lid = (SELECT lid FROM nodes WHERE nodes.uid = pending_op.parent_uid);
+CREATE INDEX pending_op_lid ON pending_op(lid);
+CREATE INDEX pending_op_parent_lid ON pending_op(parent_lid);
 ";
