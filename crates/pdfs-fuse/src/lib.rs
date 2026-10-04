@@ -2437,7 +2437,24 @@ impl Core {
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
+    ///
+    /// A listing that changed while it was being published answers EAGAIN: the
+    /// root listed again after a restart, an event, a newer refresh of a shared
+    /// folder. The listing is still owed, so it is taken again rather than
+    /// handed to the lookup or open that asked (B159).
     fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
+        for _ in 1..LISTING_ATTEMPTS {
+            match self.list_children(ino) {
+                Err(e) if e.code() == Errno::EAGAIN.code() => {
+                    debug!(ino, "listing changed while it was published; listing again");
+                }
+                done => return done,
+            }
+        }
+        self.list_children(ino)
+    }
+
+    fn list_children(&self, ino: u64) -> Result<(), Errno> {
         let (folder_uid, cached) = {
             let st = self.state();
             match st.entries.get(&ino) {
@@ -5777,6 +5794,10 @@ fn api_code(e: &(dyn std::error::Error + 'static)) -> Option<ResponseCode> {
     }
 }
 
+/// How often [`Core::ensure_children`] takes a listing that changed while it
+/// was being published.
+const LISTING_ATTEMPTS: usize = 4;
+
 /// How often a rename or move that Drive calls out of date is retried, and how
 /// long apart.
 const OUT_OF_DATE_RETRIES: u32 = 20;
@@ -8777,10 +8798,27 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_changed_while_published_is_taken_again() {
+        // The root listed again after a restart while a lookup was publishing
+        // the "Shared with me" entry, and the lookup answered EAGAIN (B159).
+        let ensure = function_source(include_str!("lib.rs"), "fn ensure_children(");
+        assert_before(
+            ensure,
+            "for _ in 1..LISTING_ATTEMPTS",
+            "Errno::EAGAIN.code()",
+        );
+        assert_eq!(ensure.matches("self.list_children(ino)").count(), 2);
+        assert!(
+            !ensure.contains("?"),
+            "an attempt's error must not skip the retry"
+        );
+    }
+
+    #[test]
     fn a_folder_lists_from_the_db_while_the_link_is_down() {
         // A listing dropped as stale mid-run, then a drop: every create in that
         // folder looks the name up first, and answered EIO for want of it.
-        let ensure = function_source(include_str!("lib.rs"), "fn ensure_children(");
+        let ensure = function_source(include_str!("lib.rs"), "fn list_children(");
         assert_before(
             ensure,
             "if !self.is_online()",

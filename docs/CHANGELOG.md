@@ -46,6 +46,8 @@ by its local id, in the queue, the stored tree and pins alike.
   lost Drive's answer to reading back the file's last upload** (B157).
 - **A file renamed twice in a row, while the first name was still taken, keeps the second name**
   (B158).
+- **Opening a file right after the daemon restarts no longer fails with "Resource temporarily
+  unavailable"** (B159).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

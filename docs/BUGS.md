@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## B159 — A write right after a restart fails with "Resource temporarily unavailable"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's flaky-link profile (`one_client_on_a_flaky_link`,
+seed 4, one of ten runs on c2f9344). Half a second after the client restarted, a write into its
+folder answered `EAGAIN`, and nothing was logged. The folder was still a queued create.
+
+**Where:** `Core::ensure_children` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** A lookup in the root also places the "Shared with me" entry. It reads that entry's
+plan from the database against a snapshot of the root listing, then publishes it only if the
+listing has not changed meanwhile, and answers `EAGAIN` if it has. Right after a restart the
+root is listed again while the first lookups come in, so a lookup could lose that race. Listing
+a shared folder answers `EAGAIN` the same way when a newer refresh overtook it. No caller
+retries, so the error reached the application.
+
+**Fix.** `ensure_children` takes a listing again, up to four times, when an attempt answers
+`EAGAIN`, and logs each retry at debug level.
+
+**Test:** unit test `a_listing_changed_while_published_is_taken_again`. A stress test with
+lookups and creates in the root at once did not hit the window (about 1,900 plans, none stale),
+so the race itself has no regression test.
+
+---
+
 ## B158 — A file renamed twice in a row ends up under the first name, again
 
 **Status:** Fixed (unverified).
