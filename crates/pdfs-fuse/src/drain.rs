@@ -703,12 +703,11 @@ impl Core {
     /// Block until there is plausibly something to do: a new op, a reconnect, or
     /// the shortest outstanding backoff elapsing.
     pub(crate) fn wait_for_drain_work(&self) {
-        let (lock, cv) = &*self.drain_wake;
-        let mut woken = lock.lock();
-        if !*woken {
-            cv.wait_for(&mut woken, DRAIN_IDLE_POLL);
-        }
-        *woken = false;
+        sleep_for_drain_work(
+            &self.drain_wake,
+            || self.shutdown.is_stopping(),
+            DRAIN_IDLE_POLL,
+        );
     }
 
     /// Like [`wait_for_drain_work`](Self::wait_for_drain_work), but first
@@ -722,12 +721,7 @@ impl Core {
             }
             _ => DRAIN_IDLE_POLL,
         };
-        let (lock, cv) = &*self.drain_wake;
-        let mut woken = lock.lock();
-        if !*woken {
-            cv.wait_for(&mut woken, timeout);
-        }
-        *woken = false;
+        sleep_for_drain_work(&self.drain_wake, || self.shutdown.is_stopping(), timeout);
     }
 
     /// Perform one queued op and retire it.
@@ -2697,6 +2691,27 @@ fn keeps_landed_upload(pinned: bool, len: u64, budget: u64) -> bool {
 }
 
 /// Where `st` has `uid`: its name and parent.
+/// Sleep on the drain's `wake` for up to `timeout`, unless a wake-up came
+/// since a worker last took one, or the mount is `stopping`.
+///
+/// One wake-up wakes every worker, and the first to wake takes it. A worker
+/// that came to sleep after that slept out its timeout, the stop's included,
+/// and the stop gave up on it after 10 s (`docs/BUGS.md` B180). The stop sets
+/// its flag before it takes the lock, so a worker that finds it unset under
+/// the lock is asleep when the wake-up comes.
+fn sleep_for_drain_work(
+    wake: &(Mutex<bool>, parking_lot::Condvar),
+    stopping: impl Fn() -> bool,
+    timeout: Duration,
+) {
+    let (lock, cv) = wake;
+    let mut woken = lock.lock();
+    if !*woken && !stopping() {
+        cv.wait_for(&mut woken, timeout);
+    }
+    *woken = false;
+}
+
 fn placed_in(st: &crate::state::State, uid: &NodeUid) -> Option<(String, Option<NodeUid>)> {
     let entry = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))?;
     Some((entry.node.name.clone(), entry.node.parent_uid.clone()))
@@ -2711,6 +2726,16 @@ mod tests {
     use proton_drive_rs::NodeKind;
     use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
     use std::cell::Cell;
+
+    #[test]
+    fn a_drain_worker_that_missed_the_stop_wake_up_does_not_sleep() {
+        // Another worker took the stop's wake-up, and this one slept out its
+        // timeout, past the stop's deadline (B180).
+        let wake = (Mutex::new(false), parking_lot::Condvar::new());
+        let started = Instant::now();
+        sleep_for_drain_work(&wake, || true, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn pending(kind: &str) -> PendingOp {
         PendingOp {

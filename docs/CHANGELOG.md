@@ -84,6 +84,8 @@ by its local id, in the queue, the stored tree and pins alike.
 - **Deleting a folder while sync is paused no longer leaves a queued change behind** for a
   file in it that was never uploaded (B178).
 - **A file read just as it reaches Drive no longer reads empty** (B179).
+- **Stopping the daemon no longer takes 10 seconds more than it needs** when an idle upload
+  worker missed the stop (B180).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).

@@ -12,6 +12,32 @@ Conventions:
 
 ---
 
+## B180 — A stop waits 10 s for a drain worker that slept through it
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the simulation suite on 0f3c06f: `a_stop_ends_a_mirror_pass_after_the_uploads_it_is_sending`
+found "background workers did not finish in time" in the log, left there by two earlier tests
+whose stops had given up on a drain worker. On its own,
+`a_folder_made_again_while_the_old_one_is_trashed_is_a_new_folder` took 11 s instead of 2 s in
+about one run in three.
+
+**Where:** `Core::wait_for_drain_work` and `Core::wait_for_drain_work_or_due` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The drain workers sleep on one flag and one condvar. A stop sets its flag, then
+raises the wake-up and wakes them all, and the first worker to wake takes the wake-up. A worker
+that was between its stop check and its sleep at that moment found no wake-up and slept its
+timeout, up to 30 s. The stop gave up on it after 10 s and shut down around it. With 16 workers
+since step 7 this was common.
+
+**Fix.** A worker checks the stop under the wake-up's lock before it sleeps. The stop sets its
+flag before it takes that lock, so a worker that finds it unset is asleep when the wake-up comes.
+
+**Test:** `a_drain_worker_that_missed_the_stop_wake_up_does_not_sleep` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+---
+
 ## B179 — A file read just as its create lands reads empty
 
 **Status:** Fixed (unverified).
