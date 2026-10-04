@@ -3964,6 +3964,43 @@ fn a_landed_folder_rewrites_no_row_or_op_below_it() {
     );
 }
 
+/// A node the mount still holds under its stand-in, written after it landed,
+/// updates the landed row: written under the stand-in, it brought the
+/// placeholder row back beside it.
+#[test]
+fn a_stand_in_written_after_landing_updates_the_landed_row() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let lid = db
+        .add_local_row(&uid("root").to_string(), "a.txt", false, 1)
+        .unwrap();
+    let local = local_uid(lid);
+    let mut node = file("x", "root", "a.txt", 3);
+    node.uid = NodeUid::new(VolumeId::from("local"), LinkId::from(lid.to_string()));
+    db.upsert_node(&node).unwrap();
+    db.land_placeholder_row(&local, &uid("a").to_string())
+        .unwrap();
+
+    node.name = "b.txt".into();
+    db.upsert_node(&node).unwrap();
+
+    let rows: Vec<(i64, String, String)> = {
+        let conn = db.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT lid, uid, name FROM nodes WHERE uid != ?1")
+            .unwrap();
+        stmt.query_map([uid("root").to_string()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    };
+    assert_eq!(rows, [(lid, uid("a").to_string(), "b.txt".to_string())]);
+    let landed = db.node_by_uid(&uid("a").to_string()).unwrap().unwrap();
+    assert_eq!((landed.uid, landed.name), (uid("a"), "b.txt".to_string()));
+}
+
 /// A create queued inside a folder made here is sent under the folder's real
 /// uid once it lands. Landing where it was sent is no move.
 #[test]

@@ -900,8 +900,25 @@ fn adopt_children_tx(tx: &Transaction<'_>, uid: &str, lid: i64) -> Result<()> {
 }
 
 fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
-    let json = serde_json::to_string(node)?;
     let uid = node.uid.to_string();
+    // A node written under its stand-in after it landed is its row, which has
+    // the uid Drive gave it by now: written under the stand-in, it would bring
+    // the placeholder row back beside it.
+    if let Some(lid) = local_lid(&uid) {
+        let landed: Option<String> = tx
+            .query_row(
+                "SELECT uid FROM nodes WHERE lid = ?1 AND uid IS NOT ?2",
+                params![lid, uid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(real) = landed.as_deref().and_then(parse_node_uid) {
+            let mut node = node.clone();
+            node.uid = real;
+            return upsert_node_tx(tx, &node);
+        }
+    }
+    let json = serde_json::to_string(node)?;
     let parent_uid = node.parent_uid.as_ref().map(|u| u.to_string());
 
     let prior: Option<PriorRow> = tx

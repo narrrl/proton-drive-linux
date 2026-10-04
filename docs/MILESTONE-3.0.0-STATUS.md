@@ -36,7 +36,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          places each node under its parent's row as it is now.
    - [x] Queries over children, subtrees and ancestors by `parent_lid`, and no rewrite of the
          children's `parent_uid` when a folder lands (R3), nor of the ops made inside it (R2).
-   - [ ] No more placeholders: a node made here goes by its local id until it lands. In four
+   - [x] No more placeholders: a node made here goes by its local id until it lands. In four
          parts:
      - [x] 6a: a node made here goes by `local~<lid>`, a function of its row, instead of a
            minted `local~<ms>-<n>`; schema 41 rewrites the old placeholders (nodes, ops, pins).
@@ -48,10 +48,13 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
            now. The row keeps its stand-in in `nodes.uid` rather than `NULL`: it is as stable,
            and `NULL` would have changed some 40 node queries for no change in behaviour. Pins
            stay keyed by uid and move with the row in the landing transaction (B148).
-     - [ ] 6d: in memory, `pending`, `hidden` and `creating` by lid; `is_local_uid` checks
-           become `remote_uid().is_none()`; a write or rename after landing queues under the
-           stand-in, so `landed_uid`, `follow_landed_create`, `landed_row_uid` and the
-           `rewrite_op_target` fallback go.
+     - [x] 6d: a node written under its stand-in after it landed updates its landed row
+           instead of bringing the placeholder row back, so a write that finds its create
+           landed takes the uid from the row and no longer polls the tree for up to 2 s
+           (`landed_uid` is gone). In memory, `pending`, the uploads and the tree stay keyed by
+           the uid Drive knows: ops are matched by lid in the database (6b), `hidden` and
+           `creating` only ever hold remote uids, and `landed_row_uid` is the one place at the
+           mount's edge where a stand-in a handle still holds becomes the real uid.
    - [ ] An executor that runs ops in dependency order, many at once.
 3. **Speed (§7)**: run independent ops in parallel, batch trashes and moves; measure 1,000 files
    and 100 folders on Wi-Fi against LAN (target: within 10 %).

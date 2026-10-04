@@ -169,10 +169,6 @@ const DRAIN_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// directly on a new write or a reconnect, so this only bounds how late a
 /// backoff can fire.
 const DRAIN_IDLE_POLL: Duration = Duration::from_secs(30);
-/// How long a write whose create just landed waits for the drain to repoint
-/// its inode (`Core::landed_uid`): 200 polls of 10 ms, two seconds in all.
-const LANDED_UID_POLLS: u32 = 200;
-const LANDED_UID_POLL: Duration = Duration::from_millis(10);
 /// How long the mount waits before asking again for a node it has just created
 /// when Drive does not list it yet (`Core::fetch_minted_node`).
 const MINTED_READ_BACK_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
@@ -3430,9 +3426,9 @@ impl Core {
                     break 'queued attached.superseded;
                 }
                 drop(pending);
-                // The create landed while this handle was open. Its uid is the
-                // one the drain has just given the inode.
-                let Some(real) = self.landed_uid(ino) else {
+                // The create landed while this handle was open, and its row
+                // already has the uid Drive gave it.
+                let Some(real) = self.landed_row_uid(ino) else {
                     error!(%uid, staged = %path.display(),
                            "queued create vanished under a write; bytes kept in staging");
                     return Err(Errno::EIO);
@@ -3509,23 +3505,6 @@ impl Core {
             });
         }
         Ok(())
-    }
-
-    /// The real uid the drain gave `ino` when its queued create landed.
-    ///
-    /// Called by a write that found the create already retired. The drain
-    /// repoints the inode right after it drops `pending`, with no network in
-    /// between, so a short wait covers the gap; `None` means the inode is gone
-    /// or never stopped being a placeholder.
-    fn landed_uid(&self, ino: u64) -> Option<NodeUid> {
-        for _ in 0..LANDED_UID_POLLS {
-            let uid = self.state().entries.get(&ino).map(|e| e.uid.clone())?;
-            if !is_local_uid(&uid) {
-                return Some(uid);
-            }
-            std::thread::sleep(LANDED_UID_POLL);
-        }
-        None
     }
 
     /// Queue the new content of a path-based truncate — `> file`, or any
