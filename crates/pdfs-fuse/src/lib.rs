@@ -59,7 +59,7 @@ use pdfs_core::cache::{BLOCK_SIZE, Baseline, BlockGeometry, BlockSpan, ContentCa
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
-    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
+    SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress,
     ThumbnailBuildStatus, Topic, TransferDirection,
 };
 use pdfs_core::db::{
@@ -4324,29 +4324,31 @@ impl Core {
         self.settle_listing_sizes(ino);
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
-        let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
+        let rows: Vec<(String, bool, u64, i64, NodeUid, u64)> = {
             let st = self.state();
             st.children
                 .get(&ino)
                 .map(|kids| {
                     kids.iter()
-                        .filter_map(|k| st.entries.get(k))
-                        .map(|e| {
+                        .filter_map(|&k| st.entries.get(&k).map(|e| (k, e)))
+                        .map(|(k, e)| {
                             (
                                 e.node.name.clone(),
                                 e.node.is_folder(),
                                 node_size(&e.node),
                                 e.node.modification_time,
                                 e.uid.clone(),
+                                k,
                             )
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         };
+        let issues = self.db.node_issues().unwrap_or_default();
         Ok(rows
             .into_iter()
-            .map(|(name, is_dir, size, modified, uid)| DirEntry {
+            .map(|(name, is_dir, size, modified, uid, ino)| DirEntry {
                 name,
                 is_dir,
                 size,
@@ -4365,6 +4367,9 @@ impl Core {
                 shared_by_unverified: false,
                 trashed_at: 0,
                 trashed_from: None,
+                issue: state::ino_lid(ino)
+                    .and_then(|lid| issues.get(&lid))
+                    .map(|issue| SyncIssue::parse(issue)),
             })
             .collect())
     }
@@ -5247,6 +5252,7 @@ impl Core {
                 shared_by: String::new(),
                 shared_at: 0,
                 shared_by_unverified: false,
+                issue: None,
             })
             .collect())
     }

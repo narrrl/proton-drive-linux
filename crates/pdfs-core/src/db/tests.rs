@@ -6988,6 +6988,30 @@ fn an_op_with_an_issue_counts_as_failing_at_once() {
     assert_eq!(db.pending_ops().unwrap().len(), 2);
 }
 
+/// The browser shows an issue on the node it is about, which it knows by
+/// local id, under either uid.
+#[test]
+fn a_refused_change_names_its_node_by_local_id() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_nodes(&[
+        folder("root", None, "My Files"),
+        file("a", "root", "a.bin", 1),
+        file("b", "root", "b.bin", 1),
+    ])
+    .unwrap();
+    let refused = queued_op(&db, &uid("a").to_string(), 1, 90_000);
+    queued_op(&db, &uid("b").to_string(), 1, 90_000);
+    let gone = queued_op(&db, "vol~nowhere", 1, 90_000);
+    db.set_op_issue(refused, Some("quota")).unwrap();
+    db.set_op_issue(gone, Some("missing")).unwrap();
+
+    let lid = db.lid_of(&uid("a").to_string()).unwrap().unwrap();
+    assert_eq!(
+        db.node_issues().unwrap(),
+        std::collections::HashMap::from([(lid, "quota".to_string())])
+    );
+}
+
 #[test]
 fn retry_all_touches_only_ops_that_have_failed() {
     let db = Db::open_in_memory().unwrap();

@@ -9,7 +9,7 @@
 //! through one place (the status, transfers, sync progress) and publishes them
 //! when they differ.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,13 +153,15 @@ pub(crate) fn transfers_line(items: Vec<TransferItem>, jobs: Vec<JobItem>) -> Op
 
 /// Watch what changes without a single place to publish it from, and publish it
 /// when it differs from the last look: the status (queue counts, cache use,
-/// online, pause), the transfers snapshot, and the synced folders with their
-/// live progress. Looks only while someone is subscribed.
+/// online, pause), the transfers snapshot, the synced folders with their
+/// live progress, and which nodes have a sync issue. Looks only while someone
+/// is subscribed.
 pub(crate) fn run_event_sampler(core: Core, username: String, mountpoint: std::path::PathBuf) {
     let mut transfers: Option<Arc<str>> = None;
     let mut status: Option<String> = None;
     let mut queue: Option<String> = None;
     let mut locations: Option<String> = None;
+    let mut issues: Option<HashMap<i64, String>> = None;
     let mut tick = 0u32;
     while core.shutdown.sleep(SAMPLE_INTERVAL) {
         if !core.events.has_subscribers() {
@@ -169,6 +171,7 @@ pub(crate) fn run_event_sampler(core: Core, username: String, mountpoint: std::p
             status = None;
             queue = None;
             locations = None;
+            issues = None;
             continue;
         }
         let line = transfers_line(core.transfers.snapshot(), core.jobs_snapshot());
@@ -195,6 +198,15 @@ pub(crate) fn run_event_sampler(core: Core, username: String, mountpoint: std::p
             core.events.publish(&[Topic::Queue]);
         }
         queue = Some(queue_key);
+
+        // An issue shows on its node in the file browser: raised, cleared,
+        // landed or discarded, the listing is out of date.
+        if let Ok(now) = core.db.node_issues() {
+            if issues.as_ref().is_some_and(|last| *last != now) {
+                core.events.publish(&[Topic::Files]);
+            }
+            issues = Some(now);
+        }
 
         if let Ok(now) = core.list_locations() {
             let key = serde_json::to_string(&now).unwrap_or_default();

@@ -2495,9 +2495,13 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
 }
 
 /// The sync-state badge for an entry: `(icon, css-class)`, or `None` for folders
-/// (which carry no per-file cache state). Pinned (kept offline) ranks above merely
+/// (which carry no per-file cache state). A sync issue ranks first, on folders
+/// too: the change waits for the user. Pinned (kept offline) ranks above merely
 /// cached (downloaded, evictable); everything else is online-only.
 pub(crate) fn badge_for(entry: &DirEntry) -> Option<(&'static str, &'static str)> {
+    if entry.issue.is_some() {
+        return Some(("dialog-warning-symbolic", "badge-issue"));
+    }
     if entry.is_dir {
         return None;
     }
@@ -2513,9 +2517,11 @@ pub(crate) fn badge_for(entry: &DirEntry) -> Option<(&'static str, &'static str)
 /// Paint `badge` to reflect the entry's sync state (see [`badge_for`]). Clears any
 /// prior colour class first, since list factories recycle cells.
 pub(crate) fn apply_badge(badge: &gtk4::Image, entry: &DirEntry) {
-    for class in ["badge-pinned", "badge-cached", "badge-cloud"] {
+    for class in ["badge-pinned", "badge-cached", "badge-cloud", "badge-issue"] {
         badge.remove_css_class(class);
     }
+    let issue = entry.issue.map(super::locations::issue_text);
+    badge.set_tooltip_text(issue.as_deref());
     match badge_for(entry) {
         Some((icon, class)) => {
             badge.set_icon_name(Some(icon));
@@ -2915,6 +2921,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             shared_by_unverified: false,
             trashed_at: 0,
             trashed_from: None,
+            issue: None,
         })
         .collect();
     sort_entries(&mut entries, ui.browser.view.get());
@@ -2952,11 +2959,11 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoveTarget, hit_location, listing_summary, move_target_allowed,
+        MoveTarget, badge_for, hit_location, listing_summary, move_target_allowed,
         show_thumbnail_build_progress, sort_entries,
     };
     use pdfs_core::config::{FileSort, FilesView};
-    use pdfs_core::control::{DirEntry, ThumbnailBuildStatus};
+    use pdfs_core::control::{DirEntry, SyncIssue, ThumbnailBuildStatus};
 
     fn entry(name: &str, is_dir: bool, size: u64, modified: i64) -> DirEntry {
         DirEntry {
@@ -2974,11 +2981,26 @@ mod tests {
             shared_by_unverified: false,
             trashed_at: 0,
             trashed_from: None,
+            issue: None,
         }
     }
 
     fn names(entries: &[DirEntry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_sync_issue_shows_on_the_node_before_its_cache_state() {
+        let mut file = entry("a.txt", false, 1, 0);
+        file.pinned = true;
+        assert_eq!(badge_for(&file).unwrap().1, "badge-pinned");
+        file.issue = Some(SyncIssue::Quota);
+        assert_eq!(badge_for(&file).unwrap().1, "badge-issue");
+
+        let mut folder = entry("d", true, 0, 0);
+        assert_eq!(badge_for(&folder), None);
+        folder.issue = Some(SyncIssue::Missing);
+        assert_eq!(badge_for(&folder).unwrap().1, "badge-issue");
     }
 
     #[test]

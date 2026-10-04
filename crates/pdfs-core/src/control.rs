@@ -1296,6 +1296,10 @@ pub struct DirEntry {
     /// not known, and for anything not in the trash.
     #[serde(default)]
     pub trashed_from: Option<String>,
+    /// Why Drive refused a change queued on the node, for a [`Request::ListDir`]
+    /// entry; `None` otherwise.
+    #[serde(default)]
+    pub issue: Option<SyncIssue>,
 }
 
 /// One hit in a [`Request::Search`] result. Like [`DirEntry`] but carries the

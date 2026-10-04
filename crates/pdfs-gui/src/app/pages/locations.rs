@@ -727,7 +727,7 @@ fn queue_row(ui: &Rc<Ui>, op: &PendingOpInfo, now: i64) -> adw::ActionRow {
 
 /// What a sync issue means and what the user can do about it. The change stays
 /// queued either way.
-fn issue_text(issue: SyncIssue) -> String {
+pub(crate) fn issue_text(issue: SyncIssue) -> String {
     match issue {
         SyncIssue::Quota => gettext(
             "Your Proton Drive storage is full. Free up space or upgrade your plan, and this change uploads on its own.",

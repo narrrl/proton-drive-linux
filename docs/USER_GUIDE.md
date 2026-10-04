@@ -169,6 +169,8 @@ The version you do not keep goes to the Trash, so a wrong choice can be undone.
 - **Retry** a failed upload from **Sync → Overview**, or with `pdfs sync retry`.
 - **Discard** a change Proton Drive refused from the same list, or with `pdfs sync discard`: it is
   undone here and never sent. Export a file first to keep your version.
+- A file or folder with a change Proton Drive refused carries a warning badge in **Files**; hover
+  it to see why.
 
 ## Photos
 

@@ -29,6 +29,8 @@ by its local id, in the queue, the stored tree and pins alike.
 - **Discard a queued change.** The Sync page's Discard button and `pdfs sync discard <id>` drop
   a change Drive will not take and undo it here: a new file or folder goes, anything else goes
   back to what Drive has. Export a file first to keep its content.
+- **Sync issues show on the file.** A file or folder with a change Drive refused carries a
+  warning badge in the file browser, and its tooltip says what it means and what to do.
 
 ### Changed
 - **Making, renaming and deleting through the mount no longer waits for Drive.** A new folder,

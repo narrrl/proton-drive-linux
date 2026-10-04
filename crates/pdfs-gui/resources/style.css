@@ -46,6 +46,7 @@
 .badge-pinned { color: var(--success-color); }
 .badge-cached { color: var(--success-color); }
 .badge-cloud { color: color-mix(in srgb, currentColor 55%, transparent); }
+.badge-issue { color: var(--error-color); }
 .browser-statusbar { background-color: alpha(currentColor, 0.025); }
 scale.browser-status-meter trough { min-width: 104px; min-height: 6px; }
 .bulk-bar { padding: 6px 8px; border-radius: 12px; background: color-mix(in srgb, var(--accent-bg-color) 12%, transparent); }

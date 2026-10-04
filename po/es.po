@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-05 00:50+0200\n"
+"POT-Creation-Date: 2026-10-05 01:01+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Spanish\n"
@@ -511,8 +511,8 @@ msgstr "Opciones de vista"
 #: crates/pdfs-gui/src/app/pages/activity.rs:439
 #: crates/pdfs-gui/src/app/pages/browser.rs:385
 #: crates/pdfs-gui/src/app/pages/browser.rs:2109
-#: crates/pdfs-gui/src/app/pages/browser.rs:2635
-#: crates/pdfs-gui/src/app/pages/browser.rs:2639
+#: crates/pdfs-gui/src/app/pages/browser.rs:2641
+#: crates/pdfs-gui/src/app/pages/browser.rs:2645
 #: crates/pdfs-gui/src/app/pages/devices.rs:325
 #: crates/pdfs-gui/src/app/pages/locations.rs:192
 #: crates/pdfs-gui/src/app/pages/locations.rs:1123
@@ -532,8 +532,8 @@ msgid "Couldn't read activity"
 msgstr "No se pudo leer la actividad"
 
 #: crates/pdfs-gui/src/app/pages/activity.rs:470
-#: crates/pdfs-gui/src/app/pages/browser.rs:2671
-#: crates/pdfs-gui/src/app/pages/browser.rs:2853
+#: crates/pdfs-gui/src/app/pages/browser.rs:2677
+#: crates/pdfs-gui/src/app/pages/browser.rs:2859
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:308
 #: crates/pdfs-gui/src/app/pages/photos.rs:3435
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:382
@@ -1540,7 +1540,7 @@ msgid "Cancel thumbnail build"
 msgstr "Cancelar la generación de miniaturas"
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:255
-#: crates/pdfs-gui/src/app/pages/browser.rs:2784
+#: crates/pdfs-gui/src/app/pages/browser.rs:2790
 msgid "Search this folder only"
 msgstr "Buscar solo en esta carpeta"
 
@@ -1831,7 +1831,7 @@ msgstr ""
 "El servicio de Proton Drive dejó de informar del progreso de las miniaturas."
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:1705
-#: crates/pdfs-gui/src/app/pages/browser.rs:2925
+#: crates/pdfs-gui/src/app/pages/browser.rs:2932
 #, rust-format
 msgid "{n} folder"
 msgid_plural "{n} folders"
@@ -1924,7 +1924,7 @@ msgstr "No hay carpetas aquí."
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:2287
 #: crates/pdfs-gui/src/app/pages/browser.rs:2331
-#: crates/pdfs-gui/src/app/pages/browser.rs:2578
+#: crates/pdfs-gui/src/app/pages/browser.rs:2584
 msgid "Couldn't move"
 msgstr "No se pudo mover"
 
@@ -2002,50 +2002,50 @@ msgctxt "verb"
 msgid "View"
 msgstr "Ver"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2570
+#: crates/pdfs-gui/src/app/pages/browser.rs:2576
 #, rust-format
 msgid "Moved into “{name}”"
 msgstr "Movido a “{name}”"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2640
+#: crates/pdfs-gui/src/app/pages/browser.rs:2646
 #: crates/pdfs-gui/src/app/pages/devices.rs:261
 msgid "Reading this folder."
 msgstr "Leyendo esta carpeta."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2685
+#: crates/pdfs-gui/src/app/pages/browser.rs:2691
 msgid "Folder unavailable"
 msgstr "Carpeta no disponible"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2689
+#: crates/pdfs-gui/src/app/pages/browser.rs:2695
 msgid "Couldn't open this folder"
 msgstr "No se pudo abrir esta carpeta"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2731
+#: crates/pdfs-gui/src/app/pages/browser.rs:2737
 #: crates/pdfs-gui/src/app/pages/devices.rs:101
 #: crates/pdfs-gui/src/app/pages/shared.rs:456
 msgid "This folder is empty"
 msgstr "Esta carpeta está vacía"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2732
+#: crates/pdfs-gui/src/app/pages/browser.rs:2738
 msgid "Drop files here, or upload a file or create a folder to get started."
 msgstr ""
 "Suelte archivos aquí, o suba un archivo o cree una carpeta para empezar."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2782
+#: crates/pdfs-gui/src/app/pages/browser.rs:2788
 msgid "Search everywhere"
 msgstr "Buscar en todas partes"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2818
-#: crates/pdfs-gui/src/app/pages/browser.rs:2822
+#: crates/pdfs-gui/src/app/pages/browser.rs:2824
+#: crates/pdfs-gui/src/app/pages/browser.rs:2828
 msgid "Searching…"
 msgstr "Buscando…"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2823
+#: crates/pdfs-gui/src/app/pages/browser.rs:2829
 #, rust-format
 msgid "Looking for “{query}”."
 msgstr "Buscando “{query}”."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2879
+#: crates/pdfs-gui/src/app/pages/browser.rs:2885
 #, rust-format
 msgid "{summary} — showing the first {n} search result"
 msgid_plural "{summary} — showing the first {n} search results"
@@ -2053,20 +2053,20 @@ msgstr[0] "{summary}: se muestra el primer resultado de búsqueda"
 msgstr[1] "{summary}: se muestran los primeros {n} resultados de búsqueda"
 
 #. Translators: {summary} counts the hits, such as "2 folders, 5 files (3.0 MB)".
-#: crates/pdfs-gui/src/app/pages/browser.rs:2886
+#: crates/pdfs-gui/src/app/pages/browser.rs:2892
 #, rust-format
 msgid "{summary} — search results"
 msgstr "{summary}: resultados de búsqueda"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2892
+#: crates/pdfs-gui/src/app/pages/browser.rs:2898
 msgid "No matches"
 msgstr "Sin coincidencias"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2893
+#: crates/pdfs-gui/src/app/pages/browser.rs:2899
 msgid "No files or folders match that search."
 msgstr "Ningún archivo ni carpeta coincide con esa búsqueda."
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2926
+#: crates/pdfs-gui/src/app/pages/browser.rs:2933
 #: crates/pdfs-gui/src/i18n.rs:248
 #, rust-format
 msgid "{n} file"
@@ -2074,17 +2074,17 @@ msgid_plural "{n} files"
 msgstr[0] "{n} archivo"
 msgstr[1] "{n} archivos"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2932
+#: crates/pdfs-gui/src/app/pages/browser.rs:2939
 #, rust-format
 msgid "{files} ({size})"
 msgstr "{files} ({size})"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2937
+#: crates/pdfs-gui/src/app/pages/browser.rs:2944
 #, rust-format
 msgid "{folders}, {files}"
 msgstr "{folders}, {files}"
 
-#: crates/pdfs-gui/src/app/pages/browser.rs:2942
+#: crates/pdfs-gui/src/app/pages/browser.rs:2949
 #, rust-format
 msgid "{folders}, {files} ({size})"
 msgstr "{folders}, {files} ({size})"

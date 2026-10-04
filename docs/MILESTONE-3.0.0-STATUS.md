@@ -12,7 +12,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B181.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`; Discard button and
-  `pdfs sync discard`.
+  `pdfs sync discard`; a warning badge on the node in the file browser.
 
 ## Phase 3: left for 3.0.0
 
@@ -32,8 +32,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          undo the local change it stood for: a node made here goes, a node Drive has goes back
          to what Drive has. Control request, `pdfs sync discard`, Discard button with a
          confirmation; translated in every catalog.
-   - [ ] Show the issue on the node itself (file browser emblem or status). Not in the first
-         cut.
+   - [x] Show the issue on the node itself: a folder listing carries each node's issue, and
+         the file browser shows a warning badge with what it means. The listing is published
+         again when the set of issues changes.
 2. **Planner and executor (§5.4, §5.5)**: ops keyed by local id; remove `mint_local_uid`,
    `finish_create` and `adopt_real_uid`; a landing create sets `remote_uid` on its row.
    - [x] Queued ops carry `lid` and `parent_lid` (schema 39). The claim reads the parent's uid

@@ -278,7 +278,7 @@ pub(crate) fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> boo
 mod tests {
     use super::*;
     use crate::sim::fake_drive::{Entry, FakeDrive, Faults};
-    use pdfs_core::control::RefreshScope;
+    use pdfs_core::control::{RefreshScope, SyncIssue};
     use std::collections::BTreeMap;
 
     #[test]
@@ -693,6 +693,47 @@ mod tests {
         daemon.request(&paused(false)).unwrap();
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(drive.tree(), before);
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_refused_change_shows_on_its_node_until_it_is_discarded() {
+        let drive = FakeDrive::new();
+        let dir = scratch("issue-on-node");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        drive.set_quota(10);
+        std::fs::write(mnt.join("big.bin"), [0u8; 64]).unwrap();
+        std::fs::write(mnt.join("small.txt"), b"ok").unwrap();
+        let list = || {
+            let path = mnt.to_string_lossy().into_owned();
+            match daemon.request(&Request::ListDir { path }) {
+                Ok(Response::Entries { entries }) => entries
+                    .into_iter()
+                    .filter(|entry| entry.name.contains('.'))
+                    .map(|entry| (entry.name, entry.issue))
+                    .collect::<BTreeMap<_, _>>(),
+                other => panic!("the daemon did not list the root: {other:?}"),
+            }
+        };
+        let refused = BTreeMap::from([
+            ("big.bin".to_string(), Some(SyncIssue::Quota)),
+            ("small.txt".to_string(), None),
+        ]);
+        assert!(
+            wait_until(Duration::from_secs(30), || list() == refused),
+            "{:?} {:?}",
+            list(),
+            daemon.pending()
+        );
+
+        let op = daemon.pending().unwrap().remove(0);
+        let reply = daemon.request(&Request::DiscardPendingOp { id: op.id });
+        assert!(matches!(reply, Ok(Response::Ok { .. })), "{reply:?}");
+        assert_eq!(list(), BTreeMap::from([("small.txt".to_string(), None)]));
 
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);

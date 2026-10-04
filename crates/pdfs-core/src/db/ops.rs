@@ -1371,6 +1371,26 @@ impl Db {
         Ok(rows)
     }
 
+    /// The issue each node with a refused change has, by local id: what the
+    /// file browser shows on the node itself.
+    pub fn node_issues(&self) -> Result<HashMap<i64, String>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(o.lid, n.lid), o.issue FROM pending_op o
+             LEFT JOIN nodes n ON o.lid IS NULL AND n.uid = o.uid
+             WHERE o.issue IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get(1)?)))?
+            .filter_map(|row| match row {
+                Ok((Some(lid), issue)) => Some(Ok((lid, issue))),
+                Ok((None, _)) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Make a create due again if it was renamed or moved
     /// ([`Db::rewrite_op_target`]) while the attempt that just failed was on
     /// the wire, `parent_uid` and `name` being what that attempt sent. What it

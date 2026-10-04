@@ -533,6 +533,7 @@ mod tests {
             shared_by_unverified: false,
             trashed_at,
             trashed_from: from.map(str::to_string),
+            issue: None,
         }
     }
 
