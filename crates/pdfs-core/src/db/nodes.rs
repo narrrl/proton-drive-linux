@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::Db;
@@ -65,12 +66,13 @@ impl Db {
     /// snapshot while offline, including after a live event expired its TTL.
     pub fn visible_children(&self, parent: &NodeUid) -> Result<Vec<Node>> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
-            "SELECT node_json FROM nodes
-              WHERE parent_uid = ?1 AND trashed = 0 AND node_json IS NOT NULL
-              ORDER BY name, uid",
-        )?;
-        let rows = stmt.query_map([parent.to_string()], |row| row.get::<_, String>(0))?;
+        let (key, parent) = parent_key(&conn, &parent.to_string())?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+              WHERE n.{key} = ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
+              ORDER BY n.name, n.uid"
+        ))?;
+        let rows = stmt.query_map([parent], |row| row.get::<_, String>(0))?;
         let mut nodes = Vec::new();
         for row in rows {
             nodes.push(serde_json::from_str(&row?)?);
@@ -307,12 +309,14 @@ impl Db {
 
     /// Check if a folder node has any non-trashed children in the database.
     pub fn has_children(&self, parent_uid: &NodeUid) -> Result<bool> {
-        let uid_str = parent_uid.to_string();
         let conn = self.read();
+        let (key, parent) = parent_key(&conn, &parent_uid.to_string())?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes
-             WHERE parent_uid = ?1 AND trashed = 0 AND node_json IS NOT NULL",
-            params![uid_str],
+            &format!(
+                "SELECT COUNT(*) FROM nodes
+                 WHERE {key} = ?1 AND trashed = 0 AND node_json IS NOT NULL"
+            ),
+            params![parent],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -349,11 +353,11 @@ impl Db {
     pub fn path_relative_to(&self, ancestor_uid: &str, uid: &str) -> Result<Option<String>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "WITH RECURSIVE anc(uid, parent_uid, name, depth) AS (
-               SELECT uid, parent_uid, name, 0 FROM nodes WHERE uid = ?1
+            "WITH RECURSIVE anc(uid, parent_lid, name, depth) AS (
+               SELECT uid, parent_lid, name, 0 FROM nodes WHERE uid = ?1
                UNION ALL
-               SELECT n.uid, n.parent_uid, n.name, anc.depth + 1
-               FROM nodes n JOIN anc ON n.uid = anc.parent_uid
+               SELECT n.uid, n.parent_lid, n.name, anc.depth + 1
+               FROM nodes n JOIN anc ON n.lid = anc.parent_lid
                WHERE anc.depth < 1024
              )
              SELECT uid, name FROM anc ORDER BY depth",
@@ -402,12 +406,13 @@ impl Db {
         let conn = self.read();
         let rows: Vec<HitRow> = if query.chars().count() < TRIGRAM_MIN {
             let pat = format!("%{}%", like_escape(query));
-            let mut stmt = conn.prepare(
-                "SELECT node_json, uid, path FROM nodes
-                 WHERE name LIKE ?1 ESCAPE '\\' AND trashed = 0 AND node_json IS NOT NULL
-                   AND (?3 IS NULL OR path IS NULL OR path LIKE ?3 ESCAPE '\\')
-                 ORDER BY name LIMIT ?2",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {NODE_NOW}, n.uid, n.path
+                 FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+                 WHERE n.name LIKE ?1 ESCAPE '\\' AND n.trashed = 0 AND n.node_json IS NOT NULL
+                   AND (?3 IS NULL OR n.path IS NULL OR n.path LIKE ?3 ESCAPE '\\')
+                 ORDER BY n.name LIMIT ?2"
+            ))?;
             collect_hits(stmt.query_map(params![pat, limit as i64, scope_pat], hit_row)?)?
         } else {
             // Escape double quotes and quote each term, then combine with AND so
@@ -417,13 +422,14 @@ impl Db {
                 .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            let mut stmt = conn.prepare(
-                "SELECT n.node_json, n.uid, n.path
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {NODE_NOW}, n.uid, n.path
                  FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
+                 LEFT JOIN nodes p ON p.lid = n.parent_lid
                  WHERE f.name MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
                    AND (?3 IS NULL OR n.path IS NULL OR n.path LIKE ?3 ESCAPE '\\')
-                 ORDER BY f.rank LIMIT ?2",
-            )?;
+                 ORDER BY f.rank LIMIT ?2"
+            ))?;
             collect_hits(stmt.query_map(params![phrase, limit as i64, scope_pat], hit_row)?)?
         };
 
@@ -460,20 +466,22 @@ impl Db {
         let lane_limit = limit.div_ceil(2);
         let mut rows: Vec<HitRow> = if terms.is_empty() {
             let pat = format!("%{}%", like_escape(query));
-            let mut stmt = conn.prepare(
-                "SELECT node_json, uid, path FROM nodes
-                 WHERE name LIKE ?1 ESCAPE '\\' AND trashed = 0 AND node_json IS NOT NULL
-                 ORDER BY name LIMIT ?2",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {NODE_NOW}, n.uid, n.path
+                 FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+                 WHERE n.name LIKE ?1 ESCAPE '\\' AND n.trashed = 0 AND n.node_json IS NOT NULL
+                 ORDER BY n.name LIMIT ?2"
+            ))?;
             collect_hits(stmt.query_map(params![pat, limit as i64], hit_row)?)?
         } else {
             let expression = terms.join(" OR ");
-            let mut stmt = conn.prepare(
-                "SELECT n.node_json, n.uid, n.path
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {NODE_NOW}, n.uid, n.path
                    FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
+                   LEFT JOIN nodes p ON p.lid = n.parent_lid
                   WHERE nodes_fts MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
-                  ORDER BY f.rank LIMIT ?2",
-            )?;
+                  ORDER BY f.rank LIMIT ?2"
+            ))?;
             collect_hits(stmt.query_map(params![expression, lane_limit as i64], hit_row)?)?
         };
         // Trigram rank does not know that a name *starts* with the query, and a
@@ -483,12 +491,13 @@ impl Db {
         if !terms.is_empty()
             && let Some(first) = query.chars().next()
         {
-            let mut stmt = conn.prepare(
-                "SELECT node_json, uid, path FROM nodes
-                 WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
-                   AND trashed = 0 AND node_json IS NOT NULL
-                 ORDER BY name COLLATE NOCASE LIMIT ?2",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {NODE_NOW}, n.uid, n.path
+                 FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+                 WHERE n.name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
+                   AND n.trashed = 0 AND n.node_json IS NOT NULL
+                 ORDER BY n.name COLLATE NOCASE LIMIT ?2"
+            ))?;
             let mut extra = Vec::new();
             for pattern in [
                 format!("{}%", like_escape(query)),
@@ -538,24 +547,20 @@ impl Db {
     /// stored below it may still hold the placeholder.
     pub fn load_all(&self) -> Result<Vec<StoredNode>> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
-            "SELECT n.node_json, n.listed, n.lid, p.uid
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NODE_NOW}, n.listed, n.lid
              FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
-             WHERE n.node_json IS NOT NULL",
-        )?;
+             WHERE n.node_json IS NOT NULL"
+        ))?;
         let rows = stmt.query_map([], |row| {
             let json: String = row.get(0)?;
             let listed: i64 = row.get(1)?;
-            let parent: Option<String> = row.get(3)?;
-            Ok((json, listed != 0, row.get(2)?, parent))
+            Ok((json, listed != 0, row.get(2)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (json, listed, lid, parent) = row?;
-            let mut node: Node = serde_json::from_str(&json)?;
-            if let Some(parent) = parent.as_deref().and_then(parse_node_uid) {
-                node.parent_uid = Some(parent);
-            }
+            let (json, listed, lid) = row?;
+            let node: Node = serde_json::from_str(&json)?;
             out.push(StoredNode { node, listed, lid });
         }
         Ok(out)
@@ -568,7 +573,10 @@ impl Db {
         let conn = self.read();
         let json: Option<String> = conn
             .query_row(
-                "SELECT node_json FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL",
+                &format!(
+                    "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+                     WHERE n.uid = ?1 AND n.node_json IS NOT NULL"
+                ),
                 params![uid],
                 |r| r.get(0),
             )
@@ -613,20 +621,26 @@ impl Db {
             let mut known = tx.prepare_cached("SELECT lid FROM nodes WHERE uid = ?1")?;
             let mut stub = tx.prepare_cached(
                 "INSERT INTO nodes (uid, parent_uid, name, is_dir, mtime, trashed, parent_lid)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT lid FROM nodes WHERE uid = ?2))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for node in nodes {
                 let uid = node.uid.to_string();
                 let lid = match known.query_row(params![uid], |r| r.get(0)).optional()? {
                     Some(lid) => lid,
                     None => {
+                        let parent = node.parent_uid.as_ref().map(ToString::to_string);
+                        let parent_lid = match &parent {
+                            Some(parent) => node_lid(&tx, parent)?,
+                            None => None,
+                        };
                         stub.execute(params![
                             uid,
-                            node.parent_uid.as_ref().map(ToString::to_string),
+                            parent,
                             node.name,
                             node.is_folder() as i64,
                             node.modification_time,
                             node.trashed as i64,
+                            parent_lid,
                         ])?;
                         let lid = tx.last_insert_rowid();
                         adopt_children_tx(&tx, &uid, lid)?;
@@ -699,11 +713,12 @@ impl Db {
     /// had: a listing dropped as stale may miss or keep a child.
     pub fn known_children(&self, parent: &NodeUid) -> Result<Vec<Node>> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
-            "SELECT node_json FROM nodes
-             WHERE parent_uid = ?1 AND node_json IS NOT NULL AND trashed = 0",
-        )?;
-        let rows = stmt.query_map(params![parent.to_string()], |r| r.get::<_, String>(0))?;
+        let (key, parent) = parent_key(&conn, &parent.to_string())?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+             WHERE n.{key} = ?1 AND n.node_json IS NOT NULL AND n.trashed = 0"
+        ))?;
+        let rows = stmt.query_map(params![parent], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for json in rows {
             out.push(serde_json::from_str(&json?)?);
@@ -721,13 +736,13 @@ impl Db {
     /// until the create lands (`docs/BUGS.md` B132).
     pub fn queued_children(&self, parent: &NodeUid) -> Result<(Vec<Node>, HashSet<String>)> {
         let conn = self.read();
-        let parent = parent.to_string();
-        let mut stmt = conn.prepare(
-            "SELECT n.node_json FROM nodes n
-             WHERE n.parent_uid = ?1 AND n.node_json IS NOT NULL AND n.trashed = 0
-               AND EXISTS (SELECT 1 FROM pending_op p
-                           WHERE p.uid = n.uid AND p.kind IN (?2, ?3, ?4))",
-        )?;
+        let (key, parent) = parent_key(&conn, &parent.to_string())?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NODE_NOW} FROM nodes n LEFT JOIN nodes p ON p.lid = n.parent_lid
+             WHERE n.{key} = ?1 AND n.node_json IS NOT NULL AND n.trashed = 0
+               AND EXISTS (SELECT 1 FROM pending_op o
+                           WHERE (o.lid = n.lid OR o.uid = n.uid) AND o.kind IN (?2, ?3, ?4))"
+        ))?;
         let rows = stmt.query_map(params![parent, OP_CREATE, OP_MKDIR, OP_RENAME], |r| {
             r.get::<_, String>(0)
         })?;
@@ -735,10 +750,10 @@ impl Db {
         for json in rows {
             here.push(serde_json::from_str(&json?)?);
         }
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT p.uid FROM pending_op p JOIN nodes n ON n.uid = p.uid
-             WHERE p.kind = ?2 AND n.parent_uid IS NOT ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT n.uid FROM pending_op p JOIN nodes n ON n.lid = p.lid OR n.uid = p.uid
+             WHERE p.kind = ?2 AND n.{key} IS NOT ?1"
+        ))?;
         let gone = stmt
             .query_map(params![parent, OP_RENAME], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
@@ -777,8 +792,29 @@ pub(super) fn node_lid(conn: &rusqlite::Connection, uid: &str) -> Result<Option<
     Ok(row.optional()?)
 }
 
-/// Hand a drained placeholder's row, and the rows below it, to the real uid it
-/// landed as.
+/// The column and value a row names `parent` by: its local id when it has a
+/// row, which the children keep when it lands, or its uid when it has none,
+/// as a device folder's root does.
+fn parent_key(conn: &rusqlite::Connection, parent: &str) -> Result<(&'static str, Value)> {
+    Ok(match node_lid(conn, parent)? {
+        Some(lid) => ("parent_lid", Value::Integer(lid)),
+        None => ("parent_uid", Value::Text(parent.to_owned())),
+    })
+}
+
+/// `n.node_json` naming its parent as the parent's row `p`, joined by
+/// `n.parent_lid`, has it now. A folder that lands takes its real uid in its
+/// own row only, so a node stored below it still names the stand-in.
+const NODE_NOW: &str = "CASE WHEN p.uid IS NULL OR p.uid = n.parent_uid THEN n.node_json
+     ELSE json_set(n.node_json, '$.parent_uid', json_object(
+            'volume_id', substr(p.uid, 1, instr(p.uid, '~') - 1),
+            'link_id', substr(p.uid, instr(p.uid, '~') + 1))) END";
+
+/// Hand a drained placeholder's row to the real uid it landed as.
+///
+/// Nothing else is rewritten. The rows below it and the ops made inside it
+/// name it by its local id, which stays; what reads them for a uid takes the
+/// one the row has now ([`NODE_NOW`], `PARENT_NOW` in `ops.rs`).
 ///
 /// Dropping the placeholder row and waiting for the server's copy of the real
 /// node left a window with no row for either uid. A queued child drained in
@@ -800,19 +836,6 @@ pub(super) fn adopt_placeholder_row_tx(
         params![local, real],
     )?;
     tx.execute("DELETE FROM pins WHERE uid = ?1", params![local])?;
-    // The node a row holds names its parent too, and is what a restart builds
-    // the tree from: a folder that landed with no write to its children after
-    // left them under a parent no row has (`docs/BUGS.md` B140).
-    let real_json = parse_node_uid(real)
-        .map(|uid| serde_json::to_string(&uid))
-        .transpose()?;
-    tx.execute(
-        "UPDATE nodes SET parent_uid = ?2,
-           node_json = CASE WHEN ?3 IS NULL OR node_json IS NULL THEN node_json
-                            ELSE json_set(node_json, '$.parent_uid', json(?3)) END
-         WHERE parent_uid = ?1",
-        params![local, real, real_json],
-    )?;
     let row: Option<(i64, Option<String>)> = tx
         .query_row(
             "SELECT lid, node_json FROM nodes WHERE uid = ?1",
@@ -829,11 +852,6 @@ pub(super) fn adopt_placeholder_row_tx(
     let Some((lid, json)) = row else {
         return Ok(());
     };
-    // The ops made inside the folder name it by its local id, which stays.
-    tx.execute(
-        "UPDATE pending_op SET parent_uid = ?2 WHERE parent_lid = ?1",
-        params![lid, real],
-    )?;
     let known: Option<(i64, Option<String>)> = tx
         .query_row(
             "SELECT lid, node_json FROM nodes WHERE uid = ?1",
@@ -908,13 +926,16 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
     let (parent_lid, path) = match &parent_uid {
         None => (None, String::new()),
         Some(parent) => {
-            let parent_row: Option<(i64, Option<String>)> = tx
-                .query_row(
-                    "SELECT lid, path FROM nodes WHERE uid = ?1",
-                    params![parent],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
+            let parent_row: Option<(i64, Option<String>)> = match node_lid(tx, parent)? {
+                Some(lid) => tx
+                    .query_row(
+                        "SELECT lid, path FROM nodes WHERE lid = ?1",
+                        params![lid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?,
+                None => None,
+            };
             let (lid, parent_path) = parent_row.unzip();
             (
                 lid,
@@ -980,7 +1001,7 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
             || prior.trashed != node.trashed
     });
     if node.is_folder() && subtree_moved {
-        reindex_subtree_tx(tx, &uid, &path, indexable)?;
+        reindex_subtree_tx(tx, rowid, &path, indexable)?;
     }
     Ok(())
 }
@@ -1001,22 +1022,22 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
 /// this deep.
 fn reindex_subtree_tx(
     tx: &Transaction<'_>,
-    folder: &str,
+    folder: i64,
     folder_path: &str,
     folder_indexable: bool,
 ) -> Result<()> {
     let descendants: Vec<(i64, String, bool)> = {
         let mut stmt = tx.prepare(
-            "WITH RECURSIVE sub(rowid, uid, name, path, blocked, depth) AS (
-               SELECT n.rowid, n.uid, n.name,
+            "WITH RECURSIVE sub(rowid, name, path, blocked, depth) AS (
+               SELECT n.rowid, n.name,
                       CASE WHEN ?2 = '' THEN n.name ELSE ?2 || '/' || n.name END,
                       n.trashed, 0
-                 FROM nodes n WHERE n.parent_uid = ?1
+                 FROM nodes n WHERE n.parent_lid = ?1
                UNION ALL
-               SELECT n.rowid, n.uid, n.name,
+               SELECT n.rowid, n.name,
                       sub.path || '/' || n.name,
                       MAX(sub.blocked, n.trashed), sub.depth + 1
-                 FROM nodes n JOIN sub ON n.parent_uid = sub.uid
+                 FROM nodes n JOIN sub ON n.parent_lid = sub.rowid
                 WHERE sub.depth < 256
              )
              SELECT rowid, path, blocked FROM sub",
@@ -1057,7 +1078,8 @@ fn reindex_subtree_tx(
 }
 
 fn direct_child_uids_tx(tx: &Transaction<'_>, parent: &str) -> Result<Vec<String>> {
-    let mut stmt = tx.prepare("SELECT uid FROM nodes WHERE parent_uid = ?1")?;
+    let (key, parent) = parent_key(tx, parent)?;
+    let mut stmt = tx.prepare(&format!("SELECT uid FROM nodes WHERE {key} = ?1"))?;
     let rows = stmt.query_map([parent], |row| row.get::<_, String>(0))?;
     let mut uids = Vec::new();
     for row in rows {
@@ -1082,14 +1104,14 @@ fn direct_child_uids_tx(tx: &Transaction<'_>, parent: &str) -> Result<Vec<String
 /// ends at one whose parent is a row we have already visited.
 fn node_is_indexable_tx(tx: &Transaction<'_>, uid: &str) -> Result<bool> {
     let indexable: i64 = tx.query_row(
-        "WITH RECURSIVE ancestors(uid, parent_uid, trashed, depth, path) AS (
-           SELECT uid, parent_uid, trashed, 0, char(31) || uid || char(31)
+        "WITH RECURSIVE ancestors(lid, parent_lid, trashed, depth, path) AS (
+           SELECT lid, parent_lid, trashed, 0, ',' || lid || ','
              FROM nodes WHERE uid = ?1
            UNION ALL
-           SELECT n.uid, n.parent_uid, n.trashed, a.depth + 1,
-                  a.path || n.uid || char(31)
-             FROM ancestors a JOIN nodes n ON n.uid = a.parent_uid
-            WHERE instr(a.path, char(31) || n.uid || char(31)) = 0
+           SELECT n.lid, n.parent_lid, n.trashed, a.depth + 1,
+                  a.path || n.lid || ','
+             FROM ancestors a JOIN nodes n ON n.lid = a.parent_lid
+            WHERE instr(a.path, ',' || n.lid || ',') = 0
          )
          SELECT CASE
            WHEN COUNT(*) = 0 THEN 0
@@ -1097,8 +1119,7 @@ fn node_is_indexable_tx(tx: &Transaction<'_>, uid: &str) -> Result<bool> {
            WHEN EXISTS (
              SELECT 1 FROM ancestors a
               WHERE a.depth = (SELECT MAX(depth) FROM ancestors)
-                AND a.parent_uid IS NOT NULL
-                AND EXISTS (SELECT 1 FROM nodes p WHERE p.uid = a.parent_uid)
+                AND EXISTS (SELECT 1 FROM nodes p WHERE p.lid = a.parent_lid)
            ) THEN 0
            ELSE 1
          END
@@ -1116,7 +1137,7 @@ fn tombstone_subtree_tx(tx: &Transaction<'_>, root_uid: &str) -> Result<()> {
                SELECT rowid, uid, node_json FROM nodes WHERE uid = ?1
                UNION
                SELECT n.rowid, n.uid, n.node_json FROM nodes n
-                 JOIN subtree s ON n.parent_uid = s.uid
+                 JOIN subtree s ON n.parent_lid = s.rowid
              )
              SELECT rowid, uid, node_json FROM subtree",
         )?;

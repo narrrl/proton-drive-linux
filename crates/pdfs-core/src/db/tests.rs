@@ -3900,6 +3900,104 @@ fn a_landed_folder_hands_its_children_over_in_the_stored_node_too() {
     assert_eq!(names, ["a.txt"]);
 }
 
+/// A folder made here that lands takes its real uid in its own row only. What
+/// was made inside it names it by local id, and is found under the real uid.
+#[test]
+fn a_landed_folder_rewrites_no_row_or_op_below_it() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let root = uid("root").to_string();
+    let dir_lid = db.add_local_row(&root, "dir", true, 1).unwrap();
+    let local_dir = local_uid(dir_lid);
+    let mut dir = folder("x", Some("root"), "dir");
+    dir.uid = NodeUid::new(VolumeId::from("local"), LinkId::from(dir_lid.to_string()));
+    db.upsert_node(&dir).unwrap();
+    let child_lid = db.add_local_row(&local_dir, "a.txt", false, 1).unwrap();
+    let local_child = local_uid(child_lid);
+    let mut child = file("y", "x", "a.txt", 3);
+    child.uid = NodeUid::new(VolumeId::from("local"), LinkId::from(child_lid.to_string()));
+    child.parent_uid = Some(dir.uid.clone());
+    db.upsert_node(&child).unwrap();
+    db.enqueue_op(&op_on(OP_CREATE, &local_child, Some(&local_dir)))
+        .unwrap();
+
+    let real_dir = uid("dir").to_string();
+    db.land_placeholder_row(&local_dir, &real_dir).unwrap();
+
+    let (stored_parent, op_parent): (String, String) = {
+        let conn = db.conn.lock();
+        (
+            conn.query_row(
+                "SELECT parent_uid FROM nodes WHERE lid = ?1",
+                [child_lid],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row("SELECT parent_uid FROM pending_op", [], |r| r.get(0))
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        (stored_parent.as_str(), op_parent.as_str()),
+        (local_dir.as_str(), local_dir.as_str()),
+        "the child's row and op are not rewritten"
+    );
+
+    let children = db.known_children(&uid("dir")).unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].parent_uid, Some(uid("dir")));
+    assert!(db.has_children(&uid("dir")).unwrap());
+    assert_eq!(
+        db.node_path(&local_child).unwrap().as_deref(),
+        Some("dir/a.txt")
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].parent_uid.as_deref(),
+        Some(real_dir.as_str()),
+        "the drain sends the folder's real uid"
+    );
+
+    db.delete_ops_for_uid(&real_dir).unwrap();
+    assert!(
+        db.pending_ops().unwrap().is_empty(),
+        "removing the folder takes the create made inside it"
+    );
+}
+
+/// A create queued inside a folder made here is sent under the folder's real
+/// uid once it lands. Landing where it was sent is no move.
+#[test]
+fn a_create_sent_into_a_landed_folder_lands_where_it_was_queued() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let dir_lid = db
+        .add_local_row(&uid("root").to_string(), "dir", true, 1)
+        .unwrap();
+    let local_dir = local_uid(dir_lid);
+    let child_lid = db.add_local_row(&local_dir, "new.txt", false, 1).unwrap();
+    let local_child = local_uid(child_lid);
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_CREATE, &local_child, Some(&local_dir)))
+        .unwrap();
+    let real_dir = uid("dir").to_string();
+    db.land_placeholder_row(&local_dir, &real_dir).unwrap();
+
+    let claimed = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(claimed.parent_uid.as_deref(), Some(real_dir.as_str()));
+    let real = uid("new").to_string();
+    db.finish_create(
+        id,
+        Some("/staging/create"),
+        &landing(&local_child, &real, &real_dir, "new.txt"),
+        |_| None,
+    )
+    .unwrap();
+    assert!(
+        db.pending_ops().unwrap().is_empty(),
+        "no rename is queued for a file that landed where it was sent"
+    );
+}
+
 #[test]
 fn migration_v36_gives_every_node_its_rowid_as_lid() {
     let path = std::env::temp_dir().join(format!(

@@ -64,11 +64,11 @@ impl Db {
     }
 
     /// Whether `uid` is pinned — directly, or because a strict ancestor folder
-    /// is pinned recursively. The ancestor check walks `parent_uid` to the root
+    /// is pinned recursively. The ancestor check walks `parent_lid` to the root
     /// via a CTE; a direct pin is honoured even when the node has no `nodes` row
     /// yet (e.g. a CLI that never hydrates the node cache).
     ///
-    /// The walk is depth-capped like [`super::utils::path_of`]: a `parent_uid`
+    /// The walk is depth-capped like [`super::utils::path_of`]: a parent
     /// cycle is corrupt data the API can hand us, and `UNION ALL` over one never
     /// terminates — while holding the daemon's only SQLite connection, on a path
     /// that runs per cached read.
@@ -85,11 +85,11 @@ impl Db {
         let anc: Option<i64> = conn
             .query_row(
                 &format!(
-                    "WITH RECURSIVE anc(uid, parent_uid, depth) AS (
-                       SELECT uid, parent_uid, 0 FROM nodes WHERE uid = ?1
+                    "WITH RECURSIVE anc(uid, parent_lid, depth) AS (
+                       SELECT uid, parent_lid, 0 FROM nodes WHERE uid = ?1
                        UNION ALL
-                       SELECT n.uid, n.parent_uid, anc.depth + 1
-                       FROM nodes n JOIN anc ON n.uid = anc.parent_uid
+                       SELECT n.uid, n.parent_lid, anc.depth + 1
+                       FROM nodes n JOIN anc ON n.lid = anc.parent_lid
                        WHERE anc.depth < {MAX_PATH_DEPTH}
                      )
                      SELECT 1 FROM anc a JOIN pins p ON p.uid = a.uid
@@ -109,10 +109,11 @@ impl Db {
     pub fn pinned_uids(&self) -> Result<Vec<String>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "WITH RECURSIVE sub(uid) AS (
-               SELECT uid FROM pins WHERE recursive = 1
+            "WITH RECURSIVE sub(uid, lid) AS (
+               SELECT p.uid, n.lid FROM pins p LEFT JOIN nodes n ON n.uid = p.uid
+                WHERE p.recursive = 1
                UNION
-               SELECT n.uid FROM nodes n JOIN sub ON n.parent_uid = sub.uid
+               SELECT n.uid, n.lid FROM nodes n JOIN sub ON n.parent_lid = sub.lid
              )
              SELECT uid FROM sub
              UNION
@@ -126,15 +127,16 @@ impl Db {
         Ok(out)
     }
 
-    /// Every descendant uid of `folder` (all depths), via a `parent_uid` CTE.
+    /// Every descendant uid of `folder` (all depths), via a `parent_lid` CTE.
     /// Used to evict a recursively-pinned subtree's cached blobs on unpin.
     pub fn descendants(&self, folder: &str) -> Result<Vec<String>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "WITH RECURSIVE sub(uid) AS (
-               SELECT uid FROM nodes WHERE parent_uid = ?1
+            "WITH RECURSIVE sub(uid, lid) AS (
+               SELECT c.uid, c.lid FROM nodes c JOIN nodes f ON c.parent_lid = f.lid
+                WHERE f.uid = ?1
                UNION
-               SELECT n.uid FROM nodes n JOIN sub ON n.parent_uid = sub.uid
+               SELECT n.uid, n.lid FROM nodes n JOIN sub ON n.parent_lid = sub.lid
              )
              SELECT uid FROM sub",
         )?;

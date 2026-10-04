@@ -107,18 +107,19 @@ impl Db {
         }
         let value = conn
             .query_row(
-                "WITH RECURSIVE ancestors(uid, parent_uid, depth, path) AS (
-                   SELECT uid, parent_uid, 0, char(31) || uid || char(31)
+                "WITH RECURSIVE ancestors(uid, parent_uid, parent_lid, depth, path) AS (
+                   SELECT uid, parent_uid, parent_lid, 0, char(31) || uid || char(31)
                      FROM nodes WHERE uid = ?1
                    UNION ALL
-                   SELECT a.parent_uid, n.parent_uid, a.depth + 1,
-                          a.path || a.parent_uid || char(31)
+                   SELECT COALESCE(n.uid, a.parent_uid), n.parent_uid, n.parent_lid,
+                          a.depth + 1,
+                          a.path || COALESCE(n.uid, a.parent_uid) || char(31)
                      FROM ancestors a
-                     LEFT JOIN nodes n ON n.uid = a.parent_uid
+                     LEFT JOIN nodes n ON n.lid = a.parent_lid
                     WHERE a.parent_uid IS NOT NULL
                       AND instr(
                             a.path,
-                            char(31) || a.parent_uid || char(31)
+                            char(31) || COALESCE(n.uid, a.parent_uid) || char(31)
                           ) = 0
                  )
                  SELECT sa.access

@@ -34,17 +34,20 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          through `parent_lid`, and a landing folder rewrites the ops inside it by local id.
    - [x] Node rows link to their parent by lid (`nodes.parent_lid`, schema 40), and a restart
          places each node under its parent's row as it is now.
-   - [ ] Queries over children and subtrees by `parent_lid`, and no rewrite of the children's
-         `parent_uid` when a folder lands (R3). Both go with the placeholders: until then the
-         strings are kept in step.
-   - [ ] No more placeholders: `nodes.uid` is `NULL` until a node lands. In four parts:
+   - [x] Queries over children, subtrees and ancestors by `parent_lid`, and no rewrite of the
+         children's `parent_uid` when a folder lands (R3), nor of the ops made inside it (R2).
+   - [ ] No more placeholders: a node made here goes by its local id until it lands. In four
+         parts:
      - [x] 6a: a node made here goes by `local~<lid>`, a function of its row, instead of a
            minted `local~<ms>-<n>`; schema 41 rewrites the old placeholders (nodes, ops, pins).
      - [x] 6b: an op is found by its node's local id under either uid, the claim keeps one op
            per local id on the wire, and the drain sends the uid the row has now;
            `remap_local_uid` is gone.
-     - [ ] 6c: a local node's row has `uid NULL`; children, subtrees and ops' parents by lid,
-           so a landing create rewrites no other row or op; pins by lid.
+     - [x] 6c: children, subtrees, ancestors and ops' parents by lid, so a landing create
+           rewrites no other row or op; what is read for a uid names the parent as its row has it
+           now. The row keeps its stand-in in `nodes.uid` rather than `NULL`: it is as stable,
+           and `NULL` would have changed some 40 node queries for no change in behaviour. Pins
+           stay keyed by uid and move with the row in the landing transaction (B148).
      - [ ] 6d: in memory, `pending`, `hidden` and `creating` by lid; `is_local_uid` checks
            become `remote_uid().is_none()`; a write or rename after landing queues under the
            stand-in, so `landed_uid`, `follow_landed_create`, `landed_row_uid` and the

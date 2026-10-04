@@ -72,18 +72,18 @@ pub(super) fn path_of(conn: &Connection, uid: &str) -> Result<String> {
     }
 }
 
-/// Resolve a path by walking `parent_uid` to the root via a recursive CTE.
+/// Resolve a path by walking `parent_lid` to the root via a recursive CTE.
 ///
-/// A cycle in `parent_uid` is corrupt data the API can still hand us, and
+/// A cycle in the parents is corrupt data the API can still hand us, and
 /// `UNION ALL` over one never terminates — the walk is therefore depth-capped
 /// and returns the truncated path rather than hanging the caller.
 pub(super) fn walk_path_of(conn: &Connection, uid: &str) -> Result<String> {
     let mut stmt = conn.prepare(&format!(
-        "WITH RECURSIVE anc(uid, parent_uid, name, depth) AS (
-           SELECT uid, parent_uid, name, 0 FROM nodes WHERE uid = ?1
+        "WITH RECURSIVE anc(parent_lid, parent_uid, name, depth) AS (
+           SELECT parent_lid, parent_uid, name, 0 FROM nodes WHERE uid = ?1
            UNION ALL
-           SELECT n.uid, n.parent_uid, n.name, anc.depth + 1
-           FROM nodes n JOIN anc ON n.uid = anc.parent_uid
+           SELECT n.parent_lid, n.parent_uid, n.name, anc.depth + 1
+           FROM nodes n JOIN anc ON n.lid = anc.parent_lid
            WHERE anc.depth < {MAX_PATH_DEPTH}
          )
          SELECT name, parent_uid FROM anc ORDER BY depth DESC"

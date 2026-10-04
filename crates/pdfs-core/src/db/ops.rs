@@ -110,25 +110,29 @@ pub fn op_supersedes(kind: &str) -> bool {
 fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<String>> {
     const DOOMED: &str = "
         WITH RECURSIVE
-          below(uid) AS (
-            SELECT ?1
+          below(uid, lid) AS (
+            SELECT ?1, ?2
             UNION
-            SELECT n.uid FROM nodes n JOIN below b ON n.parent_uid = b.uid
+            SELECT n.uid, n.lid FROM nodes n JOIN below b
+              ON n.parent_lid = b.lid OR (n.parent_lid IS NULL AND n.parent_uid = b.uid)
           ),
-          queued(uid) AS (
-            SELECT ?1
+          queued(uid, lid) AS (
+            SELECT ?1, ?2
             UNION
-            SELECT p.uid FROM pending_op p
+            SELECT p.uid, p.lid FROM pending_op p
             WHERE p.kind IN ('create', 'mkdir')
-              AND p.parent_uid IN (SELECT uid FROM below)
+              AND (p.parent_lid IN (SELECT lid FROM below)
+                   OR p.parent_uid IN (SELECT uid FROM below))
             UNION
-            SELECT p.uid FROM pending_op p JOIN queued q ON p.parent_uid = q.uid
+            SELECT p.uid, p.lid FROM pending_op p JOIN queued q
+              ON p.parent_lid = q.lid OR p.parent_uid = q.uid
           ),
           doomed(id) AS (
             SELECT id FROM pending_op
             WHERE uid IN (SELECT uid FROM queued)
-               OR lid = ?2
-               OR (kind = 'revision' AND uid IN (SELECT uid FROM below))
+               OR lid IN (SELECT lid FROM queued)
+               OR (kind = 'revision'
+                   AND (uid IN (SELECT uid FROM below) OR lid IN (SELECT lid FROM below)))
           )";
     const SENT: &str = "kind IN ('create', 'mkdir') AND (claimed_at <> 0 OR attempts > 0)";
     let lid = node_lid(tx, uid)?;
@@ -147,8 +151,10 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
             "{DOOMED}
              UPDATE pending_op
              SET kind = 'trash', issue = NULL,
-                 parent_uid = CASE WHEN parent_uid LIKE '{LOCAL_VOLUME}~%' THEN NULL
-                                   ELSE parent_uid END
+                 parent_uid = CASE WHEN {PARENT_NOW} LIKE '{LOCAL_VOLUME}~%' THEN NULL
+                                   ELSE {PARENT_NOW} END,
+                 parent_lid = CASE WHEN {PARENT_NOW} LIKE '{LOCAL_VOLUME}~%' THEN NULL
+                                   ELSE parent_lid END
              WHERE id IN (SELECT id FROM doomed) AND {SENT}"
         ),
         params![uid, lid],
@@ -422,7 +428,7 @@ impl Db {
             &format!(
                 "SELECT EXISTS(
                     SELECT 1 FROM pending_op
-                    WHERE kind = ?1 AND parent_uid = ?2 AND name = ?3
+                    WHERE kind = ?1 AND {PARENT_NOW} = ?2 AND name = ?3
                       AND uid LIKE '{LOCAL_VOLUME}~%'
                  )"
             ),
@@ -651,8 +657,10 @@ impl Db {
         let tx = conn.transaction()?;
         let row: Option<CreateRow> = tx
             .query_row(
-                "SELECT blob_path, meta_json, parent_uid, name, created_at
-                 FROM pending_op WHERE id = ?1 AND kind <> ?2",
+                &format!(
+                    "SELECT blob_path, meta_json, {PARENT_NOW}, name, created_at
+                     FROM pending_op WHERE id = ?1 AND kind <> ?2"
+                ),
                 params![id, OP_TRASH],
                 |r| {
                     Ok(CreateRow {
@@ -1112,13 +1120,13 @@ impl Db {
     /// the one query that does.
     pub fn parked_create_ops(&self) -> Result<Vec<PendingOp>> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
              FROM pending_op
              WHERE next_attempt_at >= ?1 AND kind IN (?2, ?3)
-             ORDER BY created_at",
-        )?;
+             ORDER BY created_at"
+        ))?;
         let rows = stmt
             .query_map(params![PARK_UNTIL, OP_CREATE, OP_MKDIR], |r| {
                 Ok(PendingOp {
@@ -1300,9 +1308,11 @@ impl Db {
     ) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
-            "UPDATE pending_op SET next_attempt_at = 0
-             WHERE id = ?1 AND kind IN (?4, ?5) AND next_attempt_at < ?6
-               AND (parent_uid IS NOT ?2 OR name IS NOT ?3)",
+            &format!(
+                "UPDATE pending_op SET next_attempt_at = 0
+                 WHERE id = ?1 AND kind IN (?4, ?5) AND next_attempt_at < ?6
+                   AND ({PARENT_NOW} IS NOT ?2 OR name IS NOT ?3)"
+            ),
             params![id, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL],
         )?;
         Ok(n > 0)
