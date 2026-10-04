@@ -927,6 +927,7 @@ impl Core {
                 None => debug!(%uid, name, "withdrawn create never landed; trash op satisfied"),
             }
             self.retire_trash_op(op, &uid)?;
+            self.create_sent.lock().remove(&op.id);
             return Ok(());
         }
         match self
@@ -1018,11 +1019,12 @@ impl Core {
             },
         };
         // A blob gone from staging matches nothing, and leaves the node be.
-        let sent = match op.blob_path.as_deref() {
+        let current = match op.blob_path.as_deref() {
             Some(blob) if node_size(&twin) > 0 => staged_sha1(Path::new(blob)).ok(),
             _ => None,
         };
-        Ok(adoptable(is_dir, &twin, op.created_at, sent.as_deref()).then_some(twin.uid))
+        let sent = self.create_sent_digests(op.id, current);
+        Ok(adoptable(is_dir, &twin, op.created_at, &sent).then_some(twin.uid))
     }
 
     /// Record the name the remote actually gave a node, after a conflict forced
@@ -1062,6 +1064,11 @@ impl Core {
         }
         let created = self.create_local_node(op);
         self.creating.lock().remove(&op.id);
+        // A withdrawn create goes on as a trash under the same id, which still
+        // looks for the bytes it sent (`Core::withdrawn_twin`).
+        if !self.db.op_exists(op.id).unwrap_or(true) {
+            self.create_sent.lock().remove(&op.id);
+        }
         created
     }
 
@@ -1346,15 +1353,32 @@ impl Core {
             },
         };
         // A create uploads its bytes in the same call, so the node a lost
-        // answer leaves holds them (docs/BUGS.md B127).
-        let sent = match op.blob_path.as_deref() {
+        // answer leaves holds them (docs/BUGS.md B127): the ones the op holds
+        // now, or ones a write has replaced since (B156), which still go up.
+        let current = match op.blob_path.as_deref() {
             Some(blob) if node_size(&twin) > 0 => Some(staged_sha1(Path::new(blob))?),
             _ => None,
         };
-        Ok(
-            adoptable(op.kind == OP_MKDIR, &twin, op.created_at, sent.as_deref())
-                .then(|| (twin.uid, sent.is_some())),
-        )
+        let holds_blob = current
+            .as_deref()
+            .is_some_and(|sha| holds_bytes(&twin, sha));
+        let sent = self.create_sent_digests(op.id, current);
+        Ok(adoptable(op.kind == OP_MKDIR, &twin, op.created_at, &sent)
+            .then_some((twin.uid, holds_blob)))
+    }
+
+    /// The SHA-1s of the bytes queued create `id` may have made its file with:
+    /// `current`, those of the blob it holds now, and those each earlier
+    /// attempt uploaded.
+    fn create_sent_digests(&self, id: i64, current: Option<String>) -> Vec<String> {
+        let mut sent = self
+            .create_sent
+            .lock()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        sent.extend(current);
+        sent
     }
 
     /// Make one queued `create`/`mkdir` real under a given name, and hand back
@@ -1402,6 +1426,15 @@ impl Core {
         if !meta.complete {
             return Err("queued create holds an incomplete blob".into());
         }
+        // The call may make the file and lose its answer, and the op may hold
+        // a newer blob by the time it is retried (`Core::adoptable_twin`).
+        let sha = staged_sha1(Path::new(blob))?;
+        let mut sent = self.create_sent.lock();
+        let digests = sent.entry(op.id).or_default();
+        if !digests.contains(&sha) {
+            digests.push(sha);
+        }
+        drop(sent);
         let thumbnails = self.upload_thumbnails(Path::new(blob), name);
         let guard = self
             .transfers
@@ -2503,28 +2536,24 @@ const ADOPT_WINDOW_MS: i64 = 2 * 60 * 1000;
 /// Whether `twin`, found holding the name a queued create wants, is the node an
 /// earlier, unanswered attempt at that create made: the same kind, created
 /// around when the op was queued, and for a file still empty, as the mount's
-/// create leaves it, or holding exactly the bytes the op uploads, whose SHA-1
-/// is `sent`.
-fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64, sent: Option<&str>) -> bool {
+/// create leaves it, or holding exactly bytes the op uploaded, whose SHA-1 is
+/// one of `sent`.
+fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64, sent: &[String]) -> bool {
     if twin.creation_time.saturating_mul(1000) < op_created_ms - ADOPT_WINDOW_MS {
         return false;
     }
     match &twin.kind {
         NodeKind::Folder => is_dir,
-        NodeKind::File {
-            claimed_size,
-            content_sha1,
-            ..
-        } => {
-            !is_dir
-                && (*claimed_size == Some(0)
-                    || sent.is_some_and(|sent| {
-                        content_sha1
-                            .as_deref()
-                            .is_some_and(|sha| sha.eq_ignore_ascii_case(sent))
-                    }))
+        NodeKind::File { claimed_size, .. } => {
+            !is_dir && (*claimed_size == Some(0) || sent.iter().any(|sha| holds_bytes(twin, sha)))
         }
     }
+}
+
+/// Whether `node` is a file whose content has SHA-1 `sha`.
+fn holds_bytes(node: &Node, sha: &str) -> bool {
+    matches!(&node.kind, NodeKind::File { content_sha1: Some(have), .. }
+        if have.eq_ignore_ascii_case(sha))
 }
 
 /// The lowercase-hex SHA-1 of a staged blob, as Drive reports a file's.
@@ -3033,20 +3062,20 @@ mod tests {
             false,
             &made(file_node(0, 0, None), 990),
             queued,
-            None
+            &[]
         ));
         assert!(adoptable(
             true,
             &made(folder_node("d", None), 990),
             queued,
-            None
+            &[]
         ));
         // Made long before the op: someone else's file, not our lost create.
         assert!(!adoptable(
             false,
             &made(file_node(0, 0, None), 800),
             queued,
-            None
+            &[]
         ));
         // Our create leaves a file empty; one with other content is someone
         // else's.
@@ -3054,20 +3083,20 @@ mod tests {
             false,
             &made(file_node(0, 5, None), 990),
             queued,
-            None
+            &[]
         ));
         // The kind has to match what the op makes.
         assert!(!adoptable(
             true,
             &made(file_node(0, 0, None), 990),
             queued,
-            None
+            &[]
         ));
         assert!(!adoptable(
             false,
             &made(folder_node("d", None), 990),
             queued,
-            None
+            &[]
         ));
     }
 
@@ -3080,10 +3109,15 @@ mod tests {
         if let NodeKind::File { content_sha1, .. } = &mut twin.kind {
             *content_sha1 = Some("AA55".into());
         }
-        assert!(adoptable(false, &twin, queued, Some("aa55")));
-        assert!(!adoptable(false, &twin, queued, Some("bb66")));
-        assert!(!adoptable(false, &twin, queued, None));
-        assert!(!adoptable(true, &twin, queued, Some("aa55")));
+        let sent = |shas: &[&str]| shas.iter().map(|sha| sha.to_string()).collect::<Vec<_>>();
+        assert!(adoptable(false, &twin, queued, &sent(&["aa55"])));
+        assert!(!adoptable(false, &twin, queued, &sent(&["bb66"])));
+        assert!(!adoptable(false, &twin, queued, &[]));
+        assert!(!adoptable(true, &twin, queued, &sent(&["aa55"])));
+        // An attempt sent these bytes before a write replaced them (B156).
+        assert!(adoptable(false, &twin, queued, &sent(&["aa55", "bb66"])));
+        assert!(holds_bytes(&twin, "aa55"));
+        assert!(!holds_bytes(&twin, "bb66"));
     }
 
     #[test]

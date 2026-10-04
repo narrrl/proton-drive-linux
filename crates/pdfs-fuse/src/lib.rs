@@ -573,6 +573,10 @@ struct Core {
     /// Drive holds that name until the create lands and a rename or trash
     /// queued behind it frees it again.
     creating: Arc<Mutex<HashMap<i64, (NodeUid, String)>>>,
+    /// The SHA-1 of each blob an attempt at a queued create uploaded, by op
+    /// id. An attempt whose answer was lost may have made the file with bytes
+    /// a later write has since replaced in the op (`docs/BUGS.md` B156).
+    create_sent: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Creates that landed but could not be read back, by the uid Drive gave
     /// them, with the placeholder's. The drain adopts one before it sends
     /// anything else for it.

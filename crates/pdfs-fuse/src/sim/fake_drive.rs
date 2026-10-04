@@ -1099,14 +1099,14 @@ impl DriveApi for FakeClient {
         if made.is_ok() && self.0.drop_after_create.swap(false, Ordering::SeqCst) {
             self.set_online(false);
         }
-        if made.is_ok() && self.0.lose_create_reply.swap(false, Ordering::SeqCst) {
-            return Err(no_answer());
-        }
         let held = self.0.hold_create_reply.lock().take();
         if made.is_ok()
             && let Some(state) = held
         {
             wait_until_released(&state).await;
+        }
+        if made.is_ok() && self.0.lose_create_reply.swap(false, Ordering::SeqCst) {
+            return Err(no_answer());
         }
         made
     }

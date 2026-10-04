@@ -506,6 +506,41 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_written_again_after_its_create_lost_its_answer_lands_once() {
+        // Drive made the file, but its answer was lost, and the file was
+        // written again before the retry. The retry found the name taken by a
+        // node holding the bytes the first attempt sent, not the ones the op
+        // held now, and uploaded the file as a conflict copy (B156).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-create-reply-rewritten");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        let held = daemon.client.hold_reply_to_next_create();
+        daemon.client.lose_reply_to_next_create();
+        std::fs::write(&path, b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || held.reached()));
+        std::fs::write(&path, b"second").unwrap();
+        drop(held);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"second")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_deleted_after_its_create_lost_its_answer_leaves_drive() {
         // Drive made the file, but its answer was lost, and the file was
         // deleted before the retry. The delete dropped the queued create and

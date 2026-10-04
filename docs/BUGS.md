@@ -12,6 +12,26 @@ Conventions:
 
 ---
 
+## B156 — A file written again after its create lost its answer lands as a conflict copy
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's Wi-Fi profile (`one_client_on_a_slow_link`, seed 4,
+two of six replays on e5f3f61). The create of `a.txt` timed out twice, but Drive had made the file
+with the bytes of the first write. A later write replaced the blob the queued create carried. The
+third attempt found the name taken and created `a (sync-conflict …).txt`; `a.txt` kept the old
+bytes.
+
+**Where:** `Core::adoptable_twin` and `Core::withdrawn_twin` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A twin is adopted when it holds the bytes the create uploads (B127), and only the blob
+the op held at the retry was hashed. The twin held the bytes an earlier attempt sent.
+
+**Fix.** Each attempt records the SHA-1 of the blob it uploads, by op id, in memory. A twin holding
+any of them is ours. One holding older bytes than the op's is adopted, and the op's blob goes up
+as a revision of it. After a restart such a twin still forks a conflict copy, which loses
+nothing. Sim test `a_file_written_again_after_its_create_lost_its_answer_lands_once`; the fake
+Drive's held and lost create answers now combine.
+
 ## B155 — A write whose upload lost its answer lands as a conflict copy of itself
 
 **Status:** Fixed (unverified).

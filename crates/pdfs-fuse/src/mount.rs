@@ -434,6 +434,7 @@ pub(crate) fn mount_with(
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
         creating: Arc::new(Mutex::new(HashMap::new())),
+        create_sent: Arc::new(Mutex::new(HashMap::new())),
         unadopted: Arc::new(Mutex::new(HashMap::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         shutdown: Arc::new(crate::shutdown::Shutdown::default()),
