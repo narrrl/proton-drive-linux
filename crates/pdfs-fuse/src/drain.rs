@@ -377,9 +377,17 @@ impl Core {
                 // permission/quota error can become recoverable after the user
                 // changes account state, and deleting the row here made the blob
                 // unreachable after five ordinary network failures.
-                let backoff = DRAIN_BACKOFF_MIN
-                    .saturating_mul(1u32 << attempts.min(6))
-                    .min(DRAIN_BACKOFF_MAX);
+                //
+                // A name a change of ours is about to free is a wait, not a
+                // failure: the trash or rename holding it lands in moments.
+                let held = waits_for_name(e.as_ref());
+                let backoff = if held {
+                    DRAIN_BACKOFF_MIN
+                } else {
+                    DRAIN_BACKOFF_MIN
+                        .saturating_mul(1u32 << attempts.min(6))
+                        .min(DRAIN_BACKOFF_MAX)
+                };
                 warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
                 if let Err(e) = self.db.record_op_failure(
                     op.id,
@@ -390,6 +398,15 @@ impl Core {
                     self.release_claim(&op);
                     self.wait_for_drain_work();
                     continue;
+                }
+                // What held the name wakes the ops waiting for it as it lets go
+                // (`Db::wake_ops_waiting_for`). Letting go between our check and
+                // the record above woke nothing, and the op sat out its backoff.
+                if held
+                    && let Some(name) = op.name.as_deref()
+                    && let Err(e) = self.db.wake_ops_waiting_for(name)
+                {
+                    debug!(uid = %op.uid, error = %e, "waking the ops waiting for a name failed");
                 }
                 // A failure to reach Drive says nothing about an earlier refusal,
                 // so it keeps the issue that refusal recorded.
@@ -1526,7 +1543,8 @@ impl Core {
         // A rename made while the create was on the wire is queued against the
         // real uid (`Db::finish_create`). Until it lands, the tree keeps the
         // name and folder the user gave it.
-        let renaming = self.db.has_pending_op(&real.to_string(), OP_RENAME)?;
+        let real_key = real.to_string();
+        let renaming = self.db.has_pending_op(&real_key, OP_RENAME)?;
         // Before open handles are rebased onto the node, so one released in
         // between finds what `adopt` keeps (`docs/BUGS.md` B123).
         adopt(&node);
@@ -1547,12 +1565,20 @@ impl Core {
                 st.by_uid.insert(real.clone(), ino);
             }
             let Some(&ino) = st.by_uid.get(real) else {
+                st.write_through(node.clone());
                 return;
             };
+            // Asked again under the lock: `Core::queue_rename` queues its op
+            // before it renames the entry under this lock. Asked only before,
+            // a rename made since was overwritten with the name the create was
+            // sent with, here and in the node row (`docs/BUGS.md` B152).
+            let renaming =
+                renaming || matches!(self.db.has_pending_op(&real_key, OP_RENAME), Ok(true));
             if renaming && let Some(e) = st.entries.get(&ino) {
                 node.name = e.node.name.clone();
                 node.parent_uid = e.node.parent_uid.clone();
             }
+            st.write_through(node.clone());
             let mut landed = node.clone();
             st.keep_open_write_size(ino, &mut landed);
             if let Some(e) = st.entries.get_mut(&ino) {
@@ -1582,10 +1608,6 @@ impl Core {
                 }
             }
         });
-        // Write the real node through, now that nothing points at the old uid.
-        if let Err(e) = self.db.upsert_node(&node) {
-            warn!(%real, error = %e, "db upsert_node failed after remap");
-        }
         // A handle still open on the placeholder was based on no revision at
         // all: a local-clock mtime and no revision id. Released as it is, its
         // write would land as a conflict copy of the empty file this create just
@@ -2416,7 +2438,28 @@ fn park_verdict(created_at: i64, now: i64, open: bool, listed: bool) -> ParkVerd
 /// The retryable error for an op whose name a change of ours has yet to free
 /// ([`Core::name_is_held`]).
 fn held_by_queued_change(name: &str) -> Box<dyn std::error::Error> {
-    format!("{name} is still held by a node whose trash or rename is queued").into()
+    Box::new(NameHeld(name.to_string()))
+}
+
+/// An op waits for a queued change of ours to free the name it wants.
+#[derive(Debug)]
+struct NameHeld(String);
+
+impl std::fmt::Display for NameHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is still held by a node whose trash or rename is queued",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NameHeld {}
+
+/// Whether a failed attempt only waited for a name ([`NameHeld`]).
+fn waits_for_name(e: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(e), |e| e.source()).any(|e| e.is::<NameHeld>())
 }
 
 /// How many attempts an op waits for a rename or a create on the wire to free
@@ -2575,6 +2618,18 @@ mod tests {
         }
         let wrapped = Wrapped(api(ResponseCode::InsufficientSpace, 422));
         assert_eq!(refusal(&wrapped), Some(Some(SyncIssue::Quota)));
+    }
+
+    /// An op that waited for a queued trash to free its name retried only
+    /// after the doubled backoff, past the moment the trash landed.
+    #[test]
+    fn a_held_name_is_a_wait_and_other_failures_are_not() {
+        assert!(waits_for_name(held_by_queued_change("c.bin").as_ref()));
+        assert_eq!(
+            held_by_queued_change("c.bin").to_string(),
+            "c.bin is still held by a node whose trash or rename is queued"
+        );
+        assert!(!waits_for_name(&std::io::Error::other("disk")));
     }
 
     #[test]

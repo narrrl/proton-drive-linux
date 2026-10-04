@@ -884,6 +884,11 @@ impl State {
         }
     }
 
+    /// Write `node` through as it is, in order with the tree's other changes.
+    pub(crate) fn write_through(&mut self, node: Node) {
+        self.outbox.push(DbWrite::Upsert(vec![node]));
+    }
+
     pub(crate) fn intern(&mut self, parent: u64, mut node: Node) -> u64 {
         self.keep_revision_mtime(&mut node);
         self.outbox.push(DbWrite::Upsert(vec![node.clone()]));

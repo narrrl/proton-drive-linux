@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B127 and B141 to B151.
+- Fixes from the simulation and account runs since then: B127 and B141 to B153.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -49,6 +49,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    - [ ] Simulation passes on the Wi-Fi profile: `one_client_on_a_slow_link` failed in CI on
          seeds 2 and 3. Two bugs (B127, B151) and a harness gap: a settle did not read the log, so
          it could not explain a known bug's damage. All three fixed; not yet confirmed in CI.
+         Replays then found two races on the LAN profile too (B152, B153), both fixed. One
+         slow-link run of seed 2 failed once with a rename answering `ENOENT` as a folder move
+         landed. Not reproduced in 8 runs since; it may be B152.
    - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B127, B129 and B132 fixed
          but unconfirmed.
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)

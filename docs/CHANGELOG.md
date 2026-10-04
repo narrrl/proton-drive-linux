@@ -33,6 +33,10 @@ folder by local id too.
   for this release.
 
 ### Fixed
+- **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
+  the old name, and a second rename no longer failed with "No such file or directory" (B152).
+- **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or
+  upload over a file being deleted goes out as soon as the delete lands (B153).
 - **A file deleted right after it was made no longer stays on Drive when the link lost Drive's
   answer.** The node Drive made is trashed (B151).
 - **A new file no longer lands twice when the link loses Drive's answer to its upload.** The

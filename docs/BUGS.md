@@ -12,6 +12,46 @@ Conventions:
 
 ---
 
+## B153 — An op waiting for a name sat out its backoff after the name was free
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's LAN profile (`one_client_on_a_good_link`, seed 4,
+about one run in five, also before the B151 change). `d` was renamed over `c.bin` while the
+create of the old `c.bin` was on the wire. The queues did not drain within 4 s: the rename still
+owed `c.bin is still held by a node whose trash or rename is queued`.
+
+**Where:** the failure path of `Core::run_pending_drain` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The rename found the name held by the queued trash of the old `c.bin` and failed. The
+trash landed a millisecond later and woke the ops waiting for the name
+(`Db::wake_ops_waiting_for`), before the rename had recorded its failure, so there was nothing to
+wake. The failure then set the doubled backoff of a network error, 4 s on the first attempt and
+more after it.
+
+**Fix.** A held name fails as `NameHeld`, which backs off by the minimum (2 s) without doubling,
+and the op wakes the waiters for its name again once its failure is recorded. Unit test
+`a_held_name_is_a_wait_and_other_failures_are_not`; the seed is the regression check.
+
+## B152 — A rename made as its create landed was undone in the tree
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's LAN profile (`one_client_on_a_good_link`, seed 4,
+about one run in ten). `a.txt` was renamed to `b.txt` 3 ms before its create finished landing.
+The next rename, `b.txt` to `e.md`, answered `ENOENT`, and the node row kept `a.txt` although
+Drive had `b.txt`.
+
+**Where:** `Core::adopt_real_uid` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** Adoption puts the node Drive made into the tree, but keeps the tree's name and folder
+while a rename is queued. It asked whether one was queued before it wrote the remote uid into the
+queue and took the tree lock. A rename between the two was overwritten with the name the create
+was sent with, in the tree and in the node row, which was written after the lock.
+
+**Fix.** Adoption asks again under the tree lock. `Core::queue_rename` queues its op before it
+renames the entry under that lock, so a renamed entry always has its op. The node row is written
+through the lock's outbox, in order with the rename's own write. No test: the window is inside
+one call and no fake hook reaches it; the seed is the regression check.
+
 ## B151 — A file deleted after its create lost its answer stays on Drive
 
 **Status:** Fixed (unverified).
