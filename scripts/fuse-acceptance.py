@@ -4168,16 +4168,23 @@ class MoveContext:
 
         A mirror's sync pass holds the folder, and the daemon refuses a move
         that waited 5 s for it. A periodic pass over a folder earlier runs
-        filled can take longer, so the move is tried again until it ends."""
-        command = [self.pair.pdfs, "move", *(str(path) for path in paths)]
+        filled can take longer, so the move is tried again until it ends.
+        With several sources, the ones an attempt already moved are gone, and
+        only the rest are tried again."""
+        *sources, dest = paths
         deadline = time.monotonic() + self.pair.timeout
         while True:
+            command = [self.pair.pdfs, "move", *(str(path) for path in (*sources, dest))]
             result = subprocess.run(
                 command, text=True, capture_output=True, timeout=self.pair.timeout
             )
             detail = result.stderr.strip() or result.stdout.strip()
             if not (result.returncode and "busy syncing" in detail) or time.monotonic() > deadline:
                 break
+            left = [source for source in sources if os.path.lexists(source)]
+            if not left:
+                break
+            sources = left
             time.sleep(2)
         if result.returncode and "different Proton Drive volumes" in detail:
             raise Skip(f"the locations are on different volumes: {detail}")
@@ -4374,6 +4381,19 @@ def test_move_refuses_a_mirror_copy_drive_lacks(mc: MoveContext) -> None:
     # copy after a move would lose it.
     os.symlink("data.txt", source.root / name / "link")
     source.settle()
+    if dest.mode == "mirror" and os.stat(source.folder).st_dev == os.stat(dest.folder).st_dev:
+        # Between two mirrors on one filesystem the local copy is renamed
+        # along, so the move loses nothing and goes ahead.
+        mc.move_ok(source.root / name, dest.root)
+        check((dest.root / name / "link").is_symlink(), "the symlink did not move along")
+        dest.settle()
+        check_bytes(
+            read(dest.root / name / "data.txt"),
+            files[Path(name) / "data.txt"],
+            f"{dest.name}: data.txt after the move",
+        )
+        check(not (source.root / name).exists(), f"{source.name}: {name} is still there")
+        return
     detail = mc.move_refused(source.root / name, dest.root)
     check("not fully synced" in detail, f"unexpected refusal: {detail}")
     check((source.root / name / "link").is_symlink(), "the symlink was lost by a refused move")
@@ -4417,7 +4437,7 @@ MOVE_CASES = [
     Case("copy a tree out of My files", test_copy_tree_out_of_my_files, (LIVE,)),
     Case("move refuses a name taken at the destination", test_move_refuses_a_name_taken_at_the_destination, (LIVE,)),
     Case("move refuses a folder into itself", test_move_refuses_a_folder_into_itself, (LIVE,)),
-    Case("move refuses a mirror copy Drive lacks", test_move_refuses_a_mirror_copy_drive_lacks, (LIVE,)),
+    Case("move never loses a mirror copy Drive lacks", test_move_refuses_a_mirror_copy_drive_lacks, (LIVE,)),
     Case("move refuses a file still being written", test_move_refuses_a_file_still_being_written, (LIVE,)),
 ]
 
