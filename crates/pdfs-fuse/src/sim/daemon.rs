@@ -360,6 +360,30 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_folder_made_while_the_drain_is_idle_reaches_drive_at_once() {
+        // A new folder queued its create without waking the drain, so it sat
+        // until the workers' 30 s idle poll (B160).
+        let drive = FakeDrive::new();
+        let dir = scratch("idle-mkdir");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+
+        std::fs::create_dir(daemon.mountpoint.join("x")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || drive.lookup("x").is_some()),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_whose_upload_was_not_read_back_takes_two_writes_at_once() {
         // The read-back after an upload went unanswered, and the drain let go of
         // the uploaded bytes without caching them. A partial write had nothing

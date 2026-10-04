@@ -12,6 +12,27 @@ Conventions:
 
 ---
 
+## B160 — A new folder reaches Drive only half a minute later
+
+**Status:** Fixed.
+**Found:** 2026-10-04, by the simulation's slow-link profile (`one_client_on_a_slow_link`,
+seed 4). Folders made last before the client waited for its queue reached Drive 30 s late. The
+log showed each `mkdir` queued, then claimed exactly 30 s later.
+
+**Where:** `Core::queue_local_node` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** The drain workers sleep until an op is due, or for up to 30 s when none is. Every
+other way of queueing an op (a write, a rename, a trash) wakes them. Queueing a folder's create
+did not, so with the workers asleep it waited for their next poll. A file's create did not need
+the wake: its bytes ride on the create, and the release that attaches them wakes the drain.
+
+**Fix.** Queueing a folder's create wakes the drain.
+
+**Test:** simulation test `a_folder_made_while_the_drain_is_idle_reaches_drive_at_once` (failed
+before the fix: the folder was still queued after 10 s).
+
+---
+
 ## B159 — A write right after a restart fails with "Resource temporarily unavailable"
 
 **Status:** Fixed (unverified).

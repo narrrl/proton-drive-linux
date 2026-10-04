@@ -3688,6 +3688,12 @@ impl Core {
             Errno::EIO
         })?;
         debug!(%uid, %parent_uid, name, is_dir, "created node offline; queued");
+        // A folder is due now; without this the workers slept through it to
+        // the idle poll (B160). A file is not: its bytes ride on the create, and
+        // the release that attaches them wakes the drain.
+        if is_dir {
+            self.wake_drain();
+        }
         Ok(node)
     }
 
