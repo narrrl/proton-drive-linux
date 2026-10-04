@@ -205,12 +205,32 @@ const PARENT_NOW: &str =
     "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.parent_lid), parent_uid)";
 
 /// The volume id given to a node that exists only on this machine, so far. A
-/// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
+/// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<lid>` and
 /// round-trips through the same `Display`/parse path as any other uid.
 ///
 /// Nothing bearing this volume may be handed to the API — it would 404. The
 /// drain replaces it with the uid the server assigns.
 pub const LOCAL_VOLUME: &str = "local";
+
+/// The uid a node made on this machine goes by until Drive gives it one: its
+/// row's local id under [`LOCAL_VOLUME`].
+///
+/// A function of the row, so it never changes: whatever still holds it once
+/// the node has landed finds the node, and its real uid, through
+/// [`local_lid`].
+pub fn local_uid(lid: i64) -> String {
+    format!("{LOCAL_VOLUME}~{lid}")
+}
+
+/// The local id a [`local_uid`] stands for, or `None` for any other uid,
+/// including a placeholder minted before schema 41.
+pub fn local_lid(uid: &str) -> Option<i64> {
+    let digits = uid.strip_prefix(LOCAL_VOLUME)?.strip_prefix('~')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 /// A `next_attempt_at` far enough in the future that [`Db::next_due_op`] never
 /// selects the op (ms since epoch, ≈ year 2223). Used to *park* a queued create

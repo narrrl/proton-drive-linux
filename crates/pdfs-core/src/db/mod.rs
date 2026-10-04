@@ -58,7 +58,7 @@ pub use nodes::{PublishedSharedRoot, SearchHit, StoredNode};
 pub use ops::{
     AttachedBlob, CreateLanding, CreateRetired, FAILING_ATTEMPTS, LOCAL_VOLUME, OP_CREATE,
     OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_EXPIRY_MS, PARK_UNTIL, PendingCounts,
-    PendingOp, RenameMeta, op_supersedes,
+    PendingOp, RenameMeta, local_lid, local_uid, op_supersedes,
 };
 pub use photos::{StoredPhoto, StoredPlace, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN, TimelineRow};
 pub use pins::PinRow;

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::Db;
-use super::ops::{OP_CREATE, OP_MKDIR, OP_RENAME, wake_ops_waiting_for_tx};
+use super::ops::{OP_CREATE, OP_MKDIR, OP_RENAME, local_lid, local_uid, wake_ops_waiting_for_tx};
 use crate::{Access, Result};
 use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{Node, NodeKind};
@@ -593,14 +593,21 @@ impl Db {
 
     /// The local id of the node stored under `uid`, or `None` when it has no
     /// row. It stays the same for as long as the row exists, including when a
-    /// create lands and the row takes the uid Drive gave it.
+    /// create lands and the row takes the uid Drive gave it: a node made on
+    /// this machine is found by its stand-in ([`local_uid`]) before and after.
     pub fn lid_of(&self, uid: &str) -> Result<Option<i64>> {
         let conn = self.read();
-        Ok(conn
-            .query_row("SELECT lid FROM nodes WHERE uid = ?1", params![uid], |r| {
+        let row = match local_lid(uid) {
+            Some(lid) => {
+                conn.query_row("SELECT lid FROM nodes WHERE lid = ?1", params![lid], |r| {
+                    r.get(0)
+                })
+            }
+            None => conn.query_row("SELECT lid FROM nodes WHERE uid = ?1", params![uid], |r| {
                 r.get(0)
-            })
-            .optional()?)
+            }),
+        };
+        Ok(row.optional()?)
     }
 
     /// The local id of each node, in order, giving a row to each that has none.
@@ -642,6 +649,41 @@ impl Db {
         }
         tx.commit()?;
         Ok(lids)
+    }
+
+    /// Give a node being made on this machine its row under `parent_uid`, and
+    /// return its local id. The row goes by [`local_uid`] of that id until
+    /// the node lands.
+    ///
+    /// Like [`Db::lids_for`], only a stub: the caller upserts the node.
+    pub fn add_local_row(
+        &self,
+        parent_uid: &str,
+        name: &str,
+        is_dir: bool,
+        mtime: i64,
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO nodes (uid, parent_uid, name, is_dir, mtime, trashed, parent_lid)
+             VALUES (NULL, ?1, ?2, ?3, ?4, 0,
+                     COALESCE(?5, (SELECT lid FROM nodes WHERE uid = ?1)))",
+            params![
+                parent_uid,
+                name,
+                is_dir as i64,
+                mtime,
+                local_lid(parent_uid)
+            ],
+        )?;
+        let lid = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE nodes SET uid = ?2 WHERE lid = ?1",
+            params![lid, local_uid(lid)],
+        )?;
+        tx.commit()?;
+        Ok(lid)
     }
 
     /// Read the persisted incremental-sync cursor (a `DriveEventId`), if any.

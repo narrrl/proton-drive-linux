@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 40;
+pub(super) const SCHEMA_VERSION: i64 = 41;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -409,6 +409,19 @@ impl Db {
             )? > 0;
             if has_nodes && !has_column {
                 tx.execute_batch(MIGRATION_V40)?;
+            }
+        }
+        if current < 41 {
+            // Needs both tables; on a database that never had them there is
+            // nothing to rewrite.
+            let tables: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('nodes', 'pending_op', 'pins')",
+                [],
+                |row| row.get(0),
+            )?;
+            if tables == 3 {
+                tx.execute_batch(MIGRATION_V41)?;
             }
         }
         tx.execute(
@@ -1244,4 +1257,48 @@ const MIGRATION_V40: &str = "
 ALTER TABLE nodes ADD COLUMN parent_lid INTEGER;
 UPDATE nodes SET parent_lid = (SELECT p.lid FROM nodes p WHERE p.uid = nodes.parent_uid);
 CREATE INDEX idx_nodes_parent_lid ON nodes(parent_lid);
+";
+
+/// Schema v41: a node made on this machine goes by `local~<lid>` until it
+/// lands, a function of its row, where it used to get a `local~<ms>-<n>`
+/// placeholder. Every placeholder still stored is rewritten to its row's
+/// stand-in: the row itself and its `node_json`, its children, the ops on it
+/// or into it, and its pins. A placeholder op with no row keeps its uid and
+/// drains as before.
+const MIGRATION_V41: &str = "
+CREATE TEMP TABLE local_v41 AS
+  SELECT uid AS old, 'local~' || lid AS new, lid FROM nodes
+   WHERE uid LIKE 'local~%' AND uid <> 'local~' || lid;
+UPDATE pending_op SET uid = (SELECT new FROM local_v41 WHERE old = pending_op.uid)
+ WHERE uid IN (SELECT old FROM local_v41);
+UPDATE pending_op SET parent_uid = (SELECT new FROM local_v41 WHERE old = pending_op.parent_uid)
+ WHERE parent_uid IN (SELECT old FROM local_v41);
+UPDATE pending_op
+   SET meta_json = json_set(meta_json, '$.uid',
+         (SELECT new FROM local_v41 WHERE old = json_extract(pending_op.meta_json, '$.uid')))
+ WHERE json_valid(meta_json)
+   AND json_extract(meta_json, '$.uid') IN (SELECT old FROM local_v41);
+UPDATE pending_op
+   SET meta_json = json_set(meta_json, '$.original_parent_uid',
+         (SELECT new FROM local_v41
+           WHERE old = json_extract(pending_op.meta_json, '$.original_parent_uid')))
+ WHERE json_valid(meta_json)
+   AND json_extract(meta_json, '$.original_parent_uid') IN (SELECT old FROM local_v41);
+UPDATE pins SET uid = (SELECT new FROM local_v41 WHERE old = pins.uid)
+ WHERE uid IN (SELECT old FROM local_v41);
+UPDATE nodes
+   SET node_json = json_set(node_json, '$.parent_uid.link_id',
+         (SELECT CAST(lid AS TEXT) FROM local_v41 WHERE old = nodes.parent_uid))
+ WHERE parent_uid IN (SELECT old FROM local_v41)
+   AND json_valid(node_json)
+   AND json_extract(node_json, '$.parent_uid.volume_id') = 'local';
+UPDATE nodes SET parent_uid = (SELECT new FROM local_v41 WHERE old = nodes.parent_uid)
+ WHERE parent_uid IN (SELECT old FROM local_v41);
+UPDATE nodes
+   SET node_json = json_set(node_json, '$.uid.link_id', CAST(lid AS TEXT))
+ WHERE lid IN (SELECT lid FROM local_v41)
+   AND json_valid(node_json)
+   AND json_extract(node_json, '$.uid.volume_id') = 'local';
+UPDATE nodes SET uid = 'local~' || lid WHERE lid IN (SELECT lid FROM local_v41);
+DROP TABLE local_v41;
 ";

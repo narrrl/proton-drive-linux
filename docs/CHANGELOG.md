@@ -11,10 +11,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **40**. The queue table is rebuilt so an id is never given out twice; queued changes
+Schema: **41**. The queue table is rebuilt so an id is never given out twice; queued changes
 are kept. Queued changes get a column for the reason Drive refused them, and name their file
 and folder by local id as well as by Drive's id. Stored files and folders name their parent
-folder by local id too.
+folder by local id too. A file or folder made on this machine that Drive does not have yet goes
+by its local id, in the queue, the stored tree and pins alike.
 
 ### Added
 - **Sync issues.** A change Drive refuses because the storage is full, access was taken away,

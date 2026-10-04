@@ -3650,14 +3650,17 @@ impl Core {
         hold: bool,
     ) -> Result<Node, Errno> {
         self.require_uid_writable(parent_uid)?;
-        let uid = mint_local_uid();
+        // The row the tree would give it anyway, now: the node goes by its
+        // local id until it lands.
+        let lid = self
+            .db
+            .add_local_row(&parent_uid.to_string(), name, is_dir, now_secs())
+            .map_err(|e| {
+                error!(%parent_uid, name, error = %e, "giving a local node its row failed");
+                Errno::EIO
+            })?;
+        let uid = local_node_uid(lid);
         let node = local_node(uid.clone(), parent_uid.clone(), name.to_string(), is_dir);
-        // The row the tree would give it anyway, now, so the op is queued with
-        // the node's local id.
-        self.db.lids_for(&[&node]).map_err(|e| {
-            error!(%parent_uid, name, error = %e, "giving a local node its row failed");
-            Errno::EIO
-        })?;
         let op = PendingOp {
             id: 0,
             kind: if is_dir { OP_MKDIR } else { OP_CREATE }.to_string(),
@@ -5752,21 +5755,12 @@ fn parse_node_uid(s: &str) -> Option<NodeUid> {
     parse_uid(s)
 }
 
-/// Distinguishes placeholder uids minted by [`mint_local_uid`] within one run.
-static LOCAL_UID_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Invent a uid for a node created while offline, so it can be interned, listed
-/// and written to before the server has ever heard of it (offline.md Phase 3b).
-///
-/// Uniqueness only has to hold among this machine's undrained ops, so the clock
-/// (which separates runs) plus a counter (which separates nodes within a run) is
-/// enough without taking on a uuid dependency.
-fn mint_local_uid() -> NodeUid {
-    let seq = LOCAL_UID_SEQ.fetch_add(1, Ordering::Relaxed);
-    NodeUid::new(
-        VolumeId::from(LOCAL_VOLUME),
-        LinkId::from(format!("{}-{seq}", now_millis())),
-    )
+/// The uid a node made on this machine goes by until it lands, so it can be
+/// interned, listed and written to before the server has ever heard of it
+/// (offline.md Phase 3b): its row's local id, as [`pdfs_core::db::local_uid`]
+/// has it.
+fn local_node_uid(lid: i64) -> NodeUid {
+    NodeUid::new(VolumeId::from(LOCAL_VOLUME), LinkId::from(lid.to_string()))
 }
 
 /// Whether this node exists only on this machine, so far. Such a uid is
@@ -7022,24 +7016,24 @@ mod local_uid_tests {
     use super::*;
 
     #[test]
-    fn a_minted_uid_is_recognisable_and_round_trips() {
-        let uid = mint_local_uid();
+    fn a_local_node_uid_is_recognisable_and_round_trips() {
+        let uid = local_node_uid(42);
         assert!(is_local_uid(&uid));
         assert!(is_local_uid_str(&uid.to_string()));
+        assert_eq!(uid.to_string(), pdfs_core::db::local_uid(42));
 
         // It has to survive the trip through `pending_op.uid` as text, like any
-        // other uid does.
+        // other uid does, and give back the row it stands for.
         let parsed = parse_node_uid(&uid.to_string()).expect("parses back");
         assert_eq!(parsed, uid);
+        assert_eq!(pdfs_core::db::local_lid(&uid.to_string()), Some(42));
     }
 
     #[test]
-    fn minted_uids_are_distinct_within_a_run() {
+    fn local_node_uids_are_distinct_per_row() {
         // Two files created in the same millisecond must not collide — the whole
         // queue is keyed by uid.
-        let a = mint_local_uid();
-        let b = mint_local_uid();
-        assert_ne!(a, b);
+        assert_ne!(local_node_uid(1), local_node_uid(2));
     }
 
     #[test]
@@ -7056,7 +7050,7 @@ mod local_uid_tests {
     #[test]
     fn a_placeholder_file_reports_itself_as_empty_and_unsealed() {
         let parent = NodeUid::new(VolumeId::from("vol1"), LinkId::from("dir"));
-        let node = local_node(mint_local_uid(), parent.clone(), "notes.txt".into(), false);
+        let node = local_node(local_node_uid(7), parent.clone(), "notes.txt".into(), false);
 
         assert_eq!(node.name, "notes.txt");
         assert_eq!(node.parent_uid, Some(parent));
@@ -7080,7 +7074,7 @@ mod local_uid_tests {
     #[test]
     fn a_placeholder_folder_is_a_folder() {
         let parent = NodeUid::new(VolumeId::from("vol1"), LinkId::from("root"));
-        let node = local_node(mint_local_uid(), parent, "photos".into(), true);
+        let node = local_node(local_node_uid(7), parent, "photos".into(), true);
         assert!(node.is_folder());
     }
 }
@@ -8552,7 +8546,7 @@ mod tests {
         assert_before(truncate, "require_uid_writable", "create_scratch");
 
         for (signature, first_side_effect) in [
-            ("fn queue_local_node(", "mint_local_uid"),
+            ("fn queue_local_node(", "add_local_row"),
             ("fn queue_rename(", "queue_rename_authorized"),
             ("fn queue_trash(", "replace_ops_with_trash"),
         ] {

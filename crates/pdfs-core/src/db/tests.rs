@@ -3897,21 +3897,118 @@ fn migration_v36_gives_every_node_its_rowid_as_lid() {
     assert_eq!(rowids.len(), 3);
 
     let db = Db::open(&path).unwrap();
+    // The placeholder goes by its row's stand-in from V41 on.
+    let stand_in = |uid: &str, rowid: i64| match uid == local.to_string() {
+        true => local_uid(rowid),
+        false => uid.to_string(),
+    };
     for (uid, rowid) in &rowids {
-        assert_eq!(db.lid_of(uid).unwrap(), Some(*rowid), "{uid}");
+        let uid = stand_in(uid, *rowid);
+        assert_eq!(db.lid_of(&uid).unwrap(), Some(*rowid), "{uid}");
     }
     let found = db.search("report", 10).unwrap();
     assert_eq!(found.len(), 1, "the search index still finds the node");
     assert_eq!(found[0].node.uid, uid("kept"));
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops.len(), 1);
-    assert_eq!(ops[0].uid, local.to_string());
+    let (_, dir) = rowids
+        .iter()
+        .find(|(uid, _)| *uid == local.to_string())
+        .unwrap();
+    assert_eq!(ops[0].uid, local_uid(*dir));
     assert_eq!(ops[0].attempts, 1);
     assert_eq!(ops[0].last_error.as_deref(), Some("network unreachable"));
 
     db.upsert_node(&file("new", "root", "new.txt", 1)).unwrap();
     let newest = db.lid_of(&uid("new").to_string()).unwrap().unwrap();
     assert!(newest > rowids.last().unwrap().1);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn migration_v41_gives_every_placeholder_its_rows_stand_in() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v40-fixture-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (dir, inner) = {
+        let db = Db::open(&path).unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        let old_dir = NodeUid::new(VolumeId::from("local"), LinkId::from("1700000000000-0"));
+        let old_inner = NodeUid::new(VolumeId::from("local"), LinkId::from("1700000000000-1"));
+        let mut dir = folder("x", Some("root"), "Offline folder");
+        dir.uid = old_dir.clone();
+        db.upsert_node(&dir).unwrap();
+        let mut inner = file("x", "root", "inner.txt", 0);
+        inner.uid = old_inner.clone();
+        inner.parent_uid = Some(old_dir.clone());
+        db.upsert_node(&inner).unwrap();
+        let op = |kind: &str, uid: &NodeUid, parent: &str, meta: Option<String>| PendingOp {
+            id: 0,
+            kind: kind.to_string(),
+            uid: uid.to_string(),
+            parent_uid: Some(parent.to_string()),
+            name: Some("n".to_string()),
+            blob_path: None,
+            meta_json: meta,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        };
+        db.enqueue_op(&op(OP_MKDIR, &old_dir, &uid("root").to_string(), None))
+            .unwrap();
+        let staged = json!({"uid": old_inner.to_string(), "len": 0}).to_string();
+        db.enqueue_op(&op(
+            OP_CREATE,
+            &old_inner,
+            &old_dir.to_string(),
+            Some(staged),
+        ))
+        .unwrap();
+        db.pin_add(&old_dir.to_string(), "/Offline folder", true)
+            .unwrap();
+        let lids = (
+            db.lid_of(&old_dir.to_string()).unwrap().unwrap(),
+            db.lid_of(&old_inner.to_string()).unwrap().unwrap(),
+        );
+        drop(db);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE sync_state SET value = '40' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        lids
+    };
+
+    let db = Db::open(&path).unwrap();
+    let (dir_uid, inner_uid) = (local_uid(dir), local_uid(inner));
+    assert_eq!(db.uid_of_lid(dir).unwrap(), Some(dir_uid.clone()));
+    assert_eq!(db.uid_of_lid(inner).unwrap(), Some(inner_uid.clone()));
+    let stored = db.node_by_uid(&inner_uid).unwrap().unwrap();
+    assert_eq!(
+        stored.uid.to_string(),
+        inner_uid,
+        "node_json follows the row"
+    );
+    assert_eq!(
+        stored.parent_uid.map(|p| p.to_string()),
+        Some(dir_uid.clone())
+    );
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops[0].uid, dir_uid);
+    assert_eq!(ops[1].uid, inner_uid);
+    assert_eq!(ops[1].parent_uid, Some(dir_uid.clone()));
+    let staged: serde_json::Value =
+        serde_json::from_str(ops[1].meta_json.as_deref().unwrap()).unwrap();
+    assert_eq!(staged["uid"], inner_uid.as_str());
+    let pins: Vec<String> = db.pin_list().unwrap().into_iter().map(|p| p.uid).collect();
+    assert_eq!(pins, vec![dir_uid]);
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
@@ -3935,36 +4032,45 @@ fn a_2_8_database_migrates_with_every_node_and_op_intact() {
     let (nodes, ops) = migrates_intact(&path);
     assert_eq!((nodes, ops), (8, 6));
     let db = Db::open(&path).unwrap();
+    let lid_named = |name: &str| -> i64 {
+        db.conn
+            .lock()
+            .query_row("SELECT lid FROM nodes WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let (dir, inner_lid) = (lid_named("Offline folder"), lid_named("inner.txt"));
     let queued = db.pending_ops().unwrap();
-    let inner = queued.iter().find(|op| op.uid == "local~inner").unwrap();
-    assert_eq!(inner.parent_uid.as_deref(), Some("local~dir"));
+    let inner = queued
+        .iter()
+        .find(|op| op.uid == local_uid(inner_lid))
+        .unwrap();
+    assert_eq!(inner.parent_uid, Some(local_uid(dir)));
     let lids: (Option<i64>, Option<i64>) = db
         .conn
         .lock()
         .query_row(
-            "SELECT lid, parent_lid FROM pending_op WHERE uid = 'local~inner'",
-            [],
+            "SELECT lid, parent_lid FROM pending_op WHERE id = ?1",
+            [inner.id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(
         lids,
-        (
-            db.lid_of("local~inner").unwrap(),
-            db.lid_of("local~dir").unwrap()
-        ),
+        (Some(inner_lid), Some(dir)),
         "the migration names the op's node and parent by local id"
     );
     let parent_lid: Option<i64> = db
         .conn
         .lock()
         .query_row(
-            "SELECT parent_lid FROM nodes WHERE uid = 'local~inner'",
-            [],
+            "SELECT parent_lid FROM nodes WHERE lid = ?1",
+            [inner_lid],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(parent_lid, db.lid_of("local~dir").unwrap());
+    assert_eq!(parent_lid, Some(dir));
     let parked = db.parked_create_ops().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].name.as_deref(), Some("movie.part"));
@@ -3997,7 +4103,7 @@ fn a_copy_of_a_real_database_migrates_with_every_node_and_op_intact() {
 /// Opens the database at `path` and checks that the migration kept every node
 /// on its row id and every queued op as it was. Returns how many of each.
 fn migrates_intact(path: &std::path::Path) -> (usize, usize) {
-    let (version, nodes, ops, sealed) = {
+    let (version, nodes, mut ops, sealed) = {
         let conn = rusqlite::Connection::open(path).unwrap();
         let version: String = conn
             .query_row(
@@ -4017,6 +4123,33 @@ fn migrates_intact(path: &std::path::Path) -> (usize, usize) {
         let sealed = rows(&conn, "SELECT * FROM own_sealed_rev ORDER BY uid");
         (version, nodes, ops, sealed)
     };
+    // A node made on this machine goes by its row's stand-in from schema 41
+    // on, in its ops as everywhere else.
+    let stand_ins: Vec<(String, String)> = nodes
+        .iter()
+        .filter(|(uid, rowid)| uid.starts_with("local~") && *uid != local_uid(*rowid))
+        .map(|(uid, rowid)| (uid.clone(), local_uid(*rowid)))
+        .collect();
+    let nodes: Vec<(String, i64)> = nodes
+        .into_iter()
+        .map(
+            |(uid, rowid)| match stand_ins.iter().any(|(old, _)| *old == uid) {
+                true => (local_uid(rowid), rowid),
+                false => (uid, rowid),
+            },
+        )
+        .collect();
+    for value in ops.iter_mut().flatten() {
+        if let rusqlite::types::Value::Text(text) = value {
+            for (old, new) in &stand_ins {
+                if text == old {
+                    *text = new.clone();
+                } else {
+                    *text = text.replace(&format!("\"{old}\""), &format!("\"{new}\""));
+                }
+            }
+        }
+    }
     let db = Db::open(path).unwrap();
     {
         let conn = rusqlite::Connection::open(path).unwrap();
