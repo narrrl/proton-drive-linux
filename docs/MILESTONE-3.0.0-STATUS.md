@@ -88,7 +88,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          drain's idle poll (B160, fixed). Slow-link seed 3 failed on a file moved while its
          create was on the wire, which the mount showed under its old name (B161, fixed).
          Seed 4 failed on a folder removed and made again, whose create adopted the removed
-         folder (B162, fixed).
+         folder (B162, fixed). CI on 903452a passed every profile.
    - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B127, B129 and B132 fixed
          but unconfirmed.
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)
@@ -126,7 +126,10 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          paused kept a create below it as a trash: a paused drain worker had claimed it
          (B178, fixed). A file read as its create landed read empty (B179, fixed).
          The suite on 0f3c06f: a stop gave up on a drain worker that slept through its
-         wake-up (B180, fixed).
+         wake-up (B180, fixed). The account run on 903452a (2026-10-04, Wi-Fi: 262 passed,
+         1 failed) failed only its cleanup, which found no control socket: after the mirror
+         target's last restart the queue wait took the missing daemon for an empty queue
+         (the script's side, fixed in 6539c73).
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0
