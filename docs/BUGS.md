@@ -12,6 +12,46 @@ Conventions:
 
 ---
 
+## B155 — A write whose upload lost its answer lands as a conflict copy of itself
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation's Wi-Fi profile (`one_client_on_a_slow_link`, seed 2,
+second replay on 7269cb5). `x/z/y/a.txt` was written after its create landed. The revision upload
+reached Drive, but the answer was lost and the call timed out. On the retry, Drive held
+`a (sync-conflict …).txt` beside the file, with the same bytes.
+
+**Where:** `Core::revision_conflict` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A queued write remembers the revision it was made against. The retry found the file one
+revision further, sealed by the lost upload, which this daemon never heard of, so it was not
+recorded as our own (`own_sealed_rev`). The write was taken for a change from elsewhere and kept as
+a conflict copy.
+
+**Fix.** A complete write whose bytes the remote already holds, by size and SHA-1, is not a
+conflict: it is sent again as a revision of the same bytes. Sim test
+`a_write_whose_answer_was_lost_lands_once`, with the fake Drive's new
+`lose_reply_to_next_revision`.
+
+## B154 — A file made under the name of a create on the wire lands as a conflict copy
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by CI on 7269cb5 (`one_client_on_a_good_link`, seed 9, every run). `c.bin`
+was renamed to `d` while its create was on the wire, and a new `c.bin` was made. The new file landed
+as `c (sync-conflict …).bin`, the mount showed that name, and `unlink c.bin` answered `ENOENT`.
+
+**Where:** the failure path of `Core::run_pending_drain` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A regression from the B153 fix. The new file's create found `c.bin` held by the first
+create, which was still on the wire, and failed as a wait. The B153 fix then woke the ops waiting
+for the name. The database cannot see a create on the wire, only queued trashes and renames, so
+it found the name free and the op was due again at once. Four waits went in 70 ms, and the create
+took a conflict name.
+
+**Fix.** No wake while another create on the wire holds the name. It frees the name when it
+lands, or hands it to the rename queued behind it, which wakes the waiters when it lands. Sim
+test `a_file_made_under_the_name_of_a_create_on_the_wire_waits_for_it`, with the fake Drive's
+new `hold_reply_to_next_create`.
+
 ## B153 — An op waiting for a name sat out its backoff after the name was free
 
 **Status:** Fixed (unverified).

@@ -33,6 +33,10 @@ folder by local id too.
   for this release.
 
 ### Fixed
+- **A file made under the name of a file whose upload is still going out keeps its name.** It
+  no longer lands as a conflict copy, and the mount no longer shows that copy's name (B154).
+- **A change to a file no longer lands as a conflict copy of itself when the link loses Drive's
+  answer to its upload** (B155).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

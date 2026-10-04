@@ -537,6 +537,84 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_made_under_the_name_of_a_create_on_the_wire_waits_for_it() {
+        // A file renamed while its create was on the wire, and a new one made
+        // under its old name. The new file's create found the name held by the
+        // first and woke itself again after every try: it spent its waits in
+        // milliseconds and landed under a conflict name, which the mount then
+        // showed instead of the user's (B154).
+        let drive = FakeDrive::new();
+        let dir = scratch("create-waits-for-create");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mount = &daemon.mountpoint;
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        let held = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mount.join("c.bin"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || held.reached()));
+        std::fs::rename(mount.join("c.bin"), mount.join("d")).unwrap();
+        std::fs::write(mount.join("c.bin"), b"second").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon
+                .pending()
+                .is_ok_and(|items| items.iter().any(|op| op.attempts > 0))
+        }));
+        // Long enough for the waits to run out, were they not waits.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("d").cloned() == file(b"first")
+                    && drive.tree().get("c.bin").cloned() == file(b"second")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 2, "{:?}", drive.tree());
+        assert_eq!(std::fs::read(mount.join("c.bin")).unwrap(), b"second");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_write_whose_answer_was_lost_lands_once() {
+        // Drive made the revision, but its answer was lost. The retry found
+        // the file at a revision it did not know and kept the write as a
+        // conflict copy of itself (B155).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-revision-reply");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        std::fs::write(&path, b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("f.txt").cloned() == file(b"first")
+        }));
+        daemon.client.lose_reply_to_next_revision();
+        std::fs::write(&path, b"second").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"second")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_pdfs_rename_after_a_queued_rename_is_not_undone() {
         // `pdfs rename` and `pdfs move` went straight to Drive, and the
         // mount's own rename, still queued, landed after them and put the old

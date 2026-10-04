@@ -402,8 +402,12 @@ impl Core {
                 // What held the name wakes the ops waiting for it as it lets go
                 // (`Db::wake_ops_waiting_for`). Letting go between our check and
                 // the record above woke nothing, and the op sat out its backoff.
+                // A create on the wire holds it where the database cannot see:
+                // woken here, the op spent its waits in milliseconds and landed
+                // under a conflict name (`docs/BUGS.md` B154).
                 if held
                     && let Some(name) = op.name.as_deref()
+                    && !self.creating_named(&op, name)
                     && let Err(e) = self.db.wake_ops_waiting_for(name)
                 {
                     debug!(uid = %op.uid, error = %e, "waking the ops waiting for a name failed");
@@ -1238,6 +1242,15 @@ impl Core {
         Ok(creating || self.db.has_pending_move_from(name)?)
     }
 
+    /// Whether a create other than `op` is on the wire under `name`, in any
+    /// folder.
+    fn creating_named(&self, op: &PendingOp, name: &str) -> bool {
+        self.creating
+            .lock()
+            .iter()
+            .any(|(id, (_, n))| *id != op.id && n == name)
+    }
+
     /// Trash the node a create made after the file was deleted, or replaced by
     /// a rename, while its upload was on the wire (`docs/BUGS.md` B129).
     ///
@@ -1657,6 +1670,7 @@ impl Core {
         &self,
         uid: &NodeUid,
         meta: &StagedWrite,
+        blob: &Path,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let Some(ref base) = meta.based_on else {
             return Ok(None);
@@ -1685,6 +1699,21 @@ impl Core {
         if is_own_self_supersede(meta.complete, remote_rev.as_deref(), own_rev.as_deref()) {
             debug!(%uid, ?remote_rev,
                    "queued write chains onto our own sealed revision; not a conflict");
+            return Ok(None);
+        }
+        // An earlier attempt at this write may have landed with its answer
+        // lost: the remote then holds these very bytes in a revision we never
+        // heard of. Forked, the write was a conflict copy of itself
+        // (docs/BUGS.md B155); sent again, it is a revision of the same bytes.
+        if meta.complete
+            && node_size(&node) == meta.len
+            && let NodeKind::File {
+                content_sha1: Some(remote),
+                ..
+            } = &node.kind
+            && remote.eq_ignore_ascii_case(&staged_sha1(blob)?)
+        {
+            debug!(%uid, ?remote_rev, "the remote already holds the queued write; not a conflict");
             return Ok(None);
         }
         Ok(Some(reason))
@@ -2014,7 +2043,7 @@ impl Core {
         let meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
         let uid = parse_node_uid(&meta.uid).ok_or("staged write has an unparseable uid")?;
 
-        if let Some(reason) = self.revision_conflict(&uid, &meta)? {
+        if let Some(reason) = self.revision_conflict(&uid, &meta, &blob)? {
             // Trashing the file from the mount drops its queued write, but not
             // from under a worker already holding it. That worker then finds the
             // node trashed — by us — and would upload the withdrawn bytes as a

@@ -332,6 +332,8 @@ impl FakeDrive {
             hold: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
             lose_create_reply: AtomicBool::new(false),
+            hold_create_reply: Mutex::new(None),
+            lose_revision_reply: AtomicBool::new(false),
         }))
     }
 
@@ -583,6 +585,10 @@ struct ClientInner {
     drop_after_create: AtomicBool,
     /// Set by [`FakeClient::lose_reply_to_next_create`].
     lose_create_reply: AtomicBool,
+    /// The create [`FakeClient::hold_reply_to_next_create`] is waiting for.
+    hold_create_reply: Mutex<Option<Arc<HoldState>>>,
+    /// Set by [`FakeClient::lose_reply_to_next_revision`].
+    lose_revision_reply: AtomicBool,
 }
 
 struct HoldState {
@@ -591,8 +597,17 @@ struct HoldState {
     released: AtomicBool,
 }
 
-/// A read held on its way to Drive, from [`FakeClient::hold_next_read`]. It
-/// goes on when this is dropped.
+/// Wait while `state` holds a call.
+async fn wait_until_released(state: &HoldState) {
+    state.reached.store(true, Ordering::SeqCst);
+    while !state.released.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A call held on its way to or from Drive, from [`FakeClient::hold_next_read`]
+/// or [`FakeClient::hold_reply_to_next_create`]. It goes on when this is
+/// dropped.
 pub(crate) struct Held(Arc<HoldState>);
 
 impl Held {
@@ -646,6 +661,23 @@ impl FakeClient {
         Held(state)
     }
 
+    /// Make the next file create on Drive, then hold its answer until the
+    /// answer is dropped, as a slow link does.
+    pub(crate) fn hold_reply_to_next_create(&self) -> Held {
+        let state = Arc::new(HoldState {
+            uid: self.0.drive.root(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_create_reply.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Make the next revision of a file on Drive and lose its answer.
+    pub(crate) fn lose_reply_to_next_revision(&self) {
+        self.0.lose_revision_reply.store(true, Ordering::SeqCst);
+    }
+
     /// Wait here if `uids` is the read a [`Held`] is for.
     async fn wait_if_held(&self, uids: &[NodeUid]) {
         let state = {
@@ -656,10 +688,7 @@ impl FakeClient {
             }
         };
         let Some(state) = state else { return };
-        state.reached.store(true, Ordering::SeqCst);
-        while !state.released.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until_released(&state).await;
     }
 
     /// Requests made through this client so far.
@@ -1073,6 +1102,12 @@ impl DriveApi for FakeClient {
         if made.is_ok() && self.0.lose_create_reply.swap(false, Ordering::SeqCst) {
             return Err(no_answer());
         }
+        let held = self.0.hold_create_reply.lock().take();
+        if made.is_ok()
+            && let Some(state) = held
+        {
+            wait_until_released(&state).await;
+        }
         made
     }
 
@@ -1129,7 +1164,11 @@ impl DriveApi for FakeClient {
             server.put(file_uid, Some(remote));
             Ok(())
         })
-        .await
+        .await?;
+        if self.0.lose_revision_reply.swap(false, Ordering::SeqCst) {
+            return Err(no_answer());
+        }
+        Ok(())
     }
 
     async fn open_revision(&self, uid: &NodeUid) -> Result<Arc<dyn RevisionRead>> {
