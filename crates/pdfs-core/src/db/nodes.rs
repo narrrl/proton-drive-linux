@@ -533,9 +533,10 @@ impl Db {
     /// re-enumerates from the remote on next access.
     pub fn set_listed(&self, uid: &NodeUid, listed: bool) -> Result<()> {
         let conn = self.conn.lock();
+        let (key, uid) = row_key(&uid.to_string());
         conn.execute(
-            "UPDATE nodes SET listed = ?2 WHERE uid = ?1",
-            params![uid.to_string(), listed as i64],
+            &format!("UPDATE nodes SET listed = ?2 WHERE {key} = ?1"),
+            params![uid, listed as i64],
         )?;
         Ok(())
     }
@@ -694,10 +695,11 @@ impl Db {
     /// server head, so changes made while unmounted are still applied (P2).
     pub fn children_if_listed(&self, parent: &NodeUid) -> Result<Option<Vec<Node>>> {
         let conn = self.read();
+        let (key, folder) = row_key(&parent.to_string());
         let listed: Option<i64> = conn
             .query_row(
-                "SELECT listed FROM nodes WHERE uid = ?1",
-                params![parent.to_string()],
+                &format!("SELECT listed FROM nodes WHERE {key} = ?1"),
+                params![folder],
                 |r| r.get(0),
             )
             .optional()?;
@@ -790,6 +792,17 @@ pub(super) fn node_lid(conn: &rusqlite::Connection, uid: &str) -> Result<Option<
         }),
     };
     Ok(row.optional()?)
+}
+
+/// The column and value that find `uid`'s own row. A stand-in is found by its
+/// local id: a create that lands gives the row the uid Drive made before the
+/// tree has it, and the tree asks by the stand-in until then (`docs/BUGS.md`
+/// B177).
+fn row_key(uid: &str) -> (&'static str, Value) {
+    match local_lid(uid) {
+        Some(lid) => ("lid", Value::Integer(lid)),
+        None => ("uid", Value::Text(uid.to_owned())),
+    }
 }
 
 /// The column and value a row names `parent` by: its local id when it has a

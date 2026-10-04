@@ -12,6 +12,28 @@ Conventions:
 
 ---
 
+## B177 — A folder listed just as its create lands answers "Input/output error"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the account run on 378667f, on an on-demand sync folder: B100's
+`lstat` of `b100-copy/dir-0/sub-0/file-00.bin` failed with `EIO`. The daemon logged
+`enumerate folder children failed folder_uid=local~163903 ... InvalidEncryptedIdFormat` 85 ms
+before `dir-0`'s create landed.
+
+**Where:** `Db::children_if_listed` and `Db::set_listed` in `crates/pdfs-core/src/db/nodes.rs`.
+
+**Cause.** A folder made on the mount is marked as listed, so its listing comes from the
+database and never from Drive, which has not heard of it. The flag was looked up by uid. In
+B173's gap the row already has the uid Drive gave the folder and the tree still asks by the
+stand-in, so the lookup found no row, and the listing went to Drive with the stand-in.
+
+**Fix.** A stand-in finds its row by its local id, before and after its create lands.
+
+**Test:** `a_stand_in_folder_stays_listed_once_its_create_has_landed` in
+`crates/pdfs-core/src/db/tests.rs`.
+
+---
+
 ## B176 — A write closed just as its file's create lands is dropped
 
 **Status:** Fixed (unverified).
