@@ -12,6 +12,32 @@ Conventions:
 
 ---
 
+## B167 — The mount takes seconds to come up on a large Drive
+
+**Status:** Fixed.
+**Found:** 2026-10-04, looking into the cleanup of the account run on the working tree after
+B165, which found no control socket after the last daemon restart. Every start in that run
+took 2 to 3 s from "mounting" to "hydrated metadata cache from db" (37,000 nodes), the one
+before the cleanup 8.8 s. That was not the cleanup's failure: the socket is bound before the
+hydrate, and a request made during it waits. The cleanup ran some 1.5 s after the restart,
+before the new daemon got as far as binding it. `pdfs status` reports a daemon that is not
+listening yet as not running, and the run's queue wait took that for an empty queue.
+
+**Where:** `hydrate` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** The hydrate rebuilt the listing of every listed folder with a pass over all
+entries: 4,600 listed folders times 37,000 entries. That took 1.7 s on an idle machine
+(measured on a tree of that shape with entries of the real size), before the mount came up.
+
+**Fix.** The listings are gathered in one pass over the entries (`listed_children`), which
+takes 3 ms on the same tree.
+
+**Test:** `hydrated_listings_hold_each_folders_live_children` in `lib.rs`: each listed folder
+gets its live children, the root is not listed inside itself, and an unlisted folder gets no
+listing.
+
+---
+
 ## B166 — A folder drops or empties a file whose create lands while it is listed
 
 **Status:** Fixed.

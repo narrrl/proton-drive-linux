@@ -62,6 +62,8 @@ by its local id, in the queue, the stored tree and pins alike.
 - **A folder no longer drops or empties a new file while others are uploaded.** A file whose
   upload landed while the folder was being listed was missing from that listing, or listed as
   empty (B166).
+- **The mount comes up faster on a large Drive.** Rebuilding the folder listings from the cache
+  took close to 2 s with 37,000 files at every start (B167).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or

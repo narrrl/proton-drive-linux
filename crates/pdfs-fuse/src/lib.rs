@@ -1810,19 +1810,9 @@ impl Core {
         }
         st.hydrate_access();
 
-        // Pass 3: rebuild child listings for fully-enumerated folders. The root
-        // is its own parent (that is what `..` resolves to), so it would match
-        // its own filter; a directory listed inside itself makes the kernel fail
-        // the lookup with EIO, taking the whole listing down with it.
-        for dir_ino in listed_dirs {
-            let kids: Vec<u64> = st
-                .entries
-                .iter()
-                .filter(|&(&ino, e)| ino != dir_ino && e.parent == dir_ino && !e.node.trashed)
-                .map(|(&ino, _)| ino)
-                .collect();
-            st.children.insert(dir_ino, kids);
-        }
+        // Pass 3: rebuild child listings for fully-enumerated folders.
+        let listings = listed_children(&st.entries, listed_dirs);
+        st.children.extend(listings);
         info!(nodes = st.entries.len(), "hydrated metadata cache from db");
     }
 
@@ -6537,6 +6527,29 @@ fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) ->
     !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
 }
 
+/// The children `entries` hold for each folder in `listed`, gathered in one
+/// pass over them.
+///
+/// The root is its own parent (that is what `..` resolves to), so it would
+/// count as its own child; a directory listed inside itself makes the kernel
+/// fail the lookup with EIO, taking the whole listing down with it.
+///
+/// A pass per listed folder took 1.7 s on a tree of 37,000 nodes with 4,600 of
+/// them listed, at every start before the mount came up (`docs/BUGS.md` B167).
+fn listed_children(entries: &HashMap<u64, Entry>, listed: Vec<u64>) -> HashMap<u64, Vec<u64>> {
+    let mut children: HashMap<u64, Vec<u64>> =
+        listed.into_iter().map(|ino| (ino, Vec::new())).collect();
+    for (&ino, entry) in entries {
+        if ino != entry.parent
+            && !entry.node.trashed
+            && let Some(kids) = children.get_mut(&entry.parent)
+        {
+            kids.push(ino);
+        }
+    }
+    children
+}
+
 /// Lay what is queued for a folder over Drive's listing of it, from
 /// `Db::queued_children`: a node a queued rename moved away is dropped, and a
 /// node a queued create, mkdir or rename put there is listed as the DB has it.
@@ -9338,6 +9351,36 @@ mod tests {
             !release_can_discard_unlinked(&state.db, &uid),
             "database uncertainty must retain the tombstone and authority row"
         );
+    }
+
+    #[test]
+    fn hydrated_listings_hold_each_folders_live_children() {
+        let entry = |id: &str, parent: u64, is_dir: bool, trashed: bool| {
+            let mut node = node_helper(id, "none", id, is_dir);
+            node.trashed = trashed;
+            crate::state::Entry {
+                uid: node.uid.clone(),
+                parent,
+                node,
+                access: Access::Owner,
+                lookup_count: 1,
+                open_count: 0,
+                unlinked: false,
+            }
+        };
+        let entries: HashMap<u64, crate::state::Entry> = [
+            (1, entry("root", 1, true, false)),
+            (2, entry("a", 1, true, false)),
+            (3, entry("b", 1, true, false)),
+            (4, entry("a1", 2, false, false)),
+            (5, entry("a2", 2, false, true)),
+            (6, entry("b1", 3, false, false)),
+        ]
+        .into_iter()
+        .collect();
+        let mut listings = super::listed_children(&entries, vec![1, 2]);
+        listings.values_mut().for_each(|kids| kids.sort());
+        assert_eq!(listings, HashMap::from([(1, vec![2, 3]), (2, vec![4])]));
     }
 
     fn node_helper(id: &str, parent: &str, name: &str, is_dir: bool) -> Node {

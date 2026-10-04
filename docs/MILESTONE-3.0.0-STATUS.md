@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B127 and B141 to B166.
+- Fixes from the simulation and account runs since then: B127 and B141 to B167.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -104,7 +104,10 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          it (B165, bounded). The next run on the working tree (2026-10-04: 259 passed, 4
          failed) found a wide folder dropping files whose create landed while it was listed
          (B166, fixed), or listing one empty: the new file that read back empty again
-         (B166 too). Still open from it: a cleanup that found no control socket.
+         (B166 too). Its cleanup found no control socket because it ran 1.5 s after the
+         last restart, before the new daemon had bound it: `pdfs status` reports that as not
+         running, which the run's queue wait takes for an empty queue (the script's side).
+         Looking into it found the start spending 1.7 s rebuilding listings (B167, fixed).
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0
