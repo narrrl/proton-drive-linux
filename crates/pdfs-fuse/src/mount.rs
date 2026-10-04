@@ -784,9 +784,10 @@ fn signal_stop(rt: &tokio::runtime::Handle) -> std::sync::mpsc::Receiver<()> {
     sig_rx
 }
 
-/// How long teardown waits for the FUSE worker pool before proceeding without
-/// it. Long enough for an in-flight block to finish, short enough that
-/// `systemctl --user stop` still returns inside `TimeoutStopSec`.
+/// How long teardown waits for the background workers and then the FUSE worker
+/// pool before proceeding without them. Long enough for an in-flight block to
+/// finish, short enough that `systemctl --user stop` still returns inside
+/// `TimeoutStopSec`.
 const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Signal every background loop, wake the ones that are blocked, and join them.
@@ -801,7 +802,8 @@ const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 /// inside `accept`, which only returns when a connection arrives — so it gets
 /// one, from us, after the flag is already set. A join that takes a while is
 /// expected and correct: a worker part-way through an upload finishes it rather
-/// than abandoning the user's bytes mid-flight.
+/// than abandoning the user's bytes mid-flight. Up to [`WORKER_JOIN_DEADLINE`]:
+/// past it, systemd kills the daemon anyway, and a queued op is sent again.
 fn stop_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::JoinHandle<()>>) {
     // Say so before the joins: a teardown that takes a while must not be read as
     // a missed watchdog ping and turned into a kill.
@@ -815,25 +817,71 @@ fn stop_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::Jo
     // unlink cannot put it back to sleep.
     let _ = std::os::unix::net::UnixStream::connect(control_socket);
     let _ = std::fs::remove_file(control_socket);
-    for worker in workers {
-        if worker.join().is_err() {
-            warn!("a background worker panicked before shutdown");
-        }
+    let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
+    let running = join_until(workers, deadline);
+    if !running.is_empty() {
+        warn!(
+            running = running.join(","),
+            "background workers did not finish in time; shutting down around them"
+        );
     }
     // The FUSE worker pool last, and *before* the caller drops the tokio
     // runtime: a worker still inside a job when the runtime goes away panics on
     // its next timer with "A Tokio 1.x context was found, but it is being
     // shutdown" (seen 2026-09-18 09:58:35). Bounded, so a worker wedged on the
     // network cannot hold the stop the user asked for.
-    core.workers.stop_and_join(WORKER_JOIN_DEADLINE);
+    core.workers
+        .stop_and_join(deadline.saturating_duration_since(Instant::now()));
     debug!("background workers stopped");
+}
+
+/// Join `workers` until `deadline`, and name the ones still running then.
+///
+/// A stop used to wait for each one however long it took. The sync engine's
+/// mirror pass waits on Drive with no deadline, and a stop that waited for it
+/// was killed by systemd (`docs/BUGS.md` B165).
+fn join_until(workers: Vec<std::thread::JoinHandle<()>>, deadline: Instant) -> Vec<String> {
+    let mut running = Vec::new();
+    for worker in workers {
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !worker.is_finished() {
+            running.push(worker.thread().name().unwrap_or("unnamed").to_string());
+        } else if worker.join().is_err() {
+            warn!("a background worker panicked before shutdown");
+        }
+    }
+    running
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
-    use super::{SecondaryInsertRejection, SecondaryMountRegistry, teardown_session};
+    use super::{SecondaryInsertRejection, SecondaryMountRegistry, join_until, teardown_session};
+
+    #[test]
+    fn a_stop_names_the_workers_still_running_at_its_deadline() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let done = std::thread::Builder::new()
+            .name("done".into())
+            .spawn(|| {})
+            .unwrap();
+        let stuck = std::thread::Builder::new()
+            .name("stuck".into())
+            .spawn(move || {
+                let _ = wait.recv();
+            })
+            .unwrap();
+        let running = join_until(
+            vec![done, stuck],
+            Instant::now() + Duration::from_millis(100),
+        );
+        assert_eq!(running, ["stuck"]);
+        drop(release);
+    }
 
     #[test]
     fn session_is_unroutable_before_teardown_starts() {

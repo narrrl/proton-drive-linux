@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B127 and B141 to B164.
+- Fixes from the simulation and account runs since then: B127 and B141 to B165.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -100,7 +100,8 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          into a deleted folder (B150, fixed). Not confirmed yet. The run on 2.10.0
          (2026-10-04: 260 passed, 3 failed) failed a new file that read back empty (B163,
          fixed), a 128-entry folder that listed 129 (B164, fixed), and its cleanup, which ran
-         while the daemon was restarting.
+         while the daemon was restarting: the stop waited on a busy thread until systemd killed
+         it (B165, bounded).
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0

@@ -12,6 +12,34 @@ Conventions:
 
 ---
 
+## B165 — A stop waits on a stuck thread until systemd kills the daemon
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the account run on 2.10.0 (cleanup after on-demand pairing 2). The
+daemon was stopped at 15:53:04 and logged "control socket closing", but never "sync engine
+stopping" or "daemon stopping". systemd killed it 15 s later (`TimeoutStopSec`). The run's
+cleanup then found no control socket, because the new daemon had not opened it yet, and left
+its folders behind.
+
+**Where:** `stop_workers` in `crates/pdfs-fuse/src/mount.rs`; `mount_once` in
+`crates/pdfs-cli/src/main.rs`.
+
+**Cause.** A stop joined every background thread and waited as long as each one took. Every
+clean stop in the run logged the sync engine stopping just before the control socket
+closed. This one did not, so the engine was busy. It was most likely in a mirror pass over the
+run's mirror folder: that pass calls Drive with no deadline and does not check for a stop.
+The thread is inferred from the log, not observed.
+
+**Fix.** The stop waits up to 10 s for the background threads and the FUSE workers together,
+then names any thread still running in a warning and exits. A queued op it cut off is sent
+again on the next start, as after a kill. The runtime is shut down with a 2 s limit, so a
+blocking task cannot hold the exit either. The pass itself still has no deadline (STATUS,
+"Any time").
+
+**Test:** `a_stop_names_the_workers_still_running_at_its_deadline` in `mount.rs`.
+
+---
+
 ## B164 — A folder lists a new file twice while its create lands
 
 **Status:** Fixed.

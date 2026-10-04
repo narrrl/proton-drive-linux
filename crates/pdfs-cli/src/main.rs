@@ -2090,6 +2090,9 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
     if let Err(e) = rt.block_on(auth::persist(&session)) {
         tracing::debug!(error = %e, "no new tokens to persist on shutdown");
     }
+    // Dropping the runtime waits for every blocking task, however long; a call
+    // still stuck on Drive would hold the stop until systemd kills it (B165).
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
 
     let outcome = result.context("mount failed")?;
     Ok(outcome)

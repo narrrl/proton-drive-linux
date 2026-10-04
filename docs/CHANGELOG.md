@@ -57,6 +57,8 @@ by its local id, in the queue, the stored tree and pins alike.
   before its contents are committed, and the mount took that answer (B163).
 - **A folder no longer lists a new file twice while it is uploaded.** A listing taken as the
   upload landed showed it both as Drive had it and as the queue did (B164).
+- **Stopping the daemon no longer hangs until systemd kills it.** A stop waits up to 10 s for
+  work in progress, then exits and logs what was still running (B165).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152).
 - **A change that waits for a name to be freed no longer waits seconds after it is.** A rename or
