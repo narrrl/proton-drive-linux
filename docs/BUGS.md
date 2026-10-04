@@ -12,6 +12,28 @@ Conventions:
 
 ---
 
+## B175 — A file replaced by a rename just as its create lands stays on Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by `one_client_on_a_good_link` (seed 8) on 378667f, run three at a time
+in a loop. `rename b.txt -> a.txt` replaced an `a.txt` whose create had landed a few
+milliseconds before, and the next `rename a.txt -> d` moved the old `a.txt` on Drive. Drive
+ended with the old bytes in `d` and the new ones still in `a.txt`, and the queue did not drain.
+
+**Where:** `Core::remove_replaced` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** The same gap as B173, through `rename`. The replace found the old file under its
+stand-in, found no op left to drop, and took it for a file Drive had never seen. So nothing
+trashed it on Drive, and the tree took it back under its name once it got its uid.
+
+**Fix.** As in B173: after dropping a stand-in's ops, the replace checks whether the node's row
+has a real uid. If it has, the file is trashed on Drive like any other replaced file.
+
+**Test:** `a_file_replaced_as_its_create_lands_is_trashed_on_drive` in
+`crates/pdfs-fuse/src/sim/daemon.rs`.
+
+---
+
 ## B174 — A file renamed just as its create lands is refused with "Permission denied"
 
 **Status:** Fixed (unverified).

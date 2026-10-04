@@ -562,6 +562,55 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_replaced_as_its_create_lands_is_trashed_on_drive() {
+        // The same race as B173, through a rename onto the file: the replace
+        // found no op left to drop and took the file for one Drive had never
+        // seen. Drive kept it under the name, and the next rename of that name
+        // moved it instead of the file that replaced it (B175).
+        let drive = FakeDrive::new();
+        let dir = scratch("replaced-as-create-lands");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        std::fs::write(mnt.join("b.txt"), b"new").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.lookup("b.txt").is_some()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mnt.join("a.txt"), b"old").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        let uid = drive.lookup("a.txt").unwrap();
+        let landing = daemon.client.hold_next_landing(&uid);
+        drop(create);
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+        std::fs::rename(mnt.join("b.txt"), mnt.join("a.txt")).unwrap();
+        drop(landing);
+        std::fs::rename(mnt.join("a.txt"), mnt.join("d")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.lookup("a.txt").is_none()
+                    && drive.tree().get("d") == Some(&Entry::File(Arc::new(b"new".to_vec())))
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(std::fs::read(mnt.join("d")).unwrap(), b"new");
+        assert!(!mnt.join("a.txt").exists());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name() {
         // The move queued behind the create landed while the drain read the
         // new node back. The answer still had the old name, and the drain no

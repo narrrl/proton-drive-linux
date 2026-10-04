@@ -5007,15 +5007,18 @@ impl Core {
     ///
     /// A node whose own creation is still queued has never reached the server, so
     /// dropping its queued ops is the whole removal; nothing goes to the wire and
-    /// it works offline.
+    /// it works offline. A create that landed before its ops were dropped left
+    /// none: Drive has the node, so it is trashed there like any other
+    /// (`docs/BUGS.md` B175).
     ///
     /// A handle still open on the replaced node keeps reading its bytes, as
     /// `rename(2)` promises: the inode stays as an unlinked entry and its
     /// staged bytes, cache and reader go at the final close, exactly as for an
     /// `unlink` under an open handle. Its queued ops go now, or the drain would
     /// upload to the node after it was trashed (`docs/BUGS.md` B106).
-    fn remove_replaced(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
-        if is_local_uid(uid) {
+    fn remove_replaced(&self, ino: u64, uid: &NodeUid, name: &str) -> Result<(), Errno> {
+        let landed;
+        let uid = if is_local_uid(uid) {
             if self.is_open_anywhere(uid) {
                 self.withdraw_queued_ops(uid)?;
             } else {
@@ -5024,9 +5027,20 @@ impl Core {
             self.for_each_state(|st| {
                 st.forget_or_unlink(uid);
             });
-            debug!(%uid, name, "replaced a node whose create was still queued");
-            return Ok(());
-        }
+            match self.landed_row_uid(ino) {
+                Some(real) => {
+                    debug!(local = %uid, %real, name, "create landed under a replace");
+                    landed = real;
+                    &landed
+                }
+                None => {
+                    debug!(%uid, name, "replaced a node whose create was still queued");
+                    return Ok(());
+                }
+            }
+        } else {
+            uid
+        };
         // Local-first or offline, or the network goes away under the call:
         // queue the trash. The rename that follows queues as well, behind it.
         if !self.sends_inline() {

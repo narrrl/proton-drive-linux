@@ -1946,7 +1946,7 @@ impl ProtonFs {
                 reply.error(error);
                 return;
             }
-            if let Err(e) = self.core.remove_replaced(victim_uid, newname) {
+            if let Err(e) = self.core.remove_replaced(*victim_ino, victim_uid, newname) {
                 reply.error(e);
                 return;
             }
