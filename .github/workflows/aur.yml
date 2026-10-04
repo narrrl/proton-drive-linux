@@ -67,7 +67,13 @@ jobs:
             User aur
           EOF
           # Pin the host key to the fingerprint published on aur.archlinux.org.
-          ssh-keyscan -t ed25519 aur.archlinux.org > "$HOME/.ssh/known_hosts"
+          # The scan sometimes returns nothing from the runner, so retry it.
+          for attempt in 1 2 3 4 5; do
+            ssh-keyscan -T 15 -t ed25519 aur.archlinux.org > "$HOME/.ssh/known_hosts" &&
+              [ -s "$HOME/.ssh/known_hosts" ] && break
+            echo "ssh-keyscan attempt $attempt returned no key; retrying"
+            sleep 10
+          done
           ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -q 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
           chown -R builder: "$HOME/.ssh"
           chmod 600 "$HOME/.ssh/aur"
