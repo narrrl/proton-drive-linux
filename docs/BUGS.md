@@ -12,6 +12,26 @@ Conventions:
 
 ---
 
+## B150 — A conflict copy whose folder is gone retries forever
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the journal check of the account run on a6f36d5: 33 warnings, one
+every two minutes for the whole run, all "queued write conflicts; keeping a conflict copy" for a
+`write.bin` from an earlier run's B79 case, each followed by `DoesNotExist` from Drive.
+
+**Where:** `Core::keep_as_conflict_copy` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A queued write to a file that was trashed or deleted on Drive is kept as a conflict
+copy beside the file. When the file's folder was deleted too, the upload into it failed, the op
+backed off and tried again, with no end. The copy only fell back to the root when the tree had
+forgotten the file, not when Drive had lost its folder.
+
+**Fix.** The copy checks that the folder is still on Drive and not trashed, and lands in the
+location's root otherwise. Sim test `a_queued_write_whose_folder_was_trashed_lands_in_the_root`.
+
+**Left open.** How the B79 case's bytes stayed in `staging/` after the file was deleted, so that
+the next start queued them again ("reconciled orphaned staged writes queued=1"), is not known yet.
+
 ## B149 — `pdfs rename` or `pdfs move` right after a rename through the mount is undone
 
 **Status:** Fixed (unverified).

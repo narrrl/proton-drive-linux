@@ -1585,8 +1585,14 @@ impl Core {
             .map(|(_, n)| n.clone())
             .unwrap_or_else(|| self.node_name(uid));
         // A node the tree has forgotten still has bytes worth keeping, so the
-        // copy falls back to the root rather than being abandoned.
-        let Some(parent) = place.map(|(p, _)| p).or_else(|| self.root_uid()) else {
+        // copy falls back to the root rather than being abandoned. So does one
+        // whose folder went with it: an upload into a folder Drive no longer
+        // has fails on every retry (B150).
+        let folder = match place.map(|(p, _)| p) {
+            Some(p) if self.fetch_node_remote(&p)?.is_some_and(|n| !n.trashed) => Some(p),
+            _ => None,
+        };
+        let Some(parent) = folder.or_else(|| self.root_uid()) else {
             return self.abandon_to_staging(op, blob, uid, &name, reason);
         };
         warn!(%uid, name, reason, "queued write conflicts; keeping a conflict copy");

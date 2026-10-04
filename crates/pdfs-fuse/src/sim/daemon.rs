@@ -278,6 +278,7 @@ pub(crate) fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> boo
 mod tests {
     use super::*;
     use crate::sim::fake_drive::{Entry, FakeDrive, Faults};
+    use std::collections::BTreeMap;
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
@@ -529,6 +530,52 @@ mod tests {
         );
         let tree = drive.tree();
         assert!(!tree.contains_key("b/back.txt") && !tree.contains_key("b/inner/back.txt"));
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_queued_write_whose_folder_was_trashed_lands_in_the_root() {
+        // The conflict copy of a write to a file trashed elsewhere went into
+        // the file's folder. With that folder gone too, the upload failed on
+        // every retry, every two minutes (B150).
+        let drive = FakeDrive::new();
+        let dir = scratch("conflict-copy-folder-gone");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        let mount = &daemon.mountpoint;
+        std::fs::create_dir(mount.join("d")).unwrap();
+        std::fs::write(mount.join("d/f.txt"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().contains_key("d/f.txt") && daemon.pending().is_ok_and(|ops| ops.is_empty())
+        }));
+
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        std::fs::write(mount.join("d/f.txt"), b"second").unwrap();
+        drive.device().trash("d/f.txt");
+        drive.device().trash("d");
+        daemon.request(&paused(false)).unwrap();
+
+        let copy = |tree: &BTreeMap<String, Entry>| {
+            tree.iter()
+                .find(|(path, _)| path.starts_with("f (sync-conflict "))
+                .map(|(_, entry)| entry.clone())
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                copy(&drive.tree()) == Some(Entry::File(Arc::new(b"second".to_vec())))
+                    && daemon.pending().is_ok_and(|ops| ops.is_empty())
+            }),
+            "{:?} {:?}",
+            drive.tree().keys().collect::<Vec<_>>(),
+            daemon.pending()
+        );
 
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
