@@ -12,6 +12,29 @@ Conventions:
 
 ---
 
+## B179 — A file read just as its create lands reads empty
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the account run on 378667f, on on-demand sync folders: the unusual
+names case read `<angle>|pipe` back as 0 bytes instead of 12, and B70's completed download as 0
+bytes instead of 147456. Both files had a write that landed during their create, which the
+daemon queued as a revision.
+
+**Where:** `Core::read_range` in `crates/pdfs-fuse/src/reads.rs`.
+
+**Cause.** A read takes the file's uid from the tree and reads on a transfer worker. A file made
+on the mount has its stand-in uid there until its create lands. When it lands, the queued write
+moves to the uid Drive gave the file. A read that still asked by the stand-in found no write
+queued under it, took the file for one created and never written, and returned nothing. The
+read waits on the transfer lane, which a run keeps busy, so the window is not small.
+
+**Fix.** A stand-in with no queued write is looked up by its local id. Once its create has
+landed, the read goes on under the uid Drive gave it.
+
+**Test:** `a_file_read_as_its_create_lands_has_its_bytes` in `crates/pdfs-fuse/src/sim/daemon.rs`.
+
+---
+
 ## B178 — Trashing a folder while sync is paused keeps a create in it as a trash
 
 **Status:** Fixed (unverified).

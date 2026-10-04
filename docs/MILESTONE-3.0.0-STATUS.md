@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B127 and B141 to B178.
+- Fixes from the simulation and account runs since then: B127 and B141 to B179.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -124,7 +124,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          The account run on 378667f: a folder listed as its create landed asked Drive by
          its stand-in and answered `EIO` (B177, fixed). A folder trashed while sync was
          paused kept a create below it as a trash: a paused drain worker had claimed it
-         (B178, fixed).
+         (B178, fixed). A file read as its create landed read empty (B179, fixed).
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0

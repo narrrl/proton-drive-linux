@@ -499,9 +499,14 @@ impl Core {
         }
         // A node created offline and never written has no blob and no remote: it
         // is an empty file, and asking the API about a `local~` uid would only
-        // earn a 404 (offline.md Phase 3b).
+        // earn a 404 (offline.md Phase 3b). Unless its create landed since the
+        // read looked: the landing moved the queued write to the uid Drive
+        // gave it, and the row says which (`docs/BUGS.md` B179).
         if is_local_uid(uid) {
-            return Ok(Vec::new());
+            return match self.landed_stand_in_uid(uid) {
+                Some(real) => self.read_range(&real, mtime, fsize, offset, len, cache_blocks),
+                None => Ok(Vec::new()),
+            };
         }
         self.read_range_remote(uid, mtime, fsize, offset, len, cache_blocks)
     }

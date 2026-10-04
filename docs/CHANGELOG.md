@@ -83,6 +83,7 @@ by its local id, in the queue, the stored tree and pins alike.
   (B177).
 - **Deleting a folder while sync is paused no longer leaves a queued change behind** for a
   file in it that was never uploaded (B178).
+- **A file read just as it reaches Drive no longer reads empty** (B179).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).

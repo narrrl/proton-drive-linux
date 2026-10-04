@@ -3225,8 +3225,19 @@ impl Core {
     /// `None` while it is still queued. Read from the row, which has it before
     /// the tree does.
     pub(crate) fn landed_row_uid(&self, ino: u64) -> Option<NodeUid> {
-        state::ino_lid(ino)
-            .and_then(|lid| self.db.uid_of_lid(lid).ok().flatten())
+        state::ino_lid(ino).and_then(|lid| self.landed_lid_uid(lid))
+    }
+
+    /// [`Core::landed_row_uid`] for a node known by its stand-in `uid`.
+    pub(crate) fn landed_stand_in_uid(&self, uid: &NodeUid) -> Option<NodeUid> {
+        pdfs_core::db::local_lid(&uid.to_string()).and_then(|lid| self.landed_lid_uid(lid))
+    }
+
+    fn landed_lid_uid(&self, lid: i64) -> Option<NodeUid> {
+        self.db
+            .uid_of_lid(lid)
+            .ok()
+            .flatten()
             .and_then(|uid| parse_node_uid(&uid))
             .filter(|uid| !is_local_uid(uid))
     }

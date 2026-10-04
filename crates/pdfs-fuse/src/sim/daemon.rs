@@ -611,6 +611,41 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_read_as_its_create_lands_has_its_bytes() {
+        // The landing moved the queued write to the uid Drive gave the file.
+        // A read that still knew the file by its stand-in found no write
+        // queued under it, took the file for one never written and read it
+        // empty (B179).
+        let drive = FakeDrive::new();
+        let dir = scratch("read-as-create-lands");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        let create = daemon.client.hold_reply_to_next_create();
+        std::fs::write(mnt.join("a.txt"), b"old").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || create.reached()));
+        std::fs::write(mnt.join("a.txt"), b"newer").unwrap();
+        let uid = drive.lookup("a.txt").unwrap();
+        let landing = daemon.client.hold_next_landing(&uid);
+        drop(create);
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+        assert_eq!(std::fs::read(mnt.join("a.txt")).unwrap(), b"newer");
+        drop(landing);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("a.txt") == Some(&Entry::File(Arc::new(b"newer".to_vec())))
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_moved_while_its_create_was_on_the_wire_keeps_its_new_name() {
         // The move queued behind the create landed while the drain read the
         // new node back. The answer still had the old name, and the drain no
