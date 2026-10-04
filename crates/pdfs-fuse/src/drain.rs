@@ -299,29 +299,30 @@ impl Core {
                 return;
             }
             let now = now_millis();
+            // Offline or paused, nothing is claimed. A claimed create may be on
+            // the wire, so trashing its folder kept it as a trash; claimed
+            // only to be handed back, it was kept although nothing had sent
+            // it (`docs/BUGS.md` B178).
+            let online = self.online.load(Ordering::Relaxed);
+            let paused = self.sync_paused();
             // One row, chosen and *claimed* by the database. Reading the whole
             // queue to pick one op made a long queue quadratic to drain, and
             // held the shared connection — and so every FUSE metadata call —
             // for the duration.
-            let due = match self.db.claim_next_due_op(now) {
-                Ok(due) => due,
+            let due = match (online && !paused)
+                .then(|| self.db.claim_next_due_op(now))
+                .transpose()
+            {
+                Ok(due) => due.flatten(),
                 Err(error) => {
                     error!(%error, "claiming the next pending operation failed");
                     self.wait_for_drain_work();
                     continue;
                 }
             };
-            let online = self.online.load(Ordering::Relaxed);
-            let paused = self.sync_paused();
             let op = match due {
-                Some(op) if online && !paused => op,
-                idle => {
-                    // Claimed but offline: hand it straight back, or it stays
-                    // invisible to every worker until this one happens to be
-                    // the next to notice the reconnect.
-                    if let Some(op) = idle {
-                        self.release_claim(&op);
-                    }
+                Some(op) => op,
+                None => {
                     if primary {
                         // Nothing to upload is exactly when the connection is
                         // free, so this is where the read path's buffered LRU

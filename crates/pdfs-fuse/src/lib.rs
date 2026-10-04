@@ -9035,6 +9035,17 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_drain_claims_nothing() {
+        // A claimed create counts as sent, so trashing its folder kept it as
+        // a trash, although the paused worker only handed it back (B178).
+        let worker: String =
+            function_source(include_str!("drain.rs"), "pub(crate) fn run_pending_drain(")
+                .split_whitespace()
+                .collect();
+        assert!(worker.contains("(online&&!paused).then(||self.db.claim_next_due_op(now))"));
+    }
+
+    #[test]
     fn a_landed_upload_stays_pending_until_its_bytes_are_cached() {
         let drain = function_source(include_str!("drain.rs"), "pub(crate) fn drain_revision(");
         assert_before(

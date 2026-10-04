@@ -12,6 +12,27 @@ Conventions:
 
 ---
 
+## B178 — Trashing a folder while sync is paused keeps a create in it as a trash
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the account run on 378667f, on an on-demand sync folder: B116's
+`pdfs rm b116` with sync paused left the create of `b116/sub/deeper/b116 held.bin` queued as
+trash #16098.
+
+**Where:** `Core::run_pending_drain` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** Trashing a folder drops the creates queued below it, but keeps a create that may
+already be on the wire as a trash, for a node Drive may have made (B151). A claimed create
+counts as such. A drain worker that woke while sync was paused or offline claimed the next due
+op and only then saw it could not send it, and handed it back. The rename that lets a parked
+create go wakes the workers, so a trash in that moment kept a create nothing had sent.
+
+**Fix.** A worker checks that it is online and not paused before it claims anything.
+
+**Test:** `a_paused_drain_claims_nothing` in `crates/pdfs-fuse/src/lib.rs`.
+
+---
+
 ## B177 — A folder listed just as its create lands answers "Input/output error"
 
 **Status:** Fixed (unverified).
