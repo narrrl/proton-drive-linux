@@ -49,10 +49,13 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          run.
    - [ ] Known-bug list in `sim/run.rs` is empty: B125 and B130 open; B129 and B132 fixed but
          unconfirmed.
-   - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN, partial report) failed only
-         B113 and B121, on every on-demand mount. B121 was a bug (B149, fixed); B113's case
-         still expected creates to reach Drive at once and now accepts queued ones. Not
-         confirmed yet.
+   - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)
+         failed B113 and B121 on every on-demand mount, two mirror-to-mirror move cases, and
+         the journal check. B121 was a bug (B149, fixed); B113's case still expected creates
+         to reach Drive at once and now accepts queued ones. The move cases were the harness:
+         it retried every source after one was busy, and expected a refusal where a mirror to
+         mirror move carries the local copy along. The journal showed a conflict copy retrying
+         into a deleted folder (B150, fixed). Not confirmed yet.
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0
