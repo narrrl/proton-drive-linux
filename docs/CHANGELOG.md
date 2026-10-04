@@ -32,6 +32,8 @@ by its local id, in the queue, the stored tree and pins alike.
   a new file, a rename or a delete is recorded locally and the call returns at once; the queue
   sends it, as it does offline. `"local_first": false` in `config.json` brings back the old way
   for this release.
+- **The queue sends up to 16 changes at once instead of 3.** A thousand new files in a hundred
+  folders reach Drive about three times as fast on a LAN, and four times as fast on Wi-Fi.
 
 ### Fixed
 - **A file made under the name of a file whose upload is still going out keeps its name.** It

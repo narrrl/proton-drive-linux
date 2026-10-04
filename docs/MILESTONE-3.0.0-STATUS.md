@@ -55,13 +55,21 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
            the uid Drive knows: ops are matched by lid in the database (6b), `hidden` and
            `creating` only ever hold remote uids, and `landed_row_uid` is the one place at the
            mount's edge where a stand-in a handle still holds becomes the real uid.
-   - [ ] An executor that runs ops in dependency order, many at once.
+   - [x] An executor that runs ops in dependency order, many at once: 16 drain workers instead
+         of 3, and a worker that lands an op wakes the idle ones, which slept through the ops it
+         made claimable. The claim already keeps the order: a create waits for its parent's
+         uid, a node's ops go one at a time. Ops stay blocking calls on worker threads: each
+         one spends its time waiting on Drive, so tasks would buy nothing threads do not.
 3. **Speed (§7)**: run independent ops in parallel, batch trashes and moves; measure 1,000 files
    and 100 folders on Wi-Fi against LAN (target: within 10 %).
    - [x] The measurement: `a_thousand_files_drain_as_fast_on_wifi_as_on_lan` in `sim/daemon.rs`,
          run with `PDFS_SIM_MEASURE=1`. It prints the times and asserts nothing yet.
    - [x] Baseline on eb1c105, three drain threads: the syscalls take 3.7 s on LAN and 4.3 s on
          Wi-Fi; the drain takes 138 s on LAN and 938 s on Wi-Fi, 6.8 times as long.
+   - [x] Sixteen workers: the syscalls take 5.2 s on LAN and 5.0 s on Wi-Fi, which meets the
+         target; the drain takes 47 s on LAN and 247 s on Wi-Fi. Most of a create on Wi-Fi is
+         its read-back waiting for Drive to list the new node (250 ms, then 1 s), so batching
+         (step 8) helps trashes and moves, not creates.
 4. **Done-when checks**:
    - [ ] Simulation passes on the Wi-Fi profile: `one_client_on_a_slow_link` failed in CI on
          seeds 2 and 3. Two bugs (B127, B151) and a harness gap: a settle did not read the log, so

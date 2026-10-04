@@ -363,10 +363,15 @@ impl Core {
             }
             // The access check let this attempt through, so any earlier run of
             // deferrals is over and must not be counted against the next one.
-            if matches!(outcome, Ok(DrainDisposition::Applied))
-                && let Err(error) = self.db.clear_op_access_deferral(op.id)
-            {
-                debug!(uid = %op.uid, %error, "clearing an access-deferral window failed");
+            if matches!(outcome, Ok(DrainDisposition::Applied)) {
+                if let Err(error) = self.db.clear_op_access_deferral(op.id) {
+                    debug!(uid = %op.uid, %error, "clearing an access-deferral window failed");
+                }
+                // What landed may have made other ops claimable: the files
+                // made in a folder that has its uid now, the next change to the
+                // same node. This worker only takes one of them; the others
+                // slept until the next idle poll.
+                self.wake_drain();
             }
             if let Err(e) = outcome {
                 let attempts = op.attempts + 1;

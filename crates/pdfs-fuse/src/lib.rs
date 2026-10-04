@@ -201,10 +201,13 @@ const UPLOAD_TIME_MEMORY: usize = 512;
 ///
 /// One meant a single 10 GiB upload blocked every queued rename, trash and
 /// small write behind it. Ordering only has to hold per node — enforced by the
-/// claim query, not by the thread count — so the rest is throughput. Kept small:
-/// these are uploads, and past a handful they compete for the same uplink and
-/// for the SDK's own per-request concurrency.
-const DRAIN_WORKERS: usize = 3;
+/// claim query, not by the thread count — so the rest is throughput. Most ops
+/// spend their time waiting: a create waits for Drive to list the node it made
+/// before it reads it back. Three workers left a thousand small creates taking
+/// 0.3 s each on a LAN and 2.5 s on Wi-Fi, one after another. Uploads cannot
+/// crowd each other out by number: the SDK caps the blocks in flight across
+/// the client.
+const DRAIN_WORKERS: usize = 16;
 
 /// How long a staged blob that names no node is kept before it is retired.
 ///
