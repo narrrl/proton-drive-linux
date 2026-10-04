@@ -1218,7 +1218,7 @@ timing, and then on the refused write.
 
 ## B130 — A read of a file that a remote change invalidates can hang the daemon
 
-**Status:** Open.
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 1).
 After the last step, a read of `c0/z/f.txt` never returned. The watchdog's stacks showed the
 read's worker in `read_range_remote`, waiting in `block_on` for its fetch, and a runtime worker
@@ -1239,9 +1239,16 @@ sleep on a condvar. The read's fetch waits on a timer (here the fake's latency, 
 HTTP response), so it never finishes and never lets go of the page lock. The daemon stays stuck
 until some other work wakes a worker, and on an idle machine that may never happen.
 
-**Test:** the simulation runs recognise it in the watchdog's stacks (a `tokio-rt-worker` in
-state `D` inside `NotifyBatch::flush`), count it and end the seed there. With
-`PDFS_SIM_KNOWN=fail`, seed 1 of one-client-flaky fails on it.
+**Fix.** Every notice to the kernel goes through `off_the_runtime`, which on a runtime worker
+sends it from inside `block_in_place`: the worker's tasks, and the driver with them, go to
+another thread while it waits. Anywhere else the notice is sent as before.
+
+**Test:** `a_kernel_notice_sent_from_the_runtime_leaves_its_timers_running` in
+`crates/pdfs-fuse/src/lib.rs`: the one worker of a runtime sends a notice that returns only once
+a timer of that runtime has fired. The simulation runs still recognise it in the watchdog's
+stacks (a `tokio-rt-worker` in state `D` inside `NotifyBatch::flush`); with
+`PDFS_SIM_KNOWN=fail`, seed 1 of one-client-flaky fails on it, though it no longer reaches it
+since phase 3.
 
 ## B129 — A file deleted or replaced while its create is on the wire stays on Drive
 

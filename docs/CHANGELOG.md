@@ -88,6 +88,7 @@ by its local id, in the queue, the stored tree and pins alike.
   worker missed the stop (B180).
 - **A folder made while offline or with sync paused no longer fails with "Input/output
   error"** once it is refreshed or the connection comes back (B125).
+- **The daemon no longer hangs when a file being read changes on Drive** (B130).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).

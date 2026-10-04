@@ -1364,24 +1364,42 @@ impl KernelChannel {
 
     pub(crate) fn inval_inode(&self, ino: u64) -> std::io::Result<()> {
         let ino = filesystem::kernel_ino(self.root, ino);
-        self.notifier.inval_inode(ino, 0, 0)
+        off_the_runtime(|| self.notifier.inval_inode(ino, 0, 0))
     }
 
     /// Drop the cached attributes of `ino` but not its page cache.
     fn inval_attrs(&self, ino: u64) -> std::io::Result<()> {
         let ino = filesystem::kernel_ino(self.root, ino);
-        self.notifier.inval_inode(ino, -1, 0)
+        off_the_runtime(|| self.notifier.inval_inode(ino, -1, 0))
     }
 
     pub(crate) fn inval_entry(&self, parent: u64, name: &OsStr) -> std::io::Result<()> {
         let parent = filesystem::kernel_ino(self.root, parent);
-        self.notifier.inval_entry(parent, name)
+        off_the_runtime(|| self.notifier.inval_entry(parent, name))
     }
 
     fn delete(&self, parent: u64, child: u64, name: &OsStr) -> std::io::Result<()> {
         let parent = filesystem::kernel_ino(self.root, parent);
         let child = filesystem::kernel_ino(self.root, child);
-        self.notifier.delete(parent, child, name)
+        off_the_runtime(|| self.notifier.delete(parent, child, name))
+    }
+}
+
+/// Send a notice to the kernel without holding up the runtime.
+///
+/// The kernel answers an invalidation only once it has the pages' locks, and
+/// a read holds those until the daemon answers it. Sent from a runtime worker,
+/// the notice blocked that worker in the kernel; when it was the one driving
+/// the timers and I/O, nothing drove them any more, so the read's fetch never
+/// finished and the daemon hung (`docs/BUGS.md` B130). On a worker the notice
+/// hands the worker's tasks to another thread first; anywhere else it is sent
+/// as it is.
+fn off_the_runtime<T>(notice: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(notice)
+        }
+        _ => notice(),
     }
 }
 
@@ -7319,12 +7337,12 @@ mod tests {
         SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
         accepted_share_provenance, conflict_name, copy_pending_for_truncate, expand_restore,
         first_seen_in_trash, fuse_name, is_stale_mount, node_visible, note_self_change,
-        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
-        publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
-        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
-        rename_needs_queue, require_node_parent_access, require_rename_access,
-        resolve_anywhere_with, shared_with_me_uid, take_self_change, uid_write_authority,
-        virtual_node,
+        off_the_runtime, orphan_past_retention, parse_node_uid, prepare_shared_roots,
+        preserve_on_access_denied, publish_virtual_root_in_listing,
+        reconcile_virtual_root_in_listing, release_can_discard_unlinked,
+        release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
+        require_node_parent_access, require_rename_access, resolve_anywhere_with,
+        shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
     };
     use super::{Db, WriteAuthority};
     use std::time::Duration;
@@ -8998,6 +9016,42 @@ mod tests {
         // Built inside the runtime: a FUSE worker has no reactor, and a timer
         // built there panicked every remote read.
         assert!(remote.contains("async { tokio::time::timeout(budget, fetch).await }"));
+    }
+
+    #[test]
+    fn a_kernel_notice_sent_from_the_runtime_leaves_its_timers_running() {
+        // A notice waits in the kernel for a read whose fetch waits on a
+        // timer of the same runtime (B130). Here the runtime's one worker sends
+        // it, and the timer has to fire for the notice to return.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fetched, fetch) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = fetched.send(());
+        });
+        let notice =
+            rt.spawn(async move { off_the_runtime(|| fetch.recv_timeout(Duration::from_secs(5))) });
+        assert!(rt.block_on(notice).unwrap().is_ok());
+
+        // Every notice to a session goes through it.
+        let lib = include_str!("lib.rs");
+        for method in [
+            "fn inval_inode(&self",
+            "fn inval_attrs(&self",
+            "fn inval_entry(&self",
+            "fn delete(&self, parent: u64",
+        ] {
+            let source = function_source(lib, method);
+            assert_eq!(source.matches("self.notifier.").count(), 1, "{method}");
+            assert!(
+                source.contains("off_the_runtime(|| self.notifier."),
+                "{method}"
+            );
+        }
     }
 
     #[test]
