@@ -3300,8 +3300,15 @@ def remember_preexisting_ops(queue: list[dict]) -> None:
     print(f"NOTE: {plural(len(new), 'queued op')} predate this target, for {shown}; queue waits ignore them")
 
 
-def queue_settled(mount: dict, queue) -> bool:
-    """Whether everything this run queued has drained. `queue` lists the ops."""
+def queue_settled(mount: dict | None, queue) -> bool:
+    """Whether everything this run queued has drained. `queue` lists the ops.
+
+    `mount` is `pdfs --json status`'s "mount", None while no daemon answers:
+    just after a restart, before the new one listens. That is not a drained
+    queue, only an unread one.
+    """
+    if mount is None:
+        return False
     if mount.get("pending_uploads", 0) == 0 and mount.get("pending_changes", 0) == 0:
         return True
     if not PREEXISTING_OPS:
@@ -3356,10 +3363,10 @@ class Daemon:
         deadline = time.monotonic() + self.timeout
         last = None
         while time.monotonic() < deadline:
-            last = self.status().get("mount") or {}
+            last = self.status().get("mount")
             if queue_settled(last, self.queue):
                 return
-            if last.get("parked_uploads"):
+            if last and last.get("parked_uploads"):
                 # A transient name's create waits for a rename, not for the
                 # drain, so waiting out the timeout would only hide which file.
                 parked = [
@@ -3849,7 +3856,7 @@ class ManagedSyncPair:
         last = None
         while time.monotonic() < deadline:
             value = json.loads(self.command("status", json_output=True))
-            last = value.get("mount") or {}
+            last = value.get("mount")
             if queue_settled(
                 last,
                 lambda: json.loads(self.command("sync", "queue", json_output=True))["items"],
