@@ -31,6 +31,8 @@ are kept. Queued changes get a column for the reason Drive refused them.
   for this release.
 
 ### Fixed
+- **A folder kept offline before it reached Drive stays kept offline.** Its pin was lost when the
+  folder landed (B148).
 - **A queued change no longer holds up the queue forever on a link that stops answering.**
   Sending a new folder, a delete or a file waits at most 20 seconds for Drive, plus time for
   the file's size, and then the queue treats the link as down and tries again.

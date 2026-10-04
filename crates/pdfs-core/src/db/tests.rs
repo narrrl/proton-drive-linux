@@ -3321,6 +3321,53 @@ fn a_landed_folder_keeps_a_row_until_the_server_copy_replaces_it() {
     assert_eq!(found[0].path, "New folder/inside.txt");
 }
 
+/// B148: a folder pinned before it landed is still pinned once it has.
+#[test]
+fn a_folder_pinned_before_it_landed_stays_pinned() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let local = NodeUid::new(VolumeId::from("local"), LinkId::from("dir"));
+    let mut placeholder = folder("dir", Some("root"), "Keep");
+    placeholder.uid = local.clone();
+    db.upsert_node(&placeholder).unwrap();
+    db.pin_add(&local.to_string(), "Keep", true).unwrap();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_MKDIR.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(uid("root").to_string()),
+            name: Some("Keep".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+
+    db.finish_create(
+        id,
+        None,
+        &landing(
+            &local.to_string(),
+            &uid("real").to_string(),
+            &uid("root").to_string(),
+            "Keep",
+        ),
+        |_| None,
+    )
+    .unwrap();
+
+    assert!(db.is_pinned(&uid("real").to_string()).unwrap());
+    assert!(!db.is_pinned(&local.to_string()).unwrap());
+    let pins = db.pin_list().unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].uid, uid("real").to_string());
+    assert!(pins[0].recursive);
+}
+
 /// A file deleted while its create was on the wire still lands: nothing stops
 /// an upload in flight. The node it made is unwanted, so a trash of it is
 /// queued in the same transaction, already claimed by the drain that landed it

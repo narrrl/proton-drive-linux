@@ -733,6 +733,13 @@ pub(super) fn adopt_placeholder_row_tx(
     local: &str,
     real: &str,
 ) -> Result<()> {
+    // A folder pinned before it landed stays pinned: the pin keyed by the
+    // placeholder was dropped with it (`docs/BUGS.md` B148).
+    tx.execute(
+        "UPDATE OR IGNORE pins SET uid = ?2 WHERE uid = ?1",
+        params![local, real],
+    )?;
+    tx.execute("DELETE FROM pins WHERE uid = ?1", params![local])?;
     // The node a row holds names its parent too, and is what a restart builds
     // the tree from: a folder that landed with no write to its children after
     // left them under a parent no row has (`docs/BUGS.md` B140).

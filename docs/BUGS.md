@@ -12,6 +12,23 @@ Conventions:
 
 ---
 
+## B148 — A folder pinned before it has reached Drive loses its pin
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, while planning the move of queued ops to local ids: every table keyed by
+uid was checked for what happens when a placeholder lands, and `pins` was the one no landing
+touched.
+
+**Where:** `adopt_placeholder_row_tx` in `crates/pdfs-core/src/db/nodes.rs`.
+
+**Cause.** A folder made through the mount has a placeholder uid (`local~…`) until its mkdir lands.
+Pinning it then stored the placeholder in `pins.uid`. The landing moved the node row, the children
+and the queued ops to the real uid, but not the pin, which then named no node: the folder was no
+longer kept offline and the pin list showed an entry for nothing.
+
+**Fix.** The landing moves the pin to the real uid in the same transaction. A pin the real uid
+already has wins, and the placeholder's is dropped.
+
 ## B147 — A new file made under a name just renamed away can share the first file's node
 
 **Status:** Fixed (unverified).
