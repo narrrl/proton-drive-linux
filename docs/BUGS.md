@@ -12,6 +12,31 @@ Conventions:
 
 ---
 
+## B171 — A file deleted while its upload fails stays on Drive for the upload's backoff
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-04, by the simulation suite (`one_client_on_a_good_link`, seed 9). The queue
+did not drain within 4 s of the settle: it still held a trash of `b.txt` with one attempt and
+the error "No such file or directory (os error 2)", due seconds later.
+
+**Where:** `drop_doomed_ops` and `Db::record_op_failure` in `crates/pdfs-core/src/db/ops.rs`, and
+the drain loop in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A file deleted after its create was sent keeps its op as a trash, in case the create
+made the node and only its answer was lost (B151). The op kept the create's attempts, error and
+backoff. The drain also recorded the failure of a create attempt still on the wire on the row,
+which by then was the trash. Here the attempt failed because a write had replaced the blob it
+was reading, and the trash waited out the create's backoff.
+
+**Fix.** The trash starts with no attempts and is due at once, as a create that becomes a
+revision already does. The drain records a failed attempt only if the op is still the kind it
+ran as (`Db::record_attempt_failure`).
+
+**Test:** `a_create_deleted_after_it_was_sent_leaves_a_trash_that_is_due_at_once` in
+`crates/pdfs-core/src/db/tests.rs`.
+
+---
+
 ## B170 — A write opened as an upload lands fails the next write with `EIO`
 
 **Status:** Fixed (unverified).

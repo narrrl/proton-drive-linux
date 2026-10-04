@@ -394,8 +394,9 @@ impl Core {
                         .min(DRAIN_BACKOFF_MAX)
                 };
                 warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
-                if let Err(e) = self.db.record_op_failure(
+                if let Err(e) = self.db.record_attempt_failure(
                     op.id,
+                    &op.kind,
                     &err_str,
                     now_millis() + backoff.as_millis() as i64,
                 ) {

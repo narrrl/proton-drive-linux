@@ -3726,6 +3726,61 @@ fn a_create_withdrawn_after_it_failed_queues_a_trash_that_keeps_its_blob() {
     assert!(db.pending_ops().unwrap().is_empty());
 }
 
+/// A create deleted after it was sent becomes a trash in its place. The
+/// create's backoff, and the failure of an attempt still on the wire, are the
+/// create's: the trash is due at once (`docs/BUGS.md` B171).
+#[test]
+fn a_create_deleted_after_it_was_sent_leaves_a_trash_that_is_due_at_once() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let create = |local: &str| {
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: local.to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some(format!("{local}.txt")),
+            blob_path: Some(format!("/staging/{local}")),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap()
+        .0
+    };
+    let failed = create("local~failed");
+    db.record_attempt_failure(failed, OP_CREATE, "no answer", 50_000)
+        .unwrap();
+    let sending = create("local~sending");
+    assert_eq!(
+        db.claim_next_due_op(10).unwrap().map(|op| op.id),
+        Some(sending)
+    );
+
+    db.delete_ops_for_uid("local~failed").unwrap();
+    db.delete_ops_for_uid("local~sending").unwrap();
+    db.record_attempt_failure(sending, OP_CREATE, "No such file or directory", 50_000)
+        .unwrap();
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 2);
+    for op in &ops {
+        assert_eq!(op.kind, OP_TRASH);
+        assert_eq!((op.attempts, op.last_error.as_deref()), (0, None), "{op:?}");
+        assert_eq!(op.next_attempt_at, 0, "{op:?}");
+    }
+    db.record_attempt_failure(failed, OP_TRASH, "offline", 50_000)
+        .unwrap();
+    let trash = db
+        .pending_ops()
+        .unwrap()
+        .into_iter()
+        .find(|op| op.id == failed);
+    assert_eq!(trash.map(|op| op.attempts), Some(1));
+}
+
 #[test]
 fn a_landed_placeholder_never_overwrites_the_server_copy() {
     let db = Db::open_in_memory().unwrap();

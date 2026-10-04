@@ -151,6 +151,7 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
             "{DOOMED}
              UPDATE pending_op
              SET kind = 'trash', issue = NULL,
+                 attempts = 0, last_error = NULL, next_attempt_at = 0,
                  parent_uid = CASE WHEN {PARENT_NOW} LIKE '{LOCAL_VOLUME}~%' THEN NULL
                                    ELSE {PARENT_NOW} END,
                  parent_lid = CASE WHEN {PARENT_NOW} LIKE '{LOCAL_VOLUME}~%' THEN NULL
@@ -1276,6 +1277,31 @@ impl Db {
     /// A rename with a newer one queued behind it ([`Db::enqueue_op`]) is
     /// dropped instead: retried, it could land after the newer one and undo it.
     pub fn record_op_failure(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
+        self.record_failure(id, None, error, next_attempt_at)
+    }
+
+    /// [`Db::record_op_failure`] for an attempt at op `id` as a `kind` op. An
+    /// op that has become another kind while the attempt ran is left as it
+    /// is: a create deleted on the wire is a trash now, and the create's
+    /// failure would hold the trash back for the create's backoff
+    /// (`docs/BUGS.md` B171).
+    pub fn record_attempt_failure(
+        &self,
+        id: i64,
+        kind: &str,
+        error: &str,
+        next_attempt_at: i64,
+    ) -> Result<()> {
+        self.record_failure(id, Some(kind), error, next_attempt_at)
+    }
+
+    fn record_failure(
+        &self,
+        id: i64,
+        kind: Option<&str>,
+        error: &str,
+        next_attempt_at: i64,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         if drop_replaced_rename(&conn, id)? {
             return Ok(());
@@ -1284,8 +1310,8 @@ impl Db {
             "UPDATE pending_op
              SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3,
                  access_deferred_since = 0
-             WHERE id = ?1",
-            params![id, error, next_attempt_at],
+             WHERE id = ?1 AND (?4 IS NULL OR kind = ?4)",
+            params![id, error, next_attempt_at, kind],
         )?;
         Ok(())
     }

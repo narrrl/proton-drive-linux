@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B127 and B141 to B170.
+- Fixes from the simulation and account runs since then: B127 and B141 to B171.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -112,7 +112,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          sent again, to the root (B168, fixed), and a stop that let a mirror pass go on
          until the runtime ended under it (B169, fixed). CI on 9bbc994 failed
          `one_client_on_a_good_link`: a write opened as an upload landed took the revision
-         it replaced as its base, and the next write failed with `EIO` (B170, fixed).
+         it replaced as its base, and the next write failed with `EIO` (B170, fixed). The
+         suite's seed 9 found a deleted file's trash waiting out its create's backoff (B171,
+         fixed).
 5. **Release**: 2.10.0 is tagged; the 2.9.0 tag still waits for the user's go-ahead.
 
 ## After 3.0.0
