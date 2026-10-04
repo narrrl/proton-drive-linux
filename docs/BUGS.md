@@ -12,6 +12,33 @@ Conventions:
 
 ---
 
+## B181 — The app shows a queued edit kept as a conflict copy in English
+
+**Status:** Fixed.
+**Found:** 2026-10-05, checking that every name collision and conflict the drain resolves is
+reported (`docs/MILESTONE-3.0.0.md` §6.2). Each one is in the activity log, and the app words
+each in the user's language but one.
+
+**Where:** `detail_label` in `crates/pdfs-gui/src/app/pages/activity_text.rs`; the daemon
+writes the entry in `Core::keep_as_conflict_copy` and `Core::abandon_to_staging`
+(`crates/pdfs-fuse/src/drain.rs`).
+
+**Cause.** A queued edit whose file was changed, trashed or removed on Drive meanwhile is
+uploaded as a conflict copy, or kept in staging when it cannot be. The entry's detail is the
+reason followed by "; local changes uploaded as {copy}" or "; local changes kept at {path}".
+The app knew neither shape, so it showed the detail as the daemon wrote it, in English: "The
+remote revision changed under the queued write (based on revision …); local changes uploaded
+as …".
+
+**Fix.** The app reads both shapes and the three reasons the daemon gives, and says each as
+one sentence: "It was changed on Proton Drive, so your changes were uploaded as {name}". A
+reason it does not know still gets a sentence without the why. Translated in every catalog.
+
+**Test:** `an_edit_kept_as_a_copy_says_why_in_words` in
+`crates/pdfs-gui/src/app/pages/activity_text.rs`.
+
+---
+
 ## B180 — A stop waits 10 s for a drain worker that slept through it
 
 **Status:** Fixed.

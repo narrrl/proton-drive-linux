@@ -341,6 +341,59 @@ fn detail_label(entry: &ActivityEntry) -> Option<String> {
             &[("name", alt)],
         ));
     }
+    if let Some((reason, copy)) = detail.split_once("; local changes uploaded as ") {
+        let args = [("name", copy)];
+        return Some(match edit_conflict(reason) {
+            // Translators: {name} is the copy the changes made on this
+            // computer were uploaded as.
+            EditConflict::Gone => gettext_f(
+                "It no longer exists on Proton Drive, so your changes were uploaded as {name}",
+                &args,
+            ),
+            // Translators: {name} is the copy the changes made on this
+            // computer were uploaded as.
+            EditConflict::Trashed => gettext_f(
+                "It was moved to the Trash on Proton Drive, so your changes were uploaded as {name}",
+                &args,
+            ),
+            // Translators: {name} is the copy the changes made on this
+            // computer were uploaded as.
+            EditConflict::Changed => gettext_f(
+                "It was changed on Proton Drive, so your changes were uploaded as {name}",
+                &args,
+            ),
+            // Translators: {name} is the copy the changes made on this
+            // computer were uploaded as.
+            EditConflict::Other => gettext_f("Your changes were uploaded as {name}", &args),
+        });
+    }
+    if let Some((reason, path)) = detail.split_once("; local changes kept at ") {
+        let path = tilde_path(path);
+        let args = [("path", path.as_str())];
+        return Some(match edit_conflict(reason) {
+            // Translators: {path} is the file on this computer that holds the
+            // changes which could not be uploaded.
+            EditConflict::Gone => gettext_f(
+                "It no longer exists on Proton Drive, so your changes were kept in {path}",
+                &args,
+            ),
+            // Translators: {path} is the file on this computer that holds the
+            // changes which could not be uploaded.
+            EditConflict::Trashed => gettext_f(
+                "It was moved to the Trash on Proton Drive, so your changes were kept in {path}",
+                &args,
+            ),
+            // Translators: {path} is the file on this computer that holds the
+            // changes which could not be uploaded.
+            EditConflict::Changed => gettext_f(
+                "It was changed on Proton Drive, so your changes were kept in {path}",
+                &args,
+            ),
+            // Translators: {path} is the file on this computer that holds the
+            // changes which could not be uploaded.
+            EditConflict::Other => gettext_f("Your changes were kept in {path}", &args),
+        });
+    }
     if let Some(base) = detail.strip_prefix("differs from ") {
         // Translators: {name} is the file the conflicting copy was made from.
         return Some(gettext_f("Differs from {name}", &[("name", base)]));
@@ -386,6 +439,26 @@ fn detail_label(entry: &ActivityEntry) -> Option<String> {
         ));
     }
     Some(capitalize(detail))
+}
+
+/// Why a queued edit could not land on its file, from the reason the daemon
+/// gives before "; local changes uploaded as" or "; local changes kept at".
+enum EditConflict {
+    Gone,
+    Trashed,
+    Changed,
+    Other,
+}
+
+fn edit_conflict(reason: &str) -> EditConflict {
+    match reason {
+        "the file no longer exists remotely" => EditConflict::Gone,
+        "the file was trashed remotely" => EditConflict::Trashed,
+        r if r.starts_with("the remote revision changed under the queued write") => {
+            EditConflict::Changed
+        }
+        _ => EditConflict::Other,
+    }
 }
 
 /// A sync pass summary such as "2 uploaded, 1 folder(s) created", as a
@@ -594,6 +667,38 @@ mod tests {
         ));
         assert_eq!(d.title, "Shared an item");
         assert_eq!(d.details, vec!["1 person can view"]);
+    }
+
+    #[test]
+    fn an_edit_kept_as_a_copy_says_why_in_words() {
+        let d = describe(&entry(
+            ActivityKind::Upload,
+            "notes.txt",
+            "the remote revision changed under the queued write \
+             (based on revision r1, remote now at r2); \
+             local changes uploaded as notes (sync-conflict 1700000000).txt",
+            false,
+        ));
+        assert_eq!(
+            d.details,
+            vec![
+                "It was changed on Proton Drive, so your changes were uploaded as \
+                 notes (sync-conflict 1700000000).txt"
+            ]
+        );
+        let d = describe(&entry(
+            ActivityKind::Upload,
+            "notes.txt",
+            "the file was trashed remotely; local changes kept at /var/staging/7",
+            false,
+        ));
+        assert_eq!(
+            d.details,
+            vec![
+                "It was moved to the Trash on Proton Drive, so your changes were kept in \
+                 /var/staging/7"
+            ]
+        );
     }
 
     #[test]

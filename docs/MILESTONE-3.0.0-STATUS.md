@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B180.
+- Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B181.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`.
 
@@ -24,6 +24,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    - [x] `pdfs sync issues`, and the issue shown in `pdfs sync queue`.
    - [x] The app's Sync page shows each issue with what the user can do; Export and Retry
          buttons; translated in every catalog.
+   - [x] A name collision lands under a conflict name (create, rename, move, re-homed create)
+         and goes in the activity log, as does a queued edit kept as a conflict copy. The app
+         words each one in the user's language (the last one since B181).
    - [ ] Discard an issue on purpose (after export, or for a change with no content), and
          undo the local change it stood for. Not in the first cut.
    - [ ] Show the issue on the node itself (file browser emblem or status). Not in the first
