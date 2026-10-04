@@ -596,18 +596,7 @@ impl Db {
     /// create lands and the row takes the uid Drive gave it: a node made on
     /// this machine is found by its stand-in ([`local_uid`]) before and after.
     pub fn lid_of(&self, uid: &str) -> Result<Option<i64>> {
-        let conn = self.read();
-        let row = match local_lid(uid) {
-            Some(lid) => {
-                conn.query_row("SELECT lid FROM nodes WHERE lid = ?1", params![lid], |r| {
-                    r.get(0)
-                })
-            }
-            None => conn.query_row("SELECT lid FROM nodes WHERE uid = ?1", params![uid], |r| {
-                r.get(0)
-            }),
-        };
-        Ok(row.optional()?)
+        node_lid(&self.read(), uid)
     }
 
     /// The local id of each node, in order, giving a row to each that has none.
@@ -773,6 +762,19 @@ struct PriorRow {
     name: String,
     path: Option<String>,
     trashed: bool,
+}
+
+/// [`Db::lid_of`] on `conn`, which may be a transaction.
+pub(super) fn node_lid(conn: &rusqlite::Connection, uid: &str) -> Result<Option<i64>> {
+    let row = match local_lid(uid) {
+        Some(lid) => conn.query_row("SELECT lid FROM nodes WHERE lid = ?1", params![lid], |r| {
+            r.get(0)
+        }),
+        None => conn.query_row("SELECT lid FROM nodes WHERE uid = ?1", params![uid], |r| {
+            r.get(0)
+        }),
+    };
+    Ok(row.optional()?)
 }
 
 /// Hand a drained placeholder's row, and the rows below it, to the real uid it

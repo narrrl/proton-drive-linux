@@ -1568,10 +1568,8 @@ impl Core {
         // B123).
         let remote = node.clone();
         self.stamp_pending_sizes(std::slice::from_mut(&mut node));
-        // Repoints queued children and node rows, and readdresses the placeholder row.
-        // A no-op after `retire_create`, which has already done both.
-        self.db
-            .remap_local_uid(&local.to_string(), &real.to_string())?;
+        // The rows and queued ops already follow the node: `retire_create`
+        // moved its row to the real uid, and ops find it by local id.
 
         self.for_each_state(|st| {
             if let Some(ino) = st.by_uid.remove(local) {

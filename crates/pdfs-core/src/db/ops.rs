@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::Db;
-use super::nodes::adopt_placeholder_row_tx;
+use super::nodes::{adopt_placeholder_row_tx, node_lid};
 use crate::Result;
 
 /// The `kind` of a [`PendingOp`] that uploads a staged file as a new revision.
@@ -127,9 +127,11 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
           doomed(id) AS (
             SELECT id FROM pending_op
             WHERE uid IN (SELECT uid FROM queued)
+               OR lid = ?2
                OR (kind = 'revision' AND uid IN (SELECT uid FROM below))
           )";
     const SENT: &str = "kind IN ('create', 'mkdir') AND (claimed_at <> 0 OR attempts > 0)";
+    let lid = node_lid(tx, uid)?;
     let blobs: Vec<String> = {
         let mut stmt = tx.prepare(&format!(
             "{DOOMED}
@@ -137,7 +139,7 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
              WHERE id IN (SELECT id FROM doomed) AND blob_path IS NOT NULL
                AND NOT ({SENT})"
         ))?;
-        let rows = stmt.query_map(params![uid], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![uid, lid], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     tx.execute(
@@ -149,7 +151,7 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
                                    ELSE parent_uid END
              WHERE id IN (SELECT id FROM doomed) AND {SENT}"
         ),
-        params![uid],
+        params![uid, lid],
     )?;
     tx.execute(
         &format!(
@@ -158,7 +160,7 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
              WHERE id IN (SELECT id FROM doomed)
                AND NOT (kind = 'trash' AND uid LIKE '{LOCAL_VOLUME}~%')"
         ),
-        params![uid],
+        params![uid, lid],
     )?;
     Ok(blobs)
 }
@@ -185,18 +187,39 @@ pub(super) fn wake_ops_waiting_for_tx(tx: &rusqlite::Transaction<'_>, name: &str
 }
 
 /// Point queued op `id` at its node and its parent by local id, from the uids
-/// it names (schema 39). A uid with no row leaves `NULL`, and the op is matched
-/// by uid, as before.
+/// it names (schema 39), a stand-in ([`local_uid`]) included. A uid with no
+/// row leaves `NULL`, and the op is matched by uid, as before.
 fn fill_op_lids(conn: &rusqlite::Connection, id: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE pending_op
-         SET lid = (SELECT lid FROM nodes WHERE uid = pending_op.uid),
-             parent_lid = (SELECT lid FROM nodes WHERE uid = pending_op.parent_uid)
-         WHERE id = ?1",
+    let (uid, parent): (String, Option<String>) = conn.query_row(
+        "SELECT uid, parent_uid FROM pending_op WHERE id = ?1",
         params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let parent_lid = match parent {
+        Some(parent) => node_lid(conn, &parent)?,
+        None => None,
+    };
+    conn.execute(
+        "UPDATE pending_op SET lid = ?2, parent_lid = ?3 WHERE id = ?1",
+        params![id, node_lid(conn, &uid)?, parent_lid],
     )?;
     Ok(())
 }
+
+/// The ops on the node `?1` names, `?L` being its local id
+/// ([`Db::lid_of`]): queued under that uid, or under the node's other one, its
+/// stand-in before it landed or its real uid after.
+const ON_NODE: &str = "(uid = ?1 OR lid = ?L)";
+
+/// [`ON_NODE`] with `?L` numbered `n`.
+fn on_node(n: usize) -> String {
+    ON_NODE.replace("?L", &format!("?{n}"))
+}
+
+/// The uid a queued op's node has now: the one its row holds, which a landing
+/// create has already moved to its real uid, or the one the op was queued with
+/// when the node has no row.
+const UID_NOW: &str = "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.lid), uid)";
 
 /// The uid a queued op's parent has now: the one its row holds, which a
 /// landing folder has already moved to its real uid, or the one the op was
@@ -438,11 +461,13 @@ impl Db {
     /// Whether a specific desired-state operation is still queued for a node.
     pub fn has_pending_op(&self, uid: &str, kind: &str) -> Result<bool> {
         let conn = self.read();
+        let lid = node_lid(&conn, uid)?;
         conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM pending_op WHERE uid = ?1 AND kind = ?2
-             )",
-            params![uid, kind],
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM pending_op WHERE {} AND kind = ?2)",
+                on_node(3)
+            ),
+            params![uid, kind, lid],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -451,9 +476,13 @@ impl Db {
     /// Read an existing operation's metadata before a superseding enqueue.
     pub fn pending_op_meta(&self, uid: &str, kind: &str) -> Result<Option<String>> {
         let conn = self.read();
+        let lid = node_lid(&conn, uid)?;
         conn.query_row(
-            "SELECT meta_json FROM pending_op WHERE uid = ?1 AND kind = ?2",
-            params![uid, kind],
+            &format!(
+                "SELECT meta_json FROM pending_op WHERE {} AND kind = ?2",
+                on_node(3)
+            ),
+            params![uid, kind, lid],
             |row| row.get(0),
         )
         .optional()
@@ -471,19 +500,22 @@ impl Db {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let superseded: Option<String> = if op_supersedes(&op.kind) {
+            let lid = node_lid(&tx, &op.uid)?;
+            let same = format!(
+                "{} AND kind = ?2 AND (kind <> ?3 OR claimed_at = 0)",
+                on_node(4)
+            );
             let blob: Option<String> = tx
                 .query_row(
-                    "SELECT blob_path FROM pending_op
-                     WHERE uid = ?1 AND kind = ?2 AND (kind <> ?3 OR claimed_at = 0)",
-                    params![op.uid, op.kind, OP_RENAME],
+                    &format!("SELECT blob_path FROM pending_op WHERE {same}"),
+                    params![op.uid, op.kind, OP_RENAME, lid],
                     |r| r.get(0),
                 )
                 .optional()?
                 .flatten();
             tx.execute(
-                "DELETE FROM pending_op
-                 WHERE uid = ?1 AND kind = ?2 AND (kind <> ?3 OR claimed_at = 0)",
-                params![op.uid, op.kind, OP_RENAME],
+                &format!("DELETE FROM pending_op WHERE {same}"),
+                params![op.uid, op.kind, OP_RENAME, lid],
             )?;
             blob
         } else {
@@ -553,10 +585,14 @@ impl Db {
         meta_json: &str,
     ) -> Result<Option<AttachedBlob>> {
         let conn = self.conn.lock();
+        let lid = node_lid(&conn, uid)?;
         let existing: Option<(i64, Option<String>)> = conn
             .query_row(
-                "SELECT id, blob_path FROM pending_op WHERE uid = ?1 AND kind = ?2",
-                params![uid, OP_CREATE],
+                &format!(
+                    "SELECT id, blob_path FROM pending_op WHERE {} AND kind = ?2",
+                    on_node(3)
+                ),
+                params![uid, OP_CREATE, lid],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -688,8 +724,8 @@ impl Db {
                 original_name: Some(landing.landed.1.to_string()),
             })?;
             tx.execute(
-                "DELETE FROM pending_op WHERE uid = ?1 AND kind = ?2",
-                params![real, OP_RENAME],
+                &format!("DELETE FROM pending_op WHERE {} AND kind = ?2", on_node(3)),
+                params![real, OP_RENAME, node_lid(&tx, local)?],
             )?;
             tx.execute(
                 "INSERT INTO pending_op (kind, uid, parent_uid, name, meta_json, created_at)
@@ -722,9 +758,13 @@ impl Db {
     /// queued, which is the ordinary case.
     pub fn update_op_meta(&self, uid: &str, kind: &str, meta_json: &str) -> Result<bool> {
         let conn = self.conn.lock();
+        let lid = node_lid(&conn, uid)?;
         let n = conn.execute(
-            "UPDATE pending_op SET meta_json = ?3 WHERE uid = ?1 AND kind = ?2",
-            params![uid, kind, meta_json],
+            &format!(
+                "UPDATE pending_op SET meta_json = ?3 WHERE {} AND kind = ?2",
+                on_node(4)
+            ),
+            params![uid, kind, meta_json, lid],
         )?;
         Ok(n > 0)
     }
@@ -743,13 +783,19 @@ impl Db {
     /// create stays parked.
     pub fn rewrite_op_target(&self, uid: &str, parent_uid: &str, name: &str) -> Result<bool> {
         let conn = self.conn.lock();
+        let lid = node_lid(&conn, uid)?;
+        let parent_lid = node_lid(&conn, parent_uid)?;
         let n = conn.execute(
-            "UPDATE pending_op
-             SET parent_uid = ?2, name = ?3,
-               parent_lid = (SELECT lid FROM nodes WHERE uid = ?2),
-               next_attempt_at = CASE WHEN next_attempt_at < ?6 THEN 0 ELSE next_attempt_at END
-             WHERE uid = ?1 AND kind IN (?4, ?5)",
-            params![uid, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL],
+            &format!(
+                "UPDATE pending_op
+                 SET parent_uid = ?2, name = ?3, parent_lid = ?7,
+                   next_attempt_at = CASE WHEN next_attempt_at < ?6 THEN 0 ELSE next_attempt_at END
+                 WHERE {} AND kind IN (?4, ?5)",
+                on_node(8)
+            ),
+            params![
+                uid, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL, parent_lid, lid
+            ],
         )?;
         Ok(n > 0)
     }
@@ -765,10 +811,19 @@ impl Db {
     /// already is.
     pub fn set_create_hold(&self, uid: &str, held: bool) -> Result<bool> {
         let conn = self.conn.lock();
+        let lid = node_lid(&conn, uid)?;
         let n = conn.execute(
-            "UPDATE pending_op SET next_attempt_at = ?2
-             WHERE uid = ?1 AND kind IN (?3, ?4)",
-            params![uid, if held { PARK_UNTIL } else { 0 }, OP_CREATE, OP_MKDIR],
+            &format!(
+                "UPDATE pending_op SET next_attempt_at = ?2 WHERE {} AND kind IN (?3, ?4)",
+                on_node(5)
+            ),
+            params![
+                uid,
+                if held { PARK_UNTIL } else { 0 },
+                OP_CREATE,
+                OP_MKDIR,
+                lid
+            ],
         )?;
         Ok(n > 0)
     }
@@ -776,9 +831,13 @@ impl Db {
     /// Check if a queued create or mkdir op exists for `uid`.
     pub fn has_create_op(&self, uid: &str) -> Result<bool> {
         let conn = self.read();
+        let lid = node_lid(&conn, uid)?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE uid = ?1 AND kind IN (?2, ?3)",
-            params![uid, OP_CREATE, OP_MKDIR],
+            &format!(
+                "SELECT COUNT(*) FROM pending_op WHERE {} AND kind IN (?2, ?3)",
+                on_node(4)
+            ),
+            params![uid, OP_CREATE, OP_MKDIR, lid],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -792,9 +851,10 @@ impl Db {
     /// blob that holds them (`docs/BUGS.md` B71).
     pub fn has_any_op(&self, uid: &str) -> Result<bool> {
         let conn = self.read();
+        let lid = node_lid(&conn, uid)?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE uid = ?1",
-            params![uid],
+            &format!("SELECT COUNT(*) FROM pending_op WHERE {}", on_node(2)),
+            params![uid, lid],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -825,10 +885,10 @@ impl Db {
         Ok(blobs)
     }
 
-    /// Readdress a placeholder that has drained to its real uid: its row, the
-    /// rows below it, and the queued ops made inside it
-    /// ([`adopt_placeholder_row_tx`]).
-    pub fn remap_local_uid(&self, local: &str, real: &str) -> Result<()> {
+    /// What [`Db::finish_create`] does to the node rows and pins when a create
+    /// lands, without the op ([`adopt_placeholder_row_tx`]).
+    #[cfg(test)]
+    pub(crate) fn land_placeholder_row(&self, local: &str, real: &str) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         adopt_placeholder_row_tx(&tx, local, real)?;
@@ -865,7 +925,7 @@ impl Db {
     pub fn next_due_op(&self, now: i64) -> Result<Option<PendingOp>> {
         let conn = self.read();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT id, kind, uid, {PARENT_NOW}, name, blob_path, meta_json, created_at,
+            "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
              FROM pending_op
              WHERE next_attempt_at <= ?1
@@ -919,13 +979,15 @@ impl Db {
         let tx = conn.transaction()?;
         let op = {
             let mut stmt = tx.prepare_cached(&format!(
-                "SELECT id, kind, uid, {PARENT_NOW}, name, blob_path, meta_json, created_at,
+                "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                         attempts, last_error, next_attempt_at
                  FROM pending_op
                  WHERE next_attempt_at <= ?1
                    AND claimed_at = 0
                    AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')
                    AND uid NOT IN (SELECT uid FROM pending_op WHERE claimed_at <> 0)
+                   AND (lid IS NULL OR lid NOT IN (
+                     SELECT lid FROM pending_op WHERE claimed_at <> 0 AND lid IS NOT NULL))
                  ORDER BY id LIMIT 1",
                 v = LOCAL_VOLUME,
                 n = LOCAL_VOLUME.len() + 1,
@@ -1018,11 +1080,11 @@ impl Db {
     /// drain wants [`next_due_op`](Self::next_due_op) instead.
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
         let conn = self.read();
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
-             FROM pending_op ORDER BY id",
-        )?;
+             FROM pending_op ORDER BY id"
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(PendingOp {

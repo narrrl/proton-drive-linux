@@ -40,11 +40,15 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
    - [ ] No more placeholders: `nodes.uid` is `NULL` until a node lands. In four parts:
      - [x] 6a: a node made here goes by `local~<lid>`, a function of its row, instead of a
            minted `local~<ms>-<n>`; schema 41 rewrites the old placeholders (nodes, ops, pins).
-     - [ ] 6b: ops by lid; a landing create rewrites no other op.
-     - [ ] 6c: a local node's row has `uid NULL`; children and subtrees by `parent_lid`; pins
-           by lid.
+     - [x] 6b: an op is found by its node's local id under either uid, the claim keeps one op
+           per local id on the wire, and the drain sends the uid the row has now;
+           `remap_local_uid` is gone.
+     - [ ] 6c: a local node's row has `uid NULL`; children, subtrees and ops' parents by lid,
+           so a landing create rewrites no other row or op; pins by lid.
      - [ ] 6d: in memory, `pending`, `hidden` and `creating` by lid; `is_local_uid` checks
-           become `remote_uid().is_none()`.
+           become `remote_uid().is_none()`; a write or rename after landing queues under the
+           stand-in, so `landed_uid`, `follow_landed_create`, `landed_row_uid` and the
+           `rewrite_op_target` fallback go.
    - [ ] An executor that runs ops in dependency order, many at once.
 3. **Speed (§7)**: run independent ops in parallel, batch trashes and moves; measure 1,000 files
    and 100 folders on Wi-Fi against LAN (target: within 10 %).

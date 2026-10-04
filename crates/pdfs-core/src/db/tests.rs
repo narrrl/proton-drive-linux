@@ -3178,6 +3178,87 @@ fn landing<'a>(local: &'a str, real: &'a str, parent: &'a str, name: &'a str) ->
     }
 }
 
+/// A queued op on a node made here, `kind` under `uid`.
+fn op_on(kind: &str, uid: &str, parent: Option<&str>) -> PendingOp {
+    PendingOp {
+        id: 0,
+        kind: kind.to_string(),
+        uid: uid.to_string(),
+        parent_uid: parent.map(str::to_string),
+        name: parent.map(|_| "new.txt".to_string()),
+        blob_path: Some(format!("/staging/{kind}")),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    }
+}
+
+#[test]
+fn an_op_queued_under_a_stand_in_after_its_create_landed_goes_to_the_landed_node() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "new.txt", false, 1).unwrap();
+    let local = local_uid(lid);
+    let real = uid("real").to_string();
+    let (id, _) = db
+        .enqueue_op(&op_on(OP_CREATE, &local, Some(&parent)))
+        .unwrap();
+    db.claim_next_due_op(1).unwrap().unwrap();
+    db.finish_create(
+        id,
+        Some("/staging/create"),
+        &landing(&local, &real, &parent, "new.txt"),
+        |_| None,
+    )
+    .unwrap();
+
+    // A handle opened before the create landed still names the stand-in.
+    db.enqueue_op(&op_on(OP_REVISION, &local, None)).unwrap();
+    assert!(db.has_pending_op(&real, OP_REVISION).unwrap());
+    assert!(db.has_any_op(&real).unwrap());
+    // A second write, made through the real uid, replaces it.
+    let (_, superseded) = db.enqueue_op(&op_on(OP_REVISION, &real, None)).unwrap();
+    assert_eq!(superseded.as_deref(), Some("/staging/revision"));
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(
+        ops[0].uid, real,
+        "the queue names the node by the uid it has now"
+    );
+    let claimed = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(claimed.uid, real, "the drain sends the real uid");
+}
+
+#[test]
+fn a_node_queued_under_both_its_uids_is_sent_one_op_at_a_time() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("parent", None, "My Files")).unwrap();
+    let parent = uid("parent").to_string();
+    let lid = db.add_local_row(&parent, "new.txt", false, 1).unwrap();
+    let local = local_uid(lid);
+    let real = uid("real").to_string();
+    db.land_placeholder_row(&local, &real).unwrap();
+    db.enqueue_op(&op_on(OP_RENAME, &real, Some(&parent)))
+        .unwrap();
+    db.enqueue_op(&op_on(OP_REVISION, &local, None)).unwrap();
+
+    let first = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(first.kind, OP_RENAME);
+    assert!(
+        db.claim_next_due_op(1).unwrap().is_none(),
+        "the write waits for the rename of the same node"
+    );
+    db.delete_op(first.id).unwrap();
+    let second = db.claim_next_due_op(1).unwrap().unwrap();
+    assert_eq!(
+        (second.kind.as_str(), second.uid.as_str()),
+        (OP_REVISION, real.as_str())
+    );
+}
+
 #[test]
 fn a_rename_made_while_its_create_uploads_is_queued_for_the_landed_node() {
     let db = Db::open_in_memory().unwrap();
@@ -3220,7 +3301,7 @@ fn a_rename_made_while_its_create_uploads_is_queued_for_the_landed_node() {
     assert_eq!(meta.original_name.as_deref(), Some("new (conflict).txt"));
 
     // The folder lands next and the move follows it.
-    db.remap_local_uid("local~dir", &uid("dir").to_string())
+    db.land_placeholder_row("local~dir", &uid("dir").to_string())
         .unwrap();
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops[0].parent_uid, Some(uid("dir").to_string()));
@@ -3246,7 +3327,7 @@ fn draining_a_folder_repoints_its_queued_children() {
     })
     .unwrap();
 
-    db.remap_local_uid(local_dir, &real_dir).unwrap();
+    db.land_placeholder_row(local_dir, &real_dir).unwrap();
 
     // The child was queued against a folder that did not exist yet. Once the
     // folder is real, the child must target the server's uid — otherwise the
@@ -3466,7 +3547,7 @@ fn an_op_on_a_listed_twin_follows_the_folder_that_lands() {
         })
         .unwrap();
 
-    db.remap_local_uid(&local.to_string(), &uid("real").to_string())
+    db.land_placeholder_row(&local.to_string(), &uid("real").to_string())
         .unwrap();
 
     let lid: Option<i64> = db
@@ -3646,7 +3727,7 @@ fn a_landed_placeholder_never_overwrites_the_server_copy() {
     db.upsert_node(&folder("real", Some("root"), "New folder (1)"))
         .unwrap();
 
-    db.remap_local_uid(&local.to_string(), &uid("real").to_string())
+    db.land_placeholder_row(&local.to_string(), &uid("real").to_string())
         .unwrap();
 
     assert!(db.node_by_uid(&local.to_string()).unwrap().is_none());
@@ -3721,7 +3802,7 @@ fn a_landed_placeholder_keeps_its_lid() {
             db.upsert_node(&listed).unwrap();
         }
 
-        db.remap_local_uid(&local.to_string(), &real.to_string())
+        db.land_placeholder_row(&local.to_string(), &real.to_string())
             .unwrap();
 
         assert_eq!(db.lid_of(&local.to_string()).unwrap(), None);
@@ -3805,7 +3886,7 @@ fn a_landed_folder_hands_its_children_over_in_the_stored_node_too() {
     child.parent_uid = Some(local.clone());
     db.upsert_node(&child).unwrap();
 
-    db.remap_local_uid(&local.to_string(), &uid("dir").to_string())
+    db.land_placeholder_row(&local.to_string(), &uid("dir").to_string())
         .unwrap();
 
     let stored = db.node_by_uid(&uid("child").to_string()).unwrap().unwrap();
