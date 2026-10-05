@@ -12,6 +12,23 @@ Conventions:
 
 ---
 
+## B187 — An uploaded file can leave a copy of itself in the cache until the next start
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, writing the test for B186: after its file was deleted, the cache still
+held a `.tmp` file with its bytes.
+
+**Where:** `ContentCache::store_file` in `crates/pdfs-core/src/cache.rs`.
+
+**Cause.** The cache adopts an uploaded file by linking its staged bytes to a temp name and
+renaming that over the cached blob. A landed create and the revision after it can adopt the same
+staged bytes. The temp name was then a second name of the cached blob, and a rename between two
+names of one file does nothing. The temp file stayed, outside the cache's budget, until the next
+start swept it, even after the file was evicted or deleted.
+
+**Fix.** The temp name is removed after the rename. Test
+`store_file_twice_from_the_same_blob_leaves_no_temp_file` in `crates/pdfs-core/src/cache.rs`.
+
 ## B186 — A file deleted offline while open fails a partial write with "Input/output error"
 
 **Status:** Fixed (unverified).

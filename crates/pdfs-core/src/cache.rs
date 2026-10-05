@@ -845,6 +845,9 @@ impl ContentCache {
         }
         let bytes = std::fs::metadata(&tmp)?.len();
         std::fs::rename(&tmp, &blob)?;
+        // Linked from the blob already cached, the temp name was a second name
+        // of it, and the rename did nothing (`docs/BUGS.md` B187).
+        let _ = std::fs::remove_file(&tmp);
         let meta = serde_json::to_vec(&Meta { mtime, size })?;
         std::fs::write(self.meta_path(uid), meta)?;
         self.db
@@ -2195,6 +2198,24 @@ mod tests {
 
         assert!(!c.is_cached(&u, 100, 3), "stale meta must not validate");
         assert_eq!(c.read_range(&u, 200, 5, 0, 5).unwrap(), b"newer");
+    }
+
+    /// A landed create and the revision after it can adopt the same staged
+    /// blob. The link to the temp name is then a second name of the cached
+    /// blob, and a rename between two names of one file does nothing: the
+    /// temp name stayed until the next start swept it (`docs/BUGS.md` B187).
+    #[test]
+    fn store_file_twice_from_the_same_blob_leaves_no_temp_file() {
+        let (c, d) = cache();
+        let u = uid("a");
+        let src = d.path().join("staged-blob");
+        std::fs::write(&src, b"staged").unwrap();
+
+        c.store_file(&u, 100, 6, &src).unwrap();
+        c.store_file(&u, 100, 6, &src).unwrap();
+
+        assert!(!c.blob_path(&u).with_extension("tmp").exists());
+        assert_eq!(c.read_range(&u, 100, 6, 0, 6).unwrap(), b"staged");
     }
 
     #[test]

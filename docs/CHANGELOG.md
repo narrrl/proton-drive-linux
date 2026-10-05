@@ -109,6 +109,8 @@ by its local id, in the queue, the stored tree and pins alike.
   it reaches Drive (B185).
 - **A file deleted while open can still be read and written until it is closed**, offline too.
   A write into it no longer failed with "Input/output error" (B186).
+- **An uploaded file no longer leaves a copy of itself in the cache** until the next start
+  (B187).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).
