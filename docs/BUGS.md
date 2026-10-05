@@ -12,6 +12,25 @@ Conventions:
 
 ---
 
+## B191 — A file deleted after its create failed and was written again can stay on Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 1436c5f (`one_client_on_a_flaky_link` seed 11,
+one replay in six). A create of `a.txt` got no answer, though Drive had made the file. The file
+was written again, renamed twice and deleted. Drive kept `a.txt`, and nothing was queued.
+
+**Where:** `drop_doomed_ops` in `crates/pdfs-core/src/db/ops.rs`.
+
+**Cause.** A delete turns a create that was sent into a trash of what it may have made (B151).
+Whether it was sent was read from its attempts and its claim. A write after the failure attaches
+its bytes to the create and clears the attempts, so that the retry goes out at once
+(`Db::attach_blob_to_create`). The delete then took the create for one never sent, and dropped
+it whole.
+
+**Fix.** A create with a target recorded (`sent_to`, B184) counts as sent as well. Test
+`a_create_rewritten_after_it_failed_still_leaves_a_trash_when_deleted` in
+`crates/pdfs-core/src/db/tests.rs`.
+
 ## B190 — A file saved just before the daemon stops can keep its old content on Drive
 
 **Status:** Fixed (unverified).

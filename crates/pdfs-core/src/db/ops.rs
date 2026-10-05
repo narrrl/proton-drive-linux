@@ -107,6 +107,10 @@ pub fn op_supersedes(kind: &str) -> bool {
 /// name and bytes (`docs/BUGS.md` B151). Such a trash keeps the create's
 /// parent and blob, which the drain looks for the node by, and which it
 /// discards once the trash is done ([`Db::complete_trash_op`]).
+///
+/// Sent is where it was sent to ([`Db::note_create_target`]), not only its
+/// attempts: a write after the failure clears those for a prompt retry, and
+/// the delete then dropped the create whole (`docs/BUGS.md` B191).
 fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<String>> {
     const DOOMED: &str = "
         WITH RECURSIVE
@@ -134,7 +138,8 @@ fn drop_doomed_ops(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<Vec<Stri
                OR (kind = 'revision'
                    AND (uid IN (SELECT uid FROM below) OR lid IN (SELECT lid FROM below)))
           )";
-    const SENT: &str = "kind IN ('create', 'mkdir') AND (claimed_at <> 0 OR attempts > 0)";
+    const SENT: &str = "kind IN ('create', 'mkdir')
+        AND (claimed_at <> 0 OR attempts > 0 OR sent_to IS NOT NULL)";
     let lid = node_lid(tx, uid)?;
     let blobs: Vec<String> = {
         let mut stmt = tx.prepare(&format!(

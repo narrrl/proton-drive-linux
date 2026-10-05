@@ -3951,6 +3951,48 @@ fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A write after a create failed clears its attempts, so the next try goes
+/// out at once. The create was still sent: deleting the file then left no
+/// trash, and the file a lost answer made stayed on Drive under the name it
+/// was sent with (`docs/BUGS.md` B191).
+#[test]
+fn a_create_rewritten_after_it_failed_still_leaves_a_trash_when_deleted() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~sent".to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("a.txt".to_string()),
+            blob_path: Some("/staging/first".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    db.note_create_target(id, &parent, "a.txt").unwrap();
+    db.note_create_sent(id, "aaaa").unwrap();
+    db.record_op_failure(id, "no answer", 0).unwrap();
+    db.attach_blob_to_create("local~sent", "/staging/second", "{}")
+        .unwrap()
+        .expect("the create is still queued");
+
+    assert!(db.delete_ops_for_uid("local~sent").unwrap().is_empty());
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!((ops[0].id, ops[0].kind.as_str()), (id, OP_TRASH));
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/second"));
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![(parent.clone(), "a.txt".to_string())]
+    );
+}
+
 /// A create deleted after it was sent becomes a trash in its place. The
 /// create's backoff, and the failure of an attempt still on the wire, are the
 /// create's: the trash is due at once (`docs/BUGS.md` B171).
