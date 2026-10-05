@@ -12,6 +12,26 @@ Conventions:
 
 ---
 
+## B188 — A restart can leave a queued write retrying forever on a file deleted while open
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 2baad67 (`three_clients_one_writer_each`
+seed 12). With its link down, a client overwrote a file, deleted it while open, appended to it
+and restarted. After the restart a revision of the deleted file retried on "No such file or
+directory" until the run gave up.
+
+**Where:** `Core::reconcile_staging` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** Since B186's fix, the queued trash of an open file keeps the staged bytes the handle
+reads, and the trash's landing removes them. A restart in between forgets which handle the bytes
+were kept for. The scan at mount found them owned by no op and queued them again as a revision of
+the node. The trash, queued first, landed and removed the bytes, and the revision kept retrying on
+a blob that was gone. B186's fix brought this in, so no release has it.
+
+**Fix.** The scan at mount discards staged bytes whose node has a queued trash, as the trash would
+have. Test `a_restart_does_not_bring_back_the_write_of_a_file_deleted_while_open` in
+`crates/pdfs-fuse/src/sim/daemon.rs`.
+
 ## B187 — An uploaded file can leave a copy of itself in the cache until the next start
 
 **Status:** Fixed (unverified).

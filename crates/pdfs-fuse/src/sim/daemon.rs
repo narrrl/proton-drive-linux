@@ -478,6 +478,49 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_restart_does_not_bring_back_the_write_of_a_file_deleted_while_open() {
+        // The bytes kept for the open handle outlived a restart, which queued
+        // them again as a revision; the trash then landed and removed them, and
+        // the revision retried on a missing blob for good (B188).
+        use std::io::Write;
+        let drive = FakeDrive::new();
+        let dir = scratch("unlink-open-restart");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("f.txt") == Some(&Entry::File(Arc::new(b"0123456789".to_vec())))
+        }));
+        daemon.client.set_online(false);
+        std::fs::write(&path, b"abcdef").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.write_all(b"xy").unwrap();
+        drop(file);
+
+        let daemon = daemon.restart().unwrap();
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.tree().is_empty()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_write_opened_as_an_upload_lands_takes_the_landed_revision_as_its_base() {
         // An upload landed and the drain let go of its blob before the tree had
         // the node. A partial write opened in between took the revision the

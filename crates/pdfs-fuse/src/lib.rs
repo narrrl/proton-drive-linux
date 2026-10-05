@@ -1961,6 +1961,20 @@ impl Core {
                       "staged bytes are superseded by a queued write; kept for recovery");
                 continue;
             }
+            if self
+                .db
+                .has_pending_op(&uid.to_string(), OP_TRASH)
+                .unwrap_or(false)
+            {
+                // The node was deleted while a handle still read these bytes,
+                // and the daemon stopped before its trash went out. Queued again,
+                // they lost their blob when the trash landed and retried on it
+                // for good (`docs/BUGS.md` B188).
+                info!(%uid, blob = %blob.display(),
+                      "staged bytes belong to a node whose trash is queued; discarded");
+                self.cache.discard_staged(&blob);
+                continue;
+            }
             let op = PendingOp {
                 id: 0,
                 kind: OP_REVISION.to_string(),
