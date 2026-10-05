@@ -1369,7 +1369,8 @@ fix, seed 1 of three-clients passes repeatedly with `PDFS_SIM_KNOWN=fail`.
 
 ## B134 — A file deleted online while the drain checks its write is kept as a conflict copy
 
-**Status:** Open.
+**Status:** Open, with `local_first` off only. By default an `unlink` drops the write and queues
+the trash in one step, and the drain sends the trash.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 3).
 `c.bin` was written, renamed to `f.txt` and deleted, all online. The drain logged "queued write
 conflicts; keeping a conflict copy" for `f.txt`, with "the file was trashed remotely". The copy
@@ -1386,13 +1387,11 @@ B105's check asks whether the op is still queued, and it still is, so the drain 
 as a conflict copy of a file the user deleted. When the copy runs before the unlink discards the
 staged blob, it lands next to where the file was.
 
-**Test:** the simulation runs count such a conflict when the copy is named after the file, and
-count a copy that lands. With `PDFS_SIM_KNOWN=fail`, seed 3 of three-clients fails on it when it
-comes up, which depends on timing.
+**Test:** none. The simulation runs mount with `local_first` on, so they no longer reach it.
 
 ## B133 — A file deleted while its upload is in flight can still come back as a recovered copy
 
-**Status:** Open.
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-deletes, seed 3).
 `y/e.md` was written, and the drain picked the write up. The step held the drain's read of the
 node, deleted the file, and released the read. The next step wrote `a.txt`. The drain then logged
@@ -1411,13 +1410,16 @@ next op queued took the same id. `op_exists` found that other op and said the wr
 wanted. A SQLite workload queues a write to the database right after deleting its journal, so
 this is the usual case there, not a rare one.
 
-**Test:** the simulation runs make the file again, or not, while the drain's read is held. When
-they did, they count the drain's conflict copy of it. With `PDFS_SIM_KNOWN=fail` one-client-deletes
-fails on it in every seed.
+**Fix.** With B137's: schema 37 gives `pending_op` ids with `AUTOINCREMENT`, so an op queued
+after a delete never takes the dropped op's id.
+
+**Test:** the simulation runs make the file again, or not, while the drain's read is held, and
+fail on any conflict copy the drain keeps of it. They counted it instead until the run on
+812eb3d passed every profile on twelve seeds without the count.
 
 ## B132 — A folder whose mkdir is still queued is gone after a restart
 
-**Status:** Fixed (unverified).
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 4).
 The first listing of the Drive root failed with the link down, and the client's folder `c0` was
 made offline. The link came back, and the client restarted with 8 ops still queued, `c0`'s
@@ -1517,7 +1519,7 @@ since phase 3.
 
 ## B129 — A file deleted or replaced while its create is on the wire stays on Drive
 
-**Status:** Fixed (unverified).
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-lan, seed 4).
 `a.txt` was created, renamed to `b.txt` and then to `e.md` while its create was still queued.
 A moment later `rename f.txt -> e.md` failed with `EIO`, and the daemon logged "rename failed"
@@ -1542,13 +1544,12 @@ the same transaction, and the drain sends it at once; if that fails it stays que
 backoff. A create whose row is gone altogether gets such a trash too. A trash of a placeholder
 whose create never landed is done without asking Drive.
 
-**Test:** the simulation runs count a rename it fails and end the seed there. With
-`PDFS_SIM_KNOWN=fail`, seed 4 of one-client-lan fails on it when it comes up, which depends
-on timing.
+**Test:** the simulation runs fail on it. They counted it instead until the run on 812eb3d
+passed every profile on twelve seeds without the count.
 
 ## B128 — A file created offline over one deleted offline can be lost
 
-**Status:** Open.
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 3).
 While the link was down, `f.txt` was deleted and a new `f.txt` was made. Its first version had
 not landed yet, so Drive held it empty. When the link came back, the drain logged "the name is
@@ -1567,12 +1568,15 @@ trash then trashed it. Only after the adoption check does the drain ask whether 
 holds the name (`has_pending_trash_named`), and the adoption does not exclude a node that has
 one.
 
-**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the three-client
-profile fails on it when it comes up, which depends on timing.
+**Fix.** With B162's: the adoption skips a node this mount trashed (its `hidden` set), which a
+queued trash puts it in, and the create waits for the trash to free the name (B144).
+
+**Test:** the simulation runs fail on it. They counted it instead until the run on 812eb3d
+passed every profile on twelve seeds without the count.
 
 ## B127 — A file created offline lands twice when the answer to its upload is lost
 
-**Status:** Fixed (unverified).
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile one-client-flaky, seed 1).
 The upload of a queued create timed out after Drive had made the file. On the next attempt the
 drain logged "name is taken remotely; creating under a conflict name". Drive ended with the file
@@ -1590,12 +1594,12 @@ adopted, and the file is uploaded a second time under a conflict name.
 blob then counts as uploaded. Sim test `a_create_whose_answer_was_lost_lands_once`. A write that
 replaced the blob after the lost upload still forks a copy: the node holds the older bytes.
 
-**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the flaky profile
-fails on it when it comes up, which depends on timing.
+**Test:** the simulation runs fail on it. They counted it instead until the run on 812eb3d
+passed every profile on twelve seeds without the count.
 
 ## B126 — A file created offline under a name an offline rename freed lands as a conflict copy
 
-**Status:** Open.
+**Status:** Fixed.
 **Found:** 2026-10-03, by the simulation runs (`sim::run`, profile three-clients, seed 3).
 While the link was down, `b.txt` was renamed to `c.bin`, and a new `b.txt` was made. When the link
 came back, the drain logged "name is taken remotely; creating under a conflict name" for
@@ -1611,8 +1615,11 @@ when the name is held by a node whose trash is queued (`has_pending_trash_named`
 queued rename is about to move it away. It treats the name as someone else's file and lands the
 new one under a conflict name.
 
-**Test:** the simulation runs count it and go on. With `PDFS_SIM_KNOWN=fail` the three-client
-profile fails on it when it comes up, which depends on timing.
+**Fix.** With B138's: the create also waits while a queued rename moves a node away from its
+name (`Core::name_is_held`).
+
+**Test:** the simulation runs fail on it. They counted it instead until the run on 812eb3d
+passed every profile on twelve seeds without the count.
 
 ## B125 — A folder made offline fails with `EIO` once its listing is invalidated
 

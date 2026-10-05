@@ -104,8 +104,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          It may be a kernel notice sent from a runtime worker by another path than B130's,
          which a68dae9 (not yet pushed then) also takes off the runtime. CI now keeps a hung
          run's stacks.
-   - [ ] Known-bug list in `sim/run.rs` is empty: none open; B125, B127, B129, B130 and B132
-         fixed but not yet confirmed by the runs. The confirmation run (`PDFS_SIM_KNOWN=fail`)
+   - [x] Known-bug list in `sim/run.rs` is empty: the run on 812eb3d (`PDFS_SIM_KNOWN=fail`,
+         twelve seeds) passed every profile, so the matchers are gone. That confirms B125 to
+         B133; B134 stays open with `local_first` off only, which the runs do not mount. The confirmation run (`PDFS_SIM_KNOWN=fail`)
          on da013c2 failed `one_client_on_a_flaky_link` seeds 6 and 11 on two new bugs, both
          after restarts: a write over a create never read back (B182) and a trash that forgot
          what its create sent (B183). Replays with those fixed found a third: a create renamed

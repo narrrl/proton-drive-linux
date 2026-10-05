@@ -138,8 +138,12 @@ by its local id, in the queue, the stored tree and pins alike.
   the upload made is trashed as soon as it lands, so its name is free again (B129).
 - **A delete queued while a rename is sent is no longer lost.** The rename landing could remove
   the delete from the queue, leaving the file on Drive (B137).
+- **A file made offline over one deleted offline is no longer lost.** Its upload could take
+  over the deleted file, and the delete then took the new bytes along with it (B128).
+- **A file deleted while its upload is on the wire no longer comes back as a `recovered-…`
+  copy** when another file is made right after (B133).
 - **A file made where another one is leaving no longer lands as a conflict copy.** Its upload
-  waits for the rename or trash that frees the name (B138).
+  waits for the rename or trash that frees the name (B126, B138).
 - **A file closed just as its first upload lands keeps its last write.** The write was refused
   and left in staging (B139).
 - **Files made in a new folder are still there after a restart.** A folder that landed as the

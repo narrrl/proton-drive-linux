@@ -22,14 +22,9 @@
 //! one wrote down, but in-flight work is let finish rather than cut. A kill
 //! at an arbitrary point needs the daemon in a process of its own.
 //!
-//! A call that answers otherwise than the model says fails the run, unless it
-//! is one of the [`KNOWN`] open bugs. Those are counted instead and the model
-//! takes the call back, or the seed ends there when the bug leaves the mount
-//! where the model cannot follow, so the runs stay a regression net until
-//! they are fixed. A file gone, or a conflict copy the drain made of one of
-//! the client's own, is counted too when a known bug explains it
-//! (`Run::known_damage`), and so is a hang the stacks show is one of the
-//! [`KNOWN_HANGS`]. `PDFS_SIM_KNOWN=fail` fails on all of them.
+//! Any of these fails the seed. No open bug is tolerated: the matchers that
+//! counted the ones still open instead (B125 to B134) went once a run on
+//! 812eb3d passed every profile without them.
 //!
 //! The runs are ignored by default because they mount FUSE; run them with
 //! `cargo test -p pdfs-fuse --lib sim::run -- --ignored --test-threads=1`.
@@ -42,105 +37,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use std::collections::BTreeMap;
-
-use proton_drive_rs::proton_sdk::ids::NodeUid;
-
 use super::daemon::{Daemon, scratch, take_logged, wait_until};
 use super::fake_drive::{Entry, FakeDrive, Faults};
-use super::model::{FsOp, Model, Tree, data, join, name_of, parent_of};
+use super::model::{FsOp, Model, Tree, data, join};
 use super::rng::Rng;
-use super::watchdog::{Hung, Watchdog};
-
-/// An open bug in `docs/BUGS.md` the runs tolerate.
-struct Known {
-    bug: &'static str,
-    /// Whether a call that answered `errno` against the model's word, with
-    /// lines `logged` at `INFO` and above meanwhile and `before` it, is this
-    /// bug. `model` is from before the call.
-    is: fn(model: &Model, op: &FsOp, errno: i32, logged: &[String], before: &[String]) -> bool,
-    /// Whether it also left the mount where the model cannot follow, so the
-    /// seed ends there.
-    ends_seed: fn(model: &Model, op: &FsOp) -> bool,
-}
-
-const KNOWN: &[Known] = &[
-    // A replacing rename trashes what it replaces first, so Drive refuses the
-    // name only when it holds a node the mount has forgotten: the create of
-    // the replaced file landed after its op was dropped.
-    Known {
-        bug: "B129",
-        is: |model, op, errno, logged, _| {
-            let FsOp::Rename { to, .. } = op else {
-                return false;
-            };
-            errno == libc::EIO
-                && model.tree().contains_key(to)
-                && logged
-                    .iter()
-                    .any(|line| line.starts_with("rename failed") && line.contains("AlreadyExists"))
-        },
-        // The model made the rename, and Drive holds a node the mount does
-        // not know.
-        ends_seed: |_, _| true,
-    },
-    // A folder made offline is listed on Drive once its listing has been
-    // invalidated, and Drive does not know it, or does not list it yet. Only
-    // the client writes its folder, so a folder of its own is never really
-    // gone.
-    Known {
-        bug: "B125",
-        is: |_, _, errno, logged, _| {
-            matches!(errno, libc::EIO | libc::ENOENT)
-                && logged.iter().any(|line| {
-                    line.starts_with("enumerate folder children failed")
-                        && line.contains("DoesNotExist")
-                })
-        },
-        // The folder keeps failing to list, and what is in it can come back
-        // as gone, so the mount no longer follows the model.
-        ends_seed: |_, _| true,
-    },
-    // A restart forgets the listings served offline, so the first lookup
-    // lists a folder on Drive, which does not hold what is still queued for
-    // it.
-    Known {
-        bug: "B132",
-        is: |_, _, errno, _, before| {
-            errno == libc::ENOENT
-                && before
-                    .iter()
-                    .any(|line| line.starts_with("lost the connection to Proton"))
-                && before
-                    .iter()
-                    .any(|line| line.starts_with("restored pending ops"))
-        },
-        // The listing stays without it until something relists the folder.
-        ends_seed: |_, _| true,
-    },
-];
-
-/// An open bug in `docs/BUGS.md` that hangs a call, which the runs tolerate.
-/// The seed ends there, since the watchdog aborted the mounts.
-struct KnownHang {
-    bug: &'static str,
-    /// Whether the stacks the watchdog kept show this bug.
-    is: fn(stacks: &str) -> bool,
-}
-
-const KNOWN_HANGS: &[KnownHang] = &[
-    // A runtime worker invalidating a file's pages waits for the page lock
-    // of a read, whose fetch waits for a timer that no worker drives.
-    KnownHang {
-        bug: "B130",
-        is: |stacks| {
-            stacks.split("\nthread ").any(|thread| {
-                thread.contains("\"tokio-rt-worker\", state D")
-                    && thread.contains("NotifyBatch>::flush")
-            })
-        },
-    },
-];
+use super::watchdog::Watchdog;
 
 /// What a run looks like.
 pub(crate) struct Profile {
@@ -178,16 +79,6 @@ const LOG_TAIL: usize = 40;
 /// for the last run and the mount.
 const STALL: Duration = Duration::from_secs(120);
 
-/// What a known bug left on Drive in place of a file, and how the model
-/// takes it in.
-struct KnownDamage {
-    bug: &'static str,
-    path: String,
-    /// The conflict copy it made, if it made one.
-    copy: Option<String>,
-    change: FsOp,
-}
-
 struct Client {
     daemon: Option<Daemon>,
     model: Model,
@@ -213,25 +104,14 @@ struct Run {
     clients: Vec<Client>,
     log: Vec<String>,
     started: Instant,
-    /// How often each [`KNOWN`] bug turned up.
-    known: BTreeMap<&'static str, usize>,
-    /// The known bug that ended the seed early, if one did.
-    ended_by: Option<&'static str>,
     /// What the daemons logged at `INFO` and above so far.
     logged: Vec<String>,
-    /// Files deleted while the drain held a write to them.
-    held: Vec<NodeUid>,
-    /// Those of them made again before it went on.
-    remade: Vec<NodeUid>,
     watchdog: Watchdog,
 }
 
-/// Run `profile` on `seed`. It answers how often each known bug turned up,
-/// or a report of what went wrong.
-pub(crate) fn run(
-    seed: u64,
-    profile: &'static Profile,
-) -> Result<BTreeMap<&'static str, usize>, String> {
+/// Run `profile` on `seed`. It answers a report of what went wrong, if
+/// anything did.
+pub(crate) fn run(seed: u64, profile: &'static Profile) -> Result<(), String> {
     let dir = scratch(&format!("{}-{seed}", profile.name));
     let mut rng = Rng::new(seed);
     let drive = FakeDrive::new();
@@ -242,18 +122,14 @@ pub(crate) fn run(
         clients: Vec::new(),
         log: Vec::new(),
         started: Instant::now(),
-        known: BTreeMap::new(),
-        ended_by: None,
         logged: Vec::new(),
-        held: Vec::new(),
-        remade: Vec::new(),
         watchdog: Watchdog::new(&dir),
     };
     let outcome = run.execute(&dir, &mut rng);
     run.watchdog.stop();
     // A hang is what failed, whatever the aborted call answered.
     let outcome = match run.watchdog.fired() {
-        Some(hung) => run.known_hang(&hung),
+        Some(hung) => Err(format!("liveness: {}", hung.what)),
         None => outcome,
     };
     for client in &mut run.clients {
@@ -264,27 +140,13 @@ pub(crate) fn run(
     match outcome {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&dir);
-            Ok(run.known)
+            Ok(())
         }
         Err(failure) => Err(run.report(&failure, &dir)),
     }
 }
 
 impl Run {
-    /// Count `hung` if it is one of the [`KNOWN_HANGS`], or fail on it.
-    fn known_hang(&mut self, hung: &Hung) -> Result<(), String> {
-        let known = KNOWN_HANGS.iter().find(|known| (known.is)(&hung.stacks));
-        match known {
-            Some(known) if tolerate_known() => {
-                *self.known.entry(known.bug).or_default() += 1;
-                self.note(format!("known bug {}; the seed ends here", known.bug));
-                self.ended_by = Some(known.bug);
-                Ok(())
-            }
-            _ => Err(format!("liveness: {}", hung.what)),
-        }
-    }
-
     fn execute(&mut self, dir: &Path, rng: &mut Rng) -> Result<(), String> {
         for index in 0..self.profile.clients {
             let client = self.drive.client(rng.next_u64(), (self.profile.faults)());
@@ -302,9 +164,6 @@ impl Run {
         for step in 0..self.profile.steps {
             let _watching = self.watchdog.arm(self.step_limit(), format!("step {step}"));
             self.step(rng)?;
-            if self.ended_by.is_some() {
-                return Ok(());
-            }
         }
         let _watching = self.watchdog.arm(
             self.profile.drain_budget + STALL,
@@ -413,18 +272,11 @@ impl Run {
                 data: bytes,
             },
         )?;
-        if self.ended_by.is_some() {
-            return Ok(());
-        }
         if !wait_until(PICKUP_BUDGET, || held.reached()) {
             self.note(format!("client {index}: nothing read {path} back"));
             return Ok(());
         }
         self.syscall(index, FsOp::Unlink { path: path.clone() })?;
-        if self.ended_by.is_some() {
-            return Ok(());
-        }
-        self.held.push(uid.clone());
         if rng.chance(0.5) {
             self.syscall(
                 index,
@@ -433,7 +285,6 @@ impl Run {
                     data: data(rng),
                 },
             )?;
-            self.remade.push(uid);
         }
         let faults = (self.profile.faults)();
         let latency = Duration::from_millis(faults.latency_ms.1);
@@ -448,11 +299,9 @@ impl Run {
     fn syscall(&mut self, index: usize, op: FsOp) -> Result<(), String> {
         let client = &mut self.clients[index];
         let root = client.root(index);
-        let model = client.model.clone();
         let before = client.model.content(target(&op)).cloned();
         let expected = client.model.apply(&op);
         self.logged.extend(take_logged());
-        let logged_before = self.logged.len();
         let start = Instant::now();
         let actual = perform(&root, &op, before.as_deref());
         let took = start.elapsed();
@@ -462,25 +311,7 @@ impl Run {
             outcome(&actual)
         ));
         let actual = actual?;
-        let logged = take_logged();
-        self.logged.extend(logged.iter().cloned());
-        if actual != expected
-            && let Err(errno) = actual
-            && tolerate_known()
-            && let Some(known) = KNOWN.iter().find(|known| {
-                (known.is)(&model, &op, errno, &logged, &self.logged[..logged_before])
-            })
-        {
-            *self.known.entry(known.bug).or_default() += 1;
-            if (known.ends_seed)(&model, &op) {
-                self.note(format!("known bug {}; the seed ends here", known.bug));
-                self.ended_by = Some(known.bug);
-            } else {
-                self.note(format!("known bug {}; taken back", known.bug));
-            }
-            self.clients[index].model = model;
-            return Ok(());
-        }
+        self.logged.extend(take_logged());
         if actual != expected {
             return Err(format!(
                 "posix: client {index}: {} answered {}, expected {}",
@@ -517,61 +348,15 @@ impl Run {
         }
         // Each client's folder is its own, so a file of it gone from Drive was
         // deleted by the client.
-        let own_deletes: Vec<String> = self
-            .logged
-            .iter()
-            .filter(|line| is_own_delete_kept(line))
-            .cloned()
-            .collect();
-        for line in own_deletes {
-            let bug = if self
-                .remade
-                .iter()
-                .any(|uid| line.contains(&format!(" uid={uid} ")))
-            {
-                // Made again while the drain held its write: the new file's
-                // write took the freed op id.
-                "B133"
-            } else if !self
-                .held
-                .iter()
-                .any(|uid| line.contains(&format!(" uid={uid} ")))
-                && !line.contains(" name=\"recovered-")
-            {
-                // The tree still placed the file, so the drain looked before
-                // the unlink had dropped its write.
-                "B134"
-            } else {
-                return Err(format!(
-                    "no false conflicts: the drain took a client's own delete for another device's: {line}"
-                ));
-            };
-            if !tolerate_known() {
-                return Err(format!(
-                    "no false conflicts: the drain took a client's own delete for another device's: {line}"
-                ));
-            }
-            *self.known.entry(bug).or_default() += 1;
-            self.note(format!("known bug {bug}: {line}"));
+        if let Some(line) = self.logged.iter().find(|line| is_own_delete_kept(line)) {
+            return Err(format!(
+                "no false conflicts: the drain took a client's own delete for another device's: {line}"
+            ));
         }
         let drive = self.drive_tree();
-        let mut explained = Vec::new();
-        for index in 0..self.clients.len() {
-            for damage in self.known_damage(index, &drive) {
-                *self.known.entry(damage.bug).or_default() += 1;
-                self.note(format!(
-                    "known bug {}: client {index}'s {} landed as {:?}",
-                    damage.bug, damage.path, damage.copy
-                ));
-                let _ = self.clients[index].model.apply(&damage.change);
-                if let Some(copy) = damage.copy {
-                    explained.push(join(&owned_folder(index), &copy));
-                }
-            }
-        }
         let conflicts: Vec<String> = drive
             .into_keys()
-            .filter(|path| is_conflict_copy(path) && !explained.contains(path))
+            .filter(|path| is_conflict_copy(path))
             .collect();
         if !conflicts.is_empty() {
             return Err(format!("no false conflicts: {conflicts:?}"));
@@ -593,153 +378,16 @@ impl Run {
     }
 
     /// Whether every client's queue is empty and Drive holds what its model
-    /// says, but for what known bugs explain.
+    /// says.
     fn landed(&self) -> bool {
         let drive = self.drive_tree();
         self.clients.iter().enumerate().all(|(index, client)| {
-            let mut model = client.model.clone();
-            for damage in self.known_damage(index, &drive) {
-                let _ = model.apply(&damage.change);
-            }
             client
                 .daemon()
                 .pending()
                 .is_ok_and(|items| items.is_empty())
-                && subtree(&drive, &owned_folder(index)) == *model.tree()
+                && subtree(&drive, &owned_folder(index)) == *client.model.tree()
         })
-    }
-
-    /// The files of client `index` that a known bug left otherwise on Drive
-    /// than the model says. A conflict copy takes Drive holding it with the
-    /// model's bytes, and the drain saying it made that copy for that name:
-    ///
-    /// - B126: the file's queued create ran into its name while a queued
-    ///   rename was about to free it, so it is there only as the copy.
-    /// - B127: the file's queued create landed but its answer was lost, so
-    ///   the retry found it and made the copy next to it.
-    ///
-    /// A lost file takes the drain saying it adopted a node for that name
-    /// whose queued trash then landed:
-    ///
-    /// - B128: the file's queued create ran into the name of the file it
-    ///   replaced and took that over, trash and all.
-    ///
-    /// A conflict copy of a file the client deleted takes the drain saying it
-    /// kept that file's write as the copy, because Drive had the file in the
-    /// trash while the tree still placed it:
-    ///
-    /// - B134: the unlink trashed the file on Drive before it dropped the
-    ///   write.
-    fn known_damage(&self, index: usize, drive: &Tree) -> Vec<KnownDamage> {
-        if !tolerate_known() {
-            return Vec::new();
-        }
-        let drive = subtree(drive, &owned_folder(index));
-        let model = self.clients[index].model.tree();
-        let made_copy = |path: &str, copy: &str| {
-            let wanted = format!("wanted={:?}", name_of(path));
-            let name = format!("name={:?}", name_of(copy));
-            self.logged.iter().any(|line| {
-                line.starts_with("name is taken remotely; creating under a conflict name")
-                    && line.contains(&wanted)
-                    && line.contains(&name)
-            })
-        };
-        let adopted_trashed = |path: &str| {
-            let wanted = format!("wanted={:?}", name_of(path));
-            self.logged.iter().any(|line| {
-                line.starts_with("the name is held by our own unanswered create; adopting it")
-                    && line.contains(&wanted)
-                    && line.split(' ').any(|field| {
-                        field.strip_prefix("twin=").is_some_and(|twin| {
-                            let uid = format!("uid={twin}");
-                            self.logged.iter().any(|line| {
-                                line.starts_with("pending trash landed")
-                                    && line.split(' ').any(|field| field == uid)
-                            })
-                        })
-                    })
-            })
-        };
-        let kept_deleted = |copy: &str| {
-            let alt = format!(" alt={:?}", name_of(copy));
-            self.logged.iter().any(|line| {
-                line.starts_with("queued write landed as a conflict copy")
-                    && line.ends_with(&alt)
-                    && line.split(' ').any(|field| {
-                        field.starts_with("uid=")
-                            && self.logged.iter().any(|kept| {
-                                is_own_delete_kept(kept)
-                                    && !kept.contains(" name=\"recovered-")
-                                    && kept.split(' ').any(|other| other == field)
-                            })
-                    })
-            })
-        };
-        let mut damage = Vec::new();
-        for (copy, content) in &drive {
-            let Some(content) = content else { continue };
-            if !is_conflict_copy(copy) || model.contains_key(copy) {
-                continue;
-            }
-            if !kept_deleted(copy) {
-                continue;
-            }
-            damage.push(KnownDamage {
-                bug: "B134",
-                path: copy.clone(),
-                copy: Some(copy.clone()),
-                change: FsOp::Create {
-                    path: copy.clone(),
-                    data: content.clone(),
-                },
-            });
-        }
-        for (path, content) in model {
-            let Some(content) = content else { continue };
-            let copy = drive.iter().find(|(copy, other)| {
-                is_conflict_copy(copy)
-                    && !model.contains_key(*copy)
-                    && parent_of(copy) == parent_of(path)
-                    && other.as_ref() == Some(content)
-                    && made_copy(path, copy)
-            });
-            let Some((copy, _)) = copy else {
-                if !drive.contains_key(path) && adopted_trashed(path) {
-                    damage.push(KnownDamage {
-                        bug: "B128",
-                        path: path.clone(),
-                        copy: None,
-                        change: FsOp::Unlink { path: path.clone() },
-                    });
-                }
-                continue;
-            };
-            let (bug, change) = match drive.get(path) {
-                None => (
-                    "B126",
-                    FsOp::Rename {
-                        from: path.clone(),
-                        to: copy.clone(),
-                    },
-                ),
-                Some(Some(landed)) if landed == content => (
-                    "B127",
-                    FsOp::Create {
-                        path: copy.clone(),
-                        data: content.clone(),
-                    },
-                ),
-                Some(_) => continue,
-            };
-            damage.push(KnownDamage {
-                bug,
-                path: path.clone(),
-                copy: Some(copy.clone()),
-                change,
-            });
-        }
-        damage
     }
 
     fn difference(&self) -> String {
@@ -894,11 +542,6 @@ fn subtree(tree: &Tree, folder: &str) -> Tree {
         .collect()
 }
 
-/// Whether a known bug is counted rather than failing the run.
-fn tolerate_known() -> bool {
-    std::env::var("PDFS_SIM_KNOWN").as_deref() != Ok("fail")
-}
-
 fn owned_folder(index: usize) -> String {
     format!("c{index}")
 }
@@ -974,21 +617,10 @@ pub(crate) fn run_seeds(profile: &'static Profile, default_seeds: u64) {
             (1..=count).collect()
         }
     };
-    let mut failures = Vec::new();
-    let mut known = BTreeMap::<&str, usize>::new();
-    for seed in seeds {
-        match run(seed, profile) {
-            Ok(hits) => {
-                for (bug, count) in hits {
-                    *known.entry(bug).or_default() += count;
-                }
-            }
-            Err(failure) => failures.push(failure),
-        }
-    }
-    if !known.is_empty() {
-        eprintln!("{}: known bugs turned up: {known:?}", profile.name);
-    }
+    let failures: Vec<String> = seeds
+        .into_iter()
+        .filter_map(|seed| run(seed, profile).err())
+        .collect();
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
 
@@ -1130,16 +762,5 @@ mod tests {
         assert!(!is_own_delete_kept(
             &kept.replace("the file was trashed remotely", "revision changed")
         ));
-    }
-
-    #[test]
-    fn an_invalidation_stuck_on_a_page_lock_is_b130() {
-        let b130 = |stacks: &str| KNOWN_HANGS.iter().any(|known| (known.is)(stacks));
-        let stuck = "thread 1 \"fuser-0\", state S, waiting in fuse_dev_do_read\n\
-                     \nthread 2 \"tokio-rt-worker\", state D, waiting in __folio_lock\n\
-                     \x20 11: <pdfs_fuse::NotifyBatch>::flush\n";
-        assert!(b130(stuck));
-        assert!(!b130(&stuck.replace("state D", "state S")));
-        assert!(!b130(&stuck.replace("NotifyBatch", "Other")));
     }
 }
