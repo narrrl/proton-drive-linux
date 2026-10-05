@@ -3334,6 +3334,12 @@ impl Core {
         if !h.dirty {
             self.cache.clear_scratch_durable(&h.path);
             let _ = std::fs::remove_file(&h.path);
+            // A new file's create waits for this release to wake the drain
+            // (`Core::queue_local_node`). Closed empty, it attached nothing
+            // that would, and sat until the idle poll (`docs/BUGS.md` B192).
+            if is_local_uid(&h.uid) {
+                self.wake_drain();
+            }
             return Ok(());
         }
         preserve_on_access_denied(self.require_uid_writable(&h.uid), h.dirty, || {
@@ -3828,7 +3834,7 @@ impl Core {
         debug!(%uid, %parent_uid, name, is_dir, "created node offline; queued");
         // A folder is due now; without this the workers slept through it to
         // the idle poll (B160). A file is not: its bytes ride on the create, and
-        // the release that attaches them wakes the drain.
+        // its release wakes the drain, with bytes or without (B192).
         if is_dir {
             self.wake_drain();
         }

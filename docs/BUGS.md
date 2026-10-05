@@ -12,6 +12,23 @@ Conventions:
 
 ---
 
+## B192 — A new file closed empty reaches Drive only half a minute later
+
+**Status:** Fixed.
+**Found:** 2026-10-05, while writing the test for B193. An empty file made on an idle mount was
+still queued 30 s later.
+
+**Where:** `Core::queue_revision` in `crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** Queueing a file's create does not wake the drain: its bytes ride on the create, and
+the release that attaches them wakes it (B160). A file closed without a write (`touch`, `: > f`)
+attaches nothing, so its create waited for the workers' 30 s idle poll.
+
+**Fix.** Closing a clean handle of a file whose create is queued wakes the drain.
+
+**Test:** simulation test `a_file_made_empty_while_the_drain_is_idle_reaches_drive_at_once`
+(failed before the fix: the file was still queued after 10 s).
+
 ## B191 — A file deleted after its create failed and was written again can stay on Drive
 
 **Status:** Fixed (unverified).

@@ -385,6 +385,34 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_made_empty_while_the_drain_is_idle_reaches_drive_at_once() {
+        // A new file's create waits for the release that attaches its bytes
+        // to wake the drain. A file closed without any attached none, so it
+        // sat until the workers' 30 s idle poll (B192).
+        let drive = FakeDrive::new();
+        let dir = scratch("idle-empty-create");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+
+        std::fs::write(daemon.mountpoint.join("e.md"), b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.lookup("e.md").is_some()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_whose_upload_was_not_read_back_takes_two_writes_at_once() {
         // The read-back after an upload went unanswered, and the drain let go of
         // the uploaded bytes without caching them. A partial write had nothing

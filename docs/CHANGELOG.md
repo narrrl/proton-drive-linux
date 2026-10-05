@@ -54,7 +54,8 @@ by its local id, in the queue, the stored tree and pins alike.
   (B158).
 - **Opening a file right after the daemon restarts no longer fails with "Resource temporarily
   unavailable"** (B159).
-- **A new folder reaches Drive at once**, not up to half a minute later (B160).
+- **A new folder, or a new empty file, reaches Drive at once**, not up to half a minute later
+  (B160, B192).
 - **A file moved while it was still being uploaded keeps its new name in the mount** on a slow
   link (B161).
 - **A folder removed and made again at once keeps what goes into it.** It used to be created
