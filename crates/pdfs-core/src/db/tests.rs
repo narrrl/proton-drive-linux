@@ -3848,6 +3848,69 @@ fn a_create_withdrawn_after_it_failed_queues_a_trash_that_keeps_its_blob() {
     assert!(db.pending_ops().unwrap().is_empty());
 }
 
+/// What a queued create sent, and where, stays on its row: through a newer
+/// blob, through the turn into a trash a delete makes of it, and across a
+/// reopen. The trash finds the file the create made by those bytes, after a
+/// restart too, and under a name the file had before a rename
+/// (`docs/BUGS.md` B183, B184).
+#[test]
+fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-create-sent-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let parent = uid("parent").to_string();
+    let id = {
+        let db = Db::open(&path).unwrap();
+        let (id, _) = db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_CREATE.to_string(),
+                uid: "local~sent".to_string(),
+                parent_uid: Some(parent.clone()),
+                name: Some("d".to_string()),
+                blob_path: Some("/staging/first".to_string()),
+                meta_json: Some("{}".to_string()),
+                created_at: 1,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            })
+            .unwrap();
+        assert!(db.create_sent(id).unwrap().is_empty());
+        assert!(db.create_targets(id).unwrap().is_empty());
+        db.note_create_target(id, &parent, "c").unwrap();
+        db.note_create_target(id, &parent, "c").unwrap();
+        db.note_create_sent(id, "aaaa").unwrap();
+        db.note_create_sent(id, "aaaa").unwrap();
+        db.record_op_failure(id, "no answer", 0).unwrap();
+        db.attach_blob_to_create("local~sent", "/staging/second", "{}")
+            .unwrap()
+            .expect("the create is still queued");
+        db.note_create_target(id, &parent, "d").unwrap();
+        db.note_create_sent(id, "bbbb").unwrap();
+        db.record_op_failure(id, "no answer", 0).unwrap();
+        db.delete_ops_for_uid("local~sent").unwrap();
+        id
+    };
+
+    let db = Db::open(&path).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!((ops[0].id, ops[0].kind.as_str()), (id, OP_TRASH));
+    assert_eq!(db.create_sent(id).unwrap(), vec!["aaaa", "bbbb"]);
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![
+            (parent.clone(), "c".to_string()),
+            (parent.clone(), "d".to_string())
+        ]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
 /// A create deleted after it was sent becomes a trash in its place. The
 /// create's backoff, and the failure of an attempt still on the wire, are the
 /// create's: the trash is due at once (`docs/BUGS.md` B171).

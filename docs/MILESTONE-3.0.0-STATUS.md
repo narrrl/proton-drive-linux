@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B181.
+- Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B184.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`; Discard button and
   `pdfs sync discard`; a warning badge on the node in the file browser.
@@ -102,7 +102,12 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          which a68dae9 (not yet pushed then) also takes off the runtime. CI now keeps a hung
          run's stacks.
    - [ ] Known-bug list in `sim/run.rs` is empty: none open; B125, B127, B129, B130 and B132
-         fixed but not yet confirmed by the runs.
+         fixed but not yet confirmed by the runs. The confirmation run (`PDFS_SIM_KNOWN=fail`)
+         on da013c2 failed `one_client_on_a_flaky_link` seeds 6 and 11 on two new bugs, both
+         after restarts: a write over a create never read back (B182) and a trash that forgot
+         what its create sent (B183). Replays with those fixed found a third: a create renamed
+         after it lost its answer (B184). All three fixed; no known-bug matcher fired. It was
+         stopped before `three_clients`.
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)
          failed B113 and B121 on every on-demand mount, two mirror-to-mirror move cases, and
          the journal check. B121 was a bug (B149, fixed); B113's case still expected creates

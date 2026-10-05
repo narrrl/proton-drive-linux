@@ -765,6 +765,89 @@ impl Db {
         })
     }
 
+    /// Record that queued create `id` is sending a blob with SHA-1 `sha`.
+    ///
+    /// Drive may make the file and lose its answer. The op that next finds
+    /// the file, the create's retry or the trash a delete made of it, takes
+    /// it for its own when it holds any bytes sent so. Kept on the row, so a
+    /// newer blob, the turn into a trash and a restart all keep it
+    /// (`docs/BUGS.md` B156, B183).
+    pub fn note_create_sent(&self, id: i64, sha: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE pending_op
+             SET sent_sha1 = CASE
+                 WHEN sent_sha1 IS NULL THEN ?2
+                 WHEN instr(' ' || sent_sha1 || ' ', ' ' || ?2 || ' ') > 0 THEN sent_sha1
+                 ELSE sent_sha1 || ' ' || ?2 END
+             WHERE id = ?1",
+            params![id, sha],
+        )?;
+        Ok(())
+    }
+
+    /// Record that queued create `id` is being sent to `parent` under `name`.
+    ///
+    /// A rename while the op waits rewrites its target, but the file a lost
+    /// answer left stays where it was sent. The retry and the trash look
+    /// there too (`docs/BUGS.md` B184).
+    pub fn note_create_target(&self, id: i64, parent: &str, name: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let sent: Option<String> = tx
+            .query_row("SELECT sent_to FROM pending_op WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        let mut targets: Vec<(String, String)> = sent
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let target = (parent.to_string(), name.to_string());
+        if !targets.contains(&target) {
+            targets.push(target);
+            tx.execute(
+                "UPDATE pending_op SET sent_to = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&targets)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The parent and name queued op `id` was sent under as a create, in the
+    /// order it was ([`Db::note_create_target`]).
+    pub fn create_targets(&self, id: i64) -> Result<Vec<(String, String)>> {
+        let sent: Option<String> = self
+            .conn
+            .lock()
+            .query_row("SELECT sent_to FROM pending_op WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(sent
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default())
+    }
+
+    /// The SHA-1 of each blob queued op `id` sent as a create
+    /// ([`Db::note_create_sent`]).
+    pub fn create_sent(&self, id: i64) -> Result<Vec<String>> {
+        let sent: Option<String> = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT sent_sha1 FROM pending_op WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(sent
+            .map(|sent| sent.split(' ').map(str::to_string).collect())
+            .unwrap_or_default())
+    }
+
     /// Replace the sidecar of a queued op, for a baseline that has moved under
     /// it.
     ///

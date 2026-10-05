@@ -153,6 +153,19 @@ enum DrainDisposition {
     AuthorityUnknown(NodeUid),
 }
 
+/// The node an earlier attempt at a create made before a rename moved the op
+/// (`docs/BUGS.md` B184).
+struct EarlierTwin {
+    /// The folder the attempt was sent to.
+    parent: NodeUid,
+    /// The name it was sent under.
+    name: String,
+    /// The node it made.
+    twin: NodeUid,
+    /// Whether the node holds the op's blob already.
+    holds_blob: bool,
+}
+
 /// Why an op went back on the clock without consuming an attempt. Only affects
 /// what the user is told — every variant is deferred and reported identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,7 +571,6 @@ impl Core {
                 self.release_claim(op);
                 return;
             }
-            self.create_sent.lock().remove(&op.id);
             return;
         }
         match fetched {
@@ -747,8 +759,13 @@ impl Core {
         let Some(real) = parse_node_uid(&op.uid) else {
             return Ok(());
         };
-        let Some(local) = self.unadopted.lock().get(&real).cloned() else {
-            return Ok(());
+        let local = match self.unadopted.lock().get(&real).cloned() {
+            Some(local) => local,
+            // The map does not outlive a restart, which also forgets the
+            // stand-in: the row is under the real uid by then. A file as it was
+            // made here has no revision of Drive's (`docs/BUGS.md` B182).
+            None if op.kind == OP_REVISION && self.never_read_back(&real) => real.clone(),
+            None => return Ok(()),
         };
         // A node gone since is the op's to deal with.
         if self.fetch_node_remote(&real)?.is_some() {
@@ -757,6 +774,16 @@ impl Core {
         self.unadopted.lock().remove(&real);
         debug!(%local, %real, "adopted a landed create");
         Ok(())
+    }
+
+    /// Whether the tree has the file `real` as it was made here: its create
+    /// landed, but Drive's answer was never read back.
+    fn never_read_back(&self, real: &NodeUid) -> bool {
+        let st = self.state();
+        st.by_uid
+            .get(real)
+            .and_then(|ino| st.entries.get(ino))
+            .is_some_and(|entry| !entry.node.is_folder() && node_revision_id(&entry.node).is_none())
     }
 
     /// Apply a queued rename/move to the remote.
@@ -953,7 +980,6 @@ impl Core {
                 None => debug!(%uid, name, "withdrawn create never landed; trash op satisfied"),
             }
             self.retire_trash_op(op, &uid)?;
-            self.create_sent.lock().remove(&op.id);
             return Ok(());
         }
         match self
@@ -989,24 +1015,48 @@ impl Core {
     }
 
     /// The node a create that a trash withdrew made on Drive although its
-    /// answer was lost: in the create's folder under its name, and one the
-    /// create would have adopted had it been retried ([`adoptable`]). A node
-    /// with a change of ours queued is one the user is still working on.
+    /// answer was lost: in the create's folder under its name, or under one
+    /// an attempt was sent with before a rename (`docs/BUGS.md` B184).
     fn withdrawn_twin(
         &self,
         op: &PendingOp,
     ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
-        let (Some(parent), Some(name)) = (
-            op.parent_uid
-                .as_deref()
-                .filter(|parent| !is_local_uid_str(parent))
-                .and_then(parse_node_uid),
-            op.name.as_deref(),
-        ) else {
-            return Ok(None);
-        };
+        let mut targets: Vec<(String, String)> = op
+            .parent_uid
+            .clone()
+            .zip(op.name.clone())
+            .into_iter()
+            .collect();
+        for target in self.db.create_targets(op.id)? {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        for (parent, name) in targets {
+            if is_local_uid_str(&parent) {
+                continue;
+            }
+            let Some(parent) = parse_node_uid(&parent) else {
+                continue;
+            };
+            if let Some(twin) = self.withdrawn_twin_in(op, &parent, &name)? {
+                return Ok(Some(twin));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The node in `parent` under `name` a withdrawn create made, if it is one
+    /// the create would have adopted had it been retried ([`adoptable`]). A
+    /// node with a change of ours queued is one the user is still working on.
+    fn withdrawn_twin_in(
+        &self,
+        op: &PendingOp,
+        parent: &NodeUid,
+        name: &str,
+    ) -> Result<Option<NodeUid>, Box<dyn std::error::Error>> {
         let uids =
-            match self.block_on_bounded(self.drive.enumerate_folder_children_node_uids(&parent)) {
+            match self.block_on_bounded(self.drive.enumerate_folder_children_node_uids(parent)) {
                 Ok(uids) => uids,
                 Err(e) if is_gone(&e) => return Ok(None),
                 Err(e) => return Err(e.into()),
@@ -1090,11 +1140,6 @@ impl Core {
         }
         let created = self.create_local_node(op);
         self.creating.lock().remove(&op.id);
-        // A withdrawn create goes on as a trash under the same id, which still
-        // looks for the bytes it sent (`Core::withdrawn_twin`).
-        if !self.db.op_exists(op.id).unwrap_or(true) {
-            self.create_sent.lock().remove(&op.id);
-        }
         created
     }
 
@@ -1123,8 +1168,27 @@ impl Core {
         // whose trash is still queued is about to let go of it.
         let mut name = wanted.clone();
         let mut home = parent.clone();
+        let mut sent = (parent_str.to_string(), wanted.clone());
         let mut blob_landed = true;
-        let mut real = self.create_drained_node(op, &parent, &name);
+        // An earlier attempt, sent before the file was renamed or moved, may
+        // have made it and lost the answer. That node is ours where it was
+        // sent, and the rename follows it (`docs/BUGS.md` B184).
+        let mut real = match self.earlier_twin(op, parent_str, &wanted)? {
+            Some(EarlierTwin {
+                parent: was_in,
+                name: was_named,
+                twin,
+                holds_blob,
+            }) => {
+                info!(%local, %twin, was_named, wanted, "an earlier attempt landed unanswered under another name; adopting it");
+                sent = (was_in.to_string(), was_named.clone());
+                home = was_in;
+                name = was_named;
+                blob_landed = holds_blob;
+                Ok(twin)
+            }
+            None => self.create_drained_node(op, &parent, &name),
+        };
         if real.as_ref().is_err_and(|e| is_already_exists(e.as_ref()))
             && let Some((twin, holds_blob)) = self.adoptable_twin(op, &parent, &wanted)?
         {
@@ -1202,7 +1266,7 @@ impl Core {
         let landing = CreateLanding {
             local: &local.to_string(),
             real: &real.to_string(),
-            sent: (parent_str, &wanted),
+            sent: (&sent.0, &sent.1),
             landed: (&home.to_string(), &name),
         };
         let newer = match self.retire_create(op, uploaded, &landing, &local, &real)? {
@@ -1335,6 +1399,38 @@ impl Core {
         Ok(())
     }
 
+    /// The node an earlier attempt at create `op` made under a parent or name
+    /// the op has been moved from since ([`Core::adoptable_twin`]).
+    fn earlier_twin(
+        &self,
+        op: &PendingOp,
+        parent: &str,
+        name: &str,
+    ) -> Result<Option<EarlierTwin>, Box<dyn std::error::Error>> {
+        for (was_in, was_named) in self.db.create_targets(op.id)? {
+            if (was_in.as_str(), was_named.as_str()) == (parent, name) {
+                continue;
+            }
+            let Some(was_in) = parse_node_uid(&was_in) else {
+                continue;
+            };
+            match self.adoptable_twin(op, &was_in, &was_named) {
+                Ok(Some((twin, holds_blob))) => {
+                    return Ok(Some(EarlierTwin {
+                        parent: was_in,
+                        name: was_named,
+                        twin,
+                        holds_blob,
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) if is_gone(e.as_ref()) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
     /// The node already holding `name` under `parent`, if it is the one an
     /// earlier attempt at this op made before its answer was lost, and whether
     /// it holds the op's blob already.
@@ -1407,12 +1503,10 @@ impl Core {
     /// `current`, those of the blob it holds now, and those each earlier
     /// attempt uploaded.
     fn create_sent_digests(&self, id: i64, current: Option<String>) -> Vec<String> {
-        let mut sent = self
-            .create_sent
-            .lock()
-            .get(&id)
-            .cloned()
-            .unwrap_or_default();
+        let mut sent = self.db.create_sent(id).unwrap_or_else(|e| {
+            warn!(id, error = %e, "reading what a queued create sent failed");
+            Vec::new()
+        });
         sent.extend(current);
         sent
     }
@@ -1428,6 +1522,8 @@ impl Core {
         parent: &NodeUid,
         name: &str,
     ) -> Result<NodeUid, Box<dyn std::error::Error>> {
+        self.db
+            .note_create_target(op.id, &parent.to_string(), name)?;
         match op.kind == OP_MKDIR {
             true => Ok(self.block_on_bounded(self.drive.create_folder(
                 parent,
@@ -1465,12 +1561,7 @@ impl Core {
         // The call may make the file and lose its answer, and the op may hold
         // a newer blob by the time it is retried (`Core::adoptable_twin`).
         let sha = staged_sha1(Path::new(blob))?;
-        let mut sent = self.create_sent.lock();
-        let digests = sent.entry(op.id).or_default();
-        if !digests.contains(&sha) {
-            digests.push(sha);
-        }
-        drop(sent);
+        self.db.note_create_sent(op.id, &sha)?;
         let thumbnails = self.upload_thumbnails(Path::new(blob), name);
         let guard = self
             .transfers

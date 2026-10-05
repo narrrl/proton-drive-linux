@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 41;
+pub(super) const SCHEMA_VERSION: i64 = 42;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -422,6 +422,22 @@ impl Db {
             )?;
             if tables == 3 {
                 tx.execute_batch(MIGRATION_V41)?;
+            }
+        }
+        if current < 42 {
+            // Same guards as V26-V40.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_op') WHERE name = 'sent_sha1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops && !has_column {
+                tx.execute_batch(MIGRATION_V42)?;
             }
         }
         tx.execute(
@@ -1301,4 +1317,16 @@ UPDATE nodes
    AND json_extract(node_json, '$.uid.volume_id') = 'local';
 UPDATE nodes SET uid = 'local~' || lid WHERE lid IN (SELECT lid FROM local_v41);
 DROP TABLE local_v41;
+";
+
+/// Schema v42: the SHA-1 of each blob a queued create sent, space-separated.
+/// A create whose answer was lost may have made its file with any of them,
+/// and the op that finds that file again may run after a restart. `NULL` for
+/// an op that has sent nothing, which is every op migrated: what the daemon
+/// that wrote it sent is not known. Likewise the parent and name each attempt
+/// was sent under, as a JSON list of pairs: a rename since then moves the op
+/// but not the file Drive may have made.
+const MIGRATION_V42: &str = "
+ALTER TABLE pending_op ADD COLUMN sent_sha1 TEXT;
+ALTER TABLE pending_op ADD COLUMN sent_to TEXT;
 ";

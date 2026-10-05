@@ -12,6 +12,71 @@ Conventions:
 
 ---
 
+## B184 — A file renamed after its create lost its answer stays on Drive under its old name
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, replaying `one_client_on_a_flaky_link` seed 11 with the B183 fix. `a.txt`'s
+create reached Drive and lost its answer. The file was then rewritten, renamed to `b.txt` and
+then `d`, and deleted. Drive kept `a.txt` with the bytes the create had sent.
+
+**Where:** `Core::withdrawn_twin` and `Core::create_local_node` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A rename while a create waits rewrites the op's parent and name, but the node a lost
+answer left stays where the create was sent. The trash a delete made of the create, and the
+create's retry, looked for that node under the op's last name only. The trash found nothing
+and left the file on Drive. The retry made a second file under the new name, so Drive had both.
+
+**Fix.** Each attempt records the parent and name it is sent under on the op's row, in a new
+`pending_op.sent_to` column (schema 42). The trash looks for its node under each of them. A
+retry first adopts a node an earlier attempt made under another name, and the rename to the
+current name follows it. Sim tests `a_file_renamed_after_its_create_lost_its_answer_lands_once`
+and `a_file_renamed_and_deleted_after_its_create_lost_its_answer_leaves_nothing`, and
+`what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart` in
+`crates/pdfs-core/src/db/tests.rs`.
+
+## B183 — A file deleted after a restart stays on Drive when its create lost its answer
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, by the known-bug confirmation run (`PDFS_SIM_KNOWN=fail`) on da013c2:
+`one_client_on_a_flaky_link` seed 11 failed every replay. `d` was made, written again while
+its create was on the wire, and deleted after several restarts. Drive kept a `d` with the bytes
+the create had sent, and the next file renamed to `d` landed as `d (sync-conflict …)`.
+
+**Where:** `Core::withdrawn_twin` and `Core::adoptable_twin` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** The trash a delete makes of a create that was sent looks for a node Drive made with
+the bytes the create sent (B151). Those were kept in memory only (B156). After a restart the
+trash knew only the blob the op held last, which a later write had replaced. It found no node of
+its own and left the file on Drive. A create retried after a restart had the same gap and forked
+a conflict copy.
+
+**Fix.** Each attempt records the SHA-1 of the blob it sends on the op's row, in a new
+`pending_op.sent_sha1` column (schema 42). The row keeps it through a newer blob, through the
+turn into a trash and across restarts. The in-memory map is gone. Tests
+`what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart` in
+`crates/pdfs-core/src/db/tests.rs`, and sim test
+`a_file_deleted_after_a_restart_leaves_drive_with_what_its_create_sent`.
+
+## B182 — A write after a restart over a create never read back lands as a conflict copy
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, by the known-bug confirmation run on da013c2:
+`one_client_on_a_flaky_link` seed 6 failed two of three replays. `y/x/c.bin`'s create landed and
+the link went down before it was read back. The daemon restarted, and a write to the file landed
+as `c (sync-conflict …).bin`, with Drive keeping the old bytes.
+
+**Where:** `Core::finish_adoption` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A create that landed but was not read back is adopted before the next op for the
+node is sent (B143). The node is remembered for that in memory, and a restart forgot it. The
+tree then still had the file as it was made here, with no revision of Drive's, and a write was
+based on that. The drain found Drive's revision in its way and took it for someone else's.
+
+**Fix.** A queued write over a file the tree holds without a revision id is adopted first, as
+B143 does, after a restart too. Sim test
+`a_write_after_a_restart_over_a_create_never_read_back_is_not_a_conflict`.
+
 ## B181 — The app shows a queued edit kept as a conflict copy in English
 
 **Status:** Fixed.
@@ -673,8 +738,7 @@ the op held at the retry was hashed. The twin held the bytes an earlier attempt 
 
 **Fix.** Each attempt records the SHA-1 of the blob it uploads, by op id, in memory. A twin holding
 any of them is ours. One holding older bytes than the op's is adopted, and the op's blob goes up
-as a revision of it. After a restart such a twin still forks a conflict copy, which loses
-nothing. Sim test `a_file_written_again_after_its_create_lost_its_answer_lands_once`; the fake
+as a revision of it. Kept on the op's row since B183, so a restart no longer forgets them. Sim test `a_file_written_again_after_its_create_lost_its_answer_lands_once`; the fake
 Drive's held and lost create answers now combine.
 
 ## B155 — A write whose upload lost its answer lands as a conflict copy of itself

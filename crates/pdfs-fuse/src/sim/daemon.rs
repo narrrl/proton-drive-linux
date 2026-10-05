@@ -1292,6 +1292,47 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_write_after_a_restart_over_a_create_never_read_back_is_not_a_conflict() {
+        // The create landed and the link went down before it was read back,
+        // then the daemon restarted. What was to read it back did not outlive
+        // the restart, so the next write was based on the file as it was made
+        // here and landed as a conflict copy of it (B182).
+        let drive = FakeDrive::new();
+        let dir = scratch("unadopted-restart");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+        let path = daemon.mountpoint.join("f.txt");
+
+        // Drive stamps a create with the second it arrives, so it has to land
+        // a second after the file was made here for the two to differ.
+        daemon.client.set_online(false);
+        std::fs::write(&path, b"first").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        daemon.client.drop_link_after_next_create();
+        daemon.client.set_online(true);
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().get("f.txt").cloned() == file(b"first")
+                && daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        let daemon = daemon.restart().unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        write_at(&path, 5, b" and second").unwrap();
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                drive.tree().get("f.txt").cloned() == file(b"first and second")
+            }),
+            "{:?}",
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_create_whose_answer_was_lost_lands_once() {
         // Drive made the file, but its answer was lost. The retry found the
         // name taken by a node holding the file's bytes, which was not empty
@@ -1379,6 +1420,126 @@ mod tests {
             drive.tree()
         );
         assert!(!path.exists());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_deleted_after_a_restart_leaves_drive_with_what_its_create_sent() {
+        // Drive made the file with the bytes its create sent, but the answer
+        // was lost, and the file was written again. After a restart the file
+        // was deleted. The trash knew only the bytes the file held last, which
+        // were not the ones Drive had, so it left that file on Drive (B183).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-create-reply-restart-deleted");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+
+        let held = daemon.client.hold_reply_to_next_create();
+        daemon.client.lose_reply_to_next_create();
+        std::fs::write(&path, b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || held.reached()));
+        std::fs::write(&path, b"second").unwrap();
+        drop(held);
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon
+                .pending()
+                .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
+        }));
+        daemon.client.set_online(false);
+        let daemon = daemon.restart().unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        std::fs::remove_file(&path).unwrap();
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.tree().is_empty()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert!(!path.exists());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_renamed_after_its_create_lost_its_answer_lands_once() {
+        // Drive made the file, but the answer was lost, and the file was
+        // renamed before the retry. The retry looked for the file Drive made
+        // under the new name only, and made a second one there (B184).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-create-reply-renamed");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        daemon.client.lose_reply_to_next_create();
+        std::fs::write(daemon.mountpoint.join("f.txt"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon
+                .pending()
+                .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
+        }));
+        daemon.client.set_online(false);
+        std::fs::rename(
+            daemon.mountpoint.join("f.txt"),
+            daemon.mountpoint.join("g.txt"),
+        )
+        .unwrap();
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("g.txt").cloned() == file(b"first")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_renamed_and_deleted_after_its_create_lost_its_answer_leaves_nothing() {
+        // As above, and the file was deleted after the rename. The trash
+        // looked for the file Drive made under the last name only, and left
+        // it on Drive under the first (B184).
+        let drive = FakeDrive::new();
+        let dir = scratch("lost-create-reply-renamed-deleted");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        daemon.client.lose_reply_to_next_create();
+        std::fs::write(daemon.mountpoint.join("f.txt"), b"first").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon
+                .pending()
+                .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
+        }));
+        daemon.client.set_online(false);
+        std::fs::rename(
+            daemon.mountpoint.join("f.txt"),
+            daemon.mountpoint.join("g.txt"),
+        )
+        .unwrap();
+        std::fs::remove_file(daemon.mountpoint.join("g.txt")).unwrap();
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.tree().is_empty()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
 
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);

@@ -572,10 +572,6 @@ struct Core {
     /// Drive holds that name until the create lands and a rename or trash
     /// queued behind it frees it again.
     creating: Arc<Mutex<HashMap<i64, (NodeUid, String)>>>,
-    /// The SHA-1 of each blob an attempt at a queued create uploaded, by op
-    /// id. An attempt whose answer was lost may have made the file with bytes
-    /// a later write has since replaced in the op (`docs/BUGS.md` B156).
-    create_sent: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// The SHA-1 of the last revision this daemon uploaded to a file and could
     /// not read back, so its revision id is not known (`docs/BUGS.md` B157).
     sealed_unread: Arc<Mutex<HashMap<NodeUid, String>>>,

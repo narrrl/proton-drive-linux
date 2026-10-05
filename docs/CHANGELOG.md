@@ -11,9 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **41**. The queue table is rebuilt so an id is never given out twice; queued changes
-are kept. Queued changes get a column for the reason Drive refused them, and name their file
-and folder by local id as well as by Drive's id. Stored files and folders name their parent
+Schema: **42**. The queue table is rebuilt so an id is never given out twice; queued changes
+are kept. Queued changes get a column for the reason Drive refused them, and two for the
+content a new file was sent with and where, and name their file and folder by local id as well
+as by Drive's id. Stored files and folders name their parent
 folder by local id too. A file or folder made on this machine that Drive does not have yet goes
 by its local id, in the queue, the stored tree and pins alike.
 
@@ -96,6 +97,14 @@ by its local id, in the queue, the stored tree and pins alike.
 - **The daemon no longer hangs when a file being read changes on Drive** (B130).
 - **The Activity page says in your language why an edit was kept as a conflicting copy**,
   instead of the daemon's English (B181).
+- **A file written after a restart no longer lands as a conflict copy of itself** when the
+  connection dropped just as it first reached Drive (B182).
+- **A file deleted after a restart is removed from Drive too** when the connection lost Drive's
+  answer to its upload and the file was written again meanwhile. It no longer stayed there and
+  turned the next file under its name into a conflict copy (B183).
+- **A file renamed while the connection lost Drive's answer to its upload lands once.** It no
+  longer stayed on Drive under its old name too, or, when deleted, under its old name alone
+  (B184).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).
