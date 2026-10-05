@@ -478,6 +478,42 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns() {
+        // Only the drain met the outage, and it never took the mount offline:
+        // no probe saw the link come back, and the write sat out its backoff
+        // (B189).
+        let drive = FakeDrive::new();
+        let dir = scratch("short-outage");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::write(daemon.mountpoint.join("g.txt"), b"g").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty()) && drive.tree().len() == 1
+        }));
+
+        daemon.client.set_online(false);
+        std::fs::write(daemon.mountpoint.join("f.txt"), b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon
+                .pending()
+                .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
+        }));
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt")
+                        == Some(&Entry::File(Arc::new(b"0123456789".to_vec())))
+            }),
+            "{:?}",
+            daemon.pending()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_restart_does_not_bring_back_the_write_of_a_file_deleted_while_open() {
         // The bytes kept for the open handle outlived a restart, which queued
         // them again as a revision; the trash then landed and removed them, and

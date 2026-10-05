@@ -12,6 +12,25 @@ Conventions:
 
 ---
 
+## B189 — A change that failed on a short outage waits out its retry long after the link is back
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 2baad67 (`three_clients_one_writer_each`
+seed 6, every replay). A client's link was down for 0.3 s, during which it made a folder and a
+file. Their uploads failed once, and 4 s after the link came back they were still queued.
+
+**Where:** the failure path of `Core::run_pending_drain` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** Every syscall and the event poll take the mount offline when Drive does not answer,
+and the probe that brings it back makes every backed-off op due at once. The drain was the one
+caller that did not. An outage that only the drain met left the mount online, so nothing probed
+for the link's return, and the ops sat out a backoff that doubles with each failure, up to five
+minutes.
+
+**Fix.** A drain attempt that cannot reach Drive takes the mount offline like any other call.
+Test `a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns` in
+`crates/pdfs-fuse/src/sim/daemon.rs`.
+
 ## B188 — A restart can leave a queued write retrying forever on a file deleted while open
 
 **Status:** Fixed (unverified).

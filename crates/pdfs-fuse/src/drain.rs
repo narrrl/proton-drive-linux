@@ -432,6 +432,13 @@ impl Core {
                 {
                     debug!(uid = %op.uid, error = %e, "waking the ops waiting for a name failed");
                 }
+                // A drain that cannot reach Drive has lost the link as surely as
+                // a syscall that cannot. Unmarked, a short outage only the drain
+                // met had no probe to see the link return, and the op sat out
+                // its backoff long after (`docs/BUGS.md` B189).
+                if let Some(proton) = proton_error(e.as_ref()) {
+                    self.lost_link(proton, "drain");
+                }
                 // A failure to reach Drive says nothing about an earlier refusal,
                 // so it keeps the issue that refusal recorded.
                 if let Some(issue) = refusal(e.as_ref()) {
@@ -2654,12 +2661,16 @@ fn moved_elsewhere(meta: &RenameMeta, node: &Node, parent: &NodeUid, name: &str)
     !at(&meta.original_parent_uid, original_name) && !at(&parent.to_string(), name)
 }
 
+/// The answer from Drive somewhere in `e`'s chain, if it got that far.
+fn proton_error<'e>(e: &'e (dyn std::error::Error + 'static)) -> Option<&'e ProtonError> {
+    std::iter::successors(Some(e), |e| e.source()).find_map(|e| e.downcast_ref::<ProtonError>())
+}
+
 /// What a failed attempt says about its op's sync issue: `None` when Drive
 /// could not be reached, which says nothing; otherwise the issue Drive's answer
 /// is, or `Some(None)` for a failure that is not a refusal.
 fn refusal(e: &(dyn std::error::Error + 'static)) -> Option<Option<SyncIssue>> {
-    let proton = std::iter::successors(Some(e), |e| e.source())
-        .find_map(|e| e.downcast_ref::<ProtonError>())?;
+    let proton = proton_error(e)?;
     if is_network_error(proton) {
         return None;
     }
