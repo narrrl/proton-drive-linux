@@ -3902,6 +3902,11 @@ impl Core {
     /// staged bytes that never landed — which is precisely what deleting an
     /// un-uploaded file means, and the alternative (upload it, then trash it) is
     /// worse in every way.
+    ///
+    /// A file still open keeps the bytes its handle reads, the queued ones and
+    /// the cached ones, as when the trash is sent at once: a partial write
+    /// fills its gaps from them, offline too (`docs/BUGS.md` B186). The final
+    /// close or the trash landing, whichever comes last, lets go of them.
     fn queue_trash(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
         self.require_uid_writable(uid)?;
         // The bytes below are about to be discarded, and a drain worker may be
@@ -3917,7 +3922,18 @@ impl Core {
                 error!(%uid, error = %e, "queueing trash failed");
                 Errno::EIO
             })?;
-        self.release_dropped_ops(uid, blobs);
+        let open_now = self.is_open_anywhere(uid);
+        if open_now {
+            let read_from = self.pending_blob(uid);
+            self.release_dropped_below(
+                blobs
+                    .into_iter()
+                    .filter(|blob| read_from.as_deref() != Some(Path::new(blob)))
+                    .collect(),
+            );
+        } else {
+            self.release_dropped_ops(uid, blobs);
+        }
         self.hidden.lock().insert(uid.clone());
         // Withdrawn from the tree, which every mount serves from, so no other
         // mount goes on serving a file the user just trashed (`docs/BUGS.md`
@@ -3925,8 +3941,10 @@ impl Core {
         self.for_each_state(|st| {
             st.unlink_mem(uid);
         });
-        self.cache.evict(uid);
-        self.evict_reader(uid);
+        if !open_now {
+            self.cache.evict(uid);
+            self.evict_reader(uid);
+        }
         self.wake_drain();
         debug!(%uid, name, "trashed offline; queued");
         Ok(())

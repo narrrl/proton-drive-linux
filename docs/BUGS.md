@@ -12,6 +12,25 @@ Conventions:
 
 ---
 
+## B186 — A file deleted offline while open fails a partial write with "Input/output error"
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 3073052 (`three_clients_one_writer_each`
+seed 4; it fails on da013c2 too). With its link down, a client opened a file it had uploaded,
+deleted it, and appended to it. The append took 30 s and failed with `EIO`.
+
+**Where:** `Core::queue_trash` in `crates/pdfs-fuse/src/lib.rs` and `Core::drain_trash` in
+`crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A delete sent to Drive at once keeps what an open handle reads, its queued and cached
+bytes, until the final close (B106). A delete queued, as local-first and offline do, dropped
+them at once. A partial write fills its gaps from those bytes, so it had to download the file,
+and offline it could not.
+
+**Fix.** A queued delete of an open file keeps them as well. The final close lets go of them
+once the delete has landed, and the delete landing lets go of them once the file is closed.
+Sim test `a_file_deleted_offline_while_open_still_reads_and_takes_writes`.
+
 ## B185 — A new file written again just as it starts uploading waits out a retry
 
 **Status:** Fixed (unverified).

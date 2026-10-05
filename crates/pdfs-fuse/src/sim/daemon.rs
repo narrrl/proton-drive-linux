@@ -425,6 +425,59 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_deleted_offline_while_open_still_reads_and_takes_writes() {
+        // Queuing the trash dropped the cached bytes the open handle reads,
+        // and a partial write offline failed with EIO (B186).
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let drive = FakeDrive::new();
+        let dir = scratch("unlink-open-offline");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.tree().get("f.txt") == Some(&Entry::File(Arc::new(b"0123456789".to_vec())))
+        }));
+        daemon.client.set_online(false);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"ab").unwrap();
+        let mut read = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"0123456789ab");
+        drop(file);
+
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty()) && drive.tree().is_empty()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        // The bytes kept for the handle went once the trash landed with it closed.
+        let cached: Vec<_> = std::fs::read_dir(dir.join("cache"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(cached.is_empty(), "{cached:?}");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_write_opened_as_an_upload_lands_takes_the_landed_revision_as_its_base() {
         // An upload landed and the drain let go of its blob before the tree had
         // the node. A partial write opened in between took the revision the

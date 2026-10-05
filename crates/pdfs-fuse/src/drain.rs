@@ -994,6 +994,17 @@ impl Core {
             Err(e) => return Err(e.into()),
         }
         self.retire_trash_op(op, &uid)?;
+        // A file trashed while open kept the bytes its handle reads, and a
+        // final close while the trash was queued left them to this
+        // (`docs/BUGS.md` B186).
+        if !self.is_open_anywhere(&uid) {
+            if let Some(blob) = self.pending_blob(&uid) {
+                self.release_pending(&uid, &blob);
+                self.cache.discard_staged(&blob);
+            }
+            self.cache.evict(&uid);
+            self.evict_reader(&uid);
+        }
         if let Err(e) = self.db.clear_own_sealed_rev(&uid.to_string()) {
             debug!(%uid, error = %e, "clearing the sealed-revision record failed");
         }
