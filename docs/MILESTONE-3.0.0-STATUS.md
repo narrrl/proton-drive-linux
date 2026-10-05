@@ -9,7 +9,7 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
 - **Phase 2**: local ids, inode = local id, one tree for every mount (2.10.0).
 - **Phase 3, first part**: mkdir, create, rename, unlink and rmdir on the mount are recorded
   locally and sent from the queue; `"local_first": false` brings back the old path (5e0f30c).
-- Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B189.
+- Fixes from the simulation and account runs since then: B125, B127, B130 and B141 to B190.
 - **Sync issues, first cut** (§6.2): refusals sorted into issues, shown at once in the app,
   tray and CLI; Export button and `pdfs sync export`; `pdfs sync issues`; Discard button and
   `pdfs sync discard`; a warning badge on the node in the file browser.
@@ -115,7 +115,8 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          while open that lost the bytes its handle read (B186, fixed; older than 3.0.0).
          The run on 2baad67 found that a restart before such a file's trash went out queued
          its kept bytes again, for good (B188, fixed), and changes that sat out their retry
-         after an outage only the drain had met (B189, fixed; older than 3.0.0).
+         after an outage only the drain had met (B189, fixed; older than 3.0.0), and a file
+         saved just before a stop whose release the stop dropped (B190, fixed; older too).
    - [ ] A clean account run. The one on a6f36d5 (2026-10-04, LAN: 427 passed, 12 failed)
          failed B113 and B121 on every on-demand mount, two mirror-to-mirror move cases, and
          the journal check. B121 was a bug (B149, fixed); B113's case still expected creates

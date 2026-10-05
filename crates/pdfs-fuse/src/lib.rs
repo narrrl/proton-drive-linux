@@ -3281,6 +3281,42 @@ impl Core {
             .filter(|uid| !is_local_uid(uid))
     }
 
+    /// Queue what the write handles the kernel never released hold.
+    ///
+    /// `close(2)` returns before the kernel sends `release`, and the stop
+    /// aborts the FUSE connection with the releases still queued: a file a
+    /// program had just saved was never queued, and Drive kept it as it was
+    /// (`docs/BUGS.md` B190). Runs once every session has ended, so no release
+    /// can race it. A handle still open in a program goes the same way, with
+    /// what it wrote so far; one on an unlinked file only leaves its scratch.
+    pub(crate) fn queue_unreleased_writes(&self) {
+        let handles: Vec<(WriteHandle, bool)> = {
+            let mut st = self.state();
+            st.handles.clear();
+            let inos: Vec<u64> = st.active_writes.keys().copied().collect();
+            inos.into_iter()
+                .filter_map(|ino| {
+                    let unlinked = st.entries.get(&ino).is_some_and(|e| e.unlinked);
+                    st.active_writes.remove(&ino).map(|h| (h, unlinked))
+                })
+                .collect()
+        };
+        for (mut h, unlinked) in handles {
+            if unlinked {
+                self.cache.clear_scratch_durable(&h.path);
+                let _ = std::fs::remove_file(&h.path);
+                continue;
+            }
+            self.follow_landed_create(&mut h);
+            match self.queue_revision(&mut h) {
+                Ok(()) => info!(uid = %h.uid, "queued a write the kernel never released"),
+                Err(error) => {
+                    warn!(uid = %h.uid, ?error, "cannot queue a write the kernel never released")
+                }
+            }
+        }
+    }
+
     /// Accept a released write handle's bytes and queue their upload
     /// (offline.md Phase 3).
     ///

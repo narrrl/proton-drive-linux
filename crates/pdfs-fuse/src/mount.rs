@@ -750,6 +750,7 @@ pub(crate) fn mount_with(
             warn!(id, error = %e, "unmount on-demand folder failed");
         }
     }
+    core.queue_unreleased_writes();
 
     // Last, because the workers may legitimately be finishing an upload, and
     // nothing they can still do is harmful once the mounts are down.

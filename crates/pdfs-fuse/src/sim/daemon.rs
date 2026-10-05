@@ -478,6 +478,37 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_stop_keeps_what_a_handle_wrote_before_its_release() {
+        // close(2) returns before the kernel sends the release, and the stop
+        // aborted the connection with the release still queued: the bytes of a
+        // file just saved were never queued, and Drive kept it empty (B190).
+        // A handle still open at the stop is the same case, held open.
+        use std::io::Write;
+        let drive = FakeDrive::new();
+        let dir = scratch("stop-before-release");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mut file = std::fs::File::create(daemon.mountpoint.join("f.txt")).unwrap();
+        file.write_all(b"0123456789").unwrap();
+
+        let daemon = daemon.restart().unwrap();
+        drop(file);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt")
+                        == Some(&Entry::File(Arc::new(b"0123456789".to_vec())))
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_write_that_failed_on_a_short_outage_goes_out_soon_after_the_link_returns() {
         // Only the drain met the outage, and it never took the mount offline:
         // no probe saw the link come back, and the write sat out its backoff

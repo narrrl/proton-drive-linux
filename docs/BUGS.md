@@ -12,6 +12,27 @@ Conventions:
 
 ---
 
+## B190 — A file saved just before the daemon stops can keep its old content on Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 2baad67 (`one_client_on_a_flaky_link` seed 9,
+about one run in three). A client wrote a 32-byte file and closed it, and the daemon was
+restarted at once. Drive held the file empty, and nothing was queued.
+
+**Where:** the stop in `crates/pdfs-fuse/src/mount.rs`, and `Core::queue_unreleased_writes` in
+`crates/pdfs-fuse/src/lib.rs`.
+
+**Cause.** `close(2)` returns before the kernel sends `release`, and the release is what queues
+a handle's bytes. The stop aborts the FUSE connection so that the unmount cannot hang, and the
+abort drops the requests the kernel still has queued. A release among them never reached the
+daemon. The file's create went out with what it held before the write, and the bytes went with
+the handle's scratch file. A handle a program still held open at the stop lost what it had
+written in the same way.
+
+**Fix.** Once every session has ended, the stop queues each write handle the kernel never
+released, as its release would have. Test `a_stop_keeps_what_a_handle_wrote_before_its_release`
+in `crates/pdfs-fuse/src/sim/daemon.rs`.
+
 ## B189 — A change that failed on a short outage waits out its retry long after the link is back
 
 **Status:** Fixed (unverified).

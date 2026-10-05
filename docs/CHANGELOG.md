@@ -113,6 +113,8 @@ by its local id, in the queue, the stored tree and pins alike.
   (B187).
 - **Changes that failed during a short outage go out soon after the connection is back**, not
   after a retry delay of up to five minutes (B189).
+- **A file saved just before the daemon stops reaches Drive** with what was written. It could
+  keep its old content, or stay empty (B190).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).
