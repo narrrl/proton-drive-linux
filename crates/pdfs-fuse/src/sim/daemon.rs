@@ -1738,6 +1738,58 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_withdrawn_create_leaves_the_file_renamed_to_the_name_it_was_sent_under() {
+        // A create was sent as d and refused, the file renamed to q, and an
+        // empty file of the user's renamed to d. Deleting q left a trash that
+        // looked for what the create may have made under d, took the user's
+        // empty file for it and trashed it (B193).
+        let drive = FakeDrive::new();
+        let dir = scratch("withdrawn-create-renamed-over");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mnt = daemon.mountpoint.clone();
+        let empty = Some(Entry::File(Arc::new(Vec::new())));
+
+        std::fs::write(mnt.join("e.md"), b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("e.md").cloned() == empty
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        drive.set_quota(0);
+        std::fs::write(mnt.join("d"), b"refused").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon
+                .pending()
+                .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
+        }));
+        std::fs::rename(mnt.join("d"), mnt.join("q")).unwrap();
+        std::fs::rename(mnt.join("e.md"), mnt.join("d")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().get("d").cloned() == empty
+        }));
+        std::fs::remove_file(mnt.join("q")).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+            }),
+            "{:?}",
+            daemon.pending()
+        );
+        let tree = drive.tree();
+        assert_eq!(tree.get("d").cloned(), empty, "{tree:?}");
+        assert_eq!(tree.len(), 1, "{tree:?}");
+        assert_eq!(std::fs::read(mnt.join("d")).unwrap(), b"");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_made_under_the_name_of_a_create_on_the_wire_waits_for_it() {
         // A file renamed while its create was on the wire, and a new one made
         // under its old name. The new file's create found the name held by the

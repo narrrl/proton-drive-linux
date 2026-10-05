@@ -1081,12 +1081,20 @@ impl Core {
                 Err(e) => return Err(e.into()),
             };
         let children = self.block_on_bounded(self.drive.enumerate_nodes_light(&uids))?;
+        // As for a create's own twin (`Core::adoptable_twin`): a node this
+        // mount trashed is not one, and a node in the tree was answered for.
+        // A file of the user's renamed to the name the create was sent under
+        // was taken for it, and trashed (`docs/BUGS.md` B193).
+        let hidden = self.hidden.lock().clone();
         let Some(twin) = children
             .into_iter()
-            .find(|node| node.name == name && !node.trashed)
+            .find(|node| node.name == name && !node.trashed && !hidden.contains(&node.uid))
         else {
             return Ok(None);
         };
+        if self.state().by_uid.contains_key(&twin.uid) {
+            return Ok(None);
+        }
         let queued = twin.uid.to_string();
         for kind in [OP_RENAME, OP_REVISION, OP_TRASH] {
             if self.db.has_pending_op(&queued, kind)? {

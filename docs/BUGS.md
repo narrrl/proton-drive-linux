@@ -12,6 +12,29 @@ Conventions:
 
 ---
 
+## B193 — Deleting a file whose create failed can trash a file of the user's on Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 1436c5f (`one_client_on_a_flaky_link` seed 6;
+no replay reproduced it). A file renamed over `y/y/d`, then emptied, was gone from Drive and
+from the local database, with nothing queued. The run kept no log. The path below explains it,
+and the test reproduces that path every time.
+
+**Where:** `Core::withdrawn_twin_in` in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A delete turns a create that was sent into a trash of what it may have made, under a
+name it was sent with (B151, B184). The drain looks there for a node made in the last two
+minutes that holds bytes the create sent, or none. It did not leave out a node in the tree, so
+an empty file of the user's renamed to that name matched, and was trashed. A create's own search
+for its twin (`Core::adoptable_twin`) already left such a node out, and nodes this mount trashed
+(B162).
+
+**Fix.** The trash's search leaves out the same nodes. A file a lost answer made that a listing
+has since put in the tree stays on Drive, where the user can see and delete it.
+
+**Test:** simulation test `a_withdrawn_create_leaves_the_file_renamed_to_the_name_it_was_sent_under`
+(failed before the fix: Drive was empty).
+
 ## B192 — A new file closed empty reaches Drive only half a minute later
 
 **Status:** Fixed.
