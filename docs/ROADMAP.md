@@ -1,14 +1,41 @@
 # Roadmap
 
-Planned work and open verification, as of 2.5.0. Individual defects and their status live in
+Planned work and open verification, as of 3.0.0. Individual defects and their status live in
 [BUGS.md](BUGS.md), which is the authoritative ledger; this page groups what is left by theme.
 Nothing here is a promise of a date.
 
+- [Sync engine](#sync-engine)
 - [Data safety and recovery](#data-safety-and-recovery)
 - [Features](#features)
 - [Performance and correctness](#performance-and-correctness)
 - [Verification still owed](#verification-still-owed)
 - [Release assurance](#release-assurance)
+
+## Sync engine
+
+3.0.0 records changes made through the mount locally and sends them from the queue
+([MILESTONE-3.0.0.md](MILESTONE-3.0.0.md)). What comes after it:
+
+| Item | State | Notes |
+|---|---|---|
+| Remove the online path | Not started | The old way of sending a change before the syscall returns, and the `local_first` switch that brings it back, go in the release after 3.0.0 |
+| One applier for remote changes | Not started | Phase 4 of the milestone: a remote tree, and remote changes applied through the same planner as local ones |
+| Synced folders on the queue | Not started | Phase 5: synced folders sent by the same planner and executor as the mount |
+| Batch trashes and moves | Deferred | See below |
+
+**Batching trashes and moves.** `trash_nodes` and `move_nodes_streaming` take up to 150 nodes per
+call, but the queue still sends one node per call. It was left out of 3.0.0 on purpose:
+
+- The speed target of the milestone (§7) is met without it. Making 1,000 files in 100 folders
+  takes 5.2 s on a LAN and 5.0 s on Wi-Fi.
+- What the queue spends its time on is the creates. Each one waits for Drive to list the new node
+  before it counts as landed (250 ms, then 1 s), and batching does not help with that.
+- Sending many ops in one call means splitting one answer back into many results. Races in
+  exactly that step were the largest class of bugs found for 3.0.0 (B15x to B17x).
+
+Before building it, measure `rm -r` of a folder with 1,000 files on Wi-Fi. If that is slow, the
+cheaper fix is to drop the queued trashes of the files in a folder when the folder itself is
+trashed, since trashing the folder takes its contents with it.
 
 ## Data safety and recovery
 

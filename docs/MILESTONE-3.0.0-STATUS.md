@@ -77,6 +77,9 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
          target; the drain takes 47 s on LAN and 247 s on Wi-Fi. Most of a create on Wi-Fi is
          its read-back waiting for Drive to list the new node (250 ms, then 1 s), so batching
          (step 8) helps trashes and moves, not creates.
+   - [x] Batched trashes and moves: left for after 3.0.0 (see below). The target is met
+         without them, the drain waits on the creates' read-back, and splitting one answer into
+         many results is where the B15x to B17x races lived.
 4. **Done-when checks**:
    - [ ] Simulation passes on the Wi-Fi profile: `one_client_on_a_slow_link` failed in CI on
          seeds 2 and 3. Two bugs (B127, B151) and a harness gap: a settle did not read the log, so
@@ -155,6 +158,12 @@ Tracks `docs/MILESTONE-3.0.0.md`. Update it with every commit that moves a phase
   3.0.0).
 - **Phase 4**: one applier for remote changes.
 - **Phase 5**: mirror folders on the same planner and executor.
+- **Batched trashes and moves** (plan step 8). Not needed for the §7 target: the syscalls take
+  5.2 s on LAN and 5.0 s on Wi-Fi. The drain's time goes to the creates' read-back (250 ms,
+  then 1 s each), which batching does not shorten. A batch call answers for many ops at once,
+  and splitting that answer back per op is the step the B15x to B17x races came from. First
+  measure `rm -r` of 1,000 files on Wi-Fi. If it is slow, drop the queued trashes of a trashed
+  folder's children before batching anything: trashing the folder takes them with it.
 - **Any time**: `Size` and block geometry as types; a deadline on the remote calls outside
   the drain (the drain's have one: `link::upload_deadline`, `Core::block_on_within`).
 - Open questions in §12 of the milestone.

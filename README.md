@@ -38,8 +38,9 @@ scriptable CLI.
 - **Synced folders.** Back up folders such as `~/Documents` under your computer in Proton Drive,
   as a full two-way copy or online only. Gitignore-style `.pdfsignore` rules, conflict copies
   instead of overwrites, pause and bandwidth limits.
-- **Safe writes.** Changes are staged on disk and queued before they are acknowledged, so they
-  survive a lost connection, a crash or a reboot and upload when they can.
+- **Works at local speed.** Making, renaming and deleting files and folders returns at once, online
+  or offline. Changes are staged on disk and queued before they are acknowledged, so they survive
+  a lost connection, a crash or a reboot and reach Drive when they can.
 
 **Desktop app**
 
@@ -50,7 +51,8 @@ scriptable CLI.
 - **Sharing.** Invite people as viewer, editor or admin, create public links with password and
   expiry, accept invitations.
 - **Sync overview.** What is uploading, what is waiting, what failed and why, and a history of
-  what happened.
+  what happened. A change Drive refuses (storage full, access taken away) shows at once, on the
+  file too, and can be exported or discarded.
 - **Tray icon** with status, pause and quick actions, and a **search launcher** (`pdfs-prompt`)
   that searches Proton Drive and your home folder together, as its own window, through fuzzel,
   rofi or wofi, or live in `fzf`.
