@@ -105,6 +105,8 @@ by its local id, in the queue, the stored tree and pins alike.
 - **A file renamed while the connection lost Drive's answer to its upload lands once.** It no
   longer stayed on Drive under its old name too, or, when deleted, under its old name alone
   (B184).
+- **A new file written again just as it starts uploading no longer waits out a retry** before
+  it reaches Drive (B185).
 - **A file renamed just as its upload finished keeps its new name.** The mount no longer showed
   the old name, and a second rename no longer failed with "No such file or directory" (B152,
   B172).

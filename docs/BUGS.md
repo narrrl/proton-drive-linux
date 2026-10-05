@@ -12,6 +12,25 @@ Conventions:
 
 ---
 
+## B185 — A new file written again just as it starts uploading waits out a retry
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-05, in the confirmation run on 3073052 (`one_client_on_a_good_link` seed 6,
+then `one_client_deleting_files_as_they_upload` seed 4). The queues did not drain in time: a
+create had failed with "No such file or directory" and was backing off.
+
+**Where:** `Db::retry_if_retargeted` in `crates/pdfs-core/src/db/ops.rs`, called from the drain
+in `crates/pdfs-fuse/src/drain.rs`.
+
+**Cause.** A write to a file whose create is queued attaches a new blob to the create and
+discards the old one at once. An attempt that had claimed the create but not yet opened the old
+blob failed on a file that was gone, and backed off as if Drive had refused it. The new blob was
+ready, but the create waited out the backoff.
+
+**Fix.** A failed create whose blob was replaced while it ran is due again at once, the way one
+renamed while it ran already was. Test `renaming_a_backing_off_create_makes_it_due` in
+`crates/pdfs-core/src/db/tests.rs`.
+
 ## B184 — A file renamed after its create lost its answer stays on Drive under its old name
 
 **Status:** Fixed (unverified).

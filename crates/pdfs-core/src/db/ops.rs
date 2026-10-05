@@ -1477,22 +1477,28 @@ impl Db {
     /// Make a create due again if it was renamed or moved
     /// ([`Db::rewrite_op_target`]) while the attempt that just failed was on
     /// the wire, `parent_uid` and `name` being what that attempt sent. What it
-    /// failed on may have been the target it no longer has. Returns whether it
+    /// failed on may have been the target it no longer has. Likewise if a
+    /// write replaced its blob (`blob_path` being the one the attempt read):
+    /// the old one is discarded as the new one attaches, and an attempt that
+    /// had not opened it yet failed on a file that is gone. Returns whether it
     /// was.
     pub fn retry_if_retargeted(
         &self,
         id: i64,
         parent_uid: Option<&str>,
         name: Option<&str>,
+        blob_path: Option<&str>,
     ) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
             &format!(
                 "UPDATE pending_op SET next_attempt_at = 0
                  WHERE id = ?1 AND kind IN (?4, ?5) AND next_attempt_at < ?6
-                   AND ({PARENT_NOW} IS NOT ?2 OR name IS NOT ?3)"
+                   AND ({PARENT_NOW} IS NOT ?2 OR name IS NOT ?3 OR blob_path IS NOT ?7)"
             ),
-            params![id, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL],
+            params![
+                id, parent_uid, name, OP_CREATE, OP_MKDIR, PARK_UNTIL, blob_path
+            ],
         )?;
         Ok(n > 0)
     }

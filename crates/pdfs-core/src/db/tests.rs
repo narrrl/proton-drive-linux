@@ -2969,7 +2969,8 @@ fn renaming_a_queued_create_rewrites_its_target() {
 
 /// A create that failed on a name held by a queued change waits out a
 /// backoff. Renamed away from that name, it is due again at once; parked, it
-/// stays parked.
+/// stays parked. One whose blob a write replaced as it failed is due again at
+/// once too.
 #[test]
 fn renaming_a_backing_off_create_makes_it_due() {
     let db = Db::open_in_memory().unwrap();
@@ -3011,8 +3012,13 @@ fn renaming_a_backing_off_create_makes_it_due() {
     db.record_op_failure(sent.id, "d is still held", 10_000)
         .unwrap();
     assert!(
-        db.retry_if_retargeted(sent.id, sent.parent_uid.as_deref(), sent.name.as_deref())
-            .unwrap()
+        db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            sent.name.as_deref(),
+            sent.blob_path.as_deref()
+        )
+        .unwrap()
     );
     let ops = db.pending_ops().unwrap();
     assert_eq!(
@@ -3023,8 +3029,42 @@ fn renaming_a_backing_off_create_makes_it_due() {
         0
     );
     assert!(
-        !db.retry_if_retargeted(sent.id, sent.parent_uid.as_deref(), Some("f"))
-            .unwrap()
+        !db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            Some("f"),
+            sent.blob_path.as_deref()
+        )
+        .unwrap()
+    );
+
+    // A write replaced the blob before the attempt opened it: the old one was
+    // discarded, the attempt failed on a missing file, and the create is due
+    // again at once with the new one (`docs/BUGS.md` B185).
+    db.record_op_failure(sent.id, "No such file or directory", 10_000)
+        .unwrap();
+    db.attach_blob_to_create("local~failed", "/staging/newer", "{}")
+        .unwrap()
+        .expect("the create is still queued");
+    db.record_op_failure(sent.id, "No such file or directory", 10_000)
+        .unwrap();
+    assert!(
+        db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            Some("f"),
+            sent.blob_path.as_deref()
+        )
+        .unwrap()
+    );
+    assert!(
+        !db.retry_if_retargeted(
+            sent.id,
+            sent.parent_uid.as_deref(),
+            Some("f"),
+            Some("/staging/newer")
+        )
+        .unwrap()
     );
 }
 

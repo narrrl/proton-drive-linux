@@ -441,9 +441,10 @@ impl Core {
                     op.id,
                     op.parent_uid.as_deref(),
                     op.name.as_deref(),
+                    op.blob_path.as_deref(),
                 ) {
                     Ok(true) => {
-                        debug!(uid = %op.uid, "create was renamed while it failed; retrying")
+                        debug!(uid = %op.uid, "create was renamed or rewritten while it failed; retrying")
                     }
                     Ok(false) => {}
                     Err(e) => {
