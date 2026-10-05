@@ -11,6 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-05
+
 Schema: **42**. The queue table is rebuilt so an id is never given out twice; queued changes
 are kept. Queued changes get a column for the reason Drive refused them, and two for the
 content a new file was sent with and where, and name their file and folder by local id as well
@@ -1596,6 +1598,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[3.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.0.0
 
 [2.10.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.10.0
 [2.9.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v2.9.0
