@@ -1,0 +1,156 @@
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1920" y2="1080" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1A1240"/>
+      <stop offset="1" stop-color="#0A0618"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="1390" cy="520" r="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6D4AFF" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#6D4AFF" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#6D4AFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="160" cy="1080" r="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A855F7" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#A855F7" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.6" fill="#FFFFFF"/>
+    </pattern>
+    <radialGradient id="dotfade" cx="1390" cy="520" r="900" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="dotmask" maskUnits="userSpaceOnUse" x="0" y="0" width="1920" height="1080">
+      <rect width="1920" height="1080" fill="url(#dotfade)"/>
+    </mask>
+    <linearGradient id="title2" x1="140" y1="0" x2="760" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#C9BBFF"/>
+      <stop offset="1" stop-color="#8A6CFF"/>
+    </linearGradient>
+
+    <!-- app logo -->
+    <linearGradient id="pdl-face" x1="12" y1="12" x2="116" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A48BFF"/>
+      <stop offset="0.55" stop-color="#7552FF"/>
+      <stop offset="1" stop-color="#5B36F2"/>
+    </linearGradient>
+    <linearGradient id="pdl-cloud" x1="0" y1="34" x2="0" y2="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#ECE6FF"/>
+    </linearGradient>
+    <mask id="pdl-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128">
+      <g fill="#FFFFFF">
+        <circle cx="66" cy="57" r="23"/>
+        <circle cx="42" cy="68" r="16"/>
+        <circle cx="88" cy="69" r="15"/>
+        <rect x="26" y="68" width="77" height="20" rx="10"/>
+      </g>
+      <g stroke="#000000" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round" fill="none">
+        <path d="M64 49v26"/>
+        <path d="M54.5 65.5l9.5 9.5 9.5-9.5"/>
+      </g>
+    </mask>
+    <filter id="logoshadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <filter id="chipshadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+
+  <!-- background -->
+  <rect width="1920" height="1080" fill="url(#bg)"/>
+  <rect width="1920" height="1080" fill="url(#glow2)"/>
+  <rect width="1920" height="1080" fill="url(#glow1)"/>
+  <rect width="1920" height="1080" fill="url(#dots)" opacity="0.07" mask="url(#dotmask)"/>
+
+  <!-- orbit rings -->
+  <g fill="none" stroke="#FFFFFF">
+    <circle cx="1390" cy="520" r="300" stroke-opacity="0.10" stroke-width="2"/>
+    <circle cx="1390" cy="520" r="420" stroke-opacity="0.06" stroke-width="2" stroke-dasharray="4 14" stroke-linecap="round"/>
+  </g>
+
+  <!-- logo, 128 -> 384 -->
+  <g transform="translate(1198 328) scale(3)">
+    <rect x="16" y="24" width="96" height="92" rx="24" fill="#2A1080" opacity="0.8" filter="url(#logoshadow)"/>
+    <rect x="12" y="16" width="104" height="100" rx="26" fill="#4424C0"/>
+    <rect x="12" y="12" width="104" height="100" rx="26" fill="url(#pdl-face)"/>
+    <rect x="12.5" y="12.5" width="103" height="99" rx="25.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.2"/>
+    <rect y="3" width="128" height="128" fill="#2E1596" fill-opacity="0.3" mask="url(#pdl-cut)"/>
+    <rect width="128" height="128" fill="url(#pdl-cloud)" mask="url(#pdl-cut)"/>
+  </g>
+
+  <!-- feature chips around the logo -->
+  <g font-family="Adwaita Sans" font-size="26" font-weight="600" fill="#FFFFFF">
+    <!-- folder, top left -->
+    <g transform="translate(1000 200)">
+      <rect x="0" y="10" width="236" height="76" rx="22" fill="#000000" opacity="0.35" filter="url(#chipshadow)"/>
+      <rect x="0" y="0" width="236" height="76" rx="22" fill="#2A2058" fill-opacity="0.85" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+      <g transform="translate(22 20)">
+        <rect width="36" height="36" rx="10" fill="#6D4AFF"/>
+        <path d="M8 13a2 2 0 0 1 2-2h5l2.5 2.5H26a2 2 0 0 1 2 2V25a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2z" fill="#FFFFFF"/>
+      </g>
+      <text x="74" y="47">On demand</text>
+    </g>
+    <!-- sync, top right -->
+    <g transform="translate(1590 290)">
+      <rect x="0" y="10" width="164" height="76" rx="22" fill="#000000" opacity="0.35" filter="url(#chipshadow)"/>
+      <rect x="0" y="0" width="164" height="76" rx="22" fill="#2A2058" fill-opacity="0.85" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+      <g transform="translate(22 20)">
+        <rect width="36" height="36" rx="10" fill="#1EA885"/>
+        <g fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M26 15a8.5 8.5 0 0 0-15-2"/>
+          <path d="M10 9v4.5h4.5"/>
+          <path d="M10 21a8.5 8.5 0 0 0 15 2"/>
+          <path d="M26 27v-4.5h-4.5"/>
+        </g>
+      </g>
+      <text x="74" y="47">Sync</text>
+    </g>
+    <!-- photos, bottom right -->
+    <g transform="translate(1560 690)">
+      <rect x="0" y="10" width="206" height="76" rx="22" fill="#000000" opacity="0.35" filter="url(#chipshadow)"/>
+      <rect x="0" y="0" width="206" height="76" rx="22" fill="#2A2058" fill-opacity="0.85" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+      <g transform="translate(22 20)">
+        <rect width="36" height="36" rx="10" fill="#E8618C"/>
+        <rect x="8" y="9" width="20" height="18" rx="3" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>
+        <circle cx="14" cy="15" r="2" fill="#FFFFFF"/>
+        <path d="M9.5 25l6-6 4 4 3-3 4 4" fill="none" stroke="#FFFFFF" stroke-width="2.4" stroke-linejoin="round"/>
+      </g>
+      <text x="74" y="47">Photos</text>
+    </g>
+    <!-- terminal, bottom left -->
+    <g transform="translate(980 790)">
+      <rect x="0" y="10" width="206" height="76" rx="22" fill="#000000" opacity="0.35" filter="url(#chipshadow)"/>
+      <rect x="0" y="0" width="206" height="76" rx="22" fill="#2A2058" fill-opacity="0.85" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+      <g transform="translate(22 20)">
+        <rect width="36" height="36" rx="10" fill="#3B3F5C"/>
+        <path d="M9 12l6 6-6 6" fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M18 25h9" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round"/>
+      </g>
+      <text x="74" y="48" font-family="JetBrainsMono NF" font-size="25" font-weight="700">pdfs</text>
+      <text x="150" y="48" font-weight="500" fill="#B9B0D9">CLI</text>
+    </g>
+  </g>
+
+  <!-- text block -->
+  <g font-family="Adwaita Sans">
+    <g transform="translate(140 292)">
+      <rect width="410" height="48" rx="24" fill="#6D4AFF" fill-opacity="0.18" stroke="#8A6CFF" stroke-opacity="0.6" stroke-width="1.5"/>
+      <circle cx="28" cy="24" r="6" fill="#A48BFF"/>
+      <text x="46" y="32" font-size="21" font-weight="700" letter-spacing="2.4" fill="#D6CCFF">UNOFFICIAL · OPEN SOURCE</text>
+    </g>
+    <text x="134" y="478" font-size="124" font-weight="800" letter-spacing="-3" fill="#FFFFFF">Proton Drive</text>
+    <text x="134" y="610" font-size="124" font-weight="800" letter-spacing="-3" fill="url(#title2)">for Linux</text>
+    <text x="140" y="702" font-size="38" font-weight="400" fill="#B9B0D9">Your Drive as a folder, and a native GTK4 app.</text>
+    <text x="140" y="752" font-size="38" font-weight="400" fill="#B9B0D9">No Electron.</text>
+  </g>
+
+  <!-- footer -->
+  <g font-family="JetBrainsMono NF" font-size="24" fill="#8C83B0">
+    <text x="140" y="968">github.com/narrrl/proton-drive-linux</text>
+  </g>
+  <g font-family="Adwaita Sans" font-size="22" fill="#6F6894">
+    <text x="1780" y="968" text-anchor="end">Not affiliated with Proton AG</text>
+  </g>
+</svg>
