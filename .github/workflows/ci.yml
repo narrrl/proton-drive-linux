@@ -64,7 +64,7 @@ jobs:
   # Real Proton credentials and /dev/fuse deliberately do not run on pull
   # requests. Follow docs/TESTING.md on a dedicated test-account runner.
 
-  # The seeded simulation runs (docs/MILESTONE-3.0.0.md §8.2): real FUSE
+  # The seeded simulation runs (docs/TESTING.md): real FUSE
   # daemons against an in-memory Drive, so they need /dev/fuse but no account.
   simulation:
     if: github.event_name != 'pull_request'

@@ -1168,8 +1168,8 @@ const MIGRATION_V35: &str = "
 ALTER TABLE trash ADD COLUMN trashed_at INTEGER;
 ";
 
-/// Schema v36: every node row has a local id (`lid`), phase 2 of
-/// docs/MILESTONE-3.0.0.md.
+/// Schema v36: every node row has a local id (`lid`); see
+/// docs/ARCHITECTURE.md §2.
 ///
 /// The `uid` was the row's key, so a node had no identity until Drive minted
 /// one, and a create that landed moved its row to a new key. The `lid` is given

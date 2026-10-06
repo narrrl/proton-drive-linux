@@ -31,7 +31,7 @@ the interesting boundaries are:
   or the wrong key material to Proton.
 
 What the client deliberately keeps in plaintext on disk, and why, is documented in the
-[threat model](docs/ARCHITECTURE.md#8-threat-model-what-this-client-writes-to-disk-in-plaintext).
+[threat model](docs/ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
 Behaviour described there is known and not a vulnerability by itself; a way to make it worse
 than described is.
 

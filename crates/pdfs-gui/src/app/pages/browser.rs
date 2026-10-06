@@ -832,8 +832,8 @@ fn show_location_column(ui: &Rc<Ui>, visible: bool) {
     }
 }
 
-/// The menu for one entry, in the order of `docs/UI_UX_PLAN.md` §6: open,
-/// offline, sharing, organising, and the destructive item last on its own.
+/// The menu for one entry, in a fixed order: open, offline, sharing,
+/// organising, and the destructive item last on its own.
 pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     let mut menu = ActionMenu::new();
     let (ui_c, entry_c) = (ui.clone(), entry.clone());

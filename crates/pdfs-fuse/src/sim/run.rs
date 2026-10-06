@@ -1,4 +1,4 @@
-//! The simulation runs of `docs/MILESTONE-3.0.0.md` §8.2.
+//! The simulation runs described in `docs/TESTING.md`.
 //!
 //! A run starts one or more daemons on a shared [`FakeDrive`], each owning a
 //! folder `c<n>` that only it writes, so there is one writer per file. A seed

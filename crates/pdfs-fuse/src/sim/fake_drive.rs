@@ -1,4 +1,4 @@
-//! An in-memory Drive for the simulation tests (`docs/MILESTONE-3.0.0.md` §8.1).
+//! An in-memory Drive for the simulation tests (`docs/TESTING.md`).
 //!
 //! [`FakeDrive`] is the server: one tree of nodes with uids, revisions and
 //! names, and an event log. Each simulated daemon reaches it through its own

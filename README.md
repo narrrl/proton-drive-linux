@@ -149,7 +149,7 @@ keys before it leaves the machine, through a Rust implementation of Proton's Dri
 
 Files you open are decrypted into a local cache so programs can read them. What that means for
 the security of the machine is spelled out in the
-[threat model](docs/ARCHITECTURE.md#8-threat-model-what-this-client-writes-to-disk-in-plaintext).
+[threat model](docs/ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
 
 ## Contributing
 

@@ -255,7 +255,7 @@ B143 does, after a restart too. Sim test
 
 **Status:** Fixed.
 **Found:** 2026-10-05, checking that every name collision and conflict the drain resolves is
-reported (`docs/MILESTONE-3.0.0.md` §6.2). Each one is in the activity log, and the app words
+reported (sync issues, `docs/ARCHITECTURE.md` §5). Each one is in the activity log, and the app words
 each in the user's language but one.
 
 **Where:** `detail_label` in `crates/pdfs-gui/src/app/pages/activity_text.rs`; the daemon

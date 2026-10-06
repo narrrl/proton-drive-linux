@@ -3,7 +3,7 @@
 //! `Core` used to hold a concrete [`ProtonDriveClient`], so no test could make
 //! Drive answer late, answer stale, or not answer at all, and the interleavings
 //! behind most recent bugs could only be found on a real account over a slow
-//! link (`docs/MILESTONE-3.0.0.md` §2, §8.1). [`DriveApi`] is the part of the
+//! link. [`DriveApi`] is the part of the
 //! client the mount, the drain, the event feed and the mirror engine use; the
 //! real client implements it by forwarding, and the simulation tests implement
 //! it with an in-memory Drive that injects Drive's known faults.

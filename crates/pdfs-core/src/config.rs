@@ -157,7 +157,7 @@ pub struct AppConfig {
     /// Record a new folder, a new file, a rename or a delete through the mount
     /// locally and send it from the queue, instead of waiting for Drive in the
     /// syscall. `None` means on. `false` brings back the old path for one
-    /// release (docs/MILESTONE-3.0.0.md §10). Defaulted for configs predating
+    /// release (docs/ROADMAP.md). Defaulted for configs predating
     /// the field.
     #[serde(default)]
     pub local_first: Option<bool>,

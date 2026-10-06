@@ -1,5 +1,5 @@
-//! The reference file system of the simulation (`docs/MILESTONE-3.0.0.md`
-//! §8.2, property 4): what each syscall a simulated client makes should
+//! The reference file system of the simulation (`docs/TESTING.md`,
+//! "Simulation runs", property 1): what each syscall a simulated client makes should
 //! answer, and the tree it should leave, on a POSIX file system.
 //!
 //! A [`Model`] covers one client's own folder; paths are relative to it. The
