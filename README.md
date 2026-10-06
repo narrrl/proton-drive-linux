@@ -15,6 +15,7 @@ scriptable CLI.
 [![AUR](https://img.shields.io/aur/version/proton-drive-for-linux)](https://aur.archlinux.org/packages/proton-drive-for-linux)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/narl)
 
 <img src="images/files.png" alt="My files in the Proton Drive app" width="820">
 
@@ -155,6 +156,13 @@ the security of the machine is spelled out in the
 Bug reports, translations and patches are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 workflow and the checks CI runs, and [SECURITY.md](SECURITY.md) to report a vulnerability
 privately.
+
+## Support
+
+Proton Drive Linux is free and built in spare time. If it saves you a few headaches, you can
+[buy me a coffee](https://buymeacoffee.com/narl).
+
+<a href="https://buymeacoffee.com/narl"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
 
 ## License
 
