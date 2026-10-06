@@ -1410,10 +1410,11 @@ def test_throughput(ctx: Context) -> None:
     on the network. PDFS_ACCEPTANCE_MIN_MIBPS and PDFS_ACCEPTANCE_MIN_OPS move
     the floors; 0 turns one off.
 
-    Metadata is the exception. On a Drive mount each create and each unlink
-    waits for Drive before it returns (about 350 ms for a create), so 20
-    operations a second is out of reach there by design. The default floor for
-    a FUSE target is 3, which still catches a second round trip per operation.
+    Metadata has a lower default floor on a FUSE target: 3 operations a
+    second. A local-first mount records each create and unlink locally and
+    clears it easily, but with `local_first` off each one waits for Drive
+    before it returns (about 350 ms for a create), and 20 a second is out of
+    reach. The floor still catches a second round trip per operation.
     """
     min_rate = float(os.environ.get("PDFS_ACCEPTANCE_MIN_MIBPS", "10"))
     default_ops = "3" if is_fuse(ctx.root) else "20"
@@ -2344,7 +2345,7 @@ def _shared_root(daemon: Daemon, mount: Path, role: str) -> Path:
 
     Skips rather than fails when the account has no such share: the role cases
     need a *second* account to have shared something at that role, which most
-    runs will not have (mount-architecture.md §7).
+    runs will not have.
     """
     entries = [e for e in _shared_with_me(daemon) if e.get("role") == role]
     if not entries:
