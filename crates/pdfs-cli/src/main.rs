@@ -2027,7 +2027,7 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
     loop {
         // Wait until a session is stored. The GUI enables this service on login,
         // but the service may also start at boot before the user has logged in.
-        wait_for_session(|| auth::load().map(|_| ()), std::thread::sleep)?;
+        wait_for_session(|| auth::load().map(|_| ()), pdfs_fuse::idle_sleep)?;
 
         match mount_once(mountpoint.clone()) {
             Ok(pdfs_fuse::MountOutcome::Shutdown) => {
@@ -2036,13 +2036,13 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
             }
             Ok(pdfs_fuse::MountOutcome::Unmounted) => {
                 tracing::warn!("mount ended externally; remounting in 2s");
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                pdfs_fuse::idle_sleep(std::time::Duration::from_secs(2));
             }
             Err(e) => {
                 // `{:#}` so the whole anyhow chain lands in the log — the top
                 // context alone ("mount failed") never says *why*.
                 tracing::error!(error = format!("{e:#}"), "mount failed; retrying in 5s");
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                pdfs_fuse::idle_sleep(std::time::Duration::from_secs(5));
             }
         }
     }

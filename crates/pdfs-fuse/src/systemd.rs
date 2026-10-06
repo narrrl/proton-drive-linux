@@ -74,6 +74,26 @@ pub(crate) fn watchdog_ping() {
     let _ = notify("WATCHDOG=1\n");
 }
 
+/// Sleep for `duration`, pinging the watchdog on the way.
+///
+/// For the stretches where the daemon is alive but has no mount, and so no
+/// supervisor: waiting for a login, or backing off after a failed mount. The
+/// manager arms the watchdog when the process starts, so without these pings a
+/// daemon that is merely retrying is aborted after `WatchdogSec` and leaves a
+/// coredump instead of the error it was logging. Never use this while mounted:
+/// there the ping must prove the control socket answers.
+pub fn idle_sleep(duration: Duration) {
+    const CHUNK: Duration = Duration::from_secs(10);
+    let mut left = duration;
+    watchdog_ping();
+    while !left.is_zero() {
+        let step = left.min(CHUNK);
+        std::thread::sleep(step);
+        left -= step;
+        watchdog_ping();
+    }
+}
+
 /// Tell the manager the daemon is stopping, so a slow teardown is not mistaken
 /// for a hang by the watchdog it is racing.
 pub(crate) fn stopping() {
