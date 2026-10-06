@@ -248,7 +248,7 @@ impl Core {
     }
 
     /// Watch the link for the life of the mount: sleep while it is up, and
-    /// probe it back while it is down (offline.md Phase 1).
+    /// probe it back while it is down.
     ///
     /// A mount that started from the cache is down from the first moment; one
     /// that started online goes down when [`Core::mark_offline`] says so.

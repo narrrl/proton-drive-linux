@@ -133,7 +133,7 @@ impl Drop for Busy {
 /// from Shared or Shared-with-me may not: it can live under a device folder's
 /// own inode space, or on someone else's volume, neither of which the primary
 /// mount's path space can name. Those carry a uid instead, and the daemon
-/// resolves it with `Core::resolve_anywhere` (mount-architecture.md P4).
+/// resolves it with `Core::resolve_anywhere`.
 ///
 /// The two are separate request variants rather than one request with an
 /// optional field on purpose: an older daemon that ignored `uid` would resolve

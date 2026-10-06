@@ -25,8 +25,8 @@ pub struct StoredSyncFolder {
 }
 
 /// One per-file sync baseline row: what a path looked like on both sides at the
-/// last successful sync, so the next reconcile can tell which side changed
-/// (devices.md Phase 2). `remote_rev`/`remote_hash` hold the remote signature —
+/// last successful sync, so the next reconcile can tell which side changed.
+/// `remote_rev`/`remote_hash` hold the remote signature —
 /// its modification time and size as strings — since no cheap content hash is
 /// exposed; change detection is `(mtime, size)` on each side.
 #[derive(Clone, Debug, PartialEq)]
@@ -39,7 +39,7 @@ pub struct StoredSyncEntry {
     ///
     /// `local_mtime` alone cannot tell an edit that landed inside the same
     /// second as the last sync — and left the file the same length — from no
-    /// edit at all, so those never uploaded (bugs.md B25). `None` on a row
+    /// edit at all, so those never uploaded (`docs/BUGS.md` B25). `None` on a row
     /// written before schema 28, which the comparison reads as "compare whole
     /// seconds", so upgrading does not make an entire mirror look changed.
     pub local_mtime_ns: Option<i64>,
@@ -345,7 +345,7 @@ impl Db {
     /// Drop the entire baseline for a folder. Used when flipping ondemand→mirror:
     /// the local tree was evicted, so the old baseline is stale and would make the
     /// next reconcile mistake "locally deleted" for "must re-download". Clearing it
-    /// leaves an empty baseline + full remote = pure download (devices.md P3).
+    /// leaves an empty baseline + full remote = pure download.
     pub fn sync_entries_clear(&self, folder_id: i64) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

@@ -1,4 +1,4 @@
-//! Two-way folder sync engine (devices.md Phase 2).
+//! Two-way folder sync engine.
 //!
 //! Each `mirror`-mode synced folder is kept mirrored between a local directory
 //! and a folder under this machine's Proton Drive device. A local filesystem
@@ -1342,7 +1342,7 @@ impl Core {
     /// rename below is the destructive step, and the download in between can run
     /// for minutes, so the destination is re-examined right before it: a local
     /// file that no longer matches the plan is set aside as a conflict copy
-    /// instead of being replaced (bugs.md B39).
+    /// instead of being replaced (`docs/BUGS.md` B39).
     #[allow(clippy::too_many_arguments)]
     async fn download_file(
         &self,
@@ -1441,7 +1441,7 @@ impl Core {
     /// the pre-upload identity is what makes the next pass see the path as
     /// locally changed and upload a whole, clean revision over it. Recording the
     /// post-upload stat instead declared the torn revision synchronized and left
-    /// it as the file's content on Drive (bugs.md B40).
+    /// it as the file's content on Drive (`docs/BUGS.md` B40).
     async fn record_file_baseline(
         &self,
         folder_id: i64,
@@ -1505,7 +1505,7 @@ fn open_to_upload(path: &Path, rel: &str) -> Result<Option<std::fs::File>, Strin
 /// records the identity the upload *read* rather than the one on disk now, so
 /// the next pass classifies the path as locally changed and replaces the torn
 /// revision. Without the log there is nothing in the journal to explain the
-/// extra revision (bugs.md B40).
+/// extra revision (`docs/BUGS.md` B40).
 fn warn_if_torn(rel: &str, path: &Path, streamed: LocalSig) {
     let now = local_sig(path);
     if !now.is_some_and(|now| now.same_content(&streamed)) {
@@ -1537,7 +1537,7 @@ fn local_sig(path: &Path) -> Option<LocalSig> {
 /// transfer started, and a download of a large file can run for minutes. Without
 /// this, a local edit completed inside that window was replaced by the remote
 /// version with no copy of it kept anywhere — the one shape of loss a sync
-/// engine must not have (bugs.md B39). Keeping the copy makes it re-upload as a
+/// engine must not have (`docs/BUGS.md` B39). Keeping the copy makes it re-upload as a
 /// new file on the next pass, which is the same resolution a both-sides-changed
 /// conflict already gets.
 ///
@@ -1573,7 +1573,7 @@ fn keep_racing_local_edit(path: &Path, expected: Option<LocalSig>) -> std::io::R
 /// exists, so the same removal was re-attempted and re-reported as an error on
 /// every pass, forever. Every other error is still an error, and keeping the
 /// baseline is exactly right there: the surviving file must not be mistaken for
-/// a new local creation on the next pass and uploaded back (bugs.md B42).
+/// a new local creation on the next pass and uploaded back (`docs/BUGS.md` B42).
 fn removed_locally(result: std::io::Result<()>) -> std::io::Result<()> {
     match result {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1830,7 +1830,7 @@ fn system_mtime(meta: &std::fs::Metadata) -> i64 {
 ///
 /// Whole seconds cannot distinguish an edit made in the same second as the last
 /// sync from no edit at all, and if the size did not change either, that file
-/// was never uploaded (bugs.md B25). `None` for a clock or filesystem that
+/// was never uploaded (`docs/BUGS.md` B25). `None` for a clock or filesystem that
 /// cannot answer, which falls the comparison back to seconds rather than
 /// asserting an mtime of zero.
 fn system_mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
@@ -1845,7 +1845,7 @@ mod tests {
 
     /// A removal of something already gone has produced the state the sync
     /// engine wanted, so its baseline is dropped rather than retried forever.
-    /// Anything else stays an error and keeps the baseline (bugs.md B42).
+    /// Anything else stays an error and keeps the baseline (`docs/BUGS.md` B42).
     #[test]
     fn an_already_absent_path_counts_as_removed() {
         let root = std::env::temp_dir().join(format!("pdfs-b42-{}", std::process::id()));
@@ -1862,7 +1862,7 @@ mod tests {
     }
 
     /// The download guard: a destination that still matches the plan is
-    /// replaced silently, one that has moved on since is kept (bugs.md B39).
+    /// replaced silently, one that has moved on since is kept (`docs/BUGS.md` B39).
     #[test]
     fn a_download_keeps_a_local_edit_it_did_not_plan_for() {
         let root = std::env::temp_dir().join(format!("pdfs-b39-{}", std::process::id()));
@@ -2177,7 +2177,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A restored folder (features.md 5.2) starts with an empty baseline against
+    /// A restored folder starts with an empty baseline against
     /// an empty local directory and a full remote. That must reconcile as
     /// "download everything" rather than tripping the wipe guard — otherwise
     /// every restore would wedge its folder on the first pass.

@@ -432,7 +432,7 @@ impl AppDirs {
     /// typical umask makes them `0755`. Until this was fixed, the only thing
     /// keeping another local user out was `~/.cache` and `~/.local/state`
     /// happening to be `0700`, which is a convention of the user's system and
-    /// not something this client established (bugs.md B6).
+    /// not something this client established (`docs/BUGS.md` B6).
     ///
     /// Applied on every start, not just at creation: a directory that already
     /// exists with a permissive mode — restored from a backup that flattened
@@ -483,7 +483,7 @@ fn restrict_dir(dir: &Path) -> Result<()> {
 /// session — enumerate, read, upload, trash, share — without presenting any
 /// credential, since the daemon already holds one. It is an authority boundary,
 /// not merely private data, and `UnixListener::bind` applies the umask like any
-/// other file (bugs.md B6).
+/// other file (`docs/BUGS.md` B6).
 ///
 /// There is a window between `bind` and this call during which the socket
 /// carries the umask's mode. It is closed in practice by the containing
@@ -504,7 +504,7 @@ mod tests {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// bugs.md B6. A permissive mode here is not a cosmetic problem: these
+    /// `docs/BUGS.md` B6. A permissive mode here is not a cosmetic problem: these
     /// directories hold decrypted content, a plaintext index of every node name,
     /// and the control socket that commands the daemon's session.
     #[test]

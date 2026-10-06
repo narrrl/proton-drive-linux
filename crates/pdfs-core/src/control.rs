@@ -443,11 +443,11 @@ pub enum Request {
     DeleteDevice { uid: String },
     /// Adopt an existing device as this machine's, pinning its uid in
     /// `config.json` so a hostname change or reinstall re-attaches to it instead
-    /// of registering a duplicate (features.md 5.1). `uid: None` clears the pin.
+    /// of registering a duplicate. `uid: None` clears the pin.
     /// Replies with [`Response::Ok`].
     AdoptDevice { uid: Option<String> },
 
-    // ---- device folder sync (devices.md) ----------------------------------
+    // ---- device folder sync ----------------------------------
     /// Add a local folder to this machine's device, uploading its tree and
     /// registering the device on first use. Replies with [`Response::Ok`].
     AddSyncFolder { local_path: String },
@@ -496,7 +496,7 @@ pub enum Request {
     /// [`Response::Ok`].
     ResolveConflict { path: String, keep: ConflictKeep },
     /// List the folders under this machine's device that can be synced here,
-    /// each with a proposed local path (features.md 5.2). Replies with
+    /// each with a proposed local path. Replies with
     /// [`Response::RestorableFolders`].
     ListRestorableFolders,
     /// Attach the given remote device folders to local paths and sync them down.
@@ -1903,17 +1903,17 @@ pub enum Response {
         /// The pin registry.
         pins: Vec<Pin>,
         /// False when the daemon is serving the cached tree because the API is
-        /// unreachable (offline.md Phase 1). Cached and pinned content still
+        /// unreachable. Cached and pinned content still
         /// reads; anything else fails until the network is back.
         #[serde(default = "default_online")]
         online: bool,
-        /// Writes accepted locally but not yet uploaded (offline.md Phase 3).
+        /// Writes accepted locally but not yet uploaded.
         /// Non-zero means the mount is ahead of the remote — either a copy is
         /// still draining, or it cannot drain because we are offline.
         #[serde(default)]
         pending_uploads: u64,
-        /// Queued mutations that carry no bytes: `mkdir`, `rename`, `trash`
-        /// (offline.md Phase 3b). Counted apart from `pending_uploads` because
+        /// Queued mutations that carry no bytes: `mkdir`, `rename`, `trash`.
+        /// Counted apart from `pending_uploads` because
         /// calling a queued `mkdir` an upload is a lie.
         #[serde(default)]
         pending_changes: u64,

@@ -193,7 +193,7 @@ pub(super) fn clear_stale_mount(mountpoint: &Path) {
 }
 
 /// `sync_state` key holding the uid of the My Files root, so a later run can
-/// recover it from `nodes` without the API (offline.md Phase 1).
+/// recover it from `nodes` without the API.
 const ROOT_UID_KEY: &str = "root_uid";
 
 /// The My Files root, and whether we got it from the API (`true`) or from the
@@ -401,7 +401,7 @@ pub(crate) fn mount_with(
         .all_share_access()
         .map_err(|error| std::io::Error::other(format!("load shared access: {error}")))?;
 
-    // The folder-sync engine (devices.md Phase 2) runs on its own thread and is
+    // The folder-sync engine runs on its own thread and is
     // nudged over this channel; the sender lives in Core so control-socket
     // handlers can trigger reconciles.
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<sync::SyncMsg>();
@@ -501,7 +501,7 @@ pub(crate) fn mount_with(
     // Every long-lived thread started from here on is kept in `workers` and
     // joined at the end of this function. Leaving them running turned an
     // in-process remount into a second generation of drain workers, sync engines
-    // and sweeps all operating on a mount that no longer exists (bugs.md B44).
+    // and sweeps all operating on a mount that no longer exists (`docs/BUGS.md` B44).
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for worker in 0..DRAIN_WORKERS {
         let core = core.clone();
@@ -738,7 +738,7 @@ pub(crate) fn mount_with(
     };
 
     // Unmount every on-demand sync folder too, or the kernel mounts linger as
-    // stale and the next start fails with EBUSY (devices.md Phase 3).
+    // stale and the next start fails with EBUSY.
     if let Some(worker) = restore_worker
         && worker.join().is_err()
     {
@@ -798,7 +798,7 @@ const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(10);
 /// The mount used to return with its drain workers, sync engine, sweep, online
 /// probe, indexer and control listener all still running on `Core` clones. The
 /// process usually exited straight afterwards and hid it; an in-process remount
-/// did not, and started a second full set on top of the first (bugs.md B44).
+/// did not, and started a second full set on top of the first (`docs/BUGS.md` B44).
 ///
 /// Two of the waits need waking rather than merely flagging: the drain workers
 /// block on their own condvar (`wake_drain`), and the control listener blocks

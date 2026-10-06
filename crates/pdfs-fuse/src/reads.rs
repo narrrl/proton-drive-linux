@@ -464,7 +464,7 @@ impl Core {
     /// it, and the [`BLOCK_SIZE`] assumption when it has not — which is every
     /// first read, because learning it means opening a `RevisionReader`, and
     /// opening one per read is precisely the per-file key derivation the block
-    /// cache exists to avoid (bugs.md B12, B85).
+    /// cache exists to avoid (`docs/BUGS.md` B12, B85).
     ///
     /// Being wrong here is not a correctness problem: `read_at` plans over the
     /// real sizes and clamps to what was asked for either way. It costs a
@@ -493,13 +493,13 @@ impl Core {
     ) -> Result<Vec<u8>, Errno> {
         // A queued write has not reached the remote yet, so the remote's current
         // revision is stale and the staged blob is the truth. Serve from it until
-        // the drain worker lands the upload (offline.md Phase 3).
+        // the drain worker lands the upload.
         if let Some(pending) = self.pending.lock().get(uid).cloned() {
             return self.read_pending(&pending, offset, len);
         }
         // A node created offline and never written has no blob and no remote: it
         // is an empty file, and asking the API about a `local~` uid would only
-        // earn a 404 (offline.md Phase 3b). Unless its create landed since the
+        // earn a 404. Unless its create landed since the
         // read looked: the landing moved the queued write to the uid Drive
         // gave it, and the row says which (`docs/BUGS.md` B179).
         if is_local_uid(uid) {
@@ -636,7 +636,7 @@ impl Core {
     ///
     /// A block that comes back shorter than the file's size says it must be is
     /// never served, cached or promoted: it is repaired from the whole-file
-    /// download, or the read fails. See [`Core::repair_block`] (bugs.md B84).
+    /// download, or the read fails. See [`Core::repair_block`] (`docs/BUGS.md` B84).
     async fn read_block(
         &self,
         reader: &Arc<dyn RevisionRead>,
@@ -651,7 +651,7 @@ impl Core {
         // file's boundaries are wrong, and the failure is not confined to short
         // reads: sizes that *overstate* a block shift every block after it and
         // return full-length reads of the wrong bytes. So a disagreement of any
-        // kind takes the file off the range path entirely (bugs.md B84).
+        // kind takes the file off the range path entirely (`docs/BUGS.md` B84).
         let bytes = if reader.size() != fsize {
             warn!(
                 %uid, bidx = span.idx, fsize,
@@ -664,7 +664,7 @@ impl Core {
             // Learned here rather than on a path of its own: this is where a
             // reader is open anyway, and recording the real geometry is what
             // lets the *next* read plan its blocks on the revision's own
-            // boundaries instead of the 4 MiB fallback (bugs.md B85).
+            // boundaries instead of the 4 MiB fallback (`docs/BUGS.md` B85).
             if cache_blocks {
                 self.cache
                     .store_block_geometry(uid, mtime, fsize, reader.block_sizes());
@@ -706,7 +706,7 @@ impl Core {
     /// The range path derives every block boundary from the revision's recorded
     /// block sizes. When those understate the file, reads come back short with
     /// no error anywhere, and the caller hands userspace a truncated file that
-    /// looks like a clean EOF (bugs.md B84). `download_file_to` does not do that
+    /// looks like a clean EOF (`docs/BUGS.md` B84). `download_file_to` does not do that
     /// arithmetic — it streams the block list — so it returns the whole file
     /// where the range path cannot, which is why pinning was the workaround.
     /// This does the same thing on the user's behalf, once, and the resulting
@@ -918,7 +918,7 @@ impl Core {
         let end = offset.saturating_add(len).min(fsize);
         let mut out = Vec::with_capacity((end - offset) as usize);
         // On the revision's own boundaries where they are known, and on the
-        // 4 MiB fallback where they are not (bugs.md B85).
+        // 4 MiB fallback where they are not (`docs/BUGS.md` B85).
         let wanted = self.block_geometry(uid, mtime, fsize).spans(offset, end);
         let (Some(&head), Some(&tail)) = (wanted.first(), wanted.last()) else {
             return Ok(out);
@@ -1038,7 +1038,7 @@ impl Core {
             // — the cache validates it on read, the network path in `read_block`
             // — so this refuses rather than quietly contributing fewer bytes
             // than the range covers, which is what turned a bad block into a
-            // truncated file (bugs.md B84).
+            // truncated file (`docs/BUGS.md` B84).
             if block.len() as u64 != span.len {
                 error!(
                     %uid, bidx = span.idx, len = block.len(), expected = span.len, fsize,

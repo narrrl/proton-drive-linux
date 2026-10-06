@@ -91,7 +91,7 @@ const TOUCH_FLUSH_AT: usize = 256;
 ///
 /// Public because it is the *contract* a block has to satisfy, not a detail of
 /// this cache: the network read path validates against it too, so a block that
-/// comes back short is refused before it can truncate a file (bugs.md B84).
+/// comes back short is refused before it can truncate a file (`docs/BUGS.md` B84).
 pub fn block_len(size: u64, idx: u64) -> u64 {
     let start = idx.saturating_mul(BLOCK_SIZE);
     size.saturating_sub(start).min(BLOCK_SIZE)
@@ -311,8 +311,7 @@ struct PinFile {
     pins: BTreeMap<String, Pin>,
 }
 
-/// What a staged file actually contains, written beside it as `<name>.json`
-/// (offline.md Phase 2).
+/// What a staged file actually contains, written beside it as `<name>.json`.
 ///
 /// A staged file is **not** necessarily valid whole-file content, and that is
 /// the whole reason this exists. A partial overwrite commits by filling the
@@ -439,9 +438,9 @@ pub struct ContentCache {
     /// Subdirectory for write-handle scratch files (disk-backed write buffers).
     /// Emptied on open so a crashed run leaves no orphans.
     scratch_dir: PathBuf,
-    /// Subdirectory holding the bytes of writes that have not been uploaded yet
-    /// (offline.md Phase 2/3) — every released write passes through here, since
-    /// the upload is a queued op performed later. Unlike `scratch_dir` this is
+    /// Subdirectory holding the bytes of writes that have not been uploaded yet.
+    /// Every released write passes through here, since the upload is a queued
+    /// op performed later. Unlike `scratch_dir` this is
     /// **never** emptied on open: these are the only copy of content the user
     /// authored, and the whole point is that they outlive the daemon.
     staging_dir: PathBuf,
@@ -476,7 +475,7 @@ pub struct ContentCache {
     thumb_bytes: AtomicU64,
     /// Unified metadata DB. Its `cache_entries` table is the LRU index: every
     /// store/read/evict updates it, and the budget enforcers query it instead of
-    /// scanning the cache directories (plan.md P4).
+    /// scanning the cache directories.
     db: Arc<Db>,
     /// LRU touches not yet written to `cache_entries`, keyed by cache key.
     ///
@@ -989,7 +988,7 @@ impl ContentCache {
     /// a miss ([`cached_block`](Self::cached_block) checks), so a bad block
     /// cannot escape this cache even though this does not check. Validating a
     /// block is the *reader's* job, at the point it is fetched — see
-    /// `Core::read_block` (bugs.md B84).
+    /// `Core::read_block` (`docs/BUGS.md` B84).
     pub fn store_block(
         &self,
         uid: &NodeUid,
@@ -1491,9 +1490,8 @@ impl ContentCache {
     /// This is what makes a write survive its upload: the caller is releasing a
     /// write handle and would otherwise delete the file, so until the bytes are
     /// on the remote, staging holds the only copy. Every dirty handle goes
-    /// through here — the upload is a queued op performed later (offline.md
-    /// Phase 3), and a staged file is also what a human can recover from if the
-    /// queue never drains.
+    /// through here — the upload is a queued op performed later, and a staged
+    /// file is also what a human can recover from if the queue never drains.
     ///
     /// Falls back to a copy when the rename crosses a filesystem boundary; a
     /// failure here means we could not save the bytes at all, so it is reported
@@ -2707,7 +2705,7 @@ mod tests {
     }
 
     /// The geometry the whole read path validates against, here and over the
-    /// network (bugs.md B84): full blocks, then whatever is left.
+    /// network (`docs/BUGS.md` B84): full blocks, then whatever is left.
     #[test]
     fn block_len_is_full_blocks_then_the_remainder() {
         let size = BLOCK_SIZE * 2 + 17;
@@ -2787,7 +2785,7 @@ mod tests {
     /// A cached block is addressed by the range it covers, not by its index
     /// alone. Re-planning a file onto its real geometry must therefore miss the
     /// blocks the uniform fallback cached, rather than serve their bytes at the
-    /// wrong offset (bugs.md B85).
+    /// wrong offset (`docs/BUGS.md` B85).
     #[test]
     fn a_cached_block_is_not_served_to_a_different_geometry() {
         let (c, _d) = cache();
@@ -2854,7 +2852,7 @@ mod tests {
 
     /// A block of the wrong length cannot escape the cache even though the
     /// store does not check: the read validates it and reports a miss, so the
-    /// next read refetches rather than serving a hole (bugs.md B84).
+    /// next read refetches rather than serving a hole (`docs/BUGS.md` B84).
     #[test]
     fn a_block_of_the_wrong_length_reads_as_a_miss() {
         let (c, _d) = cache();
@@ -2919,7 +2917,7 @@ mod tests {
         );
     }
 
-    /// A failed upload must never cost the user their bytes (offline.md Phase 2):
+    /// A failed upload must never cost the user their bytes:
     /// the scratch file moves to staging intact, and staging survives a reopen
     /// the way scratch deliberately does not.
     #[test]

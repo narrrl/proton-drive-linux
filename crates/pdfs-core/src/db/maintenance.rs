@@ -1,4 +1,4 @@
-//! Database health reporting and repair (features.md 4.3).
+//! Database health reporting and repair.
 //!
 //! Everything here exists for the case where something has already gone wrong:
 //! a crash mid-write, a full disk, a cache that has grown out of proportion to

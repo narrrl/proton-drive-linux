@@ -183,7 +183,7 @@ impl WriteHandle {
     }
 }
 
-/// A released write whose upload has not happened yet (offline.md Phase 3).
+/// A released write whose upload has not happened yet.
 ///
 /// The bytes live in the content cache's staging dir and the intent lives in the
 /// `pending_op` table; this pairs them in memory so a read can be served without
@@ -253,7 +253,7 @@ pub(crate) struct State {
     /// two pages shifted every later entry, and the caller silently skipped or
     /// repeated whatever crossed the page boundary. Each entry is
     /// `(ino, is_dir, name)` — the kernel type is mapped at reply time so this
-    /// module stays free of `fuser` (bugs.md B43).
+    /// module stays free of `fuser` (`docs/BUGS.md` B43).
     pub(crate) dir_snapshots: HashMap<u64, Arc<DirListing>>,
     /// Resident inode attributes whose effective access changed during an
     /// intern/root refresh. Core drains this set and notifies the matching
@@ -1198,7 +1198,7 @@ impl State {
     /// re-enumerate, which is the cheaper way to stay honest about what the
     /// server did. A queued rename cannot: re-enumerating needs the network, and
     /// the server has not been told yet in any case — so this *is* the tree's
-    /// new truth until the op drains (offline.md Phase 3b).
+    /// new truth until the op drains.
     pub(crate) fn rename_in_place(
         &mut self,
         ino: u64,
@@ -1317,7 +1317,7 @@ impl State {
     /// created offline, nothing at all), so this row is the only record that the
     /// file is as long as the caller was told it is. Without it a restart serves
     /// the stale size and the file reads as truncated — or empty — while its
-    /// bytes sit safely in staging (offline.md Phase 3).
+    /// bytes sit safely in staging.
     /// Returns the node to persist rather than queueing it in the outbox, and is
     /// the one mutation here whose write-through the caller must do itself:
     /// failure has to be reported, not logged. Dropping the row silently means

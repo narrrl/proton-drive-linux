@@ -568,8 +568,7 @@ impl Db {
     }
 
     /// Load one persisted node back by uid. Used to recover the My Files root
-    /// when the API is unreachable, so the mount can still serve the cached tree
-    /// (offline.md Phase 1).
+    /// when the API is unreachable, so the mount can still serve the cached tree.
     pub fn node_by_uid(&self, uid: &str) -> Result<Option<Node>> {
         let conn = self.read();
         let json: Option<String> = conn

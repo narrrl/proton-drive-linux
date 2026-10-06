@@ -15,7 +15,7 @@ use crate::Result;
 pub const OP_REVISION: &str = "revision";
 
 /// The `kind` of a [`PendingOp`] that creates a file that so far exists only
-/// locally, under a `local:` placeholder uid (offline.md Phase 3b).
+/// locally, under a `local:` placeholder uid.
 ///
 /// The written bytes ride along on the same row rather than as a follow-on
 /// [`OP_REVISION`]: draining the create mints the node's real uid, which would
@@ -29,7 +29,7 @@ pub const OP_CREATE: &str = "create";
 pub const OP_MKDIR: &str = "mkdir";
 
 /// The `kind` of a [`PendingOp`] that gives a node a new name, a new parent, or
-/// both — the queued form of `mv` (offline.md Phase 3b).
+/// both — the queued form of `mv`.
 ///
 /// `parent_uid` and `name` hold the node's *desired end state*, not a delta, so
 /// a second rename simply replaces the row (see [`Db::enqueue_op`]) and the
@@ -55,8 +55,7 @@ pub struct RenameMeta {
     pub original_name: Option<String>,
 }
 
-/// The `kind` of a [`PendingOp`] that trashes a node the server knows about
-/// (offline.md Phase 3b).
+/// The `kind` of a [`PendingOp`] that trashes a node the server knows about.
 ///
 /// A node that only ever existed locally never gets one of these: there is
 /// nothing to trash remotely, so deleting it just drops its queued ops
@@ -311,7 +310,7 @@ pub const PARK_UNTIL: i64 = 8_000_000_000_000;
 pub const PARK_EXPIRY_MS: i64 = 60 * 60 * 1000;
 
 /// A mutation that has been accepted locally but not yet performed against the
-/// API — the durable half of the write-back queue (offline.md Phase 3).
+/// API — the durable half of the write-back queue.
 ///
 /// The daemon answers the FUSE call the moment this row and its staged blob are
 /// on disk, so a `cp` into the mount runs at disk speed and the upload happens
@@ -887,7 +886,7 @@ impl Db {
     /// make — the node is still only a queued intent, and rewriting that intent
     /// *is* the rename. Returns false when the create has already drained, in
     /// which case the node has a real uid and the caller must rename it there
-    /// instead (offline.md Phase 3b).
+    /// instead.
     ///
     /// A create backing off is made due: what it failed on may have been the
     /// name it no longer wants, such as one held by a queued change. A parked

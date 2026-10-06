@@ -226,7 +226,7 @@ const DRAIN_WORKERS: usize = 16;
 const STAGING_ORPHAN_RETAIN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// First and longest delay between probes for the network coming back after an
-/// offline mount (offline.md Phase 1). Doubles from min to max: a laptop shut in
+/// offline mount. Doubles from min to max: a laptop shut in
 /// a bag is the common case, so the steady state must be cheap, while a brief
 /// blip should still recover in seconds.
 const ONLINE_PROBE_MIN: Duration = Duration::from_secs(5);
@@ -334,7 +334,7 @@ const MAX_THUMBNAIL_MISSES: usize = 8192;
 ///
 /// Matches the SDK's own `MAX_BATCH_COUNT`, so a chunk is exactly one request:
 /// chunking smaller would add round trips, larger would be split anyway and
-/// delay the waiters this chunking exists to release (bugs.md B14).
+/// delay the waiters this chunking exists to release (`docs/BUGS.md` B14).
 const SIZE_UPGRADE_CHUNK: usize = 150;
 
 /// How many folders may have a size upgrade in flight at once.
@@ -344,7 +344,7 @@ const SIZE_UPGRADE_CHUNK: usize = 150;
 /// both with the number of folders it walked. Eight keeps an interactive `ls -l`
 /// (one folder, sometimes a couple) entirely unaffected while putting a ceiling
 /// on the recursive case. A folder past the cap is queued, not dropped: one of
-/// the running threads takes it over when its own batch ends (bugs.md B100).
+/// the running threads takes it over when its own batch ends (`docs/BUGS.md` B100).
 const MAX_SIZE_UPGRADES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -535,7 +535,7 @@ struct Core {
     workers: Arc<Workers>,
     /// Unified SQLite metadata cache: the persistence layer behind the in-memory
     /// `State` maps. Every mutation writes through here, and the maps rehydrate
-    /// from it on mount (plan.md P1).
+    /// from it on mount.
     db: Arc<Db>,
     /// Serializes only shared-list publication and access-loss invalidation.
     /// Network calls happen before taking it.
@@ -545,8 +545,8 @@ struct Core {
     /// Successful refreshes suppress retries even if persisting their timestamp
     /// fails. Shared across primary/fork clones and cleared by access events.
     shared_refresh_deadlines: Arc<Mutex<SharedRefreshDeadlines>>,
-    /// False while the API is unreachable and we are serving the cached tree
-    /// (offline.md Phase 1). Set by the probe thread; read by front-ends through
+    /// False while the API is unreachable and we are serving the cached tree.
+    /// Set by the probe thread; read by front-ends through
     /// `Response::Status` so the UI can say so rather than leaving the user to
     /// infer it from a wall of EIO.
     online: Arc<AtomicBool>,
@@ -557,8 +557,8 @@ struct Core {
     /// [`pause::PAUSED_INDEFINITELY`] for "until resumed", `0` when not paused.
     /// Persisted, so a pause survives a restart (see [`Core::sync_paused`]).
     sync_paused_until: Arc<AtomicI64>,
-    /// Writes accepted from the kernel but not yet uploaded, keyed by node
-    /// (offline.md Phase 3). The in-memory face of the `pending_op` table, from
+    /// Writes accepted from the kernel but not yet uploaded, keyed by node.
+    /// The in-memory face of the `pending_op` table, from
     /// which it is rebuilt on mount.
     ///
     /// Two things read it: [`Core::read_range`], because until the op drains the
@@ -586,7 +586,7 @@ struct Core {
     /// the queue instead of waiting out their backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
     /// The daemon's stop signal, shared with every background loop this `Core`
-    /// was cloned into so teardown can end and join them (bugs.md B44).
+    /// was cloned into so teardown can end and join them (`docs/BUGS.md` B44).
     shutdown: Arc<shutdown::Shutdown>,
     /// How long this node's last upload actually took, in milliseconds, with
     /// the time it was measured for eviction. Feeds
@@ -695,7 +695,7 @@ struct Core {
     /// Size upgrades currently running, per folder inode, across every mount. A `getattr` that
     /// needs a real size waits on the entry rather than issuing its own fetch —
     /// `ls -l` of a folder is one `getattr` per file, and they must collapse
-    /// onto a single batch (bugs.md B14).
+    /// onto a single batch (`docs/BUGS.md` B14).
     size_upgrades: Arc<Mutex<HashMap<u64, Arc<SizeUpgrade>>>>,
     /// Replies parked on those upgrades. Shared across every mount for the same
     /// reason the pool is: the bound that matters is per daemon.
@@ -726,11 +726,11 @@ struct Core {
     /// can say what a pass is doing rather than just "syncing". An entry exists
     /// only while that folder's reconcile pass is running.
     sync_progress: Arc<Mutex<HashMap<i64, SyncProgress>>>,
-    /// Channel to the folder-sync engine (devices.md Phase 2): nudges it to
+    /// Channel to the folder-sync engine: nudges it to
     /// reconcile a folder, reconcile everything, or re-scan its watch set.
     sync_tx: std::sync::mpsc::Sender<sync::SyncMsg>,
     /// Secondary FUSE sessions for `ondemand` sync folders, keyed by sync-folder
-    /// id (devices.md Phase 3). Each is a `ProtonFs` rooted at the folder's remote
+    /// id. Each is a `ProtonFs` rooted at the folder's remote
     /// node, mounted over its local path, sharing this Core's client/cache/db and
     /// tree but with its own root (`fork_state`). Held so we can unmount on
     /// toggle back to `mirror` and on daemon shutdown. Each entry retains the
@@ -1833,8 +1833,7 @@ impl Core {
         info!(nodes = st.entries.len(), "hydrated metadata cache from db");
     }
 
-    /// Rebuild the in-memory pending map from the `pending_op` table on mount
-    /// (offline.md Phase 3).
+    /// Rebuild the in-memory pending map from the `pending_op` table on mount.
     ///
     /// A queued write survives a restart — that is the point of persisting it —
     /// so until the drain worker gets to it, reads of that file must still come
@@ -2774,7 +2773,7 @@ impl Core {
             missing.push(uid.clone());
         }
         // Returned, not awaited here: the caller is a `getattr` that must not
-        // answer with a provisional size (bugs.md B14), and it parks its reply
+        // answer with a provisional size (`docs/BUGS.md` B14), and it parks its reply
         // on this batch rather than holding a thread until it lands.
         self.upgrade_sizes(key, missing)
     }
@@ -2791,7 +2790,7 @@ impl Core {
     /// `total_size_on_storage`, the *ciphertext* size, which is slightly larger
     /// than the real one. A read must not plan on it: since B84 a size the
     /// revision disagrees with fails the read, so `read` settles the size first
-    /// ([`Core::resolve_provisional_size`], bugs.md B100). In `stat` it is a
+    /// ([`Core::resolve_provisional_size`], `docs/BUGS.md` B100). In `stat` it is a
     /// discrepancy that closes within a round trip, not a repeat of B11 (which
     /// reported **0** and so suppressed reads entirely).
     ///
@@ -2865,11 +2864,11 @@ impl Core {
     /// Chunked so a waiter is released as soon as *its* file is resolved. A
     /// single 793-node batch took ~80 s, which outran [`SizeUpgrade::WAIT`] and
     /// put provisional sizes back in front of callers — the bug this was
-    /// supposed to fix (bugs.md B14).
+    /// supposed to fix (`docs/BUGS.md` B14).
     ///
     /// When the batch ends, the thread takes over the oldest batch the cap held
     /// back, so at most [`MAX_SIZE_UPGRADES`] threads run however many folders
-    /// a recursive walk touches (bugs.md B100).
+    /// a recursive walk touches (`docs/BUGS.md` B100).
     fn run_size_upgrade(&self, key: u64, uids: Vec<NodeUid>, slot: Arc<SizeUpgrade>) {
         let (mut key, mut uids, mut slot) = (key, uids, slot);
         loop {
@@ -2897,7 +2896,7 @@ impl Core {
     /// size it is given against the revision's own block table and fails the
     /// read on a mismatch (B84), so reading on the provisional size is an `EIO`
     /// every time. `getattr` usually settles the size first, but not when its
-    /// wait times out, so the read cannot rely on it (bugs.md B100).
+    /// wait times out, so the read cannot rely on it (`docs/BUGS.md` B100).
     fn resolve_provisional_size(&self, ino: u64, uid: &NodeUid) -> Option<u64> {
         let parent = self.state().entries.get(&ino)?.parent;
         // Without a network the answer is `None` either way; the bound keeps a
@@ -3317,8 +3316,7 @@ impl Core {
         }
     }
 
-    /// Accept a released write handle's bytes and queue their upload
-    /// (offline.md Phase 3).
+    /// Accept a released write handle's bytes and queue their upload.
     ///
     /// This is what makes a copy into the mount run at disk speed: the caller's
     /// `close` returns once the bytes are staged on local disk and the intent is
@@ -3785,8 +3783,8 @@ impl Core {
         Ok(())
     }
 
-    /// Invent a node under `parent_uid` and queue the op that will make it real
-    /// (offline.md Phase 3b). Returns the node to intern, exactly as the online
+    /// Invent a node under `parent_uid` and queue the op that will make it real.
+    /// Returns the node to intern, exactly as the online
     /// path returns the one the server minted.
     ///
     /// The parent may itself be a placeholder — `mkdir -p` offline, or `cp -r` of
@@ -3842,7 +3840,7 @@ impl Core {
     }
 
     /// Queue giving a node a new parent and/or name, and apply it to the tree
-    /// now (offline.md Phase 3b).
+    /// now.
     ///
     /// The op records the desired end state rather than the step, so it both
     /// supersedes any earlier queued rename and lets the drain skip whichever
@@ -3950,7 +3948,7 @@ impl Core {
     }
 
     /// Queue trashing a node the server knows about, and drop it from the tree
-    /// now (offline.md Phase 3b).
+    /// now.
     ///
     /// Anything else queued for this node is discarded first: the user has said
     /// the file should not exist, so uploading bytes to it or renaming it are
@@ -4081,7 +4079,7 @@ impl Core {
     ///
     /// The path identifies the revision: publication stages a fresh file and
     /// swaps the map entry to point at it, so an unchanged path means the base a
-    /// caller sampled earlier is still the base now (bugs.md B32).
+    /// caller sampled earlier is still the base now (`docs/BUGS.md` B32).
     fn pending_blob(&self, uid: &NodeUid) -> Option<PathBuf> {
         self.pending.lock().get(uid).map(|p| p.path.clone())
     }
@@ -5124,7 +5122,7 @@ impl Core {
     /// `rename(2)` promises to replace an existing destination atomically. Proton
     /// offers no such primitive — `rename_node` refuses a name that is already
     /// taken — so this is the first half of an emulation that is *not* atomic:
-    /// see [`Core::restore_replaced`] for the other half (bugs.md B13).
+    /// see [`Core::restore_replaced`] for the other half (`docs/BUGS.md` B13).
     ///
     /// A node whose own creation is still queued has never reached the server, so
     /// dropping its queued ops is the whole removal; nothing goes to the wire and
@@ -5950,8 +5948,8 @@ fn parse_node_uid(s: &str) -> Option<NodeUid> {
 }
 
 /// The uid a node made on this machine goes by until it lands, so it can be
-/// interned, listed and written to before the server has ever heard of it
-/// (offline.md Phase 3b): its row's local id, as [`pdfs_core::db::local_uid`]
+/// interned, listed and written to before the server has ever heard of it:
+/// its row's local id, as [`pdfs_core::db::local_uid`]
 /// has it.
 fn local_node_uid(lid: i64) -> NodeUid {
     NodeUid::new(VolumeId::from(LOCAL_VOLUME), LinkId::from(lid.to_string()))
@@ -6114,7 +6112,7 @@ fn dir_is_empty(dir: &Path) -> std::io::Result<bool> {
 
 /// Delete everything inside `dir` but keep `dir` itself (it stays as the FUSE
 /// mountpoint). Used when a `mirror` folder flips to `ondemand`: the local files
-/// are the disk we're reclaiming (devices.md Phase 3).
+/// are the disk we're reclaiming.
 fn evict_dir_contents(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -6196,7 +6194,7 @@ struct Progress {
 ///
 /// Waiters are released **per chunk**, not once at the end: a waiter only cares
 /// about its own file, and waiting for the other 792 is what let a large folder
-/// outrun the timeout (bugs.md B14).
+/// outrun the timeout (`docs/BUGS.md` B14).
 #[derive(Default)]
 struct SizeUpgrade {
     inner: Mutex<Progress>,
@@ -6222,7 +6220,7 @@ enum SizeUpgradeClaim {
 /// Past the cap this used to return nothing, and the caller answered with the
 /// provisional size at once. Nothing retried the folder until the next `stat`,
 /// so a recursive walk over more than [`MAX_SIZE_UPGRADES`] fresh folders showed
-/// ciphertext sizes for most of them (bugs.md B100). Queued, the batch is still
+/// ciphertext sizes for most of them (`docs/BUGS.md` B100). Queued, the batch is still
 /// fetched, and a waiter gets the real size unless [`SizeUpgrade::WAIT`] runs out.
 fn claim_size_upgrade(
     in_flight: &mut HashMap<u64, Arc<SizeUpgrade>>,
@@ -6425,7 +6423,7 @@ impl SizeWaitQueue {
 /// Split out from the handler because it is the part that is pure and the part
 /// that is dangerous: every `Err` here is a refusal that happens *before*
 /// anything is trashed, and getting one wrong turns a refusal into the
-/// destruction of the destination (bugs.md B13).
+/// destruction of the destination (`docs/BUGS.md` B13).
 ///
 /// `dst_empty` is only meaningful when `dst_dir`; pass `true` otherwise.
 fn check_replaceable(src_dir: bool, dst_dir: bool, dst_empty: bool) -> Result<(), Errno> {
@@ -7155,7 +7153,7 @@ mod size_upgrade_tests {
     }
 
     /// Past the cap a folder used to get no upgrade at all, so a recursive
-    /// walk reported ciphertext sizes for most of what it listed (bugs.md B100).
+    /// walk reported ciphertext sizes for most of what it listed (`docs/BUGS.md` B100).
     #[test]
     fn a_folder_past_the_cap_is_queued_not_dropped() {
         let mut in_flight = HashMap::new();
@@ -7208,7 +7206,7 @@ mod replace_tests {
 
     /// The case that motivated all of this: rsync renaming its temp file over
     /// the real one. Two plain files, and it has to be allowed — refusing is
-    /// what made every rsync transfer fail at the last step (bugs.md B13).
+    /// what made every rsync transfer fail at the last step (`docs/BUGS.md` B13).
     #[test]
     fn a_file_may_replace_a_file() {
         assert!(check_replaceable(false, false, true).is_ok());

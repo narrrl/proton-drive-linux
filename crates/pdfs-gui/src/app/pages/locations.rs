@@ -7,7 +7,7 @@
 //! `~/ProtonDrive` mount, plus each folder this computer backs up, whether it is
 //! a mirrored local directory or an on-demand FUSE session. The page is called
 //! *Locations* rather than *Mounts* because a mirror folder is a plain directory
-//! with no FUSE session behind it (mount-architecture.md §4).
+//! with no FUSE session behind it.
 //!
 //! The device rows drive the same control requests the Computers page used to:
 //! mode switch, sync now, remove. What is new here is that the primary mount is

@@ -577,7 +577,7 @@ CREATE TABLE trash (
 );
 ";
 
-/// Schema v8: device sync (devices.md). This machine registers as one Proton Drive
+/// Schema v8: device sync. This machine registers as one Proton Drive
 /// **Device** (a share + root folder on the main volume); `device` is a singleton
 /// row cached so we reuse the same device across restarts instead of creating a
 /// new one each run. `sync_folder` is one row per local folder the user added,
@@ -638,8 +638,8 @@ ALTER TABLE sync_folder ADD COLUMN pending_mode TEXT;
 ";
 
 /// Schema v11: writes no longer upload inside the FUSE handler. `release` stages
-/// the bytes and records the intended upload here, and a drain worker performs it
-/// (offline.md Phase 3). The row outlives the process, so a write survives both a
+/// the bytes and records the intended upload here, and a drain worker performs it.
+/// The row outlives the process, so a write survives both a
 /// dead network and a restart.
 ///
 /// `blob_path` points into the content cache's `staging/` dir and `meta_json` is
@@ -666,7 +666,7 @@ CREATE INDEX pending_op_uid ON pending_op(uid);
 
 /// Schema v12: `pending_op` also carries mutations that *create* a node, which a
 /// revision op never had to describe — it always addressed a node the server had
-/// already minted a uid for (offline.md Phase 3b).
+/// already minted a uid for.
 ///
 /// An offline `create`/`mkdir` cannot get a real uid, so the node is invented
 /// locally under a `local~<uuid>` placeholder and the op records where it goes
@@ -1056,7 +1056,7 @@ ALTER TABLE pending_op ADD COLUMN access_deferred_since INTEGER NOT NULL DEFAULT
 /// as the last sync and left the file the same length — a fixed-size record
 /// rewritten, an image re-exported, a database page updated in place — read as
 /// *unchanged* and was never uploaded. The remote copy silently stayed at the
-/// older content until something else about the file moved (bugs.md B25).
+/// older content until something else about the file moved (`docs/BUGS.md` B25).
 ///
 /// Nullable rather than a converted `local_mtime * 1_000_000_000`: the
 /// nanosecond part of an existing baseline is genuinely unknown, and inventing

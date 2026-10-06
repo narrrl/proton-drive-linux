@@ -132,7 +132,7 @@ impl Filesystem for ProtonFs {
         // A provisional size is the *ciphertext* size, which is larger than the
         // file. Publishing it makes every reader that trusts `st_size` — rsync,
         // mmap, sendfile, a sized read loop — run off the end of the file and
-        // fail. So resolve it before answering rather than after (bugs.md B14).
+        // fail. So resolve it before answering rather than after (`docs/BUGS.md` B14).
         //
         // The cost is one batched round trip for the whole folder, not one per
         // file: `ls -l` is one `getattr` per entry and they collapse onto a
@@ -172,7 +172,7 @@ impl Filesystem for ProtonFs {
     /// here — once per `opendir`, which the kernel pairs exactly with one
     /// `releasedir` — is what makes the offsets stable, so a create or a trash
     /// during an enumeration can no longer make the caller skip or repeat an
-    /// entry (bugs.md B43).
+    /// entry (`docs/BUGS.md` B43).
     ///
     /// Enumerating a cold folder is a remote call, so it goes to a worker for
     /// the same reason `lookup` and `readdir` do.
@@ -346,7 +346,7 @@ impl Filesystem for ProtonFs {
         self.core.workers.run(Lane::Transfer, "read", move || {
             // The revision disagrees with a provisional size, and B84 fails
             // such a read outright, so settle the size first. On the network,
-            // hence here and not above (bugs.md B100).
+            // hence here and not above (`docs/BUGS.md` B100).
             let fsize = match provisional {
                 true => core.resolve_provisional_size(ino.0, &uid).unwrap_or(fsize),
                 false => fsize,
@@ -517,7 +517,7 @@ impl Filesystem for ProtonFs {
                 // `> file`. This is the second write path into the API, and
                 // queueing it is what lets a redirect work offline at all: it
                 // never reaches `release`, so without this it failed before any
-                // byte was written (offline.md Phase 2/3b).
+                // byte was written.
                 //
                 // The one branch of `setattr` that can reach the network:
                 // shrinking keeps the prefix, which `queue_truncate` gap-fills
@@ -607,7 +607,7 @@ impl Filesystem for ProtonFs {
     }
 
     /// `close(2)` calls flush before release. The upload is queued in `release`
-    /// and performed in the background (offline.md Phase 3), so there is nothing
+    /// and performed in the background, so there is nothing
     /// to push here — the written bytes are already in the scratch file.
     fn flush(
         &self,
@@ -985,7 +985,7 @@ pub struct ProtonFs {
 }
 
 /// How many times a write `open` will re-read its base after a `release`
-/// published a newer queued revision underneath it (bugs.md B32).
+/// published a newer queued revision underneath it (`docs/BUGS.md` B32).
 ///
 /// One retry covers the race, which needs a close and an open of the same file
 /// to overlap on different threads. More than that is not contention, it is a
@@ -1021,7 +1021,7 @@ fn build_listing(st: &State, ino: u64) -> DirListing {
 ///
 /// The cookie handed back is the index of the *next* entry, so a resumed call
 /// continues exactly where the last one stopped — which is only true because
-/// the listing behind those indexes is a snapshot (bugs.md B43).
+/// the listing behind those indexes is a snapshot (`docs/BUGS.md` B43).
 fn reply_listing(listing: &DirListing, offset: u64, root: u64, mut reply: ReplyDirectory) {
     for (i, (ino, is_dir, name)) in listing.iter().enumerate().skip(offset as usize) {
         let ft = if *is_dir {
@@ -1094,7 +1094,7 @@ impl ProtonFs {
                             // `getattr` would, so `ls -l` — which is one `lookup`
                             // per entry and no `getattr` at all — takes its sizes
                             // from here. Resolving only in `getattr` left the whole
-                            // listing provisional (bugs.md B14).
+                            // listing provisional (`docs/BUGS.md` B14).
                             let provisional = matches!(
                                 &e.node.kind,
                                 NodeKind::File {
@@ -1276,7 +1276,7 @@ impl ProtonFs {
         // revision in between sends this around again. Without the re-check the
         // new handle carried the *older* base, and its own release published
         // content that silently discarded the revision closed a moment earlier
-        // (bugs.md B32). A second attempt is already unlikely and a third would
+        // (`docs/BUGS.md` B32). A second attempt is already unlikely and a third would
         // mean something is republishing continuously, so give up rather than
         // spin: the caller's `open` fails instead of its data being lost.
         //
@@ -1286,7 +1286,7 @@ impl ProtonFs {
             for attempt in 0..OPEN_BASE_ATTEMPTS {
                 // The handle starts at the base's size. A provisional one is the
                 // ciphertext size, so the file would grow by the encryption
-                // overhead and reading the base would fail (bugs.md B100). A
+                // overhead and reading the base would fail (`docs/BUGS.md` B100). A
                 // queued revision stamps a real size, so this only goes to the
                 // network for a file the listing has not sized yet.
                 if provisional && self.core.pending_blob(&uid).is_none() {
@@ -1541,7 +1541,7 @@ impl ProtonFs {
         let transient = is_transient_name(name);
         // Offline the server cannot mint a uid, so invent one and queue the
         // create. The file is real to the caller either way; only its identity is
-        // provisional until the drain (offline.md Phase 3b).
+        // provisional until the drain.
         //
         // A parent that is itself still queued forces the same path even when we
         // are online: the API has no folder to put this in yet.
@@ -1652,7 +1652,7 @@ impl ProtonFs {
             .ok();
         // As in `create`: offline — or under a parent that is itself still
         // queued — the folder becomes a placeholder that the drain turns into a
-        // real one (offline.md Phase 3b).
+        // real one.
         // Losing the network on the way queues it the same way.
         let minted = if self.core.sends_inline() && !is_local_uid(&parent_uid) {
             if let Err(error) = self.core.require_uid_writable(&parent_uid) {
@@ -1874,7 +1874,7 @@ impl ProtonFs {
         // rename, so the victim has to be removed first and the operation stops
         // being atomic. Without this the 422 surfaced as a blanket EIO and every
         // write-to-temp-then-rename tool — rsync, atomic editor saves — failed
-        // at the very end of its transfer (bugs.md B13).
+        // at the very end of its transfer (`docs/BUGS.md` B13).
         //
         // `RENAME_EXCHANGE` has no Proton primitive and cannot be emulated
         // without a window in which one of the two names does not exist.
@@ -1956,8 +1956,7 @@ impl ProtonFs {
         };
         // A node whose own creation is still queued has no server-side identity
         // to rename: the queued op *is* the node, so rewriting its target is the
-        // whole rename. Nothing reaches the API, which is why this works offline
-        // (offline.md Phase 3b).
+        // whole rename. Nothing reaches the API, which is why this works offline.
         // A create that lands meanwhile leaves no op to rewrite; the node is
         // then renamed by the uid Drive gave it (docs/BUGS.md B142).
         if is_local_uid(&uid) {
@@ -2156,7 +2155,7 @@ impl ProtonFs {
             .is_some_and(|e| e.open_count > 0);
         // A node the server has never heard of cannot be trashed there; deleting
         // it just means its queued creation is no longer wanted. This works
-        // offline, which the remote path below cannot (offline.md Phase 3b).
+        // offline, which the remote path below cannot.
         if is_local_uid(&uid) {
             let dropped = if open_now {
                 self.core.withdraw_queued_ops(&uid)
@@ -2185,7 +2184,7 @@ impl ProtonFs {
         }
         // Offline: queue it. Trashing is the one mutation a user expects to work
         // regardless — the file is gone from their point of view the moment the
-        // command returns (offline.md Phase 3b). The same when the network goes
+        // command returns. The same when the network goes
         // away under the remote call below.
         let queue_it = |reply: ReplyEmpty| match self.core.queue_trash(&uid, name) {
             Ok(()) => reply.ok(),
@@ -2234,7 +2233,7 @@ impl ProtonFs {
         self.core.invalidate_trash();
         // Every other trash site records itself; this one did not, which made a
         // file found in the trash impossible to attribute after the fact — the
-        // activity log was the only record and it showed nothing (bugs.md B2).
+        // activity log was the only record and it showed nothing (`docs/BUGS.md` B2).
         self.core
             .log_activity(ActivityKind::Trash, name, "trashed from the mount", true);
         reply.ok();

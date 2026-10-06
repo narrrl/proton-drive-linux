@@ -675,8 +675,8 @@ fn foreign_folder(volume: &str, link: &str, parent: NodeUid, name: &str) -> Node
     node
 }
 
-/// Recovering the root by uid is what lets the daemon mount offline
-/// (offline.md Phase 1): the uid is remembered in `sync_state`, the node
+/// Recovering the root by uid is what lets the daemon mount offline:
+/// the uid is remembered in `sync_state`, the node
 /// itself comes back out of `nodes`.
 #[test]
 fn node_by_uid_recovers_a_stored_node() {
@@ -796,7 +796,7 @@ fn children_if_listed_gated_on_flag() {
     assert_eq!(kids.len(), 2);
 }
 
-/// The shape of the `mv`-loses-the-file bug (bugs.md B1): a rename deletes the
+/// The shape of the `mv`-loses-the-file bug (`docs/BUGS.md` B1): a rename deletes the
 /// moved node's row, so a destination left marked `listed` is rebuilt from the DB
 /// without it — the file is gone from the source and absent from the destination,
 /// with `rename(2)` having reported success. Clearing the flag is what forces the
@@ -5735,7 +5735,7 @@ fn cache_eviction_candidates_are_lru_ordered_and_limited() {
     );
 }
 
-/// **The B5 checkpoint.** `improvements.md` P2.3 proposes concurrent SQLite
+/// **The B5 checkpoint.** A performance plan proposed concurrent SQLite
 /// reads, on the premise that the single `Mutex<Connection>` serializes the FUSE
 /// workers. This measures what the connection is actually asked to do now that
 /// B3 and B4 have landed, so the proposal is decided on evidence.
@@ -6291,7 +6291,7 @@ fn migration_v27_adds_the_access_deferral_column_to_a_v26_queue() {
 /// back with no nanosecond time. That `None` is the whole point: it makes the
 /// comparison fall back to whole seconds for rows written before the column
 /// existed, instead of asserting a sub-second time of zero and re-uploading
-/// every already-synced file in the folder (bugs.md B25).
+/// every already-synced file in the folder (`docs/BUGS.md` B25).
 #[test]
 fn migration_v28_adds_sub_second_local_times_without_disturbing_a_v27_baseline() {
     let path = std::env::temp_dir().join(format!(

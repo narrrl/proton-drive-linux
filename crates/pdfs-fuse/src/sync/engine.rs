@@ -33,7 +33,7 @@ pub(crate) enum SyncMsg {
     /// Re-read the folder set and adjust the filesystem watches (after add/remove).
     Rewatch,
     /// The daemon is tearing down: finish the current pass and end the engine
-    /// thread, so the mount can join it (bugs.md B44).
+    /// thread, so the mount can join it (`docs/BUGS.md` B44).
     Stop,
 }
 

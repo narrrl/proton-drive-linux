@@ -1,4 +1,4 @@
-//! Selective-sync ignore rules for mirror folders (features.md 1.1).
+//! Selective-sync ignore rules for mirror folders.
 //!
 //! A mirror folder otherwise uploads every path beneath its root, which for a
 //! project directory means `node_modules/`, `.git/`, and `target/` — quota

@@ -6,7 +6,7 @@
 //! invisible; in an in-process remount — which is how the daemon recovers from a
 //! mount going away underneath it — it leaks a whole generation of threads that
 //! keep writing to the database and calling the API on behalf of a mount that no
-//! longer exists (bugs.md B44).
+//! longer exists (`docs/BUGS.md` B44).
 //!
 //! The primitive is deliberately small: a flag plus a condvar. Every loop that
 //! would otherwise call `thread::sleep` calls [`Shutdown::sleep`] instead, which

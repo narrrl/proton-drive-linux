@@ -1,7 +1,7 @@
 //! The write-back drain: turning queued mutations into remote calls.
 //!
 //! Every write the kernel hands us is answered the moment its bytes and its
-//! `pending_op` row are on disk (offline.md Phase 3), which is what lets a `cp`
+//! `pending_op` row are on disk, which is what lets a `cp`
 //! into the mount run at disk speed and lets an offline write succeed at all.
 //! This module is the other half: the worker that walks that queue and performs
 //! the uploads, creates, renames and trashes it recorded.
@@ -276,8 +276,7 @@ fn run_authorized_drain(
 }
 
 impl Core {
-    /// Drain the pending-op queue: the background half of every write
-    /// (offline.md Phase 3).
+    /// Drain the pending-op queue: the background half of every write.
     ///
     /// Runs for the life of the mount. Ops are replayed oldest-first, each
     /// retried with doubling backoff and *never* dropped on failure — the staged
@@ -306,7 +305,7 @@ impl Core {
         loop {
             // Between ops, never inside one: an op that has started is either
             // retired or released, so stopping here cannot leave the queue with
-            // a row claimed by a worker that no longer exists (bugs.md B44).
+            // a row claimed by a worker that no longer exists (`docs/BUGS.md` B44).
             if self.shutdown.is_stopping() {
                 debug!(primary, "drain worker stopping");
                 return;
@@ -1150,7 +1149,7 @@ impl Core {
     }
 
     /// Make a node that so far exists only on this machine real, and adopt the
-    /// uid the server gives it (offline.md Phase 3b).
+    /// uid the server gives it.
     pub(crate) fn drain_local_node(
         &self,
         op: &PendingOp,
@@ -1850,7 +1849,7 @@ impl Core {
     /// that window the node can be rewritten by another device, trashed, or
     /// deleted outright. Sending the blob anyway would silently drop whatever
     /// happened in between, which is exactly the thing the sync engine refuses
-    /// to do (offline.md Phase 3b).
+    /// to do.
     ///
     /// Only checkable against a recorded baseline: a write staged before
     /// [`StagedWrite::based_on`] existed, or one against a node that has never
@@ -2009,7 +2008,7 @@ impl Core {
         self.db.delete_op(op.id)?;
         // Dropping the pending entry hands the node back to the remote's truth:
         // reads stop coming from the staged blob, and the event sync stops
-        // skipping it as "ahead of the server" (offline.md Phase 3a). Only if it
+        // skipping it as "ahead of the server". Only if it
         // is still *this* write's entry — see [`Core::release_pending`].
         self.release_pending(uid, blob);
         self.cache.discard_staged(blob);

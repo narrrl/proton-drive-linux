@@ -143,7 +143,7 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
             // create, and re-fetching would replace the size and mtime of the
             // write we just accepted with the stale revision's — making a file
             // that was copied in seconds ago read as empty until its upload
-            // lands (offline.md Phase 3).
+            // lands.
             //
             // A write that has already drained is the same story one step later:
             // the drain brought the tree level with the revision it sealed, so
@@ -375,7 +375,7 @@ pub(super) async fn run_event_sync(
         // server head; persist it so the next restart resumes instead of
         // reseeding (which would skip everything that changed offline).
         // Seeding needs the network, and this task also runs on mounts that
-        // started offline (offline.md Phase 1) — so retry rather than giving up,
+        // started offline — so retry rather than giving up,
         // which used to disable live sync for the life of the daemon.
         Ok(None) => {
             // Nothing says what changed before this cursor, so a persisted SDK
@@ -660,7 +660,7 @@ pub(super) fn run_local_index(
             scan_local_once(&db, &indexing, &transfers, &mountpoint);
         }
         // Interruptible, so teardown joins this thread instead of leaving it to
-        // keep rewriting the index for a mount that is gone (bugs.md B44).
+        // keep rewriting the index for a mount that is gone (`docs/BUGS.md` B44).
         if !shutdown.sleep(LOCAL_INDEX_CHECK) {
             return;
         }

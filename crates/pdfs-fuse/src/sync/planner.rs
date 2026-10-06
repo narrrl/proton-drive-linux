@@ -218,7 +218,7 @@ pub(super) fn plan_file(
     }
 
     let local_changed = local.is_some_and(|item| {
-        // Nanoseconds where both sides have them (bugs.md B25): whole seconds
+        // Nanoseconds where both sides have them (`docs/BUGS.md` B25): whole seconds
         // could not see an edit made in the same second as the last sync that
         // left the file the same length, so it was never uploaded.
         baseline.is_none_or(|base| !LocalSig::from(item).same_content(&LocalSig::from(base)))
@@ -291,7 +291,7 @@ mod file_plan_tests {
 
     /// Whole seconds cannot see an edit made inside the same second that leaves the
     /// file the same length, so a mirror silently stopped uploading it. With a
-    /// nanosecond time on both sides it is an ordinary local change (bugs.md B25).
+    /// nanosecond time on both sides it is an ordinary local change (`docs/BUGS.md` B25).
     #[test]
     fn a_same_second_same_size_edit_is_still_a_local_change() {
         let mut base = baseline(10, 20, 30, 40);

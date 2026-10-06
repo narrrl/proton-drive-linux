@@ -68,7 +68,7 @@ impl Core {
     /// docs for the identical/divergent policy.
     pub(crate) fn run_conflict_sweep_loop(&self) {
         // Both waits are interruptible, so teardown does not have to sit out a
-        // five-minute interval to join this thread (bugs.md B44).
+        // five-minute interval to join this thread (`docs/BUGS.md` B44).
         if !self.shutdown.sleep(CONFLICT_SWEEP_WARMUP) {
             return;
         }

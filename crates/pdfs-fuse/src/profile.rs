@@ -1,5 +1,5 @@
 //! Reading and writing this machine's `profile.json` in its device root, and
-//! the restore that rebuilds a machine from one (features.md 5.2 and 5.3).
+//! the restore that rebuilds a machine from one.
 //!
 //! The document itself is defined in [`pdfs_core::profile`]; this is the half
 //! that talks to Drive. Saving is best-effort and never blocks a user action:
@@ -246,7 +246,7 @@ impl Core {
         Profile::parse(&buf).map(Some).map_err(CoreError::invalid)
     }
 
-    // ---- restore (features.md 5.2) ----------------------------------------
+    // ---- restore ----------------------------------------
 
     /// The folders under a device that could be synced here, each carrying a
     /// proposed local path. `device` names another registered device by uid;

@@ -1,4 +1,4 @@
-//! The machine profile that travels with a device (features.md 5.3).
+//! The machine profile that travels with a device.
 //!
 //! Sync folder mappings, pins, and the settings that shape them live in
 //! `cache.db` and `config.json` — both on the local disk. When that disk dies,

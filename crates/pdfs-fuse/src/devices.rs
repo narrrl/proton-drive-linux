@@ -1,5 +1,5 @@
 //! This machine as a Proton Drive Device, and the local folders it keeps in
-//! step with the remote (devices.md).
+//! step with the remote.
 //!
 //! A sync folder runs in one of two modes. `mirror` keeps a real local tree that
 //! the engine in [`super::sync`] reconciles both ways; `ondemand` evicts that
@@ -184,8 +184,8 @@ impl Core {
     }
 
     /// Adopt an existing device as *this* machine's, pinning it in `config.json`
-    /// so hostname changes and reinstalls stop registering duplicates
-    /// (features.md 5.1). `None` clears the pin and returns to hostname matching.
+    /// so hostname changes and reinstalls stop registering duplicates.
+    /// `None` clears the pin and returns to hostname matching.
     ///
     /// Refuses a uid that is not in the account: the whole point of the pin is
     /// that it is authoritative, so accepting a bad one would defer the failure
@@ -260,7 +260,7 @@ impl Core {
         })
     }
 
-    // ---- device folder sync (devices.md, Phase 1) -------------------------
+    // ---- device folder sync -------------------------
 
     /// Auto-register (or recover) this machine as a Proton Drive Device, caching
     /// it so restarts reuse the same device. Recovery matches an existing remote
@@ -270,8 +270,7 @@ impl Core {
     /// Resolution order: the *adopted* uid pinned in `config.json`, then the
     /// cached DB row (validated remotely), then a hostname match, then create.
     /// The pin exists because the hostname heuristic silently registers a second
-    /// device after a rename or reinstall, orphaning the first one's folders
-    /// (features.md 5.1).
+    /// device after a rename or reinstall, orphaning the first one's folders.
     pub(crate) fn ensure_device(&self) -> CoreResult<StoredDevice> {
         let name = this_hostname();
         // Enumerate the remote devices once: used to validate the pin, validate
@@ -617,7 +616,7 @@ impl Core {
     }
 
     /// A sibling Core for a secondary FUSE session rooted at an `ondemand` sync
-    /// folder (devices.md Phase 3). It shares everything with this one,
+    /// folder. It shares everything with this one,
     /// the tree included, except what belongs to a session: its root and its
     /// kernel channel, both filled in when the session is built.
     pub(crate) fn fork_state(&self) -> Core {
@@ -986,8 +985,7 @@ impl Core {
     /// restart (their local dirs are empty on disk — the files live in the cloud).
     /// Best-effort per folder: a missing local path or a failed remote fetch marks
     /// the folder `error` and moves on rather than aborting the rest. Runs on its
-    /// own thread from `mount` so the network fetches never block startup
-    /// (devices.md Phase 4).
+    /// own thread from `mount` so the network fetches never block startup.
     pub(crate) fn restore_ondemand_mounts(&self) {
         let folders = match self.db.sync_folder_list() {
             Ok(f) => f,

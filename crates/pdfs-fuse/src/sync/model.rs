@@ -20,7 +20,7 @@ impl LocalSig {
     /// Nanoseconds decide it when both sides have them; otherwise the comparison
     /// falls back to whole seconds, which is what a baseline row written before
     /// schema 28 — or a filesystem that reports no sub-second time — can support
-    /// (bugs.md B25).
+    /// (`docs/BUGS.md` B25).
     pub(super) fn same_content(&self, other: &Self) -> bool {
         if self.size != other.size {
             return false;
@@ -161,7 +161,7 @@ pub(super) enum Pending {
     /// was there. A download can run for minutes, so the apply step revalidates
     /// against it immediately before it renames over the destination: a writer
     /// that finished an edit in the meantime must not be overwritten without a
-    /// conflict copy (bugs.md B39).
+    /// conflict copy (`docs/BUGS.md` B39).
     Download {
         rel: String,
         uid: NodeUid,
