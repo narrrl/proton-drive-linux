@@ -31,12 +31,12 @@ time when the installed library has them (`crates/pdfs-gui/src/compat.rs`).
 | Path | Contents |
 |---|---|
 | `crates/pdfs-core` | Shared library: authentication and keyring (`auth`), configuration (`config`), SQLite schema and queries (`db/`), content cache (`cache`), control protocol (`control`), search scoring, sync ignore rules, Google Takeout parsing, machine profile |
-| `crates/pdfs-fuse` | The daemon: FUSE filesystem, read path (`reads`), write queue (`queue`, `drain`, `upload`), sync engine (`sync/`), remote events (`background`), push events for front ends (`events`), control handlers (`control`), photos, devices, supervisor |
+| `crates/pdfs-fuse` | The daemon: FUSE handlers (`filesystem`), the tree (`state`), reads (`reads`), the queue and the drain (`queue`, `drain`, `upload`), link state (`link`), the sync engine (`sync`, `sync/`), moves between locations (`relocate`), remote events (`background`), push events (`events`), control handlers (`control`), photos, devices, the supervisor, and the simulation tests (`sim/`) |
 | `crates/pdfs-cli` | The `pdfs` binary |
 | `crates/pdfs-gui` | `pdfs-app`, `pdfs-tray` and `pdfs-prompt`. Pages in `src/app/pages/`, shared widgets in `src/app/widgets/`, CSS and icons in `resources/` |
 | `po/` | Translation template, catalogs and the scripts that maintain them |
 | `packaging/` | systemd unit, desktop files, icon, PKGBUILD, RPM spec, AUR recipes |
-| `scripts/` | FUSE acceptance suite, map-data generators |
+| `scripts/` | FUSE acceptance suite, map-data generators, the wiki publisher |
 | `docs/` | This documentation |
 
 The GUI talks to the daemon only through the control socket. Anything a front end needs that the
@@ -87,8 +87,9 @@ cargo test --workspace --locked
 scripts/fuse-acceptance.sh --offline-only
 ```
 
-For changes to the FUSE layer, the write queue or the sync engine, also run the live acceptance
-cases described in [TESTING.md](TESTING.md).
+For changes to the FUSE layer, the queue or the sync engine, also run the
+[simulation runs](TESTING.md#simulation-runs), which CI runs only after a push to `main`, and the
+[acceptance suite](TESTING.md#acceptance-suite) on a test account.
 
 For changes to GUI strings, check that every catalog is complete:
 
@@ -136,6 +137,15 @@ file to `po/POTFILES.in`, run `po/update.sh`, and translate the new entries in e
 `#[serde(default)]`, so older files still load, and document it in
 [CONFIGURATION.md](CONFIGURATION.md).
 
+**A bug fix.** Add or update the entry in [BUGS.md](BUGS.md#adding-an-entry), cover the fix with a
+unit test, a simulation scenario or a `regression B<n>` acceptance case, and cite the entry in the
+code as `docs/BUGS.md B<n>`. Do not cite planning notes that are not in the repository.
+
+**A user-visible change.** Update the matching page (user guide, CLI reference, configuration)
+and the `[Unreleased]` section of [CHANGELOG.md](CHANGELOG.md). `scripts/publish-wiki.sh` copies
+the six user pages (`INSTALL`, `USER_GUIDE`, `CLI`, `CONFIGURATION`, `TROUBLESHOOTING`, `RECOVERY`)
+to the GitHub wiki, so keep their file names.
+
 ## Releasing
 
 Releases are cut from `main` by pushing a `v*` tag. `.github/workflows/release.yml` then:
@@ -160,5 +170,5 @@ git tag vX.Y.Z
 git push origin main vX.Y.Z
 ```
 
-Before a release that touches the filesystem or sync, run the managed live mode matrix from
-[TESTING.md](TESTING.md). Open release-assurance items are listed in [ROADMAP.md](ROADMAP.md).
+Before a release, work through [Before a release](TESTING.md#before-a-release). Open
+release-assurance items are listed in [ROADMAP.md](ROADMAP.md#release-assurance).

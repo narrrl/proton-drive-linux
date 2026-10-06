@@ -39,9 +39,9 @@ cargo test --workspace --locked
 scripts/fuse-acceptance.sh --offline-only
 ```
 
-Changes to the FUSE layer, sync, or the pending-operation queue should also be exercised against a
-real mount before review — see [`docs/TESTING.md`](docs/TESTING.md). Live runs are destructive:
-use a dedicated test account, never one holding data you cannot lose.
+Changes to the FUSE layer, sync, or the queue should also pass the simulation runs and be
+exercised against a real mount before review — see [`docs/TESTING.md`](docs/TESTING.md). Live
+runs are destructive: use a dedicated test account, never one holding data you cannot lose.
 
 ## Making changes
 
