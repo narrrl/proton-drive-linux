@@ -7,6 +7,7 @@ How Proton Drive for Linux works and how to use it day to day. For installation 
 - [My files](#my-files)
 - [Keeping files on this computer](#keeping-files-on-this-computer)
 - [Syncing local folders](#syncing-local-folders)
+- [Changes waiting for Proton Drive](#changes-waiting-for-proton-drive)
 - [Conflicts](#conflicts)
 - [Pausing and limiting sync](#pausing-and-limiting-sync)
 - [Photos](#photos)
@@ -33,7 +34,7 @@ the service to do things over a local socket:
 
 Your Drive, your file names and your photos are end-to-end encrypted by Proton. On this computer,
 the service must decrypt what it shows you, and it keeps a decrypted cache and index on disk. Use
-full-disk or home-directory encryption. [ARCHITECTURE.md §8](ARCHITECTURE.md#8-threat-model-what-this-client-writes-to-disk-in-plaintext)
+full-disk or home-directory encryption. [ARCHITECTURE.md §10](ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext)
 lists exactly what is stored.
 
 The app uses these words consistently, and so does this guide:
@@ -54,9 +55,11 @@ downloads only when a program reads it:
 
 - **Reads fetch only what is needed.** A video player that seeks, or a tool that reads a file
   header, downloads only those parts. Media streams while it plays.
-- **Writes are safe offline.** When a program closes a file it wrote, the service stores the new
-  content on disk and queues the upload. The queue survives network loss, restarts and crashes.
-  `pdfs sync queue` lists what has not reached Proton Drive yet.
+- **Changes work at local speed.** Creating, renaming, moving and deleting files and folders
+  returns at once, online or offline. When a program closes a file it wrote, the new content is
+  stored on disk. Every change is queued and sent to Proton Drive in the background; the changes
+  to one file are sent in the order you made them. The queue survives network loss, restarts and
+  crashes. See [Changes waiting for Proton Drive](#changes-waiting-for-proton-drive).
 - **Recently read content is cached** on disk up to the cache size limit (5 GiB by default) and
   evicted oldest first.
 - **Items shared with you** appear under `Shared with me/` inside the Proton Drive folder. Shares
@@ -143,6 +146,36 @@ places, and both apply:
 Rules are re-read on every pass. Ignoring never deletes anything: a file that becomes ignored is
 simply no longer tracked, and its copy on Proton Drive stays.
 
+## Changes waiting for Proton Drive
+
+A change you made in the Proton Drive folder exists only on this computer until it reaches
+Proton Drive. `pdfs status`, the tray and **Sync → Overview** count what is still waiting, and
+`pdfs sync queue` lists it.
+
+Sometimes Proton Drive refuses a change: the storage is full, a share was taken away, the folder
+is gone, the folder holds too many items, or Drive does not accept a name. The change then needs
+your attention. It shows at once in **Sync → Overview**, in the tray, and in `pdfs sync issues`,
+with what it means and what you can do. A file or folder with such a change carries a warning
+badge in **Files**; hover it to see why.
+
+Nothing is deleted. The change stays queued and is retried. You can:
+
+- **Retry** it now, from the same list or with `pdfs sync retry`, for example after freeing space.
+- **Export** a file's content to keep your version (`pdfs sync export <id> <file>`).
+- **Discard** the change (`pdfs sync discard <id>`). It is undone here and never sent: a new file
+  or folder goes away, anything else goes back to what Proton Drive has. Export first if you want
+  to keep the content.
+
+Two cases are not refused, and the activity log records both:
+
+- A new file or folder whose name is already taken on Proton Drive by something this computer had
+  not seen yet lands under a `(sync-conflict …)` name, as described below.
+- A new file whose folder was deleted on another device meanwhile lands at the top of My files,
+  so its content is not lost.
+
+Before you shut down a computer for good, check that nothing is waiting: see
+[RECOVERY.md](RECOVERY.md#lost-with-the-machine).
+
 ## Conflicts
 
 When the same file changed on this computer and somewhere else since the last sync, neither side
@@ -166,11 +199,6 @@ The version you do not keep goes to the Trash, so a wrong choice can be undone.
   reading files keeps working. `pdfs sync resume` continues.
 - **Limit bandwidth** under **Preferences → General → Network**, or with
   `pdfs sync limit --up 2M --down 10M`. `0` removes a limit.
-- **Retry** a failed upload from **Sync → Overview**, or with `pdfs sync retry`.
-- **Discard** a change Proton Drive refused from the same list, or with `pdfs sync discard`: it is
-  undone here and never sent. Export a file first to keep your version.
-- A file or folder with a change Proton Drive refused carries a warning badge in **Files**; hover
-  it to see why.
 
 ## Photos
 

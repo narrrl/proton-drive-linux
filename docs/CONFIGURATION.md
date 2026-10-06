@@ -38,7 +38,7 @@ Inside `content/`:
 > not reached Proton Drive and exists nowhere else.
 
 Everything in these directories except the keyring is **decrypted**. See
-[ARCHITECTURE.md §8](ARCHITECTURE.md#8-threat-model-what-this-client-writes-to-disk-in-plaintext).
+[ARCHITECTURE.md §10](ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
 
 ## `config.json`
 
@@ -190,13 +190,16 @@ Command-line flags win over the file: `--gtk`, `--dmenu`, `--fzf` and `--menu`.
 | `PDFS_LOCALEDIR` | app, tray, prompt | Load translations from another directory (development) |
 | `PDFS_STAND_IN_WIDGETS` | app | `1` uses the libadwaita 1.5 fallback widgets on newer systems (development) |
 
-The acceptance suite has its own `PDFS_ACCEPTANCE_*` variables, listed in [TESTING.md](TESTING.md).
+The tests have their own variables (`PDFS_ACCEPTANCE_*`, `PDFS_SIM_*`, `PDFS_MIGRATE_DB`),
+listed in [TESTING.md](TESTING.md).
 
 ## The systemd service
 
-`proton-drive.service` is a user unit. It restarts the service whenever it exits, restarts it when
-it stops answering for two minutes (`WatchdogSec=120`), and caps its memory at 6 GiB. To change
-the unit without editing the packaged file, use a drop-in:
+`proton-drive.service` is a user unit started with your graphical session
+(`WantedBy=graphical-session.target`). It restarts the service whenever it exits, restarts it
+when it stops answering for two minutes (`WatchdogSec=120`), throttles it above 2 GiB of memory
+(`MemoryHigh`) and stops it at 6 GiB (`MemoryMax`). To change the unit without editing the
+packaged file, use a drop-in:
 
 ```bash
 systemctl --user edit proton-drive.service

@@ -113,28 +113,40 @@ pdfs refresh Documents
 **"Permission denied" when writing** — the item is in a share where you are a viewer, or under
 `Shared with me/`, which is read-only as a folder. Check your role with `pdfs shared-with-me`.
 
-**A program says "Operation not supported"** — Proton Drive cannot store symbolic links, hard
-links, device files or FIFOs. The error is intentional. Use a synced folder for
-projects that need them, or exclude those paths.
+**`ln` or another program fails with "Operation not permitted"** — Proton Drive cannot store
+symbolic links, hard links, device files or FIFOs, so creating one fails at once. The error is
+intentional. Use a synced folder for projects that need them, or exclude those paths.
 
 ## Uploads and sync
 
-**Something is stuck uploading** — list the queue and retry:
+**A change shows here but not on other devices** — changes are recorded on this computer first
+and sent from a queue. List what is still waiting, and what needs attention:
 
 ```bash
 pdfs sync queue
+pdfs sync issues
+```
+
+The app shows the same on **Sync → Overview**. A change waits while the service is offline or
+sync is paused (`pdfs status`), and backs off after a failure. To retry at once:
+
+```bash
 pdfs sync retry           # every failed operation
 pdfs sync retry 42        # one operation
 ```
 
-The app shows the same list on **Sync → Overview**. An operation that keeps failing shows its
-error there. A change Proton Drive will not take can be dropped instead, which undoes it here;
-save a file's content first if you want to keep it:
+A change Proton Drive refuses (storage full, access taken away, folder gone) is listed by
+`pdfs sync issues` with what to do. It stays queued until you fix the cause or drop it. Dropping
+it undoes it here; save a file's content first if you want to keep it:
 
 ```bash
 pdfs sync export 42 ~/Desktop/
 pdfs sync discard 42
 ```
+
+If you suspect the local-first behaviour of 3.0.0 itself, `"local_first": false` in `config.json`
+makes the Proton Drive folder wait for Proton Drive again while online (see
+[CONFIGURATION.md](CONFIGURATION.md#local_first)), and please report the problem.
 
 **A file in a synced folder does not upload** — check that:
 
