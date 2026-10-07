@@ -128,7 +128,12 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
 
         set_signing_in(&ui, true);
         ui.login.login_status.set_text(&gettext("Signing in…"));
-        let (rx, totp_req_rx, hv_req_rx) = spawn_login(username, password);
+        let LoginChannels {
+            result: rx,
+            totp: totp_req_rx,
+            hv: hv_req_rx,
+            mailbox: mailbox_req_rx,
+        } = spawn_login(username, password);
 
         // Surface the 2FA dialog only if the SDK actually asks for a code (i.e.
         // the account has 2FA enabled). The worker blocks until the dialog feeds
@@ -154,6 +159,21 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     .login_status
                     .set_text(&gettext("Complete the verification to continue…"));
                 prompt_human_verification(&ui_hv, &url, token_tx);
+            }
+        });
+
+        // And for the mailbox password, which only a two-password account has.
+        // The worker asks again after a wrong answer, so this loops too.
+        let ui_mailbox = ui.clone();
+        glib::spawn_future_local(async move {
+            while let Ok((attempt, answer_tx)) = mailbox_req_rx.recv().await {
+                ask_mailbox(&ui_mailbox, attempt > 0, move |answer| {
+                    // A cancelled dialog drops the sender, which the worker
+                    // reads as a cancelled login.
+                    if let Some(answer) = answer {
+                        let _ = answer_tx.send(answer);
+                    }
+                });
             }
         });
 
@@ -209,6 +229,12 @@ pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
         pdfs_core::Error::Other(message) if message.contains("two-factor") => {
             gettext("Sign-in cancelled: no two-factor code was entered.")
         }
+        pdfs_core::Error::Other(message) if message.contains("mailbox") => {
+            gettext("Sign-in cancelled: no mailbox password was entered.")
+        }
+        pdfs_core::Error::WrongMailboxPassword => {
+            gettext("That mailbox password didn't unlock your account.")
+        }
         pdfs_core::Error::Other(message) if message.contains("verification") => gettext(
             "Sign-in cancelled: the verification wasn't completed. Sign in again to get a new one.",
         ),
@@ -220,26 +246,31 @@ pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
     }
 }
 
+/// What the login worker asks the UI for, and how it reports back.
+pub(crate) struct LoginChannels {
+    /// The final outcome, once.
+    pub(crate) result: async_channel::Receiver<Result<(), String>>,
+    /// Fires only if the account needs a 2FA code; carries the sender for it.
+    pub(crate) totp: async_channel::Receiver<std::sync::mpsc::Sender<String>>,
+    /// Fires only if the sign-in is gated: the page to show, and the sender for
+    /// the token the user earns on it.
+    pub(crate) hv: async_channel::Receiver<(String, std::sync::mpsc::Sender<String>)>,
+    /// Fires only for a two-password account: how many answers were already
+    /// wrong, and the sender for the password and the "remember" choice.
+    pub(crate) mailbox: async_channel::Receiver<(u32, std::sync::mpsc::Sender<(String, bool)>)>,
+}
+
 /// Run the async SRP + optional 2FA login on a dedicated current-thread Tokio
-/// runtime. Returns two channels: the first yields the final login result once;
-/// the second fires *only if* the account needs a 2FA code, carrying a
-/// [`std::sync::mpsc::Sender`] the UI uses to feed the code back. The login
-/// closure blocks the worker on that sender until the dialog answers, so the
-/// code is requested lazily and can't expire before the password proof.
-#[allow(clippy::type_complexity)]
-pub(crate) fn spawn_login(
-    username: String,
-    password: String,
-) -> (
-    async_channel::Receiver<Result<(), String>>,
-    async_channel::Receiver<std::sync::mpsc::Sender<String>>,
-    async_channel::Receiver<(String, std::sync::mpsc::Sender<String>)>,
-) {
+/// runtime. The returned [`LoginChannels`] carry the final result and the lazy
+/// prompts. Each login closure blocks the worker on a sender the UI answers, so
+/// a code is requested lazily and can't expire before the password proof.
+pub(crate) fn spawn_login(username: String, password: String) -> LoginChannels {
     let (tx, rx) = async_channel::bounded(1);
     // Two, not one: a CAPTCHA-gated login restarts, so a 2FA account is asked
     // for a code on each attempt and a single slot would deadlock the worker.
     let (totp_req_tx, totp_req_rx) = async_channel::bounded(2);
     let (hv_req_tx, hv_req_rx) = async_channel::bounded(1);
+    let (mailbox_req_tx, mailbox_req_rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -267,6 +298,19 @@ pub(crate) fn spawn_login(
                         .recv()
                         .map_err(|_| pdfs_core::Error::Other("two-factor entry cancelled".into()))
                 },
+                |attempt| {
+                    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<(String, bool)>();
+                    mailbox_req_tx
+                        .send_blocking((attempt, answer_tx))
+                        .map_err(|_| pdfs_core::Error::Other("mailbox prompt closed".into()))?;
+                    let (password, remember) = answer_rx
+                        .recv()
+                        .map_err(|_| pdfs_core::Error::Other("mailbox entry cancelled".into()))?;
+                    Ok(auth::Mailbox {
+                        password: password.into(),
+                        remember,
+                    })
+                },
                 |hv| {
                     // Gated: hand the UI the page to show, block on the token the
                     // user earns by solving it.
@@ -287,7 +331,143 @@ pub(crate) fn spawn_login(
         });
         let _ = tx.send_blocking(result);
     });
-    (rx, totp_req_rx, hv_req_rx)
+    LoginChannels {
+        result: rx,
+        totp: totp_req_rx,
+        hv: hv_req_rx,
+        mailbox: mailbox_req_rx,
+    }
+}
+
+/// Ask for the mailbox password of a two-password account.
+///
+/// `done` gets the password and the "keep unlocked" choice, or `None` when the
+/// dialog was cancelled. `retry` says the last answer was wrong. The choice
+/// defaults to off: storing the mailbox unlock in the keyring trades away what
+/// a separate mailbox password is for, so it is something to opt into.
+pub(crate) fn ask_mailbox(
+    ui: &Rc<Ui>,
+    retry: bool,
+    done: impl FnOnce(Option<(String, bool)>) + 'static,
+) {
+    let body = if retry {
+        gettext("That mailbox password didn't unlock your account. Try again.")
+    } else {
+        gettext("This account has a separate mailbox password. Enter it to unlock your files.")
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Mailbox Password"))
+        .body(body)
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+    let entry = adw::PasswordEntryRow::builder()
+        .title(gettext("Mailbox password"))
+        .activates_default(true)
+        .build();
+    let remember = adw::SwitchRow::builder()
+        .title(gettext("Keep unlocked on this computer"))
+        .subtitle(gettext(
+            "Stores the unlock in the system keyring, so Proton Drive opens without asking after every login. Otherwise you enter the password once per session.",
+        ))
+        .build();
+    group.add(&entry);
+    group.add(&remember);
+    dialog.set_extra_child(Some(&group));
+
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("unlock", &gettext("Unlock"));
+    dialog.set_response_appearance("unlock", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("unlock"));
+    dialog.set_close_response("cancel");
+
+    let done = RefCell::new(Some(done));
+    dialog.connect_response(None, move |_, resp| {
+        let Some(done) = done.borrow_mut().take() else {
+            return;
+        };
+        let password = entry.text().to_string();
+        if resp == "unlock" && !password.is_empty() {
+            done(Some((password, remember.is_active())));
+        } else {
+            done(None);
+        }
+    });
+
+    let parent = ui_window(ui).map(|w| w.upcast::<gtk4::Window>());
+    dialog.present(parent.as_ref());
+}
+
+/// If the signed-in account is locked, ask for its mailbox password — once per
+/// run; after a cancel, a toast keeps an Unlock button within reach.
+///
+/// The key state is a keyring and kernel-keyring read, so it runs on a worker.
+pub(crate) fn offer_unlock(ui: &Rc<Ui>) {
+    if ui.unlock_offered.get() {
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let state = gio::spawn_blocking(|| auth::key_state().ok()).await;
+        if matches!(state, Ok(Some(auth::KeyState::Locked))) && !ui.unlock_offered.replace(true) {
+            prompt_unlock(&ui, false);
+        }
+    });
+}
+
+enum UnlockOutcome {
+    Unlocked,
+    Wrong,
+    Failed(String),
+}
+
+/// Ask for the mailbox password and unlock the account with it.
+fn prompt_unlock(ui: &Rc<Ui>, retry: bool) {
+    let ui_done = ui.clone();
+    ask_mailbox(ui, retry, move |answer| {
+        let Some((password, remember)) = answer else {
+            toast_action(
+                &ui_done,
+                &gettext("Proton Drive is locked. Enter your mailbox password to unlock it."),
+                &gettext("Unlock"),
+                |ui| prompt_unlock(ui, false),
+            );
+            return;
+        };
+        glib::spawn_future_local(async move {
+            // Verifying talks to Proton and the restart talks to systemd, so
+            // both run on a worker, never on the main loop.
+            let outcome = gio::spawn_blocking(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => return UnlockOutcome::Failed(e.to_string()),
+                };
+                match rt.block_on(auth::unlock(&password, remember)) {
+                    Ok(()) => {
+                        service::restart();
+                        UnlockOutcome::Unlocked
+                    }
+                    Err(pdfs_core::Error::WrongMailboxPassword) => UnlockOutcome::Wrong,
+                    Err(e) => UnlockOutcome::Failed(login_error_message(&e)),
+                }
+            })
+            .await;
+            match outcome {
+                Ok(UnlockOutcome::Unlocked) => {
+                    toast(&ui_done, &gettext("Unlocked."));
+                    refresh(&ui_done);
+                }
+                Ok(UnlockOutcome::Wrong) => prompt_unlock(&ui_done, true),
+                Ok(UnlockOutcome::Failed(message)) => {
+                    toast_error(&ui_done, &gettext("Couldn't unlock"), &message)
+                }
+                Err(_) => {}
+            }
+        });
+    });
 }
 
 /// Show the lazy two-factor dialog and feed the entered code back to the waiting
@@ -372,6 +552,12 @@ mod tests {
         assert!(login_error_message(&totp).contains("two-factor code"));
         let hv = pdfs_core::Error::Other("verification cancelled".into());
         assert!(login_error_message(&hv).contains("verification wasn't completed"));
+    }
+
+    #[test]
+    fn a_cancelled_mailbox_prompt_is_reported_as_such() {
+        let error = pdfs_core::Error::Other("mailbox entry cancelled".into());
+        assert!(login_error_message(&error).contains("no mailbox password"));
     }
 
     #[test]

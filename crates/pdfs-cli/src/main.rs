@@ -135,6 +135,24 @@ enum Command {
         /// Account email; prompted if omitted.
         #[arg(short, long)]
         username: Option<String>,
+        /// For a two-password account, keep the mailbox password's unlock in the
+        /// system keyring so the daemon starts without asking after every login.
+        /// Without it the unlock lives in kernel memory for this session only.
+        #[arg(long)]
+        remember: bool,
+    },
+    /// Enter the mailbox password of a two-password account so the daemon can
+    /// unlock your files. Needed once per login session.
+    Unlock {
+        /// Keep the unlock in the system keyring instead of kernel memory only.
+        #[arg(long)]
+        remember: bool,
+    },
+    /// Forget the unlock held in kernel memory; the account is locked again.
+    Lock {
+        /// Also remove an unlock kept in the keyring with `--remember`.
+        #[arg(long)]
+        forget: bool,
     },
     /// Forget the stored session.
     Logout,
@@ -803,7 +821,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     match cli.command {
-        Command::Login { username } => cmd_login(username),
+        Command::Login { username, remember } => cmd_login(username, remember),
+        Command::Unlock { remember } => cmd_unlock(remember),
+        Command::Lock { forget } => cmd_lock(forget),
         Command::Logout => cmd_logout(),
         Command::Status => cmd_status(),
         Command::Locations => cmd_locations(),
@@ -1781,7 +1801,7 @@ fn prompt_line(label: &str) -> Result<String> {
     Ok(line.trim().to_owned())
 }
 
-fn cmd_login(username: Option<String>) -> Result<()> {
+fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
     let username = match username {
         Some(u) => u,
         None => prompt_line("Proton email")?,
@@ -1793,11 +1813,14 @@ fn cmd_login(username: Option<String>) -> Result<()> {
         prompt_line("2FA code").map_err(|e| pdfs_core::Error::Other(format!("read 2FA code: {e}")))
     };
 
+    // Only a two-password account is ever asked for this.
+    let get_mailbox = |attempt: u32| prompt_mailbox(attempt, remember);
+
     let rt = tokio::runtime::Runtime::new()?;
     // Solving a CAPTCHA needs a browser engine, which the CLI has no business
     // carrying. Point at the app that does rather than failing with the raw API
     // message, which reads as "your login is broken".
-    rt.block_on(auth::login(&username, &password, get_totp))
+    rt.block_on(auth::login(&username, &password, get_totp, get_mailbox))
         .map_err(|e| match e {
             pdfs_core::Error::HumanVerificationRequired(_) => anyhow::anyhow!(
                 "Proton is asking for a CAPTCHA before it will accept this sign-in.\n\
@@ -1818,7 +1841,86 @@ fn cmd_login(username: Option<String>) -> Result<()> {
     }
 
     println!("Logged in as {username}. Session stored in the system keyring.");
+    report_key_state();
     Ok(())
+}
+
+/// Ask for the mailbox password of a two-password account, without echo.
+fn prompt_mailbox(attempt: u32, remember: bool) -> pdfs_core::Result<auth::Mailbox> {
+    if attempt == 0 {
+        eprintln!("This account has a separate mailbox password.");
+    } else {
+        eprintln!("That mailbox password did not unlock the account. Try again.");
+    }
+    let password = rpassword::prompt_password("Mailbox password: ")
+        .map_err(|e| pdfs_core::Error::Other(format!("read mailbox password: {e}")))?;
+    Ok(auth::Mailbox {
+        password: zeroize::Zeroizing::new(password),
+        remember,
+    })
+}
+
+/// Say where the account's keys are held, and what that means for the next login.
+fn report_key_state() {
+    match auth::key_state() {
+        Ok(auth::KeyState::Session) => println!(
+            "Unlocked for this login session only. After you log out or reboot, run `pdfs unlock`."
+        ),
+        Ok(auth::KeyState::Locked) => println!("The account is locked. Run `pdfs unlock`."),
+        _ => {}
+    }
+}
+
+fn cmd_unlock(remember: bool) -> Result<()> {
+    auth::load().context("not logged in (run `pdfs login` first)")?;
+    let rt = tokio::runtime::Runtime::new()?;
+    // Bounded like the login prompt: three wrong answers end the command.
+    let mut attempt = 0;
+    loop {
+        let mailbox = prompt_mailbox(attempt, remember)?;
+        match rt.block_on(auth::unlock(&mailbox.password, remember)) {
+            Ok(()) => break,
+            Err(pdfs_core::Error::WrongMailboxPassword) if attempt < 2 => attempt += 1,
+            Err(e) => return Err(anyhow::Error::new(e).context("unlock failed")),
+        }
+    }
+    // A daemon parked on the locked account would otherwise notice on its next
+    // poll; restarting it makes the mount appear now, as after `pdfs login`.
+    if service::is_active() {
+        service::restart();
+    }
+    println!("Unlocked.");
+    report_key_state();
+    Ok(())
+}
+
+fn cmd_lock(forget: bool) -> Result<()> {
+    auth::lock(forget)?;
+    println!(
+        "Locked. {}",
+        if forget {
+            "Unlock removed from memory and keyring."
+        } else {
+            "Run `pdfs unlock` to unlock again."
+        }
+    );
+    // The running daemon keeps its keys until it restarts; say so, since
+    // "locked" would otherwise suggest the mount stopped.
+    if service::is_active() {
+        println!(
+            "The running daemon keeps its keys until it restarts: `systemctl --user restart proton-drive`."
+        );
+    }
+    Ok(())
+}
+
+/// `stored`, `session` or `locked`: where the account's keys are held.
+fn key_state_name() -> &'static str {
+    match auth::key_state() {
+        Ok(auth::KeyState::Stored) => "stored",
+        Ok(auth::KeyState::Session) => "session",
+        _ => "locked",
+    }
 }
 
 fn cmd_logout() -> Result<()> {
@@ -1848,6 +1950,7 @@ fn cmd_status() -> Result<()> {
             "username": session.as_ref().map(|s| s.username.clone()),
             "user_id": session.as_ref().map(|s| s.user_id.clone()),
             "scopes": session.as_ref().map(|s| s.scopes.clone()),
+            "keys": session.as_ref().map(|_| key_state_name()),
             "mount": mount,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -1858,6 +1961,11 @@ fn cmd_status() -> Result<()> {
         Ok(s) => {
             println!("Logged in as {} (user {})", s.username, s.user_id);
             println!("Scopes: {}", s.scopes.join(", "));
+            match key_state_name() {
+                "locked" => println!("Keys: locked — run `pdfs unlock`"),
+                "session" => println!("Keys: unlocked for this login session"),
+                _ => {}
+            }
         }
         Err(pdfs_core::Error::NotLoggedIn) => {
             println!("Not logged in. Run `pdfs login`.");
@@ -1989,7 +2097,7 @@ fn login_poll_delay(attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(BASE_SECS.saturating_mul(factor).min(MAX_SECS))
 }
 
-/// Block until a session is stored, backing off between checks.
+/// Block until a session is stored and unlocked, backing off between checks.
 ///
 /// `load` and `sleep` are parameters rather than direct calls so the backoff
 /// schedule can be tested without a keyring and without real time passing.
@@ -2014,6 +2122,16 @@ where
                 sleep(delay);
                 attempts = attempts.saturating_add(1);
             }
+            Err(pdfs_core::Error::Locked) => {
+                let delay = login_poll_delay(attempts);
+                if attempts == 0 {
+                    tracing::info!("account is locked; waiting for `pdfs unlock`…");
+                } else {
+                    tracing::debug!(delay_secs = delay.as_secs(), "account still locked");
+                }
+                sleep(delay);
+                attempts = attempts.saturating_add(1);
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -2024,10 +2142,13 @@ where
 /// an external unmount triggers a remount; errors back off and retry. This is
 /// the entry point for the systemd user service.
 fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
+    // The daemon holds the account's key passphrases in memory; keep them out
+    // of core dumps and away from same-user ptrace.
+    pdfs_core::kernelkey::forbid_dumps();
     loop {
         // Wait until a session is stored. The GUI enables this service on login,
         // but the service may also start at boot before the user has logged in.
-        wait_for_session(|| auth::load().map(|_| ()), pdfs_fuse::idle_sleep)?;
+        wait_for_session(auth::ready, pdfs_fuse::idle_sleep)?;
 
         match mount_once(mountpoint.clone()) {
             Ok(pdfs_fuse::MountOutcome::Shutdown) => {
@@ -3224,6 +3345,19 @@ fn cmd_diagnose() -> Result<()> {
     match pdfs_core::auth::load() {
         Ok(session) => {
             report.finding(DiagnoseLevel::Ok, "  keyring session", session.username);
+            match key_state_name() {
+                "locked" => report.finding(
+                    DiagnoseLevel::Fail,
+                    "  account keys",
+                    "locked — run `pdfs unlock` (the daemon waits for it)",
+                ),
+                "session" => report.finding(
+                    DiagnoseLevel::Ok,
+                    "  account keys",
+                    "unlocked for this login session",
+                ),
+                _ => report.finding(DiagnoseLevel::Ok, "  account keys", "stored in the keyring"),
+            }
         }
         Err(e) => {
             // A locked keyring and an absent login look the same from here, so
@@ -3520,6 +3654,21 @@ mod login_wait_tests {
             total >= Duration::from_secs(4 * 60),
             "20 checks should span at least 4 minutes, spanned {total:?}"
         );
+    }
+
+    #[test]
+    fn a_locked_account_is_waited_on_until_it_is_unlocked() {
+        let mut checks = vec![
+            Ok(()),
+            Err(pdfs_core::Error::Locked),
+            Err(pdfs_core::Error::NotLoggedIn),
+            Err(pdfs_core::Error::Locked),
+        ];
+        let mut slept = 0;
+
+        wait_for_session(|| checks.pop().unwrap(), |_| slept += 1).unwrap();
+
+        assert_eq!(slept, 3, "locked and signed-out are both waited out");
     }
 
     #[test]

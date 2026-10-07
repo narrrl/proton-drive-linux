@@ -1,22 +1,50 @@
 //! Login, session persistence, and Drive-client construction.
 //!
 //! A successful login is persisted to the OS keyring as a single JSON blob
-//! holding the resumable session tokens plus the mailbox password (needed to
-//! rebuild the key chain on resume). The daemon resumes from this blob with no
-//! interactive step; the refresh token auto-renews via the HTTP client's 401
-//! path, so no fresh 2FA is required until the refresh token itself expires.
+//! holding the resumable session tokens, the account's key salts and — unless
+//! the user chose otherwise — the per-key *passphrases* derived from the
+//! mailbox password. The password itself is never stored: the passphrases are
+//! what it exists to produce, and they are enough to rebuild the key chain on
+//! resume. The daemon resumes from this blob with no interactive step; the
+//! refresh token auto-renews via the HTTP client's 401 path, so no fresh 2FA is
+//! required until the refresh token itself expires.
+//!
+//! # Two-password accounts
+//!
+//! An account with a separate mailbox password exists precisely so that no one
+//! login holds the means to read the data. Storing that password in the keyring
+//! would defeat it, so such an account is **locked by default**: its
+//! passphrases are kept only in the kernel keyring ([`crate::kernelkey`]), for
+//! the length of the user's session, and `pdfs unlock` (or the app) supplies
+//! them again after each login. Storing them in the Secret Service as well is
+//! an explicit opt-in ([`Mailbox::remember`]). Single-password accounts have no
+//! such separation to protect and are stored, as they always were.
 
+use std::collections::BTreeMap;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use keyring_core::Entry;
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
+use proton_sdk::account::KeyPassphrases;
 use proton_sdk::api::{HumanVerification, HumanVerificationCredential};
 use proton_sdk::cache::EncryptedCacheRepository;
 use proton_sdk::config::ProtonClientConfiguration;
+use proton_sdk::error::ProtonError;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use proton_sdk::telemetry::TracingTelemetry;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::config::{APP_VERSION, AppDirs, KEYRING_SERVICE, USER_AGENT};
 use crate::error::{Error, Result};
+use crate::kernelkey;
+
+/// How often a wrong mailbox password is asked for again before the login gives up.
+const MAILBOX_ATTEMPTS: u32 = 3;
+
+/// Domain-separation label for the key that encrypts the persistent entity cache.
+const ENTITY_CACHE_PURPOSE: &[u8] = b"pdfs entity cache v1";
 
 /// Fixed keyring account name for the single stored session blob.
 const KEYRING_USER: &str = "session";
@@ -32,8 +60,11 @@ pub struct StoredSession {
     pub scopes: Vec<String>,
     /// `1` = single password, `2` = dual (Proton wire value).
     pub password_mode: u8,
-    /// Mailbox (data) password — required by `ProtonDriveClient::new` to derive
-    /// the key chain. Lives only in the OS keyring, never on disk in cleartext.
+    /// The mailbox password of a blob written by 3.0.x and earlier.
+    ///
+    /// Read only, to migrate: [`resume_client`] derives the passphrases from it
+    /// once and writes the blob back without it. Never serialized again.
+    #[serde(default, skip_serializing)]
     pub mailbox_password: String,
     /// The account's key salts, captured at login.
     ///
@@ -49,6 +80,11 @@ pub struct StoredSession {
     /// backfilling) them.
     #[serde(default)]
     pub key_salts: Vec<KeySalt>,
+    /// Per-key passphrases (key id → base64), when the user keeps them in the
+    /// keyring: always for a single-password account, by opt-in for a
+    /// two-password one. `None` means they are not stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_passphrases: Option<BTreeMap<String, String>>,
 }
 
 impl StoredSession {
@@ -89,6 +125,26 @@ fn keyring_entry() -> Result<Entry> {
     Ok(Entry::new(KEYRING_SERVICE, KEYRING_USER)?)
 }
 
+/// What the user answered when asked for the mailbox password.
+pub struct Mailbox {
+    pub password: Zeroizing<String>,
+    /// Keep the derived passphrases in the keyring, so the daemon unlocks by
+    /// itself after every login. Off by default: it trades the protection a
+    /// separate mailbox password gives for convenience.
+    pub remember: bool,
+}
+
+/// Where the passphrases that unlock this account's keys currently live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    /// In the keyring, available after every login.
+    Stored,
+    /// In kernel memory for this login session only.
+    Session,
+    /// Nowhere: the mailbox password has to be entered (`pdfs unlock`).
+    Locked,
+}
+
 /// Run an interactive SRP + (optional) 2FA login and persist the session.
 ///
 /// `get_totp` is only invoked when the account requires a second factor, so
@@ -96,14 +152,19 @@ fn keyring_entry() -> Result<Entry> {
 /// more than once — [`login_interactive`] re-runs the whole login after human
 /// verification, and a 2FA account needs a fresh code on that second attempt.
 ///
+/// `get_mailbox` is only invoked for a two-password account. It receives the
+/// number of earlier wrong answers (so a prompt can say "try again") and is
+/// asked at most [`MAILBOX_ATTEMPTS`] times; an `Err` from it aborts the login.
+///
 /// A gated login fails with [`Error::HumanVerificationRequired`]; a front-end
 /// that can present the challenge should use [`login_interactive`] instead.
 pub async fn login(
     username: &str,
     password: &str,
     get_totp: impl Fn() -> Result<String>,
+    get_mailbox: impl Fn(u32) -> Result<Mailbox>,
 ) -> Result<()> {
-    login_verified(username, password, None, get_totp).await
+    login_verified(username, password, None, get_totp, get_mailbox).await
 }
 
 /// [`login`], able to answer a human-verification gate rather than fail on it.
@@ -123,12 +184,20 @@ pub async fn login_interactive(
     username: &str,
     password: &str,
     get_totp: impl Fn() -> Result<String>,
+    get_mailbox: impl Fn(u32) -> Result<Mailbox>,
     get_hv: impl FnOnce(HumanVerification) -> Result<HumanVerificationCredential>,
 ) -> Result<()> {
-    match login_verified(username, password, None, &get_totp).await {
+    match login_verified(username, password, None, &get_totp, &get_mailbox).await {
         Err(Error::HumanVerificationRequired(hv)) => {
             let credential = get_hv(*hv)?;
-            login_verified(username, password, Some(&credential), &get_totp).await
+            login_verified(
+                username,
+                password,
+                Some(&credential),
+                &get_totp,
+                &get_mailbox,
+            )
+            .await
         }
         other => other,
     }
@@ -145,15 +214,18 @@ pub async fn login_verified(
     password: &str,
     verification: Option<&HumanVerificationCredential>,
     get_totp: impl Fn() -> Result<String>,
+    get_mailbox: impl Fn(u32) -> Result<Mailbox>,
 ) -> Result<()> {
-    let mut session = ProtonApiSession::begin_verified(
+    let password = Zeroizing::new(password.to_owned());
+    let session = ProtonApiSession::begin_verified(
         client_config(),
         username,
         password.as_bytes(),
         verification,
     )
     .await
-    .map_err(classify_verification_gate)?;
+    .map_err(classify_verification_gate);
+    let mut session = session?;
 
     if session.is_waiting_for_second_factor() {
         let code = get_totp()?;
@@ -163,38 +235,38 @@ pub async fn login_verified(
     // Grab the key salts while this access token still has the `locked` scope:
     // after its first refresh it never will again, and without them no later
     // resume can unlock the key chain. See `StoredSession::key_salts`.
-    let client = ProtonDriveClient::new(&session, password.as_bytes().to_vec());
-    let key_salts = client.account().key_salts().await?;
+    let key_salts = ProtonDriveClient::new(&session, Vec::new())
+        .account()
+        .key_salts()
+        .await?;
 
-    register_refresh_handler(&session, password.to_owned(), key_salts.clone());
-
-    save(&session, password, key_salts).await?;
-    Ok(())
-}
-
-/// Lift a human-verification gate out of the generic API error into the typed
-/// variant a front-end can act on.
-///
-/// Only a gate that names a solvable method is converted. A `9001` with no
-/// `Details`, or one offering only `email`/`sms`, stays a plain API error:
-/// promoting it would send the UI to open a verification page it cannot
-/// complete, which reads to the user as a hang rather than a refusal.
-fn classify_verification_gate(e: proton_sdk::error::ProtonError) -> Error {
-    let proton_sdk::error::ProtonError::Api(api) = &e else {
-        return e.into();
+    // A single-password account's mailbox password is the login password. A
+    // two-password one has a second secret the user must type, and it is checked
+    // against the account now — a typo found at login is a retry, found later it
+    // is a daemon that never mounts.
+    let (passphrases, remember) = match session.password_mode() {
+        PasswordMode::Single => (
+            derive_verified(&session, password.as_bytes(), key_salts.clone()).await?,
+            true,
+        ),
+        PasswordMode::Dual => {
+            let mut attempt = 0;
+            loop {
+                let mailbox = get_mailbox(attempt)?;
+                match derive_verified(&session, mailbox.password.as_bytes(), key_salts.clone())
+                    .await
+                {
+                    Ok(passphrases) => break (passphrases, mailbox.remember),
+                    Err(Error::WrongMailboxPassword) if attempt + 1 < MAILBOX_ATTEMPTS => {
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     };
-    match api.human_verification() {
-        Some(hv) if hv.supports_captcha() => Error::HumanVerificationRequired(Box::new(hv)),
-        _ => e.into(),
-    }
-}
 
-/// Persist the session's current tokens, mailbox password and key salts.
-pub async fn save(
-    session: &ProtonApiSession,
-    mailbox_password: &str,
-    key_salts: Vec<KeySalt>,
-) -> Result<()> {
+    register_refresh_handler(&session);
     let tokens = session.current_tokens().await;
     let stored = StoredSession {
         session_id: session.session_id().as_str().to_owned(),
@@ -207,10 +279,103 @@ pub async fn save(
             PasswordMode::Single => 1,
             PasswordMode::Dual => 2,
         },
-        mailbox_password: mailbox_password.to_owned(),
+        mailbox_password: String::new(),
         key_salts,
+        key_passphrases: None,
     };
-    let json = serde_json::to_string(&stored)?;
+    keep_passphrases(stored, &passphrases, remember)
+}
+
+/// Derive the key passphrases from `mailbox` and prove they unlock the account.
+///
+/// [`Error::WrongMailboxPassword`] means the account answered and the password
+/// is wrong; any other error says nothing about the password (no network, an
+/// API fault) and must not be reported as a typo.
+async fn derive_verified(
+    session: &ProtonApiSession,
+    mailbox: &[u8],
+    key_salts: Vec<KeySalt>,
+) -> Result<KeyPassphrases> {
+    let client = ProtonDriveClient::with_key_salts(session, mailbox.to_vec(), key_salts);
+    client.account().unlock().await.map_err(|e| match e {
+        ProtonError::KeysLocked => Error::WrongMailboxPassword,
+        other => other.into(),
+    })?;
+    Ok(client.account().key_passphrases().await?)
+}
+
+/// Write `stored` with the passphrases in the place the user chose: the
+/// keyring (`remember`) or kernel memory only. Whichever is not chosen is
+/// cleared, so a revoked choice never leaves a copy behind.
+///
+/// The kernel entry is written first. If it cannot be (no keyring support), the
+/// secret is *not* quietly stored somewhere weaker: the blob is written locked
+/// and the error says so.
+fn keep_passphrases(
+    mut stored: StoredSession,
+    passphrases: &KeyPassphrases,
+    remember: bool,
+) -> Result<()> {
+    let outcome = if remember {
+        stored.key_passphrases = Some(encode(passphrases));
+        // Best-effort: a system without a kernel keyring has nothing to clear.
+        let _ = kernelkey::clear();
+        Ok(())
+    } else {
+        stored.key_passphrases = None;
+        kernelkey::store(&encode_secret(passphrases)).map_err(|e| {
+            Error::Other(format!(
+                "the kernel keyring is unavailable, so the unlock cannot be kept for this session: {e}"
+            ))
+        })
+    };
+    write_stored(&stored)?;
+    outcome
+}
+
+fn encode(passphrases: &KeyPassphrases) -> BTreeMap<String, String> {
+    passphrases
+        .iter()
+        .map(|(id, secret)| (id.to_owned(), BASE64.encode(secret)))
+        .collect()
+}
+
+fn decode(encoded: &BTreeMap<String, String>) -> Option<KeyPassphrases> {
+    let mut passphrases = KeyPassphrases::new();
+    for (id, secret) in encoded {
+        passphrases.insert(id.clone(), BASE64.decode(secret).ok()?);
+    }
+    (!passphrases.is_empty()).then_some(passphrases)
+}
+
+/// The kernel-keyring payload: the same map as the blob's, as JSON.
+fn encode_secret(passphrases: &KeyPassphrases) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(serde_json::to_vec(&encode(passphrases)).unwrap_or_default())
+}
+
+fn decode_secret(secret: &[u8]) -> Option<KeyPassphrases> {
+    decode(&serde_json::from_slice(secret).ok()?)
+}
+
+/// Lift a human-verification gate out of the generic API error into the typed
+/// variant a front-end can act on.
+///
+/// Only a gate that names a solvable method is converted. A `9001` with no
+/// `Details`, or one offering only `email`/`sms`, stays a plain API error:
+/// promoting it would send the UI to open a verification page it cannot
+/// complete, which reads to the user as a hang rather than a refusal.
+fn classify_verification_gate(e: ProtonError) -> Error {
+    let ProtonError::Api(api) = &e else {
+        return e.into();
+    };
+    match api.human_verification() {
+        Some(hv) if hv.supports_captcha() => Error::HumanVerificationRequired(Box::new(hv)),
+        _ => e.into(),
+    }
+}
+
+fn write_stored(stored: &StoredSession) -> Result<()> {
+    let json = Zeroizing::new(serde_json::to_string(stored)?);
     keyring_entry()?.set_password(&json)?;
     Ok(())
 }
@@ -225,12 +390,93 @@ pub fn load() -> Result<StoredSession> {
     }
 }
 
+/// Where the passphrases for the stored session live right now.
+///
+/// Reads the kernel keyring and the stored blob only; never the network.
+pub fn key_state() -> Result<KeyState> {
+    Ok(key_state_of(&load()?))
+}
+
+fn key_state_of(stored: &StoredSession) -> KeyState {
+    match find_passphrases(stored) {
+        Ok(Some((_, origin))) => origin,
+        // A 3.0.x blob still holds its password; `resume_client` migrates it.
+        _ if !stored.mailbox_password.is_empty() => KeyState::Stored,
+        _ => KeyState::Locked,
+    }
+}
+
+/// Whether the stored session can be resumed without asking the user:
+/// `Ok` when it can, [`Error::NotLoggedIn`] or [`Error::Locked`] when not.
+/// What the daemon waits on before it mounts.
+pub fn ready() -> Result<()> {
+    match key_state_of(&load()?) {
+        KeyState::Locked => Err(Error::Locked),
+        _ => Ok(()),
+    }
+}
+
+/// The passphrases the stored session can use without being asked, and which
+/// of the two places they came from. Prefers the keyring blob: it is what the
+/// user opted into. A corrupt entry is treated as absent, so it reads as
+/// locked instead of wedging the daemon.
+fn find_passphrases(stored: &StoredSession) -> Result<Option<(KeyPassphrases, KeyState)>> {
+    if let Some(found) = stored.key_passphrases.as_ref().and_then(decode) {
+        return Ok(Some((found, KeyState::Stored)));
+    }
+    match kernelkey::load() {
+        Ok(Some(secret)) => Ok(decode_secret(&secret).map(|p| (p, KeyState::Session))),
+        Ok(None) => Ok(None),
+        // No keyring on this system: nothing was ever kept there.
+        Err(e) => {
+            tracing::debug!(error = %e, "kernel keyring not readable; treating the account as locked");
+            Ok(None)
+        }
+    }
+}
+
+/// Supply the mailbox password of a locked account.
+///
+/// Verifies it against the account, then keeps the derived passphrases in
+/// kernel memory for this login session — or, with `remember`, in the keyring.
+/// A daemon waiting on [`Error::Locked`] picks them up on its next attempt.
+///
+/// Fails with [`Error::WrongMailboxPassword`] for a wrong password, which
+/// changes nothing, and [`Error::ReloginRequired`] for a session that predates
+/// stored key salts.
+pub async fn unlock(mailbox: &str, remember: bool) -> Result<()> {
+    let stored = load()?;
+    if stored.key_salts.is_empty() {
+        return Err(Error::ReloginRequired);
+    }
+    let mailbox = Zeroizing::new(mailbox.to_owned());
+    let session = ProtonApiSession::resume(client_config(), stored.to_params())?;
+    register_refresh_handler(&session);
+    let passphrases =
+        derive_verified(&session, mailbox.as_bytes(), stored.key_salts.clone()).await?;
+    keep_passphrases(stored, &passphrases, remember)
+}
+
+/// Drop the passphrases held in kernel memory, so the account is locked again
+/// until [`unlock`]. With `forget`, also those in the keyring blob.
+pub fn lock(forget: bool) -> Result<()> {
+    kernelkey::clear()?;
+    if forget {
+        let mut stored = load()?;
+        if stored.key_passphrases.take().is_some() {
+            write_stored(&stored)?;
+        }
+    }
+    Ok(())
+}
+
 /// Forget the persisted session (best-effort; absent entry is not an error).
 pub fn logout() -> Result<()> {
     // The persisted entity cache describes the account being logged out of. It
-    // is encrypted under that account's mailbox password, but leaving it behind
-    // would also mean the next account inherits a store it can only ever read as
-    // misses. Best-effort: failing to remove a cache must not block the logout.
+    // is encrypted under a key derived from that account's passphrases, but
+    // leaving it behind would also mean the next account inherits a store it can
+    // only ever read as misses. Best-effort: failing to remove a cache must not
+    // block the logout.
     if let Ok(dirs) = AppDirs::new() {
         let path = dirs.state_dir().join("sdk_cache.db");
         if let Some(cache) = crate::sdkcache::SdkCache::opened()
@@ -242,6 +488,9 @@ pub fn logout() -> Result<()> {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+    if let Err(e) = kernelkey::clear() {
+        tracing::warn!(error = %e, "clearing the kernel-keyring unlock on logout failed");
+    }
     match keyring_entry()?.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
@@ -250,42 +499,85 @@ pub fn logout() -> Result<()> {
 
 /// Resume a persisted session and build an authenticated Drive client.
 ///
-/// Returns `Error::NotLoggedIn` when no session has been saved. The caller is
-/// responsible for persisting rotated tokens over the session's lifetime via
-/// [`persist`] — Proton refresh tokens are single-use, so a refresh that is not
-/// written back leaves the keyring holding a stale (now-invalid) refresh token,
-/// and the next resume fails with `InvalidRefreshToken`.
+/// Returns `Error::NotLoggedIn` when no session has been saved and
+/// [`Error::Locked`] when the account is waiting for its mailbox password. Tokens
+/// the session rotates are written back to the keyring as they happen (see
+/// [`register_refresh_handler`]); Proton refresh tokens are single-use, so a
+/// refresh that is not written back would leave the keyring holding a stale
+/// refresh token, and the next resume would fail with `InvalidRefreshToken`.
+///
+/// Makes no network call for an account whose passphrases are already known, so
+/// a daemon starting offline can still mount from its cache.
 pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
     let stored = load()?;
     let session = ProtonApiSession::resume(client_config(), stored.to_params())?;
-    let password = stored.mailbox_password.clone();
+    register_refresh_handler(&session);
 
-    // Blobs written before key salts were persisted have none: fetch them once
-    // more and write them back, which only works while the stored access token
-    // still carries the `locked` scope. If it doesn't, the account must be
-    // logged into again — no refresh can restore that scope.
-    let key_salts = if stored.key_salts.is_empty() {
-        register_refresh_handler(&session, password.clone(), Vec::new());
-        let probe = ProtonDriveClient::new(&session, password.clone().into_bytes());
-        let salts = probe.account().key_salts().await.map_err(|e| match &e {
-            proton_sdk::error::ProtonError::Api(api) if api.is_insufficient_scope() => {
-                Error::ReloginRequired
-            }
-            _ => e.into(),
-        })?;
-        save(&session, &password, salts.clone()).await?;
-        salts
-    } else {
-        stored.key_salts
+    let passphrases = match find_passphrases(&stored)? {
+        Some((passphrases, _)) => passphrases,
+        None if !stored.mailbox_password.is_empty() => migrate_legacy(&session, &stored).await?,
+        None => return Err(Error::Locked),
     };
 
-    register_refresh_handler(&session, password.clone(), key_salts.clone());
-
     let client = tune(
-        ProtonDriveClient::with_key_salts(&session, password.clone().into_bytes(), key_salts),
-        password.as_bytes(),
+        ProtonDriveClient::with_key_passphrases(&session, passphrases.clone()),
+        &passphrases,
     );
     Ok((client, session))
+}
+
+/// Turn a blob written by 3.0.x — which holds the mailbox password — into one
+/// that holds passphrases, so the password stops being stored.
+///
+/// The old login saved whatever was typed as the mailbox password, which for a
+/// two-password account is the *login* password and unlocks nothing. That is
+/// checked here: a password the account rejects leaves the account locked (and
+/// the stored copy gone) rather than failing every start forever.
+async fn migrate_legacy(
+    session: &ProtonApiSession,
+    stored: &StoredSession,
+) -> Result<KeyPassphrases> {
+    let legacy = Zeroizing::new(stored.mailbox_password.clone());
+
+    // Blobs from before key salts were persisted have none: fetch them once
+    // more, which only works while the stored access token still carries the
+    // `locked` scope. If it doesn't, the account must be logged into again — no
+    // refresh can restore that scope.
+    let key_salts = if stored.key_salts.is_empty() {
+        ProtonDriveClient::new(session, Vec::new())
+            .account()
+            .key_salts()
+            .await
+            .map_err(|e| match &e {
+                ProtonError::Api(api) if api.is_insufficient_scope() => Error::ReloginRequired,
+                _ => e.into(),
+            })?
+    } else {
+        stored.key_salts.clone()
+    };
+
+    let mut migrated = stored.clone();
+    migrated.mailbox_password = String::new();
+    migrated.key_salts = key_salts.clone();
+
+    match derive_verified(session, legacy.as_bytes(), key_salts).await {
+        Ok(passphrases) => {
+            migrated.key_passphrases = Some(encode(&passphrases));
+            write_stored(&migrated)?;
+            tracing::info!(
+                "migrated the stored session from a mailbox password to key passphrases"
+            );
+            Ok(passphrases)
+        }
+        Err(Error::WrongMailboxPassword) => {
+            write_stored(&migrated)?;
+            tracing::warn!(
+                "the stored password does not unlock the account's keys; unlock required"
+            );
+            Err(Error::Locked)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The client settings every front-end wants, applied wherever a
@@ -301,23 +593,24 @@ pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
 ///   failure point per write instead of three.
 /// - **A persistent entity cache** ([`crate::sdkcache`]), so a restart does not
 ///   re-fetch and re-decrypt the tree the previous run already walked. It is
-///   wrapped in the SDK's [`EncryptedCacheRepository`] keyed by the mailbox
-///   password, so the decrypted node names it holds are not readable from the
-///   file alone — and a password change simply reads as a cold cache, since the
-///   SDK treats an undecryptable entry as a miss and clears the store.
+///   wrapped in the SDK's [`EncryptedCacheRepository`] keyed by a secret derived
+///   from the key passphrases, so the decrypted node names it holds are not
+///   readable from the file alone — and a password change simply reads as a cold
+///   cache, since the SDK treats an undecryptable entry as a miss and clears the
+///   store.
 ///
 ///   Opening it is best-effort: a store this process cannot open costs cache
 ///   hits, not the session, so the client falls back to the SDK's in-memory
 ///   default.
-fn tune(client: ProtonDriveClient, mailbox_password: &[u8]) -> ProtonDriveClient {
+fn tune(client: ProtonDriveClient, passphrases: &KeyPassphrases) -> ProtonDriveClient {
     let client = client
         .with_telemetry(TracingTelemetry::shared())
         .with_small_file_upload(true);
     match AppDirs::new().and_then(|dirs| crate::sdkcache::SdkCache::shared(&dirs)) {
-        Ok(cache) => client.with_entity_repository(EncryptedCacheRepository::shared(
-            cache,
-            mailbox_password.to_vec(),
-        )),
+        Ok(cache) => {
+            let key = passphrases.derive_secret(ENTITY_CACHE_PURPOSE);
+            client.with_entity_repository(EncryptedCacheRepository::shared(cache, key.to_vec()))
+        }
         Err(e) => {
             tracing::warn!(error = %e, "persistent SDK entity cache unavailable; using memory");
             client
@@ -327,49 +620,105 @@ fn tune(client: ProtonDriveClient, mailbox_password: &[u8]) -> ProtonDriveClient
 
 /// Write the session's current tokens back to the keyring.
 ///
-/// The session does not carry the mailbox password (it is only needed to rebuild
-/// the key chain on resume), so it is re-read from the existing stored blob and
-/// preserved. Call whenever the session may have rotated its tokens through the
-/// 401-refresh path so a later [`resume_client`] presents a live refresh token.
+/// Everything else in the stored blob — salts, passphrases — is preserved, so
+/// this never undoes an [`unlock`] or [`lock`] made since the session started.
+/// Call whenever the session may have rotated its tokens so a later
+/// [`resume_client`] presents a live refresh token.
 pub async fn persist(session: &ProtonApiSession) -> Result<()> {
-    let stored = load()?;
-    save(session, &stored.mailbox_password, stored.key_salts).await
+    let tokens = session.current_tokens().await;
+    store_tokens(tokens.access_token, tokens.refresh_token)
 }
 
-fn register_refresh_handler(
-    session: &ProtonApiSession,
-    mailbox_password: String,
-    key_salts: Vec<KeySalt>,
-) {
-    let session_id = session.session_id().as_str().to_owned();
-    let username = session.username().to_owned();
-    let user_id = session.user_id().as_str().to_owned();
-    let scopes = session.scopes().to_vec();
-    let password_mode = match session.password_mode() {
-        PasswordMode::Single => 1,
-        PasswordMode::Dual => 2,
-    };
+fn store_tokens(access_token: String, refresh_token: String) -> Result<()> {
+    let mut stored = load()?;
+    stored.access_token = access_token;
+    stored.refresh_token = refresh_token;
+    write_stored(&stored)
+}
 
+/// Persist rotated tokens the moment the session obtains them.
+///
+/// The handler re-reads the stored blob instead of capturing one, so it cannot
+/// write back a stale copy over a later unlock or lock — and cannot resurrect a
+/// session that was logged out while the daemon still ran.
+fn register_refresh_handler(session: &ProtonApiSession) {
     session.http().set_on_tokens_refreshed(move |tokens| {
-        let stored = StoredSession {
-            session_id: session_id.clone(),
-            username: username.clone(),
-            user_id: user_id.clone(),
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            scopes: scopes.clone(),
-            password_mode,
-            mailbox_password: mailbox_password.clone(),
-            key_salts: key_salts.clone(),
-        };
-        if let Ok(json) = serde_json::to_string(&stored)
-            && let Ok(entry) = keyring_entry()
-        {
-            if let Err(e) = entry.set_password(&json) {
-                tracing::warn!(error = %e, "failed to auto-persist refreshed tokens in keyring");
-            } else {
-                tracing::info!("successfully auto-persisted refreshed tokens in keyring");
+        match store_tokens(tokens.access_token, tokens.refresh_token) {
+            Ok(()) => tracing::info!("successfully auto-persisted refreshed tokens in keyring"),
+            Err(Error::NotLoggedIn) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to auto-persist refreshed tokens in keyring")
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn passphrases() -> KeyPassphrases {
+        let mut p = KeyPassphrases::new();
+        p.insert("key-a", b"alpha".to_vec());
+        p.insert("key-b", vec![0, 255, 7]);
+        p
+    }
+
+    fn blob(extra: &str) -> String {
+        format!(
+            r#"{{"session_id":"s","username":"u","user_id":"i","access_token":"a",
+            "refresh_token":"r","scopes":[],"password_mode":2{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn passphrases_survive_the_blob_encoding() {
+        let decoded = decode(&encode(&passphrases())).expect("decodes");
+        assert_eq!(decoded, passphrases());
+    }
+
+    #[test]
+    fn passphrases_survive_the_kernel_payload_encoding() {
+        let decoded = decode_secret(&encode_secret(&passphrases())).expect("decodes");
+        assert_eq!(decoded, passphrases());
+    }
+
+    #[test]
+    fn corrupt_or_empty_secrets_read_as_absent() {
+        assert!(decode_secret(b"not json").is_none());
+        assert!(decode(&BTreeMap::new()).is_none());
+        assert!(decode(&BTreeMap::from([("k".into(), "!!!".into())])).is_none());
+    }
+
+    #[test]
+    fn legacy_blob_is_read_but_its_password_is_never_written_back() {
+        let stored: StoredSession =
+            serde_json::from_str(&blob(r#","mailbox_password":"hunter2""#)).unwrap();
+        assert_eq!(stored.mailbox_password, "hunter2");
+        assert!(stored.key_passphrases.is_none());
+
+        let written = serde_json::to_string(&stored).unwrap();
+        assert!(!written.contains("hunter2"));
+        assert!(!written.contains("mailbox_password"));
+    }
+
+    #[test]
+    fn locked_blob_has_no_passphrases_field() {
+        let stored: StoredSession = serde_json::from_str(&blob("")).unwrap();
+        assert!(
+            serde_json::to_string(&stored)
+                .unwrap()
+                .find("key_passphrases")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stored_passphrases_win_over_the_kernel_keyring() {
+        let mut stored: StoredSession = serde_json::from_str(&blob("")).unwrap();
+        stored.key_passphrases = Some(encode(&passphrases()));
+        let (found, origin) = find_passphrases(&stored).unwrap().unwrap();
+        assert_eq!(origin, KeyState::Stored);
+        assert_eq!(found, passphrases());
+    }
 }

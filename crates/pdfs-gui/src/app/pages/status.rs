@@ -860,6 +860,7 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
         }
     }
 
+    offer_unlock(ui);
     refresh_status(ui);
     refresh_transfers(ui);
 }
