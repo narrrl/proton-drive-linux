@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
 use crate::menu::PromptConfig;
@@ -12,8 +12,19 @@ use crate::syncignore::DEFAULT_IGNORE_PATTERNS;
 
 /// Proton requires `external-drive-{name}@{semver}-{channel}` (channel ∈
 /// stable/beta/alpha); a malformed value trips the 422 anti-abuse path.
-pub const APP_VERSION: &str = "external-drive-linux@0.1.0-alpha";
-pub const USER_AGENT: &str = "proton-drive-linux/0.1.0";
+/// Follows the release so Proton can tell releases apart and retire old ones
+/// without retiring every one.
+pub const APP_VERSION: &str = concat!(
+    "external-drive-linux@",
+    env!("CARGO_PKG_VERSION"),
+    "-stable"
+);
+pub const USER_AGENT: &str = concat!("proton-drive-linux/", env!("CARGO_PKG_VERSION"));
+
+/// The fixed identity every release up to 3.1.0 wrote into `config.json`. Read
+/// back as "unset" so those configs follow the release instead of pinning it.
+const LEGACY_APP_VERSION: &str = "external-drive-linux@0.1.0-alpha";
+const LEGACY_USER_AGENT: &str = "proton-drive-linux/0.1.0";
 
 /// Keyring service name; one entry per credential kind keyed by username.
 pub const KEYRING_SERVICE: &str = "proton-drive-linux";
@@ -76,10 +87,24 @@ fn resolve_sweep_mode(env: Option<&str>, stored: Option<SweepMode>) -> SweepMode
 }
 
 /// Configuration structure allowing the user to customize client identification headers.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AppConfig {
-    pub app_version: String,
-    pub user_agent: String,
+    /// Override for [`APP_VERSION`]. `None` means "use the release's own";
+    /// the old fixed default reads as `None`, so it leaves the file on the
+    /// next save.
+    #[serde(
+        default,
+        deserialize_with = "identity_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_version: Option<String>,
+    /// Override for [`USER_AGENT`], handled like `app_version`.
+    #[serde(
+        default,
+        deserialize_with = "identity_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_agent: Option<String>,
     /// Soft cap on the on-disk content cache, in bytes (`0` = unlimited).
     /// `None` means "use [`DEFAULT_CACHE_BUDGET_BYTES`]"; the Settings page
     /// writes an explicit value here. Defaulted for configs predating the field.
@@ -216,31 +241,28 @@ impl FileSort {
     }
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            app_version: APP_VERSION.to_string(),
-            user_agent: USER_AGENT.to_string(),
-            cache_budget: None,
-            upload_limit: None,
-            download_limit: None,
-            mountpoint: None,
-            ignore_patterns: None,
-            device_uid: None,
-            conflict_sweep: None,
-            open_with: None,
-            prompt: None,
-            proton_theme: None,
-            files_view: FilesView::default(),
-            tray_hidden: false,
-            language: None,
-            online_map: false,
-            local_first: None,
-        }
-    }
+/// Reads an `app_version` or `user_agent` override, dropping the fixed
+/// identity older releases stored as the default.
+fn identity_override<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.filter(|v| v != LEGACY_APP_VERSION && v != LEGACY_USER_AGENT))
 }
 
 impl AppConfig {
+    /// The `x-pm-appversion` sent to Proton: the user's override, or
+    /// [`APP_VERSION`].
+    pub fn resolved_app_version(&self) -> &str {
+        self.app_version.as_deref().unwrap_or(APP_VERSION)
+    }
+
+    /// The `User-Agent` sent to Proton: the user's override, or
+    /// [`USER_AGENT`].
+    pub fn resolved_user_agent(&self) -> &str {
+        self.user_agent.as_deref().unwrap_or(USER_AGENT)
+    }
+
     /// The effective cache budget in bytes: the user's explicit choice, or
     /// [`DEFAULT_CACHE_BUDGET_BYTES`] when unset.
     pub fn resolved_cache_budget(&self) -> u64 {
@@ -571,8 +593,8 @@ mod tests {
     #[test]
     fn test_app_config_serialization() {
         let config = AppConfig {
-            app_version: "external-drive-test-client@1.0.0".to_string(),
-            user_agent: "test-agent/1.0".to_string(),
+            app_version: Some("external-drive-test-client@1.0.0".to_string()),
+            user_agent: Some("test-agent/1.0".to_string()),
             cache_budget: Some(1234),
             upload_limit: Some(500_000),
             download_limit: None,
@@ -596,8 +618,11 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
-        assert_eq!(decoded.user_agent, "test-agent/1.0");
+        assert_eq!(
+            decoded.resolved_app_version(),
+            "external-drive-test-client@1.0.0"
+        );
+        assert_eq!(decoded.resolved_user_agent(), "test-agent/1.0");
         assert_eq!(decoded.proton_theme, Some(true));
         assert!(decoded.tray_hidden);
         assert!(decoded.online_map);
@@ -628,8 +653,55 @@ mod tests {
     #[test]
     fn test_default_app_config() {
         let default_config = AppConfig::default();
-        assert_eq!(default_config.app_version, APP_VERSION);
-        assert_eq!(default_config.user_agent, USER_AGENT);
+        assert_eq!(default_config.resolved_app_version(), APP_VERSION);
+        assert_eq!(default_config.resolved_user_agent(), USER_AGENT);
+    }
+
+    #[test]
+    fn the_client_identity_follows_the_release() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            APP_VERSION,
+            format!("external-drive-linux@{version}-stable")
+        );
+        assert_eq!(USER_AGENT, format!("proton-drive-linux/{version}"));
+    }
+
+    #[test]
+    fn an_old_config_with_the_fixed_identity_follows_the_release() {
+        // Every config written up to 3.1.0 holds these two values, so they must
+        // not pin the identity once Proton retires 0.1.0.
+        let json = format!(
+            r#"{{"app_version":"{LEGACY_APP_VERSION}","user_agent":"{LEGACY_USER_AGENT}","tray_hidden":true}}"#
+        );
+        let decoded: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.resolved_app_version(), APP_VERSION);
+        assert_eq!(decoded.resolved_user_agent(), USER_AGENT);
+        assert!(decoded.tray_hidden, "the rest of the config survives");
+
+        let saved = serde_json::to_string(&decoded).unwrap();
+        assert!(!saved.contains("app_version"), "{saved}");
+        assert!(!saved.contains("user_agent"), "{saved}");
+    }
+
+    #[test]
+    fn a_hand_set_client_identity_is_kept() {
+        let json = r#"{"app_version":"external-drive-linux@9.9.9-beta","user_agent":"custom/1"}"#;
+        let decoded: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            decoded.resolved_app_version(),
+            "external-drive-linux@9.9.9-beta"
+        );
+        assert_eq!(decoded.resolved_user_agent(), "custom/1");
+        let saved = serde_json::to_string(&decoded).unwrap();
+        assert!(saved.contains("external-drive-linux@9.9.9-beta"), "{saved}");
+    }
+
+    #[test]
+    fn a_config_without_a_client_identity_loads() {
+        let decoded: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(decoded.resolved_app_version(), APP_VERSION);
+        assert_eq!(decoded.resolved_user_agent(), USER_AGENT);
     }
 
     #[test]

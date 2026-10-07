@@ -89,7 +89,11 @@ fix it.
 | `open_with` | object | `xdg-open` | — | See [`open_with`](#open_with) |
 | `prompt` | object | built-in window | — | See [`prompt`](#prompt) |
 
-`app_version` and `user_agent` identify the client to Proton. Leave them alone.
+`app_version` and `user_agent` identify the client to Proton. When the keys are absent, the
+client sends its own release (`external-drive-linux@<version>-stable`, `proton-drive-linux/<version>`).
+Leave them out unless a support case asks for a different value. The fixed
+`external-drive-linux@0.1.0-alpha` and `proton-drive-linux/0.1.0` that releases up to 3.1.0 wrote
+here are treated as absent and removed on the next save.
 
 ### `ignore_patterns`
 

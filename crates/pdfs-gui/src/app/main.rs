@@ -1210,7 +1210,7 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
         let dialog = adw::AboutDialog::builder()
             .application_name(gettext("Proton Drive for Linux"))
             .application_icon("io.narl.proton-drive-linux")
-            .version(pdfs_core::config::APP_VERSION)
+            .version(env!("CARGO_PKG_VERSION"))
             .developer_name("Nils Pukropp")
             .website("https://proton-drive.narl.io")
             .issue_url("https://github.com/narrrl/proton-drive-linux/issues")
@@ -1350,8 +1350,8 @@ fn debug_info(ui: &Rc<Ui>) -> String {
     format!(
         "App version: {}\nUser agent: {}\nlibadwaita: {}.{}.{}\nGTK: {}.{}.{}\n\
          Mountpoint: {}\nControl socket: {}\nMount service running: {}\n",
-        pdfs_core::config::APP_VERSION,
-        pdfs_core::config::USER_AGENT,
+        config.resolved_app_version(),
+        config.resolved_user_agent(),
         adw::major_version(),
         adw::minor_version(),
         adw::micro_version(),

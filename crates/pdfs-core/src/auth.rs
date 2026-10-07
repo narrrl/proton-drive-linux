@@ -109,7 +109,10 @@ fn client_config() -> ProtonClientConfiguration {
     let (app_version, user_agent) = match AppDirs::new() {
         Ok(dirs) => {
             let config = dirs.load_config();
-            (config.app_version, config.user_agent)
+            (
+                config.resolved_app_version().to_string(),
+                config.resolved_user_agent().to_string(),
+            )
         }
         Err(_) => (APP_VERSION.to_string(), USER_AGENT.to_string()),
     };
