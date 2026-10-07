@@ -10,6 +10,7 @@ pub mod config;
 pub mod control;
 pub mod db;
 pub mod error;
+pub mod kernelkey;
 pub mod localindex;
 pub mod menu;
 pub mod mounts;

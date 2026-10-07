@@ -166,6 +166,15 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
         // No daemon: describe login state instead so the menu is still useful.
         Err(_) => {
             let (line, phase) = match auth::load() {
+                Ok(s) if matches!(auth::key_state(), Ok(auth::KeyState::Locked)) => (
+                    // Translators: {username} is the Proton account name. The
+                    // account has a mailbox password that has to be entered.
+                    gettext_f(
+                        "Signed in as {username} — locked",
+                        &[("username", &s.username)],
+                    ),
+                    Phase::Attention,
+                ),
                 Ok(s) => (
                     // Translators: {username} is the Proton account name.
                     gettext_f(

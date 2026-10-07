@@ -119,6 +119,9 @@ struct Ui {
     /// keyring (a DBus round-trip). Populated at startup and updated only on
     /// login / logout. `None` = signed out.
     session: RefCell<Option<auth::StoredSession>>,
+    /// Whether this run already asked for the mailbox password of a locked
+    /// account, so a refresh never re-opens a dialog the user cancelled.
+    unlock_offered: Cell<bool>,
     /// Whether the last refresh saw a live mount daemon. Gates the unpin buttons
     /// (which need the daemon to evict + re-hydrate) and every mutating action.
     mounted: RefCell<bool>,
@@ -362,6 +365,7 @@ fn build_window(app: &adw::Application) {
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
         session: RefCell::new(auth::load().ok()),
+        unlock_offered: Cell::new(false),
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
         nav: split.clone(),

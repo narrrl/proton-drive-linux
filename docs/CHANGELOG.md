@@ -11,6 +11,42 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-10-07
+
+Schema: **42**, unchanged.
+
+### Added
+- **Two-password accounts.** An account with a separate mailbox password now signs in: the app
+  and `pdfs login` ask for it after the login password and check it against the account, so a
+  typo is a retry and not a daemon that never mounts. The mailbox password is never stored.
+  What it unlocks is kept in kernel memory for the login session, so it is asked for once per
+  session and is gone after a reboot or when you log out of the machine.
+- **`pdfs unlock` and `pdfs lock`.** `pdfs unlock` enters the mailbox password of a locked
+  account and starts the daemon's mount; `pdfs lock` forgets it again. `--remember` on `login`
+  and `unlock` (and the "Keep unlocked on this computer" switch in the app) keeps the unlock in
+  the system keyring instead, so the daemon starts without asking; `pdfs lock --forget` removes
+  it. Off by default: it gives up the separation a second password is for.
+- **Locked state.** `pdfs status`, `pdfs diagnose` and the tray say when the account is waiting
+  for its mailbox password, and the app asks for it when it opens.
+
+### Changed
+- **The keyring no longer holds a password.** The session blob keeps the keys' passphrases
+  instead of the mailbox password, and a blob written by 3.0.x is converted on the first start.
+  A stored password the account rejects (a two-password account that was signed in with only
+  its login password) leaves the account locked instead of failing every start.
+- **The daemon is not dumpable.** It holds the unlock in memory, so core dumps and same-user
+  `ptrace` are off for it.
+- **The offline cache is re-keyed** from the new secret, so the first start after the update
+  reads it as cold and fetches the tree again once.
+
+### Fixed
+- **systemd killed a daemon that was only retrying.** `WatchdogSec` was answered only once a
+  mount existed, so a daemon waiting for a login or retrying a failed mount was aborted after
+  two minutes and restarted in a loop, hiding the error it logged. It now answers the watchdog
+  while it waits. ([#26](https://github.com/narrrl/proton-drive-linux/issues/26))
+- **A refreshed token could overwrite a newer unlock or revive a signed-out session.** Token
+  rotation now updates only the tokens in the stored blob.
+
 ## [3.0.0] — 2026-10-05
 
 Schema: **42**. The queue table is rebuilt so an id is never given out twice; queued changes

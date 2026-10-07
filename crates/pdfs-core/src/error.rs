@@ -32,6 +32,16 @@ pub enum Error {
     #[error("saved session can no longer unlock your keys — run `pdfs login` again")]
     ReloginRequired,
 
+    /// The account has a separate mailbox password that has not been entered
+    /// since login, so its keys cannot be unlocked. The fix is
+    /// [`auth::unlock`](crate::auth::unlock), not a new login.
+    #[error("account is locked — enter the mailbox password with `pdfs unlock`")]
+    Locked,
+
+    /// The mailbox password was checked against the account and is wrong.
+    #[error("that mailbox password does not unlock your account")]
+    WrongMailboxPassword,
+
     /// The login was gated behind human verification. Not a failure the user can
     /// fix by retrying: the challenge has to be solved and the login restarted
     /// with the resulting token (see [`auth::login_verified`](crate::auth::login_verified)).
@@ -199,9 +209,11 @@ impl From<serde_json::Error> for CoreError {
 impl From<Error> for CoreError {
     fn from(e: Error) -> Self {
         let kind = match &e {
-            Error::NotLoggedIn | Error::ReloginRequired | Error::HumanVerificationRequired(_) => {
-                ErrorKind::Denied
-            }
+            Error::NotLoggedIn
+            | Error::ReloginRequired
+            | Error::Locked
+            | Error::WrongMailboxPassword
+            | Error::HumanVerificationRequired(_) => ErrorKind::Denied,
             Error::Proton(proton_sdk::ProtonError::Api(api)) => api_kind(api.code),
             // A `ProtonError` that never reached the API is a transport failure.
             Error::Proton(_) => ErrorKind::Offline,
