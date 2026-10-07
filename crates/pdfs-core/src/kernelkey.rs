@@ -30,8 +30,20 @@ const KEY_TYPE: &[u8] = b"user\0";
 
 const KEY_SPEC_USER_KEYRING: i32 = -4;
 const KEYCTL_REVOKE: libc::c_long = 3;
+const KEYCTL_SETPERM: libc::c_long = 5;
 const KEYCTL_SEARCH: libc::c_long = 10;
 const KEYCTL_READ: libc::c_long = 11;
+
+/// Possessor and owner may view, read, write, search, link and set attributes;
+/// group and others get nothing.
+///
+/// A new key's default grants the owner only *view*, and read access to the
+/// possessor. A process possesses the user keyring only when its session
+/// keyring links to it, which a systemd user service or a container does not
+/// guarantee — so with the default, the daemon could store a key it then
+/// cannot read back. The owner is the same user that could ptrace the daemon
+/// anyway, so granting it read access gives up nothing.
+const PERM_OWNER_AND_POSSESSOR: u32 = 0x3f3f_0000;
 
 fn last_error<T>() -> io::Result<T> {
     Err(io::Error::last_os_error())
@@ -87,6 +99,21 @@ pub fn store(secret: &[u8]) -> io::Result<()> {
     };
     if id < 0 {
         return last_error();
+    }
+    // SAFETY: plain integer arguments.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_SETPERM,
+            id,
+            PERM_OWNER_AND_POSSESSOR,
+        )
+    };
+    if rc < 0 {
+        // A key whose permissions are unknown is not one to leave behind.
+        let err = io::Error::last_os_error();
+        let _ = clear();
+        return Err(err);
     }
     Ok(())
 }
