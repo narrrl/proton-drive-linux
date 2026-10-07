@@ -1,0 +1,121 @@
+name: Test build
+
+# On-demand Fedora RPM of any branch, for someone to try a fix before it ships.
+# Run it from the Actions tab ("Run workflow", pick the branch). Built inside a
+# Fedora container so the binaries link against Fedora's own GTK, libadwaita and
+# WebKitGTK, not the Ubuntu ones the release RPM is built against.
+#
+# The RPM is unsigned and versioned `<Cargo version>-1.test.<sha>`, so it sorts
+# below the release it precedes and `dnf` replaces it when that ships.
+on:
+  workflow_dispatch:
+    inputs:
+      fedora:
+        description: 'Fedora release to build on'
+        required: false
+        default: '44'
+        type: string
+      prerelease:
+        description: 'Also publish a pre-release anyone can download without a GitHub login'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rpm:
+    name: Fedora ${{ inputs.fedora }} RPM
+    runs-on: ubuntu-24.04
+    container: fedora:${{ inputs.fedora }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git rpm-build gcc gcc-c++ make gettext curl \
+            pkgconf-pkg-config fuse3-devel gtk4-devel libadwaita-devel \
+            libsecret-devel dbus-devel glib2-devel webkitgtk6.0-devel
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Fedora's packaged Rust can trail the workspace's minimum (1.96).
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.96'
+          cache: false
+
+      - name: Cache Cargo target
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: fedora-test-build
+          save-if: false
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Package RPM
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          SHORT=${GITHUB_SHA::7}
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT,db}
+          rpmbuild -bb \
+            --nodeps \
+            --define "_topdir $PWD/rpmbuild" \
+            --define "_sourcedir $PWD" \
+            --define "git_dir $PWD" \
+            --define "prebuilt 1" \
+            --define "version ${VERSION}" \
+            --define "dist .test.${SHORT}" \
+            --define "_dbpath $PWD/rpmbuild/db" \
+            packaging/proton-drive-linux.spec
+          mkdir -p out
+          cp rpmbuild/RPMS/x86_64/*.rpm out/
+          # The bare binaries, for trying one without installing anything.
+          tar -czf "out/proton-drive-linux-${VERSION}-${SHORT}-fedora${{ inputs.fedora }}-x86_64.tar.gz" \
+            -C target/release pdfs pdfs-tray pdfs-app pdfs-prompt
+          ls -l out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: proton-drive-linux-fedora${{ inputs.fedora }}-${{ github.sha }}
+          path: out/*
+          retention-days: 14
+          if-no-files-found: error
+
+  prerelease:
+    name: Publish pre-release
+    needs: rpm
+    if: inputs.prerelease
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+
+      # One rolling pre-release per branch: a new run replaces the last one, so
+      # the link a tester was given keeps pointing at the newest build.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="test-$(echo "${GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9._\n' '-')"
+          gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$TAG" out/* \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Test build of ${GITHUB_REF_NAME} (${GITHUB_SHA::7})" \
+            --notes "Unsigned test build of branch \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}. Not a release; replaced by the next test build of this branch."
