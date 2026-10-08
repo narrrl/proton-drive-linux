@@ -47,7 +47,7 @@ original wording.
    it in the index in the same change.
 
 ```markdown
-### B194 — What the user sees, in one line
+### B196 — What the user sees, in one line
 
 **Status:** Open
 **Found:** 2026-10-06, how it was found
@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B195](#b195--the-app-crashes-when-proton-asks-for-a-captcha-on-secureblue) | The app crashes when Proton asks for a CAPTCHA on secureblue |
 | [B193](#b193--deleting-a-file-whose-create-failed-can-trash-a-file-of-the-users-on-drive) | Deleting a file whose create failed can trash a file of the user's on Drive |
 | [B191](#b191--a-file-deleted-after-its-create-failed-and-was-written-again-can-stay-on-drive) | A file deleted after its create failed and was written again can stay on Drive |
 | [B190](#b190--a-file-saved-just-before-the-daemon-stops-can-keep-its-old-content-on-drive) | A file saved just before the daemon stops can keep its old content on Drive |
@@ -214,6 +215,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B194](#b194--on-a-fresh-install-the-tray-exits-and-the-takeout-page-cannot-remember-its-archives) | On a fresh install the tray exits and the Takeout page cannot remember its archives |
 | [B192](#b192--a-new-file-closed-empty-reaches-drive-only-half-a-minute-later) | A new file closed empty reaches Drive only half a minute later |
 | [B181](#b181--the-app-shows-a-queued-edit-kept-as-a-conflict-copy-in-english) | The app shows a queued edit kept as a conflict copy in English |
 | [B180](#b180--a-stop-waits-10-s-for-a-drain-worker-that-slept-through-it) | A stop waits 10 s for a drain worker that slept through it |
@@ -295,6 +297,60 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B195 — The app crashes when Proton asks for a CAPTCHA on secureblue
+
+**Status:** Fixed (unverified). Nobody has run the fix on secureblue yet.
+**Found:** 2026-10-07, [#29](https://github.com/narrrl/proton-drive-linux/issues/29). On
+secureblue 44 (a hardened Fedora Atomic), `pdfs-app` aborted a few seconds after the sign-in, with
+`bwrap: Can't get type of source /run/systemd/journal/socket: Permission denied` and
+`Failed to fully launch dbus-proxy`.
+**Where:** `crates/pdfs-gui/src/app/pages/verify.rs`, `crates/pdfs-gui/src/app/pages/login.rs`
+
+**Repro:** Sign in on secureblue from a network Proton asks a CAPTCHA for, such as a VPN.
+
+**Cause.** The CAPTCHA page runs in a WebKitGTK view (B8). Before it loads anything, WebKit starts
+its sandbox: bubblewrap, with the journal socket bound in, and `xdg-dbus-proxy`. secureblue keeps
+bubblewrap from the socket, the proxy does not start, and WebKit ends its process with `g_error`.
+The view was in the app's own process, so the whole app went down, and nothing in our code can
+catch that.
+
+**Fix.** The view runs in a child, `pdfs-app --human-verification`, that reads the URL on stdin
+and prints the token on stdout. A child that exits without a token after a crash or a non-zero
+status ends the sign-in with a message that says the page could not be opened. TROUBLESHOOTING.md
+gives the cause and a one-time workaround. The sandbox is not switched off by the app: users choose
+a hardened system for that isolation.
+
+**Test:** unit tests `a_window_that_died_fails`, `a_window_closed_without_a_token_cancels`,
+`a_token_counts_even_if_the_window_died_after_it` and `the_token_is_found_among_other_output`.
+On 2026-10-08 the child ran under real WebKit on Arch against a local page that posts a completion,
+and handed back its token.
+
+---
+
+### B194 — On a fresh install the tray exits and the Takeout page cannot remember its archives
+
+**Status:** Fixed.
+**Found:** 2026-10-07, in the log of [#29](https://github.com/narrrl/proton-drive-linux/issues/29):
+`failed to bind tray single-instance socket: No such file or directory` and
+`cannot remember staged Takeout archives: No such file or directory`.
+**Where:** `crates/pdfs-gui/src/main.rs`, `build_window` in `crates/pdfs-gui/src/app/main.rs`
+
+**Repro:** Start `pdfs-app` with no `~/.local/state/proton-drive-linux`, as on a fresh install. The
+tray is gone, and staging a Takeout archive logs the warning.
+
+**Cause.** Both write to the state directory, and only the daemon and the CLI made it
+(`AppDirs::ensure`). The app starts the tray before the first sign-in, so before the daemon has
+ever run.
+
+**Fix.** `pdfs-tray` and `pdfs-app` call `AppDirs::ensure` at start, which also makes the
+directories owner-only (B6).
+
+**Verified:** 2026-10-08, `pdfs-tray` with `XDG_STATE_HOME`, `XDG_CONFIG_HOME` and
+`XDG_CACHE_HOME` pointing at an empty directory. It exited with the error before the fix, and
+afterwards ran with `tray.sock` in a `0700` state directory.
+
+---
 
 ### B193 — Deleting a file whose create failed can trash a file of the user's on Drive
 

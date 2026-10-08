@@ -542,7 +542,7 @@ sequenceDiagram
     actor User
     participant UI as pdfs-app
     participant Auth as pdfs-core auth
-    participant Web as WebKitGTK dialog
+    participant Web as pdfs-app --human-verification
     participant API as Proton API
 
     User->>UI: email and password
@@ -550,9 +550,9 @@ sequenceDiagram
     Auth->>API: SRP handshake
     API-->>Auth: 9001, challenge URL
     Auth-->>UI: HumanVerificationRequired
-    UI->>Web: load challenge
+    UI->>Web: challenge URL (stdin)
     User->>Web: solve it
-    Web-->>UI: token (postMessage)
+    Web-->>UI: token (stdout)
     UI->>Auth: login_verified(token)
     Auth->>API: new SRP handshake with the token
     API-->>Auth: session
@@ -561,6 +561,9 @@ sequenceDiagram
 - The challenge used up the first SRP handshake, so the retry starts a new one with the token
   attached.
 - The page may post the token as an object or as a JSON string; both are accepted.
+- The page runs in a WebKitGTK view inside a child `pdfs-app`. WebKit aborts its process when its
+  sandbox cannot start, as on hardened systems such as secureblue (B195). In the child, that ends
+  the verification, and the app says why, instead of closing the app.
 - The CLI has no web view. It fails with a message to sign in once with `pdfs-app`; the stored
   session then works for the CLI and the service.
 
