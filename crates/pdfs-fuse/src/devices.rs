@@ -964,6 +964,23 @@ impl Core {
                 if folder.state != "idle" {
                     return Err(SwitchBlocked::NotNow);
                 }
+                // `idle` only says the last pass applied everything it tried.
+                // It never tries an ignored path, a symlink or a folder it
+                // cannot read, it defers a file open for writing, and a file can
+                // change after it ends. The eviction below deletes all of those
+                // for good, so it waits until nothing here is missing from Drive
+                // (B198).
+                let baseline = self
+                    .db
+                    .sync_entries(id)
+                    .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
+                if let Some(reason) =
+                    sync::mirror_tree_unsynced(&local, &baseline, &self.ignore_rules(&local))
+                {
+                    return Err(SwitchBlocked::Failed(format!(
+                        "going online-only would delete what is only on this computer: {reason}"
+                    )));
+                }
                 let root_uid = parse_uid(&folder.remote_uid).ok_or_else(|| {
                     SwitchBlocked::Failed(format!("bad remote uid: {}", folder.remote_uid))
                 })?;

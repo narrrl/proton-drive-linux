@@ -96,7 +96,9 @@ app and in the web app.
 Each synced folder can also be switched to **Online only**. The local copy is replaced by a mount
 of the folder, so the files stay visible but take no disk space until opened. Switch with the
 **Synced / Online only** switch on the folder's card, or `pdfs sync mode <id> ondemand` and back
-with `pdfs sync mode <id> mirror`. `pdfs locations` lists every local place the service occupies.
+with `pdfs sync mode <id> mirror`. The switch waits until everything in the folder is on Proton
+Drive, and refuses while the folder holds something that never goes there: an ignored path such
+as `.git/`, a symlink, or a folder you may not read. The message names it. `pdfs locations` lists every local place the service occupies.
 
 ### Moving between synced folders and My files
 
@@ -145,6 +147,9 @@ places, and both apply:
 
 Rules are re-read on every pass. Ignoring never deletes anything: a file that becomes ignored is
 simply no longer tracked, and its copy on Proton Drive stays.
+
+A folder you may not read, such as a cache a container created as root, is skipped the same way,
+and the activity feed names it once. Add it to `.pdfsignore` to stop that message.
 
 ## Changes waiting for Proton Drive
 

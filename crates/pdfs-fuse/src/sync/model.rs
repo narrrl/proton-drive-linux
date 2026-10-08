@@ -98,6 +98,11 @@ pub(super) struct Outcome {
     pub(super) errors: usize,
     /// Files skipped because another process held them open for writing.
     pub(super) deferred: usize,
+    /// Paths the local scan could not read, left out of the pass. Not part of
+    /// [`is_empty`](Self::is_empty) or the summary: an unreadable folder stays
+    /// unreadable from one poll to the next, so the pass reports it once, when
+    /// the set changes, rather than on every poll.
+    pub(super) unscanned: Vec<String>,
 }
 
 impl Outcome {

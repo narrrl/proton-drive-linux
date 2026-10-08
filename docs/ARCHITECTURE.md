@@ -310,8 +310,10 @@ its changes go through the queue like My files.
 A filesystem watcher (`notify`) and a remote poll every 120 s feed a debounced pass (2 s, at most
 30 s). Passes are serialized per daemon. A pass:
 
-1. **Walks the local tree.** Any `readdir`, metadata or permission failure marks the scan
-   incomplete, and an incomplete scan cannot delete anything.
+1. **Walks the local tree.** A path the user may not read, an entry that vanishes mid-scan and a
+   name that is not UTF-8 are left out, and the pass drops everything under them, as it drops
+   ignored paths, so a left-out path is never read as deleted. An unreadable root and any other
+   I/O error fail the pass.
 2. **Walks the remote tree.**
 3. **Loads the baseline**, the `sync_entry` rows: both sides as of the last successful pass.
 4. **Classifies each path** by comparing local, remote and baseline, with `(mtime, size)` as the
