@@ -2309,42 +2309,26 @@ mod tests {
     /// call also needs.
     #[test]
     fn budget_check_is_free_when_under_budget() {
-        use std::time::Instant;
-
         // Cap far above what we store, so every store stays under budget.
         let (c, _d) = cache_capped(1 << 30);
         let payload = vec![0u8; 4096];
-
-        // Cost of a store against a near-empty index...
-        let t = Instant::now();
-        for i in 0..500u64 {
+        for i in 0..8u64 {
             c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, i), &payload)
                 .unwrap();
         }
-        let empty = t.elapsed() / 500;
 
-        // ...and against one with a few thousand entries in it.
-        for i in 500..2500u64 {
-            c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, i), &payload)
-                .unwrap();
-        }
-        let t = Instant::now();
-        for i in 2500..3000u64 {
-            c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, i), &payload)
-                .unwrap();
-        }
-        let full = t.elapsed() / 500;
+        // Plant an index row far over the cap behind the running total's back,
+        // and older than every real block. Any budget check that consults the
+        // index would see the pool over budget, evict, and reseed the total.
+        c.db.cache_touch("planted", KIND_BLOCK, 1 << 40, 0).unwrap();
 
-        println!("B4: store_block under budget — {empty:?} at ~0 entries, {full:?} at 2500");
-        // A ratio, not a wall-clock bound: the claim is that the under-budget
-        // path does not grow with the index, and only a ratio tests that. An
-        // absolute threshold measures the machine's load instead, and this test
-        // runs alongside the rest of the suite.
-        assert!(
-            full < empty * 3,
-            "under-budget store should not scale with the index: \
-             {empty:?} at ~0 entries vs {full:?} at 2500"
-        );
+        c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, 8), &payload)
+            .unwrap();
+
+        // Not a timing ratio: that measured the CI runner's load and flaked.
+        assert_eq!(c.block_bytes.load(Ordering::Relaxed), 9 * 4096);
+        let entries = c.db.cache_entries_by_kind(KIND_BLOCK).unwrap();
+        assert_eq!(entries.len(), 10, "under-budget store evicted: {entries:?}");
     }
 
     /// The running totals are a fast path, not a second source of truth: after
