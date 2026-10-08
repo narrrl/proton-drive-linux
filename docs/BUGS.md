@@ -47,7 +47,7 @@ original wording.
    it in the index in the same change.
 
 ```markdown
-### B194 — What the user sees, in one line
+### B195 — What the user sees, in one line
 
 **Status:** Open
 **Found:** 2026-10-06, how it was found
@@ -214,6 +214,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B194](#b194--on-a-fresh-install-the-tray-exits-and-the-takeout-page-cannot-remember-its-archives) | On a fresh install the tray exits and the Takeout page cannot remember its archives |
 | [B192](#b192--a-new-file-closed-empty-reaches-drive-only-half-a-minute-later) | A new file closed empty reaches Drive only half a minute later |
 | [B181](#b181--the-app-shows-a-queued-edit-kept-as-a-conflict-copy-in-english) | The app shows a queued edit kept as a conflict copy in English |
 | [B180](#b180--a-stop-waits-10-s-for-a-drain-worker-that-slept-through-it) | A stop waits 10 s for a drain worker that slept through it |
@@ -295,6 +296,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B194 — On a fresh install the tray exits and the Takeout page cannot remember its archives
+
+**Status:** Fixed.
+**Found:** 2026-10-07, in the log of [#29](https://github.com/narrrl/proton-drive-linux/issues/29):
+`failed to bind tray single-instance socket: No such file or directory` and
+`cannot remember staged Takeout archives: No such file or directory`.
+**Where:** `crates/pdfs-gui/src/main.rs`, `build_window` in `crates/pdfs-gui/src/app/main.rs`
+
+**Repro:** Start `pdfs-app` with no `~/.local/state/proton-drive-linux`, as on a fresh install. The
+tray is gone, and staging a Takeout archive logs the warning.
+
+**Cause.** Both write to the state directory, and only the daemon and the CLI made it
+(`AppDirs::ensure`). The app starts the tray before the first sign-in, so before the daemon has
+ever run.
+
+**Fix.** `pdfs-tray` and `pdfs-app` call `AppDirs::ensure` at start, which also makes the
+directories owner-only (B6).
+
+**Verified:** 2026-10-08, `pdfs-tray` with `XDG_STATE_HOME`, `XDG_CONFIG_HOME` and
+`XDG_CACHE_HOME` pointing at an empty directory. It exited with the error before the fix, and
+afterwards ran with `tray.sock` in a `0700` state directory.
+
+---
 
 ### B193 — Deleting a file whose create failed can trash a file of the user's on Drive
 

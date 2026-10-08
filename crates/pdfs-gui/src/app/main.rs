@@ -303,6 +303,11 @@ fn build_window(app: &adw::Application) {
             return;
         }
     };
+    // On a fresh install the daemon has not run yet to make these, and the
+    // Takeout page keeps its staged archives in the state dir (B194).
+    if let Err(e) = dirs.ensure() {
+        tracing::warn!("cannot create the app's directories: {e}");
+    }
 
     let stack = adw::ViewStack::new();
     let (login_page, login_widgets) = build_login_page();

@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **On a fresh install the tray icon did not start.** The tray and the app now create their state
+  directory themselves instead of waiting for the service to do it. This also lets the Takeout
+  page remember staged archives before the first mount.
+  ([#29](https://github.com/narrrl/proton-drive-linux/issues/29))
+
 ## [3.1.1] — 2026-10-07
 
 Schema: **42**, unchanged.

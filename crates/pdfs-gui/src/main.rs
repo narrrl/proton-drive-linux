@@ -485,6 +485,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The socket lives in the state dir, which nothing has made yet when the app
+    // starts the tray on a fresh install (B194).
+    dirs.ensure().context("create the app's directories")?;
+
     // Ensure only one instance of the tray runs.
     let tray_sock = dirs.tray_socket();
     if std::os::unix::net::UnixStream::connect(&tray_sock).is_ok() {
