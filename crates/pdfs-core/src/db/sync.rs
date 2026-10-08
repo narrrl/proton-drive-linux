@@ -139,6 +139,17 @@ impl Db {
         Ok(())
     }
 
+    /// Re-point a synced folder at the share that now holds its remote folder,
+    /// after the folder moved to another device without changing its uid.
+    pub fn sync_folder_set_share(&self, id: i64, share_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sync_folder SET remote_share_id = ?2 WHERE id = ?1",
+            params![id, share_id],
+        )?;
+        Ok(())
+    }
+
     /// Queue (or, with `None`, withdraw) a mode the folder should move to once it
     /// is safe to switch.
     pub fn sync_folder_set_pending_mode(&self, id: i64, mode: Option<&str>) -> Result<()> {

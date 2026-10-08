@@ -283,6 +283,9 @@ Proton Drive keeps earlier versions of every file. **Details → Versions…** i
   **Restore to This Computer…** downloads its folders here.
 - **Continue This Backup Here…** makes this computer take over another computer's backup, for
   example after reinstalling or replacing a machine. See [RECOVERY.md](RECOVERY.md).
+- **Move to This Computer…** moves another computer's folders into this computer's backup, for
+  example when you switch from Windows to Linux, and then offers them for syncing here. The other
+  computer stays in the list, without those folders.
 
 ## Search launcher
 

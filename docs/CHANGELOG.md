@@ -24,6 +24,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - **Switching to online-only trashed synced files that had become ignored.** Adding a synced path
   to `.pdfsignore` and then switching moved it to the Drive trash. Ignoring never deletes now, as
   the user guide says.
+  
+### Added
+- **Move another computer's backup to this one.** **Move to This Computer…** on the Computers page,
+  or `pdfs devices migrate UID`, moves every folder another computer backs up, for example an old
+  Windows PC, into this computer's backup on Proton Drive. Then it offers them for syncing here. The
+  folders move on Proton Drive itself, so nothing is uploaded again. The other computer stays in the
+  account, without those folders.
 
 ## [3.1.2] — 2026-10-08
 
