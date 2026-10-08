@@ -4941,6 +4941,28 @@ fn pending_mode_is_queued_until_the_mode_is_reached() {
 }
 
 #[test]
+fn moved_sync_folder_points_at_its_new_share() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/tmp/pdfs-moved-share", "vol~folder", "windows-share")
+        .unwrap();
+    let other = db
+        .sync_folder_add("/tmp/pdfs-unmoved-share", "vol~other", "windows-share")
+        .unwrap();
+
+    db.sync_folder_set_share(id, "linux-share").unwrap();
+
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.remote_share_id, "linux-share");
+    // A move keeps the uid, so nothing but the share changes.
+    assert_eq!(folder.remote_uid, "vol~folder");
+    assert_eq!(
+        db.sync_folder_get(other).unwrap().unwrap().remote_share_id,
+        "windows-share"
+    );
+}
+
+#[test]
 fn mode_commit_clears_only_the_intent_it_satisfies() {
     let db = Db::open_in_memory().unwrap();
     let id = db

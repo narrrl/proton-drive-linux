@@ -377,6 +377,12 @@ Restore lists the device's folders, proposes a local path from the profile, and 
 adds a synced folder bound to the remote uid. The download is an ordinary pass against an empty
 baseline. The user side is in [RECOVERY.md](RECOVERY.md).
 
+`Core::migrate_device` moves another device's top-level folders under this machine's device root.
+Device roots are separate shares on the main volume, so each folder is one server-side move that
+keeps its uid. A name already taken here gets the other device's name as a suffix. A synced folder
+that already tracked one of them keeps its `remote_uid` and only has its `remote_share_id`
+re-pointed. The moved folders are then offered by the ordinary restore.
+
 ---
 
 ## 8. Control protocol

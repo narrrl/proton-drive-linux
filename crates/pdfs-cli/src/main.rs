@@ -628,6 +628,15 @@ enum DeviceCmd {
         #[arg(long, conflicts_with = "uid")]
         clear: bool,
     },
+    /// Move another computer's folders into this computer's backup and sync
+    /// them here. The other computer stays registered, without those folders.
+    Migrate {
+        /// Device uid (from `devices list`).
+        uid: String,
+        /// Skip the confirmation and accept every proposed local path.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -966,6 +975,24 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
             }
             let uid = if clear { None } else { uid };
             ok_or_bail(control_request(CtlRequest::AdoptDevice { uid })?)?
+        }
+        DeviceCmd::Migrate { uid, yes } => {
+            if !yes {
+                println!(
+                    "Every folder that device backs up moves into this computer's backup.\n\
+                     The device stays registered, without those folders. Stop Proton Drive\n\
+                     on that computer first, or it sees its folders disappear."
+                );
+                confirm("Move them here?")?;
+            }
+            let response = control_request(CtlRequest::MigrateDevice { uid })?;
+            // A script gets the one reply and runs `sync restore` itself.
+            if emit_json(&response)? {
+                return Ok(());
+            }
+            ok_or_bail(response)?;
+            // The folders are this device's now, so the plain restore offers them.
+            cmd_sync_restore(yes, None)?
         }
     }
     Ok(())

@@ -369,7 +369,7 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
             RefreshScope::Photos { .. } => &[],
         },
         R::RenameDevice { .. } | R::DeleteDevice { .. } => &[Topic::Devices],
-        R::AdoptDevice { .. } => &[Topic::Devices, Topic::Locations],
+        R::AdoptDevice { .. } | R::MigrateDevice { .. } => &[Topic::Devices, Topic::Locations],
         R::AddSyncFolder { .. }
         | R::RemoveSyncFolder { .. }
         | R::SetSyncFolderMode { .. }
@@ -1294,6 +1294,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::AdoptDevice { uid }) => match core.adopt_device(uid.as_deref()) {
+            Ok(message) => CtlResponse::Ok { message },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::MigrateDevice { uid }) => match core.migrate_device(&uid) {
             Ok(message) => CtlResponse::Ok { message },
             Err(e) => CtlResponse::error(e),
         },

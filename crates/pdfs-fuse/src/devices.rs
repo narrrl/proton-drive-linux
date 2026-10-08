@@ -19,6 +19,7 @@ use pdfs_core::control::{
 };
 use pdfs_core::db::{StoredDevice, StoredSyncFolder};
 use pdfs_core::mounts::MountMode;
+use pdfs_core::profile::PROFILE_DIR_NAME;
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::{DeviceUid, NodeUid};
 use proton_drive_rs::{DeviceType, Node};
@@ -112,6 +113,22 @@ pub(crate) fn set_adopted_device_uid(uid: Option<&str>) -> CoreResult<()> {
     cfg.device_uid = uid.map(|u| u.to_string());
     dirs.save_config(&cfg)
         .map_err(|e| CoreError::internal(format!("write config: {e}")))
+}
+
+/// The name a folder moved in from `device` takes when `name` is already
+/// taken under this device's root, or `None` when it can keep its own.
+fn migrated_name(name: &str, device: &str, taken: &[String]) -> Option<String> {
+    let free = |candidate: &str| !taken.iter().any(|t| t == candidate);
+    if free(name) {
+        return None;
+    }
+    let base = format!("{name} ({device})");
+    if free(&base) {
+        return Some(base);
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|candidate| free(candidate))
 }
 
 impl Core {
@@ -260,6 +277,107 @@ impl Core {
         })
     }
 
+    /// Move every folder another device backs up into this machine's own
+    /// device, so this machine carries on backing them up as itself. The other
+    /// device stays registered, without those folders.
+    ///
+    /// Device roots all live on the main volume, so each folder is one
+    /// server-side move: nothing is downloaded or uploaded, and no quota is
+    /// used twice. A folder whose name is taken here keeps its content under
+    /// "<name> (<device>)". A failed folder does not stop the others, and a
+    /// second run picks up whatever is still left on the other device.
+    ///
+    /// Nothing is synced to this disk here. The moved folders are now this
+    /// device's, so the ordinary restore offers them. Only folders that were
+    /// already synced here from the other device are touched: their uid
+    /// survives the move but their share does not.
+    pub(crate) fn migrate_device(&self, uid: &str) -> CoreResult<String> {
+        let source = self.restore_source(Some(uid))?;
+        let target = self.ensure_device()?;
+        if source.uid == target.uid {
+            return Err(CoreError::invalid(format!(
+                "{} is this computer's own device",
+                source.name
+            )));
+        }
+        let bad_root = |d: &StoredDevice| {
+            parse_uid(&d.root_uid)
+                .ok_or_else(|| CoreError::internal(format!("bad device root uid: {}", d.root_uid)))
+        };
+        let (source_root, target_root) = (bad_root(&source)?, bad_root(&target)?);
+        if source_root.volume_id != target_root.volume_id {
+            return Err(CoreError::invalid(
+                "the two devices are on different Proton Drive volumes; copy it instead",
+            ));
+        }
+
+        let mut taken: Vec<String> = self
+            .device_root_nodes(&target_root)?
+            .into_iter()
+            .filter(|n| !n.trashed)
+            .map(|n| n.name)
+            .collect();
+        let synced = self
+            .db
+            .sync_folder_list()
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+
+        let mut moved = 0usize;
+        let mut renamed: Vec<String> = Vec::new();
+        let mut left: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for node in self.device_root_nodes(&source_root)? {
+            if node.trashed || node.name == PROFILE_DIR_NAME {
+                continue;
+            }
+            // A device root only ever holds folders (B68); anything else was
+            // put there by hand and is left for the user to deal with.
+            if !node.is_folder() {
+                left.push(node.name);
+                continue;
+            }
+            let new_name = migrated_name(&node.name, &source.name, &taken);
+            if let Err(e) = self.move_rename_remote(&node.uid, &target_root, new_name.as_deref()) {
+                warn!(name = %node.name, error = %e, "migrate: could not move folder");
+                failed.push(format!("{}: {e}", node.name));
+                continue;
+            }
+            let landed = new_name.clone().unwrap_or_else(|| node.name.clone());
+            if new_name.is_some() {
+                renamed.push(format!("{} -> {landed}", node.name));
+            }
+            taken.push(landed);
+            moved += 1;
+
+            let uid = node.uid.to_string();
+            for folder in synced.iter().filter(|f| f.remote_uid == uid) {
+                if let Err(e) = self.db.sync_folder_set_share(folder.id, &target.share_id) {
+                    warn!(id = folder.id, error = ?e, "migrate: could not re-point sync folder");
+                }
+                self.sync_now(Some(folder.id));
+            }
+        }
+        self.invalidate_children_of(&source_root);
+        self.invalidate_children_of(&target_root);
+
+        let mut message = format!("moved {moved} folder(s) from {}", source.name);
+        if !renamed.is_empty() {
+            message.push_str(&format!("; renamed: {}", renamed.join(", ")));
+        }
+        if !left.is_empty() {
+            message.push_str(&format!("; left behind: {}", left.join(", ")));
+        }
+        if !failed.is_empty() {
+            message.push_str(&format!("; failed: {}", failed.join(", ")));
+        }
+        info!(from = %source.name, to = %target.name, moved, failed = failed.len(),
+            "device migrated");
+        if moved == 0 && !failed.is_empty() {
+            return Err(CoreError::conflict(message));
+        }
+        Ok(message)
+    }
+
     // ---- device folder sync -------------------------
 
     /// Auto-register (or recover) this machine as a Proton Drive Device, caching
@@ -360,21 +478,25 @@ impl Core {
         root_uid: &NodeUid,
         name: &str,
     ) -> CoreResult<Option<NodeUid>> {
+        Ok(self
+            .device_root_nodes(root_uid)?
+            .into_iter()
+            .find(|n| n.is_folder() && !n.trashed && n.name == name)
+            .map(|n| n.uid))
+    }
+
+    /// Everything directly under a device root, trashed nodes included.
+    fn device_root_nodes(&self, root_uid: &NodeUid) -> CoreResult<Vec<Node>> {
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(root_uid))
             .map_err(|e| CoreError::from_api(&e, "list device root"))?;
         if uids.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        let nodes = self
-            .rt
+        self.rt
             .block_on(self.drive.enumerate_nodes(&uids))
-            .map_err(|e| CoreError::from_api(&e, "resolve device root children"))?;
-        Ok(nodes
-            .into_iter()
-            .find(|n| n.is_folder() && !n.trashed && n.name == name)
-            .map(|n| n.uid))
+            .map_err(|e| CoreError::from_api(&e, "resolve device root children"))
     }
 
     /// Add a local folder to this device's sync set: register the device if
@@ -1107,9 +1229,37 @@ mod tests {
     use pdfs_core::db::StoredSyncFolder;
 
     use super::{
-        ApplicableMountMode, commit_after_teardown, pending_intent_matches,
+        ApplicableMountMode, commit_after_teardown, migrated_name, pending_intent_matches,
         restore_snapshot_matches, select_mode_transition,
     };
+
+    #[test]
+    fn migrated_folder_keeps_its_name_when_it_is_free() {
+        let taken = vec!["Pictures".to_string()];
+        assert_eq!(migrated_name("Documents", "DESKTOP-1", &taken), None);
+    }
+
+    #[test]
+    fn migrated_folder_is_named_after_its_device_on_a_clash() {
+        let taken = vec!["Documents".to_string()];
+        assert_eq!(
+            migrated_name("Documents", "DESKTOP-1", &taken).as_deref(),
+            Some("Documents (DESKTOP-1)")
+        );
+    }
+
+    #[test]
+    fn migrated_folder_is_numbered_when_the_device_name_is_taken_too() {
+        let taken = vec![
+            "Documents".to_string(),
+            "Documents (DESKTOP-1)".to_string(),
+            "Documents (DESKTOP-1) 2".to_string(),
+        ];
+        assert_eq!(
+            migrated_name("Documents", "DESKTOP-1", &taken).as_deref(),
+            Some("Documents (DESKTOP-1) 3")
+        );
+    }
 
     #[test]
     fn unknown_mode_cannot_select_a_destructive_transition() {

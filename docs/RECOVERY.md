@@ -133,6 +133,29 @@ pdfs sync restore --device UID
 The folders stay part of the other computer's backup and sync in both directions. This machine
 does not take over that computer's backup.
 
+### Moving another computer's backup here
+
+To switch computers for good, for example from a Windows PC to this Linux machine, move the old
+computer's folders into this computer's backup instead. Use **Move to This Computer…** on that
+computer's row, or:
+
+```bash
+pdfs devices list                 # find the old computer's UID
+pdfs devices migrate UID
+```
+
+Each folder moves on Proton Drive itself, so nothing is uploaded again and no storage is used
+twice. A folder whose name this computer already uses gets the old computer's name added, for
+example `Documents (DESKTOP-1)`. The restore picker then opens, as in
+[Step 3](#step-3-restore-the-folders), so you choose where each folder goes here.
+
+The old computer stays in your account, without those folders. Unlike
+[adoption](#step-2-continue-the-old-computers-backup), this machine keeps its own name and backup.
+
+> [!WARNING]
+> Stop Proton Drive on the old computer first. A client still running there sees its folders
+> disappear, and may upload them again as new.
+
 ## 3. How the restore works
 
 This section is for the curious and for anyone debugging a restore.
