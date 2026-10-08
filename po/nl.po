@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-08 10:15+0200\n"
+"POT-Creation-Date: 2026-10-08 18:47+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Dutch\n"
@@ -272,8 +272,9 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/locations.rs:1013
 #: crates/pdfs-gui/src/app/pages/locations.rs:1488
 #: crates/pdfs-gui/src/app/pages/locations.rs:1538
-#: crates/pdfs-gui/src/app/pages/login.rs:393
-#: crates/pdfs-gui/src/app/pages/login.rs:507
+#: crates/pdfs-gui/src/app/pages/login.rs:389
+#: crates/pdfs-gui/src/app/pages/login.rs:503
+#: crates/pdfs-gui/src/app/pages/login.rs:549
 #: crates/pdfs-gui/src/app/pages/photos.rs:2055
 #: crates/pdfs-gui/src/app/pages/shared.rs:946
 #: crates/pdfs-gui/src/app/pages/shared.rs:1027
@@ -3186,37 +3187,26 @@ msgstr "Voer je e-mailadres en wachtwoord in."
 msgid "Signing in…"
 msgstr "Aanmelden…"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:164
+#: crates/pdfs-gui/src/app/pages/login.rs:160
 msgid "Complete the verification to continue…"
 msgstr "Voltooi de verificatie om verder te gaan…"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:197
+#: crates/pdfs-gui/src/app/pages/login.rs:195
 msgid "login cancelled"
 msgstr "aanmelden geannuleerd"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:210
-msgid ""
-"The verification page couldn't be opened, so the sign-in was cancelled. Your "
-"system may keep the web view's sandbox from starting; the troubleshooting "
-"guide explains what to do."
-msgstr ""
-"De verificatiepagina kon niet worden geopend, dus het aanmelden is "
-"geannuleerd. Mogelijk verhindert je systeem dat de sandbox van de "
-"webweergave start; de handleiding voor probleemoplossing legt uit wat je "
-"kunt doen."
-
-#: crates/pdfs-gui/src/app/pages/login.rs:233
+#: crates/pdfs-gui/src/app/pages/login.rs:228
 msgid "Too many sign-in attempts. Wait a few minutes and try again."
 msgstr ""
 "Te veel aanmeldpogingen. Wacht een paar minuten en probeer het opnieuw."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:239
+#: crates/pdfs-gui/src/app/pages/login.rs:234
 msgid "Couldn't reach Proton. Check your internet connection and try again."
 msgstr ""
 "Kon Proton niet bereiken. Controleer je internetverbinding en probeer het "
 "opnieuw."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:242
+#: crates/pdfs-gui/src/app/pages/login.rs:237
 msgid ""
 "Signed in, but the session couldn't be saved to the system keyring. Make "
 "sure a keyring (GNOME Keyring or KWallet) is running and unlocked."
@@ -3225,19 +3215,19 @@ msgstr ""
 "opgeslagen. Zorg dat een sleutelbos (GNOME Keyring of KWallet) actief en "
 "ontgrendeld is."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:245
+#: crates/pdfs-gui/src/app/pages/login.rs:240
 msgid "Sign-in cancelled: no two-factor code was entered."
 msgstr "Aanmelden geannuleerd: er is geen tweestapscode ingevoerd."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:248
+#: crates/pdfs-gui/src/app/pages/login.rs:243
 msgid "Sign-in cancelled: no mailbox password was entered."
 msgstr "Aanmelden geannuleerd: er is geen mailboxwachtwoord ingevoerd."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:251
+#: crates/pdfs-gui/src/app/pages/login.rs:246
 msgid "That mailbox password didn't unlock your account."
 msgstr "Dat mailboxwachtwoord heeft je account niet ontgrendeld."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:254
+#: crates/pdfs-gui/src/app/pages/login.rs:249
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "
 "new one."
@@ -3246,36 +3236,36 @@ msgstr ""
 "om een nieuwe te krijgen."
 
 #. Translators: {error} is an error message, usually in English.
-#: crates/pdfs-gui/src/app/pages/login.rs:259
+#: crates/pdfs-gui/src/app/pages/login.rs:254
 #, rust-format
 msgid "Sign-in failed: {error}"
 msgstr "Aanmelden mislukt: {error}"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:369
+#: crates/pdfs-gui/src/app/pages/login.rs:365
 msgid "That mailbox password didn't unlock your account. Try again."
 msgstr ""
 "Dat mailboxwachtwoord heeft je account niet ontgrendeld. Probeer het opnieuw."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:371
+#: crates/pdfs-gui/src/app/pages/login.rs:367
 msgid ""
 "This account has a separate mailbox password. Enter it to unlock your files."
 msgstr ""
 "Dit account heeft een apart mailboxwachtwoord. Voer het in om je bestanden "
 "te ontgrendelen."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:374
+#: crates/pdfs-gui/src/app/pages/login.rs:370
 msgid "Mailbox Password"
 msgstr "Mailboxwachtwoord"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:380
+#: crates/pdfs-gui/src/app/pages/login.rs:376
 msgid "Mailbox password"
 msgstr "Mailboxwachtwoord"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:384
+#: crates/pdfs-gui/src/app/pages/login.rs:380
 msgid "Keep unlocked on this computer"
 msgstr "Ontgrendeld houden op deze computer"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:386
+#: crates/pdfs-gui/src/app/pages/login.rs:382
 msgid ""
 "Stores the unlock in the system keyring, so Proton Drive opens without "
 "asking after every login. Otherwise you enter the password once per session."
@@ -3284,47 +3274,68 @@ msgstr ""
 "Drive na elke aanmelding opent zonder te vragen. Anders voer je het "
 "wachtwoord één keer per sessie in."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:394
-#: crates/pdfs-gui/src/app/pages/login.rs:447
+#: crates/pdfs-gui/src/app/pages/login.rs:390
+#: crates/pdfs-gui/src/app/pages/login.rs:443
 msgid "Unlock"
 msgstr "Ontgrendelen"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:446
+#: crates/pdfs-gui/src/app/pages/login.rs:442
 msgid "Proton Drive is locked. Enter your mailbox password to unlock it."
 msgstr ""
 "Proton Drive is vergrendeld. Voer je mailboxwachtwoord in om het te "
 "ontgrendelen."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:475
+#: crates/pdfs-gui/src/app/pages/login.rs:471
 msgid "Unlocked."
 msgstr "Ontgrendeld."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:480
+#: crates/pdfs-gui/src/app/pages/login.rs:476
 msgid "Couldn't unlock"
 msgstr "Ontgrendelen mislukt"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:493
+#: crates/pdfs-gui/src/app/pages/login.rs:489
 msgid "Two-Factor Authentication"
 msgstr "Tweestapsverificatie"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:495
+#: crates/pdfs-gui/src/app/pages/login.rs:491
 msgid ""
 "Enter the code from your authenticator app, or one of your recovery codes."
 msgstr "Voer de code uit je authenticator-app in, of een van je herstelcodes."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:501
+#: crates/pdfs-gui/src/app/pages/login.rs:497
 msgid "Authentication code"
 msgstr "Verificatiecode"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:508
+#: crates/pdfs-gui/src/app/pages/login.rs:504
 msgid "Confirm"
 msgstr "Bevestigen"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:536
+#: crates/pdfs-gui/src/app/pages/login.rs:535
+#
+msgid "Verify in Your Browser"
+msgstr "Verifiëren in je browser"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:537
+msgid ""
+"The verification page can't be shown in the app on this system. Open it in "
+"your browser, complete it there, then come back and choose Continue."
+msgstr "De verificatiepagina kan op dit systeem niet in de app worden getoond. Open hem in je browser, voltooi hem daar, kom dan terug en kies “Doorgaan”."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:543
+#
+msgid "Open Verification Page"
+msgstr "Verificatiepagina openen"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:550
+#
+msgid "Continue"
+msgstr "Doorgaan"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:589
 msgid "Sign Out?"
 msgstr "Afmelden?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:538
+#: crates/pdfs-gui/src/app/pages/login.rs:591
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
@@ -3333,7 +3344,7 @@ msgstr ""
 "je opnieuw aanmeldt. Bestanden die al op deze computer staan, blijven waar "
 "ze zijn."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:540
+#: crates/pdfs-gui/src/app/pages/login.rs:593
 msgid "Sign Out"
 msgstr "Afmelden"
 
@@ -6105,6 +6116,16 @@ msgstr "{count}j"
 #, rust-format
 msgid "cannot reach the Proton Drive daemon: {error}"
 msgstr "kan de achtergronddienst van Proton Drive niet bereiken: {error}"
+
+#~ msgid ""
+#~ "The verification page couldn't be opened, so the sign-in was cancelled. "
+#~ "Your system may keep the web view's sandbox from starting; the "
+#~ "troubleshooting guide explains what to do."
+#~ msgstr ""
+#~ "De verificatiepagina kon niet worden geopend, dus het aanmelden is "
+#~ "geannuleerd. Mogelijk verhindert je systeem dat de sandbox van de "
+#~ "webweergave start; de handleiding voor probleemoplossing legt uit wat je "
+#~ "kunt doen."
 
 #~ msgid "Jump to a month"
 #~ msgstr "Naar een maand springen"

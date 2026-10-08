@@ -206,6 +206,44 @@ pub async fn login_interactive(
     }
 }
 
+/// Proton's verification page for the user's own browser, for a front-end that
+/// cannot host it in a webview.
+///
+/// Unlike [`HumanVerification::verification_url`] this asks for the full page,
+/// not the embedded one: a browser tab has no host to post the token to, so the
+/// page has to tell the user they are done instead. Proton Mail Bridge opens the
+/// same URL.
+pub fn browser_verification_url(hv: &HumanVerification) -> String {
+    let token: String = hv
+        .token
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!(
+        "https://verify.proton.me/?methods={}&token={token}",
+        hv.methods.join(","),
+    )
+}
+
+/// The credential to retry with once the user has solved the challenge in
+/// their browser.
+///
+/// The browser keeps the page's own token, so the retry carries the challenge
+/// token instead: solving the page marks that token as verified on Proton's
+/// side. The type is every offered method, as Proton Mail Bridge sends it, since
+/// the user may have picked any of them on the page.
+pub fn browser_verified(hv: &HumanVerification) -> HumanVerificationCredential {
+    HumanVerificationCredential {
+        token: hv.token.clone(),
+        method: hv.methods.join(","),
+    }
+}
+
 /// [`login`], replaying a human-verification token the user has already earned.
 ///
 /// A gated login fails with [`Error::HumanVerificationRequired`] carrying the
@@ -672,6 +710,30 @@ mod tests {
             r#"{{"session_id":"s","username":"u","user_id":"i","access_token":"a",
             "refresh_token":"r","scopes":[],"password_mode":2{extra}}}"#
         )
+    }
+
+    fn challenge() -> HumanVerification {
+        serde_json::from_str(
+            r#"{"HumanVerificationToken":"ab+c/d=","HumanVerificationMethods":["captcha","email"]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_browser_gets_the_full_verification_page() {
+        assert_eq!(
+            browser_verification_url(&challenge()),
+            "https://verify.proton.me/?methods=captcha,email&token=ab%2Bc%2Fd%3D"
+        );
+    }
+
+    /// The browser keeps the page's token, so the retry replays the challenge
+    /// itself, typed with every method the page offered.
+    #[test]
+    fn a_browser_verification_retries_with_the_challenge_token() {
+        let credential = browser_verified(&challenge());
+        assert_eq!(credential.token, "ab+c/d=");
+        assert_eq!(credential.method, "captcha,email");
     }
 
     #[test]

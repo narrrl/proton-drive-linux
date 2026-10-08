@@ -69,14 +69,16 @@ pdfs status
 ## Signing in
 
 **"Proton is asking for a CAPTCHA"** — Proton wants human verification, usually on a VPN or an
-unfamiliar network. The CLI cannot show it. Sign in with `pdfs-app`, which displays the challenge;
-the stored session then works for the CLI too.
+unfamiliar network. `pdfs login` prints the verification page's address: open it in your browser,
+complete it, then press Enter. The app shows the page in its own window.
 
-**"The verification page couldn't be opened"** — WebKit, which shows the CAPTCHA page, could not
-start its sandbox. Hardened systems such as secureblue keep its bubblewrap from the journal socket,
-and the log then shows `bwrap: Can't get type of source /run/systemd/journal/socket: Permission
-denied` and `Failed to fully launch dbus-proxy`. Check that `bwrap` and `xdg-dbus-proxy` are
-installed. If they are, sign in once with the sandbox switched off for this one run:
+**"Verify in Your Browser"** — WebKit, which shows the CAPTCHA page in the app, could not start
+its sandbox. Hardened systems such as secureblue keep its bubblewrap from the journal socket, and
+the log then shows `bwrap: Can't get type of source /run/systemd/journal/socket: Permission
+denied` and `Failed to fully launch dbus-proxy`. Choose **Open Verification Page**, complete the
+page in your browser, then choose **Continue**. If that sign-in is refused too, check that `bwrap`
+and `xdg-dbus-proxy` are installed. As a last resort, sign in once with the sandbox switched off
+for this one run:
 
 ```bash
 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 pdfs-app

@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **A CAPTCHA could not be solved on hardened systems.** When the verification page cannot open in
+  the app, as on secureblue, the app now offers it in your browser and continues the sign-in
+  once you are done. `pdfs login` now handles a CAPTCHA the same way instead of failing.
+  ([#29](https://github.com/narrrl/proton-drive-linux/issues/29))
+
 ## [3.1.2] — 2026-10-08
 
 Schema: **42**, unchanged.

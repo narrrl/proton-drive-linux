@@ -1,5 +1,5 @@
 use crate::*;
-use pdfs_core::proton_sdk::api::HumanVerificationCredential;
+use pdfs_core::proton_sdk::api::{HumanVerification, HumanVerificationCredential};
 
 pub(crate) struct LoginState {
     // Login page.
@@ -150,26 +150,24 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
         });
 
         // Same shape for human verification: only fires when the API gates the
-        // sign-in, and the worker is blocked on the token until it does. A
-        // window that never came up is told apart from one the user closed, so
-        // the result below can say why the sign-in stopped.
+        // sign-in, and the worker is blocked on the credential until it does.
         let ui_hv = ui.clone();
-        let verification_failed = Rc::new(Cell::new(false));
-        let hv_failed = verification_failed.clone();
         glib::spawn_future_local(async move {
-            if let Ok((url, token_tx)) = hv_req_rx.recv().await {
+            if let Ok((hv, credential_tx)) = hv_req_rx.recv().await {
                 ui_hv
                     .login
                     .login_status
                     .set_text(&gettext("Complete the verification to continue…"));
-                // Anything but a token drops the sender, which the worker reads
-                // as a cancelled sign-in.
-                match verify_human(url).await {
+                // Anything but a credential drops the sender, which the worker
+                // reads as a cancelled sign-in.
+                match verify_human(hv.verification_url()).await {
                     Verification::Solved(token) => {
-                        let _ = token_tx.send(token);
+                        let _ = credential_tx.send(HumanVerificationCredential::captcha(token));
                     }
                     Verification::Cancelled => {}
-                    Verification::Failed => hv_failed.set(true),
+                    // The web view could not start, most likely its sandbox
+                    // (B195): the user's browser can show the page instead.
+                    Verification::Failed => verify_in_browser(&ui_hv, &hv, credential_tx),
                 }
             }
         });
@@ -206,9 +204,6 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     let _ = gio::spawn_blocking(service::enable_start).await;
                     refresh(&ui);
                 }
-                Err(_) if verification_failed.get() => ui.login.login_status.set_text(&gettext(
-                    "The verification page couldn't be opened, so the sign-in was cancelled. Your system may keep the web view's sandbox from starting; the troubleshooting guide explains what to do.",
-                )),
                 Err(e) => ui.login.login_status.set_text(&e),
             }
         });
@@ -267,9 +262,12 @@ pub(crate) struct LoginChannels {
     pub(crate) result: async_channel::Receiver<Result<(), String>>,
     /// Fires only if the account needs a 2FA code; carries the sender for it.
     pub(crate) totp: async_channel::Receiver<std::sync::mpsc::Sender<String>>,
-    /// Fires only if the sign-in is gated: the page to show, and the sender for
-    /// the token the user earns on it.
-    pub(crate) hv: async_channel::Receiver<(String, std::sync::mpsc::Sender<String>)>,
+    /// Fires only if the sign-in is gated: the challenge, and the sender for the
+    /// credential the user earns by solving it.
+    pub(crate) hv: async_channel::Receiver<(
+        HumanVerification,
+        std::sync::mpsc::Sender<HumanVerificationCredential>,
+    )>,
     /// Fires only for a two-password account: how many answers were already
     /// wrong, and the sender for the password and the "remember" choice.
     pub(crate) mailbox: async_channel::Receiver<(u32, std::sync::mpsc::Sender<(String, bool)>)>,
@@ -327,18 +325,16 @@ pub(crate) fn spawn_login(username: String, password: String) -> LoginChannels {
                     })
                 },
                 |hv| {
-                    // Gated: hand the UI the page to show, block on the token the
-                    // user earns by solving it.
-                    let (token_tx, token_rx) = std::sync::mpsc::channel::<String>();
-                    hv_req_tx
-                        .send_blocking((hv.verification_url(), token_tx))
-                        .map_err(|_| {
-                            pdfs_core::Error::Other("verification prompt closed".into())
-                        })?;
-                    let token = token_rx
+                    // Gated: hand the UI the challenge, block on the credential
+                    // the user earns by solving it.
+                    let (credential_tx, credential_rx) =
+                        std::sync::mpsc::channel::<HumanVerificationCredential>();
+                    hv_req_tx.send_blocking((hv, credential_tx)).map_err(|_| {
+                        pdfs_core::Error::Other("verification prompt closed".into())
+                    })?;
+                    credential_rx
                         .recv()
-                        .map_err(|_| pdfs_core::Error::Other("verification cancelled".into()))?;
-                    Ok(HumanVerificationCredential::captcha(token))
+                        .map_err(|_| pdfs_core::Error::Other("verification cancelled".into()))
                 },
             )
             .await
@@ -518,6 +514,63 @@ pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) 
             && resp == "confirm"
         {
             let _ = tx.send(entry.text().trim().to_string());
+        }
+    });
+
+    let parent = ui.login.login_button.root().and_downcast::<gtk4::Window>();
+    dialog.present(parent.as_ref());
+}
+
+/// Let the user solve the challenge in their own browser, for when the
+/// verification window could not come up. The page cannot hand its token back
+/// to us, so the user says when they are done, and the retry carries the
+/// challenge token, which the solved page made good (see
+/// [`auth::browser_verified`]).
+fn verify_in_browser(
+    ui: &Rc<Ui>,
+    hv: &HumanVerification,
+    credential_tx: std::sync::mpsc::Sender<HumanVerificationCredential>,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Verify in Your Browser"))
+        .body(gettext(
+            "The verification page can't be shown in the app on this system. Open it in your browser, complete it there, then come back and choose Continue.",
+        ))
+        .build();
+
+    let url = auth::browser_verification_url(hv);
+    let open = gtk4::Button::builder()
+        .label(gettext("Open Verification Page"))
+        .halign(gtk4::Align::Center)
+        .build();
+    open.add_css_class("pill");
+    dialog.set_extra_child(Some(&open));
+
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("continue", &gettext("Continue"));
+    dialog.set_response_appearance("continue", adw::ResponseAppearance::Suggested);
+    // Continuing before the page was even opened would only fail the retry.
+    dialog.set_response_enabled("continue", false);
+    dialog.set_default_response(Some("continue"));
+    dialog.set_close_response("cancel");
+
+    let dialog_weak = dialog.downgrade();
+    open.connect_clicked(move |_| {
+        open_uri(&url);
+        if let Some(dialog) = dialog_weak.upgrade() {
+            dialog.set_response_enabled("continue", true);
+        }
+    });
+
+    let credential = auth::browser_verified(hv);
+    let credential_tx = RefCell::new(Some(credential_tx));
+    dialog.connect_response(None, move |_, resp| {
+        // On cancel/close we take + drop `tx` without sending, so the worker's
+        // recv errors out and the login is reported as cancelled.
+        if let Some(tx) = credential_tx.borrow_mut().take()
+            && resp == "continue"
+        {
+            let _ = tx.send(credential.clone());
         }
     });
 
