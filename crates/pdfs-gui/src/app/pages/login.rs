@@ -150,15 +150,27 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
         });
 
         // Same shape for human verification: only fires when the API gates the
-        // sign-in, and the worker is blocked on the token until it does.
+        // sign-in, and the worker is blocked on the token until it does. A
+        // window that never came up is told apart from one the user closed, so
+        // the result below can say why the sign-in stopped.
         let ui_hv = ui.clone();
+        let verification_failed = Rc::new(Cell::new(false));
+        let hv_failed = verification_failed.clone();
         glib::spawn_future_local(async move {
             if let Ok((url, token_tx)) = hv_req_rx.recv().await {
                 ui_hv
                     .login
                     .login_status
                     .set_text(&gettext("Complete the verification to continue…"));
-                prompt_human_verification(&ui_hv, &url, token_tx);
+                // Anything but a token drops the sender, which the worker reads
+                // as a cancelled sign-in.
+                match verify_human(url).await {
+                    Verification::Solved(token) => {
+                        let _ = token_tx.send(token);
+                    }
+                    Verification::Cancelled => {}
+                    Verification::Failed => hv_failed.set(true),
+                }
             }
         });
 
@@ -194,6 +206,9 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     let _ = gio::spawn_blocking(service::enable_start).await;
                     refresh(&ui);
                 }
+                Err(_) if verification_failed.get() => ui.login.login_status.set_text(&gettext(
+                    "The verification page couldn't be opened, so the sign-in was cancelled. Your system may keep the web view's sandbox from starting; the troubleshooting guide explains what to do.",
+                )),
                 Err(e) => ui.login.login_status.set_text(&e),
             }
         });

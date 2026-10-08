@@ -202,12 +202,20 @@ impl Ui {
 }
 
 fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let verify = std::env::args().nth(1).as_deref() == Some(VERIFY_ARG);
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    );
+    // The verification window's stdout carries its token back to the app.
+    if verify {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
     i18n::init();
+    if verify {
+        return run_verification_window();
+    }
 
     // The tray launches the app with arguments ("--page locations",
     // "--confirm-stop"), which a running instance must receive too.

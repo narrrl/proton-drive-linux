@@ -12,6 +12,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 ## [Unreleased]
 
 ### Fixed
+- **The app crashed when Proton asked for a CAPTCHA on hardened systems.** On secureblue, WebKit
+  cannot start the sandbox for the verification page and ends its process, which took the app
+  down with it. The page now opens in a separate window process: if that process fails, the
+  sign-in stops with a message that says why, and TROUBLESHOOTING.md has a workaround.
+  ([#29](https://github.com/narrrl/proton-drive-linux/issues/29))
 - **On a fresh install the tray icon did not start.** The tray and the app now create their state
   directory themselves instead of waiting for the service to do it. This also lets the Takeout
   page remember staged archives before the first mount.

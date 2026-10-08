@@ -72,6 +72,20 @@ pdfs status
 unfamiliar network. The CLI cannot show it. Sign in with `pdfs-app`, which displays the challenge;
 the stored session then works for the CLI too.
 
+**"The verification page couldn't be opened"** — WebKit, which shows the CAPTCHA page, could not
+start its sandbox. Hardened systems such as secureblue keep its bubblewrap from the journal socket,
+and the log then shows `bwrap: Can't get type of source /run/systemd/journal/socket: Permission
+denied` and `Failed to fully launch dbus-proxy`. Check that `bwrap` and `xdg-dbus-proxy` are
+installed. If they are, sign in once with the sandbox switched off for this one run:
+
+```bash
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 pdfs-app
+```
+
+Quit the app first, so this starts a new instance. The page then runs without WebKit's isolation,
+so use this only for the sign-in. The stored session keeps working without it. Signing in from
+your usual network, without a VPN, often avoids the CAPTCHA in the first place.
+
 **Sign-in works but is forgotten after a restart** — no Secret Service provider is running, or its
 keyring is locked. Install and unlock GNOME Keyring, KWallet or KeePassXC (with Secret Service
 enabled). `pdfs diagnose` shows `keyring session` as failing in that case.
