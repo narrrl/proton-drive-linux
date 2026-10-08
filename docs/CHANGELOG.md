@@ -11,6 +11,20 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **One unreadable folder stopped a synced folder from syncing at all.** A folder you may not
+  read, such as a cache a container created, failed every pass, so nothing else in the synced
+  folder reached Drive. Such a folder is now left out and named once in the activity feed, and
+  everything around it syncs. A file deleted during a scan, and a name that is not UTF-8, no
+  longer fail the pass either.
+  ([#33](https://github.com/narrrl/proton-drive-linux/issues/33))
+- **Switching a folder to online-only could delete files that were never on Drive.** Ignored
+  folders such as `.git/`, symlinks, unreadable folders and files changed after the last sync were
+  deleted with the local copy. The switch now refuses and names what is only on this computer.
+- **Switching to online-only trashed synced files that had become ignored.** Adding a synced path
+  to `.pdfsignore` and then switching moved it to the Drive trash. Ignoring never deletes now, as
+  the user guide says.
+
 ## [3.1.2] — 2026-10-08
 
 Schema: **42**, unchanged.
