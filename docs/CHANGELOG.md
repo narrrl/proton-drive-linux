@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.1.2] — 2026-10-08
+
+Schema: **42**, unchanged.
+
 ### Fixed
 - **The app crashed when Proton asked for a CAPTCHA on hardened systems.** On secureblue, WebKit
   cannot start the sandbox for the verification page and ends its process, which took the app
@@ -1660,6 +1664,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[3.1.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.1.2
 
 [3.1.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.1.1
 
