@@ -11,6 +11,21 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.1.1] — 2026-10-07
+
+Schema: **42**, unchanged.
+
+### Changed
+- **The client identifies itself with its release.** Sign-in and every API call used to send the
+  fixed `external-drive-linux@0.1.0-alpha` and `proton-drive-linux/0.1.0`. If Proton retired that
+  version, every release would fail to sign in at once and no update could fix it. The client now
+  sends `external-drive-linux@<version>-stable` and `proton-drive-linux/<version>`. `app_version`
+  and `user_agent` in `config.json` are optional overrides now. The fixed values that releases up
+  to 3.1.0 wrote there count as unset and are removed on the next save. A value you set by hand is
+  kept.
+- The About dialog shows the release version, and its debug info shows the identity that is
+  actually sent.
+
 ## [3.1.0] — 2026-10-07
 
 Schema: **42**, unchanged.
@@ -1634,6 +1649,10 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[3.1.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.1.1
+
+[3.1.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.1.0
 
 [3.0.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.0.0
 
