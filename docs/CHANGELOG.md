@@ -11,6 +11,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **Move another computer's backup to this one.** **Move to This Computer…** on the Computers page,
+  or `pdfs devices migrate UID`, moves every folder another computer backs up, for example an old
+  Windows PC, into this computer's backup on Proton Drive. Then it offers them for syncing here. The
+  folders move on Proton Drive itself, so nothing is uploaded again. The other computer stays in the
+  account, without those folders.
+
 ## [3.1.2] — 2026-10-08
 
 Schema: **42**, unchanged.

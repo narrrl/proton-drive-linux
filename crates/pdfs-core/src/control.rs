@@ -446,6 +446,13 @@ pub enum Request {
     /// of registering a duplicate. `uid: None` clears the pin.
     /// Replies with [`Response::Ok`].
     AdoptDevice { uid: Option<String> },
+    /// Move every folder another device backs up into this machine's own
+    /// device, as server-side moves on the main volume. The other device stays
+    /// registered, without those folders. Sync folders here that already track
+    /// one of them follow it to its new share. Nothing is downloaded: the moved
+    /// folders are then offered by [`Request::ListRestorableFolders`].
+    /// Replies with [`Response::Ok`].
+    MigrateDevice { uid: String },
 
     // ---- device folder sync ----------------------------------
     /// Add a local folder to this machine's device, uploading its tree and
@@ -3082,6 +3089,9 @@ mod tests {
                 uid: Some("dev-1".into()),
             },
             Request::AdoptDevice { uid: None },
+            Request::MigrateDevice {
+                uid: "dev-2".into(),
+            },
             Request::ListRestorableFolders,
             Request::RestoreSyncFolders {
                 items: vec![RestoreItem {
