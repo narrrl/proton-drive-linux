@@ -22,6 +22,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -702,7 +704,20 @@ static TOKEN_SINKS: parking_lot::Mutex<BTreeMap<String, Arc<TokenSink>>> =
 struct TokenSink {
     session_id: String,
     state: parking_lot::Mutex<SinkState>,
+    /// Whether a thread is retrying a write the keyring refused.
+    retrying: AtomicBool,
 }
+
+/// How long to wait before each new try at a write the keyring refused; the
+/// last delay repeats until it succeeds. A locked or restarting keyring
+/// usually comes back within seconds, and one that does not must not be asked
+/// in a tight loop.
+const KEYRING_RETRY: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(300),
+];
 
 struct SinkState {
     /// The refresh token the blob holds for this session, as far as this
@@ -745,13 +760,59 @@ impl TokenSink {
                 stored_refresh,
                 unsaved: None,
             }),
+            retrying: AtomicBool::new(false),
         }
     }
 
-    /// Take a new rotation and try to write it.
-    fn rotated(&self, tokens: Tokens) -> Result<()> {
+    /// Take a new rotation and try to write it. If the keyring refuses, keep
+    /// trying in the background: until then the only live refresh token is in
+    /// memory, and a stop that cannot write it either loses the session
+    /// (`docs/BUGS.md` B61).
+    fn rotated(self: &Arc<Self>, tokens: Tokens) -> Result<()> {
         self.state.lock().unsaved = Some(tokens);
-        self.flush()
+        let written = self.flush();
+        if written.is_err() {
+            self.retry_in_background();
+        }
+        written
+    }
+
+    /// Retry the unsaved rotation on [`KEYRING_RETRY`] until it is written or
+    /// has nowhere left to go. One thread per sink; a newer rotation simply
+    /// replaces what it is retrying.
+    fn retry_in_background(self: &Arc<Self>) {
+        if self.retrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sink = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-keyring-retry".into())
+            .spawn(move || {
+                loop {
+                    let delays = KEYRING_RETRY
+                        .into_iter()
+                        .chain(std::iter::repeat(KEYRING_RETRY[KEYRING_RETRY.len() - 1]));
+                    for delay in delays {
+                        std::thread::sleep(delay);
+                        match sink.flush() {
+                            Ok(()) => break,
+                            Err(e) => tracing::debug!(error = %e, ?delay, "keyring still refuses"),
+                        }
+                    }
+                    sink.retrying.store(false, Ordering::SeqCst);
+                    // A rotation refused after the last try succeeded found
+                    // this thread still running, and started none of its own.
+                    if sink.state.lock().unsaved.is_none()
+                        || sink.retrying.swap(true, Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            self.retrying.store(false, Ordering::SeqCst);
+            tracing::error!(error = %e, "could not start retrying the keyring write");
+        }
     }
 
     /// Write the unsaved rotation, if there is one. A blob that moved on, or
@@ -806,7 +867,11 @@ fn register_refresh_handler(session: &ProtonApiSession, stored_refresh: String) 
         .insert(session_id.to_owned(), Arc::clone(&sink));
     session.http().set_on_tokens_refreshed(move |tokens| {
         if let Err(e) = sink.rotated(tokens) {
-            tracing::warn!(error = %e, "failed to auto-persist refreshed tokens in keyring")
+            tracing::error!(
+                error = %e,
+                "the keyring refused the refreshed session tokens; retrying. \
+                 If the daemon stops first, the next start needs `pdfs login`"
+            )
         }
     });
 }
@@ -946,27 +1011,32 @@ mod tests {
         assert_eq!(stored.refresh_token, "r");
     }
 
-    /// The only test that touches the keyring, through `keyring-core`'s
-    /// in-memory store.
+    /// The keyring is one store per process, so the tests that use it,
+    /// through `keyring-core`'s in-memory store, take turns.
+    fn mock_keyring() -> parking_lot::MutexGuard<'static, ()> {
+        static KEYRING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let turn = KEYRING.lock();
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        turn
+    }
+
+    fn stored_with(refresh: &str) -> StoredSession {
+        serde_json::from_str(&blob("").replace(r#""r""#, &format!("{refresh:?}"))).unwrap()
+    }
+
     #[test]
     fn a_sink_keeps_writing_its_own_rotations_and_stops_at_a_new_login() {
-        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        let stored = |refresh: &str| {
-            serde_json::from_str::<StoredSession>(
-                &blob("").replace(r#""r""#, &format!("{refresh:?}")),
-            )
-            .unwrap()
-        };
-        write_stored(&stored("r")).unwrap();
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
 
-        let sink = TokenSink::new("s", "r".into());
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
         sink.rotated(tokens("a2", "r2")).unwrap();
         sink.rotated(tokens("a3", "r3")).unwrap();
         assert_eq!(load().unwrap().refresh_token, "r3");
 
         // A new login replaces the blob; the old session's next rotation, and
         // its stop, leave it alone.
-        let mut login = stored("fresh");
+        let mut login = stored_with("fresh");
         login.session_id = "new".into();
         write_stored(&login).unwrap();
         sink.rotated(tokens("a4", "r4")).unwrap();
@@ -974,5 +1044,33 @@ mod tests {
         let now = load().unwrap();
         assert_eq!(now.session_id, "new");
         assert_eq!(now.refresh_token, "fresh");
+    }
+
+    /// B61: a rotation the keyring refused lived only in memory.
+    #[test]
+    fn a_rotation_the_keyring_refused_is_written_once_it_takes_it() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
+
+        let entry = keyring_entry().unwrap();
+        let cred = entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap();
+        cred.set_error(keyring_core::Error::NoStorageAccess(
+            std::io::Error::other("locked").into(),
+        ));
+        assert!(sink.rotated(tokens("a2", "r2")).is_err());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while load().unwrap().refresh_token != "r2" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry never wrote the rotation"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sink.state.lock().unsaved.is_none());
     }
 }

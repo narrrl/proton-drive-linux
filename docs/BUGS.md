@@ -73,7 +73,6 @@ original wording.
 | [B67](#b67--fresh-state-restore-can-silently-select-a-new-device-high-22) | Fresh-state restore can silently select a new device (HIGH-22) | An ambiguous device after a loss of local state is not asked about |
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) | No shutdown protection and no `pdfs sync flush` |
 | [B65](#b65--release-artifacts-lack-supply-chain-verification-med-11) | Release artifacts lack supply-chain verification (MED-11) | No SBOM, provenance or checksums |
-| [B61](#b61--rotated-single-use-credentials-can-be-lost-high-18) | Rotated single-use credentials can be lost (HIGH-18) | Keyring write failures are only logged |
 | [B15](#b15--an-empty-but-listed-folder-and-duplicated-folder-uids) | An empty-but-`listed` folder, and duplicated folder uids | Cause not attributed |
 | [B10](#b10--glib-critical-when-the-launcher-closes-over-an-in-flight-open) | GLib critical when the launcher closes over an in-flight open |  |
 
@@ -88,6 +87,7 @@ original wording.
 | [B68](#b68--profile-backup-cannot-be-written-to-the-device-root) | Profile backup cannot be written to the device root | Backup health is not shown in the app; the restore was not re-run |
 | [B64](#b64--stable-publishing-lacks-data-safety-and-recovery-gates-crit-12) | Stable publishing lacks data-safety and recovery gates (CRIT-12) | Recovery approval before a release |
 | [B63](#b63--release-version-identity-is-inconsistent-and-unenforced-high-20) | Release version identity is inconsistent and unenforced (HIGH-20) | Protocol version identity |
+| [B61](#b61--rotated-single-use-credentials-can-be-lost-high-18) | Rotated single-use credentials can be lost (HIGH-18) | A crash or SIGKILL before a retried write lands still loses it; the GUI is not told |
 | [B57](#b57--event-cursor-can-advance-past-unapplied-state-high-14) | Event cursor can advance past unapplied state (HIGH-14) | Database and apply fault tests |
 | [B56](#b56--database-schema-version-parsing-fails-open-high-13) | Database schema version parsing fails open (HIGH-13) | Malformed schema versions |
 | [B12](#b12--cold-enumeration-is-slow-per-entry-and-goes-superlinear-past-500) | Cold enumeration is slow per entry, and goes superlinear past ~500 | The attribute-invalidation follow-up is unverified |
@@ -4921,7 +4921,8 @@ daemon/tray/FUSE, upgrade, rollback, and uninstall without deleting user state.
 
 ### B61 — Rotated single-use credentials can be lost (HIGH-18)
 
-**Status:** Open — 1.0 authentication/recovery blocker
+**Status:** Partly fixed. A process that dies before a retried write lands still loses the
+rotation, and only the log says so.
 **Found:** 2026-07-22, 1.0 authentication audit
 **Where:** `crates/pdfs-core/src/auth.rs`, refresh callback
 
@@ -4932,6 +4933,15 @@ keyring retains an invalid single-use refresh token, so restart loses login.
 **Required fix/test:** Expose unhealthy persistence, retry with bounded backoff,
 notify the user, and define a safe re-login/shutdown path. Test locked/full/
 unavailable keyrings, callback races, repeated rotations, death, and restart.
+
+**Fix (2026-10-09, issue #35).** A rotation the keyring refuses is kept as unsaved and retried
+in the background after 1 s, 5 s, 30 s and then every 5 minutes, until it is written or the blob
+has moved on (B201). The refusal is an error in the log naming `pdfs login`, and the daemon's stop
+writes a rotation still unsaved, logging an error if that fails too. The re-login path is B201's:
+an old session never writes into a newer login. Left: a crash or SIGKILL before a retry lands,
+and telling the GUI.
+
+**Test:** `auth::tests::a_rotation_the_keyring_refused_is_written_once_it_takes_it`.
 
 ---
 
