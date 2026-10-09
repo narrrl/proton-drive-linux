@@ -101,6 +101,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B200](#b200--offline-with-changes-queued-the-daemon-keeps-several-cores-busy) | Offline with changes queued, the daemon keeps several cores busy |
 | [B198](#b198--switching-to-online-only-deletes-local-files-that-never-reached-drive) | Switching to online-only deletes local files that never reached Drive |
 | [B197](#b197--switching-to-online-only-trashes-synced-files-that-became-ignored) | Switching to online-only trashes synced files that became ignored |
 | [B196](#b196--one-unreadable-folder-stops-the-whole-synced-folder-from-syncing) | One unreadable folder stops the whole synced folder from syncing |
@@ -301,6 +302,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B200 — Offline with changes queued, the daemon keeps several cores busy
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, issue #35: "offline, 3 queued", and systemd counted 17 minutes of CPU in
+2 m 16 s of wall time, 10 hours over a longer run.
+**Where:** `crates/pdfs-fuse/src/drain.rs`, `Core::run_pending_drain` and `idle_wait`;
+`crates/pdfs-core/src/db/ops.rs`, `Db::earliest_due_at`
+
+**Repro:** Queue a write, then cut the link (`nmcli networking off`). `pidstat -t -p $(pgrep -x
+pdfs) 5` shows the drain threads using most of several cores for as long as the outage lasts.
+
+**Cause.** Offline, a drain worker claims nothing, and then sleeps until the earliest queued op
+falls due. Every queued op was due already, and with no attempts nothing moves its
+`next_attempt_at`, so the sleep was zero. All 16 workers ran a query on every pass, the primary
+one its idle chores as well. The same spin happened online when a due op sat behind a claimed op
+on the same node, such as a rename queued behind a long upload: `earliest_due_at` counted it,
+`claim_next_due_op` skipped it.
+
+**Fix.** A worker that claims nothing, offline or paused, sleeps the full idle poll; a reconnect
+or a resume wakes it. `earliest_due_at` now uses the claim's own exclusions, one SQL fragment for
+both.
+
+**Test:** `drain::tests::an_offline_worker_waits_the_idle_poll_for_a_past_due_op`,
+`db::tests::earliest_due_at_skips_an_op_held_behind_a_claimed_one`.
+
+---
 
 ### B199 — A stopped share stays on the Shared by me page for minutes
 

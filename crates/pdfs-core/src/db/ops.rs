@@ -252,6 +252,25 @@ const UID_NOW: &str = "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.li
 const PARENT_NOW: &str =
     "COALESCE((SELECT uid FROM nodes WHERE lid = pending_op.parent_lid), parent_uid)";
 
+/// The `WHERE` terms for a row a drain worker may claim once it falls due: not
+/// claimed already, no other claimed op on the same node, and not under a
+/// folder that has yet to land.
+///
+/// One fragment for [`Db::claim_next_due_op`] and [`Db::earliest_due_at`]. A
+/// row the claim skips but the wait counts is due "now" for as long as it is
+/// held, and every idle worker spun on it (`docs/BUGS.md` B200).
+fn claimable() -> String {
+    format!(
+        "claimed_at = 0
+         AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')
+         AND uid NOT IN (SELECT uid FROM pending_op WHERE claimed_at <> 0)
+         AND (lid IS NULL OR lid NOT IN (
+           SELECT lid FROM pending_op WHERE claimed_at <> 0 AND lid IS NOT NULL))",
+        v = LOCAL_VOLUME,
+        n = LOCAL_VOLUME.len() + 1,
+    )
+}
+
 /// The volume id given to a node that exists only on this machine, so far. A
 /// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<lid>` and
 /// round-trips through the same `Display`/parse path as any other uid.
@@ -1127,15 +1146,9 @@ impl Db {
                 "SELECT id, kind, {UID_NOW}, {PARENT_NOW}, name, blob_path, meta_json, created_at,
                         attempts, last_error, next_attempt_at
                  FROM pending_op
-                 WHERE next_attempt_at <= ?1
-                   AND claimed_at = 0
-                   AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')
-                   AND uid NOT IN (SELECT uid FROM pending_op WHERE claimed_at <> 0)
-                   AND (lid IS NULL OR lid NOT IN (
-                     SELECT lid FROM pending_op WHERE claimed_at <> 0 AND lid IS NOT NULL))
+                 WHERE next_attempt_at <= ?1 AND {claimable}
                  ORDER BY id LIMIT 1",
-                v = LOCAL_VOLUME,
-                n = LOCAL_VOLUME.len() + 1,
+                claimable = claimable(),
             ))?;
             stmt.query_row(params![now], |r| {
                 Ok(PendingOp {
@@ -1208,19 +1221,17 @@ impl Db {
     /// debounced or backed-off op becomes eligible rather than waiting the full
     /// idle-poll interval.
     ///
-    /// Claimed ops are excluded: another worker is already on them, so they are
-    /// not work this one is waiting for, and counting them would have an idle
-    /// worker spin on a row it cannot have.
+    /// Only rows [`claim_next_due_op`](Self::claim_next_due_op) could take
+    /// count. A claimed op, or one held behind a claimed op on the same node,
+    /// is not work this worker is waiting for, and counting it would have an
+    /// idle worker spin on a row it cannot have.
     pub fn earliest_due_at(&self) -> Result<Option<i64>> {
         let conn = self.read();
         let ts: Option<i64> = conn
             .query_row(
                 &format!(
-                    "SELECT MIN(next_attempt_at) FROM pending_op \
-                     WHERE claimed_at = 0 \
-                       AND (parent_uid IS NULL OR substr({PARENT_NOW}, 1, {n}) <> '{v}~')",
-                    v = LOCAL_VOLUME,
-                    n = LOCAL_VOLUME.len() + 1,
+                    "SELECT MIN(next_attempt_at) FROM pending_op WHERE {claimable}",
+                    claimable = claimable(),
                 ),
                 [],
                 |r| r.get(0),

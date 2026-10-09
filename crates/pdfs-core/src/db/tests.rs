@@ -6547,6 +6547,36 @@ fn an_idle_worker_does_not_wait_on_an_op_another_worker_has() {
     );
 }
 
+/// B200: a rename queued behind a long upload of the same node is due, but no
+/// worker may claim it until the upload retires. Counted as due, it had every
+/// idle worker wake at once, find nothing, and go round again.
+#[test]
+fn earliest_due_at_skips_an_op_held_behind_a_claimed_one() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    let mut revision = bulk_op(0, &root);
+    revision.parent_uid = None;
+    db.enqueue_op(&revision).unwrap();
+    db.enqueue_op(&PendingOp {
+        kind: OP_RENAME.to_string(),
+        parent_uid: Some(root.clone()),
+        blob_path: None,
+        meta_json: None,
+        ..bulk_op(0, &root)
+    })
+    .unwrap();
+
+    db.claim_next_due_op(10)
+        .unwrap()
+        .expect("the revision is due");
+    assert!(db.claim_next_due_op(10).unwrap().is_none());
+    assert_eq!(
+        db.earliest_due_at().unwrap(),
+        None,
+        "a row no worker can claim is not work an idle worker is waiting for"
+    );
+}
+
 /// Trashing a photo from the gallery must not leave it behind on an album page:
 /// the row goes, its album membership goes with it, and nothing else moves.
 #[test]
