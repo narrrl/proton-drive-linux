@@ -2670,7 +2670,9 @@ fn proton_error<'e>(e: &'e (dyn std::error::Error + 'static)) -> Option<&'e Prot
 /// is, or `Some(None)` for a failure that is not a refusal.
 fn refusal(e: &(dyn std::error::Error + 'static)) -> Option<Option<SyncIssue>> {
     let proton = proton_error(e)?;
-    if is_network_error(proton) {
+    // A refused session refuses everything, so it says nothing about this
+    // op either; the mount is offline for it (`Core::lost_link`).
+    if is_network_error(proton) || pdfs_core::error::session_revoked(proton) {
         return None;
     }
     let ProtonError::Api(api) = proton else {

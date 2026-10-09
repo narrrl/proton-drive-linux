@@ -579,6 +579,7 @@ fn build_window(app: &adw::Application) {
                 detail: locations_widgets.card_detail.clone(),
                 pause: locations_widgets.pause.clone(),
                 paused: Cell::new(false),
+                sign_in: locations_widgets.card_sign_in.clone(),
             },
             queue: QueueState {
                 group: locations_widgets.queue_group.clone(),
@@ -1288,6 +1289,12 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
         };
         // Signed out, the login page owns the window; unknown names are ignored.
         if ui_page.session.borrow().is_none() {
+            return;
+        }
+        // Signed in, but Proton refused the session (the tray's "Sign In
+        // Again…"): the login page, with the rest of the app still reachable.
+        if page == "login" {
+            show_login(&ui_page);
             return;
         }
         // Activity lives on as the Sync page's History view.

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::shutdown::Shutdown;
+use pdfs_core::error::session_revoked;
 
 /// Drop `uid` from one mount's tree and tell that mount's kernel session the
 /// entry is gone. Shared by the trash and delete paths, which differ only in
@@ -402,6 +403,12 @@ pub(super) async fn run_event_sync(
                         }
                         break Some(c.clone());
                     }
+                    // Refused for good: retrying would be refused the same way
+                    // for the life of the daemon. The next login restarts it.
+                    Err(e) if session_revoked(&e) => {
+                        core.mark_session_expired("seed event cursor", &e);
+                        return;
+                    }
                     Err(e) => {
                         warn!(error = %e, ?delay, "seed event cursor failed; retrying");
                         tokio::time::sleep(delay).await;
@@ -500,6 +507,10 @@ pub(super) async fn run_photos_event_sync(core: Core) {
             Ok(Some(root)) => break root.tree_event_scope_id(),
             Ok(None) => {
                 debug!("no photos volume; photo event sync not started");
+                return;
+            }
+            Err(error) if session_revoked(&error) => {
+                core.mark_session_expired("read the photos root", &error);
                 return;
             }
             Err(error) => {

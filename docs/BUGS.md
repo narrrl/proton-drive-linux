@@ -101,6 +101,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B202](#b202--a-refused-session-shows-as-offline-forever-and-nothing-says-to-sign-in-again) | A refused session shows as offline forever, and nothing says to sign in again |
 | [B201](#b201--after-signing-in-again-the-old-daemon-puts-its-spent-tokens-back) | After signing in again, the old daemon puts its spent tokens back |
 | [B200](#b200--offline-with-changes-queued-the-daemon-keeps-several-cores-busy) | Offline with changes queued, the daemon keeps several cores busy |
 | [B198](#b198--switching-to-online-only-deletes-local-files-that-never-reached-drive) | Switching to online-only deletes local files that never reached Drive |
@@ -303,6 +304,42 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B202 — A refused session shows as offline forever, and nothing says to sign in again
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, issue #35: the tray and `pdfs diagnose` said "offline, 3 queued", and
+diagnose also said "keyring session: ok", while every call in the log failed with
+`InvalidRefreshToken (http 400)`. `pdfs sync now` and restarting the service changed nothing.
+**Where:** `crates/pdfs-fuse/src/link.rs`, `Core::lost_link` and `Core::probe_until_online`;
+`crates/pdfs-fuse/src/mount.rs`, `fetch_or_recall_root`; `crates/pdfs-fuse/src/background.rs`;
+`crates/pdfs-core/src/control.rs`, `Response::Status`; the tray, the app's status, `pdfs status`
+and `pdfs diagnose`
+
+**Repro:** Make the stored refresh token invalid (B201 is one way), then start the daemon. It
+mounts from the cache and says offline; the probe retries every 30 s, then every 5 minutes, and
+logs the refusal only at debug. A daemon that started online and loses its session later does not
+even go offline: its failures show up as EIO and drain backoff.
+
+**Cause.** Every failure to fetch the root at startup counted as offline, and nothing told a
+refused session apart from a lost connection. No status field could carry it, so no front end
+could say it.
+
+**Fix.** `pdfs_core::error::session_revoked` names the errors only a new login fixes:
+`InvalidRefreshToken`, `AccountDeleted`, `AccountDisabled`. When the root fetch, the probe, the
+drain, an event poll, the event seed or the photos root sees one, the mount goes offline with
+`session_expired` set, logs one warning naming `pdfs login`, and stops probing and retrying.
+Cached files stay readable and changes stay queued for the daemon the next login starts.
+`Response::Status` carries `session_expired`. The tray shows "Session expired — sign in again"
+with **Sign In Again…**, which opens the app's sign-in page; the app's status and Sync card say the
+same, with a **Sign In Again** button. `pdfs status` and `pdfs diagnose` report it, the latter as
+a FAIL. A refused session is not recorded as a sync issue of the op that ran into it.
+
+**Test:** `error::tests::only_a_refused_refresh_or_a_closed_account_revokes_the_session`, the
+tray's `tests::a_refused_session_outranks_everything_else` and
+`tests::a_daemon_that_does_not_say_has_a_live_session`.
+
+---
 
 ### B201 — After signing in again, the old daemon puts its spent tokens back
 

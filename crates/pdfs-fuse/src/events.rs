@@ -235,6 +235,7 @@ fn status_keys(status: &CtlResponse) -> (String, String) {
         used,
         budget,
         online,
+        session_expired,
         pending_uploads,
         pending_changes,
         ..
@@ -247,7 +248,7 @@ fn status_keys(status: &CtlResponse) -> (String, String) {
     );
     let key = format!(
         "{queue}/{staged_bytes}/{paused}/{paused_until:?}/{username}/{mountpoint}/{pinned}/\
-         {used}/{budget}/{online}"
+         {used}/{budget}/{online}/{session_expired}"
     );
     (key, queue)
 }
@@ -325,6 +326,7 @@ mod tests {
             budget: 0,
             pins: Vec::new(),
             online: true,
+            session_expired: false,
             pending_uploads: 1,
             pending_changes: 0,
         };

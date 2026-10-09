@@ -9,10 +9,11 @@
 //! queued path, and the probe thread here flips it back when Proton answers.
 
 use std::future::Future;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+use pdfs_core::error::session_revoked;
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonApiError, ProtonError};
 use tracing::{debug, info, warn};
@@ -54,6 +55,22 @@ pub(crate) struct Link {
     changed: Condvar,
     /// Folders listed from the DB alone while offline, to relist once back.
     pub(crate) stale_listings: Mutex<std::collections::HashSet<u64>>,
+    /// Proton refused the session itself ([`session_revoked`]). The mount is
+    /// offline then, but no probe brings it back: only a new login does, and
+    /// that restarts the daemon. Read by front-ends through `Response::Status`,
+    /// so they can ask the user to sign in again rather than say "offline".
+    pub(crate) session_expired: AtomicBool,
+}
+
+impl Link {
+    /// The link of a mount that comes up with Proton refusing its session, or
+    /// not.
+    pub(crate) fn starting(session_expired: bool) -> Self {
+        Self {
+            session_expired: AtomicBool::new(session_expired),
+            ..Default::default()
+        }
+    }
 }
 
 /// Whether a failed call failed because Proton could not be reached, rather
@@ -161,15 +178,36 @@ impl Core {
         self.rt.block_on(bounded_by(limit, call))
     }
 
+    /// Whether Proton refused the session itself, so nothing reaches it until
+    /// the user signs in again.
+    pub(crate) fn session_expired(&self) -> bool {
+        self.link.session_expired.load(Ordering::Relaxed)
+    }
+
     /// Report a failed remote call. Returns whether it failed for want of a
-    /// network, in which case the mount is now offline and the caller should
-    /// take its queued path instead of failing.
+    /// network, or of a session, in which case the mount is now offline and the
+    /// caller should take its queued path instead of failing.
     pub(crate) fn lost_link(&self, e: &ProtonError, what: &str) -> bool {
+        if session_revoked(e) {
+            self.mark_session_expired(what, e);
+            return true;
+        }
         if !is_network_error(e) {
             return false;
         }
         self.mark_offline(what, e);
         true
+    }
+
+    /// Flip the mount offline for good: Proton refused the session, and only a
+    /// new login brings it back. Changes stay queued for the daemon that login
+    /// starts. Only the first caller logs it.
+    pub(crate) fn mark_session_expired(&self, what: &str, error: &dyn std::fmt::Display) {
+        if !self.link.session_expired.swap(true, Ordering::Relaxed) {
+            warn!(during = what, %error,
+                  "Proton refused the session; run `pdfs login` to sign in again");
+        }
+        self.mark_offline(what, error);
     }
 
     /// Flip the mount offline and wake the probe. Only the first caller of an
@@ -276,6 +314,9 @@ impl Core {
 
     /// Probe until Proton answers, then flip the mount online. Returns `false`
     /// if the daemon is stopping.
+    ///
+    /// A refused session is not probed: every probe would be refused the same
+    /// way, forever (issue #35). The thread waits for the stop instead.
     fn probe_until_online(&self) -> bool {
         let started = self.link.lost_at.lock().unwrap_or_else(Instant::now);
         let mut delay = if started.elapsed() < YOUNG_OUTAGE {
@@ -286,6 +327,10 @@ impl Core {
         loop {
             if !self.shutdown.sleep(delay) {
                 return false;
+            }
+            if self.session_expired() {
+                delay = ONLINE_PROBE_MAX;
+                continue;
             }
             let probe = self.rt.block_on(async {
                 match tokio::time::timeout(PROBE_TIMEOUT, self.drive.get_my_files_folder()).await {
@@ -308,6 +353,7 @@ impl Core {
                     self.mark_online();
                     return true;
                 }
+                Err(e) if session_revoked(&e) => self.mark_session_expired("online probe", &e),
                 Err(e) => {
                     debug!(error = %e, ?delay, "online probe failed; still offline");
                     delay = next_probe_delay(delay, started.elapsed());

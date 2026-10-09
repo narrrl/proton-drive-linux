@@ -2024,9 +2024,11 @@ fn cmd_status() -> Result<()> {
             staged_oldest_secs,
             paused,
             paused_until,
+            session_expired,
             ..
         }) => {
             let state = match (online, paused) {
+                _ if session_expired => ", session expired: run `pdfs login`",
                 (_, true) => ", sync paused",
                 (false, false) => ", offline",
                 (true, false) => "",
@@ -3429,6 +3431,7 @@ fn cmd_diagnose() -> Result<()> {
         Ok(CtlResponse::Status {
             mountpoint,
             online,
+            session_expired,
             pending_uploads,
             pending_changes,
             ..
@@ -3450,19 +3453,29 @@ fn cmd_diagnose() -> Result<()> {
                     |kind| format!("{mountpoint} ({kind})"),
                 ),
             );
-            report.finding(
-                if online {
-                    DiagnoseLevel::Ok
-                } else {
-                    DiagnoseLevel::Warn
-                },
-                "  network",
-                if online {
-                    "online"
-                } else {
-                    "offline; cached data remains available"
-                },
-            );
+            // A refused session reads as offline too, but no connection will
+            // bring it back, and the keyring check above cannot tell.
+            if session_expired {
+                report.finding(
+                    DiagnoseLevel::Fail,
+                    "  session",
+                    "Proton refused it (expired or revoked) — run `pdfs login`",
+                );
+            } else {
+                report.finding(
+                    if online {
+                        DiagnoseLevel::Ok
+                    } else {
+                        DiagnoseLevel::Warn
+                    },
+                    "  network",
+                    if online {
+                        "online"
+                    } else {
+                        "offline; cached data remains available"
+                    },
+                );
+            }
             let pending = pending_uploads + pending_changes;
             report.finding(
                 if pending == 0 {

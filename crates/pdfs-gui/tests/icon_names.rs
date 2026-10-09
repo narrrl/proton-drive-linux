@@ -28,6 +28,7 @@ const STOCK: &[&str] = &[
     "checkbox-symbolic",
     "computer-symbolic",
     "dialog-error-symbolic",
+    "dialog-password-symbolic",
     "dialog-warning-symbolic",
     "document-edit-symbolic",
     "document-open-recent-symbolic",

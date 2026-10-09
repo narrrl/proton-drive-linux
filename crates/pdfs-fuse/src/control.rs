@@ -334,6 +334,7 @@ pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) ->
         budget: core.cache.budget(),
         pins,
         online: core.online.load(Ordering::Relaxed),
+        session_expired: core.session_expired(),
         pending_uploads: queued.uploads.max(0) as u64 + landing,
         pending_changes: queued.changes.max(0) as u64,
     }

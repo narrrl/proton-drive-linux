@@ -45,6 +45,8 @@ enum Phase {
     Offline,
     /// Changes keep failing; the user has to look.
     Attention,
+    /// Mounted, but Proton refused the session: only signing in again helps.
+    SessionExpired,
     /// Signed in, but no mount daemon is running.
     Disconnected,
     SignedOut,
@@ -60,6 +62,7 @@ impl Phase {
             Phase::Paused => "media-playback-pause-symbolic",
             Phase::Offline => "network-offline-symbolic",
             Phase::Attention => "dialog-warning-symbolic",
+            Phase::SessionExpired => "dialog-password-symbolic",
             Phase::Disconnected | Phase::SignedOut => "network-offline-symbolic",
         }
     }
@@ -234,6 +237,7 @@ fn status_state(
         pending_changes,
         failing_ops,
         paused,
+        session_expired,
         ..
     } = status
     else {
@@ -241,14 +245,21 @@ fn status_state(
     };
     let (pinned, online, failing_ops, paused) = (*pinned, *online, *failing_ops, *paused);
     let queued = i18n::pending_summary(*pending_uploads, *pending_changes);
-    let phase = phase_of(
-        paused,
-        failing_ops,
-        online,
-        queued.is_some() || busy(items, jobs),
-    );
+    let phase = if *session_expired {
+        Phase::SessionExpired
+    } else {
+        phase_of(
+            paused,
+            failing_ops,
+            online,
+            queued.is_some() || busy(items, jobs),
+        )
+    };
     DriveState {
         line: match (online, queued) {
+            // Outranks everything: it is why nothing else moves, and the one
+            // thing that fixes it is the user's to do.
+            _ if *session_expired => gettext("Session expired — sign in again"),
             _ if paused => gettext("Sync paused"),
             _ if failing_ops > 0 => ngettext_f(
                 "{n} change needs attention",
@@ -365,7 +376,7 @@ impl Tray for DriveTray {
 
     fn status(&self) -> Status {
         match self.state.phase {
-            Phase::Attention => Status::NeedsAttention,
+            Phase::Attention | Phase::SessionExpired => Status::NeedsAttention,
             _ => Status::Active,
         }
     }
@@ -423,6 +434,9 @@ impl Tray for DriveTray {
             // Nothing to mount without a session; the app's sign-in page is the
             // way in.
             Phase::SignedOut => items.push(item(&gettext("Sign In…"), |_| open_manager(&[]))),
+            Phase::SessionExpired => items.push(item(&gettext("Sign In Again…"), |_| {
+                open_manager(&["--page", "login"])
+            })),
             _ => items.push(item(&gettext("Open Proton Drive"), |_| open_manager(&[]))),
         }
 
@@ -604,6 +618,34 @@ mod tests {
         assert_eq!(phase_of(false, 0, false, true), Phase::Offline);
         assert_eq!(phase_of(false, 0, true, true), Phase::Syncing);
         assert_eq!(phase_of(false, 0, true, false), Phase::Synced);
+    }
+
+    fn status(extra: &str) -> Response {
+        serde_json::from_str(&format!(
+            r#"{{"Status":{{"username":"u","mountpoint":"/m","pinned":0,"used":0,"budget":0,
+                "pins":[],"online":false,"pending_uploads":3,"failing_ops":2,"paused":true{extra}}}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Issue #35: a refused session read as "Offline — 3 uploads queued" for
+    /// good, and nothing said that signing in again was the way out.
+    #[test]
+    fn a_refused_session_outranks_everything_else() {
+        let state = status_state(
+            &status(r#","session_expired":true"#),
+            &[],
+            &[],
+            Path::new("/m"),
+        );
+        assert_eq!(state.phase, Phase::SessionExpired);
+        assert_eq!(state.line, "Session expired — sign in again");
+    }
+
+    #[test]
+    fn a_daemon_that_does_not_say_has_a_live_session() {
+        let state = status_state(&status(""), &[], &[], Path::new("/m"));
+        assert_eq!(state.phase, Phase::Paused);
     }
 
     fn job(title: &str, background: bool) -> JobItem {

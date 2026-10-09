@@ -1959,6 +1959,11 @@ pub enum Response {
         /// resumed, or not paused.
         #[serde(default)]
         paused_until: Option<i64>,
+        /// True when Proton refused the session itself (refresh token refused,
+        /// account deleted or disabled). `online` is false then too, but no
+        /// connection brings it back: only signing in again does.
+        #[serde(default)]
+        session_expired: bool,
     },
     /// A human-readable success message.
     Ok { message: String },
