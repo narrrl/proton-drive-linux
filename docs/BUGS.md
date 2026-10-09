@@ -81,6 +81,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
 | [B71](#b71--conflict-sweep-is-not-production-ready-auto-trash-loop-crit-13) | Conflict sweep is not production-ready (auto-trash loop, CRIT-13) | Items 5 to 10 of the entry |
@@ -300,6 +301,32 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B199 — A stopped share stays on the Shared by me page for minutes
+
+**Status:** Partly fixed. The share itself is still not deleted.
+**Found:** 2026-10-09, reported from the app: after **Stop Sharing**, the row stayed, and an
+older share showed with no people and no link.
+**Where:** `crates/pdfs-fuse/src/sharing.rs`, `Core::stop_sharing_for_uid` and
+`Core::list_shared_by_me`; `crates/pdfs-gui/src/app/pages/shared_by_me.rs`, `prompt_stop_sharing`
+
+**Repro:** Share a folder with a person, then choose **Stop Sharing…** on the Shared by me page.
+The row stays, now with "—" for people and link, until a reload some minutes later.
+
+**Cause.** The Rust SDK has no call that deletes a share. Stop Sharing removes the public link, the
+invitations and the members one by one, and leaves an empty share behind. Drive deletes an empty
+share on its own, but only after a while, and until then `GET v2/volumes/{vid}/shares` still lists
+it. The JS SDK ends `unshareNode` with `DELETE drive/shares/{shareId}?Force=1` for exactly this
+reason.
+
+**Fix.** The daemon leaves a share with no member, no invitation and no link out of the Shared by
+me listing, unless one of those lookups failed. The app also drops a stopped item from the page as
+soon as the request succeeds, before the confirming reload. Left: a `delete_share` call in
+`proton-drive-rs`, made at the end of `stop_sharing_for_uid`, so the share is really gone.
+
+**Test:** none automated; the listing needs a live account.
+
+---
 
 ### B198 — Switching to online-only deletes local files that never reached Drive
 
