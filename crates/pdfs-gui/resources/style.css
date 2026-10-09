@@ -18,7 +18,9 @@
 .sidebar-status image.warning { color: var(--warning-color); }
 .sidebar-status image.error { color: var(--error-color); }
 .sidebar-quota progressbar trough, .sidebar-quota progressbar progress { min-height: 4px; }
-.sidebar-account { padding: 4px 4px 4px 8px; }
+/* The account row is the main menu's button: a row, not a pushbutton, so
+ * the name keeps the text weight. */
+button.sidebar-account { padding: 4px 8px; font-weight: normal; }
 /* A count of what waits on a page, at the end of its sidebar row */
 .sidebar-badge {
   min-width: 10px;
