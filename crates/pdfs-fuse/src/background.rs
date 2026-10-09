@@ -710,7 +710,7 @@ fn scan_local_once(
 
     // The walk has no idea how many files it will find, so the job counts what it
     // has seen and stays indeterminate.
-    let job = transfers.begin_job("Indexing this computer");
+    let job = transfers.begin_background_job("Indexing this computer");
     job.detail("Scanning your files");
     let walked = localindex::scan(&[home], &excludes, |batch| {
         if let Err(e) = db.local_upsert_batch(generation, &batch) {

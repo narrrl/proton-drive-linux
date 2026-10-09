@@ -128,20 +128,34 @@ impl ActionMenu {
     }
 }
 
-/// Where a menu opened over `anchor` should live in the widget tree: the
-/// outermost grid or list view around it, or `anchor` itself. CSS descendant
-/// selectors reach through a popover to its parent, and themes style the
-/// insides of list items (`gridview > child box { margin: 12px }` in
-/// Catppuccin); a menu parented to a tile picks those rules up and puts a wide
-/// margin around every section. Under the view itself it is no item's child.
+/// Where a menu opened over `anchor` should live in the widget tree.
+///
+/// Not inside a list item: CSS descendant selectors reach through a popover to
+/// its parent, and themes style the insides of list items (`gridview > child
+/// box { margin: 12px }` in Catppuccin); a menu parented to a tile picks those
+/// rules up and puts a wide margin around every section. So the search starts
+/// at the outermost grid or list view around `anchor`.
+///
+/// Not on a widget without a layout manager either: a popover is sized and
+/// placed again when its parent's layout manager allocates it. The list views
+/// and `ScrolledWindow` have none, so a menu parented there kept the size it was
+/// first given, often too small, and opened scrolling. The host is the first
+/// widget from there up that has one.
 fn popover_host(anchor: &gtk4::Widget) -> gtk4::Widget {
-    let mut host = anchor.clone();
+    let mut start = anchor.clone();
     let mut widget = anchor.parent();
     while let Some(w) = widget {
         widget = w.parent();
         if w.is::<gtk4::GridView>() || w.is::<gtk4::ListView>() || w.is::<gtk4::ColumnView>() {
-            host = w;
+            start = w;
         }
     }
-    host
+    let mut host = Some(start.clone());
+    while let Some(w) = host {
+        if w.layout_manager().is_some() {
+            return w;
+        }
+        host = w.parent();
+    }
+    start
 }

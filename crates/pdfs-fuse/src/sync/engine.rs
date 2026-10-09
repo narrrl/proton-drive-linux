@@ -57,9 +57,10 @@ pub(crate) fn spawn(core: Core, rx: Receiver<SyncMsg>) -> Option<std::thread::Jo
 fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
     // Paths the watcher currently covers, mapped to their folder id, so an event
     // path can be resolved back to the folder it belongs to.
-    let watched: Mutex<Vec<(PathBuf, i64)>> = Mutex::new(Vec::new());
+    let watched: Arc<Mutex<Vec<(PathBuf, i64)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let tx_events = core.sync_tx.clone();
+    let watched_events = watched.clone();
     let mut watcher =
         match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
@@ -67,7 +68,8 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 return;
             }
-            let _ = tx_events.send(SyncMsg::ReconcileAll);
+            let msg = event_target(&watched_events.lock(), &event.paths);
+            let _ = tx_events.send(msg);
         }) {
             Ok(w) => w,
             Err(e) => {
@@ -256,8 +258,31 @@ fn reconcile_all(core: &Core) {
     }
 }
 
+/// The reconcile a watcher event asks for: the one mirror folder all its paths
+/// lie in, so an edit in one folder does not walk every other one too. An event
+/// that spans folders, or that no watched folder claims (a watch list a moment
+/// out of date), falls back to every folder.
+pub(super) fn event_target(watched: &[(PathBuf, i64)], paths: &[PathBuf]) -> SyncMsg {
+    let mut ids = paths.iter().map(|path| {
+        watched
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            // The deepest root, should one mirror folder sit inside another.
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, id)| *id)
+    });
+    match ids.next() {
+        Some(Some(first)) if ids.all(|id| id == Some(first)) => SyncMsg::Reconcile(first),
+        _ => SyncMsg::ReconcileAll,
+    }
+}
+
 /// Bring the filesystem watches in line with the current mirror-folder set:
 /// watch newly-added folders, drop removed ones.
+///
+/// The watch calls run on a copy, outside the lock: the watcher's event
+/// callback takes the same lock, and a backend that hands a watch request to
+/// its event thread and waits for the answer would deadlock against it.
 fn rewatch(
     core: &Core,
     watcher: &mut notify::RecommendedWatcher,
@@ -274,7 +299,7 @@ fn rewatch(
             return;
         }
     };
-    let mut have = watched.lock();
+    let mut have = watched.lock().clone();
     // Drop watches no longer wanted.
     have.retain(|(path, _)| {
         if want.iter().any(|(p, _)| p == path) {
@@ -294,6 +319,7 @@ fn rewatch(
             Err(e) => warn!(path = %path.display(), error = %e, "sync: watch failed"),
         }
     }
+    *watched.lock() = have;
 }
 
 // ---- reconcile ------------------------------------------------------------

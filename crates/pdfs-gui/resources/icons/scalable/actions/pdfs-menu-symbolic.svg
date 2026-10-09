@@ -1,5 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <!-- Main menu: three bars. Bundled because themes such as Papirus draw
-       open-menu-symbolic as three dots, the same as every row's "more" menu. -->
-  <path fill="#222222" d="M 2,2.5 H 14 A 1,1 0 0 1 14,4.5 H 2 A 1,1 0 0 1 2,2.5 Z M 2,7 H 14 A 1,1 0 0 1 14,9 H 2 A 1,1 0 0 1 2,7 Z M 2,11.5 H 14 A 1,1 0 0 1 14,13.5 H 2 A 1,1 0 0 1 2,11.5 Z"/>
-</svg>

@@ -17,6 +17,47 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   once you are done. `pdfs login` now handles a CAPTCHA the same way instead of failing.
   ([#29](https://github.com/narrrl/proton-drive-linux/issues/29))
 
+## [3.2.0] — 2026-10-08
+
+Schema: **42**, unchanged.
+
+### Fixed
+- **One unreadable folder stopped a synced folder from syncing at all.** A folder you may not
+  read, such as a cache a container created, failed every pass, so nothing else in the synced
+  folder reached Drive. Such a folder is now left out and named once in the activity feed, and
+  everything around it syncs. A file deleted during a scan, and a name that is not UTF-8, no
+  longer fail the pass either.
+  ([#33](https://github.com/narrrl/proton-drive-linux/issues/33))
+- **Switching a folder to online-only could delete files that were never on Drive.** Ignored
+  folders such as `.git/`, symlinks, unreadable folders and files changed after the last sync were
+  deleted with the local copy. The switch now refuses and names what is only on this computer.
+- **Switching to online-only trashed synced files that had become ignored.** Adding a synced path
+  to `.pdfsignore` and then switching moved it to the Drive trash. Ignoring never deletes now, as
+  the user guide says.
+- **A stopped share stayed on the Shared by me page for minutes.** Stop Sharing now takes it off
+  the page at once, and an emptied share no longer shows with no people and no link.
+- **The tray icon showed syncing every two minutes.** The routine check of a synced folder no
+  longer counts as syncing. Only work that changes files spins the icon. An edit in one synced
+  folder also no longer rescans all the others.
+- **Right-click menus sometimes opened too short and had to be scrolled.**
+- **The Share dialog looked unfinished.** Its buttons now sit under their sections instead of in a
+  row of their own. The role is chosen beside the addresses, people show with avatars, and both
+  sections show that they are loading.
+- **Breadcrumbs spaced the "›" unevenly, and grid file names were broken with hyphens they do not
+  have.**
+
+### Changed
+- **One main menu.** The menu button beside "Proton Drive" is gone. Preferences, Keyboard
+  Shortcuts, About and Sign Out are all in the account row at the bottom of the sidebar. F10 opens
+  it.
+
+### Added
+- **Move another computer's backup to this one.** **Move to This Computer…** on the Computers page,
+  or `pdfs devices migrate UID`, moves every folder another computer backs up, for example an old
+  Windows PC, into this computer's backup on Proton Drive. Then it offers them for syncing here. The
+  folders move on Proton Drive itself, so nothing is uploaded again. The other computer stays in the
+  account, without those folders.
+
 ## [3.1.2] — 2026-10-08
 
 Schema: **42**, unchanged.
@@ -1670,6 +1711,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[3.2.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.0
 
 [3.1.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.1.2
 

@@ -81,6 +81,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
 | [B71](#b71--conflict-sweep-is-not-production-ready-auto-trash-loop-crit-13) | Conflict sweep is not production-ready (auto-trash loop, CRIT-13) | Items 5 to 10 of the entry |
@@ -100,6 +101,9 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B198](#b198--switching-to-online-only-deletes-local-files-that-never-reached-drive) | Switching to online-only deletes local files that never reached Drive |
+| [B197](#b197--switching-to-online-only-trashes-synced-files-that-became-ignored) | Switching to online-only trashes synced files that became ignored |
+| [B196](#b196--one-unreadable-folder-stops-the-whole-synced-folder-from-syncing) | One unreadable folder stops the whole synced folder from syncing |
 | [B195](#b195--the-app-crashes-when-proton-asks-for-a-captcha-on-secureblue) | The app crashes when Proton asks for a CAPTCHA on secureblue |
 | [B193](#b193--deleting-a-file-whose-create-failed-can-trash-a-file-of-the-users-on-drive) | Deleting a file whose create failed can trash a file of the user's on Drive |
 | [B191](#b191--a-file-deleted-after-its-create-failed-and-was-written-again-can-stay-on-drive) | A file deleted after its create failed and was written again can stay on Drive |
@@ -297,6 +301,121 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B199 — A stopped share stays on the Shared by me page for minutes
+
+**Status:** Partly fixed. The share itself is still not deleted.
+**Found:** 2026-10-09, reported from the app: after **Stop Sharing**, the row stayed, and an
+older share showed with no people and no link.
+**Where:** `crates/pdfs-fuse/src/sharing.rs`, `Core::stop_sharing_for_uid` and
+`Core::list_shared_by_me`; `crates/pdfs-gui/src/app/pages/shared_by_me.rs`, `prompt_stop_sharing`
+
+**Repro:** Share a folder with a person, then choose **Stop Sharing…** on the Shared by me page.
+The row stays, now with "—" for people and link, until a reload some minutes later.
+
+**Cause.** The Rust SDK has no call that deletes a share. Stop Sharing removes the public link, the
+invitations and the members one by one, and leaves an empty share behind. Drive deletes an empty
+share on its own, but only after a while, and until then `GET v2/volumes/{vid}/shares` still lists
+it. The JS SDK ends `unshareNode` with `DELETE drive/shares/{shareId}?Force=1` for exactly this
+reason.
+
+**Fix.** The daemon leaves a share with no member, no invitation and no link out of the Shared by
+me listing, unless one of those lookups failed. The app also drops a stopped item from the page as
+soon as the request succeeds, before the confirming reload. Left: a `delete_share` call in
+`proton-drive-rs`, made at the end of `stop_sharing_for_uid`, so the share is really gone.
+
+**Test:** none automated; the listing needs a live account.
+
+---
+
+### B198 — Switching to online-only deletes local files that never reached Drive
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-08, reading the switch while fixing B196.
+**Where:** `crates/pdfs-fuse/src/devices.rs`, `Core::apply_sync_folder_mode`;
+`crates/pdfs-fuse/src/sync.rs`, `mirror_tree_unsynced`
+
+**Repro:** Mirror a project folder with a `.git/` in it, then switch it to **Online only**.
+`.git/` is gone from the disk and was never on Drive.
+
+**Cause.** The switch evicts the whole local tree once the folder is `idle`. `idle` only says the
+last pass applied everything it tried, and a pass never tries an ignored path (`.git/` is ignored
+by default), a symlink, or a folder it cannot read (B196). It also defers a file that is open for
+writing without leaving `idle`, and a file can change after the pass ends. The eviction deleted
+all of those.
+
+**Fix.** Before the mode is written and anything is evicted, the switch walks the folder against
+the baseline, as a move out of a mirror folder already does, and refuses when something is only on
+this disk. The message names the path; an ignored one is called excluded from sync. A tracked file
+deleted here but not yet on Drive also refuses. An ignored one does not, since its baseline row
+stays for good and would hold the switch forever.
+
+**Test:** unit tests `a_fully_synced_mirror_folder_may_go_online_only`,
+`an_ignored_folder_only_this_disk_has_holds_the_switch_back`,
+`a_deleted_ignored_path_does_not_hold_the_switch_back`,
+`an_edit_after_the_last_pass_holds_the_switch_back`, `a_new_file_at_the_root_holds_the_switch_back`,
+`an_unreadable_folder_holds_the_switch_back` and `a_symlink_holds_the_switch_back`. The switch
+itself has not been driven against a live account.
+
+---
+
+### B197 — Switching to online-only trashes synced files that became ignored
+
+**Status:** Fixed (unverified).
+**Found:** 2026-10-08, reading the push pass while fixing B196.
+**Where:** `crates/pdfs-fuse/src/sync.rs`, `Core::push_pass`; `crates/pdfs-fuse/src/sync/planner.rs`,
+`local_deletions`
+
+**Repro:** Mirror a folder until `build/` is on Drive, add `build/` to `.pdfsignore`, then switch
+the folder to **Online only**. `build/` goes to the Drive trash, and the switch then deletes the
+local copy.
+
+**Cause.** The push pass that runs before the switch read its deletions as "in the baseline, not in
+the local walk". The walk skips ignored paths, so every synced path that later became ignored read
+as deleted. A full pass does not do this: it drops ignored paths from classification, which is
+what the user guide promises ("Ignoring never deletes anything").
+
+**Fix.** The push pass reads its deletions from the same filtered baseline the wipe guard checks:
+without ignored paths, and without paths the scan could not read (B196).
+
+**Test:** unit tests `a_push_pass_never_reads_an_ignored_path_as_deleted` and
+`local_deletions_come_out_shallowest_first`.
+
+---
+
+### B196 — One unreadable folder stops the whole synced folder from syncing
+
+**Status:** Fixed (unverified). The reporter has not run the fix yet.
+**Found:** 2026-10-08, [#33](https://github.com/narrrl/proton-drive-linux/issues/33). A synced
+`~/Documents` held a restic cache a Docker container had created, which the user may not read.
+Every pass failed with `Couldn't sync Documents: read …/restic/cache/…/snapshots: Permission
+denied`, and nothing else in `Documents` synced.
+**Where:** `crates/pdfs-fuse/src/sync.rs`, `walk_local_tree`; `crates/pdfs-fuse/src/sync/planner.rs`,
+`Unscanned`
+
+**Repro:** In a mirror folder, `sudo mkdir locked && sudo chmod 700 locked`, then sync.
+
+**Cause.** B55 made every scan failure fatal to the pass, because a path left out of the scan read
+as a local deletion and was trashed on Drive. That was safe, but a folder the user may not read is
+not transient: the pass failed on every poll, for good. The same held for a file deleted between
+the listing and its `stat`, which a busy folder hits now and then, and for a name that is not UTF-8.
+
+**Fix.** The scan leaves such a path out and records it, and the pass drops everything under it
+from classification, the wipe guard and the push pass's deletions, as it already did for ignored
+paths. A left-out path is then neither deleted on Drive nor downloaded into. A folder that lists
+but does not allow `stat` is left out whole. An unreadable or absent root, and every other I/O
+error, still fails the pass. The activity feed names the unreadable paths once each time the set
+changes, and the folder stays `idle`. Adding the folder to `.pdfsignore` was already a workaround
+and still silences the report.
+
+**Test:** unit tests `an_unreadable_subdirectory_is_left_out_and_the_rest_scans`,
+`a_listable_but_unsearchable_folder_is_left_out_whole`,
+`a_path_the_scan_left_out_is_never_a_local_deletion`,
+`unscanned_covers_a_path_and_what_is_under_it_but_not_its_siblings` and
+`a_non_utf8_name_is_left_out_and_reported`. `an_unreadable_root_fails_the_scan` and
+`an_absent_root_fails_the_scan` still hold.
+
+---
 
 ### B195 — The app crashes when Proton asks for a CAPTCHA on secureblue
 
@@ -4830,6 +4949,10 @@ subdirectory holding a file, asserting the error names the subtree),
 `a_non_utf8_name_fails_the_scan`, and `a_readable_tree_scans_completely` as the complement — the
 strictness must not cost a working pass, so a healthy tree still reports every entry and still
 skips symlinks by design.
+
+B196 later relaxed this: a path the user may not read, an entry that vanishes mid-scan and a name
+that is not UTF-8 are left out of the pass instead of failing it, and the pass drops everything
+under them from classification, so the B55 guarantee holds without the wedge.
 
 Not covered: transient I/O errors, and an entry that disappears between `read_dir` and `stat`.
 Both are races that would need a filesystem shim to force; the code path they take is the same

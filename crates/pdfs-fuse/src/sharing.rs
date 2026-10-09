@@ -660,6 +660,12 @@ impl Core {
     /// the shared uids; the per-node detail is then gathered best-effort — a single
     /// node racing with an unshare drops from the list rather than failing the whole
     /// request.
+    ///
+    /// A share with no member, no invitation and no link is left out: it is
+    /// shared with no one. Stop Sharing leaves exactly that behind, since the SDK
+    /// cannot delete a share, and Drive keeps listing it until its backend gets
+    /// round to removing it, minutes later. A share whose details could not all
+    /// be read stays listed, so a failed lookup never hides a live share.
     pub(crate) fn list_shared_by_me(&self) -> CoreResult<Vec<SharedItem>> {
         let uids = self
             .rt
@@ -678,24 +684,26 @@ impl Core {
             let members = self
                 .rt
                 .block_on(self.client.list_share_members(&uid))
-                .map(|m| m.len())
-                .unwrap_or(0);
+                .map(|m| m.len());
             let proton_invites = self
                 .rt
                 .block_on(self.client.list_share_invitations(&uid))
-                .map(|i| i.len())
-                .unwrap_or(0);
+                .map(|i| i.len());
             let external_invites = self
                 .rt
                 .block_on(self.client.list_external_invitations(&uid))
-                .map(|i| i.len())
-                .unwrap_or(0);
-            let link = self
-                .rt
-                .block_on(self.client.get_public_link(&uid))
-                .ok()
-                .flatten()
-                .map(public_link_info);
+                .map(|i| i.len());
+            let link = self.rt.block_on(self.client.get_public_link(&uid));
+            if let (Ok(0), Ok(0), Ok(0), Ok(None)) =
+                (&members, &proton_invites, &external_invites, &link)
+            {
+                debug!(%uid, "shared by me: skipping an emptied share");
+                continue;
+            }
+            let members = members.unwrap_or(0);
+            let proton_invites = proton_invites.unwrap_or(0);
+            let external_invites = external_invites.unwrap_or(0);
+            let link = link.ok().flatten().map(public_link_info);
             items.push(SharedItem {
                 uid: uid.to_string(),
                 is_dir: n.is_folder(),

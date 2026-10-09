@@ -565,6 +565,7 @@ pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entries: &[DirEntry]) {
     let uids: Vec<String> = entries.iter().map(|e| e.uid.clone()).collect();
     dialog.connect_response(Some("stop"), move |_, _| {
         let done = done.clone();
+        let stopped = uids.clone();
         run_requests(
             &ui_c,
             uids.iter()
@@ -572,12 +573,25 @@ pub(crate) fn prompt_stop_sharing(ui: &Rc<Ui>, entries: &[DirEntry]) {
                 .collect(),
             gettext_noop("Couldn't stop sharing"),
             move |ui| {
+                forget_shared_by_me(ui, &stopped);
                 reload_listing(ui);
                 toast(ui, &done);
             },
         );
     });
     dialog.present(ui_window(ui).as_ref());
+}
+
+/// Take items whose sharing just stopped off the page now, rather than when
+/// the reload that confirms it comes back: that reload asks after every share
+/// in turn and takes a while with many of them.
+fn forget_shared_by_me(ui: &Rc<Ui>, uids: &[String]) {
+    let items = {
+        let mut items = ui.shared_by_me.items.borrow_mut();
+        items.retain(|item| !uids.contains(&item.uid));
+        items.clone()
+    };
+    repaint_shared_by_me(ui, &items);
 }
 
 /// Open a shared item: a folder in My Files, a file the way My Files would.

@@ -103,6 +103,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs devices rename UID NAME` | Rename a computer. |
 | `pdfs devices rm UID` | Remove a computer and its backup from the account. |
 | `pdfs devices adopt UID` | Make this machine continue another computer's backup, for example after a reinstall. `--clear` returns to matching by hostname. |
+| `pdfs devices migrate UID [--yes]` | Move another computer's folders into this computer's backup, then restore them here like `pdfs sync restore`. The other computer stays registered, without those folders. `--yes` skips the confirmation and accepts every proposed path. See [RECOVERY.md](RECOVERY.md). |
 
 ## Trash
 

@@ -90,6 +90,96 @@ pub(super) fn filter_baseline<'a, B>(
         .collect()
 }
 
+/// The paths a local scan left out because it could not read them: a folder
+/// it has no permission for, an entry that vanished between the listing and
+/// its `stat`, a name that is not UTF-8.
+///
+/// A left-out path is not a deleted one. A pass drops everything an entry
+/// covers from classification, exactly as it drops ignored paths, so a
+/// baseline row under an unreadable folder is neither read as a local deletion
+/// nor answered with a download into a folder the pass cannot write. Failing
+/// the whole pass instead is what B55 did, and it left one root-owned folder
+/// stopping every other file in the tree from syncing (B196).
+#[derive(Default)]
+pub(super) struct Unscanned {
+    covered: HashSet<String>,
+    /// The subset worth telling the user about, with why: an entry that only
+    /// vanished mid-scan is not, since the next pass sees it settled.
+    unreadable: Vec<String>,
+}
+
+impl Unscanned {
+    /// Leave out `rel`, which vanished while the scan looked at it.
+    pub(super) fn vanished(&mut self, rel: String) {
+        self.covered.insert(rel);
+    }
+
+    /// Leave out `rel`, which cannot be read for `reason`.
+    pub(super) fn unreadable(&mut self, rel: String, reason: &str) {
+        self.unreadable.push(format!("{rel} ({reason})"));
+        self.covered.insert(rel);
+    }
+
+    /// Whether `rel` is a left-out path or lies under one.
+    pub(super) fn covers(&self, rel: &str) -> bool {
+        if self.covered.is_empty() {
+            return false;
+        }
+        let mut at = rel;
+        loop {
+            if self.covered.contains(at) {
+                return true;
+            }
+            match at.rfind('/') {
+                Some(i) => at = &at[..i],
+                None => return false,
+            }
+        }
+    }
+
+    /// The unreadable paths with their reasons, sorted, for the activity feed.
+    pub(super) fn report(&self) -> Vec<String> {
+        let mut lines = self.unreadable.clone();
+        lines.sort_unstable();
+        lines
+    }
+}
+
+/// The baseline paths a pass can see: [`filter_baseline`], minus everything
+/// under a path the scan could not read. This is the set [`guard_local_wipe`]
+/// checks and the set a push pass reads deletions from, since a path outside
+/// it is absent from the local walk by rule or by failure, never by loss.
+pub(super) fn tracked_baseline<'a, B>(
+    baseline: &'a HashMap<String, B>,
+    rules: &IgnoreRules,
+    unscanned: &Unscanned,
+) -> HashMap<String, &'a B> {
+    let mut tracked = filter_baseline(baseline, rules);
+    tracked.retain(|rel, _| !unscanned.covers(rel));
+    tracked
+}
+
+/// The baseline paths a push pass has to trash on Drive: tracked, and gone
+/// from the local walk. Shallowest first, so a trashed folder takes its
+/// children with it.
+///
+/// Built from [`tracked_baseline`] rather than from the raw baseline. Reading
+/// it raw trashed every synced path that later became ignored, because the walk
+/// skips those, and the switch to on-demand that the push pass runs for then
+/// deleted the local copy too (B197).
+pub(super) fn local_deletions<B, L>(
+    tracked: &HashMap<String, &B>,
+    local: &HashMap<String, L>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = tracked
+        .keys()
+        .filter(|rel| !local.contains_key(*rel))
+        .cloned()
+        .collect();
+    missing.sort_by_key(|p| p.matches('/').count());
+    missing
+}
+
 /// Refuse to run a pass whose local side has vanished in its entirety.
 ///
 /// When every baseline path is absent locally, the likely cause is an unavailable

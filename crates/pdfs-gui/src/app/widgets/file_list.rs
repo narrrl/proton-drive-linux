@@ -132,8 +132,13 @@ impl FileList {
                 // and the grid collapses to a single column. Allowing a mid-word
                 // break is what keeps the two-line-then-ellipsis budget below
                 // enforceable for *every* name rather than only the ones that
-                // happen to have spaces.
+                // happen to have spaces. Pango marks such a break with a hyphen
+                // that is not in the name ("SteamSetup.e-xe"); a file name is
+                // not prose, so break it bare, as Nautilus does.
+                let no_hyphens = gtk4::pango::AttrList::new();
+                no_hyphens.insert(gtk4::pango::AttrInt::new_insert_hyphens(false));
                 let label = gtk4::Label::builder()
+                    .attributes(&no_hyphens)
                     .ellipsize(gtk4::pango::EllipsizeMode::End)
                     .justify(gtk4::Justification::Center)
                     .max_width_chars(13)

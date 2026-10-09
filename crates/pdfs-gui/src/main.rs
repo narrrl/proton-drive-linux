@@ -88,8 +88,9 @@ struct DriveState {
 /// Summarise a work snapshot into one menu line, or empty when idle. A single
 /// transfer names the file and its percentage; several collapse to counts so the
 /// menu stays one line regardless of queue depth. With nothing moving bytes, a
-/// running job speaks for itself — a scan or an index rebuild is still "busy",
-/// and the tray saying nothing there reads as "finished".
+/// running job speaks for itself — a scan or an index rebuild is still work
+/// going on, and the menu saying nothing there reads as "finished". The icon is
+/// [`busy`]'s call, not this line's.
 fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
     match items {
         [] => match jobs.first() {
@@ -143,12 +144,12 @@ struct DriveTray {
 fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
     match send(socket, &Request::Status) {
         Ok(status @ Response::Status { .. }) => {
-            // Same daemon is up, so a cheap follow-up request gives the sync line.
-            let sync = match send(socket, &Request::GetQueueStatus) {
-                Ok(Response::Transfers { items, jobs }) => sync_line(&items, &jobs),
-                _ => String::new(),
+            // Same daemon is up, so a cheap follow-up request says what moves.
+            let (items, jobs) = match send(socket, &Request::GetQueueStatus) {
+                Ok(Response::Transfers { items, jobs }) => (items, jobs),
+                _ => (Vec::new(), Vec::new()),
             };
-            status_state(&status, sync, default_mountpoint)
+            status_state(&status, &items, &jobs, default_mountpoint)
         }
         // Socket answered but with something unexpected — treat as up but odd.
         Ok(_) => unexpected_reply(default_mountpoint),
@@ -217,9 +218,14 @@ fn unexpected_reply(default_mountpoint: &Path) -> DriveState {
     }
 }
 
-/// The state a running daemon's [`Response::Status`] describes, with `sync`
-/// saying what it is moving right now.
-fn status_state(status: &Response, sync: String, default_mountpoint: &Path) -> DriveState {
+/// The state a running daemon's [`Response::Status`] describes, with `items`
+/// and `jobs` saying what it is working on right now.
+fn status_state(
+    status: &Response,
+    items: &[TransferItem],
+    jobs: &[JobItem],
+    default_mountpoint: &Path,
+) -> DriveState {
     let Response::Status {
         mountpoint,
         pinned,
@@ -239,7 +245,7 @@ fn status_state(status: &Response, sync: String, default_mountpoint: &Path) -> D
         paused,
         failing_ops,
         online,
-        queued.is_some() || !sync.is_empty(),
+        queued.is_some() || busy(items, jobs),
     );
     DriveState {
         line: match (online, queued) {
@@ -278,9 +284,17 @@ fn status_state(status: &Response, sync: String, default_mountpoint: &Path) -> D
         mounted: true,
         paused,
         mountpoint: PathBuf::from(mountpoint),
-        sync,
+        sync: sync_line(items, jobs),
         failing: failing_ops,
     }
+}
+
+/// Whether the daemon is changing something: bytes moving, or a job the user
+/// is waiting on. A mirror folder's routine scan and the like are background
+/// jobs; they still get the menu line, but the icon spinning every two minutes
+/// for a scan that finds nothing reads as constant syncing.
+fn busy(items: &[TransferItem], jobs: &[JobItem]) -> bool {
+    !items.is_empty() || jobs.iter().any(|j| !j.background)
 }
 
 /// The phase a running mount is in. A pause is the user's own doing and says
@@ -547,11 +561,7 @@ fn main() -> Result<()> {
             heard.take(feed);
         }
         let st = match &heard.status {
-            Some(status) => status_state(
-                status,
-                sync_line(&heard.items, &heard.jobs),
-                &default_mountpoint,
-            ),
+            Some(status) => status_state(status, &heard.items, &heard.jobs, &default_mountpoint),
             // Lost the daemon: ask once, which describes the sign-in instead.
             None => poll_state(&socket, &default_mountpoint),
         };
@@ -594,6 +604,39 @@ mod tests {
         assert_eq!(phase_of(false, 0, false, true), Phase::Offline);
         assert_eq!(phase_of(false, 0, true, true), Phase::Syncing);
         assert_eq!(phase_of(false, 0, true, false), Phase::Synced);
+    }
+
+    fn job(title: &str, background: bool) -> JobItem {
+        JobItem {
+            title: title.to_string(),
+            detail: String::new(),
+            done: 0,
+            total: 0,
+            background,
+        }
+    }
+
+    #[test]
+    fn a_routine_scan_is_not_busy_but_a_sync_is() {
+        assert!(!busy(&[], &[]));
+        assert!(!busy(&[], &[job("Checking Documents", true)]));
+        assert!(busy(
+            &[],
+            &[
+                job("Checking Documents", true),
+                job("Syncing Photos", false)
+            ]
+        ));
+        assert!(busy(&[], &[job("Uploading files", false)]));
+    }
+
+    #[test]
+    fn a_job_from_an_older_daemon_counts_as_busy() {
+        let job: JobItem = serde_json::from_str(
+            r#"{"title":"Checking Documents","detail":"","done":0,"total":0}"#,
+        )
+        .unwrap();
+        assert!(!job.background);
     }
 
     #[test]

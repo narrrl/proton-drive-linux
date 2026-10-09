@@ -439,6 +439,10 @@ fn other_computer_row(ui: &Rc<Ui>, dev: &DeviceInfo) -> adw::ActionRow {
     menu.item(&gettext("Restore to This Computer…"), move || {
         prompt_restore_folders(&ui_c, Some((uid_c.clone(), name_c.clone())))
     });
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Move to This Computer…"), move || {
+        prompt_migrate_device(&ui_c, &uid_c, &name_c)
+    });
     menu.section();
     let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
     menu.item(&gettext("Rename…"), move || {
@@ -483,9 +487,7 @@ fn repaint_device_crumb(ui: &Rc<Ui>, nav: &[(String, String)]) {
         nav.is_empty(),
     ));
     for (i, (_, name)) in nav.iter().enumerate() {
-        let sep = gtk4::Label::new(Some("›"));
-        sep.add_css_class("dim-label");
-        crumb.append(&sep);
+        crumb.append(&crumb_separator());
         crumb.append(&device_crumb_node(ui, name, i + 1, i + 1 == nav.len()));
     }
 }
@@ -494,12 +496,7 @@ fn repaint_device_crumb(ui: &Rc<Ui>, nav: &[(String, String)]) {
 /// that goes back up to `depth` levels below the device list.
 fn device_crumb_node(ui: &Rc<Ui>, label: &str, depth: usize, current: bool) -> gtk4::Widget {
     if current {
-        let l = gtk4::Label::builder()
-            .label(label)
-            .ellipsize(gtk4::pango::EllipsizeMode::Start)
-            .build();
-        l.add_css_class("heading");
-        return l.upcast();
+        return crumb_current(label);
     }
     let button = gtk4::Button::builder().label(label).build();
     button.add_css_class("flat");
@@ -1092,6 +1089,67 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
                 &gettext("Couldn't continue that backup here"),
             );
         }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Ask before moving another computer's folders into this computer's backup,
+/// then offer them for syncing here.
+///
+/// Destructive-looking on purpose: the other computer keeps its device but
+/// loses its folders, and a copy of Proton Drive still running there would
+/// watch them vanish.
+pub(crate) fn prompt_migrate_device(ui: &Rc<Ui>, uid: &str, name: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Move Backup to This Computer?"))
+        // Translators: {name} is the name of the other computer whose folders move to this one.
+        .body(gettext_f(
+            "The folders backed up by “{name}” move into this computer's backup in Proton Drive, and you choose where they go on this computer. “{name}” stays in your account, without those folders.\n\nStop Proton Drive on “{name}” first. Otherwise it sees its folders disappear.",
+            &[("name", name)],
+        ))
+        .build();
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("move", &gettext("Move Here"));
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    // Translators: {name} is the name of the computer whose folders moved to this one.
+    let done = gettext_f("Moved the backup of “{name}”", &[("name", name)]);
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "move" {
+            return;
+        }
+        ui.busy_begin();
+        let rx = spawn_request(
+            ui.dirs.control_socket(),
+            Request::MigrateDevice { uid: uid.clone() },
+        );
+        let (ui, done) = (ui.clone(), done.clone());
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            ui.busy_end();
+            let failed = gettext("Couldn't move that backup");
+            match result {
+                Ok(Ok(Response::Ok { .. })) => {
+                    reload_sync_pages(&ui);
+                    toast(&ui, &done);
+                    // The folders are this computer's now, so its own restore
+                    // picker is where the user chooses their local paths.
+                    prompt_restore_folders(&ui, None);
+                }
+                Ok(Ok(Response::Error { message, kind })) => {
+                    toast_failure(&ui, &failed, &message, kind)
+                }
+                _ => toast_error(
+                    &ui,
+                    &failed,
+                    &gettext("The Proton Drive service didn't respond."),
+                ),
+            }
+        });
     });
     dialog.present(win.as_ref());
 }

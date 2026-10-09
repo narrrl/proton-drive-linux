@@ -484,9 +484,7 @@ fn repaint_shared_crumb(ui: &Rc<Ui>, nav: &[(String, String)]) {
         nav.is_empty(),
     ));
     for (i, (_, name)) in nav.iter().enumerate() {
-        let sep = gtk4::Label::new(Some("›"));
-        sep.add_css_class("dim-label");
-        crumb.append(&sep);
+        crumb.append(&crumb_separator());
         crumb.append(&shared_crumb_node(ui, name, i + 1, i + 1 == nav.len()));
     }
 }
@@ -495,12 +493,7 @@ fn repaint_shared_crumb(ui: &Rc<Ui>, nav: &[(String, String)]) {
 /// that goes back up to `depth` folders below the top level.
 fn shared_crumb_node(ui: &Rc<Ui>, label: &str, depth: usize, current: bool) -> gtk4::Widget {
     if current {
-        let l = gtk4::Label::builder()
-            .label(label)
-            .ellipsize(gtk4::pango::EllipsizeMode::Start)
-            .build();
-        l.add_css_class("heading");
-        return l.upcast();
+        return crumb_current(label);
     }
     let button = gtk4::Button::builder().label(label).build();
     button.add_css_class("flat");

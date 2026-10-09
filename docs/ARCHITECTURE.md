@@ -310,8 +310,10 @@ its changes go through the queue like My files.
 A filesystem watcher (`notify`) and a remote poll every 120 s feed a debounced pass (2 s, at most
 30 s). Passes are serialized per daemon. A pass:
 
-1. **Walks the local tree.** Any `readdir`, metadata or permission failure marks the scan
-   incomplete, and an incomplete scan cannot delete anything.
+1. **Walks the local tree.** A path the user may not read, an entry that vanishes mid-scan and a
+   name that is not UTF-8 are left out, and the pass drops everything under them, as it drops
+   ignored paths, so a left-out path is never read as deleted. An unreadable root and any other
+   I/O error fail the pass.
 2. **Walks the remote tree.**
 3. **Loads the baseline**, the `sync_entry` rows: both sides as of the last successful pass.
 4. **Classifies each path** by comparing local, remote and baseline, with `(mtime, size)` as the
@@ -376,6 +378,12 @@ in part.
 Restore lists the device's folders, proposes a local path from the profile, and on confirmation
 adds a synced folder bound to the remote uid. The download is an ordinary pass against an empty
 baseline. The user side is in [RECOVERY.md](RECOVERY.md).
+
+`Core::migrate_device` moves another device's top-level folders under this machine's device root.
+Device roots are separate shares on the main volume, so each folder is one server-side move that
+keeps its uid. A name already taken here gets the other device's name as a suffix. A synced folder
+that already tracked one of them keeps its `remote_uid` and only has its `remote_share_id`
+re-pointed. The moved folders are then offered by the ordinary restore.
 
 ---
 

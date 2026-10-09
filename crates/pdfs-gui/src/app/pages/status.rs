@@ -381,23 +381,34 @@ pub(crate) fn build_main_page() -> MainWidgets {
         .hexpand(true)
         .ellipsize(gtk4::pango::EllipsizeMode::Middle)
         .build();
+    // The app's one menu, on the account row the way Proton's own apps keep it:
+    // app-wide entries first, the account's last. The whole row opens it, and
+    // F10 too, as the primary menu.
+    let app_section = gio::Menu::new();
+    app_section.append(Some(&gettext("Preferences")), Some("win.preferences"));
+    app_section.append(Some(&gettext("Keyboard Shortcuts")), Some("win.shortcuts"));
+    app_section.append(
+        Some(&gettext("About Proton Drive for Linux")),
+        Some("win.about"),
+    );
+    let account_section = gio::Menu::new();
+    account_section.append(Some(&gettext("Sign Out…")), Some("win.sign-out"));
     let account_menu = gio::Menu::new();
-    account_menu.append(Some(&gettext("Preferences")), Some("win.preferences"));
-    let sign_out = gio::Menu::new();
-    sign_out.append(Some(&gettext("Sign Out…")), Some("win.sign-out"));
-    account_menu.append_section(None, &sign_out);
-    let account_button = gtk4::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .tooltip_text(gettext("Account"))
+    account_menu.append_section(None, &app_section);
+    account_menu.append_section(None, &account_section);
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    row.append(&avatar);
+    row.append(&account_name);
+    row.append(&gtk4::Image::from_icon_name("view-more-symbolic"));
+    let account = gtk4::MenuButton::builder()
+        .child(&row)
+        .tooltip_text(gettext("Main menu"))
         .menu_model(&account_menu)
-        .valign(gtk4::Align::Center)
+        .direction(gtk4::ArrowType::Up)
+        .primary(true)
         .build();
-    account_button.add_css_class("flat");
-    let account = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    account.add_css_class("flat");
     account.add_css_class("sidebar-account");
-    account.append(&avatar);
-    account.append(&account_name);
-    account.append(&account_button);
 
     let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     footer.add_css_class("sidebar-footer");

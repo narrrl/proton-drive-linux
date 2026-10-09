@@ -34,6 +34,7 @@ use pages::verify::*;
 use reload::{LoadTicket, Loader, replace_items};
 use theme::{load_resources, proton_theme_active, set_proton_theme};
 use widgets::compat::*;
+use widgets::crumb::*;
 use widgets::details::*;
 use widgets::file_list::*;
 use widgets::menu::*;
@@ -830,7 +831,6 @@ fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&brand));
-    header.pack_end(&build_primary_menu());
 
     let scroll = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -1153,25 +1153,7 @@ fn toast_failure(ui: &Rc<Ui>, what: &str, message: &str, kind: ErrorKind) {
     }
 }
 
-/// The sidebar's primary (hamburger) menu: the app-level entries that don't
-/// belong on any one page.
-fn build_primary_menu() -> gtk4::MenuButton {
-    let menu = gio::Menu::new();
-    menu.append(Some(&gettext("Preferences")), Some("win.preferences"));
-    menu.append(Some(&gettext("Keyboard Shortcuts")), Some("win.shortcuts"));
-    menu.append(
-        Some(&gettext("About Proton Drive for Linux")),
-        Some("win.about"),
-    );
-    gtk4::MenuButton::builder()
-        .icon_name("pdfs-menu-symbolic")
-        .tooltip_text(gettext("Main menu"))
-        .primary(true)
-        .menu_model(&menu)
-        .build()
-}
-
-/// Back the primary and account menus' entries with window actions.
+/// Back the main menu's entries with window actions.
 fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     let preferences = gio::SimpleAction::new("preferences", None);
     let ui_prefs = ui.clone();

@@ -744,6 +744,9 @@ struct Core {
     /// uploading that same tree — the engine would upload files as they vanish
     /// and then walk the FUSE mount as if it were local.
     sync_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    /// Per-sync-folder paths the last pass could not read, so the activity feed
+    /// says so when the set changes rather than on every poll (B196).
+    sync_unscanned: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Nodes this daemon changed on the remote itself, and how many echoes of
     /// those changes the event feed still owes us.
     ///
@@ -1031,7 +1034,9 @@ impl Core {
 
         let core = self.clone();
         std::thread::spawn(move || {
-            let job = core.transfers.begin_job("Checking the cache database");
+            let job = core
+                .transfers
+                .begin_background_job("Checking the cache database");
             job.detail("Verifying every page");
             let problems = match core.db.integrity_check() {
                 Ok(problems) => problems,

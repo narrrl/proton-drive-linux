@@ -14,7 +14,6 @@
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-details-pane-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-link-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-map-symbolic.svg</file>
-    <file preprocess="xml-stripblanks">scalable/actions/pdfs-menu-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-people-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-share-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-sync-symbolic.svg</file>
