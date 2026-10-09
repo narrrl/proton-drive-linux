@@ -1220,9 +1220,7 @@ pub(crate) fn repaint_crumb(ui: &Rc<Ui>, path: &str) {
     ));
     let mut acc = String::new();
     for (i, seg) in segments.iter().enumerate() {
-        let sep = gtk4::Label::new(Some("›"));
-        sep.add_css_class("dim-label");
-        ui.browser.crumb.append(&sep);
+        ui.browser.crumb.append(&crumb_separator());
         acc = if acc.is_empty() {
             seg.to_string()
         } else {
@@ -1237,12 +1235,7 @@ pub(crate) fn repaint_crumb(ui: &Rc<Ui>, path: &str) {
 /// flat button that navigates to `target` (clearing any active search first).
 pub(crate) fn crumb_node(ui: &Rc<Ui>, label: &str, target: &str, current: bool) -> gtk4::Widget {
     if current {
-        let l = gtk4::Label::builder()
-            .label(label)
-            .ellipsize(gtk4::pango::EllipsizeMode::Start)
-            .build();
-        l.add_css_class("heading");
-        return l.upcast();
+        return crumb_current(label);
     }
     let button = gtk4::Button::builder().label(label).build();
     button.add_css_class("flat");

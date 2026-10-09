@@ -34,6 +34,7 @@ use pages::verify::*;
 use reload::{LoadTicket, Loader, replace_items};
 use theme::{load_resources, proton_theme_active, set_proton_theme};
 use widgets::compat::*;
+use widgets::crumb::*;
 use widgets::details::*;
 use widgets::file_list::*;
 use widgets::menu::*;

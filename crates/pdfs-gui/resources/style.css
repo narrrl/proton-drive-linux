@@ -48,6 +48,9 @@
 .badge-cloud { color: color-mix(in srgb, currentColor 55%, transparent); }
 .badge-issue { color: var(--error-color); }
 .browser-statusbar { background-color: alpha(currentColor, 0.025); }
+/* The folder on screen, last in the breadcrumb trail: a flat button's side
+ * padding, so the "›" before it is spaced like the ones between buttons. */
+.crumb-current { padding: 0 10px; }
 scale.browser-status-meter trough { min-width: 104px; min-height: 6px; }
 .bulk-bar { padding: 6px 8px; border-radius: 12px; background: color-mix(in srgb, var(--accent-bg-color) 12%, transparent); }
 .dropzone { border: 2px dashed alpha(currentColor, 0.25); border-radius: 16px; padding: 28px 18px; transition: background 160ms ease, border-color 160ms ease; }
