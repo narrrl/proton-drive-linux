@@ -21,6 +21,9 @@
 //! such separation to protect and are stored, as they always were.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -31,6 +34,7 @@ use proton_sdk::api::{HumanVerification, HumanVerificationCredential};
 use proton_sdk::cache::EncryptedCacheRepository;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::error::ProtonError;
+use proton_sdk::http::Tokens;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
 use proton_sdk::telemetry::TracingTelemetry;
 use serde::{Deserialize, Serialize};
@@ -307,8 +311,8 @@ pub async fn login_verified(
         }
     };
 
-    register_refresh_handler(&session);
     let tokens = session.current_tokens().await;
+    register_refresh_handler(&session, tokens.refresh_token.clone());
     let stored = StoredSession {
         session_id: session.session_id().as_str().to_owned(),
         username: session.username().to_owned(),
@@ -360,11 +364,11 @@ fn keep_passphrases(
     let outcome = if remember {
         stored.key_passphrases = Some(encode(passphrases));
         // Best-effort: a system without a kernel keyring has nothing to clear.
-        let _ = kernelkey::clear();
+        let _ = kernelkey::PASSPHRASES.clear();
         Ok(())
     } else {
         stored.key_passphrases = None;
-        kernelkey::store(&encode_secret(passphrases)).map_err(|e| {
+        kernelkey::PASSPHRASES.store(&encode_secret(passphrases)).map_err(|e| {
             Error::Other(format!(
                 "the kernel keyring is unavailable, so the unlock cannot be kept for this session: {e}"
             ))
@@ -465,7 +469,7 @@ fn find_passphrases(stored: &StoredSession) -> Result<Option<(KeyPassphrases, Ke
     if let Some(found) = stored.key_passphrases.as_ref().and_then(decode) {
         return Ok(Some((found, KeyState::Stored)));
     }
-    match kernelkey::load() {
+    match kernelkey::PASSPHRASES.load() {
         Ok(Some(secret)) => Ok(decode_secret(&secret).map(|p| (p, KeyState::Session))),
         Ok(None) => Ok(None),
         // No keyring on this system: nothing was ever kept there.
@@ -491,17 +495,18 @@ pub async fn unlock(mailbox: &str, remember: bool) -> Result<()> {
         return Err(Error::ReloginRequired);
     }
     let mailbox = Zeroizing::new(mailbox.to_owned());
-    let session = ProtonApiSession::resume(client_config(), stored.to_params())?;
-    register_refresh_handler(&session);
+    let session = resume_stored(&stored)?;
     let passphrases =
         derive_verified(&session, mailbox.as_bytes(), stored.key_salts.clone()).await?;
-    keep_passphrases(stored, &passphrases, remember)
+    // Read again: verifying may have rotated the tokens, and the copy read
+    // above would put the spent refresh token back.
+    keep_passphrases(load()?, &passphrases, remember)
 }
 
 /// Drop the passphrases held in kernel memory, so the account is locked again
 /// until [`unlock`]. With `forget`, also those in the keyring blob.
 pub fn lock(forget: bool) -> Result<()> {
-    kernelkey::clear()?;
+    kernelkey::PASSPHRASES.clear()?;
     if forget {
         let mut stored = load()?;
         if stored.key_passphrases.take().is_some() {
@@ -529,9 +534,10 @@ pub fn logout() -> Result<()> {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
-    if let Err(e) = kernelkey::clear() {
+    if let Err(e) = kernelkey::PASSPHRASES.clear() {
         tracing::warn!(error = %e, "clearing the kernel-keyring unlock on logout failed");
     }
+    let _ = kernelkey::UNSAVED_TOKENS.clear();
     match keyring_entry()?.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
@@ -551,8 +557,7 @@ pub fn logout() -> Result<()> {
 /// a daemon starting offline can still mount from its cache.
 pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
     let stored = load()?;
-    let session = ProtonApiSession::resume(client_config(), stored.to_params())?;
-    register_refresh_handler(&session);
+    let session = resume_stored(&stored)?;
 
     let passphrases = match find_passphrases(&stored)? {
         Some((passphrases, _)) => passphrases,
@@ -565,6 +570,48 @@ pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
         &passphrases,
     );
     Ok((client, session))
+}
+
+/// Resume `stored`, with the rotation the keyring refused last time put in
+/// first, if there is one: Proton has spent the stored refresh token then,
+/// and the kernel keyring holds the one that replaced it (B61).
+fn resume_stored(stored: &StoredSession) -> Result<ProtonApiSession> {
+    let unsaved = recover_unsaved(stored);
+    let mut resumed = stored.clone();
+    if let Some(tokens) = &unsaved {
+        tracing::info!("resuming with session tokens the keyring refused last time");
+        resumed.access_token = tokens.access_token.clone();
+        resumed.refresh_token = tokens.refresh_token.clone();
+    }
+    let session = ProtonApiSession::resume(client_config(), resumed.to_params())?;
+    let sink = register_refresh_handler(&session, stored.refresh_token.clone());
+    if let Some(tokens) = unsaved {
+        let _ = sink.rotated(tokens);
+    }
+    Ok(session)
+}
+
+/// The rotation the kernel keyring holds for `stored`, if it belongs there.
+/// One that does not is from an older login, or was written since, and is
+/// dropped.
+fn recover_unsaved(stored: &StoredSession) -> Option<Tokens> {
+    let kept = match kernelkey::UNSAVED_TOKENS.load() {
+        Ok(kept) => kept?,
+        Err(e) => {
+            tracing::debug!(error = %e, "kernel keyring unavailable; no unsaved tokens to recover");
+            return None;
+        }
+    };
+    match serde_json::from_slice::<UnsavedRotation>(&kept) {
+        Ok(unsaved) if unsaved.belongs_in(stored) => Some(Tokens {
+            access_token: unsaved.access_token,
+            refresh_token: unsaved.refresh_token,
+        }),
+        _ => {
+            let _ = kernelkey::UNSAVED_TOKENS.clear();
+            None
+        }
+    }
 }
 
 /// Turn a blob written by 3.0.x — which holds the mailbox password — into one
@@ -597,11 +644,14 @@ async fn migrate_legacy(
         stored.key_salts.clone()
     };
 
-    let mut migrated = stored.clone();
+    let verified = derive_verified(session, legacy.as_bytes(), key_salts.clone()).await;
+    // Read again: the calls above may have rotated the tokens, and `stored`
+    // would put the spent refresh token back.
+    let mut migrated = load()?;
     migrated.mailbox_password = String::new();
-    migrated.key_salts = key_salts.clone();
+    migrated.key_salts = key_salts;
 
-    match derive_verified(session, legacy.as_bytes(), key_salts).await {
+    match verified {
         Ok(passphrases) => {
             migrated.key_passphrases = Some(encode(&passphrases));
             write_stored(&migrated)?;
@@ -659,39 +709,309 @@ fn tune(client: ProtonDriveClient, passphrases: &KeyPassphrases) -> ProtonDriveC
     }
 }
 
-/// Write the session's current tokens back to the keyring.
+/// Write any rotation of the session's tokens that has not reached the keyring
+/// yet. A best-effort last chance before the process exits.
 ///
-/// Everything else in the stored blob — salts, passphrases — is preserved, so
-/// this never undoes an [`unlock`] or [`lock`] made since the session started.
-/// Call whenever the session may have rotated its tokens so a later
-/// [`resume_client`] presents a live refresh token.
-pub async fn persist(session: &ProtonApiSession) -> Result<()> {
-    let tokens = session.current_tokens().await;
-    store_tokens(tokens.access_token, tokens.refresh_token)
+/// Rotations are written as they happen (see [`register_refresh_handler`]), so
+/// this usually has nothing to do. It never writes the session's current
+/// tokens for their own sake: the blob may by now belong to a newer login, or
+/// hold a newer rotation, and writing them would put a spent refresh token
+/// over a live one.
+pub fn persist(session: &ProtonApiSession) -> Result<()> {
+    let sink = TOKEN_SINKS
+        .lock()
+        .get(session.session_id().as_str())
+        .cloned();
+    match sink {
+        Some(sink) => sink.flush(),
+        None => Ok(()),
+    }
 }
 
-fn store_tokens(access_token: String, refresh_token: String) -> Result<()> {
-    let mut stored = load()?;
-    stored.access_token = access_token;
-    stored.refresh_token = refresh_token;
-    write_stored(&stored)
+/// Whether the keyring holds a session newer than any this process runs on:
+/// another login, or one of this process's sessions rotated by another
+/// process (`pdfs unlock` resumes the same login and may refresh it).
+///
+/// The refresh token this process holds is spent then, and Proton refuses it
+/// as if the session were gone. A daemon asks this before it reports the
+/// session expired, and resumes the stored one instead.
+pub fn stored_session_is_newer() -> bool {
+    // Nothing to compare with, and no keyring to wake up for it.
+    if TOKEN_SINKS.lock().is_empty() {
+        return false;
+    }
+    let Ok(stored) = load() else {
+        return false;
+    };
+    let sinks = TOKEN_SINKS.lock();
+    match sinks.get(&stored.session_id) {
+        Some(sink) => sink.state.lock().stored_refresh != stored.refresh_token,
+        None => !sinks.is_empty(),
+    }
+}
+
+/// Whether a session in this process holds refreshed tokens the keyring has
+/// not taken yet. They are retried and kept in the kernel keyring meanwhile,
+/// which a reboot clears, so the user is asked to unlock the keyring (B61).
+pub fn tokens_unsaved() -> bool {
+    TOKEN_SINKS
+        .lock()
+        .values()
+        .any(|sink| sink.state.lock().unsaved.is_some())
+}
+
+/// Where each live session in this process writes its rotated tokens, by
+/// session id, for [`persist`] to find.
+static TOKEN_SINKS: parking_lot::Mutex<BTreeMap<String, Arc<TokenSink>>> =
+    parking_lot::Mutex::new(BTreeMap::new());
+
+/// One session's rotated tokens on their way to the keyring.
+///
+/// Proton refresh tokens are single-use, so a rotation has to reach the
+/// keyring, and it must reach only the blob it belongs to. That is the blob of
+/// this session id that still holds the refresh token this session last knew
+/// it to hold. Anything else means the blob moved on without this session: a
+/// new login, or another session on the same login (`pdfs unlock`) that
+/// rotated first. Writing into it would replace a live refresh token with a
+/// spent one, and the next start fails with `InvalidRefreshToken` (issue #35).
+struct TokenSink {
+    session_id: String,
+    state: parking_lot::Mutex<SinkState>,
+    /// Whether a thread is retrying a write the keyring refused.
+    retrying: AtomicBool,
+}
+
+/// How long to wait before each new try at a write the keyring refused; the
+/// last delay repeats until it succeeds. A locked or restarting keyring
+/// usually comes back within seconds, and one that does not must not be asked
+/// in a tight loop.
+const KEYRING_RETRY: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(300),
+];
+
+struct SinkState {
+    /// The refresh token the blob holds for this session, as far as this
+    /// session knows: the one it started from, or the last one it wrote.
+    stored_refresh: String,
+    /// The latest rotation, until the keyring has taken it.
+    unsaved: Option<Tokens>,
+    /// Whether `unsaved` is also in [`kernelkey::UNSAVED_TOKENS`].
+    kept: bool,
+}
+
+/// A rotation the keyring refused, as kept in the kernel keyring until it is
+/// written: the tokens, and the blob they go into.
+#[derive(Serialize, Deserialize)]
+struct UnsavedRotation {
+    session_id: String,
+    /// The refresh token this rotation spent, which the blob still holds.
+    spent: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+impl UnsavedRotation {
+    /// Whether `stored` is the blob this rotation was refused for, still
+    /// holding the refresh token it spent.
+    fn belongs_in(&self, stored: &StoredSession) -> bool {
+        self.session_id == stored.session_id && self.spent == stored.refresh_token
+    }
+}
+
+/// What became of a rotation offered to a stored blob.
+#[derive(Debug, PartialEq, Eq)]
+enum Rotation {
+    /// The blob is this session's and took the tokens.
+    Taken,
+    /// The blob moved on without this session; it is left alone.
+    MovedOn,
+}
+
+/// Put `tokens` into `stored` if it is still this session's blob: the same
+/// session id, holding the refresh token this session last left in it, or
+/// already holding this very rotation (another process wrote it first).
+fn take_rotation(
+    stored: &mut StoredSession,
+    session_id: &str,
+    stored_refresh: &str,
+    tokens: &Tokens,
+) -> Rotation {
+    if stored.session_id != session_id
+        || (stored.refresh_token != stored_refresh && stored.refresh_token != tokens.refresh_token)
+    {
+        return Rotation::MovedOn;
+    }
+    stored.access_token = tokens.access_token.clone();
+    stored.refresh_token = tokens.refresh_token.clone();
+    Rotation::Taken
+}
+
+impl TokenSink {
+    fn new(session_id: &str, stored_refresh: String) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            state: parking_lot::Mutex::new(SinkState {
+                stored_refresh,
+                unsaved: None,
+                kept: false,
+            }),
+            retrying: AtomicBool::new(false),
+        }
+    }
+
+    /// Take a new rotation and try to write it. If the keyring refuses, keep
+    /// trying in the background: until then the only live refresh token is in
+    /// memory, and a stop that cannot write it either loses the session
+    /// (`docs/BUGS.md` B61).
+    fn rotated(self: &Arc<Self>, tokens: Tokens) -> Result<()> {
+        self.state.lock().unsaved = Some(tokens);
+        let written = self.flush();
+        if let Err(e) = &written {
+            tracing::error!(
+                error = %e,
+                "the keyring refused the refreshed session tokens; retrying"
+            );
+            self.keep_in_kernel();
+            self.retry_in_background();
+        }
+        written
+    }
+
+    /// Keep the unsaved rotation in the kernel keyring too, so a process that
+    /// dies before the retry lands does not take the only live refresh token
+    /// with it. The next resume puts it back (see [`resume_stored`]).
+    fn keep_in_kernel(&self) {
+        let mut state = self.state.lock();
+        let Some(tokens) = &state.unsaved else {
+            return;
+        };
+        let unsaved = UnsavedRotation {
+            session_id: self.session_id.clone(),
+            spent: state.stored_refresh.clone(),
+            access_token: tokens.access_token.clone(),
+            refresh_token: tokens.refresh_token.clone(),
+        };
+        let Ok(json) = serde_json::to_vec(&unsaved).map(Zeroizing::new) else {
+            return;
+        };
+        match kernelkey::UNSAVED_TOKENS.store(&json) {
+            Ok(()) => state.kept = true,
+            Err(e) => tracing::error!(
+                error = %e,
+                "the kernel keyring refused them too; if this process stops first, \
+                 the next start needs `pdfs login`"
+            ),
+        }
+    }
+
+    /// Retry the unsaved rotation on [`KEYRING_RETRY`] until it is written or
+    /// has nowhere left to go. One thread per sink; a newer rotation simply
+    /// replaces what it is retrying.
+    fn retry_in_background(self: &Arc<Self>) {
+        if self.retrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sink = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-keyring-retry".into())
+            .spawn(move || {
+                loop {
+                    let delays = KEYRING_RETRY
+                        .into_iter()
+                        .chain(std::iter::repeat(KEYRING_RETRY[KEYRING_RETRY.len() - 1]));
+                    for delay in delays {
+                        std::thread::sleep(delay);
+                        match sink.flush() {
+                            Ok(()) => break,
+                            Err(e) => tracing::debug!(error = %e, ?delay, "keyring still refuses"),
+                        }
+                    }
+                    sink.retrying.store(false, Ordering::SeqCst);
+                    // A rotation refused after the last try succeeded found
+                    // this thread still running, and started none of its own.
+                    if sink.state.lock().unsaved.is_none()
+                        || sink.retrying.swap(true, Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            self.retrying.store(false, Ordering::SeqCst);
+            tracing::error!(error = %e, "could not start retrying the keyring write");
+        }
+    }
+
+    /// Write the unsaved rotation, if there is one. A blob that moved on, or
+    /// is gone with a logout, drops it: there is nothing it may still go into.
+    fn flush(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        let Some(tokens) = state.unsaved.clone() else {
+            return Ok(());
+        };
+        let mut stored = match load() {
+            Ok(stored) => stored,
+            Err(Error::NotLoggedIn) => {
+                state.settle();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        match take_rotation(
+            &mut stored,
+            &self.session_id,
+            &state.stored_refresh,
+            &tokens,
+        ) {
+            Rotation::Taken => {
+                write_stored(&stored)?;
+                state.stored_refresh = tokens.refresh_token;
+                tracing::info!("successfully auto-persisted refreshed tokens in keyring");
+            }
+            Rotation::MovedOn => {
+                tracing::info!(
+                    "the stored session has moved on; not writing this session's tokens over it"
+                );
+            }
+        }
+        state.settle();
+        Ok(())
+    }
+}
+
+impl SinkState {
+    /// The unsaved rotation has gone where it can: drop it, and its copy in
+    /// the kernel keyring.
+    fn settle(&mut self) {
+        self.unsaved = None;
+        if std::mem::take(&mut self.kept) {
+            let _ = kernelkey::UNSAVED_TOKENS.clear();
+        }
+    }
 }
 
 /// Persist rotated tokens the moment the session obtains them.
 ///
-/// The handler re-reads the stored blob instead of capturing one, so it cannot
-/// write back a stale copy over a later unlock or lock — and cannot resurrect a
-/// session that was logged out while the daemon still ran.
-fn register_refresh_handler(session: &ProtonApiSession) {
+/// `stored_refresh` is the refresh token the keyring holds for this session
+/// now. The handler re-reads the stored blob instead of capturing one, so it
+/// cannot write back a stale copy over a later unlock or lock, and it writes
+/// only into a blob that is still this session's (see [`TokenSink`]), so it
+/// cannot resurrect a logged-out session or overwrite a newer login.
+fn register_refresh_handler(session: &ProtonApiSession, stored_refresh: String) -> Arc<TokenSink> {
+    let session_id = session.session_id().as_str();
+    let sink = Arc::new(TokenSink::new(session_id, stored_refresh));
+    TOKEN_SINKS
+        .lock()
+        .insert(session_id.to_owned(), Arc::clone(&sink));
+    let handler = Arc::clone(&sink);
     session.http().set_on_tokens_refreshed(move |tokens| {
-        match store_tokens(tokens.access_token, tokens.refresh_token) {
-            Ok(()) => tracing::info!("successfully auto-persisted refreshed tokens in keyring"),
-            Err(Error::NotLoggedIn) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to auto-persist refreshed tokens in keyring")
-            }
-        }
+        // A refusal is logged and retried by the sink itself.
+        let _ = handler.rotated(tokens);
     });
+    sink
 }
 
 #[cfg(test)]
@@ -785,5 +1105,169 @@ mod tests {
         let (found, origin) = find_passphrases(&stored).unwrap().unwrap();
         assert_eq!(origin, KeyState::Stored);
         assert_eq!(found, passphrases());
+    }
+
+    fn tokens(access: &str, refresh: &str) -> Tokens {
+        Tokens {
+            access_token: access.into(),
+            refresh_token: refresh.into(),
+        }
+    }
+
+    #[test]
+    fn own_session_tokens_are_written() {
+        let mut stored: StoredSession = serde_json::from_str(&blob("")).unwrap();
+        assert_eq!(
+            take_rotation(&mut stored, "s", "r", &tokens("a2", "r2")),
+            Rotation::Taken
+        );
+        assert_eq!(stored.access_token, "a2");
+        assert_eq!(stored.refresh_token, "r2");
+    }
+
+    /// Issue #35: `pdfs login` stores a new session and restarts the daemon,
+    /// and the old daemon's stop wrote its spent tokens into the new blob.
+    #[test]
+    fn tokens_of_another_session_are_not_written() {
+        let mut stored: StoredSession = serde_json::from_str(&blob("")).unwrap();
+        assert_eq!(
+            take_rotation(&mut stored, "old", "r", &tokens("a2", "r2")),
+            Rotation::MovedOn
+        );
+        assert_eq!(stored.refresh_token, "r");
+    }
+
+    /// `pdfs unlock` resumes a second session on the same login. Once it has
+    /// rotated, the daemon's copy of the refresh token is spent.
+    #[test]
+    fn tokens_are_not_written_over_a_newer_rotation_of_the_same_session() {
+        let mut stored: StoredSession = serde_json::from_str(&blob("")).unwrap();
+        assert_eq!(
+            take_rotation(&mut stored, "s", "spent", &tokens("a2", "r2")),
+            Rotation::MovedOn
+        );
+        assert_eq!(stored.refresh_token, "r");
+    }
+
+    /// `pdfs unlock` wrote this very rotation first, from the same session.
+    #[test]
+    fn a_rotation_already_in_the_blob_is_taken() {
+        let mut stored = stored_with("r2");
+        assert_eq!(
+            take_rotation(&mut stored, "s", "r", &tokens("a2", "r2")),
+            Rotation::Taken
+        );
+    }
+
+    /// The keyring is one store per process, so the tests that use it,
+    /// through `keyring-core`'s in-memory store, take turns.
+    fn mock_keyring() -> parking_lot::MutexGuard<'static, ()> {
+        static KEYRING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let turn = KEYRING.lock();
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        turn
+    }
+
+    fn stored_with(refresh: &str) -> StoredSession {
+        serde_json::from_str(&blob("").replace(r#""r""#, &format!("{refresh:?}"))).unwrap()
+    }
+
+    #[test]
+    fn a_sink_keeps_writing_its_own_rotations_and_stops_at_a_new_login() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
+        sink.rotated(tokens("a2", "r2")).unwrap();
+        sink.rotated(tokens("a3", "r3")).unwrap();
+        assert_eq!(load().unwrap().refresh_token, "r3");
+
+        // A new login replaces the blob; the old session's next rotation, and
+        // its stop, leave it alone.
+        let mut login = stored_with("fresh");
+        login.session_id = "new".into();
+        write_stored(&login).unwrap();
+        sink.rotated(tokens("a4", "r4")).unwrap();
+        sink.flush().unwrap();
+        let now = load().unwrap();
+        assert_eq!(now.session_id, "new");
+        assert_eq!(now.refresh_token, "fresh");
+    }
+
+    /// `pdfs unlock` rotated the daemon's session behind its back: the
+    /// daemon's refresh token is spent, and the keyring holds the live one.
+    #[test]
+    fn a_session_rotated_by_another_process_is_newer_in_the_keyring() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        TOKEN_SINKS
+            .lock()
+            .insert("s".into(), Arc::new(TokenSink::new("s", "r".into())));
+        assert!(!stored_session_is_newer());
+
+        write_stored(&stored_with("r2")).unwrap();
+        assert!(stored_session_is_newer());
+
+        let mut login = stored_with("fresh");
+        login.session_id = "new".into();
+        write_stored(&login).unwrap();
+        assert!(stored_session_is_newer());
+        TOKEN_SINKS.lock().remove("s");
+    }
+
+    /// B61: a rotation the keyring refused lived only in memory.
+    #[test]
+    fn a_rotation_the_keyring_refused_is_written_once_it_takes_it() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
+
+        let entry = keyring_entry().unwrap();
+        let cred = entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap();
+        cred.set_error(keyring_core::Error::NoStorageAccess(
+            std::io::Error::other("locked").into(),
+        ));
+        assert!(sink.rotated(tokens("a2", "r2")).is_err());
+        // Until it is written, a stop does not lose it: the next resume finds
+        // it in the kernel keyring, where one is offered.
+        let kept = sink.state.lock().kept;
+        if kept {
+            assert_eq!(
+                recover_unsaved(&stored_with("r")).unwrap().refresh_token,
+                "r2"
+            );
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while load().unwrap().refresh_token != "r2" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry never wrote the rotation"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sink.state.lock().unsaved.is_none());
+        if kept {
+            assert!(kernelkey::UNSAVED_TOKENS.load().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn an_unsaved_rotation_goes_only_into_the_blob_it_was_refused_for() {
+        let unsaved = UnsavedRotation {
+            session_id: "s".into(),
+            spent: "r".into(),
+            access_token: "a2".into(),
+            refresh_token: "r2".into(),
+        };
+        assert!(unsaved.belongs_in(&stored_with("r")));
+        // Written since, by a retry or another process.
+        assert!(!unsaved.belongs_in(&stored_with("r2")));
+        let mut login = stored_with("r");
+        login.session_id = "new".into();
+        assert!(!unsaved.belongs_in(&login));
     }
 }

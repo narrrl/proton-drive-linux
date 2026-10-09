@@ -278,6 +278,23 @@ fn api_kind(code: proton_sdk::api::ResponseCode) -> ErrorKind {
     }
 }
 
+/// Whether `e` says the session itself is gone: its refresh token was refused,
+/// or the account was deleted or disabled.
+///
+/// Nothing but a new login helps then, and no retry will ever succeed, so a
+/// caller must not take it for a lost connection and wait for it to come back
+/// (issue #35: a revoked session was shown as "offline" for good).
+pub fn session_revoked(e: &proton_sdk::ProtonError) -> bool {
+    use proton_sdk::api::ResponseCode as C;
+    match e {
+        proton_sdk::ProtonError::Api(api) => {
+            api.is_invalid_refresh_token()
+                || matches!(api.code, C::AccountDeleted | C::AccountDisabled)
+        }
+        _ => false,
+    }
+}
+
 /// The result every request-serving method in the daemon returns.
 pub type CoreResult<T> = std::result::Result<T, CoreError>;
 
@@ -307,6 +324,17 @@ mod tests {
         assert_eq!(api_kind(C::TooManyRequests), ErrorKind::Offline);
         // Nothing specific known about it, but Proton did answer.
         assert_eq!(api_kind(C::ProtonDriveUnknown), ErrorKind::Remote);
+    }
+
+    #[test]
+    fn only_a_refused_refresh_or_a_closed_account_revokes_the_session() {
+        assert!(session_revoked(&api(C::InvalidRefreshToken)));
+        assert!(session_revoked(&api(C::AccountDeleted)));
+        assert!(session_revoked(&api(C::AccountDisabled)));
+        // One file the account may not touch says nothing about the session.
+        assert!(!session_revoked(&api(C::Forbidden)));
+        assert!(!session_revoked(&api(C::Timeout)));
+        assert!(!session_revoked(&ProtonError::KeysLocked));
     }
 
     /// The regression this whole pass exists to prevent: before it, every SDK

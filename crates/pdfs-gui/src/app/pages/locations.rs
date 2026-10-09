@@ -46,6 +46,8 @@ pub(crate) struct SyncCard {
     pub(crate) pause: adw::SplitButton,
     /// Whether the last status said paused, so the button knows which way to go.
     pub(crate) paused: Cell<bool>,
+    /// Shown only while Proton refuses the session; opens the sign-in page.
+    pub(crate) sign_in: gtk4::Button,
 }
 
 /// What a folder row's controls are built from. The subtitle and progress bar
@@ -108,6 +110,7 @@ pub(crate) struct LocationsWidgets {
     pub(crate) card_icon: gtk4::Image,
     pub(crate) card_title: gtk4::Label,
     pub(crate) card_detail: gtk4::Label,
+    pub(crate) card_sign_in: gtk4::Button,
     pub(crate) pause: adw::SplitButton,
     pub(crate) queue_group: adw::PreferencesGroup,
     pub(crate) retry_all: gtk4::Button,
@@ -134,7 +137,7 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         .build();
     add_folder.add_css_class("flat");
     let transfers_group = build_transfers_group();
-    let (card, card_icon, card_title, card_detail) = build_sync_card();
+    let (card, card_icon, card_title, card_detail, card_sign_in) = build_sync_card();
     let pause = build_pause_button();
     let (queue_group, retry_all) = build_queue_group();
     let conflicts_group = adw::PreferencesGroup::builder()
@@ -253,6 +256,7 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         card_icon,
         card_title,
         card_detail,
+        card_sign_in,
         pause,
         queue_group,
         retry_all,
@@ -290,6 +294,11 @@ pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk
     let ui_add = ui.clone();
     add_folder.connect_clicked(move |_| prompt_add_sync_folder(&ui_add));
     wire_pause(ui);
+    let ui_sign_in = ui.clone();
+    ui.locations
+        .card
+        .sign_in
+        .connect_clicked(move |_| show_login(&ui_sign_in));
     let ui_retry = ui.clone();
     ui.locations
         .queue
@@ -379,9 +388,15 @@ pub(crate) fn paint_sync_banner(ui: &Rc<Ui>) {
     state.banner.set_revealed(away && title.is_some());
 }
 
-/// The status hero: a large state icon, the state in words, and what it
-/// means.
-fn build_sync_card() -> (gtk4::Box, gtk4::Image, gtk4::Label, gtk4::Label) {
+/// The status hero: a large state icon, the state in words, what it means,
+/// and the way out when there is one only the user can take.
+fn build_sync_card() -> (
+    gtk4::Box,
+    gtk4::Image,
+    gtk4::Label,
+    gtk4::Label,
+    gtk4::Button,
+) {
     let icon = gtk4::Image::builder()
         .icon_name("pdfs-sync-symbolic")
         .pixel_size(48)
@@ -408,9 +423,17 @@ fn build_sync_card() -> (gtk4::Box, gtk4::Image, gtk4::Label, gtk4::Label) {
     let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 18);
     card.add_css_class("card");
     card.add_css_class("sync-card");
+    let sign_in = gtk4::Button::builder()
+        .label(gettext("Sign In Again"))
+        .valign(gtk4::Align::Center)
+        .visible(false)
+        .build();
+    sign_in.add_css_class("pill");
+    sign_in.add_css_class("suggested-action");
     card.append(&icon);
     card.append(&text);
-    (card, icon, title, detail)
+    card.append(&sign_in);
+    (card, icon, title, detail, sign_in)
 }
 
 /// Pause/Resume, with timed pauses in its menu.

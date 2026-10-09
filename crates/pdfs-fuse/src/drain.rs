@@ -347,17 +347,7 @@ impl Core {
                         // its writer has to be noticed.
                         self.sweep_parked_creates();
                     }
-                    // Paused, nothing due changes that: sleep until a resume
-                    // wakes the worker (or the idle poll notices a timed pause
-                    // ran out), not until the next op falls due — that is
-                    // "now" for everything already queued.
-                    if paused {
-                        self.wait_for_drain_work();
-                        continue;
-                    }
-                    // A debounced or backed-off op may be waiting: sleep only
-                    // until it becomes due rather than the full idle-poll.
-                    self.wait_for_drain_work_or_due();
+                    self.wait_for_drain_work_or_due(online && !paused);
                     continue;
                 }
             };
@@ -732,14 +722,16 @@ impl Core {
     /// Like [`wait_for_drain_work`](Self::wait_for_drain_work), but first
     /// checks whether a debounced or backed-off op is due before the idle-poll
     /// ceiling. A 2-second debounce must not sleep 30 seconds.
-    fn wait_for_drain_work_or_due(&self) {
-        let timeout = match self.db.earliest_due_at() {
-            Ok(Some(ts)) => {
-                let remaining = (ts - now_millis()).max(0) as u64;
-                Duration::from_millis(remaining).min(DRAIN_IDLE_POLL)
-            }
-            _ => DRAIN_IDLE_POLL,
+    ///
+    /// `claiming` is false while the worker claims nothing (offline or
+    /// paused); see [`idle_wait`].
+    fn wait_for_drain_work_or_due(&self, claiming: bool) {
+        let earliest = if claiming {
+            self.db.earliest_due_at().ok().flatten()
+        } else {
+            None
         };
+        let timeout = idle_wait(claiming, earliest, now_millis());
         sleep_for_drain_work(&self.drain_wake, || self.shutdown.is_stopping(), timeout);
     }
 
@@ -2678,7 +2670,9 @@ fn proton_error<'e>(e: &'e (dyn std::error::Error + 'static)) -> Option<&'e Prot
 /// is, or `Some(None)` for a failure that is not a refusal.
 fn refusal(e: &(dyn std::error::Error + 'static)) -> Option<Option<SyncIssue>> {
     let proton = proton_error(e)?;
-    if is_network_error(proton) {
+    // A refused session refuses everything, so it says nothing about this
+    // op either; the mount is offline for it (`Core::lost_link`).
+    if is_network_error(proton) || pdfs_core::error::session_revoked(proton) {
         return None;
     }
     let ProtonError::Api(api) = proton else {
@@ -2833,6 +2827,23 @@ fn sleep_for_drain_work(
     *woken = false;
 }
 
+/// How long an idle drain worker sleeps: until the earliest queued op falls
+/// due, at most the idle poll.
+///
+/// A worker that claims nothing — offline or paused — sleeps the full idle
+/// poll whatever is due. Every op already queued is due "now" for it, so
+/// sleeping until then was a zero wait, and all the workers spun on the queue
+/// for as long as the outage lasted (`docs/BUGS.md` B200). A reconnect or a
+/// resume wakes the drain, so nothing waits the full poll for it.
+fn idle_wait(claiming: bool, earliest_due: Option<i64>, now: i64) -> Duration {
+    match earliest_due {
+        Some(ts) if claiming => {
+            Duration::from_millis((ts - now).max(0) as u64).min(DRAIN_IDLE_POLL)
+        }
+        _ => DRAIN_IDLE_POLL,
+    }
+}
+
 fn placed_in(st: &crate::state::State, uid: &NodeUid) -> Option<(String, Option<NodeUid>)> {
     let entry = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))?;
     Some((entry.node.name.clone(), entry.node.parent_uid.clone()))
@@ -2856,6 +2867,23 @@ mod tests {
         let started = Instant::now();
         sleep_for_drain_work(&wake, || true, Duration::from_secs(5));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_offline_worker_waits_the_idle_poll_for_a_past_due_op() {
+        // The op fell due long ago, and offline nobody attempts it, so it
+        // stays due: waiting for it was a zero wait, forever (B200).
+        assert_eq!(idle_wait(false, Some(0), 10_000), DRAIN_IDLE_POLL);
+    }
+
+    #[test]
+    fn a_claiming_worker_waits_only_until_the_next_op_falls_due() {
+        assert_eq!(
+            idle_wait(true, Some(12_000), 10_000),
+            Duration::from_secs(2)
+        );
+        assert_eq!(idle_wait(true, Some(0), 10_000), Duration::ZERO);
+        assert_eq!(idle_wait(true, None, 10_000), DRAIN_IDLE_POLL);
     }
 
     fn pending(kind: &str) -> PendingOp {

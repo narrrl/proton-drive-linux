@@ -5,6 +5,8 @@
 //! kept in kernel memory — not on disk, not in the Secret Service — and vanish
 //! when the user's last session ends or the machine reboots. Both the daemon and
 //! `pdfs unlock` reach the same entry because it hangs off the *user* keyring.
+//! It is also where session tokens wait while the Secret Service refuses them
+//! ([`UNSAVED_TOKENS`]), so they outlive the process that holds them.
 //!
 //! Kernel keys are not paged to swap, are invisible to other users, and are
 //! wiped by [`clear`] (`KEYCTL_REVOKE`), which makes them a better home than a
@@ -20,12 +22,34 @@ use std::io;
 
 use zeroize::Zeroizing;
 
-/// Key description. Namespaced so it cannot collide with another program's key.
+/// One secret in the user keyring, by its description. Descriptions are
+/// namespaced so they cannot collide with another program's keys.
+pub struct Key {
+    description: &'static [u8],
+}
+
+/// The account's key passphrases (see the module docs).
 #[cfg(not(test))]
-const DESCRIPTION: &[u8] = b"pdfs:key-passphrases\0";
+pub const PASSPHRASES: Key = Key {
+    description: b"pdfs:key-passphrases\0",
+};
 /// Tests must never touch a real unlock.
 #[cfg(test)]
-const DESCRIPTION: &[u8] = b"pdfs:key-passphrases:test\0";
+pub const PASSPHRASES: Key = Key {
+    description: b"pdfs:key-passphrases:test\0",
+};
+
+/// Session tokens the Secret Service refused to store, until it takes them.
+/// A refresh token held only in a process's memory dies with the process.
+#[cfg(not(test))]
+pub const UNSAVED_TOKENS: Key = Key {
+    description: b"pdfs:unsaved-tokens\0",
+};
+#[cfg(test)]
+pub const UNSAVED_TOKENS: Key = Key {
+    description: b"pdfs:unsaved-tokens:test\0",
+};
+
 const KEY_TYPE: &[u8] = b"user\0";
 
 const KEY_SPEC_USER_KEYRING: i32 = -4;
@@ -49,7 +73,7 @@ fn last_error<T>() -> io::Result<T> {
     Err(io::Error::last_os_error())
 }
 
-fn find() -> io::Result<Option<libc::c_long>> {
+fn find(description: &[u8]) -> io::Result<Option<libc::c_long>> {
     // SAFETY: both strings are NUL-terminated and outlive the call.
     let id = unsafe {
         libc::syscall(
@@ -57,7 +81,7 @@ fn find() -> io::Result<Option<libc::c_long>> {
             KEYCTL_SEARCH,
             KEY_SPEC_USER_KEYRING,
             KEY_TYPE.as_ptr(),
-            DESCRIPTION.as_ptr(),
+            description.as_ptr(),
             0,
         )
     };
@@ -83,100 +107,102 @@ pub fn forbid_dumps() {
     }
 }
 
-/// Store `secret`, replacing any earlier one.
-pub fn store(secret: &[u8]) -> io::Result<()> {
-    // SAFETY: strings are NUL-terminated; the payload pointer/length pair
-    // describes `secret`, which outlives the call.
-    let id = unsafe {
-        libc::syscall(
-            libc::SYS_add_key,
-            KEY_TYPE.as_ptr(),
-            DESCRIPTION.as_ptr(),
-            secret.as_ptr(),
-            secret.len(),
-            KEY_SPEC_USER_KEYRING,
-        )
-    };
-    if id < 0 {
-        return last_error();
-    }
-    // SAFETY: plain integer arguments.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_keyctl,
-            KEYCTL_SETPERM,
-            id,
-            PERM_OWNER_AND_POSSESSOR,
-        )
-    };
-    if rc < 0 {
-        // A key whose permissions are unknown is not one to leave behind.
-        let err = io::Error::last_os_error();
-        let _ = clear();
-        return Err(err);
-    }
-    Ok(())
-}
-
-/// Read the stored secret, or `None` when there is none.
-pub fn load() -> io::Result<Option<Zeroizing<Vec<u8>>>> {
-    let Some(id) = find()? else {
-        return Ok(None);
-    };
-    // Size first, then read; retry if the key was replaced in between.
-    for _ in 0..3 {
-        // SAFETY: a null buffer asks the kernel only for the payload length.
-        let len = unsafe {
+impl Key {
+    /// Store `secret`, replacing any earlier one.
+    pub fn store(&self, secret: &[u8]) -> io::Result<()> {
+        // SAFETY: strings are NUL-terminated; the payload pointer/length pair
+        // describes `secret`, which outlives the call.
+        let id = unsafe {
             libc::syscall(
-                libc::SYS_keyctl,
-                KEYCTL_READ,
-                id,
-                std::ptr::null_mut::<u8>(),
-                0usize,
+                libc::SYS_add_key,
+                KEY_TYPE.as_ptr(),
+                self.description.as_ptr(),
+                secret.as_ptr(),
+                secret.len(),
+                KEY_SPEC_USER_KEYRING,
             )
         };
-        if len < 0 {
+        if id < 0 {
+            return last_error();
+        }
+        // SAFETY: plain integer arguments.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_keyctl,
+                KEYCTL_SETPERM,
+                id,
+                PERM_OWNER_AND_POSSESSOR,
+            )
+        };
+        if rc < 0 {
+            // A key whose permissions are unknown is not one to leave behind.
+            let err = io::Error::last_os_error();
+            let _ = self.clear();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Read the stored secret, or `None` when there is none.
+    pub fn load(&self) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+        let Some(id) = find(self.description)? else {
+            return Ok(None);
+        };
+        // Size first, then read; retry if the key was replaced in between.
+        for _ in 0..3 {
+            // SAFETY: a null buffer asks the kernel only for the payload length.
+            let len = unsafe {
+                libc::syscall(
+                    libc::SYS_keyctl,
+                    KEYCTL_READ,
+                    id,
+                    std::ptr::null_mut::<u8>(),
+                    0usize,
+                )
+            };
+            if len < 0 {
+                return match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENOKEY | libc::EKEYREVOKED | libc::EKEYEXPIRED) => Ok(None),
+                    _ => last_error(),
+                };
+            }
+            let mut buf = Zeroizing::new(vec![0u8; len as usize]);
+            // SAFETY: `buf` is `len` writable bytes.
+            let read = unsafe {
+                libc::syscall(
+                    libc::SYS_keyctl,
+                    KEYCTL_READ,
+                    id,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            if read < 0 {
+                return last_error();
+            }
+            if read as usize <= buf.len() {
+                buf.truncate(read as usize);
+                return Ok(Some(buf));
+            }
+        }
+        Err(io::Error::other("the key changed while it was being read"))
+    }
+
+    /// Remove the stored secret. Succeeds when there is none.
+    pub fn clear(&self) -> io::Result<()> {
+        let Some(id) = find(self.description)? else {
+            return Ok(());
+        };
+        // SAFETY: plain integer arguments.
+        let rc = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, id) };
+        if rc < 0 {
             return match io::Error::last_os_error().raw_os_error() {
-                Some(libc::ENOKEY | libc::EKEYREVOKED | libc::EKEYEXPIRED) => Ok(None),
+                Some(libc::ENOKEY | libc::EKEYREVOKED) => Ok(()),
                 _ => last_error(),
             };
         }
-        let mut buf = Zeroizing::new(vec![0u8; len as usize]);
-        // SAFETY: `buf` is `len` writable bytes.
-        let read = unsafe {
-            libc::syscall(
-                libc::SYS_keyctl,
-                KEYCTL_READ,
-                id,
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
-        };
-        if read < 0 {
-            return last_error();
-        }
-        if read as usize <= buf.len() {
-            buf.truncate(read as usize);
-            return Ok(Some(buf));
-        }
+        Ok(())
     }
-    Err(io::Error::other("the key changed while it was being read"))
-}
-
-/// Remove the stored secret. Succeeds when there is none.
-pub fn clear() -> io::Result<()> {
-    let Some(id) = find()? else {
-        return Ok(());
-    };
-    // SAFETY: plain integer arguments.
-    let rc = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, id) };
-    if rc < 0 {
-        return match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ENOKEY | libc::EKEYREVOKED) => Ok(()),
-            _ => last_error(),
-        };
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -187,18 +213,21 @@ mod tests {
     // so one test covers the whole round trip and skips when it is unavailable.
     #[test]
     fn stored_secret_round_trips_and_clears() {
-        if store(b"probe").is_err() {
+        if PASSPHRASES.store(b"probe").is_err() {
             eprintln!("kernel keyring unavailable; skipping");
             return;
         }
-        let saved = load().unwrap().expect("stored secret is readable");
+        let saved = PASSPHRASES
+            .load()
+            .unwrap()
+            .expect("stored secret is readable");
         assert_eq!(saved.as_slice(), b"probe");
 
-        store(b"replaced").unwrap();
-        assert_eq!(load().unwrap().unwrap().as_slice(), b"replaced");
+        PASSPHRASES.store(b"replaced").unwrap();
+        assert_eq!(PASSPHRASES.load().unwrap().unwrap().as_slice(), b"replaced");
 
-        clear().unwrap();
-        assert!(load().unwrap().is_none());
-        clear().unwrap();
+        PASSPHRASES.clear().unwrap();
+        assert!(PASSPHRASES.load().unwrap().is_none());
+        PASSPHRASES.clear().unwrap();
     }
 }

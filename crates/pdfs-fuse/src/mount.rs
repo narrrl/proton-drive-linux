@@ -12,6 +12,10 @@ pub enum MountOutcome {
     /// The kernel mount ended on its own (e.g. an external `fusermount -u`).
     /// The caller may want to remount.
     Unmounted,
+    /// Proton refused the session, and the keyring holds a newer one: another
+    /// process (`pdfs unlock`) refreshed it, or a new login replaced it. We
+    /// unmounted ourselves; the caller should mount again, which resumes it.
+    ResumeStored,
 }
 
 /// Whether `path` is a mountpoint whose FUSE connection is dead — the state a
@@ -210,28 +214,58 @@ fn fetch_or_recall_root(
     drive: &dyn DriveApi,
     rt: &tokio::runtime::Handle,
     db: &Db,
-) -> std::io::Result<(Node, bool)> {
+) -> std::io::Result<(Node, Start)> {
     let err = match rt.block_on(drive.get_my_files_folder()) {
         Ok(root) => {
             if let Err(e) = db.set_state_str(ROOT_UID_KEY, &root.uid.to_string()) {
                 warn!(error = %e, "persist root uid failed");
             }
-            return Ok((root, true));
+            return Ok((root, Start::Online));
         }
         Err(e) => e,
     };
+    // Still mounted from the cache, so cached files stay readable and changes
+    // queue for the daemon the next login starts.
+    let start = if pdfs_core::error::session_revoked(&err) {
+        Start::SessionExpired
+    } else {
+        Start::Offline
+    };
+    if start == Start::SessionExpired && pdfs_core::auth::stored_session_is_newer() {
+        return Err(std::io::Error::other(format!(
+            "Proton refused a session another process has since refreshed ({err}); resuming it"
+        )));
+    }
     let cached = db
         .state_str(ROOT_UID_KEY)
         .ok()
         .flatten()
         .and_then(|uid| db.node_by_uid(&uid).ok().flatten());
     match cached {
+        Some(root) if start == Start::SessionExpired => {
+            warn!(error = %err,
+                  "Proton refused the session; mounting from cache until `pdfs login`");
+            Ok((root, start))
+        }
         Some(root) => {
             warn!(error = %err, "fetch My Files root failed; mounting from cache (offline)");
-            Ok((root, false))
+            Ok((root, start))
         }
+        None if start == Start::SessionExpired => Err(std::io::Error::other(format!(
+            "Proton refused the session ({err}); run `pdfs login`"
+        ))),
         None => Err(std::io::Error::other(format!("fetch My Files root: {err}"))),
     }
+}
+
+/// How a mount comes up, from what fetching its root said.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Start {
+    Online,
+    /// Proton could not be reached: serve the cache and probe for the link.
+    Offline,
+    /// Proton refused the session: serve the cache until a new login.
+    SessionExpired,
 }
 
 /// Per-mount settings resolved from [`pdfs_core::config::AppConfig`] by the
@@ -393,7 +427,8 @@ pub(crate) fn mount_with(
     // Start the uptime clock here rather than at the first `pdfs diagnostics`,
     // so the age it reports is the daemon's own.
     super::diagnostics::start_clock();
-    let (root, online) = fetch_or_recall_root(drive.as_ref(), &rt, &db)?;
+    let (root, start) = fetch_or_recall_root(drive.as_ref(), &rt, &db)?;
+    let online = start == Start::Online;
     let scope = root.tree_event_scope_id();
     db.mount_upsert_my_files(&mountpoint.to_string_lossy(), &root.uid.to_string(), None)
         .map_err(|error| std::io::Error::other(format!("project My Files mount: {error}")))?;
@@ -429,7 +464,7 @@ pub(crate) fn mount_with(
         shared_generation: Arc::new(AtomicU64::new(0)),
         shared_refresh_deadlines: Arc::new(Mutex::new(SharedRefreshDeadlines::default())),
         online: Arc::new(AtomicBool::new(online)),
-        link: Arc::new(Default::default()),
+        link: Arc::new(link::Link::starting(start == Start::SessionExpired)),
         sync_paused_until: Arc::new(AtomicI64::new(paused_until)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
@@ -718,6 +753,18 @@ pub(crate) fn mount_with(
                     warn!(error = %e, "umount_and_join failed");
                 }
                 break MountOutcome::Shutdown;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if core.link.resume_stored.load(Ordering::Relaxed) =>
+            {
+                info!("unmounting to resume the stored session");
+                core.mounts.lock().close();
+                if let Err(e) = teardown_session(&core.session_live, || {
+                    umount_session_unblocked(bg, main_conn)
+                }) {
+                    warn!(error = %e, "umount_and_join failed");
+                }
+                break MountOutcome::ResumeStored;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if bg.guard.is_finished() {

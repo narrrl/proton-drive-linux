@@ -836,6 +836,13 @@ pub(crate) fn wire_retry(ui: &Rc<Ui>) {
         .connect_clicked(move |_| restart_service_then(&ui_trash, load_trash));
 }
 
+/// Show the sign-in page while a session is still stored, because Proton has
+/// refused it. The sidebar stays, so the user can go back to cached files; a
+/// login moves on to the files as from any sign-in ([`refresh`]).
+pub(crate) fn show_login(ui: &Rc<Ui>) {
+    ui.stack.set_visible_child_name("login");
+}
+
 /// Repaint the window from the cached login identity, then ask the daemon for
 /// its status and transfers. Runs at startup, after a login and after a service
 /// restart; the daemon's event feed keeps both current in between. The identity
@@ -1221,6 +1228,8 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
         failing_error,
         paused,
         paused_until,
+        session_expired,
+        tokens_unsaved,
         ..
     } = status
     else {
@@ -1231,7 +1240,11 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
     // in it: it is why a file that looks saved is not on the remote
     // yet, and offline is usually the reason it is still queued.
     let queued = i18n::pending_summary(pending_uploads, pending_changes);
-    let state = if paused {
+    let state = if session_expired {
+        SyncState::SessionExpired { queued }
+    } else if tokens_unsaved {
+        SyncState::TokensUnsaved
+    } else if paused {
         SyncState::Paused {
             until: paused_until,
             queued,
@@ -1294,6 +1307,14 @@ pub(crate) fn paint_disconnected(ui: &Rc<Ui>) {
 
 /// What the sidebar's status strip reports, most urgent first.
 pub(crate) enum SyncState {
+    /// Proton refused the session: nothing reaches it until the user signs in
+    /// again. Outranks a pause, which it makes moot.
+    SessionExpired {
+        queued: Option<String>,
+    },
+    /// The keyring refuses the session's refreshed tokens. Sync goes on, but
+    /// a reboot before the keyring takes them signs the user out.
+    TokensUnsaved,
     /// The user paused syncing; nothing goes up until it resumes. Outranks
     /// everything else, because it is the reason for everything else.
     Paused {
@@ -1328,7 +1349,29 @@ pub(crate) enum SyncState {
 fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     let paused = matches!(state, SyncState::Paused { .. });
     let connected = !matches!(state, SyncState::Disconnected | SyncState::NotResponding);
+    let expired = matches!(state, SyncState::SessionExpired { .. });
     let (icon, class, title, detail) = match state {
+        SyncState::SessionExpired { queued } => (
+            "dialog-password-symbolic",
+            Some("error"),
+            gettext("Session expired"),
+            Some(match queued {
+                // Translators: {queued} says what is waiting, such as "3 uploads
+                // queued".
+                Some(queued) => {
+                    gettext_f("{queued} · sign in again to sync", &[("queued", &queued)])
+                }
+                None => gettext("Sign in again to sync"),
+            }),
+        ),
+        SyncState::TokensUnsaved => (
+            "dialog-warning-symbolic",
+            Some("warning"),
+            gettext("Sign-in not saved"),
+            Some(gettext(
+                "Unlock your keyring, or the next reboot signs you out",
+            )),
+        ),
         SyncState::Paused { until, queued } => (
             "media-playback-pause-symbolic",
             Some("warning"),
@@ -1399,6 +1442,7 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     if let Some(class) = class {
         image.add_css_class(class);
     }
+    ui.locations.card.sign_in.set_visible(expired);
     ui.status.status_title.set_label(&title);
     ui.status.status_detail.set_visible(detail.is_some());
     ui.status

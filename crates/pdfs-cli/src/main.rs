@@ -2024,9 +2024,12 @@ fn cmd_status() -> Result<()> {
             staged_oldest_secs,
             paused,
             paused_until,
+            session_expired,
+            tokens_unsaved,
             ..
         }) => {
             let state = match (online, paused) {
+                _ if session_expired => ", session expired: run `pdfs login`",
                 (_, true) => ", sync paused",
                 (false, false) => ", offline",
                 (true, false) => "",
@@ -2057,6 +2060,11 @@ fn cmd_status() -> Result<()> {
                 println!(
                     "Stuck      {failing_ops} queued operation(s) keep failing: {}",
                     failing_error.as_deref().unwrap_or("no error recorded"),
+                );
+            }
+            if tokens_unsaved {
+                println!(
+                    "Keyring    refuses the refreshed sign-in; unlock it, or a reboot needs `pdfs login`"
                 );
             }
         }
@@ -2191,6 +2199,9 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                 tracing::info!("daemon stopping");
                 return Ok(());
             }
+            Ok(pdfs_fuse::MountOutcome::ResumeStored) => {
+                tracing::info!("resuming the session stored in the keyring");
+            }
             Ok(pdfs_fuse::MountOutcome::Unmounted) => {
                 tracing::warn!("mount ended externally; remounting in 2s");
                 pdfs_fuse::idle_sleep(std::time::Duration::from_secs(2));
@@ -2261,9 +2272,14 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         },
     );
 
-    // Clean unmount check (as a best-effort final backup).
-    if let Err(e) = rt.block_on(auth::persist(&session)) {
-        tracing::debug!(error = %e, "no new tokens to persist on shutdown");
+    // Last chance for a rotation the keyring refused when it happened. Only
+    // that: by now the keyring may hold a newer login, the one this stop was
+    // restarted for, and the tokens of this session would overwrite it.
+    if let Err(e) = auth::persist(&session) {
+        tracing::error!(
+            error = %e,
+            "could not save the refreshed session tokens; the next start may need `pdfs login`"
+        );
     }
     // Dropping the runtime waits for every blocking task, however long; a call
     // still stuck on Drive would hold the stop until systemd kills it (B165).
@@ -3424,6 +3440,8 @@ fn cmd_diagnose() -> Result<()> {
         Ok(CtlResponse::Status {
             mountpoint,
             online,
+            session_expired,
+            tokens_unsaved,
             pending_uploads,
             pending_changes,
             ..
@@ -3445,19 +3463,38 @@ fn cmd_diagnose() -> Result<()> {
                     |kind| format!("{mountpoint} ({kind})"),
                 ),
             );
-            report.finding(
-                if online {
-                    DiagnoseLevel::Ok
-                } else {
-                    DiagnoseLevel::Warn
-                },
-                "  network",
-                if online {
-                    "online"
-                } else {
-                    "offline; cached data remains available"
-                },
-            );
+            // The keyring check above read the blob, which still holds the
+            // tokens the daemon could not replace.
+            if tokens_unsaved {
+                report.finding(
+                    DiagnoseLevel::Warn,
+                    "  session tokens",
+                    "the keyring refuses the refreshed ones; unlock it, or a reboot needs `pdfs login`",
+                );
+            }
+            // A refused session reads as offline too, but no connection will
+            // bring it back, and the keyring check above cannot tell.
+            if session_expired {
+                report.finding(
+                    DiagnoseLevel::Fail,
+                    "  session",
+                    "Proton refused it (expired or revoked) — run `pdfs login`",
+                );
+            } else {
+                report.finding(
+                    if online {
+                        DiagnoseLevel::Ok
+                    } else {
+                        DiagnoseLevel::Warn
+                    },
+                    "  network",
+                    if online {
+                        "online"
+                    } else {
+                        "offline; cached data remains available"
+                    },
+                );
+            }
             let pending = pending_uploads + pending_changes;
             report.finding(
                 if pending == 0 {

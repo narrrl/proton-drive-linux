@@ -73,7 +73,6 @@ original wording.
 | [B67](#b67--fresh-state-restore-can-silently-select-a-new-device-high-22) | Fresh-state restore can silently select a new device (HIGH-22) | An ambiguous device after a loss of local state is not asked about |
 | [B66](#b66--local-only-pending-data-is-not-protected-at-shutdown-high-21) | Local-only pending data is not protected at shutdown (HIGH-21) | No shutdown protection and no `pdfs sync flush` |
 | [B65](#b65--release-artifacts-lack-supply-chain-verification-med-11) | Release artifacts lack supply-chain verification (MED-11) | No SBOM, provenance or checksums |
-| [B61](#b61--rotated-single-use-credentials-can-be-lost-high-18) | Rotated single-use credentials can be lost (HIGH-18) | Keyring write failures are only logged |
 | [B15](#b15--an-empty-but-listed-folder-and-duplicated-folder-uids) | An empty-but-`listed` folder, and duplicated folder uids | Cause not attributed |
 | [B10](#b10--glib-critical-when-the-launcher-closes-over-an-in-flight-open) | GLib critical when the launcher closes over an in-flight open |  |
 
@@ -101,6 +100,10 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B203](#b203--pdfs-unlock-leaves-a-running-daemon-a-spent-refresh-token) | `pdfs unlock` leaves a running daemon a spent refresh token |
+| [B202](#b202--a-refused-session-shows-as-offline-forever-and-nothing-says-to-sign-in-again) | A refused session shows as offline forever, and nothing says to sign in again |
+| [B201](#b201--after-signing-in-again-the-old-daemon-puts-its-spent-tokens-back) | After signing in again, the old daemon puts its spent tokens back |
+| [B200](#b200--offline-with-changes-queued-the-daemon-keeps-several-cores-busy) | Offline with changes queued, the daemon keeps several cores busy |
 | [B198](#b198--switching-to-online-only-deletes-local-files-that-never-reached-drive) | Switching to online-only deletes local files that never reached Drive |
 | [B197](#b197--switching-to-online-only-trashes-synced-files-that-became-ignored) | Switching to online-only trashes synced files that became ignored |
 | [B196](#b196--one-unreadable-folder-stops-the-whole-synced-folder-from-syncing) | One unreadable folder stops the whole synced folder from syncing |
@@ -189,6 +192,7 @@ a live account since.
 | [B81](#b81--prompt-labels-every-drive-hit-my-files-including-device-folders) | Prompt labels every Drive hit "My files", including device folders |
 | [B80](#b80--29-of-the-account-is-absent-from-the-search-index) | 29% of the account is absent from the search index |
 | [B62](#b62--debian-artifact-omits-required-service-and-autostart-units-high-19) | Debian artifact omits required service and autostart units (HIGH-19) |
+| [B61](#b61--rotated-single-use-credentials-can-be-lost-high-18) | Rotated single-use credentials can be lost (HIGH-18) |
 | [B60](#b60--config-writes-are-non-atomic-and-parse-errors-are-overwritten-high-17) | Config writes are non-atomic and parse errors are overwritten (HIGH-17) |
 | [B59](#b59--private-state-permission-enforcement-fails-open-high-16) | Private state permission enforcement fails open (HIGH-16) |
 | [B58](#b58--control-socket-has-unbounded-frames-and-connections-high-15) | Control socket has unbounded frames and connections (HIGH-15) |
@@ -301,6 +305,130 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B203 — `pdfs unlock` leaves a running daemon a spent refresh token
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, reading the code for issue #35 after the B201 fix
+**Where:** `crates/pdfs-core/src/auth.rs`, `stored_session_is_newer`; `crates/pdfs-fuse/src/link.rs`,
+`Core::mark_session_expired`; `crates/pdfs-fuse/src/mount.rs`; `crates/pdfs-cli/src/main.rs`,
+`cmd_daemon`
+
+**Repro:** With the daemon running, run `pdfs unlock` while the stored access token has expired.
+Unlock resumes the same session, refreshes it and stores the new tokens. The daemon still holds
+the old refresh token. If it refreshes before unlock restarts it, Proton refuses the spent token,
+and since B202 the mount reports the session expired, although the keyring holds a live one.
+
+**Cause.** Two processes ran the same session, and only one of them could hold its live refresh
+token. B201 stopped the daemon from writing its spent token over the live one, but nothing made the
+daemon pick up the live one.
+
+**Fix.** Before a refused session counts as expired, `auth::stored_session_is_newer` compares the
+keyring with what this process last stored. When the keyring holds a newer rotation of the same
+session, or another login, the mount ends with `MountOutcome::ResumeStored`, and the daemon mounts
+again at once from the keyring. At startup the same check turns the refusal into a mount error,
+which the daemon retries. A rotation that another process already wrote into the blob is now
+taken as this session's, so the daemon keeps writing its later rotations.
+
+**Test:** `auth::tests::a_session_rotated_by_another_process_is_newer_in_the_keyring` and
+`auth::tests::a_rotation_already_in_the_blob_is_taken`.
+
+---
+
+### B202 — A refused session shows as offline forever, and nothing says to sign in again
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, issue #35: the tray and `pdfs diagnose` said "offline, 3 queued", and
+diagnose also said "keyring session: ok", while every call in the log failed with
+`InvalidRefreshToken (http 400)`. `pdfs sync now` and restarting the service changed nothing.
+**Where:** `crates/pdfs-fuse/src/link.rs`, `Core::lost_link` and `Core::probe_until_online`;
+`crates/pdfs-fuse/src/mount.rs`, `fetch_or_recall_root`; `crates/pdfs-fuse/src/background.rs`;
+`crates/pdfs-core/src/control.rs`, `Response::Status`; the tray, the app's status, `pdfs status`
+and `pdfs diagnose`
+
+**Repro:** Make the stored refresh token invalid (B201 is one way), then start the daemon. It
+mounts from the cache and says offline; the probe retries every 30 s, then every 5 minutes, and
+logs the refusal only at debug. A daemon that started online and loses its session later does not
+even go offline: its failures show up as EIO and drain backoff.
+
+**Cause.** Every failure to fetch the root at startup counted as offline, and nothing told a
+refused session apart from a lost connection. No status field could carry it, so no front end
+could say it.
+
+**Fix.** `pdfs_core::error::session_revoked` names the errors only a new login fixes:
+`InvalidRefreshToken`, `AccountDeleted`, `AccountDisabled`. When the root fetch, the probe, the
+drain, an event poll, the event seed or the photos root sees one, the mount goes offline with
+`session_expired` set, logs one warning naming `pdfs login`, and stops probing and retrying.
+Cached files stay readable and changes stay queued for the daemon the next login starts.
+`Response::Status` carries `session_expired`. The tray shows "Session expired — sign in again"
+with **Sign In Again…**, which opens the app's sign-in page; the app's status and Sync card say the
+same, with a **Sign In Again** button. `pdfs status` and `pdfs diagnose` report it, the latter as
+a FAIL. A refused session is not recorded as a sync issue of the op that ran into it.
+
+**Test:** `error::tests::only_a_refused_refresh_or_a_closed_account_revokes_the_session`, the
+tray's `tests::a_refused_session_outranks_everything_else` and
+`tests::a_daemon_that_does_not_say_has_a_live_session`.
+
+---
+
+### B201 — After signing in again, the old daemon puts its spent tokens back
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, reading the code for issue #35, where every call failed with
+`InvalidRefreshToken` and signing in again did not obviously help.
+**Where:** `crates/pdfs-core/src/auth.rs`, `persist`, `register_refresh_handler`, `unlock` and
+`migrate_legacy`; `crates/pdfs-cli/src/main.rs`, `cmd_daemon`
+
+**Repro:** With the daemon running, run `pdfs login`. It stores the new session and restarts the
+unit. The old daemon's stop runs `auth::persist`, which wrote its own access and refresh tokens
+into the blob, now the new session's. The new daemon starts with a refresh token of another
+session, and the first refresh fails with `InvalidRefreshToken`. `pdfs unlock` had the same
+shape: its session could rotate the tokens, and the restarted daemon's stop put the spent refresh
+token back. `unlock` and `migrate_legacy` could do it themselves, writing a copy of the blob read
+before verifying the mailbox password, which may have rotated the tokens.
+
+**Cause.** Proton refresh tokens are single-use. `store_tokens` loaded whatever blob was stored
+and replaced its tokens, without checking that the blob was still this session's.
+
+**Fix.** Each session writes its rotations through a `TokenSink`. It writes only into a blob with
+its session id that still holds the refresh token the session last left there; a blob that moved
+on, to a new login or to another session's rotation, is left alone. The stop no longer writes the
+session's tokens, only a rotation the keyring refused when it happened. `unlock` and
+`migrate_legacy` read the blob again after verifying. A failed final write is an error in the log,
+not a debug line claiming there was nothing to save.
+
+**Test:** `auth::tests::tokens_of_another_session_are_not_written`,
+`auth::tests::tokens_are_not_written_over_a_newer_rotation_of_the_same_session`,
+`auth::tests::a_sink_keeps_writing_its_own_rotations_and_stops_at_a_new_login`.
+
+---
+
+### B200 — Offline with changes queued, the daemon keeps several cores busy
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, issue #35: "offline, 3 queued", and systemd counted 17 minutes of CPU in
+2 m 16 s of wall time, 10 hours over a longer run.
+**Where:** `crates/pdfs-fuse/src/drain.rs`, `Core::run_pending_drain` and `idle_wait`;
+`crates/pdfs-core/src/db/ops.rs`, `Db::earliest_due_at`
+
+**Repro:** Queue a write, then cut the link (`nmcli networking off`). `pidstat -t -p $(pgrep -x
+pdfs) 5` shows the drain threads using most of several cores for as long as the outage lasts.
+
+**Cause.** Offline, a drain worker claims nothing, and then sleeps until the earliest queued op
+falls due. Every queued op was due already, and with no attempts nothing moves its
+`next_attempt_at`, so the sleep was zero. All 16 workers ran a query on every pass, the primary
+one its idle chores as well. The same spin happened online when a due op sat behind a claimed op
+on the same node, such as a rename queued behind a long upload: `earliest_due_at` counted it,
+`claim_next_due_op` skipped it.
+
+**Fix.** A worker that claims nothing, offline or paused, sleeps the full idle poll; a reconnect
+or a resume wakes it. `earliest_due_at` now uses the claim's own exclusions, one SQL fragment for
+both.
+
+**Test:** `drain::tests::an_offline_worker_waits_the_idle_poll_for_a_past_due_op`,
+`db::tests::earliest_due_at_skips_an_op_held_behind_a_claimed_one`.
+
+---
 
 ### B199 — A stopped share stays on the Shared by me page for minutes
 
@@ -4823,7 +4951,7 @@ daemon/tray/FUSE, upgrade, rollback, and uninstall without deleting user state.
 
 ### B61 — Rotated single-use credentials can be lost (HIGH-18)
 
-**Status:** Open — 1.0 authentication/recovery blocker
+**Status:** Fixed, not verified live
 **Found:** 2026-07-22, 1.0 authentication audit
 **Where:** `crates/pdfs-core/src/auth.rs`, refresh callback
 
@@ -4834,6 +4962,26 @@ keyring retains an invalid single-use refresh token, so restart loses login.
 **Required fix/test:** Expose unhealthy persistence, retry with bounded backoff,
 notify the user, and define a safe re-login/shutdown path. Test locked/full/
 unavailable keyrings, callback races, repeated rotations, death, and restart.
+
+**Fix (2026-10-09, issue #35).** A rotation the keyring refuses is kept as unsaved and retried
+in the background after 1 s, 5 s, 30 s and then every 5 minutes, until it is written or the blob
+has moved on (B201). The refusal is an error in the log naming `pdfs login`, and the daemon's stop
+writes a rotation still unsaved, logging an error if that fails too. The re-login path is B201's:
+an old session never writes into a newer login.
+
+Until it is written, the rotation also waits in the kernel keyring (`kernelkey::UNSAVED_TOKENS`),
+so a crash or SIGKILL before a retry lands no longer loses it. The next resume, by the daemon or
+`pdfs unlock`, puts it back in when the blob still holds the refresh token it spent, and writes
+it. One that belongs to an older login is dropped. The kernel keyring lasts until the user's last
+session ends, so a refused write followed by a crash and a logout still loses the rotation.
+
+While a rotation waits, `Response::Status` carries `tokens_unsaved`. The tray says "Sign-in not
+saved — unlock your keyring" and needs attention, the app's status says the same, `pdfs status`
+prints a `Keyring` line and `pdfs diagnose` warns.
+
+**Test:** `auth::tests::a_rotation_the_keyring_refused_is_written_once_it_takes_it` and
+`auth::tests::an_unsaved_rotation_goes_only_into_the_blob_it_was_refused_for`, and the tray's
+`tests::a_sign_in_the_keyring_refused_needs_attention`.
 
 ---
 
