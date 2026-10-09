@@ -4951,8 +4951,7 @@ daemon/tray/FUSE, upgrade, rollback, and uninstall without deleting user state.
 
 ### B61 — Rotated single-use credentials can be lost (HIGH-18)
 
-**Status:** Partly fixed. A process that dies before a retried write lands still loses the
-rotation, and only the log says so.
+**Status:** Partly fixed. Only the log says that the keyring refused a rotation.
 **Found:** 2026-07-22, 1.0 authentication audit
 **Where:** `crates/pdfs-core/src/auth.rs`, refresh callback
 
@@ -4968,10 +4967,17 @@ unavailable keyrings, callback races, repeated rotations, death, and restart.
 in the background after 1 s, 5 s, 30 s and then every 5 minutes, until it is written or the blob
 has moved on (B201). The refusal is an error in the log naming `pdfs login`, and the daemon's stop
 writes a rotation still unsaved, logging an error if that fails too. The re-login path is B201's:
-an old session never writes into a newer login. Left: a crash or SIGKILL before a retry lands,
-and telling the GUI.
+an old session never writes into a newer login.
 
-**Test:** `auth::tests::a_rotation_the_keyring_refused_is_written_once_it_takes_it`.
+Until it is written, the rotation also waits in the kernel keyring (`kernelkey::UNSAVED_TOKENS`),
+so a crash or SIGKILL before a retry lands no longer loses it. The next resume, by the daemon or
+`pdfs unlock`, puts it back in when the blob still holds the refresh token it spent, and writes
+it. One that belongs to an older login is dropped. The kernel keyring lasts until the user's last
+session ends, so a refused write followed by a crash and a logout still loses the rotation. Left:
+telling the GUI.
+
+**Test:** `auth::tests::a_rotation_the_keyring_refused_is_written_once_it_takes_it` and
+`auth::tests::an_unsaved_rotation_goes_only_into_the_blob_it_was_refused_for`.
 
 ---
 
