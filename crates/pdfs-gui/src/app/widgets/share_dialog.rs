@@ -127,6 +127,26 @@ impl Drop for Busy {
     }
 }
 
+/// A section's action, such as Send Invitations. It goes under the section's
+/// rows, at their right edge, rather than in a row of its own: a row in a boxed
+/// list reads as a setting, and a button alone in one looks misplaced.
+fn group_button(label: &str) -> gtk4::Button {
+    let button = gtk4::Button::builder()
+        .label(label)
+        .halign(gtk4::Align::End)
+        .margin_top(12)
+        .build();
+    button.add_css_class("suggested-action");
+    button
+}
+
+/// A section's only row while the share is being read.
+fn loading_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(gettext("Loading…")).build();
+    row.add_prefix(&spinner());
+    row
+}
+
 /// How an open Share dialog addresses its node.
 ///
 /// A node the browser is showing has a mountpoint-relative path. A node reached
@@ -287,26 +307,17 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .selected(0)
         .valign(gtk4::Align::Center)
         .build();
-    let role_wrap = adw::ActionRow::builder().title(gettext("Role")).build();
-    role_wrap.add_suffix(&role_drop);
+    // The role goes with the addresses it applies to, at the end of their row.
+    role_drop.set_tooltip_text(Some(&gettext("Role")));
+    email_row.add_suffix(&role_drop);
     let message_row = adw::EntryRow::builder()
         .title(gettext("Message (optional)"))
         .build();
-    let invite_btn = gtk4::Button::builder()
-        .label(gettext("Send Invitations"))
-        .halign(gtk4::Align::End)
-        .margin_top(6)
-        .build();
-    invite_btn.add_css_class("suggested-action");
+    let invite_btn = group_button(&gettext("Send Invitations"));
     invite_btn.set_sensitive(false);
-    let invite_wrap = adw::PreferencesRow::builder()
-        .activatable(false)
-        .child(&invite_btn)
-        .build();
     invite_group.add(&email_row);
-    invite_group.add(&role_wrap);
     invite_group.add(&message_row);
-    invite_group.add(&invite_wrap);
+    invite_group.add(&invite_btn);
 
     let people = adw::PreferencesGroup::builder()
         .title(gettext("People with access"))
@@ -315,21 +326,18 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .title(gettext("Public link"))
         .build();
 
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
-    content.append(&invite_group);
-    content.append(&people);
-    content.append(&link_group);
-    let clamp = adw::Clamp::builder().child(&content).build();
-    let scroll = gtk4::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .child(&clamp)
-        .build();
-    toolbar.set_content(Some(&scroll));
+    // Until the share is read, each section says so rather than standing
+    // empty under its title.
+    let people_loading = loading_row();
+    people.add(&people_loading);
+    let link_loading = loading_row();
+    link_group.add(&link_loading);
+
+    let content = adw::PreferencesPage::new();
+    content.add(&invite_group);
+    content.add(&people);
+    content.add(&link_group);
+    toolbar.set_content(Some(&content));
 
     let dialog = adw::Dialog::builder()
         .title(pgettext("verb", "Share"))
@@ -343,8 +351,8 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         target,
         people,
         link_group,
-        people_rows: RefCell::new(Vec::new()),
-        link_rows: RefCell::new(Vec::new()),
+        people_rows: RefCell::new(vec![people_loading.upcast()]),
+        link_rows: RefCell::new(vec![link_loading.upcast()]),
     });
 
     // Check the addresses as they are typed: a malformed one marks the row as
@@ -430,15 +438,33 @@ pub(crate) fn share_dialog_reload(state: &Rc<ShareDialog>) {
                 repaint_share_link(&state, link.as_ref());
             }
             Ok(Ok(Response::Error { message, .. })) => {
+                share_dialog_unread(&state);
                 toast_error(&state.ui, &gettext("Couldn't load sharing"), &message)
             }
-            _ => toast_error(
-                &state.ui,
-                &gettext("Couldn't load sharing"),
-                &gettext("The Proton Drive service didn't respond."),
-            ),
+            _ => {
+                share_dialog_unread(&state);
+                toast_error(
+                    &state.ui,
+                    &gettext("Couldn't load sharing"),
+                    &gettext("The Proton Drive service didn't respond."),
+                )
+            }
         }
     });
+}
+
+/// The share couldn't be read: what the sections showed (rows still loading,
+/// or ones that may now be stale) gives way to one line that says so.
+fn share_dialog_unread(state: &Rc<ShareDialog>) {
+    for row in state.people_rows.borrow_mut().drain(..) {
+        state.people.remove(&row);
+    }
+    for row in state.link_rows.borrow_mut().drain(..) {
+        state.link_group.remove(&row);
+    }
+    let row = dim_row(&gettext("Couldn't load sharing"));
+    state.people.add(&row);
+    state.people_rows.borrow_mut().push(row.upcast());
 }
 
 /// Rebuild the "People with access" rows from a fresh share listing.
@@ -455,15 +481,18 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
         return;
     }
     for entry in entries {
+        // A member is the plain case and needs no word; an invitation says
+        // it is still waiting on the other side.
         let subtitle = match entry.kind {
-            ShareEntryKind::Member => gettext("Member"),
-            ShareEntryKind::ProtonInvite => gettext("Invited (pending)"),
-            ShareEntryKind::ExternalInvite => gettext("Invited (external, pending)"),
+            ShareEntryKind::Member => String::new(),
+            ShareEntryKind::ProtonInvite => gettext("Invitation pending"),
+            ShareEntryKind::ExternalInvite => gettext("Invitation pending, no Proton account yet"),
         };
         let row = adw::ActionRow::builder()
             .title(&entry.email)
             .subtitle(&subtitle)
             .build();
+        row.add_prefix(&adw::Avatar::new(32, Some(&entry.email), true));
 
         // External invites can't have their role changed; show it read-only.
         // Members and Proton invites get a role dropdown.
@@ -653,16 +682,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                 .build();
             let expiry_row = adw::ActionRow::builder().title(gettext("Expires")).build();
             expiry_row.add_suffix(&expiry_drop);
-            let create = gtk4::Button::builder()
-                .label(gettext("Create Public Link"))
-                .halign(gtk4::Align::End)
-                .margin_top(6)
-                .build();
-            create.add_css_class("suggested-action");
-            let create_wrap = adw::PreferencesRow::builder()
-                .activatable(false)
-                .child(&create)
-                .build();
+            let create = group_button(&gettext("Create Public Link"));
 
             // Enter in the password field creates the link.
             let btn = create.clone();
@@ -689,11 +709,11 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             state.link_group.add(&role_row);
             state.link_group.add(&pw_row);
             state.link_group.add(&expiry_row);
-            state.link_group.add(&create_wrap);
+            state.link_group.add(&create);
             rows.push(role_row.upcast());
             rows.push(pw_row.upcast());
             rows.push(expiry_row.upcast());
-            rows.push(create_wrap.upcast());
+            rows.push(create.upcast());
         }
     }
     *state.link_rows.borrow_mut() = rows;
