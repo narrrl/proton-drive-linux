@@ -2025,6 +2025,7 @@ fn cmd_status() -> Result<()> {
             paused,
             paused_until,
             session_expired,
+            tokens_unsaved,
             ..
         }) => {
             let state = match (online, paused) {
@@ -2059,6 +2060,11 @@ fn cmd_status() -> Result<()> {
                 println!(
                     "Stuck      {failing_ops} queued operation(s) keep failing: {}",
                     failing_error.as_deref().unwrap_or("no error recorded"),
+                );
+            }
+            if tokens_unsaved {
+                println!(
+                    "Keyring    refuses the refreshed sign-in; unlock it, or a reboot needs `pdfs login`"
                 );
             }
         }
@@ -3435,6 +3441,7 @@ fn cmd_diagnose() -> Result<()> {
             mountpoint,
             online,
             session_expired,
+            tokens_unsaved,
             pending_uploads,
             pending_changes,
             ..
@@ -3456,6 +3463,15 @@ fn cmd_diagnose() -> Result<()> {
                     |kind| format!("{mountpoint} ({kind})"),
                 ),
             );
+            // The keyring check above read the blob, which still holds the
+            // tokens the daemon could not replace.
+            if tokens_unsaved {
+                report.finding(
+                    DiagnoseLevel::Warn,
+                    "  session tokens",
+                    "the keyring refuses the refreshed ones; unlock it, or a reboot needs `pdfs login`",
+                );
+            }
             // A refused session reads as offline too, but no connection will
             // bring it back, and the keyring check above cannot tell.
             if session_expired {

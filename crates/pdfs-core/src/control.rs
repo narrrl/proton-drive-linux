@@ -1964,6 +1964,11 @@ pub enum Response {
         /// connection brings it back: only signing in again does.
         #[serde(default)]
         session_expired: bool,
+        /// True while the keyring refuses the session's refreshed tokens. The
+        /// daemon keeps retrying; until it succeeds, a reboot signs the user
+        /// out.
+        #[serde(default)]
+        tokens_unsaved: bool,
     },
     /// A human-readable success message.
     Ok { message: String },

@@ -238,6 +238,7 @@ fn status_state(
         failing_ops,
         paused,
         session_expired,
+        tokens_unsaved,
         ..
     } = status
     else {
@@ -247,6 +248,8 @@ fn status_state(
     let queued = i18n::pending_summary(*pending_uploads, *pending_changes);
     let phase = if *session_expired {
         Phase::SessionExpired
+    } else if *tokens_unsaved {
+        Phase::Attention
     } else {
         phase_of(
             paused,
@@ -260,6 +263,8 @@ fn status_state(
             // Outranks everything: it is why nothing else moves, and the one
             // thing that fixes it is the user's to do.
             _ if *session_expired => gettext("Session expired — sign in again"),
+            // Sync goes on meanwhile, but a reboot ends it until the next login.
+            _ if *tokens_unsaved => gettext("Sign-in not saved — unlock your keyring"),
             _ if paused => gettext("Sync paused"),
             _ if failing_ops > 0 => ngettext_f(
                 "{n} change needs attention",
@@ -640,6 +645,19 @@ mod tests {
         );
         assert_eq!(state.phase, Phase::SessionExpired);
         assert_eq!(state.line, "Session expired — sign in again");
+    }
+
+    /// B61: the keyring refusing the refreshed tokens was only in the log.
+    #[test]
+    fn a_sign_in_the_keyring_refused_needs_attention() {
+        let state = status_state(
+            &status(r#","tokens_unsaved":true"#),
+            &[],
+            &[],
+            Path::new("/m"),
+        );
+        assert_eq!(state.phase, Phase::Attention);
+        assert_eq!(state.line, "Sign-in not saved — unlock your keyring");
     }
 
     #[test]

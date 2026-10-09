@@ -87,7 +87,6 @@ original wording.
 | [B68](#b68--profile-backup-cannot-be-written-to-the-device-root) | Profile backup cannot be written to the device root | Backup health is not shown in the app; the restore was not re-run |
 | [B64](#b64--stable-publishing-lacks-data-safety-and-recovery-gates-crit-12) | Stable publishing lacks data-safety and recovery gates (CRIT-12) | Recovery approval before a release |
 | [B63](#b63--release-version-identity-is-inconsistent-and-unenforced-high-20) | Release version identity is inconsistent and unenforced (HIGH-20) | Protocol version identity |
-| [B61](#b61--rotated-single-use-credentials-can-be-lost-high-18) | Rotated single-use credentials can be lost (HIGH-18) | A crash or SIGKILL before a retried write lands still loses it; the GUI is not told |
 | [B57](#b57--event-cursor-can-advance-past-unapplied-state-high-14) | Event cursor can advance past unapplied state (HIGH-14) | Database and apply fault tests |
 | [B56](#b56--database-schema-version-parsing-fails-open-high-13) | Database schema version parsing fails open (HIGH-13) | Malformed schema versions |
 | [B12](#b12--cold-enumeration-is-slow-per-entry-and-goes-superlinear-past-500) | Cold enumeration is slow per entry, and goes superlinear past ~500 | The attribute-invalidation follow-up is unverified |
@@ -193,6 +192,7 @@ a live account since.
 | [B81](#b81--prompt-labels-every-drive-hit-my-files-including-device-folders) | Prompt labels every Drive hit "My files", including device folders |
 | [B80](#b80--29-of-the-account-is-absent-from-the-search-index) | 29% of the account is absent from the search index |
 | [B62](#b62--debian-artifact-omits-required-service-and-autostart-units-high-19) | Debian artifact omits required service and autostart units (HIGH-19) |
+| [B61](#b61--rotated-single-use-credentials-can-be-lost-high-18) | Rotated single-use credentials can be lost (HIGH-18) |
 | [B60](#b60--config-writes-are-non-atomic-and-parse-errors-are-overwritten-high-17) | Config writes are non-atomic and parse errors are overwritten (HIGH-17) |
 | [B59](#b59--private-state-permission-enforcement-fails-open-high-16) | Private state permission enforcement fails open (HIGH-16) |
 | [B58](#b58--control-socket-has-unbounded-frames-and-connections-high-15) | Control socket has unbounded frames and connections (HIGH-15) |
@@ -4951,7 +4951,7 @@ daemon/tray/FUSE, upgrade, rollback, and uninstall without deleting user state.
 
 ### B61 — Rotated single-use credentials can be lost (HIGH-18)
 
-**Status:** Partly fixed. Only the log says that the keyring refused a rotation.
+**Status:** Fixed, not verified live
 **Found:** 2026-07-22, 1.0 authentication audit
 **Where:** `crates/pdfs-core/src/auth.rs`, refresh callback
 
@@ -4973,11 +4973,15 @@ Until it is written, the rotation also waits in the kernel keyring (`kernelkey::
 so a crash or SIGKILL before a retry lands no longer loses it. The next resume, by the daemon or
 `pdfs unlock`, puts it back in when the blob still holds the refresh token it spent, and writes
 it. One that belongs to an older login is dropped. The kernel keyring lasts until the user's last
-session ends, so a refused write followed by a crash and a logout still loses the rotation. Left:
-telling the GUI.
+session ends, so a refused write followed by a crash and a logout still loses the rotation.
+
+While a rotation waits, `Response::Status` carries `tokens_unsaved`. The tray says "Sign-in not
+saved — unlock your keyring" and needs attention, the app's status says the same, `pdfs status`
+prints a `Keyring` line and `pdfs diagnose` warns.
 
 **Test:** `auth::tests::a_rotation_the_keyring_refused_is_written_once_it_takes_it` and
-`auth::tests::an_unsaved_rotation_goes_only_into_the_blob_it_was_refused_for`.
+`auth::tests::an_unsaved_rotation_goes_only_into_the_blob_it_was_refused_for`, and the tray's
+`tests::a_sign_in_the_keyring_refused_needs_attention`.
 
 ---
 

@@ -750,6 +750,16 @@ pub fn stored_session_is_newer() -> bool {
     }
 }
 
+/// Whether a session in this process holds refreshed tokens the keyring has
+/// not taken yet. They are retried and kept in the kernel keyring meanwhile,
+/// which a reboot clears, so the user is asked to unlock the keyring (B61).
+pub fn tokens_unsaved() -> bool {
+    TOKEN_SINKS
+        .lock()
+        .values()
+        .any(|sink| sink.state.lock().unsaved.is_some())
+}
+
 /// Where each live session in this process writes its rotated tokens, by
 /// session id, for [`persist`] to find.
 static TOKEN_SINKS: parking_lot::Mutex<BTreeMap<String, Arc<TokenSink>>> =

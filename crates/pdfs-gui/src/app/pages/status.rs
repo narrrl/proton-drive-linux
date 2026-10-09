@@ -1229,6 +1229,7 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
         paused,
         paused_until,
         session_expired,
+        tokens_unsaved,
         ..
     } = status
     else {
@@ -1241,6 +1242,8 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
     let queued = i18n::pending_summary(pending_uploads, pending_changes);
     let state = if session_expired {
         SyncState::SessionExpired { queued }
+    } else if tokens_unsaved {
+        SyncState::TokensUnsaved
     } else if paused {
         SyncState::Paused {
             until: paused_until,
@@ -1309,6 +1312,9 @@ pub(crate) enum SyncState {
     SessionExpired {
         queued: Option<String>,
     },
+    /// The keyring refuses the session's refreshed tokens. Sync goes on, but
+    /// a reboot before the keyring takes them signs the user out.
+    TokensUnsaved,
     /// The user paused syncing; nothing goes up until it resumes. Outranks
     /// everything else, because it is the reason for everything else.
     Paused {
@@ -1357,6 +1363,14 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
                 }
                 None => gettext("Sign in again to sync"),
             }),
+        ),
+        SyncState::TokensUnsaved => (
+            "dialog-warning-symbolic",
+            Some("warning"),
+            gettext("Sign-in not saved"),
+            Some(gettext(
+                "Unlock your keyring, or the next reboot signs you out",
+            )),
         ),
         SyncState::Paused { until, queued } => (
             "media-playback-pause-symbolic",
