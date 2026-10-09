@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-09 02:38+0200\n"
+"POT-Creation-Date: 2026-10-09 02:57+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: French\n"
@@ -258,8 +258,9 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/locations.rs:1013
 #: crates/pdfs-gui/src/app/pages/locations.rs:1488
 #: crates/pdfs-gui/src/app/pages/locations.rs:1538
-#: crates/pdfs-gui/src/app/pages/login.rs:393
-#: crates/pdfs-gui/src/app/pages/login.rs:507
+#: crates/pdfs-gui/src/app/pages/login.rs:389
+#: crates/pdfs-gui/src/app/pages/login.rs:503
+#: crates/pdfs-gui/src/app/pages/login.rs:549
 #: crates/pdfs-gui/src/app/pages/photos.rs:2055
 #: crates/pdfs-gui/src/app/pages/shared.rs:939
 #: crates/pdfs-gui/src/app/pages/shared.rs:1020
@@ -3226,35 +3227,25 @@ msgstr "Saisissez votre adresse électronique et votre mot de passe."
 msgid "Signing in…"
 msgstr "Connexion…"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:164
+#: crates/pdfs-gui/src/app/pages/login.rs:160
 msgid "Complete the verification to continue…"
 msgstr "Terminez la vérification pour continuer…"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:197
+#: crates/pdfs-gui/src/app/pages/login.rs:195
 msgid "login cancelled"
 msgstr "connexion annulée"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:210
-msgid ""
-"The verification page couldn't be opened, so the sign-in was cancelled. Your "
-"system may keep the web view's sandbox from starting; the troubleshooting "
-"guide explains what to do."
-msgstr ""
-"La page de vérification n’a pas pu s’ouvrir, la connexion a donc été "
-"annulée. Votre système empêche peut-être le démarrage du bac à sable de la "
-"vue web ; le guide de dépannage explique la marche à suivre."
-
-#: crates/pdfs-gui/src/app/pages/login.rs:233
+#: crates/pdfs-gui/src/app/pages/login.rs:228
 msgid "Too many sign-in attempts. Wait a few minutes and try again."
 msgstr ""
 "Trop de tentatives de connexion. Patientez quelques minutes et réessayez."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:239
+#: crates/pdfs-gui/src/app/pages/login.rs:234
 msgid "Couldn't reach Proton. Check your internet connection and try again."
 msgstr ""
 "Impossible de joindre Proton. Vérifiez votre connexion Internet et réessayez."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:242
+#: crates/pdfs-gui/src/app/pages/login.rs:237
 msgid ""
 "Signed in, but the session couldn't be saved to the system keyring. Make "
 "sure a keyring (GNOME Keyring or KWallet) is running and unlocked."
@@ -3263,21 +3254,21 @@ msgstr ""
 "système. Assurez-vous qu’un trousseau (GNOME Keyring ou KWallet) est en "
 "cours d’exécution et déverrouillé."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:245
+#: crates/pdfs-gui/src/app/pages/login.rs:240
 msgid "Sign-in cancelled: no two-factor code was entered."
 msgstr "Connexion annulée : aucun code à deux facteurs n’a été saisi."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:248
+#: crates/pdfs-gui/src/app/pages/login.rs:243
 msgid "Sign-in cancelled: no mailbox password was entered."
 msgstr ""
 "Connexion annulée : aucun mot de passe de boîte aux lettres n’a été saisi."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:251
+#: crates/pdfs-gui/src/app/pages/login.rs:246
 msgid "That mailbox password didn't unlock your account."
 msgstr ""
 "Ce mot de passe de boîte aux lettres n’a pas déverrouillé votre compte."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:254
+#: crates/pdfs-gui/src/app/pages/login.rs:249
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "
 "new one."
@@ -3286,37 +3277,37 @@ msgstr ""
 "pour en obtenir une nouvelle."
 
 #. Translators: {error} is an error message, usually in English.
-#: crates/pdfs-gui/src/app/pages/login.rs:259
+#: crates/pdfs-gui/src/app/pages/login.rs:254
 #, rust-format
 msgid "Sign-in failed: {error}"
 msgstr "Échec de la connexion : {error}"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:369
+#: crates/pdfs-gui/src/app/pages/login.rs:365
 msgid "That mailbox password didn't unlock your account. Try again."
 msgstr ""
 "Ce mot de passe de boîte aux lettres n’a pas déverrouillé votre compte. "
 "Réessayez."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:371
+#: crates/pdfs-gui/src/app/pages/login.rs:367
 msgid ""
 "This account has a separate mailbox password. Enter it to unlock your files."
 msgstr ""
 "Ce compte a un mot de passe de boîte aux lettres distinct. Saisissez-le pour "
 "déverrouiller vos fichiers."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:374
+#: crates/pdfs-gui/src/app/pages/login.rs:370
 msgid "Mailbox Password"
 msgstr "Mot de passe de la boîte aux lettres"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:380
+#: crates/pdfs-gui/src/app/pages/login.rs:376
 msgid "Mailbox password"
 msgstr "Mot de passe de la boîte aux lettres"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:384
+#: crates/pdfs-gui/src/app/pages/login.rs:380
 msgid "Keep unlocked on this computer"
 msgstr "Garder déverrouillé sur cet ordinateur"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:386
+#: crates/pdfs-gui/src/app/pages/login.rs:382
 msgid ""
 "Stores the unlock in the system keyring, so Proton Drive opens without "
 "asking after every login. Otherwise you enter the password once per session."
@@ -3325,49 +3316,73 @@ msgstr ""
 "Proton Drive s’ouvre sans demande après chaque connexion. Sinon, vous "
 "saisissez le mot de passe une fois par session."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:394
-#: crates/pdfs-gui/src/app/pages/login.rs:447
+#: crates/pdfs-gui/src/app/pages/login.rs:390
+#: crates/pdfs-gui/src/app/pages/login.rs:443
 msgid "Unlock"
 msgstr "Déverrouiller"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:446
+#: crates/pdfs-gui/src/app/pages/login.rs:442
 msgid "Proton Drive is locked. Enter your mailbox password to unlock it."
 msgstr ""
 "Proton Drive est verrouillé. Saisissez votre mot de passe de boîte aux "
 "lettres pour le déverrouiller."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:475
+#: crates/pdfs-gui/src/app/pages/login.rs:471
 msgid "Unlocked."
 msgstr "Déverrouillé."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:480
+#: crates/pdfs-gui/src/app/pages/login.rs:476
 msgid "Couldn't unlock"
 msgstr "Impossible de déverrouiller"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:493
+#: crates/pdfs-gui/src/app/pages/login.rs:489
 msgid "Two-Factor Authentication"
 msgstr "Authentification à deux facteurs"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:495
+#: crates/pdfs-gui/src/app/pages/login.rs:491
 msgid ""
 "Enter the code from your authenticator app, or one of your recovery codes."
 msgstr ""
 "Saisissez le code de votre application d’authentification ou l’un de vos "
 "codes de récupération."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:501
+#: crates/pdfs-gui/src/app/pages/login.rs:497
 msgid "Authentication code"
 msgstr "Code d’authentification"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:508
+#: crates/pdfs-gui/src/app/pages/login.rs:504
 msgid "Confirm"
 msgstr "Confirmer"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:536
+#
+#: crates/pdfs-gui/src/app/pages/login.rs:535
+msgid "Verify in Your Browser"
+msgstr "Vérifier dans le navigateur"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:537
+msgid ""
+"The verification page can't be shown in the app on this system. Open it in "
+"your browser, complete it there, then come back and choose Continue."
+msgstr ""
+"La page de vérification ne peut pas s’afficher dans l’application sur ce "
+"système. Ouvrez-la dans votre navigateur, terminez-la, puis revenez et "
+"choisissez « Continuer »."
+
+#
+#: crates/pdfs-gui/src/app/pages/login.rs:543
+msgid "Open Verification Page"
+msgstr "Ouvrir la page de vérification"
+
+#
+#: crates/pdfs-gui/src/app/pages/login.rs:550
+msgid "Continue"
+msgstr "Continuer"
+
+#: crates/pdfs-gui/src/app/pages/login.rs:589
 msgid "Sign Out?"
 msgstr "Se déconnecter ?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:538
+#: crates/pdfs-gui/src/app/pages/login.rs:591
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
@@ -3376,7 +3391,7 @@ msgstr ""
 "vous vous reconnectiez. Les fichiers déjà présents sur cet ordinateur "
 "restent en place."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:540
+#: crates/pdfs-gui/src/app/pages/login.rs:593
 msgid "Sign Out"
 msgstr "Se déconnecter"
 
@@ -6169,6 +6184,15 @@ msgstr "{count} a"
 #, rust-format
 msgid "cannot reach the Proton Drive daemon: {error}"
 msgstr "impossible de joindre le démon Proton Drive : {error}"
+
+#~ msgid ""
+#~ "The verification page couldn't be opened, so the sign-in was cancelled. "
+#~ "Your system may keep the web view's sandbox from starting; the "
+#~ "troubleshooting guide explains what to do."
+#~ msgstr ""
+#~ "La page de vérification n’a pas pu s’ouvrir, la connexion a donc été "
+#~ "annulée. Votre système empêche peut-être le démarrage du bac à sable de "
+#~ "la vue web ; le guide de dépannage explique la marche à suivre."
 
 #~ msgid "Account"
 #~ msgstr "Compte"

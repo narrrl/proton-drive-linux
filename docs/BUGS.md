@@ -419,29 +419,38 @@ and still silences the report.
 
 ### B195 — The app crashes when Proton asks for a CAPTCHA on secureblue
 
-**Status:** Fixed (unverified). Nobody has run the fix on secureblue yet.
+**Status:** Fixed (unverified). On 2026-10-08 the reporter confirmed that the app survives, but
+the CAPTCHA still could not be solved; the browser fallback below has not run on secureblue yet.
 **Found:** 2026-10-07, [#29](https://github.com/narrrl/proton-drive-linux/issues/29). On
 secureblue 44 (a hardened Fedora Atomic), `pdfs-app` aborted a few seconds after the sign-in, with
 `bwrap: Can't get type of source /run/systemd/journal/socket: Permission denied` and
 `Failed to fully launch dbus-proxy`.
-**Where:** `crates/pdfs-gui/src/app/pages/verify.rs`, `crates/pdfs-gui/src/app/pages/login.rs`
+**Where:** `crates/pdfs-gui/src/app/pages/verify.rs`, `crates/pdfs-gui/src/app/pages/login.rs`,
+`crates/pdfs-core/src/auth.rs`, `crates/pdfs-cli/src/main.rs`
 
 **Repro:** Sign in on secureblue from a network Proton asks a CAPTCHA for, such as a VPN.
 
 **Cause.** The CAPTCHA page runs in a WebKitGTK view (B8). Before it loads anything, WebKit starts
 its sandbox: bubblewrap, with the journal socket bound in, and `xdg-dbus-proxy`. secureblue keeps
 bubblewrap from the socket, the proxy does not start, and WebKit ends its process with `g_error`.
+WebKit binds the socket with `--ro-bind-try`, but bubblewrap skips only a missing path, not one it
+may not read, and WebKit has no switch to leave the socket out.
 The view was in the app's own process, so the whole app went down, and nothing in our code can
 catch that.
 
 **Fix.** The view runs in a child, `pdfs-app --human-verification`, that reads the URL on stdin
 and prints the token on stdout. A child that exits without a token after a crash or a non-zero
-status ends the sign-in with a message that says the page could not be opened. TROUBLESHOOTING.md
-gives the cause and a one-time workaround. The sandbox is not switched off by the app: users choose
-a hardened system for that isolation.
+status no longer ends the sign-in: the app offers the page in the user's own browser, as Proton
+Mail Bridge does. The tab cannot post the token back, so the user says when they are done, and the
+retry carries the challenge token, typed with every offered method. `pdfs login` takes the same
+path. The sandbox is not switched off by the app: users choose a hardened system for that
+isolation. TROUBLESHOOTING.md keeps the one-time workaround as a last resort.
 
 **Test:** unit tests `a_window_that_died_fails`, `a_window_closed_without_a_token_cancels`,
-`a_token_counts_even_if_the_window_died_after_it` and `the_token_is_found_among_other_output`.
+`a_token_counts_even_if_the_window_died_after_it`, `the_token_is_found_among_other_output`,
+`the_browser_gets_the_full_verification_page` and
+`a_browser_verification_retries_with_the_challenge_token`. The browser retry has not run against a
+live challenge: Proton only asks for one from a network it distrusts.
 On 2026-10-08 the child ran under real WebKit on Arch against a local page that posts a completion,
 and handed back its token.
 

@@ -1843,20 +1843,29 @@ fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
     // Only a two-password account is ever asked for this.
     let get_mailbox = |attempt: u32| prompt_mailbox(attempt, remember);
 
+    // Proton may ask for a CAPTCHA first, usually on a VPN. The CLI has no
+    // browser engine, so the user solves the page in their own browser and says
+    // when they are done; the retry then carries the challenge token.
+    let get_hv = |hv: pdfs_core::proton_sdk::api::HumanVerification| {
+        println!(
+            "Proton is asking for a CAPTCHA before it will accept this sign-in.\n\
+             Open this page in your browser and complete it:\n\n  {}\n",
+            auth::browser_verification_url(&hv)
+        );
+        prompt_line("Press Enter once the page says you are verified")
+            .map_err(|e| pdfs_core::Error::Other(format!("read verification answer: {e}")))?;
+        Ok(auth::browser_verified(&hv))
+    };
+
     let rt = tokio::runtime::Runtime::new()?;
-    // Solving a CAPTCHA needs a browser engine, which the CLI has no business
-    // carrying. Point at the app that does rather than failing with the raw API
-    // message, which reads as "your login is broken".
-    rt.block_on(auth::login(&username, &password, get_totp, get_mailbox))
-        .map_err(|e| match e {
-            pdfs_core::Error::HumanVerificationRequired(_) => anyhow::anyhow!(
-                "Proton is asking for a CAPTCHA before it will accept this sign-in.\n\
-                 Run `pdfs-app` and sign in there — it can show the verification page.\n\
-                 (This is usually triggered by a VPN or an unfamiliar IP; signing in from \
-                 your usual network often avoids it.)"
-            ),
-            other => anyhow::Error::new(other).context("login failed"),
-        })?;
+    rt.block_on(auth::login_interactive(
+        &username,
+        &password,
+        get_totp,
+        get_mailbox,
+        get_hv,
+    ))
+    .context("login failed")?;
 
     // A daemon that is already up is parked in `wait_for_session`, sleeping
     // between keyring checks; restart it so the mount appears now instead of

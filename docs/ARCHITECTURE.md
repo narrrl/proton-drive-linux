@@ -571,9 +571,13 @@ sequenceDiagram
 - The page may post the token as an object or as a JSON string; both are accepted.
 - The page runs in a WebKitGTK view inside a child `pdfs-app`. WebKit aborts its process when its
   sandbox cannot start, as on hardened systems such as secureblue (B195). In the child, that ends
-  the verification, and the app says why, instead of closing the app.
-- The CLI has no web view. It fails with a message to sign in once with `pdfs-app`; the stored
-  session then works for the CLI and the service.
+  the web view, not the app.
+- When the child fails, the app offers the page in the user's own browser instead, as Proton Mail
+  Bridge does. A browser tab cannot post the token back, so the user says when they are done, and
+  the retry carries the challenge token itself, which the solved page made good. Its type header
+  lists every offered method (`auth::browser_verified`).
+- The CLI has no web view, so it always takes the browser path: it prints the page's URL and waits
+  for Enter.
 
 ---
 
