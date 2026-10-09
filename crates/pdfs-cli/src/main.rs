@@ -2261,9 +2261,14 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         },
     );
 
-    // Clean unmount check (as a best-effort final backup).
-    if let Err(e) = rt.block_on(auth::persist(&session)) {
-        tracing::debug!(error = %e, "no new tokens to persist on shutdown");
+    // Last chance for a rotation the keyring refused when it happened. Only
+    // that: by now the keyring may hold a newer login, the one this stop was
+    // restarted for, and the tokens of this session would overwrite it.
+    if let Err(e) = auth::persist(&session) {
+        tracing::error!(
+            error = %e,
+            "could not save the refreshed session tokens; the next start may need `pdfs login`"
+        );
     }
     // Dropping the runtime waits for every blocking task, however long; a call
     // still stuck on Drive would hold the stop until systemd kills it (B165).

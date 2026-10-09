@@ -101,6 +101,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B201](#b201--after-signing-in-again-the-old-daemon-puts-its-spent-tokens-back) | After signing in again, the old daemon puts its spent tokens back |
 | [B200](#b200--offline-with-changes-queued-the-daemon-keeps-several-cores-busy) | Offline with changes queued, the daemon keeps several cores busy |
 | [B198](#b198--switching-to-online-only-deletes-local-files-that-never-reached-drive) | Switching to online-only deletes local files that never reached Drive |
 | [B197](#b197--switching-to-online-only-trashes-synced-files-that-became-ignored) | Switching to online-only trashes synced files that became ignored |
@@ -302,6 +303,38 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B201 — After signing in again, the old daemon puts its spent tokens back
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, reading the code for issue #35, where every call failed with
+`InvalidRefreshToken` and signing in again did not obviously help.
+**Where:** `crates/pdfs-core/src/auth.rs`, `persist`, `register_refresh_handler`, `unlock` and
+`migrate_legacy`; `crates/pdfs-cli/src/main.rs`, `cmd_daemon`
+
+**Repro:** With the daemon running, run `pdfs login`. It stores the new session and restarts the
+unit. The old daemon's stop runs `auth::persist`, which wrote its own access and refresh tokens
+into the blob, now the new session's. The new daemon starts with a refresh token of another
+session, and the first refresh fails with `InvalidRefreshToken`. `pdfs unlock` had the same
+shape: its session could rotate the tokens, and the restarted daemon's stop put the spent refresh
+token back. `unlock` and `migrate_legacy` could do it themselves, writing a copy of the blob read
+before verifying the mailbox password, which may have rotated the tokens.
+
+**Cause.** Proton refresh tokens are single-use. `store_tokens` loaded whatever blob was stored
+and replaced its tokens, without checking that the blob was still this session's.
+
+**Fix.** Each session writes its rotations through a `TokenSink`. It writes only into a blob with
+its session id that still holds the refresh token the session last left there; a blob that moved
+on, to a new login or to another session's rotation, is left alone. The stop no longer writes the
+session's tokens, only a rotation the keyring refused when it happened. `unlock` and
+`migrate_legacy` read the blob again after verifying. A failed final write is an error in the log,
+not a debug line claiming there was nothing to save.
+
+**Test:** `auth::tests::tokens_of_another_session_are_not_written`,
+`auth::tests::tokens_are_not_written_over_a_newer_rotation_of_the_same_session`,
+`auth::tests::a_sink_keeps_writing_its_own_rotations_and_stops_at_a_new_login`.
+
+---
 
 ### B200 — Offline with changes queued, the daemon keeps several cores busy
 
