@@ -453,6 +453,36 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_partial_write_over_bytes_never_read_takes_another_write_at_once() {
+        // Nothing here ever read the file, so the release of a partial write
+        // had no cached base to fill its gaps from and queued an incomplete
+        // revision. The next write open on it failed with EIO (B204).
+        let drive = FakeDrive::new();
+        drive.device().write("f.txt", b"0123456789");
+        let dir = scratch("partial-write-unread-base");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+
+        write_at(&path, 2, b"ab").unwrap();
+        write_at(&path, 6, b"cd").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.tree().get("f.txt").cloned() == file(b"01ab45cd89")
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+        assert_eq!(drive.tree().len(), 1, "{:?}", drive.tree());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_deleted_offline_while_open_still_reads_and_takes_writes() {
         // Queuing the trash dropped the cached bytes the open handle reads,
         // and a partial write offline failed with EIO (B186).

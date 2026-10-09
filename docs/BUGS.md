@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B204](#b204--a-write-over-a-partial-edit-whose-base-was-never-read-fails-with-eio) | A write over a partial edit whose base was never read fails with `EIO` |
 | [B203](#b203--pdfs-unlock-leaves-a-running-daemon-a-spent-refresh-token) | `pdfs unlock` leaves a running daemon a spent refresh token |
 | [B202](#b202--a-refused-session-shows-as-offline-forever-and-nothing-says-to-sign-in-again) | A refused session shows as offline forever, and nothing says to sign in again |
 | [B201](#b201--after-signing-in-again-the-old-daemon-puts-its-spent-tokens-back) | After signing in again, the old daemon puts its spent tokens back |
@@ -305,6 +306,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B204 — A write over a partial edit whose base was never read fails with `EIO`
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, by CI on 2a86830 (`one_client_on_a_good_link`, seed 1, which did not replay
+locally). A partial write to `x/f.txt`, a file renamed twice before, was renamed over `z/d`. A
+create over `z/d` a moment later failed with `EIO`, and the daemon logged "refusing write over
+incomplete queued revision".
+**Where:** `ProtonFs::serve_open` in `crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Write at an offset into a file this client never read, then open it for writing again
+before the drain uploads the first write.
+
+**Cause.** The release of a partial write fills its gaps from the content cache only. When the
+cache does not hold the base, the queued revision stays incomplete until the drain fills it from
+Drive, and a write open over an incomplete revision was refused. B123, B157, B169 and B170 each
+closed one way the cache could miss the base. Any other miss, such as a file never read here,
+still failed the next write open for the length of the drain debounce.
+
+**Fix.** A write open over an incomplete queued revision copies the blob and fills its gaps from
+the remote base with `Core::fill_gaps`, as the drain does before an upload. The open fails only
+when that fill fails, for example offline.
+
+**Test:** `a_partial_write_over_bytes_never_read_takes_another_write_at_once` in `sim/daemon.rs`.
+Without the fix the second write fails with `EIO`.
+
+---
 
 ### B203 — `pdfs unlock` leaves a running daemon a spent refresh token
 

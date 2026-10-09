@@ -1267,8 +1267,12 @@ impl ProtonFs {
         //
         // Complete pending blobs are the common case and can be copied without
         // any network access. An incomplete blob still has gaps referring to
-        // the remote base; stacking another write on it cannot be represented
-        // safely by WriteHandle, so fail the open rather than risk corruption.
+        // the remote base, and stacking another write on it cannot be
+        // represented by WriteHandle, so the copy's gaps are filled from that
+        // base first, as the drain fills them before an upload. Only when that
+        // fails (offline, or the base is gone) does the open fail: refusing
+        // every such open failed a create over a file whose partial edit had
+        // not drained yet (`docs/BUGS.md` B204).
         //
         // Reading that blob and installing the handle cannot be done under one
         // lock — the copy is the size of the file — so the base is re-checked at
@@ -1302,10 +1306,6 @@ impl ProtonFs {
                     }
                 }
                 let pending_base = self.core.pending.lock().get(&uid).cloned();
-                if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
-                    error!(%uid, "refusing write over incomplete queued revision");
-                    break 'install Err(Errno::EIO);
-                }
                 let (file, path) = match self.core.cache.create_scratch() {
                     Ok(x) => x,
                     Err(e) => {
@@ -1324,6 +1324,25 @@ impl ProtonFs {
                         error!(%uid, source = %pending.path.display(), error = %e,
                             "copy queued revision into write scratch failed");
                         break 'install Err(Errno::EIO);
+                    }
+                    if !pending.meta.complete {
+                        let mut authored = Intervals::default();
+                        for &(s, e) in &pending.meta.authored {
+                            authored.add(s, e);
+                        }
+                        if let Err(error) = self.core.fill_gaps(
+                            &uid,
+                            &file,
+                            pending.meta.len,
+                            pending.meta.base_mtime,
+                            pending.meta.base_size,
+                            &authored,
+                        ) {
+                            let _ = std::fs::remove_file(&path);
+                            error!(%uid, ?error, "cannot complete the queued revision a write open is based on");
+                            break 'install Err(error);
+                        }
+                        debug!(%uid, "write open completed an incomplete queued revision");
                     }
                     initial_written.add(0, pending.meta.len);
                 }

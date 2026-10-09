@@ -12,6 +12,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 ## [Unreleased]
 
 ### Fixed
+- **Writing to a file again soon after a partial write could fail with an I/O error.** When the
+  first write changed only part of a file this client had not read, a second write, or saving
+  over the file, failed until the first one reached Drive. It now fetches the rest of the file
+  and goes ahead.
 - **A CAPTCHA could not be solved on hardened systems.** When the verification page cannot open in
   the app, as on secureblue, the app now offers it in your browser and continues the sign-in
   once you are done. `pdfs login` now handles a CAPTCHA the same way instead of failing.
