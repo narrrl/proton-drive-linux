@@ -46,6 +46,8 @@ struct JobEntry {
     detail: Mutex<String>,
     done: AtomicU64,
     total: AtomicU64,
+    /// Housekeeping that moves nothing; see [`JobItem::background`].
+    background: bool,
 }
 
 /// The set of transfers and jobs currently in flight. Cloned `Arc`-style across
@@ -160,12 +162,25 @@ impl TransferRegistry {
     /// that carries its progress and deregisters the job when dropped. The job
     /// starts indeterminate; give it a `total` once one is known.
     pub fn begin_job(self: &Arc<Self>, title: impl Into<String>) -> JobGuard {
+        self.register_job(title.into(), false)
+    }
+
+    /// [`TransferRegistry::begin_job`] for housekeeping the user did not ask
+    /// for and that changes nothing in their files, such as an index rebuild or
+    /// a cache check. It is reported, but front ends don't call the drive busy
+    /// over it.
+    pub fn begin_background_job(self: &Arc<Self>, title: impl Into<String>) -> JobGuard {
+        self.register_job(title.into(), true)
+    }
+
+    fn register_job(self: &Arc<Self>, title: String, background: bool) -> JobGuard {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(JobEntry {
-            title: title.into(),
+            title,
             detail: Mutex::new(String::new()),
             done: AtomicU64::new(0),
             total: AtomicU64::new(0),
+            background,
         });
         self.jobs.lock().insert(id, entry.clone());
         JobGuard {
@@ -191,6 +206,7 @@ impl TransferRegistry {
                     detail: e.detail.lock().clone(),
                     done: e.done.load(Ordering::Relaxed),
                     total: e.total.load(Ordering::Relaxed),
+                    background: e.background,
                 }
             })
             .collect()

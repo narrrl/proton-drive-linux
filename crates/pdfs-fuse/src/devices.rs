@@ -657,12 +657,16 @@ impl Core {
                     } else {
                         p.total.max(p.done) as u64
                     },
+                    // Most passes find nothing; only one that queues work is
+                    // the drive syncing.
+                    background: true,
                 },
                 SyncPhase::Applying => JobItem {
                     title: format!("Syncing {folder}"),
                     detail: p.current.clone(),
                     done: p.done as u64,
                     total: p.total.max(p.done) as u64,
+                    background: false,
                 },
             });
         }

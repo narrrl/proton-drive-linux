@@ -1225,6 +1225,12 @@ pub struct JobItem {
     /// Steps known to need doing, or `0` when unknown (indeterminate progress).
     /// May *grow* mid-job as more work is discovered.
     pub total: u64,
+    /// Housekeeping that changes nothing in the user's files: a mirror folder
+    /// scan that finds nothing to do yet, an index rebuild, a cache check. Front
+    /// ends may show it, but should not report the drive as busy over it. Absent
+    /// from older daemons, which never set it.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// One in-flight transfer in a [`Response::Transfers`] snapshot.

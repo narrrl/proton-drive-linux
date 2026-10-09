@@ -1034,7 +1034,9 @@ impl Core {
 
         let core = self.clone();
         std::thread::spawn(move || {
-            let job = core.transfers.begin_job("Checking the cache database");
+            let job = core
+                .transfers
+                .begin_background_job("Checking the cache database");
             job.detail("Verifying every page");
             let problems = match core.db.integrity_check() {
                 Ok(problems) => problems,

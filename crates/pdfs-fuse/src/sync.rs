@@ -50,7 +50,7 @@ mod planner;
 use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{SyncMsg, spawn};
 #[cfg(test)]
-use engine::{classify, settle_with};
+use engine::{classify, event_target, settle_with};
 #[cfg(test)]
 use local_scan::is_write_mode;
 use local_scan::open_for_write_set;
@@ -2095,6 +2095,32 @@ mod tests {
         let started = Instant::now();
         settle_with(rx, &mut ids, &mut all, &mut rewatch, quiet, cap);
         (ids, started.elapsed())
+    }
+
+    #[test]
+    fn a_change_in_one_mirror_folder_reconciles_only_that_folder() {
+        let watched = vec![
+            (PathBuf::from("/home/me/Docs"), 1),
+            (PathBuf::from("/home/me/Photos"), 2),
+            (PathBuf::from("/home/me/Photos/Raw"), 3),
+        ];
+        let target = |paths: &[&str]| {
+            let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            match event_target(&watched, &paths) {
+                SyncMsg::Reconcile(id) => Some(id),
+                SyncMsg::ReconcileAll => None,
+                _ => panic!("unexpected message"),
+            }
+        };
+        assert_eq!(target(&["/home/me/Docs/a.txt"]), Some(1));
+        // A rename within one folder.
+        assert_eq!(target(&["/home/me/Docs/a", "/home/me/Docs/b"]), Some(1));
+        // The deepest root wins.
+        assert_eq!(target(&["/home/me/Photos/Raw/x.cr2"]), Some(3));
+        // Across folders, outside them all, or no path at all: walk everything.
+        assert_eq!(target(&["/home/me/Docs/a", "/home/me/Photos/a"]), None);
+        assert_eq!(target(&["/home/me/Docsx/a"]), None);
+        assert_eq!(target(&[]), None);
     }
 
     /// The bug this replaced a fixed sleep for: a save that keeps writing past
