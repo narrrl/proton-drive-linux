@@ -60,6 +60,10 @@ pub(crate) struct Link {
     /// that restarts the daemon. Read by front-ends through `Response::Status`,
     /// so they can ask the user to sign in again rather than say "offline".
     pub(crate) session_expired: AtomicBool,
+    /// Proton refused the session, but only because another process rotated
+    /// it (`pdfs unlock`): the keyring holds the live tokens. The mount loop
+    /// ends the mount for the daemon to mount again from the keyring.
+    pub(crate) resume_stored: AtomicBool,
 }
 
 impl Link {
@@ -202,7 +206,19 @@ impl Core {
     /// Flip the mount offline for good: Proton refused the session, and only a
     /// new login brings it back. Changes stay queued for the daemon that login
     /// starts. Only the first caller logs it.
+    ///
+    /// Unless the keyring holds a newer session than the refused one: then
+    /// the mount ends, for the daemon to mount again on that one.
     pub(crate) fn mark_session_expired(&self, what: &str, error: &dyn std::fmt::Display) {
+        if self.link.resume_stored.load(Ordering::Relaxed) {
+            return self.mark_offline(what, error);
+        }
+        if pdfs_core::auth::stored_session_is_newer() {
+            info!(during = what, %error,
+                  "Proton refused a session another process has since refreshed; resuming it");
+            self.link.resume_stored.store(true, Ordering::Relaxed);
+            return self.mark_offline(what, error);
+        }
         if !self.link.session_expired.swap(true, Ordering::Relaxed) {
             warn!(during = what, %error,
                   "Proton refused the session; run `pdfs login` to sign in again");

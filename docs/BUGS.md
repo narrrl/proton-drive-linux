@@ -101,6 +101,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B203](#b203--pdfs-unlock-leaves-a-running-daemon-a-spent-refresh-token) | `pdfs unlock` leaves a running daemon a spent refresh token |
 | [B202](#b202--a-refused-session-shows-as-offline-forever-and-nothing-says-to-sign-in-again) | A refused session shows as offline forever, and nothing says to sign in again |
 | [B201](#b201--after-signing-in-again-the-old-daemon-puts-its-spent-tokens-back) | After signing in again, the old daemon puts its spent tokens back |
 | [B200](#b200--offline-with-changes-queued-the-daemon-keeps-several-cores-busy) | Offline with changes queued, the daemon keeps several cores busy |
@@ -304,6 +305,35 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B203 — `pdfs unlock` leaves a running daemon a spent refresh token
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-09, reading the code for issue #35 after the B201 fix
+**Where:** `crates/pdfs-core/src/auth.rs`, `stored_session_is_newer`; `crates/pdfs-fuse/src/link.rs`,
+`Core::mark_session_expired`; `crates/pdfs-fuse/src/mount.rs`; `crates/pdfs-cli/src/main.rs`,
+`cmd_daemon`
+
+**Repro:** With the daemon running, run `pdfs unlock` while the stored access token has expired.
+Unlock resumes the same session, refreshes it and stores the new tokens. The daemon still holds
+the old refresh token. If it refreshes before unlock restarts it, Proton refuses the spent token,
+and since B202 the mount reports the session expired, although the keyring holds a live one.
+
+**Cause.** Two processes ran the same session, and only one of them could hold its live refresh
+token. B201 stopped the daemon from writing its spent token over the live one, but nothing made the
+daemon pick up the live one.
+
+**Fix.** Before a refused session counts as expired, `auth::stored_session_is_newer` compares the
+keyring with what this process last stored. When the keyring holds a newer rotation of the same
+session, or another login, the mount ends with `MountOutcome::ResumeStored`, and the daemon mounts
+again at once from the keyring. At startup the same check turns the refusal into a mount error,
+which the daemon retries. A rotation that another process already wrote into the blob is now
+taken as this session's, so the daemon keeps writing its later rotations.
+
+**Test:** `auth::tests::a_session_rotated_by_another_process_is_newer_in_the_keyring` and
+`auth::tests::a_rotation_already_in_the_blob_is_taken`.
+
+---
 
 ### B202 — A refused session shows as offline forever, and nothing says to sign in again
 

@@ -687,6 +687,28 @@ pub fn persist(session: &ProtonApiSession) -> Result<()> {
     }
 }
 
+/// Whether the keyring holds a session newer than any this process runs on:
+/// another login, or one of this process's sessions rotated by another
+/// process (`pdfs unlock` resumes the same login and may refresh it).
+///
+/// The refresh token this process holds is spent then, and Proton refuses it
+/// as if the session were gone. A daemon asks this before it reports the
+/// session expired, and resumes the stored one instead.
+pub fn stored_session_is_newer() -> bool {
+    // Nothing to compare with, and no keyring to wake up for it.
+    if TOKEN_SINKS.lock().is_empty() {
+        return false;
+    }
+    let Ok(stored) = load() else {
+        return false;
+    };
+    let sinks = TOKEN_SINKS.lock();
+    match sinks.get(&stored.session_id) {
+        Some(sink) => sink.state.lock().stored_refresh != stored.refresh_token,
+        None => !sinks.is_empty(),
+    }
+}
+
 /// Where each live session in this process writes its rotated tokens, by
 /// session id, for [`persist`] to find.
 static TOKEN_SINKS: parking_lot::Mutex<BTreeMap<String, Arc<TokenSink>>> =
@@ -737,14 +759,17 @@ enum Rotation {
 }
 
 /// Put `tokens` into `stored` if it is still this session's blob: the same
-/// session id, holding the refresh token this session last left in it.
+/// session id, holding the refresh token this session last left in it, or
+/// already holding this very rotation (another process wrote it first).
 fn take_rotation(
     stored: &mut StoredSession,
     session_id: &str,
     stored_refresh: &str,
     tokens: &Tokens,
 ) -> Rotation {
-    if stored.session_id != session_id || stored.refresh_token != stored_refresh {
+    if stored.session_id != session_id
+        || (stored.refresh_token != stored_refresh && stored.refresh_token != tokens.refresh_token)
+    {
         return Rotation::MovedOn;
     }
     stored.access_token = tokens.access_token.clone();
@@ -1011,6 +1036,16 @@ mod tests {
         assert_eq!(stored.refresh_token, "r");
     }
 
+    /// `pdfs unlock` wrote this very rotation first, from the same session.
+    #[test]
+    fn a_rotation_already_in_the_blob_is_taken() {
+        let mut stored = stored_with("r2");
+        assert_eq!(
+            take_rotation(&mut stored, "s", "r", &tokens("a2", "r2")),
+            Rotation::Taken
+        );
+    }
+
     /// The keyring is one store per process, so the tests that use it,
     /// through `keyring-core`'s in-memory store, take turns.
     fn mock_keyring() -> parking_lot::MutexGuard<'static, ()> {
@@ -1044,6 +1079,27 @@ mod tests {
         let now = load().unwrap();
         assert_eq!(now.session_id, "new");
         assert_eq!(now.refresh_token, "fresh");
+    }
+
+    /// `pdfs unlock` rotated the daemon's session behind its back: the
+    /// daemon's refresh token is spent, and the keyring holds the live one.
+    #[test]
+    fn a_session_rotated_by_another_process_is_newer_in_the_keyring() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        TOKEN_SINKS
+            .lock()
+            .insert("s".into(), Arc::new(TokenSink::new("s", "r".into())));
+        assert!(!stored_session_is_newer());
+
+        write_stored(&stored_with("r2")).unwrap();
+        assert!(stored_session_is_newer());
+
+        let mut login = stored_with("fresh");
+        login.session_id = "new".into();
+        write_stored(&login).unwrap();
+        assert!(stored_session_is_newer());
+        TOKEN_SINKS.lock().remove("s");
     }
 
     /// B61: a rotation the keyring refused lived only in memory.

@@ -12,6 +12,10 @@ pub enum MountOutcome {
     /// The kernel mount ended on its own (e.g. an external `fusermount -u`).
     /// The caller may want to remount.
     Unmounted,
+    /// Proton refused the session, and the keyring holds a newer one: another
+    /// process (`pdfs unlock`) refreshed it, or a new login replaced it. We
+    /// unmounted ourselves; the caller should mount again, which resumes it.
+    ResumeStored,
 }
 
 /// Whether `path` is a mountpoint whose FUSE connection is dead — the state a
@@ -227,6 +231,11 @@ fn fetch_or_recall_root(
     } else {
         Start::Offline
     };
+    if start == Start::SessionExpired && pdfs_core::auth::stored_session_is_newer() {
+        return Err(std::io::Error::other(format!(
+            "Proton refused a session another process has since refreshed ({err}); resuming it"
+        )));
+    }
     let cached = db
         .state_str(ROOT_UID_KEY)
         .ok()
@@ -744,6 +753,18 @@ pub(crate) fn mount_with(
                     warn!(error = %e, "umount_and_join failed");
                 }
                 break MountOutcome::Shutdown;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if core.link.resume_stored.load(Ordering::Relaxed) =>
+            {
+                info!("unmounting to resume the stored session");
+                core.mounts.lock().close();
+                if let Err(e) = teardown_session(&core.session_live, || {
+                    umount_session_unblocked(bg, main_conn)
+                }) {
+                    warn!(error = %e, "umount_and_join failed");
+                }
+                break MountOutcome::ResumeStored;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if bg.guard.is_finished() {

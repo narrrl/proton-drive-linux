@@ -2193,6 +2193,9 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                 tracing::info!("daemon stopping");
                 return Ok(());
             }
+            Ok(pdfs_fuse::MountOutcome::ResumeStored) => {
+                tracing::info!("resuming the session stored in the keyring");
+            }
             Ok(pdfs_fuse::MountOutcome::Unmounted) => {
                 tracing::warn!("mount ended externally; remounting in 2s");
                 pdfs_fuse::idle_sleep(std::time::Duration::from_secs(2));
