@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **A Nix flake for NixOS.** `nix build github:narrrl/proton-drive-linux` builds the client, and
+  the flake's NixOS module installs it and runs the mount in every graphical session. See
+  [Install → NixOS](INSTALL.md#nixos-flake).
+  ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
+
 ### Fixed
 - **Writing to a file again soon after a partial write could fail with an I/O error.** When the
   first write changed only part of a file this client had not read, a second write, or saving

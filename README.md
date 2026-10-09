@@ -76,6 +76,7 @@ scriptable CLI.
 | Debian, Ubuntu 24.04 or newer | `.deb` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
 | Fedora 44 or newer | `.rpm` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
 | Arch Linux | [`proton-drive-for-linux`](https://aur.archlinux.org/packages/proton-drive-for-linux) (also `-bin` and `-git`) in the AUR |
+| NixOS | The flake in this repository: see [Install → NixOS](docs/INSTALL.md#nixos-flake) |
 | Anything else | [Build from source](docs/INSTALL.md#build-from-source) |
 
 ```bash
