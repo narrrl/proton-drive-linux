@@ -8,6 +8,7 @@
   glib,
   wrapGAppsHook4,
   fuse3,
+  glib-networking,
   gtk4,
   libadwaita,
   webkitgtk_6_0,
@@ -63,6 +64,9 @@ rustPlatform.buildRustPackage {
 
   buildInputs = [
     fuse3
+    # TLS for WebKitGTK's GIO: without it the CAPTCHA page fails with "TLS
+    # support is not available". wrapGAppsHook4 adds it to GIO_EXTRA_MODULES.
+    glib-networking
     gtk4
     libadwaita
     webkitgtk_6_0
