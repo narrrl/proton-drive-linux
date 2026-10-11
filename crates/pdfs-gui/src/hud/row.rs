@@ -77,13 +77,16 @@ pub(crate) fn icon_for(name: &str, is_dir: bool) -> gio::Icon {
 }
 
 /// The sync badge of a Drive file, as in the app's browser: pinned, cached,
-/// or online only. Folders and local files have none.
+/// or online only. A folder has one only when kept offline; local files have
+/// none.
 pub(crate) fn badge_for(hit: &Hit) -> Option<(&'static str, &'static str)> {
     let Hit::Drive(drive) = hit else {
         return None;
     };
     if drive.is_dir {
-        return None;
+        return drive
+            .pinned
+            .then_some(("pdfs-offline-symbolic", "badge-pinned"));
     }
     Some(if drive.pinned {
         ("pdfs-offline-symbolic", "badge-pinned")

@@ -384,11 +384,20 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     } else {
         parent.to_string()
     });
-    // Pinning is per file: the context menu and the selection bar offer it for
-    // files only, so the pane must not offer it for folders either.
+    // Kept through a pinned folder above it, the entry has no pin of its own
+    // to remove, so the switch shows that state without offering to change it.
     d.pin_row.set_active(entry.pinned);
-    d.pin_row.set_visible(!entry.is_dir);
-    d.pin_row.set_sensitive(*ui.mounted.borrow());
+    d.pin_row.set_subtitle(&if entry.pinned_by_folder {
+        gettext("Kept on this computer because a folder it is in is available offline.")
+    } else if entry.is_dir {
+        gettext(
+            "Keep a copy of everything in this folder on this computer, even without a connection.",
+        )
+    } else {
+        gettext("Keep a copy on this computer, even without a connection.")
+    });
+    d.pin_row
+        .set_sensitive(*ui.mounted.borrow() && !entry.pinned_by_folder);
     d.open_button.set_label(&if entry.is_dir {
         gettext("Open folder")
     } else {

@@ -1538,7 +1538,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         let row = adw::ActionRow::builder()
             .title(gettext("No files kept offline"))
             .subtitle(gettext(
-                "Right-click a file and choose “Make available offline”.",
+                "Right-click a file or folder and choose “Available offline”.",
             ))
             .build();
         ui.status.pins_group.add(&row);

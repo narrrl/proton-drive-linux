@@ -172,17 +172,19 @@ enum Command {
         /// Mountpoint; defaults to ~/ProtonDrive.
         mountpoint: Option<PathBuf>,
     },
-    /// Keep a file on this device (download + cache it). Needs a running mount.
+    /// Keep a file or folder on this device (download + cache it). A folder's
+    /// files download in the background; `pdfs transfers` shows the progress.
+    /// Needs a running mount.
     Pin {
-        /// File path, inside the mountpoint or relative to it.
+        /// File or folder path, inside the mountpoint or relative to it.
         path: PathBuf,
     },
-    /// Stop keeping a file on this device, evicting its cached content.
+    /// Stop keeping a file or folder on this device, evicting its cached content.
     Unpin {
-        /// File path, inside the mountpoint or relative to it.
+        /// File or folder path, inside the mountpoint or relative to it.
         path: PathBuf,
     },
-    /// List files pinned to this device.
+    /// List files and folders pinned to this device.
     Pins,
     /// List a directory via the running daemon (in-app browser backend).
     Ls {
@@ -3793,6 +3795,7 @@ mod login_wait_tests {
             size: 1,
             modified: 0,
             pinned: false,
+            pinned_by_folder: false,
             cached: false,
             uid: "vol~link".into(),
             path: String::new(),

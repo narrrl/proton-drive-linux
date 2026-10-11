@@ -44,7 +44,7 @@ The app uses these words consistently, and so does this guide:
 | **My files** | The root of your Drive |
 | **Proton Drive folder** | Where My files appears on disk, `~/ProtonDrive` by default |
 | **Online only** | A file or folder whose content downloads when opened |
-| **Available offline** | A single file kept on this computer |
+| **Available offline** | A file, or a folder with everything in it, kept on this computer |
 | **Synced folder** | A local folder with a full copy on this computer, backed up to Proton Drive |
 | **Proton Drive service** | The background service (`proton-drive.service`) |
 
@@ -75,11 +75,14 @@ try to create them get a clean error, not a hang or `EIO`.
 
 ## Keeping files on this computer
 
-Turn on **Make available offline** for a file in My files, or run `pdfs pin <path>`. The file is
-downloaded completely and never evicted from the cache. `pdfs pins` lists these files, and
-**Preferences → Storage → Available offline** shows them in the app.
+Turn on **Available offline** for a file or folder in My files, or run `pdfs pin <path>`. A file
+is downloaded completely and never evicted from the cache. For a folder, every file in it and in
+its subfolders downloads in the background, and the tray and the app show the progress.
+`pdfs pins` lists what is kept, and **Preferences → Storage → Available offline** shows it in the
+app.
 
-Turning it off (`pdfs unpin <path>`) frees the space. The file stays on Proton Drive.
+Turning it off (`pdfs unpin <path>`) frees the space. The files stay on Proton Drive. A file inside
+a folder kept offline stays with its folder: turn the folder off instead.
 
 ## Syncing local folders
 

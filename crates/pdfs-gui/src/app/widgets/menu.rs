@@ -61,6 +61,18 @@ impl ActionMenu {
         self
     }
 
+    /// A greyed-out check item showing `active`, for a state the user cannot
+    /// change from here.
+    pub(crate) fn locked_toggle(&mut self, label: &str, active: bool) -> &mut Self {
+        let name = self.next_action();
+        let action = gio::SimpleAction::new_stateful(&name, None, &active.to_variant());
+        action.set_enabled(false);
+        self.group.add_action(&action);
+        self.section
+            .append(Some(label), Some(&format!("menu.{name}")));
+        self
+    }
+
     /// Close the current section; the next item starts a new one below a
     /// separator. An empty section is skipped, so callers can end a group of
     /// conditional items unconditionally.

@@ -4227,8 +4227,10 @@ impl Core {
     }
 
     /// Pin the node at mountpoint-relative `rel`. A file downloads its full
-    /// plaintext into the content cache; a folder records a recursive pin and
-    /// downloads every descendant file (selective sync). Returns a human message.
+    /// plaintext into the content cache before this returns. A folder records a
+    /// recursive pin and downloads every descendant file on a background thread,
+    /// reported as a job: a big folder far outlasts the socket read timeout.
+    /// Returns a human message.
     fn pin(&self, rel: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder, mtime, size) = {
@@ -4245,34 +4247,69 @@ impl Core {
             )
         };
         if is_folder {
+            // Offline, every download would fail and the folder would only look
+            // kept. Refuse instead, as a file pin does.
+            if !self.is_online() {
+                return Err(CoreError::offline());
+            }
             // Record the recursive pin first so every descendant is eviction-
             // exempt before we start filling the cache with the subtree.
             self.cache
                 .add_pin(&uid, rel, true)
                 .map_err(|e| CoreError::from_api(&e, "pin"))?;
-            let n = self.pin_subtree(ino)?;
-            return Ok(format!("{name} ({n} files)"));
+            let core = self.clone();
+            let folder = name.clone();
+            std::thread::Builder::new()
+                .name("pin-folder".into())
+                .spawn(move || core.pin_subtree(ino, &uid, &folder))
+                .map_err(|e| CoreError::internal(format!("spawn pin: {e}")))?;
+            return Ok(format!("{name}: downloading its files in the background"));
         }
-        let bytes = self
-            .download_file_tracked(&uid, &name, size)
-            .map_err(|e| CoreError::from_api(&e, "download"))?;
-        self.cache
-            .store(&uid, mtime, size, &bytes)
-            .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
+        self.fetch_content(&uid, &name, mtime, size)?;
         self.cache
             .add_pin(&uid, rel, false)
             .map_err(|e| CoreError::from_api(&e, "pin"))?;
         Ok(name)
     }
 
-    /// Download and cache every file in the subtree rooted at folder `ino`,
-    /// returning the count cached (already-fresh blobs counted, not re-fetched).
-    /// Walks the tree depth-first, enumerating each folder so a cold subtree is
-    /// fully discovered; the lock is dropped before each network download.
-    fn pin_subtree(&self, ino: u64) -> CoreResult<usize> {
+    /// Download and cache every file in the subtree rooted at the pinned folder
+    /// `ino` (`folder`, named `name`), as a job the front ends show. Walks the
+    /// tree depth-first, enumerating each folder so a cold subtree is fully
+    /// discovered; the lock is dropped before each network download. Stops when
+    /// the folder is unpinned or the daemon stops.
+    fn pin_subtree(&self, ino: u64, folder: &NodeUid, name: &str) {
+        let job = self
+            .transfers
+            .begin_job(format!("Making {name} available offline"));
+        match self.pin_subtree_files(ino) {
+            Ok(files) => {
+                job.set_total(files.len() as u64);
+                let mut failed = 0usize;
+                for (uid, file, mtime, size) in files {
+                    if self.shutdown.is_stopping() || !self.cache.is_pinned(folder) {
+                        return;
+                    }
+                    job.detail(file.clone());
+                    if let Err(e) = self.fetch_content(&uid, &file, mtime, size) {
+                        warn!(%uid, error = %e, "pin folder: download failed");
+                        failed += 1;
+                    }
+                    job.step();
+                }
+                info!(folder = %name, failed, "pin folder: done");
+            }
+            Err(e) => warn!(folder = %name, error = %e, "pin folder: enumerate failed"),
+        }
+    }
+
+    /// Every file in the subtree rooted at folder `ino`.
+    fn pin_subtree_files(&self, ino: u64) -> CoreResult<Vec<(NodeUid, String, i64, u64)>> {
         let mut files: Vec<(NodeUid, String, i64, u64)> = Vec::new();
         let mut stack = vec![ino];
         while let Some(dir) = stack.pop() {
+            if self.shutdown.is_stopping() {
+                break;
+            }
             self.ensure_children(dir)
                 .map_err(|e| self.errno_error(e, "enumerate"))?;
             let st = self.state();
@@ -4293,22 +4330,7 @@ impl Core {
                 }
             }
         }
-        let mut count = 0;
-        for (uid, name, mtime, size) in files {
-            if self.cache.is_cached(&uid, mtime, size) {
-                count += 1;
-                continue;
-            }
-            match self.download_file_tracked(&uid, &name, size) {
-                Ok(bytes) => {
-                    if self.cache.store(&uid, mtime, size, &bytes).is_ok() {
-                        count += 1;
-                    }
-                }
-                Err(e) => warn!(%uid, error = %e, "pin subtree: download failed"),
-            }
-        }
-        Ok(count)
+        Ok(files)
     }
 
     /// Fetch a thumbnail of `ttype` for the file at `ino`, served from the cache
@@ -4354,6 +4376,8 @@ impl Core {
 
     /// Unpin the node at `rel`, evicting its cached content. For a folder, also
     /// evicts every descendant's cached blob (the subtree is no longer kept).
+    /// A node kept only because a folder above it is pinned is refused: there
+    /// is no pin of its own to remove, and it would stay kept all the same.
     fn unpin(&self, rel: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder) = {
@@ -4363,14 +4387,24 @@ impl Core {
                 .map(|e| (e.node.name.clone(), e.node.is_folder()))
                 .unwrap_or_default()
         };
+        if self.pinned_by_folder(ino) {
+            return Err(CoreError::conflict(format!(
+                "{name} is kept offline because a folder above it is; unpin that folder instead"
+            )));
+        }
         self.cache
             .remove_pin(&uid)
             .map_err(|e| CoreError::from_api(&e, "unpin"))?;
         // A recursively-pinned folder's descendants were eviction-exempt; now
         // that the pin is gone, reclaim their blobs eagerly instead of waiting
-        // for budget pressure. Descendants come from the DB node tree.
+        // for budget pressure. Descendants come from the DB node tree. One
+        // pinned on its own, or under a pinned subfolder, is still kept.
         if is_folder && let Ok(uids) = self.db.descendants(&uid.to_string()) {
+            let still_pinned = self.pinned_set();
             for s in uids {
+                if still_pinned.contains(&s) {
+                    continue;
+                }
                 if let Some(u) = parse_uid(&s) {
                     self.cache.evict(&u);
                     self.evict_reader(&u);
@@ -4378,6 +4412,20 @@ impl Core {
             }
         }
         Ok(name)
+    }
+
+    /// Whether the node at `ino` is kept offline because a folder above it is
+    /// pinned, whether or not it is also pinned on its own.
+    fn pinned_by_folder(&self, ino: u64) -> bool {
+        let parent = {
+            let st = self.state();
+            st.entries
+                .get(&ino)
+                .filter(|e| e.parent != ino)
+                .and_then(|e| st.entries.get(&e.parent))
+                .map(|p| p.uid.clone())
+        };
+        parent.is_some_and(|uid| self.cache.is_pinned(&uid))
     }
 
     /// A Photos API handle sharing this Core's Drive client and session, so it
@@ -4392,10 +4440,13 @@ impl Core {
     /// the same lazy remote enumeration `readdir` uses, projected into
     /// serializable [`DirEntry`]s (with per-file pin state).
     fn list_dir(&self, rel: &Path) -> CoreResult<Vec<DirEntry>> {
-        let (ino, _uid) = self.resolve(rel)?;
+        let (ino, uid) = self.resolve(rel)?;
         self.ensure_children(ino)
             .map_err(|e| self.errno_error(e, "enumerate"))?;
         self.settle_listing_sizes(ino);
+        // Every entry shares this folder as its parent, so one lookup says
+        // whether they are all kept through it.
+        let pinned_by_folder = self.cache.is_pinned(&uid);
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
         let rows: Vec<(String, bool, u64, i64, NodeUid, u64)> = {
@@ -4427,7 +4478,8 @@ impl Core {
                 is_dir,
                 size,
                 modified,
-                pinned: self.cache.is_pinned(&uid),
+                pinned: pinned_by_folder || self.cache.is_pinned(&uid),
+                pinned_by_folder,
                 cached: !is_dir && self.cache.is_cached(&uid, modified, size),
                 uid: uid.to_string(),
                 // Listing entries live in the requested dir; the caller derives
@@ -5319,6 +5371,7 @@ impl Core {
                 // A trashed node can't be pinned or served from the mount, so its
                 // content is never current cache: report neither.
                 pinned: false,
+                pinned_by_folder: false,
                 cached: false,
                 uid: item.uid,
                 path: String::new(),

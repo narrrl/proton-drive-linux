@@ -1260,8 +1260,15 @@ pub struct DirEntry {
     pub size: u64,
     /// Modification time, epoch seconds.
     pub modified: i64,
-    /// Whether the file is pinned to this device.
+    /// Whether the node is pinned to this device, on its own or through a
+    /// pinned folder above it.
     pub pinned: bool,
+    /// Whether the node is kept on this device because a folder above it is
+    /// pinned. Such a node cannot be unpinned on its own. Set in
+    /// [`Request::ListDir`] listings only. Defaulted for wire-compat with
+    /// daemons predating the field.
+    #[serde(default)]
+    pub pinned_by_folder: bool,
     /// Whether the file's full content is present in the local cache (a current,
     /// non-stale blob). Always false for folders. Defaulted for wire-compat with
     /// clients/daemons predating the field.

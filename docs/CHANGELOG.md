@@ -16,6 +16,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   `proton-drive-linux.cachix.org`, so NixOS installs download the client instead of compiling
   it. See [Install → Binary cache](INSTALL.md#binary-cache).
   ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
+- **Folders can be made available offline in the app.** The context menu, the details pane and
+  the selection bar now offer it for folders too. Every file in the folder and its subfolders
+  downloads in the background with its progress in the tray and the app, and pinned folders carry
+  the offline badge. A file kept through its folder shows as available offline but cannot be
+  made online only on its own. `pdfs pin` on a folder now returns at once instead of timing out
+  on a large folder, and pinned files download to disk instead of into memory.
 
 ### Fixed
 - **Removing the package left the drive mounted, and deletes there still reached Proton Drive.**

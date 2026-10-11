@@ -2099,4 +2099,62 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_pinned_folder_keeps_every_file_under_it_until_it_is_unpinned() {
+        let drive = FakeDrive::new();
+        let dir = scratch("pin-folder");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir_all(daemon.mountpoint.join("Docs/sub")).unwrap();
+        std::fs::write(daemon.mountpoint.join("Docs/a.txt"), b"alpha").unwrap();
+        std::fs::write(daemon.mountpoint.join("Docs/sub/b.txt"), b"beta").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("Docs/sub/b.txt").is_some()
+        }));
+        daemon.request(&Request::PurgeCache).unwrap();
+        let entry = |folder: &str, name: &str| match daemon.request(&Request::ListDir {
+            path: folder.into(),
+        }) {
+            Ok(Response::Entries { entries }) => entries.into_iter().find(|e| e.name == name),
+            _ => None,
+        };
+        assert!(entry("Docs", "a.txt").is_some_and(|e| !e.cached && !e.pinned));
+
+        daemon
+            .request(&Request::Pin {
+                path: "Docs".into(),
+            })
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                entry("Docs", "a.txt").is_some_and(|e| e.cached)
+                    && entry("Docs/sub", "b.txt").is_some_and(|e| e.cached)
+            }),
+            "the folder's files were downloaded in the background"
+        );
+        let a = entry("Docs", "a.txt").unwrap();
+        assert!(a.pinned && a.pinned_by_folder);
+        assert!(entry("", "Docs").is_some_and(|e| e.pinned && !e.pinned_by_folder));
+        assert!(
+            daemon
+                .request(&Request::Unpin {
+                    path: "Docs/a.txt".into(),
+                })
+                .is_err(),
+            "a file kept through its folder cannot be unpinned on its own"
+        );
+
+        daemon
+            .request(&Request::Unpin {
+                path: "Docs".into(),
+            })
+            .unwrap();
+        let a = entry("Docs", "a.txt").unwrap();
+        assert!(!a.pinned && !a.pinned_by_folder && !a.cached);
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

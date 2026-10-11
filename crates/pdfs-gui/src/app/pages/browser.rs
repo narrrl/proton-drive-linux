@@ -520,9 +520,9 @@ pub(crate) fn clear_selection(ui: &Rc<Ui>) {
 }
 
 /// Reflect the current selection in the bulk bar: how many are selected, and
-/// which bulk actions apply to that mix. Offline state is a file-only notion, so
-/// a folder anywhere in the selection disables the two pin buttons rather than
-/// half-failing once pressed.
+/// which bulk actions apply to that mix. An entry kept offline through a pinned
+/// folder above it cannot be made online only on its own, so it does not count
+/// towards Make online only.
 pub(crate) fn sync_bulk_bar(ui: &Rc<Ui>) {
     let entries = selected_entries(ui);
     // One selected entry is the details pane's job; the bar is for a batch.
@@ -530,8 +530,7 @@ pub(crate) fn sync_bulk_bar(ui: &Rc<Ui>) {
         ui.browser.bulk.set_reveal_child(false);
         return;
     }
-    let files_only = entries.iter().all(|e| !e.is_dir);
-    let any_pinned = entries.iter().any(|e| e.pinned);
+    let any_pinned = entries.iter().any(|e| e.pinned && !e.pinned_by_folder);
     let any_unpinned = entries.iter().any(|e| !e.pinned);
     let mounted = *ui.mounted.borrow();
     ui.browser.bulk_label.set_label(&ngettext_f(
@@ -541,12 +540,8 @@ pub(crate) fn sync_bulk_bar(ui: &Rc<Ui>) {
         &[],
     ));
     ui.browser.bulk_trash.set_sensitive(mounted);
-    ui.browser
-        .bulk_pin
-        .set_sensitive(mounted && files_only && any_unpinned);
-    ui.browser
-        .bulk_unpin
-        .set_sensitive(mounted && files_only && any_pinned);
+    ui.browser.bulk_pin.set_sensitive(mounted && any_unpinned);
+    ui.browser.bulk_unpin.set_sensitive(mounted && any_pinned);
     ui.browser.bulk.set_reveal_child(true);
 }
 
@@ -652,16 +647,19 @@ pub(crate) fn restore_uids(ui: &Rc<Ui>, uids: Vec<String>, count: usize) {
     );
 }
 
-/// Pin or unpin every selected file, one request at a time.
+/// Pin or unpin every selected entry, one request at a time. A folder's files
+/// download in the background, so its request returns before they are there.
 pub(crate) fn run_bulk_pin(ui: &Rc<Ui>, entries: Vec<DirEntry>, pin: bool) {
     let socket = ui.dirs.control_socket();
     // Only the entries that need changing: re-pinning an already-pinned file is
-    // a wasted round-trip, and it would inflate the count the toast reports.
-    let paths: Vec<String> = entries
+    // a wasted round-trip, and it would inflate the count the toast reports. One
+    // kept through a pinned folder above it has no pin of its own to remove.
+    let changing: Vec<&DirEntry> = entries
         .iter()
-        .filter(|e| !e.is_dir && e.pinned != pin)
-        .map(|e| entry_rel(ui, e))
+        .filter(|e| !e.pinned_by_folder && e.pinned != pin)
         .collect();
+    let any_folder = changing.iter().any(|e| e.is_dir);
+    let paths: Vec<String> = changing.iter().map(|e| entry_rel(ui, e)).collect();
     if paths.is_empty() {
         return;
     }
@@ -698,10 +696,24 @@ pub(crate) fn run_bulk_pin(ui: &Rc<Ui>, entries: Vec<DirEntry>, pin: bool) {
             (0, None) => {}
             (n, _) => toast(
                 &ui,
-                &if pin {
+                &if pin && any_folder {
+                    ngettext_f(
+                        "Making {n} item available offline…",
+                        "Making {n} items available offline…",
+                        n as u64,
+                        &[],
+                    )
+                } else if pin {
                     ngettext_f(
                         "{n} file is now available offline",
                         "{n} files are now available offline",
+                        n as u64,
+                        &[],
+                    )
+                } else if any_folder {
+                    ngettext_f(
+                        "{n} item is now online only",
+                        "{n} items are now online only",
                         n as u64,
                         &[],
                     )
@@ -860,13 +872,17 @@ pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     }
     menu.section();
 
-    if !entry.is_dir {
+    // Kept through a pinned folder above it, the entry has no pin of its own
+    // to remove: the check shows that state without offering to change it.
+    if entry.pinned_by_folder {
+        menu.locked_toggle(&gettext("Available offline"), true);
+    } else {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
         menu.toggle(&gettext("Available offline"), entry.pinned, move |_| {
             toggle_pin(&ui_c, &entry_c)
         });
-        menu.section();
     }
+    menu.section();
 
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     menu.item(&gettext("Share…"), move || {
@@ -908,9 +924,8 @@ pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
 /// simply absent here rather than offered and then refused.
 pub(crate) fn bulk_context_menu(ui: &Rc<Ui>, entries: Vec<DirEntry>) -> ActionMenu {
     let mut menu = ActionMenu::new();
-    // Offline state is a file-only notion; the check shows whether the whole
-    // batch already is.
-    if entries.iter().all(|e| !e.is_dir) {
+    // The check shows whether the whole batch already is offline.
+    {
         let (ui_c, batch) = (ui.clone(), entries.clone());
         let all_pinned = entries.iter().all(|e| e.pinned);
         menu.toggle(&gettext("Available offline"), all_pinned, move |pin| {
@@ -1147,6 +1162,7 @@ pub(crate) fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
     let rx = spawn_request(ui.dirs.control_socket(), req);
     let name = entry.name.clone();
     let pinned = entry.pinned;
+    let is_dir = entry.is_dir;
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
@@ -1166,6 +1182,9 @@ pub(crate) fn toggle_pin(ui: &Rc<Ui>, entry: &DirEntry) {
                     &ui,
                     &if pinned {
                         gettext_f("“{name}” is now online only", &[("name", &name)])
+                    } else if is_dir {
+                        // The daemon downloads a folder's files in the background.
+                        gettext_f("Making “{name}” available offline…", &[("name", &name)])
                     } else {
                         gettext_f("“{name}” is now available offline", &[("name", &name)])
                     },
@@ -2487,16 +2506,19 @@ pub(crate) fn start_upload(ui: &Rc<Ui>, sources: Vec<String>) {
     });
 }
 
-/// The sync-state badge for an entry: `(icon, css-class)`, or `None` for folders
-/// (which carry no per-file cache state). A sync issue ranks first, on folders
-/// too: the change waits for the user. Pinned (kept offline) ranks above merely
-/// cached (downloaded, evictable); everything else is online-only.
+/// The sync-state badge for an entry: `(icon, css-class)`. A folder carries no
+/// cache state of its own, so it has one only when kept offline. A sync issue
+/// ranks first, on folders too: the change waits for the user. Pinned (kept
+/// offline) ranks above merely cached (downloaded, evictable); everything else
+/// is online-only.
 pub(crate) fn badge_for(entry: &DirEntry) -> Option<(&'static str, &'static str)> {
     if entry.issue.is_some() {
         return Some(("dialog-warning-symbolic", "badge-issue"));
     }
     if entry.is_dir {
-        return None;
+        return entry
+            .pinned
+            .then_some(("pdfs-offline-symbolic", "badge-pinned"));
     }
     Some(if entry.pinned {
         ("pdfs-offline-symbolic", "badge-pinned")
@@ -2905,6 +2927,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             size: h.size,
             modified: h.modified,
             pinned: h.pinned,
+            pinned_by_folder: false,
             cached: h.cached,
             uid: h.uid.clone(),
             path: h.path.clone(),
@@ -2965,6 +2988,7 @@ mod tests {
             size,
             modified,
             pinned: false,
+            pinned_by_folder: false,
             cached: false,
             uid: String::new(),
             path: String::new(),
@@ -2992,6 +3016,8 @@ mod tests {
 
         let mut folder = entry("d", true, 0, 0);
         assert_eq!(badge_for(&folder), None);
+        folder.pinned = true;
+        assert_eq!(badge_for(&folder).unwrap().1, "badge-pinned");
         folder.issue = Some(SyncIssue::Missing);
         assert_eq!(badge_for(&folder).unwrap().1, "badge-issue");
     }

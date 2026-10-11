@@ -66,6 +66,7 @@ fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
         size,
         modified: n.modification_time,
         pinned: false,
+        pinned_by_folder: false,
         cached: false,
         path: core.rel_path_for_uid(&n.uid).unwrap_or_default(),
         uid: n.uid.to_string(),

@@ -524,6 +524,7 @@ mod tests {
             size: 0,
             modified,
             pinned: false,
+            pinned_by_folder: false,
             cached: false,
             uid: name.into(),
             path: String::new(),

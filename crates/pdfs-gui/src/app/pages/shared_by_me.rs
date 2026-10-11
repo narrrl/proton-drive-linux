@@ -622,6 +622,7 @@ pub(crate) fn shared_item_as_entry(item: &SharedItem) -> DirEntry {
         size: 0,
         modified: item.modified,
         pinned: false,
+        pinned_by_folder: false,
         cached: false,
         uid: item.uid.clone(),
         path: item.path.clone(),
