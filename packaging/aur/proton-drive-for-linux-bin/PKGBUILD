@@ -22,6 +22,8 @@ provides=("${pkgname%-bin}=$pkgver" "proton-drive-linux=$pkgver" 'pdfs')
 conflicts=('proton-drive-linux' 'proton-drive-for-linux' 'proton-drive-for-linux-git')
 # Upstream ships the binaries already built on Ubuntu 24.04; do not rewrite them.
 options=('!strip' '!debug')
+# Stops the running daemon before removal, so the mount stops mirroring deletes.
+install=proton-drive.install
 _tag="v$pkgver"
 _raw="https://raw.githubusercontent.com/narrrl/proton-drive-linux/$_tag"
 # The release tarball holds the four binaries only, so the desktop integration

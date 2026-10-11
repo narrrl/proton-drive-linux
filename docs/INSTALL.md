@@ -302,8 +302,15 @@ pdfs logout                                       # removes the session from the
 ```
 
 Then remove the package (`sudo apt remove proton-drive-linux`, `sudo dnf remove
-proton-drive-linux`, or `sudo pacman -R proton-drive-for-linux`), and, if you want no trace left,
-the local data:
+proton-drive-linux`, or `sudo pacman -R proton-drive-for-linux`). Removing the package also stops
+the service of every logged-in user, in case a step above was skipped.
+
+> [!CAUTION]
+> Do not delete `~/ProtonDrive` while it is mounted. It is your Proton Drive, not a copy: every
+> file deleted there is moved to the Proton Drive trash. Once the service is stopped the folder is
+> an empty mount point, and removing it is safe.
+
+If you want no trace left, remove the local data as well:
 
 ```bash
 rm -rf ~/.config/proton-drive-linux ~/.local/state/proton-drive-linux ~/.cache/proton-drive-linux

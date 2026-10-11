@@ -92,6 +92,25 @@ install -D -m0644 %{git_dir}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
 %{git_dir}/po/build.sh %{buildroot}%{_datadir}/locale
 
+# Removing the package does not stop a running daemon: it keeps serving the
+# mount from the deleted binary, so files deleted under the mount afterwards,
+# `rm -rf ~/ProtonDrive` included, are still deleted on Proton Drive. Stop every
+# logged-in user's service first; anything still queued stays on disk for the
+# next install. $1 is 0 on an erase and 1 on an upgrade. Same loop as
+# packaging/proton-drive.install.
+%preun
+if [ "$1" -eq 0 ]; then
+  for dir in /run/user/*; do
+    user=$(id -nu "${dir##*/}" 2>/dev/null) || continue
+    if runuser -u "$user" -- env XDG_RUNTIME_DIR="$dir" \
+      systemctl --user --quiet is-active proton-drive.service 2>/dev/null; then
+      echo "Stopping Proton Drive for $user, which unmounts its drive."
+      runuser -u "$user" -- env XDG_RUNTIME_DIR="$dir" \
+        systemctl --user stop proton-drive.service 2>/dev/null || :
+    fi
+  done
+fi
+
 %files
 %license LICENSE
 %{_bindir}/pdfs

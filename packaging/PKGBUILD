@@ -26,6 +26,8 @@ optdepends=('gnome-keyring: credential storage via Secret Service'
             'fzf: live search-as-you-type launcher (pdfs-prompt --fzf)'
             'foot: terminal for pdfs-prompt --fzf started from a keybinding')
 options=('!lto' '!debug')
+# Stops the running daemon before removal, so the mount stops mirroring deletes.
+install=proton-drive.install
 
 # Built in place from the checkout; nothing to fetch or checksum.
 source=()

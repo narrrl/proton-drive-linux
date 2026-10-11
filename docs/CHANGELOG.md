@@ -18,6 +18,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
 
 ### Fixed
+- **Removing the package left the drive mounted, and deletes there still reached Proton Drive.**
+  The service kept running from the removed program, so deleting `~/ProtonDrive` afterwards moved
+  its files to the Proton Drive trash. The .deb, .rpm and Arch packages now stop the service of
+  every logged-in user before they are removed. Upgrades are not affected.
 - **The Fedora package installed KDE packages on GNOME.** Its recommendation of KWallet is now
   only for Plasma, the GNOME keyring only for desktops other than Plasma, and the AppIndicator
   extension only for GNOME.

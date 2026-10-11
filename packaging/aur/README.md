@@ -13,7 +13,8 @@ The three packages conflict with each other and with the in-tree
 `packaging/PKGBUILD` package (`proton-drive-linux`), and every one of them
 `provides` `proton-drive-for-linux`, `proton-drive-linux`, and `pdfs`.
 
-Each directory tracks only `PKGBUILD`, `.SRCINFO`, `.gitignore`, and `LICENSE`
+Each directory tracks only `PKGBUILD`, `.SRCINFO`, `.gitignore`, `LICENSE` and
+`proton-drive.install` (a link to `packaging/proton-drive.install`, copied as a file on push)
 (the 0BSD license of the packaging sources, per
 [RFC40](https://rfc.archlinux.page/0040-license-package-sources/)); the
 `.gitignore` ignores everything else so downloaded sources, `src/`, `pkg/`, and

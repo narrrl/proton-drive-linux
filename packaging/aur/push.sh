@@ -21,9 +21,11 @@ for pkg in "${packages[@]}"; do
   # A fresh clone every time: the AUR repository, not this checkout, is what the
   # commit history has to build on.
   git -c init.defaultBranch=master clone -q "ssh://aur@aur.archlinux.org/$pkg.git" "$workdir/$pkg"
-  install -m644 "$pkg/PKGBUILD" "$pkg/.SRCINFO" "$pkg/.gitignore" "$pkg/LICENSE" "$workdir/$pkg/"
+  # proton-drive.install is a link into packaging/; install copies its content.
+  install -m644 "$pkg/PKGBUILD" "$pkg/.SRCINFO" "$pkg/.gitignore" "$pkg/LICENSE" \
+    "$pkg/proton-drive.install" "$workdir/$pkg/"
 
-  git -C "$workdir/$pkg" add -f PKGBUILD .SRCINFO .gitignore LICENSE
+  git -C "$workdir/$pkg" add -f PKGBUILD .SRCINFO .gitignore LICENSE proton-drive.install
   if git -C "$workdir/$pkg" diff --cached --quiet; then
     echo "$pkg: no changes"
     continue

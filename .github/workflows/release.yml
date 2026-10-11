@@ -153,6 +153,9 @@ jobs:
           cp LICENSE deb/usr/share/licenses/proton-drive-linux/
           po/build.sh deb/usr/share/locale
 
+          # Stops the running daemon before removal, so the mount stops mirroring deletes
+          install -m755 packaging/deb/prerm deb/DEBIAN/prerm
+
           # Calculate Installed-Size in KB for the control file
           INSTALLED_SIZE=$(du -sk deb | cut -f1)
 
