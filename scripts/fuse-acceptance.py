@@ -4388,6 +4388,21 @@ def test_move_refuses_a_mirror_copy_drive_lacks(mc: MoveContext) -> None:
     # Sync skips symlinks, so Drive never gets this one: removing the local
     # copy after a move would lose it.
     os.symlink("data.txt", source.root / name / "link")
+    try:
+        _move_keeps_what_drive_lacks(mc, source, dest, name, files)
+    finally:
+        # The link stays local-only wherever it ended up, and a mirror folder
+        # holding one refuses the switch to on-demand that the next mode
+        # pairing makes.
+        for location in (source, dest):
+            link = location.root / name / "link"
+            if os.path.lexists(link):
+                os.unlink(link)
+
+
+def _move_keeps_what_drive_lacks(
+    mc: MoveContext, source: Location, dest: Location, name: str, files: dict[Path, bytes]
+) -> None:
     source.settle()
     if dest.mode == "mirror" and os.stat(source.folder).st_dev == os.stat(dest.folder).st_dev:
         # Between two mirrors on one filesystem the local copy is renamed
