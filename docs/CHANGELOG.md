@@ -11,10 +11,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.3.0] — 2026-10-11
+
+Schema: **42**, unchanged.
+
 ### Added
 - **A Nix flake for NixOS.** `nix build github:narrrl/proton-drive-linux` builds the client, and
-  the flake's NixOS module installs it and runs the mount in every graphical session. See
-  [Install → NixOS](INSTALL.md#nixos-flake).
+  the flake's NixOS module installs it and runs the mount in every graphical session. Pin the
+  input to a release tag such as `github:narrrl/proton-drive-linux/v3.3.0` to stay on releases.
+  See [Install → NixOS](INSTALL.md#nixos-flake).
   ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
 
 ### Fixed
@@ -1753,6 +1758,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.3.0
 [3.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.1
 
 [3.2.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.0

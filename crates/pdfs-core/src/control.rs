@@ -1992,7 +1992,7 @@ pub enum Response {
         tokens_unsaved: bool,
         /// The release of the daemon that answered. A package upgrade does not
         /// restart the user service, so it can be older than the front-end
-        /// asking; daemons before 3.2.2 omit it, which reads as empty.
+        /// asking; daemons before 3.3.0 omit it, which reads as empty.
         #[serde(default)]
         version: String,
     },
