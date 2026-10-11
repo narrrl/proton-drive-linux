@@ -10,6 +10,7 @@
 | [Configuration](CONFIGURATION.md) | `config.json`, environment variables, file locations, the systemd service |
 | [Troubleshooting](TROUBLESHOOTING.md) | Diagnosing problems, common symptoms, starting over, reporting a bug |
 | [Recovering on a new computer](RECOVERY.md) | What survives a lost machine and how to restore your synced folders |
+| [Security model](SECURITY_MODEL.md) | What protects your files, what is kept on this computer, what the client connects to |
 | [Changelog](CHANGELOG.md) | What changed in each release |
 
 ## For contributors

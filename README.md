@@ -109,6 +109,7 @@ video thumbnails), headless use and uninstalling.
 | [Configuration](docs/CONFIGURATION.md) | `config.json`, file locations, environment variables, the service |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Diagnosing problems and fixing common ones |
 | [Recovering on a new computer](docs/RECOVERY.md) | Getting your synced folders back after a reinstall or a lost machine |
+| [Security model](docs/SECURITY_MODEL.md) | What protects your files, what stays on this computer, what the client connects to |
 | [Changelog](docs/CHANGELOG.md) | What changed in each release |
 
 For contributors: [development guide](docs/DEVELOPMENT.md), [architecture](docs/ARCHITECTURE.md),

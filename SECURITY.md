@@ -4,6 +4,9 @@
 
 Fixes land on the latest release. Please reproduce on the most recent version before reporting.
 
+For what the client protects and what it does not, written for users, see the
+[security model](docs/SECURITY_MODEL.md).
+
 ## Reporting a vulnerability
 
 **Do not open a public issue.** Report privately through GitHub's
