@@ -17,6 +17,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   it. See [Install → Binary cache](INSTALL.md#binary-cache).
   ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
 
+### Fixed
+- **The Fedora package installed KDE packages on GNOME.** Its recommendation of KWallet is now
+  only for Plasma, the GNOME keyring only for desktops other than Plasma, and the AppIndicator
+  extension only for GNOME.
+
 ## [3.3.0] — 2026-10-11
 
 Schema: **42**, unchanged.

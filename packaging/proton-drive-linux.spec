@@ -37,11 +37,13 @@ Requires:       webkitgtk6.0
 Requires:       perl-Image-ExifTool
 Requires:       xdg-utils
 
-# DE-specific; do not Require a single desktop environment.
-Recommends:     gnome-keyring
+# DE-specific; do not Require a single desktop environment. dnf installs weak
+# dependencies by default, so each is conditional on its own desktop: a plain
+# `Recommends: kwallet` pulled KDE Frameworks onto GNOME installs.
+Recommends:     (gnome-keyring or plasma-workspace)
 Recommends:     iso-codes
-Recommends:     gnome-shell-extension-appindicator
-Recommends:     kwallet
+Recommends:     (gnome-shell-extension-appindicator if gnome-shell)
+Recommends:     (kwallet if plasma-workspace)
 
 # Only for `pdfs-prompt --fzf`; every other front end works without them.
 Suggests:       fzf
