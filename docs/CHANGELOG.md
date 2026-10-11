@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **A Nix flake for NixOS.** `nix build github:narrrl/proton-drive-linux` builds the client, and
+  the flake's NixOS module installs it and runs the mount in every graphical session. See
+  [Install → NixOS](INSTALL.md#nixos-flake).
+  ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
+
 ### Fixed
 - **A failed photo upload said "You're offline" while everything else worked.** Only a failed
   connection now reads as offline. Other failures show what went wrong, and Upload is greyed out

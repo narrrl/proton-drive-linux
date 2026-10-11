@@ -82,6 +82,39 @@ paru -S proton-drive-for-linux     # or yay, or any other AUR helper
 
 The recipes live in [`packaging/aur/`](../packaging/aur/README.md).
 
+### NixOS (flake)
+
+The repository is a flake. Add it as an input and enable the module, which installs the package,
+links the user service into every graphical session and turns on the `fusermount3` wrapper and
+GNOME Keyring for you:
+
+```nix
+{
+  inputs.proton-drive-linux.url = "github:narrrl/proton-drive-linux";
+
+  outputs = { nixpkgs, proton-drive-linux, ... }: {
+    nixosConfigurations.<host> = nixpkgs.lib.nixosSystem {
+      modules = [
+        proton-drive-linux.nixosModules.default
+        { services.proton-drive-linux.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+To try it without changing your system, run the app straight from the flake:
+
+```bash
+nix run github:narrrl/proton-drive-linux#proton-drive-linux -- --help   # the CLI
+nix shell github:narrrl/proton-drive-linux -c pdfs-app                   # the desktop app
+```
+
+The mount itself needs the setuid `fusermount3` from NixOS (`programs.fuse.enable`, on by default
+with the module) and a Secret Service such as GNOME Keyring or KWallet. To leave out ffmpeg and
+with it video thumbnails, override the package with `withFfmpeg = false`. The recipe lives in
+[`packaging/nix/`](../packaging/nix/).
+
 ### Other distributions
 
 Unpack the `.tar.gz` into a directory on your `PATH`, then install the service unit as shown in

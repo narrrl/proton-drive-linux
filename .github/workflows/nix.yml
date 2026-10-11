@@ -1,0 +1,52 @@
+name: Nix
+
+# Builds the flake (docs/INSTALL.md#nixos-flake) whenever its recipe, the lock
+# files or the code change, so a NixOS user's `nix build` keeps working. Run it
+# from the Actions tab for any branch to get a build to try.
+on:
+  push:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'packaging/nix/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+      - 'po/**'
+      - '.github/workflows/nix.yml'
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'packaging/nix/**'
+      - 'Cargo.lock'
+      - '.github/workflows/nix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Check the flake
+        run: nix flake check --print-build-logs --no-build
+
+      - name: Build the package
+        run: nix build --print-build-logs .#proton-drive-linux
+
+      - name: Smoke test
+        run: |
+          ./result/bin/pdfs --version
+          for bin in pdfs-app pdfs-tray pdfs-prompt; do test -x "result/bin/$bin"; done
+          grep -q "ExecStart=$(readlink -f result)/bin/pdfs" result/lib/systemd/user/proton-drive.service
+          ls result/share/locale/*/LC_MESSAGES/pdfs.mo
