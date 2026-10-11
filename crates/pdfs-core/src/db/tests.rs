@@ -1689,9 +1689,16 @@ fn writing_nodes_does_not_scale_with_the_size_of_the_index() {
             .collect();
         db.upsert_nodes(&batch).unwrap();
 
-        let t = Instant::now();
-        db.upsert_nodes(&batch).unwrap();
-        t.elapsed()
+        // The fastest of a few runs: the rest of the suite runs alongside, and
+        // one run that lost the CPU to it read as the regression.
+        (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                db.upsert_nodes(&batch).unwrap();
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
     }
 
     let small = cost_against_index_of(200);
