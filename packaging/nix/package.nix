@@ -3,6 +3,7 @@
 {
   lib,
   rustPlatform,
+  adwaita-icon-theme,
   pkg-config,
   gettext,
   glib,
@@ -67,6 +68,11 @@ rustPlatform.buildRustPackage {
     # TLS for WebKitGTK's GIO: without it the CAPTCHA page fails with "TLS
     # support is not available". wrapGAppsHook4 adds it to GIO_EXTRA_MODULES.
     glib-networking
+    # The stock icons the app asks for, such as the Photos and Computers
+    # sidebar entries. GTK ships only a few itself, and a session without
+    # Adwaita installed showed the rest as missing. wrapGAppsHook4 adds it to
+    # XDG_DATA_DIRS.
+    adwaita-icon-theme
     gtk4
     libadwaita
     webkitgtk_6_0
