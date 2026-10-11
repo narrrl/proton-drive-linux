@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.2.1] — 2026-10-11
+
+Schema: **42**, unchanged.
+
 ### Fixed
 - **Writing to a file again soon after a partial write could fail with an I/O error.** When the
   first write changed only part of a file this client had not read, a second write, or saving
@@ -1731,6 +1735,8 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 ### Fixed
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
+
+[3.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.1
 
 [3.2.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.0
 
