@@ -1,6 +1,16 @@
 {
   description = "Unofficial Proton Drive client for Linux: files-on-demand FUSE mount, CLI, GTK4 app and tray";
 
+  # CI pushes every build of `main` and of each release tag here, so installing
+  # downloads the client instead of compiling it. Nix asks before it uses a
+  # flake's caches unless the user trusts them (docs/INSTALL.md).
+  nixConfig = {
+    extra-substituters = [ "https://proton-drive-linux.cachix.org" ];
+    extra-trusted-public-keys = [
+      "proton-drive-linux.cachix.org-1:w1+3pXVXyTlqkFGn3dWpUhlaJtyGhSm3X0mFwfa++AA="
+    ];
+  };
+
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =

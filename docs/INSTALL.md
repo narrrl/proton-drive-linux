@@ -112,6 +112,26 @@ inputs.proton-drive-linux.url = "github:narrrl/proton-drive-linux/v3.3.0";
 
 Each release tag is built with Nix before the release is published.
 
+#### Binary cache
+
+CI uploads every build of `main` and of each release tag to a Cachix binary cache, so Nix can
+download the client instead of compiling it. A system build does not read a flake input's cache
+settings, so add the cache to your NixOS configuration once:
+
+```nix
+nix.settings = {
+  substituters = [ "https://proton-drive-linux.cachix.org" ];
+  trusted-public-keys = [
+    "proton-drive-linux.cachix.org-1:w1+3pXVXyTlqkFGn3dWpUhlaJtyGhSm3X0mFwfa++AA="
+  ];
+};
+```
+
+The cache holds the build against the `nixpkgs` this flake locks. Setting
+`inputs.proton-drive-linux.inputs.nixpkgs.follows = "nixpkgs"` builds against yours instead, which
+the cache does not have, so Nix compiles it. `nix run` and `nix shell` ask whether to use the
+cache the first time; answer yes, or run `cachix use proton-drive-linux`.
+
 To try it without changing your system, run the app straight from the flake:
 
 ```bash

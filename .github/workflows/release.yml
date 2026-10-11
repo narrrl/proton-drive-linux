@@ -240,6 +240,13 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
+      # Pulls from the project's binary cache, and pushes what this run built
+      # when the token is there; a fork's pull request has none and only pulls.
+      - uses: cachix/cachix-action@v17
+        with:
+          name: proton-drive-linux
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - name: Build the flake
         run: nix build --print-build-logs .#proton-drive-linux
 

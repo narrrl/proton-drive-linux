@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **A binary cache for the Nix flake.** Every release and every build of `main` is uploaded to
+  `proton-drive-linux.cachix.org`, so NixOS installs download the client instead of compiling
+  it. See [Install → Binary cache](INSTALL.md#binary-cache).
+  ([#37](https://github.com/narrrl/proton-drive-linux/issues/37))
+
 ## [3.3.0] — 2026-10-11
 
 Schema: **42**, unchanged.
