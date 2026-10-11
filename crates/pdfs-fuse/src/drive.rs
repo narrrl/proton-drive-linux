@@ -8,8 +8,10 @@
 //! real client implements it by forwarding, and the simulation tests implement
 //! it with an in-memory Drive that injects Drive's known faults.
 //!
-//! Sharing, Photos, devices, invitations and public links stay on the concrete
-//! client (`Core::client`) until a test needs them faked.
+//! Sharing, Photos, invitations, public links and the rest of the device calls
+//! stay on the concrete client (`Core::client`) until a test needs them faked.
+//! Listing and registering devices are here, so a simulated daemon can sync a
+//! local folder.
 //!
 //! The method names match the client's own, so a call site reads the same
 //! whichever it goes through. The client's generic methods (a reader or writer
@@ -26,7 +28,8 @@ use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::error::Result;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid};
 use proton_drive_rs::{
-    DriveEvent, DriveEventScopeId, Node, NodeMoveItem, ProtonDriveClient, RevisionReader, Thumbnail,
+    Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem, ProtonDriveClient,
+    RevisionReader, Thumbnail,
 };
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
@@ -153,6 +156,12 @@ pub(crate) trait DriveApi: Send + Sync {
 
     /// The account's storage, across every Proton product.
     async fn quota(&self) -> Result<Quota>;
+
+    /// Every computer that backs up to the account.
+    async fn enumerate_devices(&self) -> Result<Vec<Device>>;
+
+    /// Register a computer, with a root folder of its own named `name`.
+    async fn create_device(&self, name: &str, device_type: DeviceType) -> Result<Device>;
 
     /// Called by the drain once it has let go of the blob of an upload to
     /// `uid` that landed, or retired the create that made `uid`, before the
@@ -469,5 +478,13 @@ impl DriveApi for ProtonDriveClient {
 
     async fn quota(&self) -> Result<Quota> {
         ProtonDriveClient::quota(self).await
+    }
+
+    async fn enumerate_devices(&self) -> Result<Vec<Device>> {
+        ProtonDriveClient::enumerate_devices(self).await
+    }
+
+    async fn create_device(&self, name: &str, device_type: DeviceType) -> Result<Device> {
+        ProtonDriveClient::create_device(self, name, device_type).await
     }
 }

@@ -31,6 +31,9 @@
 //! - **A full account** ([`FakeDrive::set_quota`]) refusing uploads with
 //!   `InsufficientQuota`.
 //!
+//! It also holds the account's computers, each with a root folder outside My
+//! files, so a simulated daemon can register its own and sync a local folder.
+//!
 //! A test can also hold the next read of one node on its way to Drive
 //! ([`FakeClient::hold_next_read`]), to make a change while the daemon waits
 //! for the answer, or on its way back ([`FakeClient::hold_answer_to_next_read`]),
@@ -54,9 +57,12 @@ use parking_lot::Mutex;
 use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::{ProtonApiError, ProtonError, Result};
-use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
+use proton_drive_rs::proton_sdk::ids::{
+    DeviceUid, DriveEventId, LinkId, NodeUid, ShareId, VolumeId,
+};
 use proton_drive_rs::{
-    DriveEvent, DriveEventScopeId, Node, NodeKind, NodeMoveItem, RevisionState, Thumbnail,
+    Device as Computer, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeKind, NodeMoveItem,
+    RevisionState, Thumbnail,
 };
 use sha1::{Digest as _, Sha1};
 
@@ -111,6 +117,9 @@ struct Server {
     block_pattern: Vec<u64>,
     /// The account's storage limit in bytes.
     max_space: i64,
+    /// The account's computers, oldest first, as `(name, type, root folder)`.
+    /// [`Computer`] is not `Clone`, so each answer builds them afresh.
+    devices: Vec<(String, DeviceType, NodeUid)>,
 }
 
 impl Server {
@@ -160,6 +169,20 @@ impl Server {
             cursor = self.current(&at).and_then(|remote| remote.parent.clone());
         }
         false
+    }
+
+    /// The `n`th computer of the account, as Drive lists it.
+    fn computer(&self, n: usize) -> Computer {
+        let (name, device_type, root) = &self.devices[n];
+        Computer {
+            uid: DeviceUid::new(format!("device{}", n + 1)),
+            device_type: *device_type,
+            name: Ok(name.clone()),
+            root_folder_uid: root.clone(),
+            creation_time: self.current(root).map_or(0, |remote| remote.created),
+            last_sync_time: None,
+            share_id: ShareId::new(format!("device-share{}", n + 1)),
+        }
     }
 
     fn mint_uid(&mut self) -> NodeUid {
@@ -305,6 +328,7 @@ impl FakeDrive {
             events: Vec::new(),
             block_pattern: vec![pdfs_core::cache::BLOCK_SIZE],
             max_space: 1 << 40,
+            devices: Vec::new(),
         };
         let now = now_secs();
         server.nodes.insert(
@@ -1502,6 +1526,42 @@ impl DriveApi for FakeClient {
                 max_space: server.max_space,
                 used_space: server.used_space(),
             })
+        })
+        .await
+    }
+
+    async fn enumerate_devices(&self) -> Result<Vec<Computer>> {
+        self.request(false, |server| {
+            Ok((0..server.devices.len())
+                .map(|n| server.computer(n))
+                .collect())
+        })
+        .await
+    }
+
+    async fn create_device(&self, name: &str, device_type: DeviceType) -> Result<Computer> {
+        self.request(true, |server| {
+            // A device root has no parent: like on Drive, it is not in My files.
+            // It is listed at once, as the My files root is: the listing lag is
+            // about children appearing, and the daemon lists the new root next.
+            let root = server.mint_uid();
+            let now = now_secs();
+            server.nodes.insert(
+                root.clone(),
+                vec![(
+                    Instant::now() - HISTORY,
+                    Some(Remote {
+                        parent: None,
+                        name: name.to_owned(),
+                        trashed: false,
+                        created: now,
+                        modified: now,
+                        file: None,
+                    }),
+                )],
+            );
+            server.devices.push((name.to_owned(), device_type, root));
+            Ok(server.computer(server.devices.len() - 1))
         })
         .await
     }

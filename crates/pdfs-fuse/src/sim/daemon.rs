@@ -46,6 +46,7 @@ impl Daemon {
     /// cache and the database the last run left.
     pub(crate) fn start(dir: &Path, client: FakeClient) -> io::Result<Self> {
         log_to_test_output();
+        isolate_from_the_developer();
         let mountpoint = dir.join("mnt");
         let socket = dir.join("control.sock");
         std::fs::create_dir_all(&mountpoint)?;
@@ -222,6 +223,33 @@ impl tracing::field::Visit for Message {
             self.0.push_str(&format!(" {}={value:?}", field.name()));
         }
     }
+}
+
+/// Point the XDG directories of the whole test process at a scratch
+/// directory, once, before the first daemon starts.
+///
+/// The daemon reads `config.json` through `AppDirs` in a few places (the
+/// adopted device, the ignore rules, the profile), and those would otherwise
+/// be the developer's own: an adopted device of their real account made every
+/// sync folder fail to register against the fake Drive.
+fn isolate_from_the_developer() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let home = scratch("xdg");
+        for (var, sub) in [
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+        ] {
+            let path = home.join(sub);
+            std::fs::create_dir_all(&path).expect("create a simulation XDG directory");
+            // SAFETY: the simulations run one at a time (`--test-threads=1`,
+            // docs/TESTING.md), and this runs before the first of them starts a
+            // daemon, so no other thread reads the environment meanwhile.
+            unsafe { std::env::set_var(var, &path) };
+        }
+    });
 }
 
 /// A client for what `DriveApi` does not cover (sharing, Photos, devices),

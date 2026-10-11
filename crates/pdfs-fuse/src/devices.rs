@@ -157,7 +157,7 @@ impl Core {
     pub(crate) fn list_devices(&self) -> CoreResult<Vec<DeviceInfo>> {
         let devices = self
             .rt
-            .block_on(self.client.enumerate_devices())
+            .block_on(self.drive.enumerate_devices())
             .map_err(|e| CoreError::from_api(&e, "list devices"))?;
         // No cached device row yet means this machine syncs nothing, so none of
         // the listed devices is ours.
@@ -214,7 +214,7 @@ impl Core {
         };
         let remote = self
             .rt
-            .block_on(self.client.enumerate_devices())
+            .block_on(self.drive.enumerate_devices())
             .map_err(|e| CoreError::from_api(&e, "enumerate devices"))?;
         let dev = remote
             .into_iter()
@@ -257,7 +257,7 @@ impl Core {
         };
         let remote = self
             .rt
-            .block_on(self.client.enumerate_devices())
+            .block_on(self.drive.enumerate_devices())
             .map_err(|e| CoreError::from_api(&e, "enumerate devices"))?;
         let d = remote
             .into_iter()
@@ -395,7 +395,7 @@ impl Core {
         // any cached record, and recover an existing device by name.
         let remote = self
             .rt
-            .block_on(self.client.enumerate_devices())
+            .block_on(self.drive.enumerate_devices())
             .map_err(|e| CoreError::from_api(&e, "enumerate devices"))?;
 
         // An adopted uid is an explicit instruction, so it outranks everything
@@ -454,7 +454,7 @@ impl Core {
             None => {
                 let d = self
                     .rt
-                    .block_on(self.client.create_device(&name, DeviceType::Linux))
+                    .block_on(self.drive.create_device(&name, DeviceType::Linux))
                     .map_err(|e| CoreError::from_api(&e, "create device"))?;
                 StoredDevice {
                     uid: d.uid.to_string(),
