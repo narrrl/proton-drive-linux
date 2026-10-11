@@ -25,6 +25,7 @@ use proton_drive_rs::NodeKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{info, warn};
 
+use super::state::State;
 use super::sync::mirror_subtree_unsynced;
 use super::{Core, is_local_uid, parse_uid};
 
@@ -129,6 +130,24 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
         _ => Err(err),
     }
 }
+
+/// Whether inode `ino` is `root` or lies under it in the tree. Bounded, so a
+/// parent cycle in corrupt data cannot hang the caller.
+fn ino_is_under(st: &State, mut ino: u64, root: u64) -> bool {
+    for _ in 0..MAX_TREE_DEPTH {
+        if ino == root {
+            return true;
+        }
+        match st.entries.get(&ino) {
+            Some(entry) if entry.parent != ino => ino = entry.parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// How deep [`ino_is_under`] walks before it gives up.
+const MAX_TREE_DEPTH: usize = 1024;
 
 /// Whether `uid` is `root` or lies under it, as far as the nodes table knows.
 fn under(core: &Core, root: &NodeUid, uid: &str) -> bool {
@@ -336,7 +355,7 @@ impl Core {
                     core.require_uid_writable(authority)
                         .map_err(|e| core.errno_error(e, "move access"))?;
                 }
-                if self.has_pending_work_under(&uid)? {
+                if self.has_pending_work_under(ino, &uid)? {
                     return Err(CoreError::conflict(
                         "it has changes that are not uploaded yet; wait for the upload to finish",
                     ));
@@ -410,10 +429,11 @@ impl Core {
         Ok(uid)
     }
 
-    /// Whether the queue owes Drive anything for `uid` or a node under it, or a
-    /// file under it is open for writing. Moving such a node away would strand
-    /// the pending change against a path that no longer leads to it.
-    fn has_pending_work_under(&self, uid: &NodeUid) -> CoreResult<bool> {
+    /// Whether the queue owes Drive anything for `uid` (inode `ino`) or a node
+    /// under it, or a file under it is open for writing. Moving such a node away
+    /// would strand the pending change against a path that no longer leads to
+    /// it.
+    fn has_pending_work_under(&self, ino: u64, uid: &NodeUid) -> CoreResult<bool> {
         let ops = self
             .db
             .pending_ops()
@@ -427,12 +447,18 @@ impl Core {
         }) {
             return Ok(true);
         }
-        // Collected first so no State lock is held across the nodes-table reads.
-        let mut writing = Vec::new();
+        // Open handles are placed in the tree by inode, not by uid in the nodes
+        // table. A file opened just after its create landed holds the
+        // placeholder uid until the tree catches up, and the nodes table no
+        // longer has that uid, so the move went ahead under an open write.
+        let mut writing = false;
         self.for_each_state(|st| {
-            writing.extend(st.active_writes.values().map(|w| w.uid.to_string()));
+            writing = st
+                .active_writes
+                .keys()
+                .any(|&open| ino_is_under(st, open, ino));
         });
-        Ok(writing.iter().any(|w| under(self, uid, w)))
+        Ok(writing)
     }
 
     /// Bring the source location level with a move Drive has made.

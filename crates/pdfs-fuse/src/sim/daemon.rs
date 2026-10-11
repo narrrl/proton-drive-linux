@@ -2185,4 +2185,112 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Register `local` as a synced folder in `mode` and wait until the daemon
+    /// lists it that way, returning its id.
+    fn sync_folder(daemon: &Daemon, local: &Path, mode: &str) -> i64 {
+        std::fs::create_dir_all(local).unwrap();
+        let path = local.canonicalize().unwrap().to_string_lossy().into_owned();
+        daemon
+            .request(&Request::AddSyncFolder {
+                local_path: path.clone(),
+            })
+            .unwrap();
+        let listed = |mode: &str| match daemon.request(&Request::ListSyncFolders) {
+            Ok(Response::SyncFolders { items }) => items
+                .into_iter()
+                .find(|f| {
+                    f.local_path == path
+                        && f.mode == mode
+                        && f.pending_mode.is_none()
+                        && f.last_sync > 0
+                })
+                .map(|f| f.id),
+            _ => None,
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || listed("mirror").is_some()),
+            "{} was registered: {:?}",
+            local.display(),
+            daemon.request(&Request::ListSyncFolders)
+        );
+        let id = listed("mirror").unwrap();
+        // Reads lag behind creates, so the remote folder the first pass made
+        // is not readable at once; switching modes reads it.
+        std::thread::sleep(Duration::from_millis(200));
+        if mode != "mirror" {
+            daemon
+                .request(&Request::SetSyncFolderMode {
+                    id,
+                    mode: mode.into(),
+                })
+                .unwrap();
+            assert!(
+                wait_until(Duration::from_secs(30), || listed(mode).is_some()
+                    && is_mounted(local)),
+                "{} switched to {mode}: {:?}",
+                local.display(),
+                daemon.request(&Request::ListSyncFolders)
+            );
+        }
+        id
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_move_out_of_an_on_demand_folder_refuses_a_file_still_open_for_writing() {
+        // The account run's "move refuses a file still being written" case let
+        // a move from an on-demand synced folder into a mirror folder go ahead
+        // while the file was open, so the write landed after the move.
+        let drive = FakeDrive::new();
+        let dir = scratch("move-open-out-of-ondemand");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let ondemand = dir.join("ondemand");
+        let mirror = dir.join("mirror");
+        sync_folder(&daemon, &ondemand, "ondemand");
+        sync_folder(&daemon, &mirror, "mirror");
+
+        let source = ondemand.join("open");
+        std::fs::create_dir(&source).unwrap();
+        daemon.request(&Request::SyncNow { id: None }).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        // The account run opened the file a moment after its create landed:
+        // the queue was already empty, and the tree still had the
+        // placeholder uid it gave the file.
+        let landing = daemon.client.hold_next_landing_of_any();
+        {
+            let mut file = std::fs::File::create(source.join("open.txt")).unwrap();
+            std::io::Write::write_all(&mut file, b"before").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(source.join("open.txt"))
+            .unwrap();
+        std::io::Write::write_all(&mut file, b" and after").unwrap();
+        let moved = daemon.request(&Request::Move {
+            path: source.to_string_lossy().into_owned(),
+            new_parent: mirror
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        });
+        drop(file);
+        drop(landing);
+        match moved {
+            Err(e) => assert!(
+                e.to_string().contains("not uploaded yet"),
+                "refused for another reason: {e}"
+            ),
+            Ok(answer) => panic!("the move went ahead: {answer:?}"),
+        }
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

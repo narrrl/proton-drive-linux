@@ -362,6 +362,7 @@ impl FakeDrive {
             hold: Mutex::new(None),
             hold_answer: Mutex::new(None),
             hold_trash: Mutex::new(None),
+            hold_any_landing: AtomicBool::new(false),
             hold_landing: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
             lose_create_reply: AtomicBool::new(false),
@@ -642,6 +643,9 @@ struct ClientInner {
     hold_trash: Mutex<Option<Arc<HoldState>>>,
     /// The landing [`FakeClient::hold_next_landing`] is waiting for.
     hold_landing: Mutex<Option<Arc<HoldState>>>,
+    /// Set by [`FakeClient::hold_next_landing_of_any`]: hold whichever node
+    /// lands next.
+    hold_any_landing: AtomicBool,
     /// Set by [`FakeClient::drop_link_after_next_create`].
     drop_after_create: AtomicBool,
     /// Set by [`FakeClient::lose_reply_to_next_create`].
@@ -790,6 +794,14 @@ impl FakeClient {
         });
         *self.0.hold_landing.lock() = Some(state.clone());
         Held(state)
+    }
+
+    /// [`FakeClient::hold_next_landing`] for whichever node lands next, such
+    /// as a new file, whose uid Drive has not minted yet.
+    pub(crate) fn hold_next_landing_of_any(&self) -> Held {
+        let held = self.hold_next_landing(&uid("*"));
+        self.0.hold_any_landing.store(true, Ordering::SeqCst);
+        held
     }
 
     /// Make the next file create on Drive, then hold its answer until the
@@ -1508,8 +1520,12 @@ impl DriveApi for FakeClient {
     fn landing(&self, uid: &NodeUid) {
         let state = {
             let mut hold = self.0.hold_landing.lock();
+            let any = self.0.hold_any_landing.load(Ordering::SeqCst);
             match hold.as_ref() {
-                Some(state) if state.uid == *uid => hold.take(),
+                Some(state) if any || state.uid == *uid => {
+                    self.0.hold_any_landing.store(false, Ordering::SeqCst);
+                    hold.take()
+                }
                 _ => None,
             }
         };

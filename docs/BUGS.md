@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B207](#b207--a-move-between-locations-goes-ahead-under-a-file-opened-just-after-its-create-landed) | A move between locations goes ahead under a file opened just after its create landed |
 | [B206](#b206--an-upgrade-leaves-the-old-daemon-running-and-nothing-says-so) | An upgrade leaves the old daemon running, and nothing says so |
 | [B205](#b205--a-photo-upload-the-sdk-refuses-says-youre-offline) | A photo upload the SDK refuses says "You're offline" |
 | [B204](#b204--a-write-over-a-partial-edit-whose-base-was-never-read-fails-with-eio) | A write over a partial edit whose base was never read fails with `EIO` |
@@ -308,6 +309,36 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B207 — A move between locations goes ahead under a file opened just after its create landed
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-11, account acceptance run of 3.3.0, case "move refuses a file still being
+written" on the on-demand → mirror pairing. `pdfs move` moved the folder while `open.txt` in it
+was open for writing, and the write landed after the move.
+**Where:** `Core::has_pending_work_under` in `crates/pdfs-fuse/src/relocate.rs`; `retire_create`
+in `crates/pdfs-fuse/src/drain.rs`
+
+**Repro:** Create a file in a mount, and open it for writing right after its create lands, before
+the drain has repointed the tree at the real uid. Then `pdfs move` its folder to another
+location. The account run did this by chance: it opened the file about a second after the
+create landed.
+
+**Cause.** `retire_create` takes the create out of the queue and re-keys its `nodes` row to the
+real uid first, then repoints the in-memory tree and the open write handles. A file opened in
+between gets a write handle that holds the placeholder uid. `has_pending_work_under` placed each
+open handle by looking its uid up in the `nodes` table, which no longer has the placeholder, so it
+found nothing open under the folder. The queue was already empty, and the move went ahead.
+
+**Fix.** Open handles are placed in the in-memory tree by inode, which does not change when a
+create lands.
+
+**Test:** `sim::daemon::tests::a_move_out_of_an_on_demand_folder_refuses_a_file_still_open_for_writing`
+holds the drain at that point with `FakeClient::hold_next_landing_of_any`. The simulation can now
+sync local folders: the fake Drive lists and registers devices, and the simulated daemons no longer
+read the developer's own `config.json`.
+
+---
 
 ### B206 — An upgrade leaves the old daemon running, and nothing says so
 
