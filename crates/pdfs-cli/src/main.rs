@@ -15,7 +15,7 @@ use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     ConflictKeep, ErrorKind, MountKind, RefreshScope, Request as CtlRequest,
     Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncIssue, SyncPhase,
-    pending_summary,
+    daemon_outdated, pending_summary,
 };
 use pdfs_core::db::Db;
 use pdfs_core::service;
@@ -2026,6 +2026,7 @@ fn cmd_status() -> Result<()> {
             paused_until,
             session_expired,
             tokens_unsaved,
+            version,
             ..
         }) => {
             let state = match (online, paused) {
@@ -2067,11 +2068,28 @@ fn cmd_status() -> Result<()> {
                     "Keyring    refuses the refreshed sign-in; unlock it, or a reboot needs `pdfs login`"
                 );
             }
+            if daemon_outdated(&version) {
+                println!("Daemon     {}", outdated_daemon_note(&version));
+            }
         }
         Ok(other) => println!("Mount: unexpected response {other:?}"),
         Err(_) => println!("Mount: not running."),
     }
     Ok(())
+}
+
+/// What `pdfs status` and `pdfs diagnose` say about a daemon still running
+/// an older release than this CLI.
+fn outdated_daemon_note(version: &str) -> String {
+    let running = if version.is_empty() {
+        "an older release".to_string()
+    } else {
+        version.to_string()
+    };
+    format!(
+        "still runs {running}, this is {}; run `systemctl --user restart proton-drive` to finish the update",
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 fn cmd_locations() -> Result<()> {
@@ -3444,9 +3462,17 @@ fn cmd_diagnose() -> Result<()> {
             tokens_unsaved,
             pending_uploads,
             pending_changes,
+            version,
             ..
         }) => {
             report.finding(DiagnoseLevel::Ok, "  daemon responding", "");
+            if daemon_outdated(&version) {
+                report.finding(
+                    DiagnoseLevel::Warn,
+                    "  daemon version",
+                    outdated_daemon_note(&version),
+                );
+            }
             let live_type = mounted_fs_type(Path::new(&mountpoint));
             let is_fuse = live_type
                 .as_deref()

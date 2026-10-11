@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B206](#b206--an-upgrade-leaves-the-old-daemon-running-and-nothing-says-so) | An upgrade leaves the old daemon running, and nothing says so |
 | [B205](#b205--a-photo-upload-the-sdk-refuses-says-youre-offline) | A photo upload the SDK refuses says "You're offline" |
 | [B204](#b204--a-write-over-a-partial-edit-whose-base-was-never-read-fails-with-eio) | A write over a partial edit whose base was never read fails with `EIO` |
 | [B203](#b203--pdfs-unlock-leaves-a-running-daemon-a-spent-refresh-token) | `pdfs unlock` leaves a running daemon a spent refresh token |
@@ -307,6 +308,37 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B206 — An upgrade leaves the old daemon running, and nothing says so
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-11, issue [#33](https://github.com/narrrl/proton-drive-linux/issues/33). On
+3.2.0 the reporter still saw `Couldn't sync Documents: Read …/snapshots/37: Permission denied`,
+the B196 failure 3.2.0 fixed. Since 3.2.0 the scan leaves an unreadable subfolder out and
+`walk_local_dir` can only fail the pass on the sync root, so that message comes from a daemon
+older than 3.2.0.
+**Where:** `Response::Status` and `daemon_outdated` in `crates/pdfs-core/src/control.rs`;
+`status_response` in `crates/pdfs-fuse/src/control.rs`; the tray in `crates/pdfs-gui/src/main.rs`;
+the sync card in `crates/pdfs-gui/src/app/pages/status.rs`; `pdfs status` and `pdfs diagnose`
+
+**Repro:** With the service running, install a newer package, then open the app.
+
+**Cause.** A package upgrade replaces the binaries but does not restart the user service, so the
+running daemon keeps the old release and its bugs until the next login or a manual restart. The
+app, the tray and the CLI start from the new binaries and could not tell, so they described the
+new release while the old one did the work.
+
+**Fix.** The daemon reports its release in `Status`. A daemon from before the field omits it,
+which reads as older. When the daemon is older than the front-end, the tray says "Update not
+finished — restart Proton Drive" with a Restart Proton Drive item, the sync card says "Restart to
+finish updating" with a Restart button, and `pdfs status` and `pdfs diagnose` print the
+`systemctl --user restart proton-drive` command. A newer daemon is not flagged: then the
+front-end is the stale one, and restarting the service would not help.
+
+**Test:** `control::tests::only_an_older_daemon_is_outdated`;
+`tests::a_daemon_older_than_the_tray_needs_a_restart` in `pdfs-tray`.
+
+---
 
 ### B205 — A photo upload the SDK refuses says "You're offline"
 

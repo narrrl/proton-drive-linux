@@ -16,6 +16,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   connection now reads as offline. Other failures show what went wrong, and Upload is greyed out
   on an account without a photo library.
   ([#38](https://github.com/narrrl/proton-drive-linux/issues/38))
+- **After an upgrade, the old version kept running in the background, and nothing said so.**
+  Installing a package does not restart the service, so fixed bugs, such as an unreadable folder
+  stopping a synced folder, came back until the next login. The tray, the app, `pdfs status` and
+  `pdfs diagnose` now say when the service is older than the app, and the tray and the app offer
+  to restart it. ([#33](https://github.com/narrrl/proton-drive-linux/issues/33))
 
 ## [3.2.1] — 2026-10-11
 

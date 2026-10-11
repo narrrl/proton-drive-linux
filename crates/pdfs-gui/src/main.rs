@@ -22,7 +22,8 @@ use ksni::{MenuItem, Status, ToolTip, Tray};
 use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    Event, Feed, JobItem, Request, Response, TransferDirection, TransferItem, follow, send,
+    Event, Feed, JobItem, Request, Response, TransferDirection, TransferItem, daemon_outdated,
+    follow, send,
 };
 use pdfs_core::service;
 
@@ -86,6 +87,9 @@ struct DriveState {
     paused: bool,
     /// Queued changes that keep failing, for the "N issues" item.
     failing: u64,
+    /// Whether the daemon is an older release than the tray, left running by
+    /// an upgrade; offers the restart that finishes it.
+    outdated: bool,
 }
 
 /// Summarise a work snapshot into one menu line, or empty when idle. A single
@@ -166,6 +170,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
             sync: String::new(),
             paused: false,
             failing: 0,
+            outdated: false,
         },
         // No daemon: describe login state instead so the menu is still useful.
         Err(_) => {
@@ -202,6 +207,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
                 sync: String::new(),
                 paused: false,
                 failing: 0,
+                outdated: false,
             }
         }
     }
@@ -218,6 +224,7 @@ fn unexpected_reply(default_mountpoint: &Path) -> DriveState {
         sync: String::new(),
         paused: false,
         failing: 0,
+        outdated: false,
     }
 }
 
@@ -239,6 +246,7 @@ fn status_state(
         paused,
         session_expired,
         tokens_unsaved,
+        version,
         ..
     } = status
     else {
@@ -246,9 +254,10 @@ fn status_state(
     };
     let (pinned, online, failing_ops, paused) = (*pinned, *online, *failing_ops, *paused);
     let queued = i18n::pending_summary(*pending_uploads, *pending_changes);
+    let outdated = daemon_outdated(version);
     let phase = if *session_expired {
         Phase::SessionExpired
-    } else if *tokens_unsaved {
+    } else if *tokens_unsaved || outdated {
         Phase::Attention
     } else {
         phase_of(
@@ -265,6 +274,9 @@ fn status_state(
             _ if *session_expired => gettext("Session expired — sign in again"),
             // Sync goes on meanwhile, but a reboot ends it until the next login.
             _ if *tokens_unsaved => gettext("Sign-in not saved — unlock your keyring"),
+            // An upgrade replaced the files but not the running service, which
+            // keeps the old release's bugs until it restarts.
+            _ if outdated => gettext("Update not finished — restart Proton Drive"),
             _ if paused => gettext("Sync paused"),
             _ if failing_ops > 0 => ngettext_f(
                 "{n} change needs attention",
@@ -302,6 +314,7 @@ fn status_state(
         mountpoint: PathBuf::from(mountpoint),
         sync: sync_line(items, jobs),
         failing: failing_ops,
+        outdated,
     }
 }
 
@@ -443,6 +456,13 @@ impl Tray for DriveTray {
                 open_manager(&["--page", "login"])
             })),
             _ => items.push(item(&gettext("Open Proton Drive"), |_| open_manager(&[]))),
+        }
+
+        if self.state.outdated {
+            items.push(item(&gettext("Restart Proton Drive"), |this| {
+                service::restart();
+                this.state.line = gettext("Connecting…");
+            }));
         }
 
         if self.state.mounted {
@@ -626,9 +646,14 @@ mod tests {
     }
 
     fn status(extra: &str) -> Response {
+        status_from(env!("CARGO_PKG_VERSION"), extra)
+    }
+
+    fn status_from(version: &str, extra: &str) -> Response {
         serde_json::from_str(&format!(
             r#"{{"Status":{{"username":"u","mountpoint":"/m","pinned":0,"used":0,"budget":0,
-                "pins":[],"online":false,"pending_uploads":3,"failing_ops":2,"paused":true{extra}}}}}"#
+                "pins":[],"online":false,"pending_uploads":3,"failing_ops":2,"paused":true,
+                "version":"{version}"{extra}}}}}"#
         ))
         .unwrap()
     }
@@ -658,6 +683,16 @@ mod tests {
         );
         assert_eq!(state.phase, Phase::Attention);
         assert_eq!(state.line, "Sign-in not saved — unlock your keyring");
+    }
+
+    /// #33: a daemon an upgrade left running on the old release is named,
+    /// above a pause, and the menu offers the restart that finishes it.
+    #[test]
+    fn a_daemon_older_than_the_tray_needs_a_restart() {
+        let state = status_state(&status_from("0.1.0", ""), &[], &[], Path::new("/m"));
+        assert_eq!(state.phase, Phase::Attention);
+        assert_eq!(state.line, "Update not finished — restart Proton Drive");
+        assert!(state.outdated);
     }
 
     #[test]

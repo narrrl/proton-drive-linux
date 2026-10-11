@@ -581,6 +581,7 @@ fn build_window(app: &adw::Application) {
                 pause: locations_widgets.pause.clone(),
                 paused: Cell::new(false),
                 sign_in: locations_widgets.card_sign_in.clone(),
+                restart: locations_widgets.card_restart.clone(),
             },
             queue: QueueState {
                 group: locations_widgets.queue_group.clone(),

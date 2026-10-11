@@ -329,6 +329,7 @@ mod tests {
             online: true,
             session_expired: false,
             tokens_unsaved: false,
+            version: "3.2.2".into(),
             pending_uploads: 1,
             pending_changes: 0,
         };

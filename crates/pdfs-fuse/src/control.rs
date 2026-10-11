@@ -336,6 +336,7 @@ pub(crate) fn status_response(core: &Core, username: &str, mountpoint: &Path) ->
         online: core.online.load(Ordering::Relaxed),
         session_expired: core.session_expired(),
         tokens_unsaved: pdfs_core::auth::tokens_unsaved(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         pending_uploads: queued.uploads.max(0) as u64 + landing,
         pending_changes: queued.changes.max(0) as u64,
     }

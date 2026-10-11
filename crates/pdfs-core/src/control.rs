@@ -1850,6 +1850,27 @@ pub fn pending_summary(uploads: u64, changes: u64) -> Option<String> {
     }
 }
 
+/// Whether the daemon that reported `version` in a [`Response::Status`] is an
+/// older release than this build. Installing a package replaces the binaries
+/// but leaves the running user service on the old one, which keeps its bugs
+/// until it restarts, while the app and the CLI already describe the new
+/// release (#33). Empty means a daemon from before the field, so older too.
+///
+/// Only older counts. A newer daemon means this front-end is the one still
+/// running from before the upgrade, and restarting the service would not help.
+pub fn daemon_outdated(version: &str) -> bool {
+    fn parse(v: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = v.split('.').map(|p| p.parse().ok());
+        let parsed = (parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(parsed)
+    }
+    match (parse(version), parse(env!("CARGO_PKG_VERSION"))) {
+        (Some(running), Some(this)) => running < this,
+        (None, _) => version.is_empty(),
+        (Some(_), None) => false,
+    }
+}
+
 /// One worker thread in a [`Diagnostics`] report.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorkerState {
@@ -1969,6 +1990,11 @@ pub enum Response {
         /// out.
         #[serde(default)]
         tokens_unsaved: bool,
+        /// The release of the daemon that answered. A package upgrade does not
+        /// restart the user service, so it can be older than the front-end
+        /// asking; daemons before 3.2.2 omit it, which reads as empty.
+        #[serde(default)]
+        version: String,
     },
     /// A human-readable success message.
     Ok { message: String },
@@ -2610,6 +2636,27 @@ mod tests {
             pending_summary(2, 4).as_deref(),
             Some("2 uploads, 4 changes queued")
         );
+    }
+
+    /// #33: a daemon left running over an upgrade is named as older, also when
+    /// it predates the version field, but a newer one is not, since restarting
+    /// the service cannot bring it closer to this build.
+    #[test]
+    fn only_an_older_daemon_is_outdated() {
+        assert!(!daemon_outdated(env!("CARGO_PKG_VERSION")));
+        assert!(daemon_outdated(""));
+        assert!(daemon_outdated("0.9.9"));
+        assert!(!daemon_outdated("999.0.0"));
+        assert!(!daemon_outdated("not-a-version"));
+        let old: Response = serde_json::from_str(
+            r#"{"Status":{"username":"u","mountpoint":"/m","pinned":0,
+                "used":0,"budget":0,"pins":[]}}"#,
+        )
+        .unwrap();
+        let Response::Status { version, .. } = old else {
+            panic!("not a status: {old:?}");
+        };
+        assert!(daemon_outdated(&version));
     }
 
     /// The mutation requests must survive a line-delimited JSON round-trip, since

@@ -1232,6 +1232,7 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
         paused_until,
         session_expired,
         tokens_unsaved,
+        version,
         ..
     } = status
     else {
@@ -1246,6 +1247,8 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
         SyncState::SessionExpired { queued }
     } else if tokens_unsaved {
         SyncState::TokensUnsaved
+    } else if pdfs_core::control::daemon_outdated(&version) {
+        SyncState::Outdated { running: version }
     } else if paused {
         SyncState::Paused {
             until: paused_until,
@@ -1317,6 +1320,12 @@ pub(crate) enum SyncState {
     /// The keyring refuses the session's refreshed tokens. Sync goes on, but
     /// a reboot before the keyring takes them signs the user out.
     TokensUnsaved,
+    /// The daemon is an older release than this window: an upgrade replaced
+    /// the files but left the service running, with the old release's bugs,
+    /// until it restarts (#33). `running` is empty when it is too old to say.
+    Outdated {
+        running: String,
+    },
     /// The user paused syncing; nothing goes up until it resumes. Outranks
     /// everything else, because it is the reason for everything else.
     Paused {
@@ -1352,6 +1361,7 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     let paused = matches!(state, SyncState::Paused { .. });
     let connected = !matches!(state, SyncState::Disconnected | SyncState::NotResponding);
     let expired = matches!(state, SyncState::SessionExpired { .. });
+    let outdated = matches!(state, SyncState::Outdated { .. });
     let (icon, class, title, detail) = match state {
         SyncState::SessionExpired { queued } => (
             "dialog-password-symbolic",
@@ -1373,6 +1383,20 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
             Some(gettext(
                 "Unlock your keyring, or the next reboot signs you out",
             )),
+        ),
+        SyncState::Outdated { running } => (
+            "dialog-warning-symbolic",
+            Some("warning"),
+            gettext("Restart to finish updating"),
+            Some(if running.is_empty() {
+                gettext("An older version of Proton Drive is still running")
+            } else {
+                // Translators: {version} is a release number such as "3.2.0".
+                gettext_f(
+                    "Proton Drive {version} is still running",
+                    &[("version", &running)],
+                )
+            }),
         ),
         SyncState::Paused { until, queued } => (
             "media-playback-pause-symbolic",
@@ -1445,6 +1469,7 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
         image.add_css_class(class);
     }
     ui.locations.card.sign_in.set_visible(expired);
+    ui.locations.card.restart.set_visible(outdated);
     ui.status.status_title.set_label(&title);
     ui.status.status_detail.set_visible(detail.is_some());
     ui.status

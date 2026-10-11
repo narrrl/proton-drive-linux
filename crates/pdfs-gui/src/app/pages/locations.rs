@@ -48,6 +48,8 @@ pub(crate) struct SyncCard {
     pub(crate) paused: Cell<bool>,
     /// Shown only while Proton refuses the session; opens the sign-in page.
     pub(crate) sign_in: gtk4::Button,
+    /// Shown only while the daemon is older than the app; restarts it.
+    pub(crate) restart: gtk4::Button,
 }
 
 /// What a folder row's controls are built from. The subtitle and progress bar
@@ -111,6 +113,7 @@ pub(crate) struct LocationsWidgets {
     pub(crate) card_title: gtk4::Label,
     pub(crate) card_detail: gtk4::Label,
     pub(crate) card_sign_in: gtk4::Button,
+    pub(crate) card_restart: gtk4::Button,
     pub(crate) pause: adw::SplitButton,
     pub(crate) queue_group: adw::PreferencesGroup,
     pub(crate) retry_all: gtk4::Button,
@@ -137,7 +140,7 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         .build();
     add_folder.add_css_class("flat");
     let transfers_group = build_transfers_group();
-    let (card, card_icon, card_title, card_detail, card_sign_in) = build_sync_card();
+    let (card, card_icon, card_title, card_detail, card_sign_in, card_restart) = build_sync_card();
     let pause = build_pause_button();
     let (queue_group, retry_all) = build_queue_group();
     let conflicts_group = adw::PreferencesGroup::builder()
@@ -257,6 +260,7 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         card_title,
         card_detail,
         card_sign_in,
+        card_restart,
         pause,
         queue_group,
         retry_all,
@@ -299,6 +303,11 @@ pub(crate) fn wire_locations(ui: &Rc<Ui>, retry: &gtk4::Button, add_folder: &gtk
         .card
         .sign_in
         .connect_clicked(move |_| show_login(&ui_sign_in));
+    let ui_restart = ui.clone();
+    ui.locations
+        .card
+        .restart
+        .connect_clicked(move |_| restart_service_then(&ui_restart, |_| {}));
     let ui_retry = ui.clone();
     ui.locations
         .queue
@@ -396,6 +405,7 @@ fn build_sync_card() -> (
     gtk4::Label,
     gtk4::Label,
     gtk4::Button,
+    gtk4::Button,
 ) {
     let icon = gtk4::Image::builder()
         .icon_name("pdfs-sync-symbolic")
@@ -430,10 +440,18 @@ fn build_sync_card() -> (
         .build();
     sign_in.add_css_class("pill");
     sign_in.add_css_class("suggested-action");
+    let restart = gtk4::Button::builder()
+        .label(gettext("Restart"))
+        .valign(gtk4::Align::Center)
+        .visible(false)
+        .build();
+    restart.add_css_class("pill");
+    restart.add_css_class("suggested-action");
     card.append(&icon);
     card.append(&text);
     card.append(&sign_in);
-    (card, icon, title, detail, sign_in)
+    card.append(&restart);
+    (card, icon, title, detail, sign_in, restart)
 }
 
 /// Pause/Resume, with timed pauses in its menu.
