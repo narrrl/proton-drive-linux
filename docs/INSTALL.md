@@ -103,6 +103,15 @@ GNOME Keyring for you:
 }
 ```
 
+That URL follows `main`. To stay on releases, pin the input to a release tag instead, and change
+the tag to update:
+
+```nix
+inputs.proton-drive-linux.url = "github:narrrl/proton-drive-linux/v3.3.0";
+```
+
+Each release tag is built with Nix before the release is published.
+
 To try it without changing your system, run the app straight from the flake:
 
 ```bash

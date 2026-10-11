@@ -230,9 +230,30 @@ jobs:
             *.rpm
           if-no-files-found: error
 
+  # The flake is the Nix release: a tag is what `github:narrrl/proton-drive-linux/vX.Y.Z`
+  # pins, so it has to build before the release is announced.
+  nix:
+    name: Build the Nix package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build the flake
+        run: nix build --print-build-logs .#proton-drive-linux
+
+      - name: Check the version
+        run: |
+          built="$(./result/bin/pdfs --version)"
+          echo "$built"
+          case "$GITHUB_REF" in
+            refs/tags/v*) grep -qF "${GITHUB_REF_NAME#v}" <<< "$built" ;;
+          esac
+
   publish:
     name: Create GitHub Release
-    needs: [checks, build-release]
+    needs: [checks, build-release, nix]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
 
