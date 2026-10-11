@@ -538,6 +538,7 @@ fn build_window(app: &adw::Application) {
             reload_pending: Cell::new(false),
             loading: Cell::new(false),
             has_more: Cell::new(false),
+            library: Cell::new(true),
             page_waiters: RefCell::new(Vec::new()),
             width: Cell::new(0),
             photo_tex: RefCell::new(HashMap::new()),

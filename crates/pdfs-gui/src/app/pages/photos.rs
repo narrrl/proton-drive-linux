@@ -140,6 +140,9 @@ pub(crate) struct GalleryState {
     pub(crate) loading: Cell<bool>,
     /// Whether the last page came back full, so there may be more to load.
     pub(crate) has_more: Cell<bool>,
+    /// Whether the account has a photo library. Until the daemon says it has
+    /// none, assume it does, so Upload is not greyed out while the page loads.
+    pub(crate) library: Cell<bool>,
     /// Run once the page in flight has landed in [`Self::model`] — how the
     /// lightbox steps past the last loaded photo.
     pub(crate) page_waiters: RefCell<Vec<Box<dyn FnOnce()>>>,
@@ -3341,6 +3344,12 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 items,
                 counts,
             })) => {
+                // Nothing can go into a library the account does not have; the
+                // SDK refuses the upload before sending it (issue #38).
+                ui.gallery.library.set(available);
+                ui.gallery
+                    .upload
+                    .set_sensitive(available && *ui.mounted.borrow());
                 if !available {
                     gallery_status(
                         &ui,

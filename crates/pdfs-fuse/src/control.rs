@@ -940,6 +940,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                             }
                         }
                         Err(e) => {
+                            // The reply goes to the app's toast only; without
+                            // this the journal shows a failure and no reason.
+                            warn!(error = %e, "photo upload failed");
                             CtlResponse::error(CoreError::from_api(&e, "upload photo failed"))
                         }
                     }

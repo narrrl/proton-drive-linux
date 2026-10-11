@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **A failed photo upload said "You're offline" while everything else worked.** Only a failed
+  connection now reads as offline. Other failures show what went wrong, and Upload is greyed out
+  on an account without a photo library.
+  ([#38](https://github.com/narrrl/proton-drive-linux/issues/38))
+
 ## [3.2.1] — 2026-10-11
 
 Schema: **42**, unchanged.

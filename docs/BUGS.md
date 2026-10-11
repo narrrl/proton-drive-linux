@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B205](#b205--a-photo-upload-the-sdk-refuses-says-youre-offline) | A photo upload the SDK refuses says "You're offline" |
 | [B204](#b204--a-write-over-a-partial-edit-whose-base-was-never-read-fails-with-eio) | A write over a partial edit whose base was never read fails with `EIO` |
 | [B203](#b203--pdfs-unlock-leaves-a-running-daemon-a-spent-refresh-token) | `pdfs unlock` leaves a running daemon a spent refresh token |
 | [B202](#b202--a-refused-session-shows-as-offline-forever-and-nothing-says-to-sign-in-again) | A refused session shows as offline forever, and nothing says to sign in again |
@@ -306,6 +307,34 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B205 — A photo upload the SDK refuses says "You're offline"
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-11, issue #38: uploading an image from the Photos page showed "You're offline"
+while other uploads went through. Each `upload_photo` failed about 5 µs after it started, with no
+request sent, and the journal gave no reason.
+**Where:** `CoreError::from_api` and `From<Error> for CoreError` in `crates/pdfs-core/src/error.rs`;
+the `UploadPhoto` handler in `crates/pdfs-fuse/src/control.rs`; the Photos page in
+`crates/pdfs-gui/src/app/pages/photos.rs`
+
+**Repro:** On an account without a photo library, open Photos and upload an image.
+
+**Cause.** Every `ProtonError` other than `Api` was classified as `ErrorKind::Offline`, on the
+reasoning that it never reached Proton. That holds for `Transport` only. `InvalidOperation`,
+`Crypto`, `KeysLocked` and `Serialization` happen on this machine or after Proton answered. A
+failure that fast is most likely the SDK's "account has no photos volume", which it returns from
+its cache without sending a request. The app turns `Offline` into "You're offline", and the
+daemon only sent the error back, so the journal did not say what it was.
+
+**Fix.** `proton_kind` classifies by variant: `Transport` is `Offline`, `InvalidOperation` is
+`Invalid`, `Serialization` is `Remote`, and `Crypto` and `KeysLocked` are `Internal`. The app then
+shows "Couldn't upload photo" with the daemon's reason. The daemon logs a failed photo upload. The
+Photos page greys out Upload when the daemon reports no photo library.
+
+**Test:** `error::tests::a_call_the_sdk_refuses_to_send_is_not_offline`.
+
+---
 
 ### B204 — A write over a partial edit whose base was never read fails with `EIO`
 

@@ -154,17 +154,17 @@ impl CoreError {
     /// through the boxes the drain deals in, where the concrete type survives
     /// but the static one does not.
     ///
-    /// A failure that is not an API response at all — a transport error, a
-    /// timeout, a TLS failure — is what being offline looks like from here, so
-    /// it classifies as [`ErrorKind::Offline`] rather than
-    /// [`ErrorKind::Remote`]: the request never reached Proton, and telling the
-    /// user their connection is down beats telling them the server refused.
+    /// A transport error, a timeout or a TLS failure is what being offline
+    /// looks like from here, so it classifies as [`ErrorKind::Offline`] rather
+    /// than [`ErrorKind::Remote`]: the request never reached Proton, and
+    /// telling the user their connection is down beats telling them the
+    /// server refused. The SDK's other failures say what went wrong instead
+    /// (see [`proton_kind`]).
     pub fn from_api(e: &(dyn std::error::Error + 'static), what: &str) -> Self {
         let kind = match e.downcast_ref::<proton_sdk::ProtonError>() {
-            Some(proton_sdk::ProtonError::Api(api)) => api_kind(api.code),
-            // A `ProtonError` that is not an `Api` variant never reached the
-            // API; so does anything that is not a `ProtonError` at all.
-            _ => ErrorKind::Offline,
+            Some(proton) => proton_kind(proton),
+            // Not the SDK's at all: a timeout around the call, or the socket.
+            None => ErrorKind::Offline,
         };
         Self::new(kind, format!("{what}: {e}"))
     }
@@ -214,12 +214,30 @@ impl From<Error> for CoreError {
             | Error::Locked
             | Error::WrongMailboxPassword
             | Error::HumanVerificationRequired(_) => ErrorKind::Denied,
-            Error::Proton(proton_sdk::ProtonError::Api(api)) => api_kind(api.code),
-            // A `ProtonError` that never reached the API is a transport failure.
-            Error::Proton(_) => ErrorKind::Offline,
+            Error::Proton(proton) => proton_kind(proton),
             _ => ErrorKind::Internal,
         };
         Self::new(kind, e.to_string())
+    }
+}
+
+/// What a failed SDK call means to a front-end.
+///
+/// Only a transport failure is the connection. The rest happened on this
+/// machine, and calling them "offline" sent the user to check a network that
+/// worked (issue #38: a photo upload on an account without a photo library
+/// read "You're offline").
+fn proton_kind(e: &proton_sdk::ProtonError) -> ErrorKind {
+    use proton_sdk::ProtonError as P;
+    match e {
+        P::Api(api) => api_kind(api.code),
+        P::Transport(_) => ErrorKind::Offline,
+        // Proton answered, but not with anything this client can read.
+        P::Serialization(_) => ErrorKind::Remote,
+        // The SDK refused the call before sending it, such as an upload to a
+        // photo library the account does not have.
+        P::InvalidOperation(_) => ErrorKind::Invalid,
+        P::Crypto(_) | P::KeysLocked => ErrorKind::Internal,
     }
 }
 
@@ -365,6 +383,18 @@ mod tests {
     fn a_transport_failure_reads_as_offline() {
         let io = std::io::Error::other("connection reset");
         assert_eq!(CoreError::from_api(&io, "list").kind, ErrorKind::Offline);
+    }
+
+    /// Issue #38: the SDK refused a photo upload before sending it, and the
+    /// app said "You're offline" while every other call went through.
+    #[test]
+    fn a_call_the_sdk_refuses_to_send_is_not_offline() {
+        let refused = ProtonError::invalid_operation("account has no photos volume");
+        let e = CoreError::from_api(&refused, "upload photo failed");
+        assert_eq!(e.kind, ErrorKind::Invalid);
+        assert!(e.message.ends_with("account has no photos volume"));
+        let e: CoreError = Error::Proton(ProtonError::KeysLocked).into();
+        assert_ne!(e.kind, ErrorKind::Offline);
     }
 
     /// `Error` is the plumbing type; converting it must classify as sharply as

@@ -958,7 +958,9 @@ fn quota_display(max_space: i64, used_space: i64) -> (f64, String) {
 pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     *ui.mounted.borrow_mut() = mounted;
     sync_mounted_actions(ui, mounted);
-    ui.gallery.upload.set_sensitive(mounted);
+    ui.gallery
+        .upload
+        .set_sensitive(mounted && ui.gallery.library.get());
     ui.details.details.pin_row.set_sensitive(mounted);
     ui.details.details.rename_button.set_sensitive(mounted);
     ui.details.details.trash_button.set_sensitive(mounted);
