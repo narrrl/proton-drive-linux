@@ -20,6 +20,22 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   the app, as on secureblue, the app now offers it in your browser and continues the sign-in
   once you are done. `pdfs login` now handles a CAPTCHA the same way instead of failing.
   ([#29](https://github.com/narrrl/proton-drive-linux/issues/29))
+- **The daemon kept several CPU cores busy while offline with changes queued.** Its upload
+  workers checked the queue in a tight loop for as long as the outage lasted. They now sleep
+  until the connection comes back. ([#35](https://github.com/narrrl/proton-drive-linux/issues/35))
+- **An expired sign-in was shown as "offline" for good.** When Proton refuses the session, the
+  tray now says "Session expired — sign in again" with a Sign In Again… item, the app shows the
+  same with a button, and `pdfs status` and `pdfs diagnose` tell you to run `pdfs login`. Cached
+  files stay readable and changes stay queued until you sign in.
+  ([#35](https://github.com/narrrl/proton-drive-linux/issues/35))
+- **The sign-in could be lost after `pdfs login`, `pdfs unlock` or a slow network.** The old
+  daemon wrote its spent tokens over a new sign-in when it stopped, a timeout could drop a token
+  refresh halfway, and a refresh was retried with a token Proton had already used. Each process
+  now writes only into its own session, a refresh always finishes, and it is never repeated.
+  ([#35](https://github.com/narrrl/proton-drive-linux/issues/35))
+- **A sign-in refreshed while the keyring was locked was lost on the next restart.** The client
+  now keeps retrying, holds the new tokens in the kernel keyring meanwhile, and the tray says
+  "Sign-in not saved — unlock your keyring" until it is written.
 
 ## [3.2.0] — 2026-10-08
 
