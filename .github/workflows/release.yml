@@ -237,14 +237,32 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Download packages
         uses: actions/download-artifact@v8
         with:
           name: proton-drive-linux-builds
 
+      # The release notes are this version's section of the changelog, from its
+      # heading up to the next one.
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [$version]" \
+            'index($0, heading) == 1 { found = 1; print; next }
+             found && /^## \[/ { exit }
+             found' docs/CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::docs/CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: release-notes.md
           files: |
             *.deb
             *.tar.gz
