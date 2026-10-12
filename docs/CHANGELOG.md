@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.4.0] — 2026-10-12
+
+Schema: **42**, unchanged.
+
 ### Added
 - **A binary cache for the Nix flake.** Every release and every build of `main` is uploaded to
   `proton-drive-linux.cachix.org`, so NixOS installs download the client instead of compiling
@@ -1782,6 +1786,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.0
 [3.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.3.0
 [3.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.1
 
