@@ -139,6 +139,40 @@ impl Daemon {
         }
     }
 
+    /// Write the new file `path` under the mount, and let the drain send its
+    /// create only once the create holds the bytes. Otherwise a drain worker
+    /// still busy with the op before can claim the create before the release
+    /// attaches them, which the kernel sends after `close` returns. The file
+    /// then goes out empty, and the bytes follow as a revision, past a hook on
+    /// the next create.
+    pub(crate) fn write_new(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let rel = path
+            .strip_prefix(&self.mountpoint)
+            .map_err(io::Error::other)?
+            .to_string_lossy()
+            .into_owned();
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        self.request(&paused(true))?;
+        std::fs::write(path, bytes)?;
+        let attached = wait_until(Duration::from_secs(30), || {
+            self.pending().is_ok_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.kind == "create" && item.path == rel && item.exportable)
+            })
+        });
+        self.request(&paused(false))?;
+        match attached {
+            true => Ok(()),
+            false => Err(io::Error::other(format!(
+                "{rel}: create never held the bytes"
+            ))),
+        }
+    }
+
     /// Stop the daemon and start it again on the same state and link.
     pub(crate) fn restart(mut self) -> io::Result<Self> {
         self.shut_down()?;
@@ -787,7 +821,7 @@ mod tests {
         let path = daemon.mountpoint.join("c.bin");
 
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(&path, b"abc").unwrap();
+        daemon.write_new(&path, b"abc").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         let uid = drive.lookup("c.bin").unwrap();
         let landing = daemon.client.hold_next_landing(&uid);
@@ -833,7 +867,7 @@ mod tests {
         );
 
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mnt.join("a.txt"), b"old").unwrap();
+        daemon.write_new(&mnt.join("a.txt"), b"old").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         let uid = drive.lookup("a.txt").unwrap();
         let landing = daemon.client.hold_next_landing(&uid);
@@ -871,7 +905,7 @@ mod tests {
         let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
         let mnt = daemon.mountpoint.clone();
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mnt.join("a.txt"), b"old").unwrap();
+        daemon.write_new(&mnt.join("a.txt"), b"old").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         std::fs::write(mnt.join("a.txt"), b"newer").unwrap();
         let uid = drive.lookup("a.txt").unwrap();
@@ -1054,7 +1088,7 @@ mod tests {
         );
 
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        daemon.write_new(&mnt.join("x/c.bin"), b"abc").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         std::fs::rename(mnt.join("x/c.bin"), mnt.join("y/d")).unwrap();
         let uid = drive.lookup("x/c.bin").unwrap();
@@ -1132,7 +1166,7 @@ mod tests {
         take_logged();
 
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        daemon.write_new(&mnt.join("x/c.bin"), b"abc").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         let uid = drive.lookup("x/c.bin").unwrap();
         // The read-back after the create, the one adopting it, and the size
@@ -1180,7 +1214,7 @@ mod tests {
         }));
 
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        daemon.write_new(&mnt.join("x/c.bin"), b"abc").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         let uid = drive.lookup("x/c.bin").unwrap();
         let read_back = daemon.client.hold_next_read(&uid);
@@ -1223,7 +1257,7 @@ mod tests {
         }));
 
         let create = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mnt.join("x/c.bin"), b"abc").unwrap();
+        daemon.write_new(&mnt.join("x/c.bin"), b"abc").unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         // Long enough for the next event poll to bring the file's event, which
         // drops the folder's listing.
@@ -1348,7 +1382,9 @@ mod tests {
         let folder = drive.lookup("x").unwrap();
 
         let create = daemon.client.hold_next_create();
-        std::fs::write(mnt.join("x/removed-while-uploading"), b"abc").unwrap();
+        daemon
+            .write_new(&mnt.join("x/removed-while-uploading"), b"abc")
+            .unwrap();
         assert!(wait_until(Duration::from_secs(30), || create.reached()));
         std::fs::remove_file(mnt.join("x/removed-while-uploading")).unwrap();
         std::fs::remove_dir(mnt.join("x")).unwrap();
@@ -1593,7 +1629,9 @@ mod tests {
         let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
 
         daemon.client.lose_reply_to_next_create();
-        std::fs::write(daemon.mountpoint.join("f.txt"), b"once").unwrap();
+        daemon
+            .write_new(&daemon.mountpoint.join("f.txt"), b"once")
+            .unwrap();
         assert!(
             wait_until(Duration::from_secs(30), || {
                 daemon.pending().is_ok_and(|items| items.is_empty())
@@ -1623,7 +1661,7 @@ mod tests {
 
         let held = daemon.client.hold_reply_to_next_create();
         daemon.client.lose_reply_to_next_create();
-        std::fs::write(&path, b"first").unwrap();
+        daemon.write_new(&path, b"first").unwrap();
         assert!(wait_until(Duration::from_secs(30), || held.reached()));
         std::fs::write(&path, b"second").unwrap();
         drop(held);
@@ -1655,7 +1693,7 @@ mod tests {
         let path = daemon.mountpoint.join("f.txt");
 
         daemon.client.lose_reply_to_next_create();
-        std::fs::write(&path, b"gone").unwrap();
+        daemon.write_new(&path, b"gone").unwrap();
         assert!(wait_until(Duration::from_secs(30), || {
             drive.tree().contains_key("f.txt")
         }));
@@ -1688,7 +1726,7 @@ mod tests {
 
         let held = daemon.client.hold_reply_to_next_create();
         daemon.client.lose_reply_to_next_create();
-        std::fs::write(&path, b"first").unwrap();
+        daemon.write_new(&path, b"first").unwrap();
         assert!(wait_until(Duration::from_secs(30), || held.reached()));
         std::fs::write(&path, b"second").unwrap();
         drop(held);
@@ -1728,7 +1766,9 @@ mod tests {
         let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
 
         daemon.client.lose_reply_to_next_create();
-        std::fs::write(daemon.mountpoint.join("f.txt"), b"first").unwrap();
+        daemon
+            .write_new(&daemon.mountpoint.join("f.txt"), b"first")
+            .unwrap();
         assert!(wait_until(Duration::from_secs(30), || {
             daemon
                 .pending()
@@ -1767,7 +1807,9 @@ mod tests {
         let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
 
         daemon.client.lose_reply_to_next_create();
-        std::fs::write(daemon.mountpoint.join("f.txt"), b"first").unwrap();
+        daemon
+            .write_new(&daemon.mountpoint.join("f.txt"), b"first")
+            .unwrap();
         assert!(wait_until(Duration::from_secs(30), || {
             daemon
                 .pending()
@@ -1861,7 +1903,7 @@ mod tests {
         let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
 
         let held = daemon.client.hold_reply_to_next_create();
-        std::fs::write(mount.join("c.bin"), b"first").unwrap();
+        daemon.write_new(&mount.join("c.bin"), b"first").unwrap();
         assert!(wait_until(Duration::from_secs(30), || held.reached()));
         std::fs::rename(mount.join("c.bin"), mount.join("d")).unwrap();
         std::fs::write(mount.join("c.bin"), b"second").unwrap();
