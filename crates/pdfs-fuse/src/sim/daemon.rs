@@ -2186,6 +2186,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_folder_pinned_while_a_create_in_it_lands_keeps_that_file() {
+        // The pin's download of a file started before the file's landing set
+        // its modification time from Drive, and ended after it: the blob was
+        // stored under the old time, and the file never read as cached (B208).
+        let drive = FakeDrive::new();
+        let dir = scratch("pin-folder-landing");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir(daemon.mountpoint.join("Docs")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        let entry = || match daemon.request(&Request::ListDir {
+            path: "Docs".into(),
+        }) {
+            Ok(Response::Entries { entries }) => entries.into_iter().find(|e| e.name == "a.txt"),
+            _ => None,
+        };
+
+        // Drive stamps the file with the time it landed, a second after it
+        // was written, so the landing moves its modification time.
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        std::fs::write(daemon.mountpoint.join("Docs/a.txt"), b"alpha").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let landing = daemon.client.hold_next_landing_of_any();
+        daemon.request(&paused(false)).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+        let real = drive.lookup("Docs/a.txt").unwrap();
+        let read_back = daemon.client.hold_next_read(&real);
+        drop(landing);
+        assert!(wait_until(Duration::from_secs(30), || read_back.reached()));
+        let written = entry().unwrap().modified;
+
+        // Without the blob the landing kept, the pin downloads the file.
+        daemon.request(&Request::PurgeCache).unwrap();
+
+        let download = daemon.client.hold_next_download(&real);
+        take_logged();
+        daemon
+            .request(&Request::Pin {
+                path: "Docs".into(),
+            })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || download.reached()));
+        drop(read_back);
+        assert!(wait_until(Duration::from_secs(30), || {
+            entry().is_some_and(|e| e.modified != written)
+        }));
+        drop(download);
+        let mut logged = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                logged.extend(take_logged());
+                logged
+                    .iter()
+                    .any(|line| line.starts_with("pin folder: done"))
+            }),
+            "{logged:?}"
+        );
+
+        assert!(
+            entry().is_some_and(|e| e.cached),
+            "the file kept through its folder is available offline: {:?}",
+            entry()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Register `local` as a synced folder in `mode` and wait until the daemon
     /// lists it that way, returning its id.
     fn sync_folder(daemon: &Daemon, local: &Path, mode: &str) -> i64 {

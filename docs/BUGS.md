@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B208](#b208--a-file-landing-while-its-folder-is-pinned-is-kept-but-not-available-offline) | A file landing while its folder is pinned is kept but not available offline |
 | [B207](#b207--a-move-between-locations-goes-ahead-under-a-file-opened-just-after-its-create-landed) | A move between locations goes ahead under a file opened just after its create landed |
 | [B206](#b206--an-upgrade-leaves-the-old-daemon-running-and-nothing-says-so) | An upgrade leaves the old daemon running, and nothing says so |
 | [B205](#b205--a-photo-upload-the-sdk-refuses-says-youre-offline) | A photo upload the SDK refuses says "You're offline" |
@@ -309,6 +310,34 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B208 — A file landing while its folder is pinned is kept but not available offline
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-11, CI simulation run of `3e4886f`.
+`sim::daemon::tests::a_pinned_folder_keeps_every_file_under_it_until_it_is_unpinned` waited
+30 s for `Docs/sub/b.txt` to read as cached and gave up. It failed about once in 25 runs under load
+and never alone.
+**Where:** `Core::pin_subtree` in `crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Pin a folder while a create in it lands, after the drain has repointed the tree at
+the real uid and before it has read the node back. The file's cached blob must be gone, as after
+`pdfs cache clear`, so the pin downloads it.
+
+**Cause.** The pin walks the folder first and downloads each file under the modification time
+and size it read then. The landing's read-back then sets the time Drive gave the file, and keeps
+the uploaded bytes under it. The pin's download ended after that and stored the blob again under
+the old time. The cache records one time per blob, so the file read as stale: shown as kept
+offline, but downloaded again on the next read, and unreadable offline.
+
+**Fix.** After each download the pin compares the file's time and size with the tree's. If they
+moved, it fetches the file again under the new ones, at most three times.
+
+**Test:** `sim::daemon::tests::a_folder_pinned_while_a_create_in_it_lands_keeps_that_file` holds
+the read-back and the pin's download with `FakeClient::hold_next_download`, new for this, and
+lets them go in that order.
+
+---
 
 ### B207 — A move between locations goes ahead under a file opened just after its create landed
 

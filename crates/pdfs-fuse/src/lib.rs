@@ -4290,7 +4290,7 @@ impl Core {
                         return;
                     }
                     job.detail(file.clone());
-                    if let Err(e) = self.fetch_content(&uid, &file, mtime, size) {
+                    if let Err(e) = self.fetch_pinned(&uid, &file, mtime, size) {
                         warn!(%uid, error = %e, "pin folder: download failed");
                         failed += 1;
                     }
@@ -4300,6 +4300,30 @@ impl Core {
             }
             Err(e) => warn!(folder = %name, error = %e, "pin folder: enumerate failed"),
         }
+    }
+
+    /// Cache the file `uid` for a folder pin. Its `mtime` and `size` were read
+    /// before the download, and a create landing or a remote edit can change
+    /// them while it runs. The blob is then stored under the old ones and reads
+    /// as stale, so the file is listed as kept but not available offline. Fetch
+    /// it again under the new ones, a few times at most.
+    fn fetch_pinned(&self, uid: &NodeUid, name: &str, mtime: i64, size: u64) -> CoreResult<()> {
+        let mut fetched = (mtime, size);
+        for _ in 0..3 {
+            self.fetch_content(uid, name, fetched.0, fetched.1)?;
+            let current = {
+                let st = self.state();
+                st.by_uid
+                    .get(uid)
+                    .and_then(|ino| st.entries.get(ino))
+                    .map(|e| (e.node.modification_time, node_size(&e.node)))
+            };
+            match current {
+                Some(now) if now != fetched => fetched = now,
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     /// Every file in the subtree rooted at folder `ino`.

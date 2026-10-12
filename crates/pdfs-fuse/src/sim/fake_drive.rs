@@ -362,6 +362,7 @@ impl FakeDrive {
             hold: Mutex::new(None),
             hold_answer: Mutex::new(None),
             hold_trash: Mutex::new(None),
+            hold_download: Mutex::new(None),
             hold_any_landing: AtomicBool::new(false),
             hold_landing: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
@@ -641,6 +642,8 @@ struct ClientInner {
     hold_answer: Mutex<Option<Arc<HoldState>>>,
     /// The trash [`FakeClient::hold_next_trash`] is waiting for.
     hold_trash: Mutex<Option<Arc<HoldState>>>,
+    /// The download [`FakeClient::hold_next_download`] is waiting for.
+    hold_download: Mutex<Option<Arc<HoldState>>>,
     /// The landing [`FakeClient::hold_next_landing`] is waiting for.
     hold_landing: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::hold_next_landing_of_any`]: hold whichever node
@@ -780,6 +783,18 @@ impl FakeClient {
             released: AtomicBool::new(false),
         });
         *self.0.hold_trash.lock() = Some(state.clone());
+        Held(state)
+    }
+
+    /// Hold the next download of `uid`'s content once Drive has answered it,
+    /// before the bytes reach the daemon, until the answer is dropped.
+    pub(crate) fn hold_next_download(&self, uid: &NodeUid) -> Held {
+        let state = Arc::new(HoldState {
+            uid: uid.clone(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *self.0.hold_download.lock() = Some(state.clone());
         Held(state)
     }
 
@@ -1432,6 +1447,8 @@ impl DriveApi for FakeClient {
                     .ok_or_else(|| api(ResponseCode::DoesNotExist, "file not found"))
             })
             .await?;
+        self.wait_if_held(&self.0.hold_download, std::slice::from_ref(uid))
+            .await;
         output.write_all(&content).map_err(io_error)
     }
 
