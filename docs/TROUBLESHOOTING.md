@@ -88,6 +88,13 @@ Quit the app first, so this starts a new instance. The page then runs without We
 so use this only for the sign-in. The stored session keeps working without it. Signing in from
 your usual network, without a VPN, often avoids the CAPTCHA in the first place.
 
+**"This version of the app is no longer supported"** or **"Proton is temporarily refusing
+sign-in from this device"** — Proton blocks sign-in for a while after too many attempts or from a
+network it distrusts, and sends the first message even when the release is current. Do not retry
+for several hours, up to a day, then sign in once. If it still fails, run
+`RUST_LOG=debug pdfs login` and look for `code=` in the `proton api request failed` line: 2028 is
+this block, 5003 is a release Proton no longer accepts.
+
 **Sign-in works but is forgotten after a restart** — no Secret Service provider is running, or its
 keyring is locked. Install and unlock GNOME Keyring, KWallet or KeePassXC (with Secret Service
 enabled). `pdfs diagnose` shows `keyring session` as failing in that case.

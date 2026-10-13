@@ -313,6 +313,15 @@ pub fn session_revoked(e: &proton_sdk::ProtonError) -> bool {
     }
 }
 
+/// Whether `e` is Proton's temporary block on a sign-in (code 2028).
+///
+/// Its message says the app version is no longer supported, which is not what
+/// happened: the release is current and only waiting helps (issues #28, #39).
+/// A front-end must say that instead of passing the message through.
+pub fn sign_in_blocked(e: &proton_sdk::ProtonError) -> bool {
+    matches!(e, proton_sdk::ProtonError::Api(api) if api.code == proton_sdk::api::ResponseCode::Blocked)
+}
+
 /// The result every request-serving method in the daemon returns.
 pub type CoreResult<T> = std::result::Result<T, CoreError>;
 
@@ -353,6 +362,14 @@ mod tests {
         assert!(!session_revoked(&api(C::Forbidden)));
         assert!(!session_revoked(&api(C::Timeout)));
         assert!(!session_revoked(&ProtonError::KeysLocked));
+    }
+
+    #[test]
+    fn only_code_2028_is_a_blocked_sign_in() {
+        assert!(sign_in_blocked(&api(C::Blocked)));
+        assert!(!sign_in_blocked(&api(C::OutdatedApp)));
+        assert!(!sign_in_blocked(&api(C::TooManyRequests)));
+        assert!(!sign_in_blocked(&ProtonError::KeysLocked));
     }
 
     /// The regression this whole pass exists to prevent: before it, every SDK

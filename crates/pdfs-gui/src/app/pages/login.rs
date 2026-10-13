@@ -227,6 +227,11 @@ pub(crate) fn login_error_message(error: &pdfs_core::Error) -> String {
         pdfs_core::Error::Proton(ProtonError::Api(api)) if api.http_status == 429 => {
             gettext("Too many sign-in attempts. Wait a few minutes and try again.")
         }
+        // Proton's text for this one asks the user to update an app that is
+        // already current.
+        pdfs_core::Error::Proton(e) if pdfs_core::error::sign_in_blocked(e) => gettext(
+            "Proton is temporarily refusing sign-in from this device. Your app version is not the problem. Wait several hours, up to a day, without trying again, then sign in.",
+        ),
         pdfs_core::Error::Proton(ProtonError::Api(api)) if !api.message.is_empty() => {
             api.message.clone()
         }
@@ -626,6 +631,21 @@ mod tests {
     fn a_cancelled_mailbox_prompt_is_reported_as_such() {
         let error = pdfs_core::Error::Other("mailbox entry cancelled".into());
         assert!(login_error_message(&error).contains("no mailbox password"));
+    }
+
+    #[test]
+    fn a_blocked_sign_in_does_not_ask_for_an_update() {
+        use pdfs_core::proton_sdk::api::ResponseCode;
+        use pdfs_core::proton_sdk::{ProtonApiError, ProtonError};
+        let error = pdfs_core::Error::Proton(ProtonError::Api(ProtonApiError {
+            code: ResponseCode::Blocked,
+            http_status: 422,
+            message: "This version of the app is no longer supported, please update to continue using the app".into(),
+            details: None,
+        }));
+        let message = login_error_message(&error);
+        assert!(message.contains("temporarily refusing"), "{message}");
+        assert!(!message.contains("update"), "{message}");
     }
 
     #[test]

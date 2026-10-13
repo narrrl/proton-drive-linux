@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-11 23:47+0200\n"
+"POT-Creation-Date: 2026-10-13 18:38+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: French\n"
@@ -258,9 +258,9 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/locations.rs:1054
 #: crates/pdfs-gui/src/app/pages/locations.rs:1529
 #: crates/pdfs-gui/src/app/pages/locations.rs:1579
-#: crates/pdfs-gui/src/app/pages/login.rs:389
-#: crates/pdfs-gui/src/app/pages/login.rs:503
-#: crates/pdfs-gui/src/app/pages/login.rs:549
+#: crates/pdfs-gui/src/app/pages/login.rs:394
+#: crates/pdfs-gui/src/app/pages/login.rs:508
+#: crates/pdfs-gui/src/app/pages/login.rs:554
 #: crates/pdfs-gui/src/app/pages/photos.rs:2058
 #: crates/pdfs-gui/src/app/pages/shared.rs:939
 #: crates/pdfs-gui/src/app/pages/shared.rs:1020
@@ -3268,12 +3268,19 @@ msgid "Too many sign-in attempts. Wait a few minutes and try again."
 msgstr ""
 "Trop de tentatives de connexion. Patientez quelques minutes et réessayez."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:234
+#: crates/pdfs-gui/src/app/pages/login.rs:233
+msgid ""
+"Proton is temporarily refusing sign-in from this device. Your app version is "
+"not the problem. Wait several hours, up to a day, without trying again, then "
+"sign in."
+msgstr "Proton refuse temporairement la connexion depuis cet appareil. La version de l’application n’est pas en cause. Patientez plusieurs heures, jusqu’à un jour, sans réessayer, puis connectez-vous."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:239
 msgid "Couldn't reach Proton. Check your internet connection and try again."
 msgstr ""
 "Impossible de joindre Proton. Vérifiez votre connexion Internet et réessayez."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:237
+#: crates/pdfs-gui/src/app/pages/login.rs:242
 msgid ""
 "Signed in, but the session couldn't be saved to the system keyring. Make "
 "sure a keyring (GNOME Keyring or KWallet) is running and unlocked."
@@ -3282,21 +3289,21 @@ msgstr ""
 "système. Assurez-vous qu’un trousseau (GNOME Keyring ou KWallet) est en "
 "cours d’exécution et déverrouillé."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:240
+#: crates/pdfs-gui/src/app/pages/login.rs:245
 msgid "Sign-in cancelled: no two-factor code was entered."
 msgstr "Connexion annulée : aucun code à deux facteurs n’a été saisi."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:243
+#: crates/pdfs-gui/src/app/pages/login.rs:248
 msgid "Sign-in cancelled: no mailbox password was entered."
 msgstr ""
 "Connexion annulée : aucun mot de passe de boîte aux lettres n’a été saisi."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:246
+#: crates/pdfs-gui/src/app/pages/login.rs:251
 msgid "That mailbox password didn't unlock your account."
 msgstr ""
 "Ce mot de passe de boîte aux lettres n’a pas déverrouillé votre compte."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:249
+#: crates/pdfs-gui/src/app/pages/login.rs:254
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "
 "new one."
@@ -3305,37 +3312,37 @@ msgstr ""
 "pour en obtenir une nouvelle."
 
 #. Translators: {error} is an error message, usually in English.
-#: crates/pdfs-gui/src/app/pages/login.rs:254
+#: crates/pdfs-gui/src/app/pages/login.rs:259
 #, rust-format
 msgid "Sign-in failed: {error}"
 msgstr "Échec de la connexion : {error}"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:365
+#: crates/pdfs-gui/src/app/pages/login.rs:370
 msgid "That mailbox password didn't unlock your account. Try again."
 msgstr ""
 "Ce mot de passe de boîte aux lettres n’a pas déverrouillé votre compte. "
 "Réessayez."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:367
+#: crates/pdfs-gui/src/app/pages/login.rs:372
 msgid ""
 "This account has a separate mailbox password. Enter it to unlock your files."
 msgstr ""
 "Ce compte a un mot de passe de boîte aux lettres distinct. Saisissez-le pour "
 "déverrouiller vos fichiers."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:370
+#: crates/pdfs-gui/src/app/pages/login.rs:375
 msgid "Mailbox Password"
 msgstr "Mot de passe de la boîte aux lettres"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:376
+#: crates/pdfs-gui/src/app/pages/login.rs:381
 msgid "Mailbox password"
 msgstr "Mot de passe de la boîte aux lettres"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:380
+#: crates/pdfs-gui/src/app/pages/login.rs:385
 msgid "Keep unlocked on this computer"
 msgstr "Garder déverrouillé sur cet ordinateur"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:382
+#: crates/pdfs-gui/src/app/pages/login.rs:387
 msgid ""
 "Stores the unlock in the system keyring, so Proton Drive opens without "
 "asking after every login. Otherwise you enter the password once per session."
@@ -3344,50 +3351,50 @@ msgstr ""
 "Proton Drive s’ouvre sans demande après chaque connexion. Sinon, vous "
 "saisissez le mot de passe une fois par session."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:390
-#: crates/pdfs-gui/src/app/pages/login.rs:443
+#: crates/pdfs-gui/src/app/pages/login.rs:395
+#: crates/pdfs-gui/src/app/pages/login.rs:448
 msgid "Unlock"
 msgstr "Déverrouiller"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:442
+#: crates/pdfs-gui/src/app/pages/login.rs:447
 msgid "Proton Drive is locked. Enter your mailbox password to unlock it."
 msgstr ""
 "Proton Drive est verrouillé. Saisissez votre mot de passe de boîte aux "
 "lettres pour le déverrouiller."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:471
+#: crates/pdfs-gui/src/app/pages/login.rs:476
 msgid "Unlocked."
 msgstr "Déverrouillé."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:476
+#: crates/pdfs-gui/src/app/pages/login.rs:481
 msgid "Couldn't unlock"
 msgstr "Impossible de déverrouiller"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:489
+#: crates/pdfs-gui/src/app/pages/login.rs:494
 msgid "Two-Factor Authentication"
 msgstr "Authentification à deux facteurs"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:491
+#: crates/pdfs-gui/src/app/pages/login.rs:496
 msgid ""
 "Enter the code from your authenticator app, or one of your recovery codes."
 msgstr ""
 "Saisissez le code de votre application d’authentification ou l’un de vos "
 "codes de récupération."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:497
+#: crates/pdfs-gui/src/app/pages/login.rs:502
 msgid "Authentication code"
 msgstr "Code d’authentification"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:504
+#: crates/pdfs-gui/src/app/pages/login.rs:509
 msgid "Confirm"
 msgstr "Confirmer"
 
 #
-#: crates/pdfs-gui/src/app/pages/login.rs:535
+#: crates/pdfs-gui/src/app/pages/login.rs:540
 msgid "Verify in Your Browser"
 msgstr "Vérifier dans le navigateur"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:537
+#: crates/pdfs-gui/src/app/pages/login.rs:542
 msgid ""
 "The verification page can't be shown in the app on this system. Open it in "
 "your browser, complete it there, then come back and choose Continue."
@@ -3397,20 +3404,20 @@ msgstr ""
 "choisissez « Continuer »."
 
 #
-#: crates/pdfs-gui/src/app/pages/login.rs:543
+#: crates/pdfs-gui/src/app/pages/login.rs:548
 msgid "Open Verification Page"
 msgstr "Ouvrir la page de vérification"
 
 #
-#: crates/pdfs-gui/src/app/pages/login.rs:550
+#: crates/pdfs-gui/src/app/pages/login.rs:555
 msgid "Continue"
 msgstr "Continuer"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:589
+#: crates/pdfs-gui/src/app/pages/login.rs:594
 msgid "Sign Out?"
 msgstr "Se déconnecter ?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:591
+#: crates/pdfs-gui/src/app/pages/login.rs:596
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
@@ -3419,7 +3426,7 @@ msgstr ""
 "vous vous reconnectiez. Les fichiers déjà présents sur cet ordinateur "
 "restent en place."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:593
+#: crates/pdfs-gui/src/app/pages/login.rs:598
 msgid "Sign Out"
 msgstr "Se déconnecter"
 

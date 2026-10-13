@@ -11,6 +11,14 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+- **A blocked sign-in said the app version was no longer supported.** Proton refuses sign-in for
+  a while after it suspects abuse, and its message then asks you to update. The app and
+  `pdfs login` now say that Proton is refusing sign-in for now and that waiting helps
+  (B209, [#39](https://github.com/narrrl/proton-drive-linux/issues/39)).
+- **`pdfs diagnose` failed the `database` check on a fresh install.** The daemon creates the
+  database after the first sign-in, so a missing one is now a warning.
+
 ## [3.4.0] — 2026-10-12
 
 Schema: **42**, unchanged.

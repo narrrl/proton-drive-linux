@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B209](#b209--a-blocked-sign-in-says-the-app-version-is-no-longer-supported) | A blocked sign-in says the app version is no longer supported |
 | [B208](#b208--a-file-landing-while-its-folder-is-pinned-is-kept-but-not-available-offline) | A file landing while its folder is pinned is kept but not available offline |
 | [B207](#b207--a-move-between-locations-goes-ahead-under-a-file-opened-just-after-its-create-landed) | A move between locations goes ahead under a file opened just after its create landed |
 | [B206](#b206--an-upgrade-leaves-the-old-daemon-running-and-nothing-says-so) | An upgrade leaves the old daemon running, and nothing says so |
@@ -310,6 +311,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B209 — A blocked sign-in says the app version is no longer supported
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-13, issue #39: the first sign-in on a fresh 3.4.0 install showed "This version
+of the app is no longer supported. Please update to continue using the app." Issue #28 showed the
+same text on 3.0.0 to 3.1.2, and its debug log gave `path="/auth/v4" http_status=422 code=2028`.
+Sign-in worked there after a day without attempts, with no change to the client.
+**Where:** `login_error_message` in `crates/pdfs-gui/src/app/pages/login.rs`; `cmd_login` and
+`cmd_diagnose` in `crates/pdfs-cli/src/main.rs`
+
+**Repro:** Needs Proton to block the account or network, which cannot be triggered on purpose.
+
+**Cause.** Proton answers a sign-in it blocks for abuse or rate limits with code 2028. Its `Error`
+text claims the version is no longer supported. The SDK had no name for 2028, so it read as
+`Unknown`, and the app passed Proton's text through. Users were told to update a current release.
+`pdfs diagnose` also failed the `database` check on a fresh install, before the daemon had ever
+started, which looked like part of the fault.
+
+**Fix.** proton-sdk 0.8.3 names 2028 `ResponseCode::Blocked`. `error::sign_in_blocked` detects it,
+and the app and `pdfs login` say that Proton is refusing sign-in for now and that waiting helps.
+`pdfs diagnose` warns instead of failing when `cache.db` does not exist yet.
+
+**Test:** `error::tests::only_code_2028_is_a_blocked_sign_in`,
+`pages::login::tests::a_blocked_sign_in_does_not_ask_for_an_update`.
+
+---
 
 ### B208 — A file landing while its folder is pinned is kept but not available offline
 

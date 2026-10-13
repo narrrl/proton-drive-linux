@@ -1867,7 +1867,22 @@ fn cmd_login(username: Option<String>, remember: bool) -> Result<()> {
         get_mailbox,
         get_hv,
     ))
-    .context("login failed")?;
+    .map_err(|e| {
+        // Proton words this block as "update the app", which the user can't
+        // act on: the release is current and only waiting helps.
+        let blocked =
+            matches!(&e, pdfs_core::Error::Proton(p) if pdfs_core::error::sign_in_blocked(p));
+        let e = anyhow::Error::new(e).context("login failed");
+        if blocked {
+            e.context(
+                "Proton is temporarily refusing sign-in from this device (code 2028). \
+                 Your version is not the problem. Wait several hours, up to a day, \
+                 without trying again, then sign in.",
+            )
+        } else {
+            e
+        }
+    })?;
 
     // A daemon that is already up is parked in `wait_for_session`, sleeping
     // between keyring checks; restart it so the mount appears now instead of
@@ -3396,12 +3411,25 @@ fn cmd_diagnose() -> Result<()> {
     }
 
     let db_path = dirs.db_path();
-    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    report.check(
-        "  database",
-        db_path.is_file(),
-        format!("{} ({})", db_path.display(), human_bytes(db_size)),
-    );
+    if db_path.exists() {
+        let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        report.check(
+            "  database",
+            db_path.is_file(),
+            format!("{} ({})", db_path.display(), human_bytes(db_size)),
+        );
+    } else {
+        // The daemon creates it on its first start, which waits for a sign-in,
+        // so a fresh install has none yet (issue #39 read this as the fault).
+        report.finding(
+            DiagnoseLevel::Warn,
+            "  database",
+            format!(
+                "{} not created yet (the daemon creates it on first start)",
+                db_path.display()
+            ),
+        );
+    }
 
     println!("\nFUSE");
     let fuse = Path::new("/dev/fuse");
