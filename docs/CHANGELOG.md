@@ -11,7 +11,17 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.4.1] — 2026-10-16
+
+Schema: **42**, unchanged.
+
 ### Fixed
+- **After a password reset, the drive never mounted and the app stayed on "Connecting…".** A
+  reset gives the account new keys, and Proton locks the Drive volume that was encrypted to the
+  old ones. The service then failed every start with `failed to decrypt: missing key`. It now
+  starts a new My Files volume, as the web app does. The files in the locked volume can still be
+  restored from [drive.proton.me](https://drive.proton.me) with the previous password
+  (B210, [#40](https://github.com/narrrl/proton-drive-linux/issues/40)).
 - **A blocked sign-in said the app version was no longer supported.** Proton refuses sign-in for
   a while after it suspects abuse, and its message then asks you to update. The app and
   `pdfs login` now say that Proton is refusing sign-in for now and that waiting helps
@@ -1794,6 +1804,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.4.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.1
 [3.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.0
 [3.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.3.0
 [3.2.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.2.1
