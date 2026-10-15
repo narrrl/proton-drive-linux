@@ -113,6 +113,12 @@ fusermount3 -uz ~/ProtonDrive
 systemctl --user restart proton-drive.service
 ```
 
+**`fetch My Files root: … failed to decrypt: missing key`** in the service log — the account
+keys cannot open your Drive volume, which happens after a password reset. Proton locks the volume
+that was encrypted to the old keys. From 3.4.1 the client starts a new, empty My Files volume
+in that case. Your old files stay in the locked volume: open [drive.proton.me](https://drive.proton.me)
+and restore them there with your previous password.
+
 **The folder is empty or missing** — check that the service runs and is signed in
 (`pdfs status`). The service waits for a stored session before it mounts.
 

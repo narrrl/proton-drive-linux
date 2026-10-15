@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B210](#b210--after-a-password-reset-the-mount-retries-missing-key-forever) | After a password reset, the mount retries "missing key" forever |
 | [B209](#b209--a-blocked-sign-in-says-the-app-version-is-no-longer-supported) | A blocked sign-in says the app version is no longer supported |
 | [B208](#b208--a-file-landing-while-its-folder-is-pinned-is-kept-but-not-available-offline) | A file landing while its folder is pinned is kept but not available offline |
 | [B207](#b207--a-move-between-locations-goes-ahead-under-a-file-opened-just-after-its-create-landed) | A move between locations goes ahead under a file opened just after its create landed |
@@ -311,6 +312,35 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B210 — After a password reset, the mount retries "missing key" forever
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-15, issue #40: on a fresh 3.4.0 install the sign-in worked, but the daemon
+logged `mount failed: fetch My Files root: cryptography error: failed to decrypt: missing key`
+every 5 seconds. The app stayed on "Connecting…" because the daemon never got far enough to
+create `control.sock`.
+**Where:** `ProtonDriveClient::ensure_my_files` in proton-drive-rs; `fetch_or_recall_root` in
+`crates/pdfs-fuse/src/mount.rs`
+
+**Repro:** Reset the account password through Proton's recovery flow, which replaces the account
+keys, then sign in on a client without a cache.
+
+**Cause.** A password reset gives the account new keys and locks the Drive volume whose share was
+encrypted to the old ones. `v2/shares/my-files` still returns that share, so none of the unlocked
+address keys can open its passphrase. The SDK only created a new volume when the share did not
+exist, so every mount attempt failed the same way. The web client checks for an active regular
+volume and creates a new one when there is none.
+
+**Fix.** proton-drive-rs 0.9.1 handles a share key that fails to decrypt the way the web client
+does. When `GET volumes` shows no active regular volume, it creates a new My Files volume and uses
+that. The locked volume is left alone and can still be restored from the web with the previous
+password.
+
+**Test:** `client::tests::a_locked_main_volume_is_not_an_active_regular_one`,
+`client::tests::an_active_regular_volume_is_found_with_or_without_a_type` (proton-drive-rs).
+
+---
 
 ### B209 — A blocked sign-in says the app version is no longer supported
 
