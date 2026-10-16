@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B223](#b223--a-damaged-config-file-is-replaced-with-defaults-on-the-next-settings-change) | A damaged config file is replaced with defaults on the next settings change |
 | [B224](#b224--fallocate-zero-ranges-are-undone-and-collapse-ranges-corrupt-the-file) | `fallocate` zero ranges are undone and collapse ranges corrupt the file |
 | [B222](#b222--a-full-disk-at-close-is-reported-to-nobody-and-fsync-on-a-read-only-file-fails) | A full disk at close is reported to nobody, and `fsync` on a read-only file fails |
 | [B221](#b221--a-cold-listing-holds-the-global-lock-across-a-database-transaction) | A cold listing holds the global lock across a database transaction |
@@ -325,6 +326,31 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B223 — A damaged config file is replaced with defaults on the next settings change
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.10).
+**Where:** `AppDirs::save_config`, `AppDirs::load_config` and `refuse_to_replace_unreadable` in
+`crates/pdfs-core/src/config.rs`
+
+**Repro:** Truncate `~/.config/proton-drive-linux/config.json`, then change any setting in the
+app, or let the daemon record its device.
+
+**Cause.** `load_config` gives defaults for a file it cannot parse, and logs that it leaves the
+file alone. But every setter loads, changes one field and saves, in the daemon and in the app.
+So the first change after the damage wrote the defaults over the file, losing the mountpoint,
+the device the client had adopted, the ignore rules and the `open_with` choices. ARCHITECTURE
+§10.5 says the file is never replaced with defaults. The first-run default was also written with a
+plain `std::fs::write`, which is not atomic and takes the umask's mode.
+
+**Fix.** `save_config` refuses while the file on disk exists and does not parse, and says which
+file to fix. The first-run default goes through `save_config`, so it is written atomically with
+mode 0600.
+
+**Test:** `config::tests::an_unreadable_config_is_never_written_over`.
+
+---
 
 ### B224 — `fallocate` zero ranges are undone and collapse ranges corrupt the file
 

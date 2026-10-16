@@ -310,6 +310,22 @@ impl AppConfig {
     }
 }
 
+/// Fail when the config file at `path` exists but does not parse, so that
+/// [`AppDirs::save_config`] never writes over settings it could not read.
+fn refuse_to_replace_unreadable(path: &Path) -> Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Error::Other(format!(
+                "{} cannot be read ({e}); fix it or move it aside before changing settings",
+                path.display()
+            ))),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Resolved XDG locations for state, cache, and the default mountpoint.
 pub struct AppDirs {
     dirs: ProjectDirs,
@@ -341,6 +357,7 @@ impl AppDirs {
                     // Preserve the original bytes for diagnosis/recovery.  In
                     // particular, never replace a truncated config with defaults
                     // and silently lose mount, device, or ignore settings.
+                    // `save_config` refuses to write over it for the same reason.
                     tracing::error!(path = %path.display(), error = %e, "config is unreadable; using in-memory defaults without overwriting it");
                     return AppConfig::default();
                 }
@@ -348,9 +365,8 @@ impl AppDirs {
         }
 
         let default_config = AppConfig::default();
-        if let Ok(content) = serde_json::to_string_pretty(&default_config) {
-            let _ = std::fs::create_dir_all(self.dirs.config_dir());
-            let _ = std::fs::write(&path, content);
+        if let Err(e) = self.save_config(&default_config) {
+            tracing::warn!(path = %path.display(), error = %e, "could not write the default config");
         }
         default_config
     }
@@ -358,8 +374,15 @@ impl AppDirs {
     /// Persist `config` to [`config_path`](Self::config_path), creating the
     /// config dir if missing. The Settings page calls this after editing the
     /// cache budget or mountpoint; the daemon re-reads the file on its next mount.
+    ///
+    /// Refuses while the file on disk does not parse. Every caller loads,
+    /// changes one field and saves, and [`load_config`](Self::load_config)
+    /// gives defaults for a file it cannot read, so the first change after
+    /// the file was damaged wrote defaults over the mountpoint, the device and
+    /// the ignore rules the user had (`docs/BUGS.md` B223).
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
         let path = self.config_path();
+        refuse_to_replace_unreadable(&path)?;
         let parent = path
             .parent()
             .ok_or_else(|| Error::Other("configuration path has no parent".into()))?;
@@ -524,6 +547,28 @@ mod tests {
 
     fn mode_of(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A damaged config must not be replaced by defaults the next time a
+    /// setting changes (`docs/BUGS.md` B223).
+    #[test]
+    fn an_unreadable_config_is_never_written_over() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-cfg-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        assert!(refuse_to_replace_unreadable(&path).is_ok(), "no file yet");
+        std::fs::write(&path, serde_json::to_vec(&AppConfig::default()).unwrap()).unwrap();
+        assert!(refuse_to_replace_unreadable(&path).is_ok());
+        std::fs::write(&path, br#"{"mountpoint": "/home/me/Pro"#).unwrap();
+        assert!(refuse_to_replace_unreadable(&path).is_err(), "truncated");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `docs/BUGS.md` B6. A permissive mode here is not a cosmetic problem: these
