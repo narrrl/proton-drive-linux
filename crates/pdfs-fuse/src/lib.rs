@@ -116,6 +116,7 @@ mod upload;
 mod r#virtual;
 mod workers;
 use background::{forget_and_notify, run_event_sync, run_local_index, run_photos_event_sync};
+use link::BATCH_CALL_TIMEOUT;
 pub(crate) use mount::is_stale_mount;
 pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
@@ -2120,12 +2121,39 @@ impl Core {
         }
     }
 
-    /// Whether `ino`'s listing is already in memory, i.e. whether
-    /// [`Core::ensure_children`] would return without touching the network.
-    /// Lets a handler decide between answering inline and handing off to a
-    /// worker, at the cost of one uncontended map lookup.
+    /// Whether [`Core::ensure_children`] would answer for `ino` without
+    /// touching the network. Lets a handler decide between answering inline
+    /// and handing off to a worker.
+    ///
+    /// A resident listing is not enough on its own. A shared folder's, or the
+    /// Shared with me root's, is fetched again once it is a minute old, and
+    /// that fetch ran on the dispatch loop, so every request on the mount
+    /// waited for Drive to answer (`docs/BUGS.md` B219).
     fn children_cached(&self, ino: u64) -> bool {
-        self.state().children.contains_key(&ino)
+        let (uid, resident) = {
+            let st = self.state();
+            match st.entries.get(&ino) {
+                Some(e) => (e.uid.clone(), st.children.contains_key(&ino)),
+                // `list_children` answers ENOENT without the network.
+                None => return true,
+            }
+        };
+        if !resident {
+            return false;
+        }
+        let freshness = if is_virtual_uid(&uid) {
+            Some(SHARED_WITH_ME_SYNCED_MS.to_string())
+        } else if !self.is_own_or_virtual(&uid) && !is_local_uid(&uid) {
+            Some(Self::shared_folder_freshness_key(&uid))
+        } else {
+            None
+        };
+        freshness.is_none_or(|key| {
+            !listing_needs_refresh(
+                self.online.load(Ordering::Relaxed),
+                self.shared_listing_stale(&key),
+            )
+        })
     }
 
     /// Re-apply the optimistic size of any queued write to `nodes`.
@@ -2293,8 +2321,7 @@ impl Core {
 
         let generation = self.shared_generation.load(Ordering::SeqCst);
         let accepted = accepted_share_provenance(
-            self.rt
-                .block_on(self.client.enumerate_shared_with_me())
+            self.block_on_within(BATCH_CALL_TIMEOUT, self.client.enumerate_shared_with_me())
                 .map_err(|error| {
                     error!(%error, "enumerating shared roots failed");
                     Errno::EIO
@@ -2303,12 +2330,14 @@ impl Core {
         let nodes = if accepted.uids.is_empty() {
             Vec::new()
         } else {
-            self.rt
-                .block_on(self.drive.enumerate_nodes_light(&accepted.uids))
-                .map_err(|error| {
-                    error!(%error, "materializing shared roots failed");
-                    Errno::EIO
-                })?
+            self.block_on_within(
+                BATCH_CALL_TIMEOUT,
+                self.drive.enumerate_nodes_light(&accepted.uids),
+            )
+            .map_err(|error| {
+                error!(%error, "materializing shared roots failed");
+                Errno::EIO
+            })?
         };
         let virtual_uid = shared_with_me_uid();
         let published = prepare_shared_roots(&accepted, nodes, &virtual_uid);
@@ -2879,7 +2908,8 @@ impl Core {
         let (mut key, mut uids, mut slot) = (key, uids, slot);
         loop {
             for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
-                let result = self.rt.block_on(self.drive.enumerate_nodes(chunk));
+                let result =
+                    self.block_on_within(BATCH_CALL_TIMEOUT, self.drive.enumerate_nodes(chunk));
                 self.apply_size_upgrade(key, result);
                 slot.chunk_done();
             }
@@ -4378,9 +4408,15 @@ impl Core {
         if self.thumbnail_misses.lock().remote_contains(&key, mtime) {
             return Ok(None);
         }
+        // A file manager asks for one per file in a folder, on the metadata
+        // workers. Offline, or on a stalled link, each one held a worker for
+        // the SDK's whole retry budget, and every cold lookup, create and
+        // rename on the mount queued behind them (`docs/BUGS.md` B220).
+        if !self.is_online() {
+            return Ok(None);
+        }
         let bytes = self
-            .rt
-            .block_on(self.client.download_thumbnail(&uid, ttype))
+            .block_on_bounded(self.client.download_thumbnail(&uid, ttype))
             .map_err(|e| {
                 warn!(%uid, error = %e, "download thumbnail failed");
                 Errno::EIO
@@ -9199,6 +9235,32 @@ mod tests {
         assert_eq!(ensure.matches("adopt_stale_listing(").count(), 3);
         let online = function_source(include_str!("link.rs"), "fn mark_online(");
         assert!(online.contains("self.relist_offline_listings();"));
+    }
+
+    #[test]
+    fn a_stale_shared_listing_is_fetched_off_the_dispatch_loop() {
+        // A resident listing that `list_children` would fetch again anyway
+        // must not be answered inline (B219).
+        let cached = function_source(include_str!("lib.rs"), "fn children_cached(");
+        assert!(cached.contains("SHARED_WITH_ME_SYNCED_MS"));
+        assert!(cached.contains("Self::shared_folder_freshness_key(&uid)"));
+        assert!(cached.contains("listing_needs_refresh("));
+        assert!(cached.contains("self.shared_listing_stale(&key)"));
+    }
+
+    #[test]
+    fn a_handler_does_not_wait_out_the_sdk_retry_budget() {
+        // Thumbnails, size upgrades and the share list held mount threads for
+        // minutes on a stalled link (B220).
+        let lib = include_str!("lib.rs");
+        let thumbnail = function_source(lib, "fn thumbnail(");
+        assert_before(thumbnail, "if !self.is_online()", "download_thumbnail");
+        assert!(thumbnail.contains(".block_on_bounded(self.client.download_thumbnail("));
+        let upgrade = function_source(lib, "fn run_size_upgrade(");
+        assert!(upgrade.contains("block_on_within(BATCH_CALL_TIMEOUT"));
+        let shared = function_source(lib, "fn ensure_shared_children(");
+        assert!(shared.contains("block_on_within(BATCH_CALL_TIMEOUT"));
+        assert!(!shared.contains("self.rt"));
     }
 
     #[test]

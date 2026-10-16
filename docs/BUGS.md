@@ -100,6 +100,8 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B220](#b220--thumbnails-on-a-stalled-link-hold-up-every-other-request) | Thumbnails on a stalled link hold up every other request |
+| [B219](#b219--listing-a-shared-folder-freezes-the-whole-mount-on-a-slow-link) | Listing a shared folder freezes the whole mount on a slow link |
 | [B218](#b218--pdfs-diagnose-freezes-the-mount-while-it-checks-the-database) | `pdfs diagnose` freezes the mount while it checks the database |
 | [B217](#b217--the-search-indexes-grow-to-many-times-their-size-and-slow-search-down) | The search indexes grow to many times their size and slow search down |
 | [B216](#b216--a-damaged-database-is-rebuilt-without-the-writes-still-queued-in-it) | A damaged database is rebuilt without the writes still queued in it |
@@ -320,6 +322,52 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B220 — Thumbnails on a stalled link hold up every other request
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.3 and 2.1.11).
+**Where:** `Core::thumbnail`, `Core::run_size_upgrade` and `Core::ensure_shared_children` in
+`crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Open a folder of photos in a file manager while the link stalls.
+
+**Cause.** A file manager asks for a thumbnail per file, through `getxattr` on the metadata
+workers. The download had no deadline of its own, so on a stalled link each one held a worker for
+the SDK's whole retry budget, about two minutes. Only three workers are kept for metadata, so
+every cold `lookup`, `create` and `rename` on the mount queued behind them. Offline, every
+uncached thumbnail still went to the network. The size upgrade and the Shared with me listing
+had the same unbounded calls.
+
+**Fix.** Offline, a thumbnail that is not cached is answered as absent. Online, its download
+gives up after `INTERACTIVE_CALL_TIMEOUT` (20 s). Each chunk of a size upgrade and the two calls
+behind the Shared with me listing give up after `BATCH_CALL_TIMEOUT` (60 s).
+
+**Test:** `tests::a_handler_does_not_wait_out_the_sdk_retry_budget`.
+
+---
+
+### B219 — Listing a shared folder freezes the whole mount on a slow link
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.1).
+**Where:** `Core::children_cached` in `crates/pdfs-fuse/src/lib.rs`; `lookup`, `opendir` and
+`readdir` in `crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Open a folder shared with you, wait more than a minute, then `ls` it on a slow link
+while another program reads files elsewhere on the mount.
+
+**Cause.** A handler answered inline whenever the folder's listing was resident, and handed off
+to a worker only otherwise. But `list_children` fetches a shared folder again once its listing is
+a minute old, and the Shared with me root likewise. That fetch ran on the dispatch loop, the
+single thread that reads every request of the mount, so all of them waited for Drive.
+
+**Fix.** `children_cached` asks the same question `list_children` does: a shared listing that
+would be fetched again counts as not cached, so the request goes to a metadata worker.
+
+**Test:** `tests::a_stale_shared_listing_is_fetched_off_the_dispatch_loop`.
+
+---
 
 ### B218 — `pdfs diagnose` freezes the mount while it checks the database
 

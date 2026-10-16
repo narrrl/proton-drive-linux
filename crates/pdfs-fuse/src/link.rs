@@ -29,6 +29,13 @@ use crate::{Core, ONLINE_PROBE_MAX, ONLINE_PROBE_MIN};
 /// keep waiting for; queueing the change is the better answer.
 pub(crate) const INTERACTIVE_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a mount thread waits on a remote read that answers a batch: a
+/// chunk of file sizes, or the list of shares. Longer than an interactive call,
+/// since its answer grows with the batch, but well short of the SDK's own retry
+/// budget, which held a worker for minutes on a stalled link
+/// (`docs/BUGS.md` B220).
+pub(crate) const BATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How long one probe may wait for an answer. A probe is a single small request,
 /// and a probe stuck in the SDK's retry budget would delay noticing the link is
 /// back by as long as it waits.
