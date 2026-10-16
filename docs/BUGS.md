@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B245](#b245--any-child-of-the-daemon-can-answer-the-watchdog-for-it) | Any child of the daemon can answer the watchdog for it |
 | [B244](#b244--photos-without-a-sidecar-or-a-dated-name-are-filed-under-the-upload-day) | Photos without a sidecar or a dated name are filed under the upload day |
 | [B243](#b243--a-hung-mount-freezes-the-app-when-a-file-is-opened) | A hung mount freezes the app when a file is opened |
 | [B242](#b242--opening-a-large-photo-freezes-the-app) | Opening a large photo freezes the app |
@@ -346,6 +347,27 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B245 — Any child of the daemon can answer the watchdog for it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, systemd unit).
+**Where:** `packaging/proton-drive.service`
+
+**Repro:** A child of the daemon, such as `ffmpeg` making a video thumbnail, inherits
+`NOTIFY_SOCKET` and can send `WATCHDOG=1` while the daemon itself is wedged.
+
+**Cause.** The unit set `NotifyAccess=all`, which accepts notifications from every process of the
+unit. The watchdog exists to restart a daemon that stopped answering, and any child could keep it
+from doing that.
+
+**Fix.** `NotifyAccess=main`: only the daemon's own process is heard. The rest of the hardening
+the audit listed was left out on purpose. In a user unit every seccomp-based option implies
+`NoNewPrivileges`, which stops the setuid `fusermount3` from mounting.
+
+**Test:** none automated; `systemd-analyze verify --user` accepts the unit.
+
+---
 
 ### B244 — Photos without a sidecar or a dated name are filed under the upload day
 

@@ -8,10 +8,17 @@ PartOf=graphical-session.target
 [Service]
 # Deliberately not Type=notify: the daemon waits for a stored login before it
 # mounts anything, and a machine that boots before the user logs in would then
-# fail the unit on the start timeout. NotifyAccess=all gets the daemon a
-# NOTIFY_SOCKET all the same, which is all the watchdog below needs.
+# fail the unit on the start timeout. NotifyAccess=main gets the daemon a
+# NOTIFY_SOCKET all the same, which is all the watchdog below needs, and keeps
+# its children (fusermount3, ffmpeg, exiftool) from answering the watchdog for
+# it. "all" let any of them do so.
+#
+# Most sandboxing options are left out on purpose: in a user unit, every
+# seccomp-based one (SystemCallFilter, LockPersonality, RestrictAddressFamilies
+# and the like) implies NoNewPrivileges, which stops the setuid fusermount3
+# from mounting anything.
 Type=simple
-NotifyAccess=all
+NotifyAccess=main
 # The daemon waits for a stored login, mounts ~/ProtonDrive, and keeps it
 # mounted. SIGTERM (from `systemctl --user stop`) triggers a clean lazy unmount.
 ExecStart=/usr/bin/pdfs daemon
