@@ -2598,7 +2598,10 @@ fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -
             } => continue,
             CtlResponse::ImportStatus { summary, .. } => {
                 print_import_summary(summary.as_ref());
-                return Ok(());
+                return finished_run(
+                    "the import",
+                    summary.map(|s| (s.failed, s.cancelled, s.error)),
+                );
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
@@ -2641,11 +2644,30 @@ fn cmd_redate_photos(
             CtlResponse::RedateStatus { running: true, .. } => continue,
             CtlResponse::RedateStatus { summary, .. } => {
                 print_redate_summary(summary.as_ref());
-                return Ok(());
+                return finished_run(
+                    "the re-date",
+                    summary.map(|s| (s.failed, s.cancelled, s.error)),
+                );
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         }
+    }
+}
+
+/// How a run `--wait` followed ended, as the exit status: an error when it
+/// failed, was cancelled, or left photos failed, so a script can tell.
+/// `outcome` is `(failed, cancelled, error)`; `None` when the daemon has no
+/// result, which happens when it restarted during the run.
+fn finished_run(what: &str, outcome: Option<(usize, bool, Option<String>)>) -> Result<()> {
+    match outcome {
+        None => bail!("{what} ended without a result; the service may have restarted"),
+        Some((_, _, Some(error))) => bail!("{what} failed: {error}"),
+        Some((_, true, None)) => bail!("{what} was cancelled"),
+        Some((failed, false, None)) if failed > 0 => {
+            bail!("{what} finished, but {failed} photo(s) failed")
+        }
+        Some(_) => Ok(()),
     }
 }
 
@@ -2684,6 +2706,10 @@ fn print_redate_summary(summary: Option<&pdfs_core::control::RedateSummary>) {
         println!("No re-date has run yet.");
         return;
     };
+    if let Some(error) = &summary.error {
+        println!("Failed           : {error}");
+        return;
+    }
     println!("Photos examined  : {}", summary.examined);
     println!("Mis-dated        : {}", summary.candidates);
     if summary.dry_run {
@@ -2743,6 +2769,10 @@ fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
         println!("No import has run yet.");
         return;
     };
+    if let Some(error) = &summary.error {
+        println!("Failed           : {error}");
+        return;
+    }
     println!("Photos in export : {}", summary.found);
     println!("Uploaded         : {}", summary.uploaded);
     println!("Already on Proton: {}", summary.duplicates);
@@ -3755,6 +3785,16 @@ mod login_wait_tests {
         // past the width of the shift; that must cap, not panic.
         assert_eq!(login_poll_delay(64), Duration::from_secs(15));
         assert_eq!(login_poll_delay(u32::MAX), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_waited_for_run_that_did_not_fully_succeed_exits_with_an_error() {
+        assert!(finished_run("the import", Some((0, false, None))).is_ok());
+        assert!(finished_run("the import", Some((3, false, None))).is_err());
+        assert!(finished_run("the import", Some((0, true, None))).is_err());
+        let failed = finished_run("the import", Some((0, false, Some("not a zip".into()))));
+        assert!(failed.unwrap_err().to_string().contains("not a zip"));
+        assert!(finished_run("the import", None).is_err());
     }
 
     #[test]

@@ -646,7 +646,12 @@ pub(crate) fn refresh_takeout(ui: &Rc<Ui>) {
             // An import runs for hours, so its ending is announced rather than
             // left to be discovered: a toast for whoever is looking at the
             // window, and a desktop notification for whoever is not.
-            if was_running {
+            let failed = summary.as_ref().and_then(|s| s.error.clone());
+            if was_running && let Some(error) = &failed {
+                let headline = gettext("Couldn't import from Google Photos");
+                toast_error(&ui, &headline, error);
+                notify("takeout-import", &headline, error);
+            } else if was_running {
                 let dry = ui.takeout.dry_run.get();
                 let headline = if dry {
                     gettext("Scan finished")
@@ -702,7 +707,18 @@ fn repaint_summary(ui: &Rc<Ui>, summary: &ImportSummary) {
     } else {
         gettext("Last import")
     });
-    ui.takeout.summary_group.set_description(Some(&if dry {
+    ui.takeout.summary_group.set_description(Some(&if let Some(error) = &summary.error {
+        // The reason is the service's own text, which is not translated. A
+        // group's description is markup, and the reason may name a path.
+        glib::markup_escape_text(&gettext_f(
+            "{what}: {detail}",
+            &[
+                ("what", &gettext("Couldn't import from Google Photos")),
+                ("detail", error),
+            ],
+        ))
+        .to_string()
+    } else if dry {
         gettext("Nothing was uploaded — this is what an import would do.")
     } else if summary.cancelled {
         gettext("Stopped early. Everything uploaded so far is in your timeline; run it again to continue where it left off.")

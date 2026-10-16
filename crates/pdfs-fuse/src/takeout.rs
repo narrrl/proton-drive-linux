@@ -544,7 +544,15 @@ impl Core {
                 let mut state = IMPORT.lock();
                 state.running = false;
                 state.cancel = None;
-                state.last = outcome.as_ref().ok().cloned();
+                // A failed run is reported too: without it, `--wait` read
+                // "no import has run" and exited as if all was well.
+                state.last = Some(match &outcome {
+                    Ok(summary) => summary.clone(),
+                    Err(e) => ImportSummary {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                });
             }
             match outcome {
                 Ok(summary) => {

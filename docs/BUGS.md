@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B239](#b239----wait-reports-success-for-imports-and-re-dates-that-failed) | --wait reports success for imports and re-dates that failed |
 | [B238](#b238--draining-a-large-offline-batch-is-quadratic-in-its-size) | Draining a large offline batch is quadratic in its size |
 | [B237](#b237--every-reconnect-resends-refused-uploads-all-in-the-same-second) | Every reconnect resends refused uploads, all in the same second |
 | [B236](#b236--imported-re-dated-and-app-uploaded-photos-have-no-thumbnail) | Imported, re-dated and app-uploaded photos have no thumbnail |
@@ -340,6 +341,32 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B239 — --wait reports success for imports and re-dates that failed
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, CLI).
+**Where:** `finished_run`, `cmd_import_google_photos` and `cmd_redate_photos` in
+`crates/pdfs-cli/src/main.rs`; the run threads in `crates/pdfs-fuse/src/takeout.rs` and
+`redate.rs`; `ImportSummary::error` and `RedateSummary::error` in `crates/pdfs-core/src/control.rs`;
+`refresh_takeout` in `crates/pdfs-gui/src/app/pages/takeout.rs`
+
+**Repro:** `pdfs import-google-photos --wait notes.txt; echo $?`, or an import where some photos
+fail to upload, or one cancelled from the app.
+
+**Cause.** `--wait` exited 0 however the run ended. A run that failed as a whole (an archive that
+is not a zip) left no summary at all, so the CLI printed "No import has run yet" and the app
+announced "Import finished". A run with failed photos, or a cancelled one, also exited 0. A
+script could not tell any of these from a clean run.
+
+**Fix.** A run that fails as a whole now leaves a summary with the reason. `--wait` exits 1 when
+the run failed, was cancelled, left photos failed, or ended without a result, and says which.
+The app shows the reason instead of "Import finished".
+
+**Test:** `tests::a_waited_for_run_that_did_not_fully_succeed_exits_with_an_error` in
+`crates/pdfs-cli/src/main.rs`.
+
+---
 
 ### B238 — Draining a large offline batch is quadratic in its size
 
