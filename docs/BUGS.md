@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B216](#b216--a-damaged-database-is-rebuilt-without-the-writes-still-queued-in-it) | A damaged database is rebuilt without the writes still queued in it |
 | [B215](#b215--a-remote-name-holding--or--becomes-a-path-outside-the-sync-folder) | A remote name holding `/` or `..` becomes a path outside the sync folder |
 | [B214](#b214--deleting-a-mirror-folder-here-trashes-another-devices-new-files-in-it) | Deleting a mirror folder here trashes another device's new files in it |
 | [B213](#b213--a-file-edited-during-a-mirror-pass-is-deleted-because-drive-deleted-it-earlier) | A file edited during a mirror pass is deleted because Drive deleted it earlier |
@@ -317,6 +318,32 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B216 — A damaged database is rebuilt without the writes still queued in it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.7).
+**Where:** `Db::open`, `salvage` and `quarantine_corrupt_db` in `crates/pdfs-core/src/db/mod.rs`
+
+**Repro:** Damage `cache.db` so that SQLite reports `SQLITE_CORRUPT` or `SQLITE_NOTADB` at open,
+with writes still queued.
+
+**Cause.** Opening a damaged database moved it aside and started an empty one, logging that
+"no user data is stored here". The same file holds the upload queue (`pending_op`), the mirror
+baselines (`sync_entry`, `sync_folder`), the pins and the record of revisions this machine sealed.
+Every queued create, rename and trash was dropped without a word. The staged blobs lost their ops,
+and those of files made here could never be queued again.
+
+**Fix.** After the rebuild, `salvage` attaches the damaged file read only and copies those tables
+back, each in its own transaction and with only the columns both files have. The queue keeps the
+node rows it names by local id, so files made here keep their identity; those rows come back
+unlisted, so their folders are fetched again. A table SQLite cannot read to the end is left out
+and logged as an error.
+
+**Test:** `db::tests::a_rebuild_keeps_the_queue_baselines_and_pins_of_the_damaged_file`,
+`db::tests::a_corrupt_database_is_moved_aside_and_rebuilt`.
+
+---
 
 ### B215 — A remote name holding `/` or `..` becomes a path outside the sync folder
 

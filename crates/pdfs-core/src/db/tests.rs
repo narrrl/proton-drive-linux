@@ -1283,6 +1283,89 @@ fn a_corrupt_database_is_moved_aside_and_rebuilt() {
     let _ = std::fs::remove_file(path.with_extension("db.lock"));
 }
 
+/// A rebuilt database must not lose what only this machine has: writes Drive
+/// has not received, the mirror baselines and the pins (`docs/BUGS.md` B216).
+#[test]
+fn a_rebuild_keeps_the_queue_baselines_and_pins_of_the_damaged_file() {
+    let id = now_test_id();
+    let damaged =
+        std::env::temp_dir().join(format!("pdfs-salvage-old-{}-{id}.db", std::process::id()));
+    let fresh =
+        std::env::temp_dir().join(format!("pdfs-salvage-new-{}-{id}.db", std::process::id()));
+
+    let db = Db::open(&damaged).unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("listed", "root", "listed.txt", 1))
+        .unwrap();
+    db.upsert_node(&file("queued", "root", "queued.txt", 2))
+        .unwrap();
+    db.set_listed(&uid("root"), true).unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("queued").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/queued".into()),
+        meta_json: None,
+        created_at: 1,
+        attempts: 3,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let folder_id = db
+        .sync_folder_add("/home/me/Docs", "vol~docs", "share")
+        .unwrap();
+    db.sync_entry_upsert(
+        folder_id,
+        &StoredSyncEntry {
+            rel_path: "a.txt".into(),
+            remote_uid: Some("vol~a".into()),
+            local_mtime: 5,
+            local_mtime_ns: None,
+            local_size: 6,
+            remote_rev: Some("7".into()),
+            remote_hash: Some("8".into()),
+        },
+    )
+    .unwrap();
+    db.pin_add("vol~pinned", "/pinned", true).unwrap();
+    drop(db);
+
+    let db = Db::open(&fresh).unwrap();
+    let results = salvage(&db.conn.lock(), &damaged);
+    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].uid, uid("queued").to_string());
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/queued"));
+    // The op's node came with it; the rest of the tree is fetched again.
+    assert!(
+        db.node_by_uid(&uid("queued").to_string())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.node_by_uid(&uid("listed").to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.sync_entries(folder_id).unwrap().len(), 1);
+    assert!(db.is_pinned("vol~pinned").unwrap());
+    drop(db);
+
+    for path in [&damaged, &fresh] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
+        }
+        let _ = std::fs::remove_file(path.with_extension("db.lock"));
+    }
+}
+
 fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {
     LocalEntry {
         path: path.into(),

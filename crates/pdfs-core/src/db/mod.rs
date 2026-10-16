@@ -216,18 +216,34 @@ impl Db {
         let conn = match Self::open_configured(path) {
             Ok(conn) => conn,
             Err(e) if is_corrupt(&e) => {
-                // Every byte in here is derived from the account or from the
-                // content cache directory, so the recovery is to start over —
-                // loudly, and keeping the damaged file for a post-mortem rather
-                // than deleting evidence.
+                // Most of what is in here is derived from the account and is
+                // fetched again. The queue is not: it holds writes accepted
+                // here that Drive does not have yet, and the mirror baselines
+                // and pins are this machine's alone. So the damaged file is
+                // moved aside, kept as evidence, and those tables are copied
+                // out of it into the new one as far as SQLite can still read
+                // them (`docs/BUGS.md` B216).
                 tracing::error!(
                     db = %path.display(),
                     error = %e,
-                    "cache database is corrupt — moving it aside and rebuilding \
-                     (metadata will be re-fetched; no user data is stored here)"
+                    "cache database is corrupt; moving it aside, rebuilding, and \
+                     copying the upload queue, sync baselines and pins out of it"
                 );
-                quarantine_corrupt_db(path)?;
-                Self::open_configured(path)?
+                let damaged = quarantine_corrupt_db(path)?;
+                let conn = Self::open_configured(path)?;
+                for (table, result) in salvage(&conn, &damaged) {
+                    match result {
+                        Ok(rows) => {
+                            tracing::warn!(table, rows, "salvaged from the damaged database")
+                        }
+                        Err(error) => tracing::error!(
+                            table,
+                            %error,
+                            "could not salvage from the damaged database"
+                        ),
+                    }
+                }
+                conn
             }
             Err(e) => return Err(e),
         };
@@ -428,12 +444,96 @@ fn is_corrupt(e: &Error) -> bool {
     )
 }
 
-/// Move a damaged database (and its WAL sidecars) out of the way so the next
-/// open starts from empty.
+/// The tables [`salvage`] copies out of a damaged database, in order, each
+/// with the rows it keeps.
 ///
-/// Renamed rather than deleted: this is a cache, but it is also the only
-/// evidence of what went wrong, and it costs one file the user can remove.
-fn quarantine_corrupt_db(path: &Path) -> Result<()> {
+/// The queue goes with the node rows it names by local id: a create made here
+/// has no other record of its node, and a real node keeps its local id when its
+/// folder is listed again. Those rows come back unlisted, so their folders are
+/// fetched again rather than trusted. Claims are cleared by [`Db::open`] as
+/// after any other crash.
+const SALVAGE: &[(&str, &str)] = &[
+    (
+        "nodes",
+        "lid IN (SELECT lid FROM old.pending_op WHERE lid IS NOT NULL
+                 UNION SELECT parent_lid FROM old.pending_op WHERE parent_lid IS NOT NULL)
+         OR uid LIKE 'local~%'",
+    ),
+    ("pending_op", "1"),
+    ("sync_folder", "1"),
+    ("sync_entry", "1"),
+    ("pins", "1"),
+    ("own_sealed_rev", "1"),
+];
+
+/// Copy what only this machine has out of the damaged database at `damaged`
+/// into the fresh one `conn` just created. Returns how each table went.
+///
+/// Each table is copied in its own transaction, so a table SQLite cannot read
+/// to the end is left out whole rather than half copied, and does not stop
+/// the others. Only the columns both files have are copied, which covers a
+/// file that broke in the middle of an upgrade. The damaged file is opened read
+/// only and left as it was.
+fn salvage(conn: &Connection, damaged: &Path) -> Vec<(&'static str, Result<usize>)> {
+    let uri = format!(
+        "file:{}?mode=ro",
+        damaged
+            .to_string_lossy()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23")
+    );
+    if let Err(e) = conn.execute("ATTACH DATABASE ?1 AS old", [&uri]) {
+        let e = Error::Db(e);
+        tracing::error!(error = %e, "could not open the damaged database to salvage it");
+        return Vec::new();
+    }
+    let results = SALVAGE
+        .iter()
+        .map(|&(table, rows)| (table, salvage_table(conn, table, rows)))
+        .collect();
+    let _ = conn.execute("UPDATE nodes SET listed = 0", []);
+    if let Err(e) = conn.execute("DETACH DATABASE old", []) {
+        tracing::warn!(error = %e, "could not detach the damaged database");
+    }
+    results
+}
+
+fn salvage_table(conn: &Connection, table: &str, rows: &str) -> Result<usize> {
+    let columns = |schema: &str| -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA {schema}.table_info({table})"))?;
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names)
+    };
+    let new = columns("main")?;
+    let shared: Vec<String> = columns("old")?
+        .into_iter()
+        .filter(|c| new.contains(c))
+        .map(|c| format!("\"{c}\""))
+        .collect();
+    if shared.is_empty() {
+        return Ok(0);
+    }
+    let shared = shared.join(", ");
+    let tx = conn.unchecked_transaction()?;
+    let copied = tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO main.{table} ({shared}) SELECT {shared} FROM old.{table} WHERE {rows}"
+        ),
+        [],
+    )?;
+    tx.commit()?;
+    Ok(copied)
+}
+
+/// Move a damaged database (and its WAL sidecars) out of the way so the next
+/// open starts from empty. Returns where the database itself went.
+///
+/// Renamed rather than deleted: it is the only evidence of what went wrong,
+/// and [`salvage`] reads what only this machine has back out of it.
+fn quarantine_corrupt_db(path: &Path) -> Result<PathBuf> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -457,7 +557,9 @@ fn quarantine_corrupt_db(path: &Path) -> Result<()> {
             Err(e) => tracing::warn!(file = %from.display(), error = %e, "could not quarantine"),
         }
     }
-    Ok(())
+    let mut kept = path.as_os_str().to_owned();
+    kept.push(format!(".corrupt-{stamp}"));
+    Ok(PathBuf::from(kept))
 }
 
 #[cfg(test)]
