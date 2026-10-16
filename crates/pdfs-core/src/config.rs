@@ -406,6 +406,46 @@ impl AppDirs {
         Ok(())
     }
 
+    /// This machine's id (e.g. ~/.config/proton-drive-linux/machine-id). See
+    /// [`machine_id`](Self::machine_id).
+    pub fn machine_id_path(&self) -> PathBuf {
+        self.dirs.config_dir().join("machine-id")
+    }
+
+    /// A random id for this machine, made on first use and kept in
+    /// [`machine_id_path`](Self::machine_id_path).
+    ///
+    /// It names this machine's profile in a device it may share with other
+    /// computers. Random rather than `/etc/machine-id`, so nothing that
+    /// identifies the host goes to Drive. In a file of its own rather than
+    /// `config.json`, because the app saves the config from a copy it loaded
+    /// earlier, and that would drop an id the daemon had just added.
+    pub fn machine_id(&self) -> Result<String> {
+        let path = self.machine_id_path();
+        match std::fs::read_to_string(&path) {
+            Ok(id) if is_machine_id(id.trim()) => return Ok(id.trim().to_string()),
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "machine id is unusable; making a new one");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let mut bytes = [0u8; 16];
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Other("machine id path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, format!("{id}\n"))?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(id)
+    }
+
     /// Persistent state: inode map / cache index DB lives here.
     pub fn state_dir(&self) -> PathBuf {
         // `state_dir` is Linux-only in `directories`; fall back to data dir.
@@ -492,6 +532,12 @@ impl AppDirs {
         restrict_dir(&config_dir)?;
         Ok(())
     }
+}
+
+/// Whether `id` is what [`AppDirs::machine_id`] writes: 32 lowercase hex
+/// digits.
+fn is_machine_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Make `dir` owner-only (`0700`). These directories contain decrypted bytes,
@@ -803,6 +849,15 @@ mod tests {
         assert!(json.contains(r#""conflict_sweep":"enforce""#), "{json}");
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.conflict_sweep, Some(SweepMode::Enforce));
+    }
+
+    #[test]
+    fn a_machine_id_is_32_lowercase_hex_digits() {
+        assert!(is_machine_id("0123456789abcdef0123456789abcdef"));
+        assert!(!is_machine_id("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!is_machine_id("0123456789abcdef"));
+        assert!(!is_machine_id("../../../../etc/passwd/0123456789"));
+        assert!(!is_machine_id(""));
     }
 
     #[test]

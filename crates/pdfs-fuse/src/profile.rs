@@ -15,6 +15,7 @@ use pdfs_core::control::RestorableFolder;
 use pdfs_core::mounts::MountMode;
 use pdfs_core::profile::{
     PROFILE_DIR_NAME, PROFILE_FILE_NAME, PROFILE_VERSION, Profile, ProfileFolder, ProfilePin,
+    is_profile_file_name, profile_file_name, saved_folder,
 };
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -66,9 +67,14 @@ impl Core {
         });
     }
 
-    /// Serialize this machine's arrangement and upload it to `profile.json`
-    /// inside the device's `.proton-drive-linux` folder, replacing any existing
-    /// one.
+    /// Serialize this machine's arrangement and upload it to its own
+    /// `profile-<machine id>.json` inside the device's `.proton-drive-linux`
+    /// folder, replacing any existing one.
+    ///
+    /// Each machine writes its own file because several computers may sync
+    /// into one device. They used to share `profile.json`, and each save
+    /// replaced the other computers' folders with its own (B252). That file is
+    /// left as it is, so a client before 3.5.0 still finds it.
     ///
     /// Does nothing when no device is registered: a machine that has never
     /// synced a folder has nothing to describe, and registering a device just to
@@ -85,7 +91,11 @@ impl Core {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))
         })?;
 
-        let profile = self.build_profile(&device.uid)?;
+        let machine_id = pdfs_core::config::AppDirs::new()
+            .and_then(|dirs| dirs.machine_id())
+            .map_err(|e| CoreError::internal(format!("machine id: {e}")))?;
+        let file_name = profile_file_name(&machine_id);
+        let profile = self.build_profile(&device.uid, &machine_id)?;
         let bytes = profile.to_bytes().map_err(CoreError::internal)?;
         let len = bytes.len() as i64;
 
@@ -97,7 +107,7 @@ impl Core {
         // same name: the profile is a single mutable record, and a folder with
         // `profile.json` and `profile (1).json` in it teaches the restore
         // nothing about which to trust.
-        let existing = self.find_device_child_file(&dir_uid, PROFILE_FILE_NAME)?;
+        let existing = self.find_device_child_file(&dir_uid, &file_name)?;
         match existing {
             Some(uid) => self
                 .rt
@@ -114,7 +124,7 @@ impl Core {
                 self.rt
                     .block_on(self.drive.upload_file_replacing_draft_from(
                         &dir_uid,
-                        PROFILE_FILE_NAME,
+                        &file_name,
                         "application/json",
                         Cursor::new(bytes),
                         len,
@@ -130,7 +140,7 @@ impl Core {
     }
 
     /// Snapshot the local arrangement into a [`Profile`].
-    fn build_profile(&self, device_uid: &str) -> CoreResult<Profile> {
+    fn build_profile(&self, device_uid: &str, machine_id: &str) -> CoreResult<Profile> {
         let folders = self
             .db
             .sync_folder_list()
@@ -162,6 +172,7 @@ impl Core {
             version: PROFILE_VERSION,
             device_uid: device_uid.to_string(),
             hostname: this_hostname(),
+            machine_id: Some(machine_id.to_string()),
             saved_at: now_secs(),
             folders,
             pins,
@@ -197,6 +208,31 @@ impl Core {
             .map(|n| n.uid))
     }
 
+    /// The untrashed files directly under `parent_uid` whose name passes
+    /// `keep`.
+    fn device_child_files(
+        &self,
+        parent_uid: &NodeUid,
+        keep: impl Fn(&str) -> bool,
+    ) -> CoreResult<Vec<NodeUid>> {
+        let uids = self
+            .rt
+            .block_on(self.drive.enumerate_folder_children_node_uids(parent_uid))
+            .map_err(|e| CoreError::from_api(&e, "list device root"))?;
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes = self
+            .rt
+            .block_on(self.drive.enumerate_nodes(&uids))
+            .map_err(|e| CoreError::from_api(&e, "resolve device root children"))?;
+        Ok(nodes
+            .into_iter()
+            .filter(|n| !n.is_folder() && !n.trashed && keep(&n.name))
+            .map(|n| n.uid)
+            .collect())
+    }
+
     /// The device's `.proton-drive-linux` folder, creating it if this is the
     /// first save on this device.
     ///
@@ -218,32 +254,43 @@ impl Core {
         Ok(uid)
     }
 
-    /// Download and parse this device's profile, if there is one.
+    /// Download and parse the profiles of every computer that syncs this
+    /// device.
     ///
-    /// Looks in `.proton-drive-linux/` first and falls back to the device root,
-    /// where clients before the B78 fix wrote it. The fallback is read-only: the
-    /// next save writes to the folder, and the legacy document is left alone
-    /// rather than trashed, so an older client on another machine keeps working.
-    fn load_profile(&self, root_uid: &NodeUid) -> CoreResult<Option<Profile>> {
-        let current = match self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
-            Some(dir_uid) => self.find_device_child_file(&dir_uid, PROFILE_FILE_NAME)?,
-            None => None,
+    /// Reads every profile in `.proton-drive-linux/`: one per machine, and the
+    /// shared `profile.json` of clients before 3.5.0. Falls back to the device
+    /// root, where clients before the B78 fix wrote it. The fallback is
+    /// read-only: the next save writes to the folder, and the legacy document
+    /// is left alone rather than trashed, so an older client on another
+    /// machine keeps working. A profile that cannot be read is left out and
+    /// logged; the others still count.
+    fn load_profiles(&self, root_uid: &NodeUid) -> CoreResult<Vec<Profile>> {
+        let mut uids = match self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+            Some(dir_uid) => self.device_child_files(&dir_uid, is_profile_file_name)?,
+            None => Vec::new(),
         };
-        let uid = match current {
-            Some(uid) => uid,
-            None => match self.find_device_child_file(root_uid, PROFILE_FILE_NAME)? {
-                Some(uid) => {
-                    info!("reading legacy profile from the device root");
-                    uid
+        if uids.is_empty() {
+            uids = self.device_child_files(root_uid, |name| name == PROFILE_FILE_NAME)?;
+            if !uids.is_empty() {
+                info!("reading legacy profile from the device root");
+            }
+        }
+        let mut profiles = Vec::new();
+        for uid in uids {
+            let mut buf: Vec<u8> = Vec::new();
+            let parsed = self
+                .rt
+                .block_on(self.drive.download_file_to(&uid, &mut buf))
+                .map_err(|e| CoreError::from_api(&e, "download profile"))
+                .and_then(|()| Profile::parse(&buf).map_err(CoreError::invalid));
+            match parsed {
+                Ok(profile) => profiles.push(profile),
+                Err(e) => {
+                    warn!(%uid, error = %e.message, "could not read a profile; leaving it out")
                 }
-                None => return Ok(None),
-            },
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        self.rt
-            .block_on(self.drive.download_file_to(&uid, &mut buf))
-            .map_err(|e| CoreError::from_api(&e, "download profile"))?;
-        Profile::parse(&buf).map(Some).map_err(CoreError::invalid)
+            }
+        }
+        Ok(profiles)
     }
 
     // ---- restore ----------------------------------------
@@ -265,15 +312,16 @@ impl Core {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))
         })?;
 
-        let profile = match self.load_profile(&root_uid) {
+        let profiles = match self.load_profiles(&root_uid) {
             Ok(p) => p,
             // A missing or unreadable profile is not fatal: the remote tree
             // alone is enough to offer a restore, just with plainer defaults.
             Err(e) => {
-                warn!(error = %e.message, "could not read profile; proposing defaults");
-                None
+                warn!(error = %e.message, "could not read profiles; proposing defaults");
+                Vec::new()
             }
         };
+        let hostname = this_hostname();
 
         let uids = self
             .rt
@@ -309,9 +357,7 @@ impl Core {
             .filter(|n| crate::remote_name_is_safe(&n.name))
             .map(|n| {
                 let uid = n.uid.to_string();
-                let saved = profile
-                    .as_ref()
-                    .and_then(|p| p.folders.iter().find(|f| f.remote_uid == uid));
+                let saved = saved_folder(&profiles, &uid, &hostname);
                 let proposed = saved
                     .map(|f| PathBuf::from(&f.local_path))
                     .filter(|p| path_is_usable_here(p))
@@ -492,13 +538,23 @@ mod tests {
     #[test]
     fn loading_falls_back_to_a_legacy_device_root_profile() {
         let source = include_str!("profile.rs");
-        let load = function_source(source, "fn load_profile(");
+        let load = function_source(source, "fn load_profiles(");
         assert!(load.contains("PROFILE_DIR_NAME"), "prefers the folder");
         assert!(
             load.find("PROFILE_DIR_NAME").unwrap()
                 < load.find("legacy profile").expect("legacy fallback exists"),
             "the folder is consulted before the device root"
         );
+    }
+
+    /// Several computers may share a device, so each saves to a file named
+    /// after its own machine id and never to the shared `profile.json`
+    /// (B252).
+    #[test]
+    fn each_machine_saves_its_own_profile() {
+        let save = function_source(include_str!("profile.rs"), "fn save_profile(");
+        assert!(save.contains("profile_file_name(&machine_id)"));
+        assert!(!save.contains("PROFILE_FILE_NAME"));
     }
 
     /// The profile folder is the client's own bookkeeping: neither the restore
