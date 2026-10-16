@@ -50,8 +50,49 @@ upgrade takes a moment.
   own metadata file took a similarly named one's, and an edited copy took its original's name. An
   edited copy now takes its original's date and keeps its own name (B225).
 - **Thumbnails of portrait photos lay on their side**, here and in Proton's own apps (B226).
+- **A write could be lost to a power cut after the program saving it had closed the file.** Saving
+  a change into the upload queue is now written through to disk (B229).
+- **A partly written file whose upload answer was lost came back as a conflict copy of itself.**
+  The retry now recognises its own upload (B228).
+- **A file or folder created offline could merge with another device's of the same name** made
+  while this computer was offline (B230).
+- **A large upload under a low upload limit never finished.** It ran out of time on every try,
+  took the drive offline and started over. Its time limit now allows for its share of the limit
+  (B231).
+- **Every reconnect sent all failed uploads again at once,** including those Proton had refused
+  for a full quota or missing access, and failed uploads were retried no later than every two
+  minutes. Refused uploads now keep their wait, which grows to five minutes, and retries are
+  spread out (B237).
+- **Signing out left the session valid on Proton.** It is now ended there too; `pdfs logout` says
+  so when Proton cannot be reached (B233).
+- **Any folder could be synced, the home folder included,** which uploaded the app's own cache
+  and walked into the drive itself. The root of the file system, the home folder and the folders
+  above it, the Proton Drive folder, the app's own data and folders inside or around another
+  synced folder are now refused, also when restoring another computer's folders (B234).
+- **Names with `&` or `<` showed as empty rows in the app**, and some names were drawn as
+  formatting, for example shared items, computer names and link addresses (B232).
+- **Photos imported from Google Photos, re-dated, or uploaded from the app had no thumbnail** in
+  Proton's apps (B236).
+- **Photos with no other date were filed under the day they were uploaded.** Their own EXIF date
+  is now used, for Google Photos imports and for uploads from the app (B244).
+- **Scanning a Google Photos export with a large folder took up to half a minute.** 10,000 photos
+  now take a tenth of a second (B235).
+- **Every photo opened in the viewer stayed in memory**, with its full-size image, until the app
+  quit. The Share dialog leaked the same way (B241).
+- **Opening a large photo froze the app** while it was decoded (B242).
+- **The app froze when opening a file while the drive did not respond.** It now falls back to
+  downloading the file after two seconds. Applications the app started also no longer linger as
+  zombie processes (B243).
+- **`pdfs import-google-photos --wait` and `pdfs redate-photos --wait` succeeded when the run
+  failed.** They now exit with an error when the run failed, was cancelled or left photos failed,
+  and the app shows why an import failed (B239).
+- **`pdfs mount`, `login`, `unlock` and `logout` could be core-dumped with the account's keys in
+  memory.** Only the background service was protected. A file named like an option, such as
+  `--json`, also broke the file manager's "Keep offline" script (B240).
 
 ### Changed
+- **Draining a large batch of offline changes no longer slows down with its size.** The queue is
+  indexed by name (schema 43, B238).
 - **Release binaries are stripped of their symbols**: `pdfs` goes from 43 to 35 MB, `pdfs-app`
   from 24 to 19 MB and `pdfs-tray` from 12 to 8 MB.
 
