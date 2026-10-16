@@ -59,9 +59,10 @@ pub(crate) use planner::base_name;
 #[cfg(test)]
 use planner::conflict_path;
 use planner::{
-    FilePlan, Unscanned, classification_order, conflict_path_with_suffix, filter_baseline,
-    guard_local_wipe, join_rel, local_deletions, parent_rel, plan_file, rel_to_path, remote_sig,
-    tracked_baseline, unchanged_remote_size,
+    FilePlan, RemoteGaps, Unscanned, classification_order, conflict_path_with_suffix,
+    filter_baseline, guard_local_wipe, guard_remote_wipe, join_rel, local_deletions, parent_rel,
+    plan_file, rel_to_path, remote_sig, remote_subtree_changed, tracked_baseline,
+    unchanged_remote_size,
 };
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
@@ -638,23 +639,32 @@ impl Core {
 
         let mut remote: HashMap<String, RemoteItem> = HashMap::new();
         let mut remote_dirs: HashMap<String, NodeUid> = HashMap::new();
+        let mut gaps = RemoteGaps::default();
         remote_dirs.insert(String::new(), remote_root.clone());
         self.walk_remote(
             folder_id,
             remote_root,
             "",
-            &mut remote,
-            &mut remote_dirs,
+            &mut RemoteWalk {
+                out: &mut remote,
+                dirs: &mut remote_dirs,
+                gaps: &mut gaps,
+            },
             &baseline,
         )?;
+        guard_remote_wipe(&tracked_baseline(&baseline, rules, &unscanned), &remote)?;
 
         let mut order = classification_order(&local, &remote, &baseline, rules);
         // A path the scan could not read is no more a local deletion than an
         // ignored one, and a remote path under it has nowhere to be written.
-        order.retain(|rel| !unscanned.covers(rel));
+        // The same holds for a path the remote walk could not read: missing
+        // from it, it would read as deleted on Drive (B212).
+        order.retain(|rel| !unscanned.covers(rel) && !gaps.hides(rel, &remote, &remote_dirs));
 
+        let mut unscanned_report = unscanned.report();
+        unscanned_report.extend(gaps.report());
         let mut outcome = Outcome {
-            unscanned: unscanned.report(),
+            unscanned: unscanned_report,
             ..Default::default()
         };
         // Folders to delete, collected here and removed deepest-first at the end
@@ -814,9 +824,17 @@ impl Core {
                     }
                 },
                 FilePlan::DeleteLocal => {
-                    if let Err(e) =
-                        removed_locally(std::fs::remove_file(local_root.join(rel_to_path(rel))))
-                    {
+                    let path = local_root.join(rel_to_path(rel));
+                    // The plan comes from a scan taken before the remote walk,
+                    // which can take minutes. An edit saved since then is not
+                    // something Drive deleted: keep it, and the next pass
+                    // uploads it as a new file (B213).
+                    if l.is_some_and(|planned| changed_since_scan(&path, planned)) {
+                        info!(rel, "sync: changed since the scan; not deleting it");
+                        outcome.deferred += 1;
+                        continue;
+                    }
+                    if let Err(e) = removed_locally(std::fs::remove_file(&path)) {
                         warn!(rel, error = %e, "sync: remove local file failed");
                         self.log_activity(
                             ActivityKind::Trash,
@@ -874,28 +892,70 @@ impl Core {
             &mut outcome,
         )?;
 
-        // Deferred folder deletions, deepest first.
-        delete_local_dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
-        for rel in delete_local_dirs {
-            if let Err(e) =
-                removed_locally(std::fs::remove_dir_all(local_root.join(rel_to_path(&rel))))
-            {
-                warn!(rel, error = %e, "sync: remove local folder failed");
-                self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);
-                outcome.errors += 1;
-                continue;
+        // Deferred folder deletions, deepest first. A folder that holds what
+        // Drive never had stays, and its baseline row goes, so the next pass
+        // creates it on Drive again and uploads what it holds (B211).
+        if !delete_local_dirs.is_empty() {
+            let mut current = self
+                .db
+                .sync_entries(folder_id)
+                .map_err(|e| format!("reload baseline: {e:?}"))?;
+            for removal in remove_local_dirs(local_root, delete_local_dirs, &mut current) {
+                match removal {
+                    DirRemoval::Removed(rel) => {
+                        let _ = self.db.sync_entry_remove(folder_id, &rel);
+                        self.log_activity(
+                            ActivityKind::Trash,
+                            base_name(&rel),
+                            "removed locally",
+                            true,
+                        );
+                        outcome.deleted += 1;
+                    }
+                    DirRemoval::Kept(rel, reason) => {
+                        warn!(
+                            rel,
+                            reason, "sync: deleted on Drive, but holds unsynced data; keeping it"
+                        );
+                        let _ = self.db.sync_entry_remove(folder_id, &rel);
+                        self.log_activity(
+                            ActivityKind::Trash,
+                            base_name(&rel),
+                            format!("deleted on Proton Drive, but kept here: {reason}"),
+                            false,
+                        );
+                    }
+                    DirRemoval::Failed(rel, e) => {
+                        warn!(rel, error = %e, "sync: remove local folder failed");
+                        self.log_activity(
+                            ActivityKind::Trash,
+                            base_name(&rel),
+                            e.to_string(),
+                            false,
+                        );
+                        outcome.errors += 1;
+                    }
+                }
             }
-            let _ = self.db.sync_entry_remove(folder_id, &rel);
-            self.log_activity(
-                ActivityKind::Trash,
-                base_name(&rel),
-                "removed locally",
-                true,
-            );
-            outcome.deleted += 1;
         }
         delete_remote_dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.matches('/').count()));
         for (rel, uid) in delete_remote_dirs {
+            // Deleted here, but another device has put something new in it on
+            // Drive. This pass downloaded that, so the folder is back here
+            // with it; trashing the folder now would take it away again (B214).
+            if let Some(reason) = remote_subtree_changed(&rel, &remote, &baseline) {
+                warn!(
+                    rel,
+                    reason, "sync: deleted here, but changed on Drive; not trashing it"
+                );
+                self.log_activity(
+                    ActivityKind::Trash,
+                    base_name(&rel),
+                    format!("deleted here, but kept on Proton Drive: {reason}"),
+                    false,
+                );
+                continue;
+            }
             if let Err(e) = self
                 .rt
                 .block_on(self.drive.trash_nodes(&[uid]))
@@ -963,7 +1023,7 @@ impl Core {
             .block_on(self.drive.enumerate_nodes_light(&uids))
             .map_err(|e| format!("resolve nodes: {e}"))?;
         for node in nodes {
-            if node.trashed || !node.is_folder() {
+            if node.trashed || !node.is_folder() || !crate::remote_name_is_safe(&node.name) {
                 continue;
             }
             let rel = join_rel(prefix, &node.name);
@@ -985,13 +1045,15 @@ impl Core {
     /// unchanged mtime means the recorded size still stands.
     ///
     /// [`enumerate_nodes_light`]: proton_drive_rs::ProtonDriveClient::enumerate_nodes_light
+    ///
+    /// What the walk could not read goes to `walk.gaps`, never silently out of
+    /// the map: a missing path reads as deleted on Drive.
     fn walk_remote(
         &self,
         folder_id: i64,
         folder: &NodeUid,
         prefix: &str,
-        out: &mut HashMap<String, RemoteItem>,
-        dirs: &mut HashMap<String, NodeUid>,
+        walk: &mut RemoteWalk<'_>,
         baseline: &HashMap<String, StoredSyncEntry>,
     ) -> Result<(), PassAbort> {
         // Checked per folder, not per pass: this walk is the long pole on a large
@@ -1017,6 +1079,27 @@ impl Core {
             .rt
             .block_on(self.drive.enumerate_nodes_light(&uids))
             .map_err(|e| format!("resolve nodes: {e}"))?;
+        // The SDK leaves out a node it cannot decrypt, and says so only in its
+        // log. Its name went with it, so all this can record is the folder.
+        if nodes.len() < uids.len() {
+            warn!(
+                folder = prefix,
+                listed = uids.len(),
+                read = nodes.len(),
+                "sync: some nodes on Drive cannot be read; leaving them out"
+            );
+            walk.gaps.short_listing(prefix);
+        }
+        let nodes: Vec<Node> = nodes
+            .into_iter()
+            .filter(|node| {
+                let safe = crate::remote_name_is_safe(&node.name);
+                if !safe {
+                    warn!(folder = prefix, uid = %node.uid, "sync: a name on Drive cannot be a local file name; leaving it out");
+                }
+                safe
+            })
+            .collect();
 
         // Files whose recorded mtime no longer matches: their size has to be
         // read for real, so these are the only node keys worth unlocking.
@@ -1048,8 +1131,8 @@ impl Core {
             let rel = join_rel(prefix, &node.name);
             self.progress_scanned(folder_id, base_name(&rel));
             if node.is_folder() {
-                dirs.insert(rel.clone(), node.uid.clone());
-                out.insert(
+                walk.dirs.insert(rel.clone(), node.uid.clone());
+                walk.out.insert(
                     rel.clone(),
                     RemoteItem {
                         uid: node.uid.clone(),
@@ -1058,16 +1141,19 @@ impl Core {
                         size: 0,
                     },
                 );
-                self.walk_remote(folder_id, &node.uid, &rel, out, dirs, baseline)?;
+                self.walk_remote(folder_id, &node.uid, &rel, walk, baseline)?;
             } else {
                 let size = if stale.contains(&node.uid.to_string()) {
                     match sized.get(&node.uid.to_string()) {
                         Some(size) => *size,
                         // Its size was needed but could not be read (the full
                         // enumeration skipped it as undecryptable). Leave it out
-                        // rather than record a stale size, exactly as a full
-                        // walk would have.
-                        None => continue,
+                        // rather than record a stale size, and say so: missing,
+                        // it would read as deleted on Drive.
+                        None => {
+                            walk.gaps.unread(rel);
+                            continue;
+                        }
                     }
                 } else {
                     match unchanged_remote_size(baseline, &rel, node.modification_time) {
@@ -1075,7 +1161,7 @@ impl Core {
                         None => continue,
                     }
                 };
-                out.insert(
+                walk.out.insert(
                     rel,
                     RemoteItem {
                         uid: node.uid,
@@ -1611,6 +1697,62 @@ fn keep_racing_local_edit(path: &Path, expected: Option<LocalSig>) -> std::io::R
         "sync: local file changed while downloading; keeping it as a conflict copy"
     );
     preserve_conflict_copy(path, now_secs()).map(|_| ())
+}
+
+/// What became of one folder [`remove_local_dirs`] was asked to remove.
+enum DirRemoval {
+    Removed(String),
+    /// Left in place, with why: it holds something Drive does not have.
+    Kept(String, String),
+    Failed(String, std::io::Error),
+}
+
+/// Remove the mirror folders in `dirs`, which Drive deleted, deepest first,
+/// except those that hold something Drive never had.
+///
+/// The uploads of a new file or an edit in such a folder failed earlier in the
+/// pass for want of a parent, and an ignored `.git` is never uploaded at all,
+/// so removing the folder would lose them for good (B211). `current` is the
+/// baseline as the pass has left it: a row the pass already removed with its
+/// file must not read as a deletion not carried up yet, and a subfolder removed
+/// here takes its rows with it for the same reason. A kept folder loses its own
+/// row, so its parent sees it as new and is kept too.
+fn remove_local_dirs(
+    root: &Path,
+    mut dirs: Vec<String>,
+    current: &mut HashMap<String, StoredSyncEntry>,
+) -> Vec<DirRemoval> {
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+    dirs.into_iter()
+        .map(|rel| {
+            if let Some(reason) = mirror_subtree_unsynced(root, &rel, current) {
+                current.remove(&rel);
+                return DirRemoval::Kept(rel, reason);
+            }
+            let prefix = format!("{rel}/");
+            current.retain(|path, _| *path != rel && !path.starts_with(&prefix));
+            match removed_locally(std::fs::remove_dir_all(root.join(rel_to_path(&rel)))) {
+                Ok(()) => DirRemoval::Removed(rel),
+                Err(e) => DirRemoval::Failed(rel, e),
+            }
+        })
+        .collect()
+}
+
+/// What a remote walk fills in as it goes down the tree.
+struct RemoteWalk<'a> {
+    /// Every path it read, by rel path.
+    out: &'a mut HashMap<String, RemoteItem>,
+    /// Every folder it read, by rel path, to its uid.
+    dirs: &'a mut HashMap<String, NodeUid>,
+    /// What it saw but could not read.
+    gaps: &'a mut RemoteGaps,
+}
+
+/// Whether the file at `path` is no longer what the scan saw as `planned`.
+/// A file that is gone has nothing left to lose, so it has not changed.
+fn changed_since_scan(path: &Path, planned: &LocalItem) -> bool {
+    local_sig(path).is_some_and(|now| !now.same_content(&LocalSig::from(planned)))
 }
 
 /// Read a local removal as the sync engine has to read it: the *state* it was
@@ -2890,6 +3032,83 @@ mod tests {
             .map(|rel| synced_row(&root, rel))
             .collect();
         (root, baseline)
+    }
+
+    /// Drive deleted `dir`. Everything it held that was synced goes with it;
+    /// a file Drive never had keeps the folder, and the parent with it
+    /// (`docs/BUGS.md` B211).
+    #[test]
+    fn a_folder_deleted_on_drive_keeps_what_drive_never_had() {
+        let (root, mut baseline) = synced_subtree("b211-keep");
+        // The pass already removed the synced files with their rows.
+        std::fs::remove_file(root.join("dir/a.txt")).unwrap();
+        baseline.remove("dir/a.txt");
+        std::fs::remove_file(root.join("dir/sub/b.txt")).unwrap();
+        baseline.remove("dir/sub/b.txt");
+        std::fs::write(root.join("dir/new.txt"), b"never uploaded").unwrap();
+
+        let removals = remove_local_dirs(
+            &root,
+            vec!["dir".to_string(), "dir/sub".to_string()],
+            &mut baseline,
+        );
+        let shape: Vec<(&str, &str)> = removals
+            .iter()
+            .map(|r| match r {
+                DirRemoval::Removed(rel) => ("removed", rel.as_str()),
+                DirRemoval::Kept(rel, _) => ("kept", rel.as_str()),
+                DirRemoval::Failed(rel, _) => ("failed", rel.as_str()),
+            })
+            .collect();
+        assert_eq!(shape, [("removed", "dir/sub"), ("kept", "dir")]);
+        assert_eq!(
+            std::fs::read(root.join("dir/new.txt")).unwrap(),
+            b"never uploaded"
+        );
+        assert!(!root.join("dir/sub").exists());
+        // Its row is gone, so the next pass sees a new local folder.
+        assert!(!baseline.contains_key("dir"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_deleted_on_drive_with_only_synced_content_is_removed() {
+        let (root, mut baseline) = synced_subtree("b211-remove");
+        for file in ["dir/a.txt", "dir/sub/b.txt"] {
+            std::fs::remove_file(root.join(file)).unwrap();
+            baseline.remove(file);
+        }
+        let removals = remove_local_dirs(
+            &root,
+            vec!["dir/sub".to_string(), "dir".to_string()],
+            &mut baseline,
+        );
+        assert!(removals.iter().all(|r| matches!(r, DirRemoval::Removed(_))));
+        assert!(!root.join("dir").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An edit to a file saved after the scan is not a deletion on Drive
+    /// (`docs/BUGS.md` B213).
+    #[test]
+    fn a_file_changed_since_the_scan_is_not_deleted() {
+        let root = sync_test_dir("b213");
+        let path = root.join("notes.txt");
+        std::fs::write(&path, b"as scanned").unwrap();
+        let sig = local_sig(&path).unwrap();
+        let planned = LocalItem {
+            is_dir: false,
+            mtime: sig.mtime,
+            mtime_ns: sig.mtime_ns,
+            size: sig.size,
+            open_for_write: false,
+        };
+        assert!(!changed_since_scan(&path, &planned));
+        std::fs::write(&path, b"edited after the scan").unwrap();
+        assert!(changed_since_scan(&path, &planned));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!changed_since_scan(&path, &planned));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

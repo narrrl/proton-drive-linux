@@ -6743,7 +6743,27 @@ fn fuse_name(name: &OsStr) -> Result<String, Errno> {
     name.to_str().map(str::to_owned).ok_or(Errno::EILSEQ)
 }
 
+/// Whether a decrypted remote name can stand as one local path component.
+///
+/// Drive checks names only when a client creates or renames a node, and only
+/// for length, so a name made by another client, or by a server that should
+/// not be trusted, can hold anything. Joined onto a local path, a `/` or a `..`
+/// in it walks out of the folder it belongs to, and the mirror engine would
+/// then write or delete outside the sync root. In the mount, the kernel fails
+/// the whole listing with EIO on a single such name (`docs/BUGS.md` B215).
+pub(crate) fn remote_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name.contains(['/', '\0'])
+}
+
 fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
+    if !remote_name_is_safe(&node.name) {
+        warn!(uid = %node.uid, "a remote name cannot be a local file name; leaving it out");
+        return false;
+    }
     !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
 }
 
@@ -8652,6 +8672,28 @@ mod tests {
             &folder_uid,
             &std::collections::HashSet::from([node.uid.clone()])
         ));
+    }
+
+    #[test]
+    fn a_remote_name_that_is_not_one_path_component_is_left_out() {
+        let folder_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("folder"));
+        let none = std::collections::HashSet::new();
+        for name in [
+            "a/b",
+            "../../.bashrc",
+            "..",
+            ".",
+            "",
+            "a\0b",
+            &"x".repeat(256),
+        ] {
+            let node = node_helper("child", "folder", name, false);
+            assert!(!node_visible(&node, &folder_uid, &none), "{name:?}");
+        }
+        for name in [".hidden", "a..b", "unicodé-文件", &"x".repeat(255)] {
+            let node = node_helper("child", "folder", name, false);
+            assert!(node_visible(&node, &folder_uid, &none), "{name:?}");
+        }
     }
 
     #[test]

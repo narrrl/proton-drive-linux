@@ -199,6 +199,135 @@ pub(super) fn guard_local_wipe<B, L>(
     Ok(())
 }
 
+/// Refuse to run a pass whose remote side has vanished in its entirety: the
+/// remote twin of [`guard_local_wipe`].
+///
+/// An empty or truncated remote walk reads to the planner as "Drive deleted
+/// everything", which a pass answers by deleting the local copies. When not
+/// one synced path is left on Drive, a failed listing is far likelier than a
+/// deliberate wipe of the whole folder, so the pass stops instead.
+pub(super) fn guard_remote_wipe<B, R>(
+    baseline: &HashMap<String, B>,
+    remote: &HashMap<String, R>,
+) -> Result<(), String> {
+    if !baseline.is_empty() && baseline.keys().all(|rel| !remote.contains_key(rel)) {
+        return Err(format!(
+            "every one of the {} synced paths is missing on Proton Drive; refusing to \
+             delete them here. If they were deleted on purpose, remove the folder from sync.",
+            baseline.len()
+        ));
+    }
+    Ok(())
+}
+
+/// What a remote walk saw but could not read: a node the SDK left out because
+/// it would not decrypt, or a file whose size could not be read.
+///
+/// A path missing from the walk is read as deleted on Drive, so a pass must
+/// not classify one it only failed to read. Since a node that failed to decrypt
+/// has no name, all a walk can say is that a folder's listing came back short;
+/// every path under that folder that the walk did not return is then left out,
+/// as [`Unscanned`] leaves out what the local scan could not read.
+#[derive(Default)]
+pub(super) struct RemoteGaps {
+    /// Folders whose listing came back with fewer nodes than it named.
+    short: HashSet<String>,
+    /// Paths seen, but whose entry could not be read.
+    unread: HashSet<String>,
+}
+
+impl RemoteGaps {
+    /// The listing of `folder` named nodes that did not come back.
+    pub(super) fn short_listing(&mut self, folder: &str) {
+        self.short.insert(folder.to_string());
+    }
+
+    /// `rel` is on Drive, but the walk could not read what it needs of it.
+    pub(super) fn unread(&mut self, rel: String) {
+        self.unread.insert(rel);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.short.is_empty() && self.unread.is_empty()
+    }
+
+    /// Whether `rel` may be missing from `remote` only because the walk could
+    /// not read it. A path the walk returned is never hidden.
+    pub(super) fn hides<R>(
+        &self,
+        rel: &str,
+        remote: &HashMap<String, R>,
+        remote_dirs: &HashMap<String, NodeUid>,
+    ) -> bool {
+        if self.is_empty() || remote.contains_key(rel) {
+            return false;
+        }
+        if self.unread.contains(rel) {
+            return true;
+        }
+        // The deepest folder the walk did list decides: under a short listing,
+        // anything not returned may be one of the nodes it could not read.
+        let mut at = parent_rel(rel);
+        loop {
+            if remote_dirs.contains_key(at) {
+                return self.short.contains(at);
+            }
+            if at.is_empty() {
+                return false;
+            }
+            at = parent_rel(at);
+        }
+    }
+
+    /// The folders to name to the user, sorted.
+    pub(super) fn report(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .short
+            .iter()
+            .map(|rel| {
+                let shown = if rel.is_empty() { "the folder" } else { rel };
+                format!("{shown} (items on Proton Drive that cannot be read)")
+            })
+            .chain(
+                self.unread
+                    .iter()
+                    .map(|rel| format!("{rel} (cannot be read on Proton Drive)")),
+            )
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+}
+
+/// Why the remote folder at `rel` must not be trashed although it was deleted
+/// here: something under it is new or changed on Drive since the last sync,
+/// so it is another device's work that this computer has never had.
+///
+/// Trashing the folder would take that work with it, and the next pass would
+/// then delete the copy this pass just downloaded. `None` when everything under
+/// it is exactly what the baseline recorded.
+pub(super) fn remote_subtree_changed(
+    rel: &str,
+    remote: &HashMap<String, RemoteItem>,
+    baseline: &HashMap<String, StoredSyncEntry>,
+) -> Option<String> {
+    let prefix = format!("{rel}/");
+    let mut changed: Vec<&String> = remote
+        .iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .filter(|(path, item)| match baseline.get(*path) {
+            None => true,
+            Some(_) if item.is_dir => false,
+            Some(base) => remote_sig(base) != Some((item.mtime, item.size)),
+        })
+        .map(|(path, _)| path)
+        .collect();
+    changed.sort_unstable();
+    changed
+        .first()
+        .map(|path| format!("{path} is new or changed on Proton Drive"))
+}
+
 /// The size the baseline recorded for `rel`, if its remote signature's mtime
 /// still matches `mtime`.
 pub(super) fn unchanged_remote_size(
@@ -529,5 +658,97 @@ mod file_plan_tests {
             plan_file(Some(&local), Some(&remote), Some(&base)),
             FilePlan::Download
         );
+    }
+
+    fn uid(id: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("v"), LinkId::from(id))
+    }
+
+    fn folder() -> RemoteItem {
+        RemoteItem {
+            is_dir: true,
+            mtime: 0,
+            size: 0,
+            ..remote(0, 0)
+        }
+    }
+
+    /// An empty or failed remote listing must not read as "Drive deleted
+    /// everything" and delete the local copies.
+    #[test]
+    fn the_remote_wipe_guard_blocks_only_a_total_disappearance() {
+        let base = HashMap::from([("a".to_string(), ()), ("b".to_string(), ())]);
+        let none: HashMap<String, RemoteItem> = HashMap::new();
+        assert!(guard_remote_wipe(&base, &none).is_err());
+        let one = HashMap::from([("b".to_string(), remote(1, 1))]);
+        assert!(guard_remote_wipe(&base, &one).is_ok());
+        let empty: HashMap<String, ()> = HashMap::new();
+        assert!(guard_remote_wipe(&empty, &none).is_ok());
+    }
+
+    /// A node that failed to decrypt has no name, so everything a short
+    /// listing did not return is left out, and nothing else.
+    #[test]
+    fn a_short_remote_listing_hides_what_it_did_not_return() {
+        let remote = HashMap::from([
+            ("docs".to_string(), folder()),
+            ("docs/a.txt".to_string(), remote(1, 1)),
+            ("pics".to_string(), folder()),
+        ]);
+        let dirs = HashMap::from([
+            (String::new(), uid("root")),
+            ("docs".to_string(), uid("docs")),
+            ("pics".to_string(), uid("pics")),
+        ]);
+        let mut gaps = RemoteGaps::default();
+        assert!(!gaps.hides("docs/b.txt", &remote, &dirs));
+        gaps.short_listing("docs");
+        // Returned paths stand; unreturned ones under the short folder hide,
+        // and so does anything under a subfolder it failed to return.
+        assert!(!gaps.hides("docs/a.txt", &remote, &dirs));
+        assert!(gaps.hides("docs/b.txt", &remote, &dirs));
+        assert!(gaps.hides("docs/sub/deep.txt", &remote, &dirs));
+        // A complete sibling listing still reads deletions as deletions.
+        assert!(!gaps.hides("pics/gone.jpg", &remote, &dirs));
+        assert!(!gaps.hides("top.txt", &remote, &dirs));
+        gaps.short_listing("");
+        assert!(gaps.hides("top.txt", &remote, &dirs));
+    }
+
+    #[test]
+    fn a_file_whose_size_could_not_be_read_is_hidden() {
+        let remote: HashMap<String, RemoteItem> = HashMap::new();
+        let dirs = HashMap::from([(String::new(), uid("root"))]);
+        let mut gaps = RemoteGaps::default();
+        gaps.unread("a.txt".to_string());
+        assert!(gaps.hides("a.txt", &remote, &dirs));
+        assert!(!gaps.hides("b.txt", &remote, &dirs));
+        assert_eq!(gaps.report(), ["a.txt (cannot be read on Proton Drive)"]);
+    }
+
+    /// A folder deleted here holds another device's new work on Drive, so
+    /// trashing it would lose that work.
+    #[test]
+    fn a_remote_folder_with_new_or_changed_files_is_not_trashed() {
+        let mut base = HashMap::from([
+            ("x".to_string(), baseline(0, 0, 0, 0)),
+            ("x/old.txt".to_string(), baseline(1, 1, 5, 6)),
+        ]);
+        let mut remote_tree = HashMap::from([
+            ("x".to_string(), folder()),
+            ("x/old.txt".to_string(), remote(5, 6)),
+            ("xy/new.txt".to_string(), remote(1, 1)),
+        ]);
+        // Unchanged under x; a name-prefixed sibling does not count.
+        assert_eq!(remote_subtree_changed("x", &remote_tree, &base), None);
+
+        remote_tree.insert("x/old.txt".to_string(), remote(9, 6));
+        assert!(remote_subtree_changed("x", &remote_tree, &base).is_some());
+
+        remote_tree.insert("x/old.txt".to_string(), remote(5, 6));
+        remote_tree.insert("x/sub".to_string(), folder());
+        assert!(remote_subtree_changed("x", &remote_tree, &base).is_some());
+        base.insert("x/sub".to_string(), baseline(0, 0, 0, 0));
+        assert_eq!(remote_subtree_changed("x", &remote_tree, &base), None);
     }
 }

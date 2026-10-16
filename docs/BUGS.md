@@ -100,6 +100,11 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B215](#b215--a-remote-name-holding--or--becomes-a-path-outside-the-sync-folder) | A remote name holding `/` or `..` becomes a path outside the sync folder |
+| [B214](#b214--deleting-a-mirror-folder-here-trashes-another-devices-new-files-in-it) | Deleting a mirror folder here trashes another device's new files in it |
+| [B213](#b213--a-file-edited-during-a-mirror-pass-is-deleted-because-drive-deleted-it-earlier) | A file edited during a mirror pass is deleted because Drive deleted it earlier |
+| [B212](#b212--a-node-on-drive-that-cannot-be-decrypted-is-deleted-from-the-mirror) | A node on Drive that cannot be decrypted is deleted from the mirror |
+| [B211](#b211--a-folder-deleted-on-drive-takes-unsynced-local-files-with-it) | A folder deleted on Drive takes unsynced local files with it |
 | [B210](#b210--after-a-password-reset-the-mount-retries-missing-key-forever) | After a password reset, the mount retries "missing key" forever |
 | [B209](#b209--a-blocked-sign-in-says-the-app-version-is-no-longer-supported) | A blocked sign-in says the app version is no longer supported |
 | [B208](#b208--a-file-landing-while-its-folder-is-pinned-is-kept-but-not-available-offline) | A file landing while its folder is pinned is kept but not available offline |
@@ -312,6 +317,129 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B215 — A remote name holding `/` or `..` becomes a path outside the sync folder
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.2).
+**Where:** `walk_remote` and `walk_remote_dirs` in `crates/pdfs-fuse/src/sync.rs`; `node_visible`
+in `crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Needs a node whose decrypted name holds `/`, `..` or NUL. Drive checks names only when
+a client creates or renames a node, and only for length, so another client or a server that
+should not be trusted can make one. Then let a mirror pass or a listing of its folder run.
+
+**Cause.** The mirror engine joined each decrypted name onto its parent's relative path and
+turned that into a local path, so `x/../../.config/autostart/a.desktop` named a file outside the
+sync root. The pass then created, replaced or removed it there. In the mount, the kernel refuses a
+whole `readdir` with EIO when one name in it is not a single path component.
+
+**Fix.** `remote_name_is_safe` accepts a name only if it is one path component: not empty, not
+`.` or `..`, no `/` or NUL, at most 255 bytes. Both remote walks of the mirror engine and the
+listing filter of the mount leave out any other name, with a warning. A name left out cannot be a
+local path at all, so leaving it out cannot read as a deletion of anything local.
+
+**Test:** `tests::a_remote_name_that_is_not_one_path_component_is_left_out`.
+
+---
+
+### B214 — Deleting a mirror folder here trashes another device's new files in it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.5).
+**Where:** `Core::do_reconcile` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Delete a synced folder locally while another device adds a file to it on Drive, before
+the next pass.
+
+**Cause.** The pass planned the new file as a download, which recreated the folder locally. At
+the end of the same pass it trashed the remote folder, because the folder was in the baseline and
+gone locally, and took the new file with it. The next pass then saw the downloaded copy unchanged
+and its remote gone, so it deleted that too. The other device's work survived only in the Drive
+trash, and nothing said so.
+
+**Fix.** Before a pass trashes a remote folder, `remote_subtree_changed` looks for anything under
+it on Drive that is not in the baseline or whose signature moved. If there is, the folder stays on
+Drive with its row, the activity feed says why, and only its unchanged files are trashed, one by
+one, as local deletions.
+
+**Test:** `planner::file_plan_tests::a_remote_folder_with_new_or_changed_files_is_not_trashed`.
+
+---
+
+### B213 — A file edited during a mirror pass is deleted because Drive deleted it earlier
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.6).
+**Where:** `Core::do_reconcile`, `FilePlan::DeleteLocal`, in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Delete a synced file on another device. On this one, edit the file while a pass over a
+large folder walks Drive.
+
+**Cause.** A pass takes its local signatures before the remote walk, which takes minutes on a
+large tree, and deleted a file that Drive had deleted without looking at it again. Downloads got
+that second look in B39 (`keep_racing_local_edit`); deletions did not, so the edit was lost with
+no conflict copy.
+
+**Fix.** `changed_since_scan` compares the file's signature with the one the scan planned on, right
+before the deletion. A changed file stays, and the next pass uploads it as a new file.
+
+**Test:** `tests::a_file_changed_since_the_scan_is_not_deleted`.
+
+---
+
+### B212 — A node on Drive that cannot be decrypted is deleted from the mirror
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.4). The SDK leaves out nodes it cannot
+decrypt, which B112 showed on real accounts and B97 during cancellation.
+**Where:** `Core::walk_remote` and `Core::do_reconcile` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Make one synced file or folder fail to decrypt, for example with a key the session
+cannot unlock, and let a pass run.
+
+**Cause.** The remote walk kept what the SDK returned and nothing else. A node the SDK left out
+was then missing from the remote map, and the planner reads "in the baseline and here, but not on
+Drive" as a deletion on Drive. A file was deleted locally; a folder was removed with
+`remove_dir_all`. The local side had a guard against a scan that came back empty
+(`guard_local_wipe`), the remote side had none.
+
+**Fix.**
+- A listing that returns fewer nodes than it named marks its folder as short. A file whose size
+  could not be read is marked unread.
+- `RemoteGaps::hides` leaves out of the pass every path such a gap could explain, as `Unscanned`
+  does for the local scan. The folder is reported with the paths that cannot be synced.
+- `guard_remote_wipe` refuses a pass in which none of the synced paths is left on Drive.
+
+**Test:** `planner::file_plan_tests::a_short_remote_listing_hides_what_it_did_not_return`,
+`planner::file_plan_tests::a_file_whose_size_could_not_be_read_is_hidden`,
+`planner::file_plan_tests::the_remote_wipe_guard_blocks_only_a_total_disappearance`.
+
+---
+
+### B211 — A folder deleted on Drive takes unsynced local files with it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.1).
+**Where:** `Core::do_reconcile` and `remove_local_dirs` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** In a mirror folder, add a file to a synced subfolder. Before the next pass, delete the
+subfolder on another device.
+
+**Cause.** The pass put the folder on its list of local deletions. The upload of the new file
+failed for want of a remote parent and was counted as an error. At the end of the pass,
+`remove_dir_all` removed the folder with everything in it: new files, edits, files open for
+writing, and ignored content such as `.git`, none of which had ever been on Drive.
+
+**Fix.** `remove_local_dirs` asks `mirror_subtree_unsynced` about each folder before it removes
+it, against the baseline as the pass has left it. A folder that holds anything Drive does not
+have stays, and loses its baseline row, so the next pass creates it on Drive again and uploads
+what it holds. What was synced in it is still deleted.
+
+**Test:** `tests::a_folder_deleted_on_drive_keeps_what_drive_never_had`,
+`tests::a_folder_deleted_on_drive_with_only_synced_content_is_removed`.
+
+---
 
 ### B210 — After a password reset, the mount retries "missing key" forever
 
