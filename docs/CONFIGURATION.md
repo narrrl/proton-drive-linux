@@ -62,6 +62,7 @@ fix it.
   "online_map": false,
   "tray_hidden": false,
   "files_view": { "list": true, "sort": "modified", "descending": true, "folders_first": true },
+  "window": { "width": 980, "height": 680, "maximized": false },
   "open_with": {
     "terminal": ["alacritty", "-e"],
     "rules": [{ "match": ["@text"], "command": ["nvim"], "terminal": true }]
@@ -87,6 +88,7 @@ fix it.
 | `online_map` | bool | `false` | General → Appearance | Street map for Places from OpenFreeMap |
 | `tray_hidden` | bool | `false` | General → Appearance | Hide the tray icon |
 | `files_view` | object | grid, by name | My files view menu | `list`, `sort` (`name`, `size`, `modified`), `descending`, `folders_first` |
+| `window` | object | 980 × 680 | Resizing the app window | `width`, `height` (the unmaximized size), `maximized` |
 | `open_with` | object | `xdg-open` | — | See [`open_with`](#open_with) |
 | `prompt` | object | built-in window | — | See [`prompt`](#prompt) |
 

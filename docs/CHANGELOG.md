@@ -22,8 +22,15 @@ version on Proton Drive it was synced at. Nothing is rewritten, and the upgrade 
   computer's backup alongside it, then offers its folders for syncing here. Both computers keep
   them in step, deletions included. Each computer now keeps its own settings backup in the
   shared backup, so they no longer overwrite each other (B252).
+- **The app remembers its window size**, and whether it was maximized, between runs.
 
 ### Fixed
+- **The app's window could not shrink to fit a small or scaled screen**, so the minimize,
+  maximize and close buttons ended up off-screen. Below about 760 pixels the sidebar and the
+  page now take turns, and every page fits in a window 480 pixels wide.
+- **The app showed the sign-in page when the system keyring was locked or not running yet**, as
+  if the sign-in had been lost. It now says that the keyring could not be read, and opens on its
+  own once the keyring answers (B253).
 - **An edit in a synced folder could replace one another computer had just saved.** The newer
   version from the other computer was left only in the version history. The edit is now kept as
   a conflict copy (B249).
