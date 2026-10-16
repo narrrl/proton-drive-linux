@@ -275,14 +275,42 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
             viewer.status.set_label(message);
             viewer.status.set_visible(true);
         };
-        match result {
-            Ok(Ok(Response::FilePath { path })) if is_video => {
+        let path = match result {
+            Ok(Ok(Response::FilePath { path })) => path,
+            Ok(Ok(Response::Error { message, .. })) => return fail(&message),
+            Ok(Ok(_)) => return fail(&gettext("Unexpected reply from the Proton Drive service.")),
+            Ok(Err(_)) | Err(_) => return fail(&gettext("Couldn't reach Proton Drive.")),
+        };
+        // Decoding a full-size photo and reading its EXIF take a good part of
+        // a second for a large one, which froze the whole app on the main
+        // thread. Done on a worker; a reply for a photo the user has since
+        // left is dropped like the request's own.
+        let loaded = {
+            let path = path.clone();
+            gio::spawn_blocking(move || {
+                let size = std::fs::metadata(&path).ok().map(|meta| meta.len());
+                if is_video {
+                    return (size, None, ExifInfo::default());
+                }
+                let texture = gtk4::gdk::Texture::from_filename(&path);
+                (size, Some(texture), read_exif(&path))
+            })
+            .await
+        };
+        if *viewer.uid.borrow() != uid {
+            return;
+        }
+        let Ok((size, texture, info)) = loaded else {
+            return fail(&gettext("Couldn't render this photo."));
+        };
+        match texture {
+            None => {
                 viewer.video.set_filename(Some(&path));
                 viewer.media.set_visible_child_name("video");
                 *viewer.path.borrow_mut() = Some(path.clone());
-                show_info(&viewer, &path, ExifInfo::default());
+                show_info(&viewer, size, ExifInfo::default());
             }
-            Ok(Ok(Response::FilePath { path })) => match gtk4::gdk::Texture::from_filename(&path) {
+            Some(texture) => match texture {
                 Ok(texture) => {
                     // Zoomed in on the thumbnail: keep the photo the size it is
                     // on screen, now drawn from the full-size pixels.
@@ -297,16 +325,13 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
                         zoom_to(&viewer, Some(zoom), None);
                     }
                     *viewer.path.borrow_mut() = Some(path.clone());
-                    show_info(&viewer, &path, read_exif(&path));
+                    show_info(&viewer, size, info);
                 }
                 Err(e) => {
                     tracing::error!("Failed to load texture for {path}: {e}");
                     fail(&gettext("Couldn't render this photo."));
                 }
             },
-            Ok(Ok(Response::Error { message, .. })) => fail(&message),
-            Ok(Ok(_)) => fail(&gettext("Unexpected reply from the Proton Drive service.")),
-            Ok(Err(_)) | Err(_) => fail(&gettext("Couldn't reach Proton Drive.")),
         }
     });
 }
@@ -452,16 +477,16 @@ pub(crate) fn clear_info(viewer: &Rc<Viewer>) {
 }
 
 /// Fill the details drawer for the photo now on screen: its own file facts
-/// (size, dimensions) plus whatever EXIF it carries.
-pub(crate) fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
+/// (`size`, dimensions) plus whatever EXIF it carries.
+pub(crate) fn show_info(viewer: &Rc<Viewer>, size: Option<u64>, info: ExifInfo) {
     while let Some(row) = viewer.info_rows.first_child() {
         viewer.info_rows.remove(&row);
     }
 
     let mut fields: Vec<(String, String)> = Vec::new();
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Some(size) = size {
         // Translators: label of a photo's file size in the details panel.
-        fields.push((pgettext("property", "Size"), human_bytes(meta.len())));
+        fields.push((pgettext("property", "Size"), human_bytes(size)));
     }
     fields.extend(info.fields);
 

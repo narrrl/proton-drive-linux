@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B242](#b242--opening-a-large-photo-freezes-the-app) | Opening a large photo freezes the app |
 | [B241](#b241--every-closed-photo-viewer-stays-in-memory-with-its-photo) | Every closed photo viewer stays in memory with its photo |
 | [B240](#b240--pdfs-mount-can-be-core-dumped-with-the-keys-in-memory) | pdfs mount can be core-dumped with the keys in memory |
 | [B239](#b239----wait-reports-success-for-imports-and-re-dates-that-failed) | --wait reports success for imports and re-dates that failed |
@@ -343,6 +344,27 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B242 — Opening a large photo freezes the app
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.1).
+**Where:** `load_photo` and `show_info` in `crates/pdfs-gui/src/app/pages/photo_viewer.rs`
+
+**Repro:** Open a 50-megapixel photo in the viewer and press → repeatedly while each one loads.
+
+**Cause.** When the full-size file arrived, the viewer decoded it with
+`Texture::from_filename`, read its EXIF and stat'ed it on the GTK main thread. For a large photo
+that took a good part of a second each time, and the whole app froze for it: no redraw, no
+input, no other page.
+
+**Fix.** The decode, the EXIF read and the stat run on a worker (`gio::spawn_blocking`). The
+result is used only if the viewer still shows that photo; a reply for one the user has left is
+dropped.
+
+**Test:** none automated; the GUI tests run without a display.
+
+---
 
 ### B241 — Every closed photo viewer stays in memory with its photo
 
