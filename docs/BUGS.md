@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B241](#b241--every-closed-photo-viewer-stays-in-memory-with-its-photo) | Every closed photo viewer stays in memory with its photo |
 | [B240](#b240--pdfs-mount-can-be-core-dumped-with-the-keys-in-memory) | pdfs mount can be core-dumped with the keys in memory |
 | [B239](#b239----wait-reports-success-for-imports-and-re-dates-that-failed) | --wait reports success for imports and re-dates that failed |
 | [B238](#b238--draining-a-large-offline-batch-is-quadratic-in-its-size) | Draining a large offline batch is quadratic in its size |
@@ -342,6 +343,32 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B241 — Every closed photo viewer stays in memory with its photo
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.2).
+**Where:** `open_photo_viewer` in `crates/pdfs-gui/src/app/pages/photo_viewer.rs`;
+`repaint_share_people` and `repaint_share_link` in
+`crates/pdfs-gui/src/app/widgets/share_dialog.rs`
+
+**Repro:** Open and close the photo viewer twenty times on large photos, and watch the app's
+memory. Or open and close the Share dialog of a shared folder many times.
+
+**Cause.** Every handler of the viewer held a strong `Rc<Viewer>`, and the viewer holds the
+widgets those handlers belong to. Several handlers also held the window, which owns them. Each
+pair was a reference cycle, so a closed viewer was never freed: not its window, and not the
+full-size photo its picture showed. The Share dialog had the same cycle between its state and
+the handlers of the rows inside the groups that state holds.
+
+**Fix.** The handlers hold weak handles to the viewer and its window. The one strong handle sits
+in the window's close handler, which drops it on close and clears the picture. The Share
+dialog's row handlers hold the state weakly too.
+
+**Test:** none automated; the GUI tests run without a display. Checked by reading every handler
+`open_photo_viewer` and the share rows connect.
+
+---
 
 ### B240 — pdfs mount can be core-dumped with the keys in memory
 

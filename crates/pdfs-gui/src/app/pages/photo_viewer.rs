@@ -1260,8 +1260,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     // Any real pointer movement brings the controls back; resting over one of
     // them keeps them up.
     let motion = gtk4::EventControllerMotion::new();
-    let viewer_motion = viewer.clone();
+    let viewer_motion = Rc::downgrade(&viewer);
     motion.connect_motion(move |_, x, y| {
+        let Some(viewer_motion) = viewer_motion.upgrade() else {
+            return;
+        };
         let (last_x, last_y) = viewer_motion.pointer.get();
         viewer_motion.pointer.set((x, y));
         if (x - last_x).abs() > 1.0 || (y - last_y).abs() > 1.0 {
@@ -1271,10 +1274,17 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     body.add_controller(motion);
     for revealer in [&top_reveal, &prev_reveal, &next_reveal] {
         let hover = gtk4::EventControllerMotion::new();
-        let viewer_enter = viewer.clone();
-        hover.connect_enter(move |_, _, _| viewer_enter.chrome_hover.set(true));
-        let viewer_leave = viewer.clone();
+        let viewer_enter = Rc::downgrade(&viewer);
+        hover.connect_enter(move |_, _, _| {
+            if let Some(viewer) = viewer_enter.upgrade() {
+                viewer.chrome_hover.set(true);
+            }
+        });
+        let viewer_leave = Rc::downgrade(&viewer);
         hover.connect_leave(move |_| {
+            let Some(viewer_leave) = viewer_leave.upgrade() else {
+                return;
+            };
             viewer_leave.chrome_hover.set(false);
             show_chrome(&viewer_leave);
         });
@@ -1284,8 +1294,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     // Ctrl+scroll zooms around the pointer; a plain scroll pans a zoomed photo.
     let wheel = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
     wheel.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let viewer_wheel = viewer.clone();
+    let viewer_wheel = Rc::downgrade(&viewer);
     wheel.connect_scroll(move |controller, _, dy| {
+        let Some(viewer_wheel) = viewer_wheel.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
         if !controller
             .current_event_state()
             .contains(gtk4::gdk::ModifierType::CONTROL_MASK)
@@ -1305,14 +1318,20 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     scroller.add_controller(wheel);
 
     let pinch = gtk4::GestureZoom::new();
-    let viewer_pinch = viewer.clone();
+    let viewer_pinch = Rc::downgrade(&viewer);
     pinch.connect_begin(move |_, _| {
+        let Some(viewer_pinch) = viewer_pinch.upgrade() else {
+            return;
+        };
         viewer_pinch
             .pinch_start
             .set(current_scale(&viewer_pinch).unwrap_or(1.0));
     });
-    let viewer_pinch = viewer.clone();
+    let viewer_pinch = Rc::downgrade(&viewer);
     pinch.connect_scale_changed(move |gesture, delta| {
+        let Some(viewer_pinch) = viewer_pinch.upgrade() else {
+            return;
+        };
         let start = viewer_pinch.pinch_start.get();
         zoom_to(
             &viewer_pinch,
@@ -1324,8 +1343,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     // Dragging a zoomed photo pans it.
     let drag = gtk4::GestureDrag::new();
-    let viewer_drag = viewer.clone();
+    let viewer_drag = Rc::downgrade(&viewer);
     drag.connect_drag_begin(move |_, _, _| {
+        let Some(viewer_drag) = viewer_drag.upgrade() else {
+            return;
+        };
         let scroller = &viewer_drag.scroller;
         viewer_drag.drag_start.set((
             scroller.hadjustment().value(),
@@ -1335,8 +1357,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
             viewer_drag.picture.set_cursor_from_name(Some("grabbing"));
         }
     });
-    let viewer_drag = viewer.clone();
+    let viewer_drag = Rc::downgrade(&viewer);
     drag.connect_drag_update(move |_, dx, dy| {
+        let Some(viewer_drag) = viewer_drag.upgrade() else {
+            return;
+        };
         if viewer_drag.zoom.get().is_none() {
             return;
         }
@@ -1344,39 +1369,58 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         viewer_drag.scroller.hadjustment().set_value(x - dx);
         viewer_drag.scroller.vadjustment().set_value(y - dy);
     });
-    let viewer_drag = viewer.clone();
+    let viewer_drag = Rc::downgrade(&viewer);
     drag.connect_drag_end(move |_, _, _| {
+        let Some(viewer_drag) = viewer_drag.upgrade() else {
+            return;
+        };
         if viewer_drag.zoom.get().is_some() {
             viewer_drag.picture.set_cursor_from_name(Some("grab"));
         }
     });
     scroller.add_controller(drag);
 
-    let w_close = window.clone();
+    let w_close = window.downgrade();
     close_btn.connect_clicked(move |_| {
+        let Some(w_close) = w_close.upgrade() else {
+            return;
+        };
         w_close.close();
     });
 
-    let viewer_closing = viewer.clone();
+    // The one strong handle on the viewer. Every handler holds a weak one: a
+    // strong one in a handler of a widget the viewer holds is a cycle, which
+    // kept every closed lightbox, its window and its full-size photo in memory
+    // for the life of the app.
+    let keep = RefCell::new(Some(viewer.clone()));
     window.connect_close_request(move |_| {
-        stop_video(&viewer_closing);
-        disarm_slide(&viewer_closing);
-        if let Some(source) = viewer_closing.chrome_source.borrow_mut().take() {
-            source.remove();
+        if let Some(viewer) = keep.borrow_mut().take() {
+            stop_video(&viewer);
+            disarm_slide(&viewer);
+            if let Some(source) = viewer.chrome_source.borrow_mut().take() {
+                source.remove();
+            }
+            viewer.picture.set_paintable(gtk4::gdk::Paintable::NONE);
         }
         glib::Propagation::Proceed
     });
 
-    let viewer_info = viewer.clone();
+    let viewer_info = Rc::downgrade(&viewer);
     info_toggle.connect_toggled(move |toggle| {
+        let Some(viewer_info) = viewer_info.upgrade() else {
+            return;
+        };
         viewer_info
             .info_revealer
             .set_reveal_child(toggle.is_active());
     });
 
     let ui_slides = ui.clone();
-    let viewer_slides = viewer.clone();
+    let viewer_slides = Rc::downgrade(&viewer);
     slideshow_btn.connect_toggled(move |toggle| {
+        let Some(viewer_slides) = viewer_slides.upgrade() else {
+            return;
+        };
         if toggle.is_active() {
             start_slideshow(&ui_slides, &viewer_slides);
         } else {
@@ -1388,9 +1432,15 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     info_close.connect_clicked(move |_| toggle_off.set_active(false));
 
     let ui_map = ui.clone();
-    let viewer_map = viewer.clone();
-    let w_map = window.clone();
+    let viewer_map = Rc::downgrade(&viewer);
+    let w_map = window.downgrade();
     info_map.connect_clicked(move |_| {
+        let Some(w_map) = w_map.upgrade() else {
+            return;
+        };
+        let Some(viewer_map) = viewer_map.upgrade() else {
+            return;
+        };
         let coords = *viewer_map.coords.borrow();
         if let Some((lat, lon)) = coords {
             w_map.close();
@@ -1399,8 +1449,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     });
 
     let ui_fav = ui.clone();
-    let viewer_fav = viewer.clone();
+    let viewer_fav = Rc::downgrade(&viewer);
     favorite_btn.connect_toggled(move |btn| {
+        let Some(viewer_fav) = viewer_fav.upgrade() else {
+            return;
+        };
         if viewer_fav.favorite_suppress.get() {
             return;
         }
@@ -1444,17 +1497,26 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     // gone, and leaving it open on a trashed photo invites a second Delete on
     // something the user cannot see.
     let ui_delete = ui.clone();
-    let viewer_delete = viewer.clone();
-    let w_delete = window.clone();
+    let viewer_delete = Rc::downgrade(&viewer);
+    let w_delete = window.downgrade();
     delete_btn.connect_clicked(move |_| {
+        let Some(w_delete) = w_delete.upgrade() else {
+            return;
+        };
+        let Some(viewer_delete) = viewer_delete.upgrade() else {
+            return;
+        };
         let uid = viewer_delete.uid.borrow().clone();
         w_delete.close();
         trash_photos(&ui_delete, vec![uid], false);
     });
 
     let ui_group = ui.clone();
-    let viewer_group = viewer.clone();
+    let viewer_group = Rc::downgrade(&viewer);
     group_btn.connect_clicked(move |_| {
+        let Some(viewer_group) = viewer_group.upgrade() else {
+            return;
+        };
         let uid = viewer_group.uid.borrow().clone();
         let next =
             next_group_member(&viewer_group.group.borrow(), &uid).map(|item| item.uid.clone());
@@ -1465,9 +1527,15 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     });
 
     let ui_download = ui.clone();
-    let w_download = window.clone();
-    let viewer_download = viewer.clone();
+    let w_download = window.downgrade();
+    let viewer_download = Rc::downgrade(&viewer);
     download_btn.connect_clicked(move |_| {
+        let Some(w_download) = w_download.upgrade() else {
+            return;
+        };
+        let Some(viewer_download) = viewer_download.upgrade() else {
+            return;
+        };
         if let Some(path) = viewer_download.path.borrow().as_deref() {
             let name = viewer_download.name.borrow();
             save_photo_to_disk(
@@ -1479,23 +1547,35 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         }
     });
 
-    let w_ext = window.clone();
-    let viewer_ext = viewer.clone();
+    let w_ext = window.downgrade();
+    let viewer_ext = Rc::downgrade(&viewer);
     open_ext_btn.connect_clicked(move |_| {
+        let Some(w_ext) = w_ext.upgrade() else {
+            return;
+        };
+        let Some(viewer_ext) = viewer_ext.upgrade() else {
+            return;
+        };
         if let Some(path) = viewer_ext.path.borrow().as_deref() {
             open_with(&w_ext, path, viewer_ext.name.borrow().as_deref());
         }
     });
 
     let ui_prev = ui.clone();
-    let viewer_prev = viewer.clone();
+    let viewer_prev = Rc::downgrade(&viewer);
     prev_btn.connect_clicked(move |_| {
+        let Some(viewer_prev) = viewer_prev.upgrade() else {
+            return;
+        };
         navigate_photo(&ui_prev, &viewer_prev, -1);
     });
 
     let ui_next = ui.clone();
-    let viewer_next = viewer.clone();
+    let viewer_next = Rc::downgrade(&viewer);
     next_btn.connect_clicked(move |_| {
+        let Some(viewer_next) = viewer_next.upgrade() else {
+            return;
+        };
         navigate_photo(&ui_next, &viewer_next, 1);
     });
 
@@ -1504,8 +1584,11 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     // reaching for the image doesn't fling the window shut; a zoomed photo has
     // no backdrop to speak of. Double-click toggles between fitted and 100 %.
     let backdrop = gtk4::GestureClick::new();
-    let viewer_click = viewer.clone();
+    let viewer_click = Rc::downgrade(&viewer);
     backdrop.connect_pressed(move |_, n_press, x, y| {
+        let Some(viewer_click) = viewer_click.upgrade() else {
+            return;
+        };
         if n_press != 2 {
             return;
         }
@@ -1522,9 +1605,15 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
             zoom_to(&viewer_click, Some((fit * 2.0).max(1.0)), Some(anchor));
         }
     });
-    let viewer_click = viewer.clone();
-    let w_click = window.clone();
+    let viewer_click = Rc::downgrade(&viewer);
+    let w_click = window.downgrade();
     backdrop.connect_released(move |_, n_press, x, y| {
+        let Some(w_click) = w_click.upgrade() else {
+            return;
+        };
+        let Some(viewer_click) = viewer_click.upgrade() else {
+            return;
+        };
         if n_press == 1
             && viewer_click.zoom.get().is_none()
             && !over_photo(&viewer_click.picture, x, y)
@@ -1536,9 +1625,15 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let key_controller = gtk4::EventControllerKey::new();
     let ui_key = ui.clone();
-    let viewer_key = viewer.clone();
-    let w_key = window.clone();
+    let viewer_key = Rc::downgrade(&viewer);
+    let w_key = window.downgrade();
     key_controller.connect_key_pressed(move |_, key, _keycode, state| {
+        let Some(w_key) = w_key.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        let Some(viewer_key) = viewer_key.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let playing_video = viewer_key.media.visible_child_name().as_deref() == Some("video");
         match key.name().as_deref() {

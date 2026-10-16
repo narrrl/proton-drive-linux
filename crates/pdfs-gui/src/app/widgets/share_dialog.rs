@@ -507,10 +507,16 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
                 .selected(role_wire_to_index(&entry.role))
                 .valign(gtk4::Align::Center)
                 .build();
-            let state_role = state.clone();
+            // Weak, here and in every row below: the rows belong to groups the
+            // dialog state holds, so a strong handle in a row's handler is a
+            // cycle that kept each closed dialog in memory.
+            let state_role = Rc::downgrade(state);
             let id = entry.id.clone();
             let kind = entry.kind;
             drop.connect_selected_notify(move |d| {
+                let Some(state_role) = state_role.upgrade() else {
+                    return;
+                };
                 share_dialog_op(
                     &state_role,
                     state_role.target.update_role(
@@ -540,12 +546,14 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
             .valign(gtk4::Align::Center)
             .build();
         remove.add_css_class("flat");
-        let state_rm = state.clone();
+        let state_rm = Rc::downgrade(state);
         let id = entry.id.clone();
         let kind = entry.kind;
         let who = entry.email.clone();
         remove.connect_clicked(move |btn| {
-            let state = state_rm.clone();
+            let Some(state) = state_rm.upgrade() else {
+                return;
+            };
             let id = id.clone();
             let button = btn.clone();
             confirm_destructive(
@@ -617,12 +625,12 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                     .valign(gtk4::Align::Center)
                     .build();
                 copy.add_css_class("flat");
-                let state_copy = state.clone();
+                let ui_copy = state.ui.clone();
                 let url_copy = url.clone();
                 copy.connect_clicked(move |btn| {
                     btn.clipboard().set_text(&url_copy);
                     flash_copied(btn, "edit-copy-symbolic");
-                    toast(&state_copy.ui, &gettext("Link copied"));
+                    toast(&ui_copy, &gettext("Link copied"));
                 });
                 row.add_suffix(&copy);
             }
@@ -633,10 +641,12 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                 .valign(gtk4::Align::Center)
                 .build();
             remove.add_css_class("flat");
-            let state_rm = state.clone();
+            let state_rm = Rc::downgrade(state);
             let id = link.id.clone();
             remove.connect_clicked(move |btn| {
-                let state = state_rm.clone();
+                let Some(state) = state_rm.upgrade() else {
+                    return;
+                };
                 let id = id.clone();
                 let button = btn.clone();
                 confirm_destructive(
@@ -690,9 +700,12 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             let btn = create.clone();
             pw_row.connect_entry_activated(move |_| btn.emit_clicked());
 
-            let state_c = state.clone();
+            let state_c = Rc::downgrade(state);
             let pw_for = pw_row.clone();
             create.connect_clicked(move |btn| {
+                let Some(state_c) = state_c.upgrade() else {
+                    return;
+                };
                 if !btn.is_sensitive() {
                     return;
                 }
