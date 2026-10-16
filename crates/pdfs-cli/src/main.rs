@@ -1977,8 +1977,14 @@ fn key_state_name() -> &'static str {
 }
 
 fn cmd_logout() -> Result<()> {
-    auth::logout()?;
-    println!("Stored session cleared.");
+    if auth::logout()? {
+        println!("Signed out: the session is ended on Proton and cleared here.");
+    } else {
+        println!(
+            "Stored session cleared. Proton could not be reached to end the session; \
+             it stays valid until it expires or is signed out in your account's security settings."
+        );
+    }
     Ok(())
 }
 

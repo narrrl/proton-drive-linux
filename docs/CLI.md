@@ -36,7 +36,7 @@ talks to the running service (`proton-drive.service`); `login`, `logout`, `mount
 | Command | Description |
 |---|---|
 | `pdfs login [-u EMAIL]` | Sign in (password, then a 2FA code if the account has one) and store the session in the system keyring. Restarts the service if it is running. |
-| `pdfs logout` | Remove the stored session. |
+| `pdfs logout` | End the session on Proton and remove the stored session. |
 | `pdfs status` | Account, mount, queue and cache state. |
 | `pdfs quota` | Storage used across all Proton products. |
 | `pdfs locations` | Every local place the service occupies: the Proton Drive folder and each synced folder, with mode and state. |

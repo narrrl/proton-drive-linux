@@ -602,7 +602,7 @@ pub(crate) fn sign_out(ui: &Rc<Ui>) {
             glib::spawn_future_local(async move {
                 let result = gio::spawn_blocking(|| {
                     service::disable_stop();
-                    auth::logout().map_err(|e| e.to_string())
+                    auth::logout().map(|_| ()).map_err(|e| e.to_string())
                 })
                 .await;
                 if let Ok(Err(e)) = result {

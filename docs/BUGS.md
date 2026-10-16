@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B233](#b233--signing-out-leaves-the-session-valid-on-proton) | Signing out leaves the session valid on Proton |
 | [B232](#b232--names-with--or--show-as-empty-rows-or-are-drawn-as-markup) | Names with & or < show as empty rows or are drawn as markup |
 | [B231](#b231--a-large-upload-under-a-low-upload-limit-never-finishes) | A large upload under a low upload limit never finishes |
 | [B230](#b230--a-create-queued-offline-adopts-another-devices-file-of-the-same-name) | A create queued offline adopts another device's file of the same name |
@@ -334,6 +335,29 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B233 — Signing out leaves the session valid on Proton
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, logout).
+**Where:** `logout` and `end_server_session` in `crates/pdfs-core/src/auth.rs`; `cmd_logout` in
+`crates/pdfs-cli/src/main.rs`
+
+**Repro:** Copy the keyring entry, run `pdfs logout` (or **Sign Out** in the app), and resume a
+session from the copy.
+
+**Cause.** Signing out only deleted the keyring entry and the local caches. The session was never
+ended on Proton's side, so its tokens stayed valid until they expired. The SDK has the call for
+it (`ProtonApiSession::end`, `DELETE auth/v4`); nothing used it.
+
+**Fix.** Logout resumes the stored session and ends it on Proton before it clears anything
+locally. The call is bounded to 10 s and runs on a thread of its own. When Proton cannot be
+reached, the local sign-out still happens, and `pdfs logout` says that the session stays valid
+until it expires or is signed out in the account's security settings.
+
+**Test:** none automated; ending a session needs a live account.
+
+---
 
 ### B232 — Names with & or < show as empty rows or are drawn as markup
 
