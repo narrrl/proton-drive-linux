@@ -100,10 +100,11 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B227](#b227--reading-a-file-open-for-writing-downloads-on-the-dispatch-loop) | Reading a file open for writing downloads on the dispatch loop |
 | [B226](#b226--thumbnails-of-portrait-phone-photos-lie-on-their-side) | Thumbnails of portrait phone photos lie on their side |
 | [B225](#b225--a-takeout-photo-without-a-sidecar-takes-a-siblings-name-and-date) | A Takeout photo without a sidecar takes a sibling's name and date |
-| [B223](#b223--a-damaged-config-file-is-replaced-with-defaults-on-the-next-settings-change) | A damaged config file is replaced with defaults on the next settings change |
 | [B224](#b224--fallocate-zero-ranges-are-undone-and-collapse-ranges-corrupt-the-file) | `fallocate` zero ranges are undone and collapse ranges corrupt the file |
+| [B223](#b223--a-damaged-config-file-is-replaced-with-defaults-on-the-next-settings-change) | A damaged config file is replaced with defaults on the next settings change |
 | [B222](#b222--a-full-disk-at-close-is-reported-to-nobody-and-fsync-on-a-read-only-file-fails) | A full disk at close is reported to nobody, and `fsync` on a read-only file fails |
 | [B221](#b221--a-cold-listing-holds-the-global-lock-across-a-database-transaction) | A cold listing holds the global lock across a database transaction |
 | [B220](#b220--thumbnails-on-a-stalled-link-hold-up-every-other-request) | Thumbnails on a stalled link hold up every other request |
@@ -329,6 +330,32 @@ a live account since.
 
 Newest first.
 
+### B227 — Reading a file open for writing downloads on the dispatch loop
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.2).
+**Where:** `read` in `crates/pdfs-fuse/src/filesystem.rs`; `Core::serve_open_read_local` and
+`assemble_open_read` in `crates/pdfs-fuse/src/reads.rs`
+
+**Repro:** On a slow link, open a large file that is only on Drive with `O_RDWR`, write a few
+bytes, and read elsewhere in it, as SQLite and many editors do, while another program uses the
+mount.
+
+**Cause.** A read on a file open for writing was always answered on the dispatch loop, so that it
+kept its order with the writes on the same handle. When the bytes it asked for were neither
+written nor cached, it downloaded them there, for up to the 120 s read deadline plus the wait
+for a connection. Every other request of the mount waited behind it.
+
+**Fix.** The dispatch loop answers such a read from the scratch file and the local caches only.
+When a range of the base would have to be downloaded, the read goes to a transfer worker, with
+the handle as it was when the read came in. The kernel issued the read before any later write,
+so that is the content it asked for.
+
+**Test:** `reads::open_read_tests::a_read_needing_the_base_says_so_instead_of_fetching`; the
+simulation runs cover the order of writes and reads on one handle.
+
+---
+
 ### B226 — Thumbnails of portrait phone photos lie on their side
 
 **Status:** Fixed, not verified live
@@ -379,31 +406,6 @@ by its own rule. It takes the capture time from that sidecar and keeps its own n
 
 ---
 
-### B223 — A damaged config file is replaced with defaults on the next settings change
-
-**Status:** Fixed, not verified live
-**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.10).
-**Where:** `AppDirs::save_config`, `AppDirs::load_config` and `refuse_to_replace_unreadable` in
-`crates/pdfs-core/src/config.rs`
-
-**Repro:** Truncate `~/.config/proton-drive-linux/config.json`, then change any setting in the
-app, or let the daemon record its device.
-
-**Cause.** `load_config` gives defaults for a file it cannot parse, and logs that it leaves the
-file alone. But every setter loads, changes one field and saves, in the daemon and in the app.
-So the first change after the damage wrote the defaults over the file, losing the mountpoint,
-the device the client had adopted, the ignore rules and the `open_with` choices. ARCHITECTURE
-§10.5 says the file is never replaced with defaults. The first-run default was also written with a
-plain `std::fs::write`, which is not atomic and takes the umask's mode.
-
-**Fix.** `save_config` refuses while the file on disk exists and does not parse, and says which
-file to fix. The first-run default goes through `save_config`, so it is written atomically with
-mode 0600.
-
-**Test:** `config::tests::an_unreadable_config_is_never_written_over`.
-
----
-
 ### B224 — `fallocate` zero ranges are undone and collapse ranges corrupt the file
 
 **Status:** Fixed, not verified live
@@ -428,6 +430,31 @@ the lock is not held across it.
 
 **Test:** `filesystem::falloc_tests::only_the_modes_a_handle_can_record_are_accepted`,
 `filesystem::falloc_tests::a_zeroed_or_punched_range_counts_as_written`.
+
+---
+
+### B223 — A damaged config file is replaced with defaults on the next settings change
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.10).
+**Where:** `AppDirs::save_config`, `AppDirs::load_config` and `refuse_to_replace_unreadable` in
+`crates/pdfs-core/src/config.rs`
+
+**Repro:** Truncate `~/.config/proton-drive-linux/config.json`, then change any setting in the
+app, or let the daemon record its device.
+
+**Cause.** `load_config` gives defaults for a file it cannot parse, and logs that it leaves the
+file alone. But every setter loads, changes one field and saves, in the daemon and in the app.
+So the first change after the damage wrote the defaults over the file, losing the mountpoint,
+the device the client had adopted, the ignore rules and the `open_with` choices. ARCHITECTURE
+§10.5 says the file is never replaced with defaults. The first-run default was also written with a
+plain `std::fs::write`, which is not atomic and takes the umask's mode.
+
+**Fix.** `save_config` refuses while the file on disk exists and does not parse, and says which
+file to fix. The first-run default goes through `save_config`, so it is written atomically with
+mode 0600.
+
+**Test:** `config::tests::an_unreadable_config_is_never_written_over`.
 
 ---
 

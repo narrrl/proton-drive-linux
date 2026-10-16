@@ -261,10 +261,13 @@ impl Filesystem for ProtonFs {
         // in-flight (possibly unsaved) content: authored bytes come from the
         // scratch file, untouched bytes from the base.
         //
-        // This path stays on the dispatch loop. `write` runs there too, so
-        // keeping its reads there as well preserves the ordering the write path
-        // has always had between a write and a read of the same handle; a mostly
-        // local read is not worth reasoning about that for.
+        // Answered on the dispatch loop when everything it needs is on this
+        // machine, which keeps the order `write` has with reads of the same
+        // handle. A base range that has to be downloaded goes to a worker
+        // instead, with the handle as it was when the read came in: the kernel
+        // issued the read before any write that comes after it, so that is
+        // the content it asked for. On the loop, the download held every
+        // request of the mount (`docs/BUGS.md` B227).
         let handle = {
             let st = self.core.state();
             st.active_writes.get(&ino.0).map(|h| {
@@ -279,7 +282,7 @@ impl Filesystem for ProtonFs {
             })
         };
         if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
-            match self.core.serve_open_read(
+            match self.core.serve_open_read_local(
                 &file,
                 len,
                 &uid,
@@ -289,7 +292,25 @@ impl Filesystem for ProtonFs {
                 offset,
                 size as u64,
             ) {
-                Ok(bytes) => reply.data(&bytes),
+                Ok(Some(bytes)) => reply.data(&bytes),
+                Ok(None) => {
+                    let fs = self.clone();
+                    self.core.workers.run(Lane::Transfer, "read", move || {
+                        match fs.core.serve_open_read(
+                            &file,
+                            len,
+                            &uid,
+                            base_mtime,
+                            base_size,
+                            &written,
+                            offset,
+                            size as u64,
+                        ) {
+                            Ok(bytes) => reply.data(&bytes),
+                            Err(e) => reply.error(e),
+                        }
+                    });
+                }
                 Err(e) => reply.error(e),
             }
             return;
