@@ -11,6 +11,49 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+Schema: **42**, unchanged.
+
+### Fixed
+- **A folder deleted on another device took files with it that had never reached Drive.** A new
+  file, an edit or an ignored `.git` in a synced folder was deleted along with the folder. Such a
+  folder is now kept and created on Drive again (B211).
+- **Files on Drive that could not be decrypted were deleted from the synced folder.** They read
+  as deleted on Drive. They are now left alone and named in the activity feed, and a pass in which
+  nothing synced is left on Drive is refused (B212).
+- **An edit made while a synced folder was being checked could be deleted** when another device
+  had deleted the file. It is now kept and uploaded (B213).
+- **Deleting a synced folder sent another device's new files in it to the trash.** The folder now
+  stays on Drive with them (B214).
+- **A file name on Drive containing `/` or `..` could write outside the synced folder**, and made
+  its folder in the mount fail to list. Such names are left out (B215).
+- **A damaged database lost the changes still waiting to upload.** It is still moved aside and
+  rebuilt, but queued changes, synced folders' state and files kept offline are copied out of it
+  first (B216).
+- **Search slowed down over time, and the database grew far larger than needed.** The search
+  indexes are now compacted once a day; on one machine that took the local index from 317 MiB to
+  20 MiB (B217).
+- **`pdfs diagnose` and `pdfs cache inspect` froze the drive while they checked the database**,
+  for half a minute on a large one. They no longer hold up anything else (B218).
+- **Listing a folder shared with you could freeze the whole drive on a slow connection**, and so
+  could folders of photos asking for thumbnails while the connection stalled (B219, B220).
+- **Opening a large folder for the first time held up every other file operation on the drive.**
+  (B221)
+- **A full disk while saving a file was not reported.** The program saving it now gets the error
+  when it closes the file. Copying a large file into the drive no longer stalls everything else at
+  the end, `fsync` on a file opened for reading no longer fails, and `fallocate` modes the drive
+  cannot honour are refused instead of corrupting the file (B222, B224, B227).
+- **A damaged settings file was replaced with defaults at the next settings change**, losing the
+  mount location and the ignore rules. Settings are no longer saved over a file that cannot be
+  read (B223).
+- **Google Photos import gave some photos another photo's name and date.** A photo without its
+  own metadata file took a similarly named one's, and an edited copy took its original's name. An
+  edited copy now takes its original's date and keeps its own name (B225).
+- **Thumbnails of portrait photos lay on their side**, here and in Proton's own apps (B226).
+
+### Changed
+- **Release binaries are stripped of their symbols**: `pdfs` goes from 43 to 35 MB, `pdfs-app`
+  from 24 to 19 MB and `pdfs-tray` from 12 to 8 MB.
+
 ## [3.4.1] — 2026-10-16
 
 Schema: **42**, unchanged.
