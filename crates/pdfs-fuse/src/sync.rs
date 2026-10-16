@@ -776,7 +776,23 @@ impl Core {
             }
 
             match plan_file(l, r, baseline.get(rel)) {
-                FilePlan::Unchanged => {}
+                // The size was read for real for a row without a revision id
+                // (B254), and still matches: give the row the id, so later
+                // walks trust the recorded size again.
+                FilePlan::Unchanged => {
+                    if let (Some(base), Some(revision)) =
+                        (baseline.get(rel), r.and_then(|r| r.revision.as_ref()))
+                        && base.remote_revision_id.is_none()
+                    {
+                        let row = StoredSyncEntry {
+                            remote_revision_id: Some(revision.clone()),
+                            ..base.clone()
+                        };
+                        if let Err(e) = self.db.sync_entry_upsert(folder_id, &row) {
+                            debug!(rel, error = ?e, "sync: cannot record the revision id");
+                        }
+                    }
+                }
                 FilePlan::AdoptBaseline => {
                     // First sync of a file the same size on both sides: the apply
                     // step hashes the local copy and records the baseline only if

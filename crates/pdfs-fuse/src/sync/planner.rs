@@ -333,6 +333,13 @@ pub(super) fn remote_subtree_changed(
 
 /// The size the baseline recorded for `rel`, if its remote signature's mtime
 /// still matches `mtime` and its revision is still `revision`.
+///
+/// A row without a revision id, while Drive reports one, cannot vouch for the
+/// revision, so the size is read for real. Such a row comes from before
+/// schema 44, or from an upload Drive did not list yet when it was read back.
+/// Another computer's revision in the same second as that upload kept the
+/// modification time, and only the size could show it (B254). The pass then
+/// records the id on the row, so this costs one read per row.
 pub(super) fn unchanged_remote_size(
     baseline: &HashMap<String, StoredSyncEntry>,
     rel: &str,
@@ -340,7 +347,9 @@ pub(super) fn unchanged_remote_size(
     revision: Option<&str>,
 ) -> Option<i64> {
     let base = baseline.get(rel)?;
-    if revision_moved(Some(base), revision) {
+    if revision_moved(Some(base), revision)
+        || (base.remote_revision_id.is_none() && revision.is_some())
+    {
         return None;
     }
     match remote_sig(base) {
@@ -754,6 +763,15 @@ mod file_plan_tests {
         assert_eq!(unchanged_remote_size(&rows, "file", 30, None), Some(40));
         assert_eq!(unchanged_remote_size(&rows, "file", 30, Some("r2")), None);
         assert_eq!(unchanged_remote_size(&rows, "file", 31, Some("r1")), None);
+    }
+
+    /// A row without a revision id reuses its size only while Drive gives no
+    /// id either (B254).
+    #[test]
+    fn a_row_without_a_revision_makes_the_walk_read_the_size_again() {
+        let rows = HashMap::from([("file".to_string(), baseline(10, 20, 30, 40))]);
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, Some("r1")), None);
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, None), Some(40));
     }
 
     #[test]

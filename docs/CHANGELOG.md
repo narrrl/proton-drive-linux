@@ -31,6 +31,9 @@ version on Proton Drive it was synced at. Nothing is rewritten, and the upgrade 
 - **The app showed the sign-in page when the system keyring was locked or not running yet**, as
   if the sign-in had been lost. It now says that the keyring could not be read, and opens on its
   own once the keyring answers (B253).
+- **A new version saved on another computer in the same second as an upload from here could
+  be missed for good** when Drive had not listed the uploaded file yet. The first sync pass
+  after upgrading reads each file's size from Drive once more to close this (B254).
 - **An edit in a synced folder could replace one another computer had just saved.** The newer
   version from the other computer was left only in the version history. The edit is now kept as
   a conflict copy (B249).

@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
 | [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
 | [B251](#b251--two-computers-can-make-the-same-conflict-copy-name) | Two computers can make the same conflict copy name |
@@ -355,6 +356,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B254 — An edit in the same second as a new upload never arrives
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, the B250 simulation failing about one run in five on CI.
+**Where:** `unchanged_remote_size` in `crates/pdfs-fuse/src/sync/planner.rs`; the
+`FilePlan::Unchanged` arm of `do_reconcile` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** A mirror pass uploads a new file, and Drive does not list it yet when the pass
+reads it back. Another computer saves a new revision with the same modification time, to the
+second. The mirror keeps the old content, and no pass ever downloads the new one.
+
+**Cause.** The read-back found no node, so the baseline row got the local modification time
+and size but no revision id. The next walk reused the recorded size whenever the modification
+time matched and the revision id had not moved. A row without an id never counts as moved, so
+the walk never read the new size, and the file looked unchanged.
+
+**Fix.** A row without a revision id reuses its size only while Drive gives no id either.
+Otherwise the walk reads the size for real. If the file is still unchanged, the pass writes
+Drive's revision id into the row, so the cost is one extra read per row. Rows from before
+schema 44 have no id either, so the first pass after upgrading reads every file's size once.
+
+**Test:** `a_row_without_a_revision_makes_the_walk_read_the_size_again` in `pdfs-fuse`. The
+simulation `a_revision_made_during_a_mirror_download_still_arrives` failed 3 of about 15 runs
+before the fix and passed 25 of 25 after it.
+
+---
 
 ### B253 — The app shows the sign-in page when the keyring is locked
 
