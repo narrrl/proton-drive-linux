@@ -45,7 +45,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Unit tests
         run: cargo test --workspace --locked
@@ -66,8 +66,9 @@ jobs:
 
   # The seeded simulation runs (docs/TESTING.md): real FUSE
   # daemons against an in-memory Drive, so they need /dev/fuse but no account.
+  # They run on pull requests too: most data-loss fixes are only exercised
+  # here, and a change that breaks one should not reach main first.
   simulation:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 

@@ -5,7 +5,7 @@ Three layers check the client, from fast and offline to slow and against a real 
 | Layer | Needs | Runs in CI |
 |---|---|---|
 | [Unit tests](#unit-tests) | Nothing | Every push and pull request |
-| [Simulation runs](#simulation-runs) | `/dev/fuse` | Every push to `main` |
+| [Simulation runs](#simulation-runs) | `/dev/fuse` | Every push to `main` and every pull request |
 | [Acceptance suite](#acceptance-suite) | Nothing for the reference run; a signed-in account for the rest | The reference run only |
 
 ## Unit tests
