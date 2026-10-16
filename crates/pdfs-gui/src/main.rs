@@ -361,8 +361,9 @@ fn open_manager(args: &[&str]) {
         .and_then(|p| p.parent().map(|d| d.join("pdfs-app")))
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("pdfs-app"));
-    if let Err(e) = Command::new(&exe).args(args).spawn() {
-        tracing::error!("failed to launch {}: {e}", exe.display());
+    match Command::new(&exe).args(args).spawn() {
+        Ok(child) => pdfs_core::opener::reap(child),
+        Err(e) => tracing::error!("failed to launch {}: {e}", exe.display()),
     }
 }
 

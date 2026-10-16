@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B243](#b243--a-hung-mount-freezes-the-app-when-a-file-is-opened) | A hung mount freezes the app when a file is opened |
 | [B242](#b242--opening-a-large-photo-freezes-the-app) | Opening a large photo freezes the app |
 | [B241](#b241--every-closed-photo-viewer-stays-in-memory-with-its-photo) | Every closed photo viewer stays in memory with its photo |
 | [B240](#b240--pdfs-mount-can-be-core-dumped-with-the-keys-in-memory) | pdfs mount can be core-dumped with the keys in memory |
@@ -344,6 +345,34 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B243 — A hung mount freezes the app when a file is opened
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.3, and the unreaped child processes
+in section 3).
+**Where:** `present_within` in `crates/pdfs-gui/src/activation.rs`; `download_and_open` and
+`open_entry_with` in `crates/pdfs-gui/src/app/pages/browser.rs`; `open_path` in
+`crates/pdfs-gui/src/app/main.rs`; `reap` in `crates/pdfs-core/src/opener.rs`
+
+**Repro:** Let the mount hang (a stalled link with a request stuck in the kernel), then
+double-click a file in the app's browser, or open the Proton Drive location. Separately, open a
+few files from the app and look for `<defunct>` children of `pdfs-app` in `ps`.
+
+**Cause.** Opening a file asked the mount whether it had the file with a `stat` on the GTK main
+thread, and opening a location asked whether it was a folder the same way. A hung mount never
+answers, so the whole app hung with it. The search launcher already asked on a worker with a
+2 s limit. Separately, nothing waited for the applications the app, the tray and the player
+button started, so each one stayed a zombie until the app quit.
+
+**Fix.** The browser's Open and Open With ask through `present_within`, which the launcher now
+shares: a thread of its own, given up on after 2 s, with the daemon as the fallback. Opening a
+location runs on a thread. Every child the GUI starts is waited for on a thread of its own.
+
+**Test:** `opener::tests::a_reaped_child_does_not_stay_a_zombie`; the mount checks have no
+automated test, as the GUI tests run without a display.
+
+---
 
 ### B242 — Opening a large photo freezes the app
 

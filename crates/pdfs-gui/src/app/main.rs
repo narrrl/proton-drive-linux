@@ -297,7 +297,10 @@ fn present_window(app: &adw::Application) {
 /// Spawn the tray icon process in the background.
 pub(crate) fn spawn_tray() {
     match Command::new("pdfs-tray").spawn() {
-        Ok(_) => tracing::info!("spawned `pdfs-tray`"),
+        Ok(child) => {
+            tracing::info!("spawned `pdfs-tray`");
+            pdfs_core::opener::reap(child);
+        }
         Err(e) => tracing::error!("failed to spawn `pdfs-tray`: {e}"),
     }
 }
@@ -1713,9 +1716,12 @@ pub(crate) fn flash_copied(button: &gtk4::Button, icon: &'static str) {
 
 /// Open a local path with the handler the user configured — `xdg-open` unless
 /// `open_with` in `config.json` overrides it for this kind of file.
+///
+/// On a thread of its own: telling a folder from a file is a `stat`, and the
+/// path is often in the mount, which may hang.
 fn open_path(path: &str) {
-    let path = Path::new(path);
-    pdfs_core::opener::open_default(path, path.is_dir());
+    let path = PathBuf::from(path);
+    std::thread::spawn(move || pdfs_core::opener::open_default(&path, path.is_dir()));
 }
 
 /// [`open_path`] for a file the daemon materialised into the content cache,

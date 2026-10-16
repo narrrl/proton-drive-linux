@@ -3481,10 +3481,10 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
 /// right tool for the HEVC `.mkv`s this is aimed at — and falls back to the
 /// user's default handler when mpv isn't installed.
 pub(crate) fn play_external(path: &str) {
-    if Command::new("mpv").arg(path).spawn().is_ok() {
-        return;
+    match Command::new("mpv").arg(path).spawn() {
+        Ok(child) => pdfs_core::opener::reap(child),
+        Err(_) => open_path(path),
     }
-    open_path(path);
 }
 
 #[cfg(test)]
