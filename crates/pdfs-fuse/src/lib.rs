@@ -6165,11 +6165,61 @@ fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
 /// (`sync.rs`, `conflict_path`), so the two halves of the product name the same
 /// situation the same way and a user only has to learn it once.
 fn conflict_name(name: &str, stamp: i64) -> String {
+    conflict_name_as(name, conflict_label(), stamp)
+}
+
+/// [`conflict_name`] with the machine's label given.
+fn conflict_name_as(name: &str, label: &str, stamp: i64) -> String {
     let path = Path::new(name);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let tag = conflict_tag(label, stamp, 0);
     match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => format!("{stem} (sync-conflict {stamp}).{ext}"),
-        None => format!("{stem} (sync-conflict {stamp})"),
+        Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
+        None => format!("{stem} (sync-conflict {tag})"),
+    }
+}
+
+/// This machine's name as its conflict copies carry it (`docs/BUGS.md` B251).
+///
+/// Two computers syncing one folder that each keep a copy of the same file in
+/// the same second would otherwise make the same name on Drive, and nobody
+/// could tell which computer a copy came from. Read once, from the hostname.
+fn conflict_label() -> &'static str {
+    static LABEL: OnceLock<String> = OnceLock::new();
+    LABEL.get_or_init(|| conflict_label_of(&this_hostname()))
+}
+
+/// `host` as one token: anything but ASCII letters, digits, `-`, `_` and `.`
+/// becomes `-`, so the label holds no space for `conflict_base_name` to trip
+/// on and no `/` or `)` to break the name.
+fn conflict_label_of(host: &str) -> String {
+    let label: String = host
+        .chars()
+        .take(32)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    label.trim_matches('-').to_string()
+}
+
+/// The inside of a conflict copy's marker: `<label> <stamp>`, with `-<n>`
+/// when an earlier copy already holds that name. Without a label it is the
+/// bare stamp that copies had before B251.
+fn conflict_tag(label: &str, stamp: i64, suffix: u32) -> String {
+    let suffix = if suffix == 0 {
+        String::new()
+    } else {
+        format!("-{suffix}")
+    };
+    if label.is_empty() {
+        format!("{stamp}{suffix}")
+    } else {
+        format!("{label} {stamp}{suffix}")
     }
 }
 
@@ -7548,14 +7598,15 @@ mod tests {
     use super::{
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
         SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
-        accepted_share_provenance, conflict_name, copy_pending_for_truncate, expand_restore,
-        first_seen_in_trash, fuse_name, is_stale_mount, node_visible, note_self_change,
-        off_the_runtime, orphan_past_retention, parse_node_uid, prepare_shared_roots,
-        preserve_on_access_denied, publish_virtual_root_in_listing,
-        reconcile_virtual_root_in_listing, release_can_discard_unlinked,
-        release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
-        require_node_parent_access, require_rename_access, resolve_anywhere_with,
-        shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
+        accepted_share_provenance, conflict_label, conflict_label_of, conflict_name,
+        conflict_name_as, copy_pending_for_truncate, expand_restore, first_seen_in_trash,
+        fuse_name, is_stale_mount, node_visible, note_self_change, off_the_runtime,
+        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
+        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
+        rename_needs_queue, require_node_parent_access, require_rename_access,
+        resolve_anywhere_with, shared_with_me_uid, take_self_change, uid_write_authority,
+        virtual_node,
     };
     use super::{Db, WriteAuthority};
     use std::time::Duration;
@@ -8510,15 +8561,38 @@ mod tests {
     #[test]
     fn conflict_name_keeps_the_extension() {
         assert_eq!(
-            conflict_name("notes.txt", 1700),
-            "notes (sync-conflict 1700).txt"
+            conflict_name_as("notes.txt", "laptop", 1700),
+            "notes (sync-conflict laptop 1700).txt"
         );
-        assert_eq!(conflict_name("README", 42), "README (sync-conflict 42)");
         assert_eq!(
-            conflict_name("archive.tar.gz", 7),
-            "archive.tar (sync-conflict 7).gz",
+            conflict_name_as("README", "laptop", 42),
+            "README (sync-conflict laptop 42)"
+        );
+        assert_eq!(
+            conflict_name_as("archive.tar.gz", "laptop", 7),
+            "archive.tar (sync-conflict laptop 7).gz",
             "only the last extension is one, as everywhere else"
         );
+        assert_eq!(
+            conflict_name_as("notes.txt", "", 1700),
+            "notes (sync-conflict 1700).txt"
+        );
+        assert_eq!(
+            conflict_name("notes.txt", 1700),
+            conflict_name_as("notes.txt", conflict_label(), 1700)
+        );
+    }
+
+    /// A hostname goes into a file name, so it is cut down to one safe token
+    /// (B251).
+    #[test]
+    fn a_hostname_becomes_one_safe_token() {
+        assert_eq!(conflict_label_of("laptop"), "laptop");
+        assert_eq!(conflict_label_of("my-pc.local"), "my-pc.local");
+        assert_eq!(conflict_label_of("Linux device"), "Linux-device");
+        assert_eq!(conflict_label_of("a/b) c"), "a-b--c");
+        assert_eq!(conflict_label_of("  "), "");
+        assert_eq!(conflict_label_of(&"x".repeat(40)).len(), 32);
     }
 
     #[test]

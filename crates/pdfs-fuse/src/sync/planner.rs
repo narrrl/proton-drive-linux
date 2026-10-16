@@ -318,7 +318,10 @@ pub(super) fn remote_subtree_changed(
         .filter(|(path, item)| match baseline.get(*path) {
             None => true,
             Some(_) if item.is_dir => false,
-            Some(base) => remote_sig(base) != Some((item.mtime, item.size)),
+            Some(base) => {
+                remote_sig(base) != Some((item.mtime, item.size))
+                    || revision_moved(Some(base), item.revision.as_deref())
+            }
         })
         .map(|(path, _)| path)
         .collect();
@@ -329,13 +332,18 @@ pub(super) fn remote_subtree_changed(
 }
 
 /// The size the baseline recorded for `rel`, if its remote signature's mtime
-/// still matches `mtime`.
+/// still matches `mtime` and its revision is still `revision`.
 pub(super) fn unchanged_remote_size(
     baseline: &HashMap<String, StoredSyncEntry>,
     rel: &str,
     mtime: i64,
+    revision: Option<&str>,
 ) -> Option<i64> {
-    match baseline.get(rel).and_then(remote_sig) {
+    let base = baseline.get(rel)?;
+    if revision_moved(Some(base), revision) {
+        return None;
+    }
+    match remote_sig(base) {
         Some((recorded, size)) if recorded == mtime => Some(size),
         _ => None,
     }
@@ -347,6 +355,17 @@ pub(super) fn join_rel(prefix: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{prefix}/{name}")
+    }
+}
+
+/// Whether Drive's active revision `now` is not the one the baseline row was
+/// synced at. Only a revision id on both sides can say so; a row from before
+/// schema 44, or a node read without one, leaves it to the modification time
+/// and size.
+pub(super) fn revision_moved(base: Option<&StoredSyncEntry>, now: Option<&str>) -> bool {
+    match (base.and_then(|b| b.remote_revision_id.as_deref()), now) {
+        (Some(recorded), Some(now)) => recorded != now,
+        _ => false,
     }
 }
 
@@ -380,7 +399,8 @@ pub(super) fn rel_to_path(rel: &str) -> PathBuf {
     rel.split('/').collect()
 }
 
-/// The name for a conflict copy of `path`, e.g. `notes (sync-conflict 1700000000).txt`.
+/// The name for a conflict copy of `path`, e.g.
+/// `notes (sync-conflict laptop 1700000000).txt`.
 #[cfg(test)]
 pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
     conflict_path_with_suffix(path, stamp, 0)
@@ -389,16 +409,17 @@ pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
 /// As [`conflict_path`], with a deterministic suffix used when that name already
 /// exists. This keeps conflict preservation from ever replacing an older copy.
 pub(super) fn conflict_path_with_suffix(path: &Path, stamp: i64, suffix: u32) -> PathBuf {
+    conflict_path_as(path, crate::conflict_label(), stamp, suffix)
+}
+
+/// [`conflict_path_with_suffix`] with the machine's label given.
+pub(super) fn conflict_path_as(path: &Path, label: &str, stamp: i64, suffix: u32) -> PathBuf {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
-    let suffix = if suffix == 0 {
-        String::new()
-    } else {
-        format!("-{suffix}")
-    };
+    let tag = crate::conflict_tag(label, stamp, suffix);
     let name = match ext {
-        Some(ext) => format!("{stem} (sync-conflict {stamp}{suffix}).{ext}"),
-        None => format!("{stem} (sync-conflict {stamp}{suffix})"),
+        Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
+        None => format!("{stem} (sync-conflict {tag})"),
     };
     match path.parent() {
         Some(dir) => dir.join(name),
@@ -419,11 +440,14 @@ pub(super) enum FilePlan {
     DeleteLocal,
     DeleteRemote,
     ForgetBaseline,
-    /// First sync of a file that already exists on both sides with identical
-    /// content: record the baseline without transferring anything. Without this,
+    /// First sync of a file that exists on both sides at the same size, with a
+    /// digest on Drive: record the baseline without transferring anything if
+    /// the local file hashes the same, else keep a conflict copy. Without this,
     /// a folder synced for the first time cuts a `(sync-conflict)` copy of every
     /// pre-existing file, because a missing baseline makes both sides read as
-    /// "changed" (see the mass first-sync conflict storm in docs/BUGS.md).
+    /// "changed" (see the mass first-sync conflict storm in docs/BUGS.md). Size
+    /// alone is not enough: a second machine joining the folder would read a
+    /// different file of the same size as in step (B248).
     AdoptBaseline,
 }
 
@@ -442,8 +466,13 @@ pub(super) fn plan_file(
         // left the file the same length, so it was never uploaded.
         baseline.is_none_or(|base| !LocalSig::from(item).same_content(&LocalSig::from(base)))
     });
+    // Another client's new revision shows in its id even when the link's
+    // modification time and the size come out the same.
     let remote_changed = remote.is_some_and(|item| {
-        baseline.is_none_or(|base| remote_sig(base) != Some((item.mtime, item.size)))
+        baseline.is_none_or(|base| {
+            remote_sig(base) != Some((item.mtime, item.size))
+                || revision_moved(Some(base), item.revision.as_deref())
+        })
     });
 
     match (local, remote) {
@@ -453,10 +482,13 @@ pub(super) fn plan_file(
             (false, true) => FilePlan::Download,
             // With a baseline, both-changed is a genuine concurrent edit and must
             // be preserved as a conflict. Without one, "both changed" only means
-            // this is the first sync and there was nothing to compare to: adopt
-            // the baseline when the sizes already match rather than conflict-copy
-            // an already-identical file. Divergent sizes stay a real conflict.
-            (true, true) if baseline.is_none() && l.size == r.size => FilePlan::AdoptBaseline,
+            // this is the first sync and there was nothing to compare to: when the
+            // sizes match and Drive has a digest to compare against, the apply
+            // step hashes the local file before adopting it. Divergent sizes, or
+            // no digest, stay a real conflict: a missing digest proves nothing.
+            (true, true) if baseline.is_none() && l.size == r.size && r.sha1.is_some() => {
+                FilePlan::AdoptBaseline
+            }
             (true, true) => FilePlan::Conflict,
         },
         (Some(_), None) if baseline.is_none() || local_changed => FilePlan::UploadNew,
@@ -488,6 +520,8 @@ mod file_plan_tests {
             is_dir: false,
             mtime,
             size,
+            revision: None,
+            sha1: None,
         }
     }
 
@@ -505,6 +539,7 @@ mod file_plan_tests {
             local_size,
             remote_rev: Some(remote_mtime.to_string()),
             remote_hash: Some(remote_size.to_string()),
+            remote_revision_id: None,
         }
     }
 
@@ -626,12 +661,28 @@ mod file_plan_tests {
     fn first_sync_of_an_identical_file_adopts_the_baseline_not_a_conflict() {
         // No baseline yet (first sync). Same size on both sides is a pre-existing
         // identical file, not a concurrent edit: adopt it rather than cut a
-        // conflict copy of every file in the folder.
+        // conflict copy of every file in the folder. The apply step still
+        // hashes the local file before it records anything.
+        let local = local(10, 40);
+        let remote = RemoteItem {
+            sha1: Some("da39a3ee".into()),
+            ..remote(30, 40)
+        };
+        assert_eq!(
+            plan_file(Some(&local), Some(&remote), None),
+            FilePlan::AdoptBaseline
+        );
+    }
+
+    /// A file on Drive without a digest cannot be compared without a download,
+    /// and the same size is not the same content (B248).
+    #[test]
+    fn first_sync_without_a_remote_digest_is_a_conflict() {
         let local = local(10, 40);
         let remote = remote(30, 40);
         assert_eq!(
             plan_file(Some(&local), Some(&remote), None),
-            FilePlan::AdoptBaseline
+            FilePlan::Conflict
         );
     }
 
@@ -645,6 +696,64 @@ mod file_plan_tests {
             plan_file(Some(&local), Some(&remote), None),
             FilePlan::Conflict
         );
+    }
+
+    /// Another computer's new revision can leave the modification time and
+    /// the size as they were. The revision id still tells it apart (B249).
+    #[test]
+    fn a_new_remote_revision_is_a_change_even_at_the_same_mtime_and_size() {
+        let mut base = baseline(10, 20, 30, 40);
+        base.remote_revision_id = Some("r1".into());
+        let unedited = local(10, 20);
+        let same = RemoteItem {
+            revision: Some("r1".into()),
+            ..remote(30, 40)
+        };
+        let newer = RemoteItem {
+            revision: Some("r2".into()),
+            ..remote(30, 40)
+        };
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&same), Some(&base)),
+            FilePlan::Unchanged
+        );
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&newer), Some(&base)),
+            FilePlan::Download
+        );
+        let edited = local(11, 20);
+        assert_eq!(
+            plan_file(Some(&edited), Some(&newer), Some(&base)),
+            FilePlan::Conflict
+        );
+
+        // A row from before schema 44 has no id to compare, and a node read
+        // without one says nothing: both fall back to the signature.
+        let old = baseline(10, 20, 30, 40);
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&newer), Some(&old)),
+            FilePlan::Unchanged
+        );
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&remote(30, 40)), Some(&base)),
+            FilePlan::Unchanged
+        );
+    }
+
+    /// The walk reuses the recorded size only while the revision is the one
+    /// the baseline holds.
+    #[test]
+    fn a_moved_revision_makes_the_walk_read_the_size_again() {
+        let mut base = baseline(10, 20, 30, 40);
+        base.remote_revision_id = Some("r1".into());
+        let rows = HashMap::from([("file".to_string(), base)]);
+        assert_eq!(
+            unchanged_remote_size(&rows, "file", 30, Some("r1")),
+            Some(40)
+        );
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, None), Some(40));
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, Some("r2")), None);
+        assert_eq!(unchanged_remote_size(&rows, "file", 31, Some("r1")), None);
     }
 
     #[test]

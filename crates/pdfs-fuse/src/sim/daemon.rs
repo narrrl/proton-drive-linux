@@ -1401,6 +1401,216 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A folder `mirrored` on Drive, synced in mirror mode with `dir/local`,
+    /// which holds `files` before the first pass. Returns the daemon, the
+    /// folder's id and the link it uses.
+    fn start_mirror(
+        drive: &Arc<FakeDrive>,
+        dir: &Path,
+        files: &[(&str, &[u8])],
+    ) -> (Daemon, i64, FakeClient) {
+        let daemon = Daemon::start(dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir(daemon.mountpoint.join("mirrored")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("mirrored").is_some()
+        }));
+        let remote = drive.lookup("mirrored").unwrap();
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(local.join(name), bytes).unwrap();
+        }
+        let folder = reopen(dir)
+            .sync_folder_add(local.to_str().unwrap(), &remote.to_string(), "")
+            .unwrap();
+        let client = drive.client(1, Faults::lan());
+        let daemon = Daemon::start(dir, client.clone()).unwrap();
+        (daemon, folder, client)
+    }
+
+    /// Wait until a pass of the mirror that began after `since` (epoch
+    /// seconds) is over without errors.
+    fn wait_for_pass(daemon: &Daemon, folder: i64, since: i64) -> bool {
+        wait_until(Duration::from_secs(30), || {
+            let Ok(Response::SyncFolders { items }) = daemon.request(&Request::ListSyncFolders)
+            else {
+                return false;
+            };
+            items.iter().any(|f| {
+                f.id == folder && f.state == "idle" && f.progress.is_none() && f.last_sync >= since
+            })
+        })
+    }
+
+    fn conflict_copies(dir: &Path, stem: &str) -> Vec<PathBuf> {
+        let prefix = format!("{stem} (sync-conflict ");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    fn on_drive(drive: &FakeDrive, path: &str) -> Option<Vec<u8>> {
+        match drive.tree().get(path) {
+            Some(Entry::File(content)) => Some(content.to_vec()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_joining_mirror_keeps_a_same_size_different_file_as_a_conflict() {
+        // A computer joining a folder another one syncs found a file of the
+        // same size at the same path and took it for the same file, so the two
+        // went on holding different content (B248). One that is the same is
+        // still taken as it is.
+        let drive = FakeDrive::new();
+        let dir = scratch("join-same-size");
+        let theirs: &[u8] = b"from the other computer";
+        let ours: &[u8] = b"written on this machine";
+        assert_eq!(theirs.len(), ours.len());
+        let daemon = {
+            let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+            std::fs::create_dir(daemon.mountpoint.join("mirrored")).unwrap();
+            assert!(wait_until(Duration::from_secs(30), || {
+                daemon.pending().is_ok_and(|items| items.is_empty())
+                    && drive.lookup("mirrored").is_some()
+            }));
+            daemon
+        };
+        drive.device().write("mirrored/notes.txt", theirs);
+        drive.device().write("mirrored/same.txt", b"identical");
+        let remote = drive.lookup("mirrored").unwrap();
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("notes.txt"), ours).unwrap();
+        std::fs::write(local.join("same.txt"), b"identical").unwrap();
+        reopen(&dir)
+            .sync_folder_add(local.to_str().unwrap(), &remote.to_string(), "")
+            .unwrap();
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        assert!(wait_until(Duration::from_secs(60), || {
+            conflict_copies(&local, "notes").len() == 1
+                && std::fs::read(local.join("notes.txt")).is_ok_and(|b| b == theirs)
+                && drive
+                    .tree()
+                    .keys()
+                    .any(|k| k.starts_with("mirrored/notes (sync-conflict "))
+        }));
+        let copy = &conflict_copies(&local, "notes")[0];
+        assert_eq!(std::fs::read(copy).unwrap(), ours);
+        assert_eq!(on_drive(&drive, "mirrored/notes.txt").unwrap(), theirs);
+        assert!(conflict_copies(&local, "same").is_empty());
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_mirror_edit_does_not_replace_a_revision_another_computer_made_since() {
+        // A local edit went up as a new revision of whatever Drive held at the
+        // time of the upload, from a plan made before another computer saved
+        // its own edit. Its edit was left only in the version history (B249).
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-revision-race");
+        let (daemon, folder, client) =
+            start_mirror(&drive, &dir, &[("a.txt", b"one"), ("b.txt", b"two")]);
+        let local = dir.join("local");
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.lookup("mirrored/a.txt").is_some() && drive.lookup("mirrored/b.txt").is_some()
+        }));
+        assert!(wait_for_pass(&daemon, folder, 0));
+        // The echoes of the first uploads read the files too.
+        std::thread::sleep(Duration::from_secs(2));
+
+        let a = drive.lookup("mirrored/a.txt").unwrap();
+        let check = client.hold_next_read(&a);
+        std::fs::write(local.join("a.txt"), b"edited here").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || check.reached()));
+        drive
+            .device()
+            .write("mirrored/a.txt", b"edited on the other computer");
+        drop(check);
+        assert!(wait_until(Duration::from_secs(30), || {
+            take_logged()
+                .iter()
+                .any(|line| line.contains("changed on Drive since this pass looked"))
+        }));
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+
+        assert!(wait_until(Duration::from_secs(60), || {
+            std::fs::read(local.join("a.txt")).is_ok_and(|b| b == b"edited on the other computer")
+                && conflict_copies(&local, "a").len() == 1
+                && drive
+                    .tree()
+                    .keys()
+                    .any(|k| k.starts_with("mirrored/a (sync-conflict "))
+        }));
+        assert_eq!(
+            std::fs::read(&conflict_copies(&local, "a")[0]).unwrap(),
+            b"edited here"
+        );
+        assert_eq!(
+            on_drive(&drive, "mirrored/a.txt").unwrap(),
+            b"edited on the other computer"
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_revision_made_during_a_mirror_download_still_arrives() {
+        // The baseline after a download read the node again, and recorded a
+        // revision another computer made while the download ran as synced.
+        // The disk held the older one, and the newer never arrived (B250).
+        let drive = FakeDrive::new();
+        let dir = scratch("mirror-download-race");
+        let (daemon, folder, client) =
+            start_mirror(&drive, &dir, &[("a.txt", b"one"), ("b.txt", b"two")]);
+        let local = dir.join("local");
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.lookup("mirrored/a.txt").is_some() && drive.lookup("mirrored/b.txt").is_some()
+        }));
+        assert!(wait_for_pass(&daemon, folder, 0));
+
+        let a = drive.lookup("mirrored/a.txt").unwrap();
+        drive.device().write("mirrored/a.txt", b"second");
+        let download = client.hold_next_download(&a);
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || download.reached()));
+        drive.device().write("mirrored/a.txt", b"thirdd");
+        drop(download);
+        assert!(wait_until(Duration::from_secs(30), || {
+            std::fs::read(local.join("a.txt")).is_ok_and(|b| b == b"second")
+        }));
+        assert!(wait_for_pass(&daemon, folder, 0));
+
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            std::fs::read(local.join("a.txt")).is_ok_and(|b| b == b"thirdd")
+        }));
+        assert!(conflict_copies(&local, "a").is_empty());
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_file_removed_with_its_folder_while_uploading_stays_removed() {

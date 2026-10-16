@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 43;
+pub(super) const SCHEMA_VERSION: i64 = 44;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -448,6 +448,23 @@ impl Db {
             )? > 0;
             if has_ops {
                 tx.execute_batch(MIGRATION_V43)?;
+            }
+        }
+        if current < 44 {
+            // Same guards as V26-V42.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sync_entry') \
+                 WHERE name = 'remote_revision_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_entries: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_entry'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_entries && !has_column {
+                tx.execute_batch(MIGRATION_V44)?;
             }
         }
         tx.execute(
@@ -1350,4 +1367,18 @@ ALTER TABLE pending_op ADD COLUMN sent_to TEXT;
 /// queued rename uses the index too.
 const MIGRATION_V43: &str = "
 CREATE INDEX IF NOT EXISTS pending_op_kind_name ON pending_op(kind, name);
+";
+
+/// Schema v44: a synced file's baseline remembers the revision it was synced
+/// at.
+///
+/// A mirrored file edited here is uploaded as a new revision of whatever is
+/// current on Drive, and another computer syncing the same folder may have
+/// committed one since this pass looked. The revision id is what the upload
+/// checks first, so that edit becomes a conflict copy instead of being
+/// replaced (B249). `NULL` means "this row predates the column", and the check
+/// falls back to the modification time and size; each row gains a real value
+/// the next time its path is synced.
+const MIGRATION_V44: &str = "
+ALTER TABLE sync_entry ADD COLUMN remote_revision_id TEXT;
 ";

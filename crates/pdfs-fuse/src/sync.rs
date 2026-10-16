@@ -34,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use notify::{RecursiveMode, Watcher};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
+use sha1::{Digest as _, Sha1};
 use tracing::{debug, info, warn};
 
 use crate::transfers::{CountingWriter, OwnedCountingReader};
@@ -54,14 +55,16 @@ use engine::{classify, event_target, settle_with};
 #[cfg(test)]
 use local_scan::is_write_mode;
 use local_scan::open_for_write_set;
-use model::{LocalItem, LocalSig, Outcome, PassAbort, Pending, RemoteItem};
+use model::{LocalItem, LocalSig, Outcome, PassAbort, Pending, RemoteItem, RemoteSeen};
 pub(crate) use planner::base_name;
 #[cfg(test)]
 use planner::conflict_path;
+#[cfg(test)]
+use planner::conflict_path_as;
 use planner::{
     FilePlan, RemoteGaps, Unscanned, classification_order, conflict_path_with_suffix,
     filter_baseline, guard_local_wipe, guard_remote_wipe, join_rel, local_deletions, parent_rel,
-    plan_file, rel_to_path, remote_sig, remote_subtree_changed, tracked_baseline,
+    plan_file, rel_to_path, remote_sig, remote_subtree_changed, revision_moved, tracked_baseline,
     unchanged_remote_size,
 };
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
@@ -75,6 +78,9 @@ enum Applied {
     Downloaded,
     /// A conflict copy was kept.
     Conflict,
+    /// A path already the same on both sides got its first baseline. Nothing
+    /// moved, so it is neither counted nor logged.
+    Adopted,
     /// The local file to upload was deleted after the scan planned it. There is
     /// nothing left to send, and the next pass sees the deletion (B108).
     Vanished,
@@ -410,15 +416,16 @@ impl Core {
             .collect();
 
         // One light batch tells us which of those also changed remotely. A light
-        // node carries the modification time without unlocking the node key, and
-        // mtime alone is what the baseline compares against.
+        // node carries the modification time and the revision id without
+        // unlocking the node key, and those are what the baseline compares
+        // against.
         let check: Vec<NodeUid> = changed
             .iter()
             .filter_map(|rel| baseline.get(*rel))
             .filter_map(|e| e.remote_uid.as_deref())
             .filter_map(parse_uid)
             .collect();
-        let remote_mtimes: HashMap<String, i64> = if check.is_empty() {
+        let remote_now: HashMap<String, (i64, Option<String>)> = if check.is_empty() {
             HashMap::new()
         } else {
             self.rt
@@ -426,7 +433,10 @@ impl Core {
                 .map_err(|e| format!("resolve changed nodes: {e}"))?
                 .into_iter()
                 .filter(|n| !n.trashed)
-                .map(|n| (n.uid.to_string(), n.modification_time))
+                .map(|n| {
+                    let revision = crate::node_revision_id(&n);
+                    (n.uid.to_string(), (n.modification_time, revision))
+                })
                 .collect()
         };
         let changed: HashSet<&String> = changed.into_iter().collect();
@@ -507,8 +517,18 @@ impl Core {
                     }
                 },
                 Some(uid) => {
-                    let remote_moved = match remote_mtimes.get(&uid.to_string()) {
-                        Some(mtime) => base.and_then(remote_sig).is_none_or(|(m, _)| m != *mtime),
+                    let (remote_moved, seen) = match remote_now.get(&uid.to_string()) {
+                        Some((mtime, revision)) => {
+                            let recorded = base.and_then(remote_sig);
+                            let moved = recorded.is_none_or(|(m, _)| m != *mtime)
+                                || revision_moved(base, revision.as_deref());
+                            let seen = RemoteSeen {
+                                mtime: *mtime,
+                                size: recorded.map_or(0, |(_, size)| size),
+                                revision: revision.clone(),
+                            };
+                            (moved, seen)
+                        }
                         // Trashed or unreadable remotely — treat as gone and re-upload
                         // the local copy as a new file rather than losing it.
                         None => {
@@ -540,6 +560,7 @@ impl Core {
                         batch.push(Pending::UploadRevision {
                             rel: rel.clone(),
                             uid,
+                            seen,
                         });
                     }
                 }
@@ -757,26 +778,22 @@ impl Core {
             match plan_file(l, r, baseline.get(rel)) {
                 FilePlan::Unchanged => {}
                 FilePlan::AdoptBaseline => {
-                    // First sync of an already-identical file: record the baseline
-                    // in place so future divergence is detected, without any
-                    // transfer or a spurious conflict copy.
+                    // First sync of a file the same size on both sides: the apply
+                    // step hashes the local copy and records the baseline only if
+                    // it matches Drive's digest (B248).
                     let local = l.expect("adopt baseline requires a local file");
                     let remote = r.expect("adopt baseline requires a remote file");
-                    if let Err(e) = self.db.sync_entry_upsert(
-                        folder_id,
-                        &StoredSyncEntry {
-                            rel_path: rel.clone(),
-                            remote_uid: Some(remote.uid.to_string()),
-                            local_mtime: local.mtime,
-                            local_mtime_ns: local.mtime_ns,
-                            local_size: local.size,
-                            remote_rev: Some(remote.mtime.to_string()),
-                            remote_hash: Some(remote.size.to_string()),
-                        },
-                    ) {
-                        warn!(rel, error = ?e, "sync: adopt baseline failed");
-                        outcome.errors += 1;
-                    }
+                    let sha1 = remote
+                        .sha1
+                        .clone()
+                        .expect("adopt baseline requires a remote digest");
+                    batch.push(Pending::Adopt {
+                        rel: rel.clone(),
+                        uid: remote.uid.clone(),
+                        seen: RemoteSeen::from(remote),
+                        sha1,
+                        local: LocalSig::from(local),
+                    });
                 }
                 FilePlan::Deferred => {
                     debug!(
@@ -790,6 +807,7 @@ impl Core {
                     batch.push(Pending::UploadRevision {
                         rel: rel.clone(),
                         uid: remote.uid.clone(),
+                        seen: RemoteSeen::from(remote),
                     });
                 }
                 FilePlan::Download => {
@@ -797,8 +815,7 @@ impl Core {
                     batch.push(Pending::Download {
                         rel: rel.clone(),
                         uid: remote.uid.clone(),
-                        mtime: remote.mtime,
-                        size: remote.size,
+                        seen: RemoteSeen::from(remote),
                         // What the walk saw here, so the apply step can tell a
                         // stale plan from a live one before it overwrites.
                         local: l.map(LocalSig::from),
@@ -809,8 +826,7 @@ impl Core {
                     batch.push(Pending::Conflict {
                         rel: rel.clone(),
                         uid: remote.uid.clone(),
-                        mtime: remote.mtime,
-                        size: remote.size,
+                        seen: RemoteSeen::from(remote),
                     });
                 }
                 FilePlan::UploadNew => match remote_dirs.get(parent_rel(rel)) {
@@ -1107,19 +1123,31 @@ impl Core {
             .iter()
             .filter(|n| !n.trashed && !n.is_folder())
             .filter(|n| {
-                unchanged_remote_size(baseline, &join_rel(prefix, &n.name), n.modification_time)
-                    .is_none()
+                unchanged_remote_size(
+                    baseline,
+                    &join_rel(prefix, &n.name),
+                    n.modification_time,
+                    crate::node_revision_id(n).as_deref(),
+                )
+                .is_none()
             })
             .map(|n| n.uid.clone())
             .collect();
-        let sized: HashMap<String, i64> = if stale.is_empty() {
+        // The full enumeration also decrypts the content digest, which the
+        // first sync of a path compares against the local file (B248).
+        let sized: HashMap<String, (i64, Option<String>)> = if stale.is_empty() {
             HashMap::new()
         } else {
             self.rt
                 .block_on(self.drive.enumerate_nodes(&stale))
                 .map_err(|e| format!("resolve nodes: {e}"))?
                 .iter()
-                .map(|n| (n.uid.to_string(), remote_file_sig(n).1))
+                .map(|n| {
+                    (
+                        n.uid.to_string(),
+                        (remote_file_sig(n).1, crate::node_content_sha1(n)),
+                    )
+                })
                 .collect()
         };
         let stale: HashSet<String> = stale.iter().map(|u| u.to_string()).collect();
@@ -1139,13 +1167,15 @@ impl Core {
                         is_dir: true,
                         mtime: 0,
                         size: 0,
+                        revision: None,
+                        sha1: None,
                     },
                 );
                 self.walk_remote(folder_id, &node.uid, &rel, walk, baseline)?;
             } else {
-                let size = if stale.contains(&node.uid.to_string()) {
+                let (size, sha1) = if stale.contains(&node.uid.to_string()) {
                     match sized.get(&node.uid.to_string()) {
-                        Some(size) => *size,
+                        Some(sized) => sized.clone(),
                         // Its size was needed but could not be read (the full
                         // enumeration skipped it as undecryptable). Leave it out
                         // rather than record a stale size, and say so: missing,
@@ -1156,18 +1186,25 @@ impl Core {
                         }
                     }
                 } else {
-                    match unchanged_remote_size(baseline, &rel, node.modification_time) {
-                        Some(size) => size,
+                    match unchanged_remote_size(
+                        baseline,
+                        &rel,
+                        node.modification_time,
+                        crate::node_revision_id(&node).as_deref(),
+                    ) {
+                        Some(size) => (size, None),
                         None => continue,
                     }
                 };
                 walk.out.insert(
                     rel,
                     RemoteItem {
+                        revision: crate::node_revision_id(&node),
                         uid: node.uid,
                         is_dir: false,
                         mtime: node.modification_time,
                         size,
+                        sha1,
                     },
                 );
             }
@@ -1188,6 +1225,7 @@ impl Core {
                     local_size: 0,
                     remote_rev: None,
                     remote_hash: None,
+                    remote_revision_id: None,
                 },
             )
             .map_err(|e| format!("baseline dir {rel}: {e:?}"))
@@ -1289,6 +1327,7 @@ impl Core {
         self.progress_finished(folder_id);
         let name = base_name(op.rel());
         match &result {
+            Ok(Applied::Adopted) => {}
             Ok(_) => self.log_activity(op.kind(), name, op.detail(), true),
             Err(e) => self.log_activity(op.kind(), name, e.clone(), false),
         }
@@ -1318,41 +1357,68 @@ impl Core {
             Pending::UploadNew { rel, parent } => {
                 self.upload_new(folder_id, local_root, rel, parent).await
             }
-            Pending::UploadRevision { rel, uid } => {
-                self.upload_revision(folder_id, local_root, rel, uid).await
+            Pending::UploadRevision { rel, uid, seen } => {
+                self.upload_revision(folder_id, local_root, rel, uid, seen)
+                    .await
             }
             Pending::Download {
                 rel,
                 uid,
-                mtime,
-                size,
+                seen,
                 local,
             } => {
-                self.download_file(folder_id, local_root, rel, uid, *mtime, *size, *local)
+                self.download_file(folder_id, local_root, rel, uid, seen, *local)
                     .await?;
                 Ok(Applied::Downloaded)
             }
-            Pending::Conflict {
+            Pending::Adopt {
                 rel,
                 uid,
-                mtime,
-                size,
+                seen: remote,
+                sha1,
+                local,
             } => {
-                // Set the local copy aside (it re-uploads as a new file next
-                // pass), then take the remote version as the shared truth.
                 let path = local_root.join(rel_to_path(rel));
-                if path.exists() {
-                    preserve_conflict_copy(&path, now_secs())
-                        .map_err(|e| format!("set aside conflict copy for {rel}: {e}"))?;
-                    info!(rel, "sync: kept local changes as a conflict copy");
+                let hashed = tokio::task::spawn_blocking(move || local_sha1(&path))
+                    .await
+                    .map_err(|e| format!("hash {rel}: {e}"))?
+                    .map_err(|e| format!("hash {rel}: {e}"))?;
+                let Some((seen, digest)) = hashed else {
+                    return Ok(Applied::Vanished);
+                };
+                // Edited since the scan: the next pass plans it again.
+                if !seen.same_content(local) {
+                    return Ok(Applied::Vanished);
                 }
-                // The local copy has just been moved aside, so the state this
-                // download expects to find at the path is "nothing" — anything
-                // that appears while it runs is a *new* racing write, and gets
-                // its own conflict copy rather than being overwritten (B39).
-                self.download_file(folder_id, local_root, rel, uid, *mtime, *size, None)
-                    .await?;
-                Ok(Applied::Conflict)
+                if !digest.eq_ignore_ascii_case(sha1) {
+                    info!(
+                        rel,
+                        "sync: same size as on Drive but different content; keeping a conflict copy"
+                    );
+                    return self
+                        .take_remote_keeping_local(folder_id, local_root, rel, uid, remote)
+                        .await;
+                }
+                self.db
+                    .sync_entry_upsert(
+                        folder_id,
+                        &StoredSyncEntry {
+                            rel_path: rel.clone(),
+                            remote_uid: Some(uid.to_string()),
+                            local_mtime: seen.mtime,
+                            local_mtime_ns: seen.mtime_ns,
+                            local_size: seen.size,
+                            remote_rev: Some(remote.mtime.to_string()),
+                            remote_hash: Some(remote.size.to_string()),
+                            remote_revision_id: remote.revision.clone(),
+                        },
+                    )
+                    .map_err(|e| format!("adopt baseline {rel}: {e:?}"))?;
+                Ok(Applied::Adopted)
+            }
+            Pending::Conflict { rel, uid, seen } => {
+                self.take_remote_keeping_local(folder_id, local_root, rel, uid, seen)
+                    .await
             }
             Pending::PushConflict { rel, parent } => {
                 // The ordinary conflict resolution — rename the local copy aside and
@@ -1374,6 +1440,31 @@ impl Core {
                 Ok(Applied::Conflict)
             }
         }
+    }
+
+    /// Set the local copy aside (it re-uploads as a new file next pass), then
+    /// take the remote version as the shared truth.
+    async fn take_remote_keeping_local(
+        &self,
+        folder_id: i64,
+        local_root: &Path,
+        rel: &str,
+        uid: &NodeUid,
+        seen: &RemoteSeen,
+    ) -> Result<Applied, String> {
+        let path = local_root.join(rel_to_path(rel));
+        if path.exists() {
+            preserve_conflict_copy(&path, now_secs())
+                .map_err(|e| format!("set aside conflict copy for {rel}: {e}"))?;
+            info!(rel, "sync: kept local changes as a conflict copy");
+        }
+        // The local copy has just been moved aside, so the state this
+        // download expects to find at the path is "nothing" — anything
+        // that appears while it runs is a *new* racing write, and gets
+        // its own conflict copy rather than being overwritten (B39).
+        self.download_file(folder_id, local_root, rel, uid, seen, None)
+            .await?;
+        Ok(Applied::Conflict)
     }
 
     /// Upload a brand-new local file to its remote parent, then record baseline.
@@ -1400,11 +1491,11 @@ impl Core {
         // Count the bytes as they are read, so this upload shows up in
         // `GetQueueStatus` next to a manual one. The uid isn't known until the
         // draft is sealed, so the transfer registers without one.
-        let reader = OwnedCountingReader::new(
+        let (reader, sent) = Sha1Tap::new(OwnedCountingReader::new(
             file,
             self.transfers
                 .begin(name, "", TransferDirection::Upload, meta.len()),
-        );
+        ));
         let uid = self
             .drive
             // Mirror push: the local file is authoritative. If a prior attempt was
@@ -1428,30 +1519,60 @@ impl Core {
         // snapshot that predates this upload (B86).
         self.invalidate_children_of(parent);
         warn_if_torn(rel, &path, streamed);
-        self.record_file_baseline(folder_id, rel, Some(streamed), &uid)
+        let remote = self
+            .landed_as_sent(rel, &uid, &sent.digest(), streamed)
             .await?;
+        self.record_file_baseline(folder_id, rel, Some(streamed), &uid, &remote)?;
         Ok(Applied::Uploaded)
     }
 
     /// Upload a changed local file as a new revision of an existing remote node.
+    ///
+    /// The revision supersedes whatever is current on Drive, and the plan comes
+    /// from a walk that may be minutes old. Another computer syncing the same
+    /// folder may have committed a revision since, and uploading over it would
+    /// leave that edit only in the revision history. So Drive is asked first,
+    /// and a file that moved on is left for the next pass, which keeps the
+    /// local edit as a conflict copy (B249). A revision committed between this
+    /// check and the upload's own draft is not caught here; the read-back after
+    /// the upload catches one committed after it.
     async fn upload_revision(
         &self,
         folder_id: i64,
         local_root: &Path,
         rel: &str,
         uid: &NodeUid,
+        seen: &RemoteSeen,
     ) -> Result<Applied, String> {
         let path = local_root.join(rel_to_path(rel));
         let Some(file) = open_to_upload(&path, rel)? else {
             return Ok(Applied::Vanished);
         };
+        let current = self
+            .drive
+            .enumerate_nodes(std::slice::from_ref(uid))
+            .await
+            .map_err(|e| format!("check {rel} on Drive: {e}"))?;
+        match current.first() {
+            Some(node) if !node.trashed && seen.still_current(node) => {}
+            Some(node) if !node.trashed => {
+                return Err(format!(
+                    "{rel} changed on Drive since this pass looked; it is compared again on the next pass"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "{rel} is no longer on Drive where this pass saw it; it is compared again on the next pass"
+                ));
+            }
+        }
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
         let streamed = LocalSig::from(&meta);
         let thumbnails = self
             .upload_thumbnails_async(path.clone(), base_name(rel).to_string())
             .await;
-        let reader = OwnedCountingReader::new(
+        let (reader, sent) = Sha1Tap::new(OwnedCountingReader::new(
             file,
             self.transfers.begin(
                 base_name(rel),
@@ -1459,14 +1580,16 @@ impl Core {
                 TransferDirection::Upload,
                 meta.len(),
             ),
-        );
+        ));
         self.drive
             .upload_new_revision_from(uid, reader, meta.len() as i64, thumbnails, Some(mtime))
             .await
             .map_err(|e| format!("upload revision {rel}: {e}"))?;
         warn_if_torn(rel, &path, streamed);
-        self.record_file_baseline(folder_id, rel, Some(streamed), uid)
+        let remote = self
+            .landed_as_sent(rel, uid, &sent.digest(), streamed)
             .await?;
+        self.record_file_baseline(folder_id, rel, Some(streamed), uid, &remote)?;
         Ok(Applied::Uploaded)
     }
 
@@ -1478,17 +1601,23 @@ impl Core {
     /// for minutes, so the destination is re-examined right before it: a local
     /// file that no longer matches the plan is set aside as a conflict copy
     /// instead of being replaced (`docs/BUGS.md` B39).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The baseline records `seen`, the revision the pass planned to download,
+    /// and not a read of the node afterwards. Another computer may commit a
+    /// revision while the download runs, and a read-back would record that
+    /// revision as synced while the disk holds the older one, so its edit would
+    /// never arrive (B250). If the download did fetch the newer revision, the
+    /// next pass fetches it once more, which costs a transfer and loses nothing.
     async fn download_file(
         &self,
         folder_id: i64,
         local_root: &Path,
         rel: &str,
         uid: &NodeUid,
-        mtime: i64,
-        size: i64,
+        seen: &RemoteSeen,
         expected_local: Option<LocalSig>,
     ) -> Result<(), String> {
+        let (mtime, size) = (seen.mtime, seen.size);
         let path = local_root.join(rel_to_path(rel));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir for {rel}: {e}"))?;
@@ -1560,14 +1689,60 @@ impl Core {
         }
         // Here the file on disk *is* the transferred content: it was published
         // by a rename and stamped just above, so its stat is the identity.
-        self.record_file_baseline(folder_id, rel, local_sig(&path), uid)
-            .await
+        self.record_file_baseline(folder_id, rel, local_sig(&path), uid, seen)
     }
 
-    /// Refresh a file's baseline from ground truth: the local identity these
-    /// bytes came from and the remote node's reported signature. Called after
-    /// every upload/download so the very next reconcile sees the path as
-    /// unchanged.
+    /// What Drive holds for `uid` after this daemon uploaded content with SHA-1
+    /// `sent` and identity `streamed` to it, as the baseline should record it.
+    ///
+    /// Read back so the stored signature is exactly what a walk reports next
+    /// time. A digest on Drive that is not `sent` means another computer
+    /// committed a revision right after this upload. Recording that revision
+    /// as synced would hide it, and the edit here would be lost to it on the
+    /// next download. So the baseline is left as it was, and the next pass sees
+    /// both sides changed and keeps a conflict copy (B250).
+    async fn landed_as_sent(
+        &self,
+        rel: &str,
+        uid: &NodeUid,
+        sent: &str,
+        streamed: LocalSig,
+    ) -> Result<RemoteSeen, String> {
+        let node = match self.drive.enumerate_nodes(std::slice::from_ref(uid)).await {
+            Ok(nodes) => nodes.into_iter().next(),
+            Err(e) => {
+                warn!(rel, error = %e, "sync: baseline refetch failed; using local mtime");
+                None
+            }
+        };
+        let Some(node) = node else {
+            // Drive does not list a node it has just made at once. The upload
+            // stamped it with the local modification time, so that and the
+            // size sent are what a walk reports.
+            return Ok(RemoteSeen {
+                mtime: streamed.mtime,
+                size: streamed.size,
+                revision: None,
+            });
+        };
+        if let Some(digest) = crate::node_content_sha1(&node)
+            && !digest.eq_ignore_ascii_case(sent)
+        {
+            return Err(format!(
+                "{rel} was changed on Drive by another client right after this upload; it is compared again on the next pass"
+            ));
+        }
+        let (mtime, size) = remote_file_sig(&node);
+        Ok(RemoteSeen {
+            mtime,
+            size,
+            revision: crate::node_revision_id(&node),
+        })
+    }
+
+    /// Record a file's baseline: the local identity these bytes came from and
+    /// the remote revision they were synced with. Called after every
+    /// upload/download so the very next reconcile sees the path as unchanged.
     ///
     /// `local` is the identity the *transferred content* corresponds to, which
     /// is not always the file's current stat. An upload streams the live file,
@@ -1577,28 +1752,16 @@ impl Core {
     /// locally changed and upload a whole, clean revision over it. Recording the
     /// post-upload stat instead declared the torn revision synchronized and left
     /// it as the file's content on Drive (`docs/BUGS.md` B40).
-    async fn record_file_baseline(
+    fn record_file_baseline(
         &self,
         folder_id: i64,
         rel: &str,
         local: Option<LocalSig>,
         uid: &NodeUid,
+        remote: &RemoteSeen,
     ) -> Result<(), String> {
         let Some(local) = local else {
             return Err(format!("stat {rel}: no local identity to baseline"));
-        };
-        let (lmtime, lsize) = (local.mtime, local.size);
-        // Re-fetch the node so the stored remote signature is exactly what a walk
-        // will report next time.
-        let (rmtime, rsize) = match self.drive.enumerate_nodes(std::slice::from_ref(uid)).await {
-            Ok(nodes) => nodes
-                .first()
-                .map(remote_file_sig)
-                .unwrap_or((lmtime, lsize)),
-            Err(e) => {
-                warn!(rel, error = %e, "sync: baseline refetch failed; using local mtime");
-                (lmtime, lsize)
-            }
         };
         self.db
             .sync_entry_upsert(
@@ -1606,15 +1769,62 @@ impl Core {
                 &StoredSyncEntry {
                     rel_path: rel.to_string(),
                     remote_uid: Some(uid.to_string()),
-                    local_mtime: lmtime,
+                    local_mtime: local.mtime,
                     local_mtime_ns: local.mtime_ns,
-                    local_size: lsize,
-                    remote_rev: Some(rmtime.to_string()),
-                    remote_hash: Some(rsize.to_string()),
+                    local_size: local.size,
+                    remote_rev: Some(remote.mtime.to_string()),
+                    remote_hash: Some(remote.size.to_string()),
+                    remote_revision_id: remote.revision.clone(),
                 },
             )
             .map_err(|e| format!("baseline {rel}: {e:?}"))
     }
+}
+
+/// A [`Read`] that hashes what an upload reads through it, so the digest Drive
+/// reports afterwards can be compared with what was sent.
+struct Sha1Tap<R> {
+    inner: R,
+    hasher: Arc<Mutex<Sha1>>,
+}
+
+/// The digest of what went through a [`Sha1Tap`], read once the upload is in.
+struct SentDigest(Arc<Mutex<Sha1>>);
+
+impl<R: std::io::Read> Sha1Tap<R> {
+    fn new(inner: R) -> (Self, SentDigest) {
+        let hasher = Arc::new(Mutex::new(Sha1::new()));
+        let digest = SentDigest(hasher.clone());
+        (Self { inner, hasher }, digest)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Sha1Tap<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.lock().update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl SentDigest {
+    fn digest(&self) -> String {
+        crate::takeout::hex_lower(&self.0.lock().clone().finalize())
+    }
+}
+
+/// A local file's identity and content SHA-1, both read from one descriptor,
+/// or `None` when it is gone. The identity is taken after the hash, so a file
+/// written to while it was hashed no longer matches the scan's.
+fn local_sha1(path: &Path) -> std::io::Result<Option<(LocalSig, String)>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let digest =
+        crate::takeout::sha1_of(&mut file).map_err(|e| std::io::Error::other(e.message))?;
+    Ok(Some((LocalSig::from(&file.metadata()?), digest)))
 }
 
 /// Open a local file for upload, or `None` when it is gone.
@@ -2337,6 +2547,8 @@ mod tests {
             is_dir,
             mtime: 1,
             size: 1,
+            revision: None,
+            sha1: None,
         }
     }
 
@@ -2580,6 +2792,7 @@ mod tests {
                 local_mtime_ns: None,
                 remote_rev: Some(mtime.to_string()),
                 remote_hash: Some(size.to_string()),
+                remote_revision_id: None,
             },
         )])
     }
@@ -2588,20 +2801,23 @@ mod tests {
     fn an_unchanged_mtime_reuses_the_recorded_size() {
         // The whole point: this file's node key never gets unlocked.
         let base = baseline_with("a.txt", 1700, 4096);
-        assert_eq!(unchanged_remote_size(&base, "a.txt", 1700), Some(4096));
+        assert_eq!(
+            unchanged_remote_size(&base, "a.txt", 1700, None),
+            Some(4096)
+        );
     }
 
     #[test]
     fn a_moved_mtime_forces_the_size_to_be_read() {
         let base = baseline_with("a.txt", 1700, 4096);
-        assert_eq!(unchanged_remote_size(&base, "a.txt", 1701), None);
+        assert_eq!(unchanged_remote_size(&base, "a.txt", 1701, None), None);
     }
 
     #[test]
     fn a_file_missing_from_the_baseline_forces_the_size_to_be_read() {
         // Nothing recorded to trust — a file the sync has never seen.
         let base = baseline_with("a.txt", 1700, 4096);
-        assert_eq!(unchanged_remote_size(&base, "new.txt", 1700), None);
+        assert_eq!(unchanged_remote_size(&base, "new.txt", 1700, None), None);
     }
 
     #[test]
@@ -2618,9 +2834,10 @@ mod tests {
                 local_mtime_ns: None,
                 remote_rev: None,
                 remote_hash: None,
+                remote_revision_id: None,
             },
         )]);
-        assert_eq!(unchanged_remote_size(&base, "d", 0), None);
+        assert_eq!(unchanged_remote_size(&base, "d", 0, None), None);
     }
 
     #[test]
@@ -2633,6 +2850,7 @@ mod tests {
             local_mtime_ns: None,
             remote_rev: Some("1700".into()),
             remote_hash: Some("4096".into()),
+            remote_revision_id: None,
         };
         assert_eq!(remote_sig(&e), Some((1700, 4096)));
     }
@@ -2647,6 +2865,7 @@ mod tests {
             local_mtime_ns: None,
             remote_rev: None,
             remote_hash: None,
+            remote_revision_id: None,
         };
         assert_eq!(remote_sig(&e), None);
     }
@@ -2699,8 +2918,11 @@ mod tests {
         let op = Pending::Download {
             rel: "photo.jpg".into(),
             uid: uid(),
-            mtime: 0,
-            size: 10,
+            seen: RemoteSeen {
+                mtime: 0,
+                size: 10,
+                revision: None,
+            },
             local: None,
         };
         assert_eq!(op.kind(), ActivityKind::Download);
@@ -2713,13 +2935,21 @@ mod tests {
 
     #[test]
     fn conflict_path_keeps_extension_and_directory() {
-        let p = conflict_path(Path::new("/home/me/docs/notes.txt"), 1700);
+        let p = conflict_path_as(Path::new("/home/me/docs/notes.txt"), "laptop", 1700, 0);
         assert_eq!(
             p,
-            PathBuf::from("/home/me/docs/notes (sync-conflict 1700).txt")
+            PathBuf::from("/home/me/docs/notes (sync-conflict laptop 1700).txt")
         );
-        let no_ext = conflict_path(Path::new("/home/me/README"), 42);
-        assert_eq!(no_ext, PathBuf::from("/home/me/README (sync-conflict 42)"));
+        let no_ext = conflict_path_as(Path::new("/home/me/README"), "laptop", 42, 2);
+        assert_eq!(
+            no_ext,
+            PathBuf::from("/home/me/README (sync-conflict laptop 42-2)")
+        );
+        // The engine names its copies after this machine.
+        assert_eq!(
+            conflict_path(Path::new("/home/me/README"), 42),
+            conflict_path_as(Path::new("/home/me/README"), crate::conflict_label(), 42, 0)
+        );
     }
 
     #[test]
@@ -2735,8 +2965,8 @@ mod tests {
         assert_eq!(std::fs::read(&existing).unwrap(), b"older conflict");
         assert_eq!(std::fs::read(&preserved).unwrap(), b"new local edit");
         assert_eq!(
-            preserved.file_name().unwrap(),
-            "notes (sync-conflict 1700-1).txt"
+            preserved,
+            conflict_path_as(&source, crate::conflict_label(), 1700, 1)
         );
         assert!(!source.exists());
         std::fs::remove_dir_all(dir).unwrap();
@@ -3018,6 +3248,7 @@ mod tests {
             local_size: sig.size,
             remote_rev: None,
             remote_hash: None,
+            remote_revision_id: None,
         };
         (rel.to_string(), entry)
     }

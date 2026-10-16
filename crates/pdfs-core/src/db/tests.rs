@@ -1327,6 +1327,7 @@ fn a_rebuild_keeps_the_queue_baselines_and_pins_of_the_damaged_file() {
             local_size: 6,
             remote_rev: Some("7".into()),
             remote_hash: Some("8".into()),
+            remote_revision_id: None,
         },
     )
     .unwrap();
@@ -5343,6 +5344,7 @@ fn baseline_row(rel: &str) -> StoredSyncEntry {
         local_size: 7,
         remote_rev: Some("1700000000".into()),
         remote_hash: Some("7".into()),
+        remote_revision_id: None,
     }
 }
 
@@ -5437,6 +5439,7 @@ fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
             local_size: 2,
             remote_rev: Some("3".into()),
             remote_hash: Some("2".into()),
+            remote_revision_id: None,
             local_mtime_ns: None,
         },
     )
@@ -5454,6 +5457,7 @@ fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
             local_size: 2,
             remote_rev: Some("3".into()),
             remote_hash: Some("2".into()),
+            remote_revision_id: None,
             local_mtime_ns: None,
         },
     )
@@ -6631,6 +6635,71 @@ fn migration_v27_adds_the_access_deferral_column_to_a_v26_queue() {
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
 
+/// V44 adds the remote revision a baseline row was synced at. A row carried
+/// over from V43 has none, and the mirror then compares the modification time
+/// and size as before, so upgrading changes nothing about what is in step
+/// (`docs/BUGS.md` B249).
+#[test]
+fn migration_v44_adds_the_synced_revision_without_disturbing_a_v43_baseline() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v43-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let row = StoredSyncEntry {
+        rel_path: "notes.txt".into(),
+        remote_uid: Some("vol~notes".into()),
+        local_mtime: 1_700_000_000,
+        local_mtime_ns: Some(1_700_000_000_123_456_789),
+        local_size: 42,
+        remote_rev: Some("1700000000".into()),
+        remote_hash: Some("42".into()),
+        remote_revision_id: Some("rev-1".into()),
+    };
+    {
+        let db = Db::open(&path).unwrap();
+        let folder = db
+            .sync_folder_add("/home/me/Mirror", "vol~root", "share")
+            .unwrap();
+        db.sync_entry_upsert(folder, &row).unwrap();
+    }
+    {
+        // Put the file back in the state a released V43 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sync_entry DROP COLUMN remote_revision_id;
+             UPDATE sync_state SET value = '43' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    let entry = entries.get("notes.txt").expect("the baseline row survives");
+    assert_eq!(
+        entry,
+        &StoredSyncEntry {
+            remote_revision_id: None,
+            ..row.clone()
+        }
+    );
+
+    // And the column is live, including through a move of the row.
+    db.sync_entry_upsert(1, &row).unwrap();
+    db.sync_entries_move(1, "notes.txt", 1, "moved.txt")
+        .unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    assert_eq!(
+        entries["moved.txt"].remote_revision_id.as_deref(),
+        Some("rev-1")
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A mirror baseline carried over from V27 keeps its rows, and each one reads
 /// back with no nanosecond time. That `None` is the whole point: it makes the
 /// comparison fall back to whole seconds for rows written before the column
@@ -6661,6 +6730,7 @@ fn migration_v28_adds_sub_second_local_times_without_disturbing_a_v27_baseline()
                 local_size: 42,
                 remote_rev: Some("1700000000".into()),
                 remote_hash: Some("42".into()),
+                remote_revision_id: None,
             },
         )
         .unwrap();

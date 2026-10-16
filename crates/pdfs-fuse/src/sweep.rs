@@ -37,10 +37,12 @@ const CONFLICT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// fresh mount does at startup (hydrate, recover, initial enumeration).
 const CONFLICT_SWEEP_WARMUP: Duration = Duration::from_secs(30);
 
-/// Strip a ` (sync-conflict <stamp>)` (optionally `-<n>`) marker from `name`,
-/// returning the original file name it was a copy of. `None` when `name` is not a
-/// conflict copy. Inverse of the `conflict_name` / `conflict_path_with_suffix`
-/// formats, so the two halves of the product agree on what a conflict is.
+/// Strip a ` (sync-conflict <label> <stamp>)` (optionally `-<n>`) marker from
+/// `name`, returning the original file name it was a copy of. The label names
+/// the computer that made the copy (B251); copies made before it have the bare
+/// stamp. `None` when `name` is not a conflict copy. Inverse of the
+/// `conflict_name` / `conflict_path_with_suffix` formats, so the two halves of
+/// the product agree on what a conflict is.
 pub(crate) fn conflict_base_name(name: &str) -> Option<String> {
     const MARKER: &str = " (sync-conflict ";
     let start = name.find(MARKER)?;
@@ -48,6 +50,20 @@ pub(crate) fn conflict_base_name(name: &str) -> Option<String> {
     let close_rel = name[after..].find(')')?;
     let close = after + close_rel;
     let inner = &name[after..close];
+    // A label is one token of the characters `conflict_label_of` keeps.
+    let inner = match inner.rsplit_once(' ') {
+        Some((label, token)) => {
+            let label_ok = !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !label_ok {
+                return None;
+            }
+            token
+        }
+        None => inner,
+    };
     // The token is `<digits>` or `<digits>-<digits>`; reject anything else so a
     // file that merely happens to contain the phrase is not mistaken for a copy.
     let mut parts = inner.splitn(2, '-');
@@ -486,6 +502,24 @@ mod tests {
             conflict_base_name("notes (sync-conflict 1700-3).txt").as_deref(),
             Some("notes.txt")
         );
+        // Named after the computer that made it (B251).
+        assert_eq!(
+            conflict_base_name("notes (sync-conflict laptop 1700).txt").as_deref(),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            conflict_base_name("notes (sync-conflict my-pc.local 1700-2).txt").as_deref(),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            conflict_base_name(&crate::conflict_name("notes.txt", 1700)).as_deref(),
+            Some("notes.txt")
+        );
+        assert_eq!(
+            conflict_base_name("x (sync-conflict two words 1).txt"),
+            None
+        );
+        assert_eq!(conflict_base_name("x (sync-conflict  1).txt"), None);
         // Not a conflict copy.
         assert_eq!(conflict_base_name("report.xml"), None);
         // Looks close but the token is not a stamp.

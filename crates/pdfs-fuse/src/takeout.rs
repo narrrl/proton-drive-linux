@@ -625,7 +625,7 @@ pub(crate) fn sha1_of(reader: &mut (dyn Read + Send)) -> CoreResult<String> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
