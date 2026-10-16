@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B221](#b221--a-cold-listing-holds-the-global-lock-across-a-database-transaction) | A cold listing holds the global lock across a database transaction |
 | [B220](#b220--thumbnails-on-a-stalled-link-hold-up-every-other-request) | Thumbnails on a stalled link hold up every other request |
 | [B219](#b219--listing-a-shared-folder-freezes-the-whole-mount-on-a-slow-link) | Listing a shared folder freezes the whole mount on a slow link |
 | [B218](#b218--pdfs-diagnose-freezes-the-mount-while-it-checks-the-database) | `pdfs diagnose` freezes the mount while it checks the database |
@@ -322,6 +323,35 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B221 — A cold listing holds the global lock across a database transaction
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.4).
+**Where:** `Core::list_children` in `crates/pdfs-fuse/src/lib.rs`; `State::intern_batch_with_inos`,
+`inos_for` and `State::record_listed` in `crates/pdfs-fuse/src/state.rs`; `serve_mkdir` in
+`crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** List a large folder for the first time while another program stats files elsewhere in
+the mount, and while the drain is busy.
+
+**Cause.** A new node's inode comes from its row's local id, which `Db::lids_for` allocates in a
+write transaction. A cold listing ran that transaction for every new child while it held the
+global state lock, and then marked the folder listed, also under the lock. Every inline handler
+of every mount waits on that lock, and the transaction itself waits on the single write
+connection that the drain and the sync engine also use. That went against the `StateGuard`
+outbox, which exists so that the lock is released before the writes are done. Marking the folder
+listed before its children's rows were written also meant a crash in between left a folder
+recorded as complete with no children.
+
+**Fix.** `inos_for` allocates the listing's ids before the lock is taken, and
+`intern_batch_with_inos` uses them. Marking a folder listed goes through the outbox with
+`record_listed`, after the children's rows.
+
+**Test:** `state::tests::inodes_allocated_before_the_lock_are_the_ones_the_node_keeps`,
+`state::tests::a_listing_is_recorded_complete_after_its_children`.
+
+---
 
 ### B220 — Thumbnails on a stalled link hold up every other request
 

@@ -2716,6 +2716,7 @@ impl Core {
             return Ok(());
         }
 
+        let preassigned = state::inos_for(&self.db, &filtered_nodes);
         let mut st = self.state();
         // Lost the race? Another thread already populated it.
         if st.children.contains_key(&ino) {
@@ -2737,15 +2738,14 @@ impl Core {
             })
             .map(|n| n.uid.clone())
             .collect();
-        let inos = st.intern_batch(ino, filtered_nodes);
+        let inos = st.intern_batch_with_inos(ino, filtered_nodes, preassigned);
         child_inos.extend(inos);
         st.children.insert(ino, child_inos);
         let root_snapshot = primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
         // Record the listing as complete so a later restart (or a trimmed hot
-        // cache) can rebuild it from the DB without the API.
-        if let Err(e) = self.db.set_listed(&folder_uid, true) {
-            warn!(%folder_uid, error = %e, "db set_listed(true) failed");
-        }
+        // cache) can rebuild it from the DB without the API. Written with the
+        // children's rows when the lock goes, not under it.
+        st.record_listed(folder_uid.clone());
         drop(st);
         self.flush_access_changes();
         if let Some(snapshot) = root_snapshot {

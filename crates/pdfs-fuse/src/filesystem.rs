@@ -1717,9 +1717,7 @@ impl ProtonFs {
         // empty, which it is, so reads stay offline-clean across a restart too.
         if local {
             st.children.insert(ino, Vec::new());
-            if let Err(e) = self.core.db.set_listed(&uid, true) {
-                warn!(%uid, error = %e, "db set_listed(true) failed for local folder");
-            }
+            st.record_listed(uid);
         }
         let entry = st.entries.get(&ino).unwrap();
         let attr = self.attr(ino, &entry.node, entry.access);

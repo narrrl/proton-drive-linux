@@ -212,6 +212,31 @@ pub(crate) fn lid_ino(lid: i64) -> u64 {
     lid.unsigned_abs() + crate::ROOT_INO
 }
 
+/// The inodes of the stored nodes among `nodes`, from their local ids, for
+/// [`State::intern_batch_with_inos`]. Called before the state lock is taken;
+/// a node that already has a row keeps its id. Empty when the database fails,
+/// which leaves the allocation to the lock holder, as before.
+pub(crate) fn inos_for(db: &Db, nodes: &[Node]) -> HashMap<NodeUid, u64> {
+    let stored: Vec<&Node> = nodes
+        .iter()
+        .filter(|node| !crate::r#virtual::is_virtual_uid(&node.uid))
+        .collect();
+    if stored.is_empty() {
+        return HashMap::new();
+    }
+    match db.lids_for(&stored) {
+        Ok(lids) => stored
+            .iter()
+            .zip(lids)
+            .map(|(node, lid)| (node.uid.clone(), lid_ino(lid)))
+            .collect(),
+        Err(error) => {
+            warn!(%error, "no local ids before the listing; allocating them under the lock");
+            HashMap::new()
+        }
+    }
+}
+
 /// The local id of the node at inode `ino`, the inverse of [`lid_ino`]:
 /// `None` for the root and a fallback inode.
 pub(crate) fn ino_lid(ino: u64) -> Option<i64> {
@@ -1074,20 +1099,34 @@ impl State {
     ///
     /// This is what keeps `ls` on a large folder quick: one commit for the
     /// listing, rather than one autocommit — and one fsync — per child.
-    pub(crate) fn intern_batch(&mut self, parent: u64, mut nodes: Vec<Node>) -> Vec<u64> {
+    #[cfg(test)]
+    pub(crate) fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
+        self.intern_batch_with_inos(parent, nodes, HashMap::new())
+    }
+
+    /// [`State::intern_batch`], with inodes for new entries that the caller
+    /// allocated before it took the lock, from [`inos_for`]. Allocating them
+    /// is a write transaction, and under the lock every inline handler of
+    /// every mount waited for it (`docs/BUGS.md` B221). A node missing from
+    /// `inos` still gets one here.
+    pub(crate) fn intern_batch_with_inos(
+        &mut self,
+        parent: u64,
+        mut nodes: Vec<Node>,
+        mut inos: HashMap<NodeUid, u64>,
+    ) -> Vec<u64> {
         for node in &mut nodes {
             self.keep_revision_mtime(node);
         }
         self.outbox.push(DbWrite::Upsert(nodes.clone()));
         let fresh: Vec<&Node> = nodes
             .iter()
-            .filter(|node| !self.by_uid.contains_key(&node.uid))
+            .filter(|node| !self.by_uid.contains_key(&node.uid) && !inos.contains_key(&node.uid))
             .collect();
-        let mut inos = if fresh.is_empty() {
-            HashMap::new()
-        } else {
-            self.new_inos(&fresh)
-        };
+        if !fresh.is_empty() {
+            let allocated = self.new_inos(&fresh);
+            inos.extend(allocated);
+        }
         nodes
             .into_iter()
             .map(|node| {
@@ -1096,6 +1135,13 @@ impl State {
                 self.intern_mem_at(parent, node, access, ino)
             })
             .collect()
+    }
+
+    /// Record `uid`'s listing as complete once the lock is released, after the
+    /// rows of its children: written the other way round, a crash between the
+    /// two left a folder marked complete with no children to show.
+    pub(crate) fn record_listed(&mut self, uid: NodeUid) {
+        self.outbox.push(DbWrite::SetListed(uid, true));
     }
 
     /// Check if a directory inode has any child nodes in memory or in the database.
@@ -1465,6 +1511,44 @@ mod tests {
             restarted.intern_batch(0, vec![node("a", "root", "a.txt", false)]),
             [inos[0]]
         );
+    }
+
+    /// A listing's inodes are allocated before the lock is taken, and are the
+    /// ones a node would get under it (`docs/BUGS.md` B221).
+    #[test]
+    fn inodes_allocated_before_the_lock_are_the_ones_the_node_keeps() {
+        let (mut st, _dir) = state();
+        let db = st.db.clone();
+        let listing = vec![
+            node("a", "root", "a.txt", false),
+            node("b", "root", "b.txt", false),
+        ];
+        let early = inos_for(&db, &listing);
+        assert_eq!(early.len(), 2);
+        let inos = st.intern_batch_with_inos(0, listing, early.clone());
+        assert_eq!(inos, [early[&uid("a")], early[&uid("b")]]);
+        st.flush_outbox();
+
+        let mut restarted = State::new(db, HashMap::new());
+        assert_eq!(
+            restarted.intern(0, node("b", "root", "b.txt", false)),
+            early[&uid("b")]
+        );
+    }
+
+    /// The listing is recorded complete with its children's rows, when the
+    /// lock goes, never ahead of them.
+    #[test]
+    fn a_listing_is_recorded_complete_after_its_children() {
+        let (mut st, _dir) = state();
+        let root = st.intern(0, node("root", "none", "root", true));
+        st.flush_outbox();
+        st.intern_batch(root, vec![node("a", "root", "a.txt", false)]);
+        st.record_listed(uid("root"));
+        assert!(st.db.children_if_listed(&uid("root")).unwrap().is_none());
+        st.flush_outbox();
+        let kids = st.db.children_if_listed(&uid("root")).unwrap().unwrap();
+        assert_eq!(kids.len(), 1);
     }
 
     /// Audit A5. Moving a file out of a folder leaves that folder's DB row
