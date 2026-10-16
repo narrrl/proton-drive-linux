@@ -89,6 +89,11 @@ upgrade takes a moment.
 - **`pdfs mount`, `login`, `unlock` and `logout` could be core-dumped with the account's keys in
   memory.** Only the background service was protected. A file named like an option, such as
   `--json`, also broke the file manager's "Keep offline" script (B240).
+- **Signing in while the system keyring was locked froze the app window** until the keyring was
+  unlocked (B246).
+- **A program the background service started could keep it from being restarted when it hung**
+  (B245).
+- **The tray's transfer line was not translated** (B247).
 
 ### Changed
 - **Draining a large batch of offline changes no longer slows down with its size.** The queue is
