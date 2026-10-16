@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 42;
+pub(super) const SCHEMA_VERSION: i64 = 43;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -438,6 +438,16 @@ impl Db {
             )? > 0;
             if has_ops && !has_column {
                 tx.execute_batch(MIGRATION_V42)?;
+            }
+        }
+        if current < 43 {
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops {
+                tx.execute_batch(MIGRATION_V43)?;
             }
         }
         tx.execute(
@@ -1329,4 +1339,15 @@ DROP TABLE local_v41;
 const MIGRATION_V42: &str = "
 ALTER TABLE pending_op ADD COLUMN sent_sha1 TEXT;
 ALTER TABLE pending_op ADD COLUMN sent_to TEXT;
+";
+
+/// Schema v43: queued ops by kind and name.
+///
+/// Before each create, rename and trash the drain asks whether a queued trash
+/// or rename holds the name it wants, and a released name wakes the ops
+/// waiting for it. Each of those scanned the whole queue, so a large offline
+/// batch made draining it quadratic. The kind leads, so a lookup of every
+/// queued rename uses the index too.
+const MIGRATION_V43: &str = "
+CREATE INDEX IF NOT EXISTS pending_op_kind_name ON pending_op(kind, name);
 ";

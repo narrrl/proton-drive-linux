@@ -11,7 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **42**, unchanged.
+Schema: **43**. Queued changes get an index by kind and name. Nothing is rewritten, and the
+upgrade takes a moment.
 
 ### Fixed
 - **A folder deleted on another device took files with it that had never reached Drive.** A new

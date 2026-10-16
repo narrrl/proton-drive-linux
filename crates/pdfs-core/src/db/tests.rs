@@ -7531,6 +7531,30 @@ fn a_refused_change_names_its_node_by_local_id() {
     );
 }
 
+/// The name checks the drain makes before each op look the name up in an
+/// index. Scanning the queue instead made a large offline batch quadratic.
+#[test]
+fn queue_name_checks_use_an_index() {
+    let db = Db::open_in_memory().unwrap();
+    let conn = db.conn.lock();
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    for sql in [
+        "SELECT 1 FROM pending_op WHERE kind = 'trash' AND name = 'a'",
+        "SELECT 1 FROM pending_op WHERE name = 'a' AND kind IN ('create', 'mkdir', 'rename')",
+        "SELECT 1 FROM pending_op WHERE kind = 'rename'",
+    ] {
+        let plan = plan(sql);
+        assert!(plan.contains("pending_op_kind_name"), "{sql}: {plan}");
+    }
+}
+
 /// A reconnect moves up the ops that failed for want of a link. One Drive
 /// refused, for quota or access, keeps its backoff: the link coming back
 /// changes nothing about it. "Retry all" still moves both.

@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B238](#b238--draining-a-large-offline-batch-is-quadratic-in-its-size) | Draining a large offline batch is quadratic in its size |
 | [B237](#b237--every-reconnect-resends-refused-uploads-all-in-the-same-second) | Every reconnect resends refused uploads, all in the same second |
 | [B236](#b236--imported-re-dated-and-app-uploaded-photos-have-no-thumbnail) | Imported, re-dated and app-uploaded photos have no thumbnail |
 | [B235](#b235--scanning-a-large-takeout-folder-takes-half-a-minute) | Scanning a large Takeout folder takes half a minute |
@@ -339,6 +340,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B238 — Draining a large offline batch is quadratic in its size
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.2.5).
+**Where:** `MIGRATION_V43` in `crates/pdfs-core/src/db/migrations.rs`; the queries in
+`has_pending_trash_named`, `has_withdrawn_create`, `has_pending_move_from` and
+`wake_ops_waiting_for_tx` in `crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Offline, copy a folder of 20,000 small files into the mount, then go online and watch
+the queue drain.
+
+**Cause.** Before each create, rename and trash, the drain asks whether a queued trash or rename
+holds the name it wants, and a name that is let go wakes the ops waiting for it. Nothing indexed
+the queue by name, so each of those questions read the whole queue. Draining a large offline
+batch therefore took time quadratic in its size, under the database's write lock for the wake.
+
+**Fix.** Schema 43 adds an index on `pending_op(kind, name)`. The kind leads, so the lookup of
+every queued rename uses it too. The `json_extract` on a rename's original name still reads the
+renames, which are few.
+
+**Test:** `db::tests::queue_name_checks_use_an_index`, which checks the query plans.
+
+---
 
 ### B237 — Every reconnect resends refused uploads, all in the same second
 
