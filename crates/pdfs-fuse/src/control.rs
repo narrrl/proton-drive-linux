@@ -915,6 +915,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         capture_time,
                         ..Default::default()
                     };
+                    let thumbnails = core.upload_thumbnails(Path::new(&source_path), &name);
                     let guard =
                         core.transfers
                             .begin(name.clone(), "", TransferDirection::Upload, len);
@@ -924,7 +925,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                         &media_type,
                         reader,
                         len as i64,
-                        Vec::new(),
+                        thumbnails,
                         metadata,
                         false,
                     )) {

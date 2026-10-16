@@ -434,6 +434,16 @@ fn exiftool_query(
     serde_json::from_slice(&output).map_err(|_| RawPreviewUnavailable)
 }
 
+/// Whether [`upload_thumbnails`] can make a thumbnail for a file `name` of
+/// `size` bytes, asked before the file is on disk: an image small enough to
+/// decode, or a video while ffmpeg is installed.
+pub(crate) fn can_make_thumbnail(name: &str, size: u64) -> bool {
+    if is_video_name(name) {
+        return ffmpeg_available();
+    }
+    is_thumbnail_image_name(name) && size <= UPLOAD_IMAGE_MAX_BYTES
+}
+
 /// Whether `name` is a video, whose thumbnail is a frame ffmpeg grabs rather
 /// than a picture the image decoder can scale.
 fn is_video_name(name: &str) -> bool {
@@ -2109,9 +2119,10 @@ impl Core {
 #[cfg(test)]
 mod thumb_tests {
     use super::{
-        RawTempFile, ScaleAttempt, THUMB_EDGE, UPLOAD_THUMB_MAX_BYTES, exiftool_binary,
-        fit_upload_thumb, is_video_name, ratio_of, scale_thumbnail, scale_thumbnail_with_exiftool,
-        similar_hashes, thumbnail_build_may_start, upload_thumbnails_with, video_thumbnail,
+        RawTempFile, ScaleAttempt, THUMB_EDGE, UPLOAD_IMAGE_MAX_BYTES, UPLOAD_THUMB_MAX_BYTES,
+        can_make_thumbnail, exiftool_binary, ffmpeg_available, fit_upload_thumb, is_video_name,
+        ratio_of, scale_thumbnail, scale_thumbnail_with_exiftool, similar_hashes,
+        thumbnail_build_may_start, upload_thumbnails_with, video_thumbnail,
     };
     use pdfs_core::control::{ThumbnailBuildStatus, is_thumbnail_image_name};
     use proton_drive_rs::ThumbnailType;
@@ -2191,6 +2202,17 @@ mod thumb_tests {
 
     /// A phone stores a portrait photo as landscape pixels and an EXIF
     /// orientation; its thumbnail came out on its side (`docs/BUGS.md` B226).
+    /// A Takeout photo is copied out of its archive only when a thumbnail can
+    /// be made from the copy.
+    #[test]
+    fn only_a_photo_that_can_have_a_thumbnail_is_worth_copying_out() {
+        assert!(can_make_thumbnail("IMG_1.jpg", 4 << 20));
+        assert!(can_make_thumbnail("Screenshot.png", 4 << 20));
+        assert!(!can_make_thumbnail("IMG_1.jpg", UPLOAD_IMAGE_MAX_BYTES + 1));
+        assert!(!can_make_thumbnail("notes.txt", 10));
+        assert_eq!(can_make_thumbnail("clip.mp4", 1 << 30), ffmpeg_available());
+    }
+
     #[test]
     fn a_thumbnail_is_turned_the_way_its_exif_says() {
         let ScaleAttempt::Made(thumb) = scale_thumbnail(

@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B236](#b236--imported-re-dated-and-app-uploaded-photos-have-no-thumbnail) | Imported, re-dated and app-uploaded photos have no thumbnail |
 | [B235](#b235--scanning-a-large-takeout-folder-takes-half-a-minute) | Scanning a large Takeout folder takes half a minute |
 | [B234](#b234--any-folder-can-become-a-sync-root-the-home-folder-included) | Any folder can become a sync root, the home folder included |
 | [B233](#b233--signing-out-leaves-the-session-valid-on-proton) | Signing out leaves the session valid on Proton |
@@ -337,6 +338,32 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B236 — Imported, re-dated and app-uploaded photos have no thumbnail
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.2).
+**Where:** `Core::import_takeout` and `stage_takeout_entry` in `crates/pdfs-fuse/src/takeout.rs`;
+`Core::redate_one` in `redate.rs`; the `UploadPhoto` request in `control.rs`;
+`can_make_thumbnail` in `photos.rs`
+
+**Repro:** Import a Google Takeout export, re-date a photo, or upload a photo from the app's
+gallery. Look at the new photos in Proton's web or phone app.
+
+**Cause.** All three paths uploaded with an empty thumbnail list. The drain and the mirror sync
+make thumbnails for what they upload, but these three did not, so the photos showed as blank
+tiles in Proton's apps. The 3.0 changelog says imports carry thumbnails.
+
+**Fix.** The re-date and the app's upload make thumbnails from the file they upload. A Takeout
+photo that can have a thumbnail (an image small enough to decode, or a video while ffmpeg is
+installed) is copied out of the archive into the private staging folder first. The thumbnail is
+made from the copy, the upload reads the copy, and the copy is removed. When the copy fails, the
+photo is uploaded from the archive without a thumbnail, as before.
+
+**Test:** `photos::thumb_tests::only_a_photo_that_can_have_a_thumbnail_is_worth_copying_out`; the
+thumbnail itself is covered by the existing `thumb_tests`.
+
+---
 
 ### B235 — Scanning a large Takeout folder takes half a minute
 
