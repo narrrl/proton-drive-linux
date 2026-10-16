@@ -630,6 +630,16 @@ enum DeviceCmd {
         #[arg(long, conflicts_with = "uid")]
         clear: bool,
     },
+    /// Sync the same folders as another computer: this machine continues that
+    /// computer's device alongside it, and its folders are offered for syncing
+    /// here. Both computers keep them in step.
+    Join {
+        /// Device uid (from `devices list`).
+        uid: String,
+        /// Skip the confirmation and accept every proposed local path.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Move another computer's folders into this computer's backup and sync
     /// them here. The other computer stays registered, without those folders.
     Migrate {
@@ -991,6 +1001,26 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
             }
             let uid = if clear { None } else { uid };
             ok_or_bail(control_request(CtlRequest::AdoptDevice { uid })?)?
+        }
+        DeviceCmd::Join { uid, yes } => {
+            if !yes {
+                println!(
+                    "This computer syncs into that device alongside it. Its folders are kept\n\
+                     in step on both computers: an edit or a deletion on one reaches the other.\n\
+                     New synced folders here go under that device too. Folders already synced\n\
+                     here stay where they are."
+                );
+                confirm("Sync with it?")?;
+            }
+            let response = control_request(CtlRequest::AdoptDevice { uid: Some(uid) })?;
+            // A script gets the one reply and runs `sync restore` itself.
+            if emit_json(&response)? {
+                return Ok(());
+            }
+            ok_or_bail(response)?;
+            // The device is this machine's now, so the plain restore offers its
+            // folders.
+            cmd_sync_restore(yes, None)?
         }
         DeviceCmd::Migrate { uid, yes } => {
             if !yes {
