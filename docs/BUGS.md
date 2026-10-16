@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B218](#b218--pdfs-diagnose-freezes-the-mount-while-it-checks-the-database) | `pdfs diagnose` freezes the mount while it checks the database |
 | [B217](#b217--the-search-indexes-grow-to-many-times-their-size-and-slow-search-down) | The search indexes grow to many times their size and slow search down |
 | [B216](#b216--a-damaged-database-is-rebuilt-without-the-writes-still-queued-in-it) | A damaged database is rebuilt without the writes still queued in it |
 | [B215](#b215--a-remote-name-holding--or--becomes-a-path-outside-the-sync-folder) | A remote name holding `/` or `..` becomes a path outside the sync folder |
@@ -319,6 +320,27 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B218 — `pdfs diagnose` freezes the mount while it checks the database
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.2.2). `PRAGMA integrity_check` took
+33.9 s on a copy of a live 567 MiB `cache.db`.
+**Where:** `Db::integrity_check` and `Db::stats` in `crates/pdfs-core/src/db/maintenance.rs`
+
+**Repro:** Run `pdfs diagnose` or `pdfs cache inspect` on a large database while copying files
+into the mount.
+
+**Cause.** Both read the whole file through the single write connection. Every write in the
+daemon took that connection's mutex in the meantime: the write-through of the tree, the drain's
+claims, every enqueue. So the mount looked hung for as long as the check ran.
+
+**Fix.** Both run on a pooled read connection. WAL lets them read a consistent snapshot while the
+writer goes on. `VACUUM` still needs the write connection and remains a deliberate command.
+
+**Test:** `db::maintenance::tests::the_integrity_check_and_stats_do_not_wait_for_the_writer`.
+
+---
 
 ### B217 — The search indexes grow to many times their size and slow search down
 

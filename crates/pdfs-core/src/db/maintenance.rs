@@ -91,8 +91,13 @@ impl Db {
     /// Returns an empty vector when the database is sound; otherwise each entry
     /// is one problem SQLite found. Read-only and safe against a live daemon,
     /// though it reads every page, so it is not free on a large file.
+    ///
+    /// Runs on a read connection: it reads every page, which took 34 s on a
+    /// 567 MiB file, and on the write connection every write in the daemon
+    /// waited that long behind it (`docs/BUGS.md` B218). WAL lets it read a
+    /// consistent snapshot while the writer goes on.
     pub fn integrity_check(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare("PRAGMA integrity_check")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut problems = Vec::new();
@@ -107,9 +112,11 @@ impl Db {
         Ok(problems)
     }
 
-    /// Size and row-count snapshot for `pdfs cache inspect`.
+    /// Size and row-count snapshot for `pdfs cache inspect`. On a read
+    /// connection, for the reason [`integrity_check`](Self::integrity_check)
+    /// gives: counting the rows of every table reads most of the file.
     pub fn stats(&self) -> Result<DbStats> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
@@ -216,6 +223,40 @@ mod tests {
     fn a_fresh_database_passes_its_integrity_check() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.integrity_check().unwrap().is_empty());
+    }
+
+    /// `pdfs diagnose` and `pdfs cache inspect` read the whole file. Behind the
+    /// write lock they froze every write in the daemon for as long as that
+    /// took (`docs/BUGS.md` B218).
+    #[test]
+    fn the_integrity_check_and_stats_do_not_wait_for_the_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "pdfs-check-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = std::sync::Arc::new(Db::open(&path).unwrap());
+        let writer = db.conn.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::sync::Arc::clone(&db);
+        std::thread::spawn(move || {
+            let checked = reader.integrity_check().map(|p| p.is_empty());
+            let counted = reader.stats().map(|s| s.page_count > 0);
+            let _ = tx.send((checked.ok(), counted.ok()));
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(writer);
+        assert_eq!(answer.ok(), Some((Some(true), Some(true))));
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
+        }
+        let _ = std::fs::remove_file(path.with_extension("db.lock"));
     }
 
     #[test]
