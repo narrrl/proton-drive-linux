@@ -1145,7 +1145,9 @@ pub(crate) fn locations_status(
 ) {
     ui.locations.status.set_icon_name(Some(icon));
     ui.locations.status.set_title(title);
-    ui.locations.status.set_description(Some(description));
+    ui.locations
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.locations.retry.set_visible(retry);
     ui.locations.content.set_visible_child_name("status");
 }

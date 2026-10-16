@@ -311,7 +311,9 @@ pub(crate) fn wire_shared(ui: &Rc<Ui>, widgets: &SharedWidgets) {
 pub(crate) fn shared_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.shared.status.set_icon_name(Some(icon));
     ui.shared.status.set_title(title);
-    ui.shared.status.set_description(Some(description));
+    ui.shared
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.shared.retry.set_visible(retry);
     ui.shared.content.set_visible_child_name("status");
 }
@@ -818,6 +820,7 @@ fn invitation_row(inv: &InvitationInfo) -> adw::ActionRow {
         .title(&item)
         // Translators: {email} is the address of the person who sent the invitation.
         .subtitle(gettext_f("From {email}", &[("email", &inv.inviter_email)]))
+        .use_markup(false)
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name(if inv.is_dir {
         "folder-symbolic"
@@ -862,6 +865,7 @@ fn repaint_links(ui: &Rc<Ui>, bookmarks: &[BookmarkInfo]) {
         let row = adw::ActionRow::builder()
             .title(&title)
             .subtitle(&bm.url)
+            .use_markup(false)
             .subtitle_lines(1)
             .activatable(true)
             .tooltip_text(gettext("Open in browser"))

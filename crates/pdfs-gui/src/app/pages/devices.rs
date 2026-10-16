@@ -204,7 +204,9 @@ pub(crate) fn wire_devices(ui: &Rc<Ui>, widgets: &DevicesWidgets) {
 pub(crate) fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.devices.status.set_icon_name(Some(icon));
     ui.devices.status.set_title(title);
-    ui.devices.status.set_description(Some(description));
+    ui.devices
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.devices.retry.set_visible(retry);
     ui.devices.content.set_visible_child_name("status");
 }
@@ -390,6 +392,7 @@ fn this_computer_row(
     let row = adw::ActionRow::builder()
         .title(me.map_or_else(|| gettext("This computer"), |d| d.name.clone()))
         .subtitle(this_computer_subtitle(folders))
+        .use_markup(false)
         .activatable(true)
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
@@ -426,6 +429,7 @@ fn other_computer_row(ui: &Rc<Ui>, dev: &DeviceInfo) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(&dev.name)
         .subtitle(device_subtitle(dev))
+        .use_markup(false)
         .activatable(true)
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
@@ -763,7 +767,10 @@ fn show_restore_picker(
             .active(true)
             .valign(gtk4::Align::Center)
             .build();
-        let row = adw::EntryRow::builder().title(&f.name).build();
+        let row = adw::EntryRow::builder()
+            .title(&f.name)
+            .use_markup(false)
+            .build();
         row.set_text(&f.local_path);
         row.add_prefix(&check);
         group.add(&row);

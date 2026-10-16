@@ -219,6 +219,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
         let row = adw::ActionRow::builder()
             .title(title)
             .subtitle(subtitle)
+            .use_markup(false)
             .build();
 
         let save = gtk4::Button::builder()

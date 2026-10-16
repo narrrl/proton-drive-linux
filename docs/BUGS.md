@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B232](#b232--names-with--or--show-as-empty-rows-or-are-drawn-as-markup) | Names with & or < show as empty rows or are drawn as markup |
 | [B231](#b231--a-large-upload-under-a-low-upload-limit-never-finishes) | A large upload under a low upload limit never finishes |
 | [B230](#b230--a-create-queued-offline-adopts-another-devices-file-of-the-same-name) | A create queued offline adopts another device's file of the same name |
 | [B229](#b229--a-queued-write-can-be-lost-to-a-power-cut-after-close-returned) | A queued write can be lost to a power cut after close returned |
@@ -333,6 +334,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B232 — Names with & or < show as empty rows or are drawn as markup
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, Pango markup injection).
+**Where:** the toast helpers in `crates/pdfs-gui/src/app/main.rs`; rows in
+`app/pages/shared.rs`, `devices.rs`, `status.rs`, `takeout.rs`, `photo_viewer.rs`,
+`app/widgets/share_dialog.rs`, `details.rs`, `versions_dialog.rs`; every status page helper
+
+**Repro:** Accept an invitation to a folder named `R&D`, or name a computer `Tom & Jerry`.
+Its row in the app is empty. A name such as `<span size="80000">x</span>` is drawn as markup.
+
+**Cause.** Libadwaita rows, toasts and status page descriptions read their text as Pango markup
+unless told otherwise. Names that other people control (shared items, inviter addresses, device
+names, link URLs), file paths, EXIF values and daemon error messages went in unescaped. Text that
+did not parse showed as an empty row; text that did was drawn as markup.
+
+**Fix.** Rows and toasts that show such text are built with `use_markup(false)`. Status page
+descriptions, which have no such switch, are escaped with `markup_escape_text`.
+
+**Test:** none automated; the change only sets a widget property. Checked by reading every row,
+toast and status page that takes text from outside the program.
+
+---
 
 ### B231 — A large upload under a low upload limit never finishes
 

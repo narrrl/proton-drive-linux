@@ -510,6 +510,7 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
                         .unwrap_or_else(|| path.display().to_string()),
                 )
                 .subtitle(human_bytes(size))
+                .use_markup(false)
                 .build();
             let remove = gtk4::Button::builder()
                 .icon_name("edit-delete-symbolic")

@@ -1566,6 +1566,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         let row = adw::ActionRow::builder()
             .title(&name)
             .subtitle(&pin.path)
+            .use_markup(false)
             .build();
         let icon = gtk4::Image::from_icon_name("pdfs-offline-symbolic");
         row.add_prefix(&icon);

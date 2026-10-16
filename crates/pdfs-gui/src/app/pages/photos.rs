@@ -3459,7 +3459,9 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
 pub(crate) fn gallery_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.gallery.status.set_icon_name(Some(icon));
     ui.gallery.status.set_title(title);
-    ui.gallery.status.set_description(Some(description));
+    ui.gallery
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.gallery.retry.set_visible(retry);
     // Only the empty timeline offers a way to fill it; every other status turns
     // those buttons back off.

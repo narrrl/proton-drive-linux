@@ -481,6 +481,7 @@ pub(crate) fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
             let row = adw::ActionRow::builder()
                 .title(label.as_str())
                 .subtitle(value)
+                .use_markup(false)
                 .subtitle_selectable(true)
                 .build();
             row.add_css_class("property");

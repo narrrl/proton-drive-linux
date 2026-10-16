@@ -329,7 +329,9 @@ pub(crate) fn shared_by_me_status(
 ) {
     ui.shared_by_me.status.set_icon_name(Some(icon));
     ui.shared_by_me.status.set_title(title);
-    ui.shared_by_me.status.set_description(Some(description));
+    ui.shared_by_me
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.shared_by_me.retry.set_visible(retry);
     ui.shared_by_me.content.set_visible_child_name("status");
     ui.shared_by_me.subtitle.set_subtitle("");

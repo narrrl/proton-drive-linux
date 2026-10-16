@@ -500,7 +500,9 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.browser.status.set_icon_name(Some(icon));
     ui.browser.status.set_title(title);
-    ui.browser.status.set_description(Some(description));
+    ui.browser
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.browser.retry.set_visible(retry);
     // Only the empty-folder state offers a way to fill the folder; every other
     // status (loading, offline, error) turns them back off.

@@ -1065,8 +1065,17 @@ pub(crate) fn set_sidebar_badge(ui: &Ui, page: &str, count: u64) {
 /// Show a transient toast. Non-blocking by design: an action's outcome is
 /// reported without stealing focus or forcing a click, so the user can keep
 /// working while a slow upload lands.
+///
+/// A toast's title is Pango markup unless told otherwise. Messages carry file
+/// names and daemon errors, and one with a `&` or `<` in it showed as an empty
+/// toast, so every toast here is plain text.
 fn toast(ui: &Rc<Ui>, message: &str) {
-    ui.toasts.add_toast(adw::Toast::new(message));
+    ui.toasts.add_toast(
+        adw::Toast::builder()
+            .title(message)
+            .use_markup(false)
+            .build(),
+    );
 }
 
 /// Show a toast that offers one follow-up action — an Undo, or a way to the page
@@ -1077,6 +1086,7 @@ fn toast(ui: &Rc<Ui>, message: &str) {
 fn toast_action(ui: &Rc<Ui>, message: &str, label: &str, action: impl Fn(&Rc<Ui>) + 'static) {
     let toast = adw::Toast::builder()
         .title(message)
+        .use_markup(false)
         .button_label(label)
         .timeout(8)
         .build();
@@ -1099,7 +1109,11 @@ fn toast_error(ui: &Rc<Ui>, what: &str, detail: &str) {
         gettext_f("{what}: {detail}", &[("what", what), ("detail", detail)])
     };
     tracing::warn!("{message}");
-    let toast = adw::Toast::builder().title(&message).timeout(6).build();
+    let toast = adw::Toast::builder()
+        .title(&message)
+        .use_markup(false)
+        .timeout(6)
+        .build();
     ui.toasts.add_toast(toast);
 }
 

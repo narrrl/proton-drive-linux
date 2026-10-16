@@ -645,7 +645,9 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
 fn albums_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str) {
     ui.gallery.albums_status.set_icon_name(Some(icon));
     ui.gallery.albums_status.set_title(title);
-    ui.gallery.albums_status.set_description(Some(description));
+    ui.gallery
+        .albums_status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.gallery.albums_stack.set_visible_child_name("status");
 }
 

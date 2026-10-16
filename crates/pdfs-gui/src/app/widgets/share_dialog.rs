@@ -491,6 +491,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
         let row = adw::ActionRow::builder()
             .title(&entry.email)
             .subtitle(&subtitle)
+            .use_markup(false)
             .build();
         row.add_prefix(&adw::Avatar::new(32, Some(&entry.email), true));
 
@@ -605,6 +606,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
                     url.clone()
                 })
                 .subtitle(&subtitle)
+                .use_markup(false)
                 .build();
             row.add_css_class("property");
 
