@@ -109,7 +109,8 @@ fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
                     &[("title", &j.title), ("done", &done), ("total", &total)],
                 )
             }
-            Some(j) => format!("{}…", j.title),
+            // Translators: {title} names a running job whose size is not known yet.
+            Some(j) => gettext_f("{title}…", &[("title", &j.title)]),
             None => String::new(),
         },
         [t] => {
@@ -118,10 +119,19 @@ fn sync_line(items: &[TransferItem], jobs: &[JobItem]) -> String {
                 TransferDirection::Upload => "↑",
             };
             if t.bytes_total == 0 {
-                format!("{arrow} {}…", t.name)
+                // Translators: one transfer of unknown size; {arrow} is ↑ or ↓, {name} a file name.
+                gettext_f("{arrow} {name}…", &[("arrow", arrow), ("name", &t.name)])
             } else {
                 let pct = (t.bytes_completed * 100 / t.bytes_total.max(1)).min(100);
-                format!("{arrow} {} ({pct}%)", t.name)
+                // Translators: one transfer; {arrow} is ↑ or ↓, {name} a file name, {percent} how much is done.
+                gettext_f(
+                    "{arrow} {name} ({percent}%)",
+                    &[
+                        ("arrow", arrow),
+                        ("name", &t.name),
+                        ("percent", &pct.to_string()),
+                    ],
+                )
             }
         }
         _ => {

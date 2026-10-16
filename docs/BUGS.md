@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B247](#b247--tray-status-lines-are-not-translated) | Tray status lines are not translated |
 | [B246](#b246--signing-in-with-a-locked-keyring-freezes-the-app-window) | Signing in with a locked keyring freezes the app window |
 | [B245](#b245--any-child-of-the-daemon-can-answer-the-watchdog-for-it) | Any child of the daemon can answer the watchdog for it |
 | [B244](#b244--photos-without-a-sidecar-or-a-dated-name-are-filed-under-the-upload-day) | Photos without a sidecar or a dated name are filed under the upload day |
@@ -348,6 +349,25 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B247 — Tray status lines are not translated
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, tray strings).
+**Where:** `sync_line` in `crates/pdfs-gui/src/main.rs`
+
+**Repro:** Run the tray in German or French while one file uploads. The tray's status line reads
+`↑ report.pdf (45%)`, with the percent sign as English writes it.
+
+**Cause.** Three status lines of the tray were built with `format!`, outside gettext, so no
+language could adapt them.
+
+**Fix.** They go through `gettext_f` and are translated in every catalog. German and French put
+a space before the percent sign, as they already do for the storage quota.
+
+**Test:** `msgfmt --check --statistics` on every catalog reports only translated messages.
+
+---
 
 ### B246 — Signing in with a locked keyring freezes the app window
 
