@@ -831,6 +831,20 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
+    // The commands that hold the password, the key passphrases or the session
+    // tokens in memory: keep them out of core dumps and away from same-user
+    // ptrace. Only the daemon did, though `mount` holds the same keys for as
+    // long as it runs.
+    if matches!(
+        cli.command,
+        Command::Login { .. }
+            | Command::Unlock { .. }
+            | Command::Logout
+            | Command::Mount { .. }
+            | Command::Daemon { .. }
+    ) {
+        pdfs_core::kernelkey::forbid_dumps();
+    }
     match cli.command {
         Command::Login { username, remember } => cmd_login(username, remember),
         Command::Unlock { remember } => cmd_unlock(remember),
@@ -2227,9 +2241,6 @@ where
 /// an external unmount triggers a remount; errors back off and retry. This is
 /// the entry point for the systemd user service.
 fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
-    // The daemon holds the account's key passphrases in memory; keep them out
-    // of core dumps and away from same-user ptrace.
-    pdfs_core::kernelkey::forbid_dumps();
     loop {
         // Wait until a session is stored. The GUI enables this service on login,
         // but the service may also start at boot before the user has logged in.
@@ -3785,6 +3796,18 @@ mod login_wait_tests {
         // past the width of the shift; that must cap, not panic.
         assert_eq!(login_poll_delay(64), Duration::from_secs(15));
         assert_eq!(login_poll_delay(u32::MAX), Duration::from_secs(15));
+    }
+
+    /// The file-manager script passes each selected path after `--`, so a
+    /// file named like an option is still the path.
+    #[test]
+    fn a_path_after_a_double_dash_is_a_path_even_when_it_looks_like_a_flag() {
+        let cli = Cli::try_parse_from(["pdfs", "pin", "--", "--json"]).unwrap();
+        assert!(!cli.json);
+        match cli.command {
+            Command::Pin { path } => assert_eq!(path, PathBuf::from("--json")),
+            _ => panic!("not a pin"),
+        }
     }
 
     #[test]

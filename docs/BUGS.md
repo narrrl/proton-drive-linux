@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B240](#b240--pdfs-mount-can-be-core-dumped-with-the-keys-in-memory) | pdfs mount can be core-dumped with the keys in memory |
 | [B239](#b239----wait-reports-success-for-imports-and-re-dates-that-failed) | --wait reports success for imports and re-dates that failed |
 | [B238](#b238--draining-a-large-offline-batch-is-quadratic-in-its-size) | Draining a large offline batch is quadratic in its size |
 | [B237](#b237--every-reconnect-resends-refused-uploads-all-in-the-same-second) | Every reconnect resends refused uploads, all in the same second |
@@ -341,6 +342,36 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B240 — pdfs mount can be core-dumped with the keys in memory
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, core dumps and the
+file-manager script).
+**Where:** `main` in `crates/pdfs-cli/src/main.rs`; `script_body` in
+`crates/pdfs-core/src/shell.rs`
+
+**Repro:**
+- Run `pdfs mount` and send it `SIGSEGV`, with core dumps enabled. The dump holds the key
+  passphrases.
+- In the mount, name a file `--json` and choose **Scripts → Keep offline** on it in Nautilus.
+
+**Cause.** Only `pdfs daemon` marked itself non-dumpable. `pdfs mount`, `login`, `unlock` and
+`logout` hold the password, the key passphrases or the session tokens too, and could be
+core-dumped or ptraced by another process of the same user. Separately, the file-manager script
+ran `pdfs pin "$path"`, so a file named like an option was read as one.
+
+**Fix.** Those five commands mark themselves non-dumpable at start. The script passes each path
+after `--`. A name with a newline still arrives split from Nautilus, whose list is
+newline-separated; `pdfs` then fails on both halves and changes nothing.
+
+The app's own login was left as it is: a non-dumpable GUI process hides its `/proc` entries from
+the desktop portal, which identifies the caller through them.
+
+**Test:** `tests::a_path_after_a_double_dash_is_a_path_even_when_it_looks_like_a_flag` in
+`crates/pdfs-cli/src/main.rs`; `shell::tests::the_script_ends_options_before_each_path`.
+
+---
 
 ### B239 — --wait reports success for imports and re-dates that failed
 
