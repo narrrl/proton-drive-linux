@@ -1429,6 +1429,77 @@ fn rescanning_an_unchanged_file_keeps_exactly_one_index_entry() {
     }
 }
 
+/// A scan that stopped early or lost a batch did not see every file, so it
+/// must not prune the ones it missed (`docs/BUGS.md` B217).
+#[test]
+fn a_partial_local_scan_prunes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(
+        g,
+        &[
+            local("/home/u/a.txt", "a.txt", false),
+            local("/home/u/b.txt", "b.txt", false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.local_finish_scan(g, 1).unwrap(), 2);
+
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(g, &[local("/home/u/a.txt", "a.txt", false)])
+        .unwrap();
+    assert_eq!(db.local_finish_partial_scan(2).unwrap(), 2);
+    assert_eq!(db.search_local("b.txt", 10).unwrap().len(), 1);
+    assert_eq!(db.local_indexed_at().unwrap(), Some(2));
+}
+
+/// Deleted entries pile up in an FTS5 index until it is compacted. The daily
+/// compaction must leave both indexes whole and searchable, and must not run
+/// again the same day (`docs/BUGS.md` B217).
+#[test]
+fn compacting_the_search_indexes_keeps_them_whole_and_runs_once_a_day() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "quarterly-report.pdf", 1))
+        .unwrap();
+    for round in 0..20 {
+        let g = db.local_begin_scan().unwrap();
+        let name = format!("churn-{round}.txt");
+        db.local_upsert_batch(
+            g,
+            &[
+                local("/home/u/keep.txt", "keep.txt", false),
+                local(&format!("/home/u/{name}"), &name, false),
+            ],
+        )
+        .unwrap();
+        // Far in the past, so no scan compacts on its own.
+        db.local_finish_scan(g, 0).unwrap();
+    }
+
+    let day = 24 * 60 * 60;
+    db.compact_search_indexes_if_due(day).unwrap();
+    {
+        let conn = db.conn.lock();
+        for table in ["local_fts", "nodes_fts"] {
+            conn.execute(
+                &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
+                [],
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(db.search_local("keep", 10).unwrap().len(), 1);
+    assert_eq!(db.search_local("churn-19", 10).unwrap().len(), 1);
+    assert!(db.search_local("churn-3.txt", 10).unwrap().is_empty());
+    assert_eq!(db.search("quarterly", 10).unwrap().len(), 1);
+    let stamp = |db: &Db| db.state_str("fts_compacted_at").unwrap();
+    assert_eq!(stamp(&db).as_deref(), Some(day.to_string().as_str()));
+
+    db.compact_search_indexes_if_due(day + 60).unwrap();
+    assert_eq!(stamp(&db).as_deref(), Some(day.to_string().as_str()));
+}
+
 /// Queries below the trigram minimum still match, via the `LIKE` fallback.
 #[test]
 fn local_search_short_query_like_fallback() {

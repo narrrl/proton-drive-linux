@@ -42,7 +42,7 @@ const SKIP_PATH_SUFFIXES: &[&str] = &["go/pkg/mod"];
 
 /// Hard cap on indexed entries, so a pathological home directory cannot grow the
 /// database without bound. Reaching it stops the walk early.
-const MAX_ENTRIES: usize = 400_000;
+pub const MAX_ENTRIES: usize = 400_000;
 
 /// Rows handed to the sink at a time. Large enough that the per-transaction cost
 /// amortises, small enough that the writer lock is released often (FUSE

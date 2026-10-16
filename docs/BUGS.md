@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B217](#b217--the-search-indexes-grow-to-many-times-their-size-and-slow-search-down) | The search indexes grow to many times their size and slow search down |
 | [B216](#b216--a-damaged-database-is-rebuilt-without-the-writes-still-queued-in-it) | A damaged database is rebuilt without the writes still queued in it |
 | [B215](#b215--a-remote-name-holding--or--becomes-a-path-outside-the-sync-folder) | A remote name holding `/` or `..` becomes a path outside the sync folder |
 | [B214](#b214--deleting-a-mirror-folder-here-trashes-another-devices-new-files-in-it) | Deleting a mirror folder here trashes another device's new files in it |
@@ -318,6 +319,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B217 — The search indexes grow to many times their size and slow search down
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.2.1 and 2.2.3). On a live 567 MiB
+`cache.db`, `local_fts` held 317 MiB for 40,000 indexed paths. Rebuilt, it was 20 MiB, and a
+search candidate query went from 27 ms to 7 ms. `nodes_fts` shrank from 21 to 16 MiB.
+**Where:** `Db::local_finish_scan`, `Db::compact_search_indexes_if_due` in
+`crates/pdfs-core/src/db/local.rs`; `index_local_files` in `crates/pdfs-fuse/src/background.rs`
+
+**Repro:** Run the daemon for weeks with a home directory where files come and go, then compare
+the size of `local_fts_data` with what a `rebuild` leaves.
+
+**Cause.** FTS5 keeps a deleted entry's data until the segments holding it are merged, and with
+the few large segments these indexes settle into, that is close to never. The client never ran
+`optimize` or `rebuild`. The local scan made it worse: a scan that stopped at the entry cap, or
+lost a batch, still pruned every path it had not reached, and the next scan put them all back.
+
+**Fix.** The search indexes are compacted at most once a day, at the end of a local scan:
+`local_fts` is rebuilt from `local_files`, and `nodes_fts` is merged into one segment. Each takes
+about half a second at that size. A scan that did not see everything closes with
+`local_finish_partial_scan`, which prunes nothing.
+
+**Test:** `db::tests::compacting_the_search_indexes_keeps_them_whole_and_runs_once_a_day`,
+`db::tests::a_partial_local_scan_prunes_nothing`.
+
+---
 
 ### B216 — A damaged database is rebuilt without the writes still queued in it
 

@@ -111,7 +111,78 @@ impl Db {
         )?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM local_files", [], |r| r.get(0))?;
         tx.commit()?;
+        drop(conn);
+        self.compact_search_indexes_if_due(finished_at)?;
         Ok(count)
+    }
+
+    /// Close a scan that did not see everything: it stopped at the entry cap,
+    /// or a batch failed to write. Nothing is pruned, since a path it missed is
+    /// not a path that is gone; the next complete scan prunes. Returns the
+    /// number of indexed entries.
+    ///
+    /// Pruning after such a scan dropped every entry it had not reached, and
+    /// the next scan put them back. That churn is most of what grew
+    /// `local_fts` to 16 times its size (`docs/BUGS.md` B217).
+    pub fn local_finish_partial_scan(&self, finished_at: i64) -> Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES ('local_indexed_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [finished_at.to_string()],
+        )?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_files", [], |r| r.get(0))?;
+        Ok(count)
+    }
+
+    /// Compact both full-text indexes, at most once a day.
+    ///
+    /// FTS5 keeps a deleted entry's data until the segments holding it are
+    /// merged, and with the few large segments these indexes settle into that
+    /// is close to never. Every file the local scan sees disappear or appear
+    /// leaves some behind, and every node row the tree replaces does too: on
+    /// one machine `local_fts` held 317 MiB for 40,000 paths, against 20 MiB
+    /// rebuilt, and a search took four times as long (`docs/BUGS.md` B217).
+    ///
+    /// `local_fts` is rebuilt from `local_files`, which also drops anything
+    /// left over, and `nodes_fts`, which has no content table to rebuild from,
+    /// is merged into one segment. Each runs in its own transaction on the
+    /// write connection, about half a second on an index that size; once a
+    /// day keeps the leftovers small without paying that at every scan.
+    pub fn compact_search_indexes_if_due(&self, now: i64) -> Result<()> {
+        const EVERY_SECS: i64 = 24 * 60 * 60;
+        let last: i64 = self
+            .read()
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'fts_compacted_at'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if now - last < EVERY_SECS {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        {
+            let conn = self.conn.lock();
+            conn.execute("INSERT INTO local_fts(local_fts) VALUES('rebuild')", [])?;
+        }
+        {
+            let conn = self.conn.lock();
+            conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')", [])?;
+            conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES ('fts_compacted_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [now.to_string()],
+            )?;
+        }
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "compacted the search indexes"
+        );
+        Ok(())
     }
 
     /// When the last local scan completed (epoch seconds), or `None` if the index
