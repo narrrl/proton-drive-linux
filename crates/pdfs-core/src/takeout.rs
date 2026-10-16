@@ -346,6 +346,11 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
             .insert(file.to_string(), body);
     }
 
+    let indexes: HashMap<&str, SidecarIndex<'_>> = per_folder_sidecars
+        .iter()
+        .map(|(folder, in_folder)| (folder.as_str(), SidecarIndex::new(in_folder)))
+        .collect();
+
     let mut scan = TakeoutScan::default();
     let mut seen_albums: HashMap<String, ()> = HashMap::new();
 
@@ -364,9 +369,9 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
             continue;
         };
 
-        let found = per_folder_sidecars
-            .get(&folder)
-            .and_then(|in_folder| find_sidecar(&file_name, in_folder));
+        let found = indexes
+            .get(folder.as_str())
+            .and_then(|index| find_sidecar(&file_name, index));
         // An edited copy keeps its own name: the title is its original's.
         let title_is_ours = found.is_some_and(|((rule, _), _)| rule != EDITED_COPY);
         let sidecar = found
@@ -640,19 +645,98 @@ const SIDECAR_NAME_CAP: usize = 51;
 /// sidecar. Its date is the original's, but its name is its own.
 const EDITED_COPY: u8 = 4;
 
+/// The sidecars of one folder by their `.json`-stripped stem, so a photo is
+/// ranked only against those that can match it.
+///
+/// Every rule in [`sidecar_rank`] needs the stem to start with a prefix of the
+/// photo name that the name itself determines, and a sorted map finds the
+/// stems with a given prefix as one range. Ranking every photo against every
+/// sidecar instead took 27 s for a folder of 10,000 photos.
+struct SidecarIndex<'a> {
+    by_stem: BTreeMap<&'a str, Vec<(&'a str, &'a Vec<u8>)>>,
+}
+
+impl<'a> SidecarIndex<'a> {
+    fn new(in_folder: &'a BTreeMap<String, &'a Vec<u8>>) -> Self {
+        let mut by_stem: BTreeMap<&'a str, Vec<(&'a str, &'a Vec<u8>)>> = BTreeMap::new();
+        for (name, body) in in_folder {
+            by_stem
+                .entry(strip_json_suffix(name))
+                .or_default()
+                .push((name.as_str(), *body));
+        }
+        Self { by_stem }
+    }
+
+    /// Add every sidecar whose stem starts with `prefix` to `out`.
+    fn starting_with(&self, prefix: &str, out: &mut BTreeMap<&'a str, &'a Vec<u8>>) {
+        let from = (
+            std::ops::Bound::Included(prefix),
+            std::ops::Bound::Unbounded,
+        );
+        for (stem, sidecars) in self.by_stem.range::<str, _>(from) {
+            if !stem.starts_with(prefix) {
+                break;
+            }
+            out.extend(sidecars.iter().copied());
+        }
+    }
+
+    /// Add every sidecar whose stem is `head`, or starts with `head` and a `.`:
+    /// those that have `head` as a boundary ([`suffix_boundaries`]).
+    fn bounded_by(&self, head: &str, out: &mut BTreeMap<&'a str, &'a Vec<u8>>) {
+        if let Some(sidecars) = self.by_stem.get(head) {
+            out.extend(sidecars.iter().copied());
+        }
+        self.starting_with(&format!("{head}."), out);
+    }
+
+    /// Every sidecar [`sidecar_rank`] could match `file_name` to, by name. A
+    /// superset: each one is still ranked.
+    fn candidates(&self, file_name: &str) -> BTreeMap<&'a str, &'a Vec<u8>> {
+        let mut out = BTreeMap::new();
+        // Rules 0 and 2: the stem starts with the name, or with its swapped form.
+        self.starting_with(file_name, &mut out);
+        if let Some(swapped) = swap_duplicate_marker(file_name) {
+            self.starting_with(&swapped, &mut out);
+        }
+        // Rule 1: the stem of `A(N).B` starts with `A.B(N)`, so with `A.`.
+        for (paren, _) in file_name.match_indices('(') {
+            self.starting_with(&format!("{}.", &file_name[..paren]), &mut out);
+        }
+        // Rule 3: a boundary of the stem is a prefix of the name.
+        for end in file_name
+            .char_indices()
+            .map(|(index, _)| index)
+            .skip(1)
+            .chain([file_name.len()])
+        {
+            self.bounded_by(&file_name[..end], &mut out);
+        }
+        // Rule 4: `<original>-<word>.<ext>` has `<original>.<ext>` as a boundary.
+        if let Some((_, extension)) = file_name.rsplit_once('.') {
+            for (dash, _) in file_name.match_indices('-') {
+                self.bounded_by(&format!("{}.{extension}", &file_name[..dash]), &mut out);
+            }
+        }
+        out
+    }
+}
+
 /// Find the sidecar belonging to `file_name` among the JSON files of its folder,
 /// with the rank it matched at.
 ///
 /// Tried in order of confidence: the exact name, the `(N)`-swapped name, an
 /// unknown trailing suffix, a prefix match for the case where truncation cut
 /// into the photo name itself, and last an edited copy's original. The
-/// best-ranked candidate in the folder wins.
+/// best-ranked candidate in the folder wins; of equal ranks, the first by
+/// sidecar name.
 fn find_sidecar<'a>(
     file_name: &str,
-    in_folder: &BTreeMap<String, &'a Vec<u8>>,
+    index: &SidecarIndex<'a>,
 ) -> Option<((u8, usize), &'a Vec<u8>)> {
     let mut best: Option<((u8, usize), &'a Vec<u8>)> = None;
-    for (sidecar_name, body) in in_folder {
+    for (sidecar_name, body) in index.candidates(file_name) {
         let Some(rank) = sidecar_rank(strip_json_suffix(sidecar_name), file_name) else {
             continue;
         };
@@ -1106,6 +1190,57 @@ mod tests {
         assert_eq!(scan.photos[0].name, "Holiday.jpg");
         assert_eq!(scan.photos[1].name, "IMG_2-bearbeitet.jpg");
         assert_eq!(scan.photos[1].capture_time, Some(7));
+    }
+
+    /// The index looks only at the sidecars that can match, and must find the
+    /// same one that ranking every sidecar in the folder finds.
+    #[test]
+    fn the_sidecar_index_finds_what_ranking_every_sidecar_finds() {
+        let long = "A_very_long_holiday_photo_name_from_the_beach_2019";
+        let names = [
+            "IMG_1.jpg".to_string(),
+            "IMG_12.jpg".to_string(),
+            "IMG_1(1).jpg".to_string(),
+            "IMG_1-edited.jpg".to_string(),
+            "IMG_1-bearbeitet.jpg".to_string(),
+            "my.photo(2).jpg".to_string(),
+            "x(1).jpg".to_string(),
+            "Ölbild.png".to_string(),
+            "PXL_20230101_101010.mp4".to_string(),
+            format!("{long}.jpg"),
+            format!("{long}_2.jpg"),
+            "nothing.heic".to_string(),
+        ];
+        let sidecar_names = [
+            "IMG_1.jpg.supplemental-metadata.json".to_string(),
+            "IMG_1.jpg(1).supplemental-metadata.json".to_string(),
+            "IMG_12.jpg.ergänzende-Metadaten.json".to_string(),
+            "my.photo.jpg(2).json".to_string(),
+            "x.jpg(1).json".to_string(),
+            "Ölbild.png.suppl.json".to_string(),
+            "PXL_20230101_101010.mp4.JSON".to_string(),
+            format!("{}.json", &long[..44]),
+            format!("{long}.jp.json"),
+            "IMG.json".to_string(),
+            "unrelated.json".to_string(),
+        ];
+        let bodies: Vec<Vec<u8>> = (0..sidecar_names.len())
+            .map(|i| i.to_string().into_bytes())
+            .collect();
+        let in_folder: BTreeMap<String, &Vec<u8>> =
+            sidecar_names.iter().cloned().zip(bodies.iter()).collect();
+        let index = SidecarIndex::new(&in_folder);
+        for name in &names {
+            let mut every: Option<((u8, usize), &Vec<u8>)> = None;
+            for (sidecar_name, body) in &in_folder {
+                if let Some(rank) = sidecar_rank(strip_json_suffix(sidecar_name), name)
+                    && every.as_ref().is_none_or(|(current, _)| rank < *current)
+                {
+                    every = Some((rank, *body));
+                }
+            }
+            assert_eq!(find_sidecar(name, &index), every, "{name}");
+        }
     }
 
     #[test]

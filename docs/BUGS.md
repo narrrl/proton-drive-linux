@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B235](#b235--scanning-a-large-takeout-folder-takes-half-a-minute) | Scanning a large Takeout folder takes half a minute |
 | [B234](#b234--any-folder-can-become-a-sync-root-the-home-folder-included) | Any folder can become a sync root, the home folder included |
 | [B233](#b233--signing-out-leaves-the-session-valid-on-proton) | Signing out leaves the session valid on Proton |
 | [B232](#b232--names-with--or--show-as-empty-rows-or-are-drawn-as-markup) | Names with & or < show as empty rows or are drawn as markup |
@@ -336,6 +337,29 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B235 — Scanning a large Takeout folder takes half a minute
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.1).
+**Where:** `SidecarIndex` and `find_sidecar` in `crates/pdfs-core/src/takeout.rs`
+
+**Repro:** Scan a Google Takeout export with 10,000 photos in one folder, as "Photos from 2019"
+folders often are.
+
+**Cause.** Each photo was ranked against every sidecar of its folder, so the scan grew with the
+square of the folder size: 2,000 photos took 0.8 s, 10,000 took 27–32 s before the import
+showed anything.
+
+**Fix.** The sidecars of a folder are kept in a sorted map by stem. Every matching rule needs the
+stem to start with a prefix that the photo name determines, so each photo is ranked only against
+the stems found by a few range lookups. On the same 10,000 photos the scan takes 0.1 s, with the
+same matches: ties still go to the first sidecar by name.
+
+**Test:** `takeout::tests::the_sidecar_index_finds_what_ranking_every_sidecar_finds`, which
+compares the index with ranking every sidecar, across every rule.
+
+---
 
 ### B234 — Any folder can become a sync root, the home folder included
 
