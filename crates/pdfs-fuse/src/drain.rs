@@ -1604,7 +1604,7 @@ impl Core {
             .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
         let uid = self.block_on_within(
-            link::upload_deadline(meta.len),
+            link::upload_deadline(meta.len, self.transfers.upload_cap()),
             self.drive.upload_file_from(
                 parent,
                 name,
@@ -2001,7 +2001,7 @@ impl Core {
                 .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
         self.block_on_within(
-            link::upload_deadline(meta.len),
+            link::upload_deadline(meta.len, self.transfers.upload_cap()),
             self.drive.upload_file_from(
                 &parent,
                 &alt,
@@ -2329,7 +2329,7 @@ impl Core {
         let reader = CountingReader::new(File::open(&blob)?, &guard).with_cancel(cancel.flag());
         let started = Instant::now();
         let sent = self.block_on_within(
-            link::upload_deadline(meta.len),
+            link::upload_deadline(meta.len, self.transfers.upload_cap()),
             self.drive
                 .upload_new_revision_from(&uid, reader, meta.len as i64, thumbnails, None),
         );

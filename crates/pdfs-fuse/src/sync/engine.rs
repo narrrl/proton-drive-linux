@@ -22,7 +22,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(120);
 /// per-item work is a network round-trip, so a folder with thousands of files is
 /// unusable done one-at-a-time; this bounds concurrency like the bulk-upload
 /// engine does.
-pub(super) const SYNC_CONCURRENCY: usize = 8;
+pub(crate) const SYNC_CONCURRENCY: usize = 8;
 
 /// A message to the sync engine's control thread.
 pub(crate) enum SyncMsg {

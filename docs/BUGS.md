@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B231](#b231--a-large-upload-under-a-low-upload-limit-never-finishes) | A large upload under a low upload limit never finishes |
 | [B230](#b230--a-create-queued-offline-adopts-another-devices-file-of-the-same-name) | A create queued offline adopts another device's file of the same name |
 | [B229](#b229--a-queued-write-can-be-lost-to-a-power-cut-after-close-returned) | A queued write can be lost to a power cut after close returned |
 | [B228](#b228--a-gap-filled-write-whose-upload-answer-was-lost-becomes-a-conflict-copy-of-itself) | A gap-filled write whose upload answer was lost becomes a conflict copy of itself |
@@ -332,6 +333,27 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B231 — A large upload under a low upload limit never finishes
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.9).
+**Where:** `upload_deadline` in `crates/pdfs-fuse/src/link.rs`; `TransferRegistry::upload_cap` in
+`crates/pdfs-fuse/src/transfers.rs`; the three uploads in `crates/pdfs-fuse/src/drain.rs`
+
+**Repro:** Set the upload limit to 512 KiB/s or less, and queue several large files.
+
+**Cause.** An upload's deadline allowed for at least 32 KiB/s. The upload cap is one budget
+shared by every running upload: up to 16 drain workers and 8 mirror sync tasks. Under a low cap
+each upload got less than 32 KiB/s, so a large file ran out of time on every attempt. The
+timeout took the mount offline, and on reconnect the upload started again from its first byte.
+
+**Fix.** The deadline counts an upload's share of the cap as the slowest rate when that share is
+below 32 KiB/s. Without a cap, or with a generous one, the deadline is unchanged.
+
+**Test:** `link::tests::an_upload_under_a_low_cap_gets_the_time_its_share_of_the_cap_needs`.
+
+---
 
 ### B230 — A create queued offline adopts another device's file of the same name
 

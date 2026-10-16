@@ -47,7 +47,7 @@ mod engine;
 mod local_scan;
 mod model;
 mod planner;
-use engine::SYNC_CONCURRENCY;
+pub(crate) use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{SyncMsg, spawn};
 #[cfg(test)]
 use engine::{classify, event_target, settle_with};
