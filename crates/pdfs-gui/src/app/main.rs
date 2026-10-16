@@ -69,7 +69,7 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 
-use pdfs_core::config::{AppDirs, FileSort, FilesView};
+use pdfs_core::config::{AppDirs, FileSort, FilesView, WindowState};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
@@ -716,13 +716,18 @@ fn build_window(app: &adw::Application) {
         }
     });
 
+    let saved = ui.dirs.load_config().window.usable();
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Proton Drive")
-        .default_width(980)
-        .default_height(680)
+        .default_width(saved.width)
+        .default_height(saved.height)
+        .maximized(saved.maximized)
+        .width_request(WindowState::MIN_WIDTH)
+        .height_request(WindowState::MIN_HEIGHT)
         .content(&toasts)
         .build();
+    remember_window_state(&ui, app, &window);
     // A wide window docks the details pane beside the files instead of laying it
     // over them.
     let wide = adw::Breakpoint::new(
@@ -741,6 +746,42 @@ fn build_window(app: &adw::Application) {
     follow_daemon(&ui, &window);
 
     window.present();
+}
+
+/// Save the window's size when it closes, and when the app quits with the
+/// window still open (Ctrl+Q, the tray's Quit), which never asks it to close.
+fn remember_window_state(ui: &Rc<Ui>, app: &adw::Application, window: &adw::ApplicationWindow) {
+    let ui_close = ui.clone();
+    window.connect_close_request(move |window| {
+        save_window_state(&ui_close, window);
+        glib::Propagation::Proceed
+    });
+    let ui_quit = ui.clone();
+    let window_quit = window.downgrade();
+    app.connect_shutdown(move |_| {
+        if let Some(window) = window_quit.upgrade() {
+            save_window_state(&ui_quit, &window);
+        }
+    });
+}
+
+/// Write the window's unmaximised size and maximised state to the config, if
+/// either changed. Runs as the window goes away, so a failure is only logged.
+fn save_window_state(ui: &Ui, window: &adw::ApplicationWindow) {
+    let (width, height) = window.default_size();
+    let state = WindowState {
+        width,
+        height,
+        maximized: window.is_maximized(),
+    };
+    let mut config = ui.dirs.load_config();
+    if config.window == state {
+        return;
+    }
+    config.window = state;
+    if let Err(e) = ui.dirs.save_config(&config) {
+        tracing::warn!("cannot save the window size: {e}");
+    }
 }
 
 /// Whether `window` is minimised or otherwise out of sight (another workspace,

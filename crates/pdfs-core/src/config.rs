@@ -163,6 +163,10 @@ pub struct AppConfig {
     /// Defaulted for configs predating the field.
     #[serde(default)]
     pub files_view: FilesView,
+    /// The desktop app's main window size, remembered between runs. Defaulted
+    /// for configs predating the field.
+    #[serde(default)]
+    pub window: WindowState,
     /// The user hid the tray icon from its own menu. The tray exits at start
     /// while this is set, and the app does not spawn it; Preferences turns it
     /// back on. Defaulted for configs predating the field.
@@ -207,6 +211,44 @@ impl Default for FilesView {
             sort: FileSort::Name,
             descending: false,
             folders_first: true,
+        }
+    }
+}
+
+/// The desktop app's main window, as it was when it last closed.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct WindowState {
+    /// The unmaximised size, in logical pixels.
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+impl WindowState {
+    /// Below this the saved size is taken for damage and the default is used.
+    pub const MIN_WIDTH: i32 = 480;
+    pub const MIN_HEIGHT: i32 = 400;
+
+    /// This state, with a size too small to use replaced by the default.
+    pub fn usable(self) -> Self {
+        if self.width < Self::MIN_WIDTH || self.height < Self::MIN_HEIGHT {
+            Self {
+                maximized: self.maximized,
+                ..Self::default()
+            }
+        } else {
+            self
+        }
+    }
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            width: 980,
+            height: 680,
+            maximized: false,
         }
     }
 }
@@ -702,6 +744,11 @@ mod tests {
                 descending: true,
                 folders_first: false,
             },
+            window: WindowState {
+                width: 1200,
+                height: 800,
+                maximized: true,
+            },
             tray_hidden: true,
             language: Some("de".to_string()),
             online_map: true,
@@ -721,6 +768,39 @@ mod tests {
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
+        assert_eq!(decoded.window, config.window);
+    }
+
+    #[test]
+    fn a_config_without_a_window_opens_at_the_default_size() {
+        let decoded: AppConfig =
+            serde_json::from_str(r#"{"app_version":"a","user_agent":"b"}"#).unwrap();
+        assert_eq!(decoded.window, WindowState::default());
+        let partial: WindowState = serde_json::from_str(r#"{"maximized":true}"#).unwrap();
+        assert_eq!((partial.width, partial.height), (980, 680));
+        assert!(partial.maximized);
+    }
+
+    #[test]
+    fn a_window_saved_too_small_opens_at_the_default_size() {
+        let tiny = WindowState {
+            width: 0,
+            height: 500,
+            maximized: true,
+        };
+        assert_eq!(
+            tiny.usable(),
+            WindowState {
+                maximized: true,
+                ..WindowState::default()
+            }
+        );
+        let fine = WindowState {
+            width: 640,
+            height: 480,
+            maximized: false,
+        };
+        assert_eq!(fine.usable(), fine);
     }
 
     #[test]
