@@ -364,9 +364,13 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
             continue;
         };
 
-        let sidecar = per_folder_sidecars
+        let found = per_folder_sidecars
             .get(&folder)
-            .and_then(|in_folder| find_sidecar(&file_name, in_folder))
+            .and_then(|in_folder| find_sidecar(&file_name, in_folder));
+        // An edited copy keeps its own name: the title is its original's.
+        let title_is_ours = found.is_some_and(|((rule, _), _)| rule != EDITED_COPY);
+        let sidecar = found
+            .map(|(_, body)| body)
             .and_then(|body| serde_json::from_slice::<PhotoSidecar>(body).ok())
             .unwrap_or_default();
 
@@ -388,6 +392,7 @@ fn assemble(entries: Vec<RawEntry>, sidecars: &HashMap<String, Vec<u8>>) -> Take
         let name = sidecar
             .title
             .as_deref()
+            .filter(|_| title_is_ours)
             .map(str::trim)
             .filter(|title| !title.is_empty() && same_extension(title, &file_name))
             .unwrap_or(&file_name)
@@ -627,15 +632,25 @@ fn swap_duplicate_marker(file_name: &str) -> Option<String> {
     Some(format!("{}{}{}", &file_name[..marker_start], tail, marker))
 }
 
-/// Find the sidecar belonging to `file_name` among the JSON files of its folder.
+/// How long Google lets a sidecar's file name get, `.json` included. A longer
+/// one is cut, into its suffix first and then into the photo name.
+const SIDECAR_NAME_CAP: usize = 51;
+
+/// The rank [`sidecar_rank`] gives an edited copy that shares its original's
+/// sidecar. Its date is the original's, but its name is its own.
+const EDITED_COPY: u8 = 4;
+
+/// Find the sidecar belonging to `file_name` among the JSON files of its folder,
+/// with the rank it matched at.
 ///
 /// Tried in order of confidence: the exact name, the `(N)`-swapped name, an
-/// unknown trailing suffix, then a prefix match for the case where truncation
-/// cut into the photo name itself. The best-ranked candidate in the folder wins.
+/// unknown trailing suffix, a prefix match for the case where truncation cut
+/// into the photo name itself, and last an edited copy's original. The
+/// best-ranked candidate in the folder wins.
 fn find_sidecar<'a>(
     file_name: &str,
     in_folder: &BTreeMap<String, &'a Vec<u8>>,
-) -> Option<&'a Vec<u8>> {
+) -> Option<((u8, usize), &'a Vec<u8>)> {
     let mut best: Option<((u8, usize), &'a Vec<u8>)> = None;
     for (sidecar_name, body) in in_folder {
         let Some(rank) = sidecar_rank(strip_json_suffix(sidecar_name), file_name) else {
@@ -645,7 +660,7 @@ fn find_sidecar<'a>(
             best = Some((rank, body));
         }
     }
-    best.map(|(_, body)| body)
+    best
 }
 
 /// How well a sidecar's `.json`-stripped `stem` matches `file_name`, as a sort
@@ -683,19 +698,44 @@ fn sidecar_rank(stem: &str, file_name: &str) -> Option<(u8, usize)> {
     }
     // 3 — truncation ate into the photo name itself, leaving only a prefix of
     // it. Every suffix boundary in the stem is tried, so this holds for a
-    // localized suffix too; the longest surviving prefix wins, because a folder
-    // with `IMG_1.jpg` and `IMG_12.jpg` must not let the shorter stem claim the
-    // longer photo.
-    let mut longest: Option<usize> = None;
-    for head in suffix_boundaries(stem) {
-        if !head.is_empty()
-            && file_name.starts_with(head)
-            && longest.is_none_or(|len| head.len() > len)
-        {
-            longest = Some(head.len());
+    // localized suffix too; the longest surviving prefix wins.
+    //
+    // Only for a sidecar whose name is as long as Google lets one get: a name
+    // that short of the cap was not cut, so a prefix of it is the name of a
+    // different photo. Without this, `IMG_1.jpg`'s sidecar gave its name and
+    // date to an `IMG_12.jpg` that had none (`docs/BUGS.md` B225).
+    if stem.chars().count() + ".json".len() >= SIDECAR_NAME_CAP - 4 {
+        let mut longest: Option<usize> = None;
+        for head in suffix_boundaries(stem) {
+            if !head.is_empty()
+                && file_name.starts_with(head)
+                && longest.is_none_or(|len| head.len() > len)
+            {
+                longest = Some(head.len());
+            }
+        }
+        if let Some(len) = longest {
+            return Some((3, usize::MAX - len));
         }
     }
-    longest.map(|len| (3, usize::MAX - len))
+    // 4 — an edited copy, `IMG_1-edited.jpg` (the word is localized), which
+    // Google exports without a sidecar of its own next to `IMG_1.jpg`'s.
+    suffix_boundaries(stem)
+        .filter_map(|head| head.rsplit_once('.'))
+        .any(|(original, extension)| is_edited_copy_of(file_name, original, extension))
+        .then_some((EDITED_COPY, 0))
+}
+
+/// Whether `file_name` is `<original>-<word>.<extension>`, the name Google
+/// gives an edited copy of `<original>.<extension>`.
+fn is_edited_copy_of(file_name: &str, original: &str, extension: &str) -> bool {
+    !original.is_empty()
+        && file_name
+            .strip_prefix(original)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|rest| rest.strip_suffix(extension))
+            .and_then(|rest| rest.strip_suffix('.'))
+            .is_some_and(|word| !word.is_empty() && word.chars().all(char::is_alphabetic))
 }
 
 /// The stem plus each of its prefixes ending before a `.`, longest first — the
@@ -994,27 +1034,78 @@ mod tests {
 
     #[test]
     fn longest_prefix_wins_when_the_photo_name_itself_was_truncated() {
+        // Both sidecar names are at Google's cap, so both were cut into the
+        // photo name; the longer surviving prefix is the better claim.
+        let short = "Takeout/Google Photos/Photos from 2019/PXL_20190101_120000000.PORTRAIT_ORIGINAL_E.json";
+        let long = "Takeout/Google Photos/Photos from 2019/PXL_20190101_120000000.PORTRAIT_ORIGINAL_EXPO.json";
         let mut sidecars = HashMap::new();
         sidecar(
             &mut sidecars,
-            "Takeout/Google Photos/Photos from 2019/IMG_1.json",
+            short,
             r#"{"photoTakenTime":{"timestamp":"1"}}"#,
         );
         sidecar(
             &mut sidecars,
-            "Takeout/Google Photos/Photos from 2019/IMG_12.json",
+            long,
             r#"{"photoTakenTime":{"timestamp":"2"}}"#,
         );
         let scan = assemble(
             vec![entry(
                 0,
-                "Takeout/Google Photos/Photos from 2019/IMG_12345.jpg",
+                "Takeout/Google Photos/Photos from 2019/PXL_20190101_120000000.PORTRAIT_ORIGINAL_EXPOSURE.jpg",
                 10,
             )],
             &sidecars,
         );
 
         assert_eq!(scan.photos[0].capture_time, Some(2));
+    }
+
+    /// A short sidecar name was not cut, so a prefix of it names another photo:
+    /// `IMG_1.jpg`'s sidecar gave its title and date to `IMG_12.jpg`
+    /// (`docs/BUGS.md` B225).
+    #[test]
+    fn a_photo_without_a_sidecar_does_not_take_a_shorter_named_siblings() {
+        let mut sidecars = HashMap::new();
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Photos/Photos from 2019/IMG_1.jpg.supplemental-metadata.json",
+            r#"{"title":"IMG_1.jpg","photoTakenTime":{"timestamp":"1"}}"#,
+        );
+        let scan = assemble(
+            vec![
+                entry(0, "Takeout/Google Photos/Photos from 2019/IMG_1.jpg", 10),
+                entry(0, "Takeout/Google Photos/Photos from 2019/IMG_12.jpg", 10),
+            ],
+            &sidecars,
+        );
+
+        assert_eq!(scan.photos[0].capture_time, Some(1));
+        assert_eq!(scan.photos[1].name, "IMG_12.jpg");
+        assert_eq!(scan.photos[1].capture_time, None);
+    }
+
+    /// An edited copy has no sidecar of its own. It takes its original's date,
+    /// but keeps its own name rather than the original's title.
+    #[test]
+    fn an_edited_copy_takes_its_originals_date_and_keeps_its_name() {
+        let mut sidecars = HashMap::new();
+        sidecar(
+            &mut sidecars,
+            "Takeout/Google Fotos/Urlaub/IMG_2.jpg.ergänzende-Metadaten.json",
+            r#"{"title":"Holiday.jpg","photoTakenTime":{"timestamp":"7"}}"#,
+        );
+        let scan = assemble(
+            vec![
+                entry(0, "Takeout/Google Fotos/Urlaub/IMG_2.jpg", 10),
+                entry(0, "Takeout/Google Fotos/Urlaub/IMG_2-bearbeitet.jpg", 10),
+            ],
+            &sidecars,
+        );
+
+        assert_eq!(scan.photos[0].name, "Holiday.jpg");
+        assert_eq!(scan.photos[1].name, "IMG_2-bearbeitet.jpg");
+        assert_eq!(scan.photos[1].capture_time, Some(7));
     }
 
     #[test]

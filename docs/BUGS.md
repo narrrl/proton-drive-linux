@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B225](#b225--a-takeout-photo-without-a-sidecar-takes-a-siblings-name-and-date) | A Takeout photo without a sidecar takes a sibling's name and date |
 | [B223](#b223--a-damaged-config-file-is-replaced-with-defaults-on-the-next-settings-change) | A damaged config file is replaced with defaults on the next settings change |
 | [B224](#b224--fallocate-zero-ranges-are-undone-and-collapse-ranges-corrupt-the-file) | `fallocate` zero ranges are undone and collapse ranges corrupt the file |
 | [B222](#b222--a-full-disk-at-close-is-reported-to-nobody-and-fsync-on-a-read-only-file-fails) | A full disk at close is reported to nobody, and `fsync` on a read-only file fails |
@@ -326,6 +327,35 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B225 — A Takeout photo without a sidecar takes a sibling's name and date
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.11). A scratch import through
+`scan_archives` gave `IMG_12.jpg`, which had no sidecar, the name `IMG_1.jpg` and IMG_1's capture
+time. It gave `IMG_2-edited.jpg` the title of its original.
+**Where:** `sidecar_rank`, `find_sidecar` and `is_edited_copy_of` in
+`crates/pdfs-core/src/takeout.rs`
+
+**Repro:** Import a Takeout folder holding `IMG_1.jpg` with its sidecar and `IMG_12.jpg` without
+one.
+
+**Cause.** The last matching rule accepted any sidecar whose stem, cut at a `.`, was a prefix of
+the photo's name. That rule exists for sidecar names Google cut at its 51-character cap, but it
+also matched short names that had not been cut, so `IMG_1`'s sidecar claimed `IMG_12.jpg`. The
+photo then went up under another photo's title and date, and two photos ended up with the same
+name. Edited copies, which Google exports without a sidecar of their own, matched the same way
+and took their original's title.
+
+**Fix.** The prefix rule applies only to a sidecar name that reaches the cap. An edited copy,
+`<original>-<word>.<ext>` with the word in any language, is matched to its original's sidecar
+by its own rule. It takes the capture time from that sidecar and keeps its own name.
+
+**Test:** `takeout::tests::a_photo_without_a_sidecar_does_not_take_a_shorter_named_siblings`,
+`takeout::tests::an_edited_copy_takes_its_originals_date_and_keeps_its_name`,
+`takeout::tests::longest_prefix_wins_when_the_photo_name_itself_was_truncated`.
+
+---
 
 ### B223 — A damaged config file is replaced with defaults on the next settings change
 
