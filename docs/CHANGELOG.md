@@ -11,6 +11,8 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.5.0] — 2026-10-16
+
 Schema: **43**. Queued changes get an index by kind and name. Nothing is rewritten, and the
 upgrade takes a moment.
 
@@ -1894,6 +1896,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.5.0
 [3.4.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.1
 [3.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.0
 [3.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.3.0
