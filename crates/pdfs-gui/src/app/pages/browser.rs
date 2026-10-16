@@ -376,7 +376,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     bulk_box.append(&bulk_clear);
     let bulk = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideDown)
-        .child(&bulk_box)
+        .child(&scroll_sideways(&bulk_box))
         .build();
 
     // The status bar: contextual text (stretch 1), then the icon-size slider.

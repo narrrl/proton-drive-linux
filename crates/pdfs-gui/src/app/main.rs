@@ -130,8 +130,12 @@ struct Ui {
     /// the page stack; [`sync_sidebar`] mirrors navigation that starts elsewhere.
     sidebar: gtk4::ListBox,
     /// The sidebar/content split. Collapsed while signed out, so the login page
-    /// owns the whole window and no destination is reachable without a session.
+    /// owns the whole window and no destination is reachable without a session,
+    /// and while the window is [`narrow`](Self::narrow).
     nav: adw::NavigationSplitView,
+    /// The window is too narrow for the sidebar beside a page, so the two take
+    /// turns. Set by the narrow breakpoint; [`refresh`] reads it.
+    narrow: Cell<bool>,
     /// Shared thumbnails for ordinary image files outside the Photos gallery.
     /// One cache and request queue serves Files, search, Shared and Trash, so
     /// the same image is downloaded and decoded only once.
@@ -321,7 +325,9 @@ fn build_window(app: &adw::Application) {
         tracing::warn!("cannot create the app's directories: {e}");
     }
 
-    let stack = adw::ViewStack::new();
+    // Not homogeneous: each page sets the window's minimum width only while it
+    // is shown, so the widest page does not hold every other one wide.
+    let stack = adw::ViewStack::builder().hhomogeneous(false).build();
     let (login_page, login_widgets) = build_login_page();
     let main_widgets = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
@@ -368,6 +374,8 @@ fn build_window(app: &adw::Application) {
         .content(&content_page)
         .min_sidebar_width(200.0)
         .max_sidebar_width(240.0)
+        // A narrow window opens on the page, not the sidebar.
+        .show_content(true)
         .build();
 
     // Toasts float over everything, so a report from a background action reaches
@@ -386,6 +394,7 @@ fn build_window(app: &adw::Application) {
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
         nav: split.clone(),
+        narrow: Cell::new(false),
         file_thumbs: FileThumbnailState::new(),
         login: login_widgets,
         status: StatusState {
@@ -735,6 +744,18 @@ fn build_window(app: &adw::Application) {
     );
     wide.add_setter(&ui.browser.split, "collapsed", Some(&false.to_value()));
     window.add_breakpoint(wide);
+    // A narrow window shows the sidebar and the page in turn, so every header
+    // bar keeps room for the window buttons. Signals rather than a setter:
+    // `refresh` decides the collapse while signed out, and would undo one.
+    let narrow = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 760sp").expect("static breakpoint"),
+    );
+    narrow.add_setter(&ui.browser.search, "width-chars", Some(&8.to_value()));
+    let ui_narrow = ui.clone();
+    narrow.connect_apply(move |_| set_narrow(&ui_narrow, true));
+    let ui_wide = ui.clone();
+    narrow.connect_unapply(move |_| set_narrow(&ui_wide, false));
+    window.add_breakpoint(narrow);
     install_shortcuts(&ui, &window);
     install_window_actions(&ui, &window);
     install_launch_actions(&ui, app, &window);
@@ -746,6 +767,15 @@ fn build_window(app: &adw::Application) {
     follow_daemon(&ui, &window);
 
     window.present();
+}
+
+/// Follow the narrow breakpoint. While signed out the login page keeps the
+/// split collapsed whatever the width.
+fn set_narrow(ui: &Ui, narrow: bool) {
+    ui.narrow.set(narrow);
+    if ui.session.borrow().is_some() {
+        ui.nav.set_collapsed(narrow);
+    }
 }
 
 /// Save the window's size when it closes, and when the app quits with the
@@ -911,6 +941,18 @@ fn set_busy_spinners(visible: bool) {
     });
 }
 
+/// `row` in a frame that scrolls sideways once the window is too narrow for it,
+/// so a row of labelled buttons never sets the window's minimum width.
+fn scroll_sideways(row: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .child(row)
+        .build()
+}
+
 /// A destination page's frame: its own header bar over the page content, the
 /// way GNOME apps lay a split view out. The title sits in the middle with the
 /// busy spinner beside it; the page packs its actions into the returned header
@@ -972,6 +1014,14 @@ fn wire_sidebar(ui: &Rc<Ui>) {
         let current = ui_row.stack.visible_child_name();
         if current.as_deref().map(destination_of) != Some(*page) {
             ui_row.stack.set_visible_child_name(page);
+        }
+    });
+    // In a narrow window the sidebar covers the page, so picking a row, even
+    // the selected one, has to bring the page forward.
+    let ui_open = ui.clone();
+    ui.sidebar.connect_row_activated(move |_, _| {
+        if ui_open.nav.is_collapsed() {
+            ui_open.nav.set_show_content(true);
         }
     });
 }

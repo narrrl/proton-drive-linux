@@ -609,7 +609,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     select_box.append(&select_done);
     let select_bar = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideDown)
-        .child(&select_box)
+        .child(&scroll_sideways(&select_box))
         .build();
 
     // All / Photos / Videos / Raw filter. Linked toggles acting as one segmented
