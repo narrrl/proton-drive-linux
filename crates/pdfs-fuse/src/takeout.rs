@@ -363,6 +363,14 @@ impl Core {
                 let uploaded = match &staged {
                     Some(path) => {
                         let thumbnails = self.upload_thumbnails(path, &photo.name);
+                        // No sidecar and no date in the name: the photo's own
+                        // EXIF, before Drive files it under today.
+                        let metadata = PhotoUploadMetadata {
+                            capture_time: metadata
+                                .capture_time
+                                .or_else(|| pdfs_core::exiftime::capture_time_of(path)),
+                            ..metadata
+                        };
                         std::fs::File::open(path)
                             .map_err(|e| {
                                 CoreError::internal(format!("open {}: {e}", path.display()))

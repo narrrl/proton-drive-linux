@@ -608,7 +608,7 @@ pub fn capture_time_from_name(name: &str) -> Option<i64> {
 
 /// Days between 1970-01-01 and a proleptic-Gregorian date (Howard Hinnant's
 /// `days_from_civil`). Avoids pulling a date crate in for one conversion.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = year - i64::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;

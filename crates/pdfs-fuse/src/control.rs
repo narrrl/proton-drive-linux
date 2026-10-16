@@ -911,6 +911,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 ))),
                 Ok((file, len)) => {
                     let photos = core.photos();
+                    // Unless the caller knows better: the photo's own EXIF,
+                    // then the file's modification time, which a copy resets.
+                    let capture_time = capture_time.or_else(|| {
+                        let path = Path::new(&source_path);
+                        pdfs_core::exiftime::capture_time_of(path).or_else(|| {
+                            let modified =
+                                std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+                            let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+                            Some(since.as_secs() as i64)
+                        })
+                    });
                     let metadata = proton_drive_rs::PhotoUploadMetadata {
                         capture_time,
                         ..Default::default()

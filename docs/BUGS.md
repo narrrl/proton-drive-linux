@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B244](#b244--photos-without-a-sidecar-or-a-dated-name-are-filed-under-the-upload-day) | Photos without a sidecar or a dated name are filed under the upload day |
 | [B243](#b243--a-hung-mount-freezes-the-app-when-a-file-is-opened) | A hung mount freezes the app when a file is opened |
 | [B242](#b242--opening-a-large-photo-freezes-the-app) | Opening a large photo freezes the app |
 | [B241](#b241--every-closed-photo-viewer-stays-in-memory-with-its-photo) | Every closed photo viewer stays in memory with its photo |
@@ -345,6 +346,35 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B244 — Photos without a sidecar or a dated name are filed under the upload day
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.3).
+**Where:** `crates/pdfs-core/src/exiftime.rs`; the `UploadPhoto` request in
+`crates/pdfs-fuse/src/control.rs`; `Core::import_takeout` in `crates/pdfs-fuse/src/takeout.rs`;
+the upload in `crates/pdfs-gui/src/app/pages/photos.rs`
+
+**Repro:**
+- Import a Takeout export in which a photo has no sidecar and no date in its name, such as
+  `DSC01234.JPG`. It lands in the timeline under the day of the import.
+- Copy a photo from a camera card with a tool that does not keep modification times, and upload
+  it from the app's gallery. It lands under the day of the copy.
+
+**Cause.** Nothing read a photo's own EXIF for its capture time. A Takeout photo fell back to its
+sidecar, then to a date in its name, then to nothing, which Drive files as "now". The app sent
+the file's modification time.
+
+**Fix.** `exiftime::capture_time` reads `DateTimeOriginal`, then `DateTimeDigitized`, each moved
+by its `OffsetTime…` tag when present and read as UTC otherwise, like a date in a file name. A
+Takeout photo with no other date uses it when the photo was copied out of the archive for its
+thumbnail (B236). The app no longer sends a time; the daemon dates the upload by EXIF, then by
+the modification time.
+
+**Test:** `exiftime::tests` (four cases, among them
+`a_photo_is_dated_by_its_original_time_and_offset`).
+
+---
 
 ### B243 — A hung mount freezes the app when a file is opened
 

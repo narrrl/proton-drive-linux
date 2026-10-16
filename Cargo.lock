@@ -3497,6 +3497,7 @@ dependencies = [
  "dbus-secret-service-keyring-store",
  "directories",
  "ignore",
+ "kamadak-exif",
  "keyring-core",
  "libc",
  "parking_lot",

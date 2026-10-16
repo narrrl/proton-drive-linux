@@ -1379,11 +1379,9 @@ pub(crate) fn wire_gallery(
                     "tiff" | "tif" => "image/tiff",
                     _ => "image/jpeg",
                 };
-                let capture_time = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
+                // The daemon dates the photo: by its EXIF, or by the file's
+                // modification time when it has none.
+                let capture_time = None;
 
                 ui.busy_begin();
                 let rx = spawn_request(
