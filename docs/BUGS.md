@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B246](#b246--signing-in-with-a-locked-keyring-freezes-the-app-window) | Signing in with a locked keyring freezes the app window |
 | [B245](#b245--any-child-of-the-daemon-can-answer-the-watchdog-for-it) | Any child of the daemon can answer the watchdog for it |
 | [B244](#b244--photos-without-a-sidecar-or-a-dated-name-are-filed-under-the-upload-day) | Photos without a sidecar or a dated name are filed under the upload day |
 | [B243](#b243--a-hung-mount-freezes-the-app-when-a-file-is-opened) | A hung mount freezes the app when a file is opened |
@@ -347,6 +348,26 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B246 — Signing in with a locked keyring freezes the app window
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.4).
+**Where:** `sign_in` in `crates/pdfs-gui/src/app/pages/login.rs`
+
+**Repro:** Sign in from the app while the system keyring is locked. The keyring asks for its
+password, and the app window stops redrawing until that prompt is answered.
+
+**Cause.** After a successful sign-in the app read the stored session back from the keyring on
+the GTK main thread. A locked keyring answers that read only once it is unlocked.
+
+**Fix.** The read runs in `gio::spawn_blocking`. The read at startup was left as it is: it runs
+before any window exists, and the launch actions (`--page`, `--confirm-stop`) need the window
+built in the same turn.
+
+**Test:** none automated; the GUI tests run without a display.
+
+---
 
 ### B245 — Any child of the daemon can answer the watchdog for it
 

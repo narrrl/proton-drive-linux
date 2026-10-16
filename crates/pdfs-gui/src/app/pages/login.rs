@@ -199,7 +199,13 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     ui.login.login_status.set_text("");
                     ui.login.password.set_text("");
                     // Cache the new identity so `refresh` never hits the keyring.
-                    *ui.session.borrow_mut() = auth::load().ok();
+                    // Read on a worker: a keyring that has to be unlocked first
+                    // answers only once the user has, and the window must not
+                    // freeze until then.
+                    *ui.session.borrow_mut() = gio::spawn_blocking(|| auth::load().ok())
+                        .await
+                        .ok()
+                        .flatten();
                     // Enable+start the mount service now that we have a session.
                     let _ = gio::spawn_blocking(service::enable_start).await;
                     refresh(&ui);
