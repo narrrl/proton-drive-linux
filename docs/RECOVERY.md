@@ -17,7 +17,7 @@ your synced folders back on the replacement machine.
 | Every file that finished uploading | Proton Drive |
 | The computer's registration and its backup | **Computers** in the app and the web |
 | One folder per synced folder, under that computer | Proton Drive |
-| The machine profile: which folders were synced, to which local path, in which mode; pins; ignore patterns | `.proton-drive-linux/profile.json` under the computer's backup, end-to-end encrypted like any other file |
+| The machine profile: which folders were synced, to which local path, in which mode; pins; ignore patterns | `.proton-drive-linux/profile-<machine id>.json` under the computer's backup, one per computer that syncs into it, end-to-end encrypted like any other file. Clients before 3.5.0 wrote `profile.json` |
 | Your account, keys and shares | Proton |
 
 The service rewrites the profile a short while after you add, remove or switch a synced folder,
@@ -166,18 +166,21 @@ This section is for the curious and for anyone debugging a restore.
   in the account is reported in the log instead of being replaced silently.
 - **What can be restored.** `pdfs sync restore` lists the folders directly under the computer's
   backup, except `.proton-drive-linux`. Folders already synced on this machine are skipped.
-- **Proposed paths.** When the profile names a local path whose parent directory exists on this
+- **Proposed paths.** Several computers may sync into one backup, each with its own profile. The
+  profile written by a computer with this machine's hostname is used first, then the newest one
+  that has the folder. When it names a local path whose parent directory exists on this
   machine, that path is proposed. Otherwise the proposal is `~/<folder name>`. The service never
   writes to a path you have not confirmed.
 - **Attaching by UID.** The restore binds each local path to the remote folder's UID, not to its
   name. Restoring `Documents` into `~/docs` works.
 - **Downloading.** A restored folder starts with an empty sync baseline. Against an empty local
   directory, every remote file counts as new and is downloaded. Files present on both sides with
-  no baseline become conflict copies, as described above.
+  no baseline are compared by content: identical files are taken as they are, and different
+  ones become conflict copies, as described above.
 - **The wipe guard.** A sync pass in which every previously synced file has vanished locally is
   refused instead of being mirrored to Proton Drive as a mass deletion. A folder that was emptied
   by accident therefore does not empty the backup.
-- **The profile format.** `profile.json` carries a `version` field. A client refuses a profile
+- **The profile format.** Each profile carries a `version` field. A client refuses a profile
   written by a newer, incompatible client instead of applying part of it.
 
 ## 4. Known gaps

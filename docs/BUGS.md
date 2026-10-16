@@ -100,6 +100,11 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
+| [B251](#b251--two-computers-can-make-the-same-conflict-copy-name) | Two computers can make the same conflict copy name |
+| [B250](#b250--a-revision-made-during-a-mirror-download-never-arrives) | A revision made during a mirror download never arrives |
+| [B249](#b249--a-mirror-edit-replaces-a-revision-another-computer-made-since) | A mirror edit replaces a revision another computer made since |
+| [B248](#b248--a-joining-mirror-takes-a-same-size-file-for-the-same-file) | A joining mirror takes a same-size file for the same file |
 | [B247](#b247--tray-status-lines-are-not-translated) | Tray status lines are not translated |
 | [B246](#b246--signing-in-with-a-locked-keyring-freezes-the-app-window) | Signing in with a locked keyring freezes the app window |
 | [B245](#b245--any-child-of-the-daemon-can-answer-the-watchdog-for-it) | Any child of the daemon can answer the watchdog for it |
@@ -349,6 +354,126 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B252 — Computers sharing a device overwrite each other's profile
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `save_profile` and `load_profiles` in `crates/pdfs-fuse/src/profile.rs`
+
+**Repro:** Adopt one device on two computers and sync a different folder on each. The
+device's `profile.json` lists only the folders of whichever computer saved last.
+
+**Cause.** The profile was one file per device, written as a new revision by every computer
+that synced into it, each with only its own folders.
+
+**Fix.** Each machine writes `profile-<machine id>.json`. The id is random, made on first use
+and kept in `machine-id` next to `config.json`, so nothing that identifies the host goes to
+Drive. Restore reads every profile in the folder, including the shared `profile.json` of older
+clients. A folder's proposal comes from this computer's own profile, otherwise from the newest
+one that has the folder. The legacy file is left alone.
+
+**Test:** `the_saved_folder_comes_from_this_computer_then_the_newest_profile` and
+`a_profile_name_is_the_legacy_one_or_one_per_machine` in `pdfs-core`;
+`each_machine_saves_its_own_profile` in `pdfs-fuse`.
+
+---
+
+### B251 — Two computers can make the same conflict copy name
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `conflict_path_with_suffix` in `crates/pdfs-fuse/src/sync/planner.rs`, `conflict_name`
+in `crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Two computers sync one folder and each keeps a conflict copy of the same file in the
+same second. Both name it `notes (sync-conflict 1700000000).txt`, so the second upload meets
+the first on Drive, and neither copy says which computer it came from.
+
+**Cause.** The name held only the time. The `-<n>` suffix is made unique on the local disk, not
+on Drive.
+
+**Fix.** Conflict copies carry the hostname, cut down to one token of letters, digits, `-`, `_`
+and `.`: `notes (sync-conflict laptop 1700000000).txt`. `conflict_base_name` reads both forms,
+so the sweep and **Resolve** still find copies made before.
+
+**Test:** `a_hostname_becomes_one_safe_token`, `conflict_name_keeps_the_extension`,
+`conflict_path_keeps_extension_and_directory` and `parses_conflict_names_and_leaves_others_alone`.
+
+---
+
+### B250 — A revision made during a mirror download never arrives
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `download_file` and `record_file_baseline` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Another computer saves a file in a mirrored folder while this computer downloads the
+previous version. This computer keeps the previous version, and later passes do not fetch the
+newer one.
+
+**Cause.** After a download the baseline read the node again and recorded what Drive held then.
+A revision committed while the download ran was recorded as synced, although the disk held the
+older one.
+
+**Fix.** The baseline records the revision the pass planned to download. If the download already
+fetched the newer one, the next pass fetches it once more, which costs a transfer and loses
+nothing. After an upload the read-back is still used, but only when Drive's digest is the one
+just sent; otherwise the baseline is left as it was and the next pass keeps a conflict copy.
+
+**Test:** `a_revision_made_during_a_mirror_download_still_arrives` (simulation, FUSE). It fails
+with the old read-back.
+
+---
+
+### B249 — A mirror edit replaces a revision another computer made since
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `upload_revision` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Edit a file in a mirrored folder while another computer saves its own edit of the
+same file, after this computer's pass looked at Drive and before it uploads. This computer's
+revision becomes the current one. The other edit survives only in the version history, and no
+conflict copy is made.
+
+**Cause.** The upload made a new revision of whatever Drive held at that moment, from a plan
+that could be minutes old. Nothing compared Drive with the baseline before uploading. Change
+detection used only the link's modification time and the size.
+
+**Fix.** The baseline records the revision id it was synced at (schema 44). The upload reads
+the node first and leaves a file whose revision moved for the next pass, which keeps the local
+edit as a conflict copy. A new revision id counts as a remote change even at the same
+modification time and size. A revision committed between the check and the upload's own draft
+is not caught, because the SDK reads the current revision itself; the read-back after the upload
+catches one committed after it.
+
+**Test:** `a_mirror_edit_does_not_replace_a_revision_another_computer_made_since` (simulation,
+FUSE), `a_new_remote_revision_is_a_change_even_at_the_same_mtime_and_size` and
+`migration_v44_adds_the_synced_revision_without_disturbing_a_v43_baseline`.
+
+---
+
+### B248 — A joining mirror takes a same-size file for the same file
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `plan_file` in `crates/pdfs-fuse/src/sync/planner.rs`
+
+**Repro:** Sync a local folder into a folder on Drive that already holds a file of the same name
+and size but different content, for example on a second computer joining a folder. The first
+pass records both as in step, and the two computers go on holding different files.
+
+**Cause.** The first sync of a path present on both sides adopted the baseline whenever the sizes
+matched, to avoid a conflict copy of every pre-existing file.
+
+**Fix.** The adoption needs Drive's content digest, and the local file is hashed first. A match
+is adopted; a different file, or one without a digest on Drive, is kept as a conflict copy.
+
+**Test:** `a_joining_mirror_keeps_a_same_size_different_file_as_a_conflict` (simulation, FUSE)
+and `first_sync_without_a_remote_digest_is_a_conflict`.
+
+---
 
 ### B247 — Tray status lines are not translated
 

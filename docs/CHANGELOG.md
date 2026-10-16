@@ -13,10 +13,28 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [3.5.0] — 2026-10-16
 
-Schema: **43**. Queued changes get an index by kind and name. Nothing is rewritten, and the
-upgrade takes a moment.
+Schema: **44**. Queued changes get an index by kind and name, and each synced file remembers the
+version on Proton Drive it was synced at. Nothing is rewritten, and the upgrade takes a moment.
+
+### Added
+- **Several computers can sync the same folders.** On the Computers page, **Sync With This
+  Computer…** on another computer, or `pdfs devices join`, makes this computer sync into that
+  computer's backup alongside it, then offers its folders for syncing here. Both computers keep
+  them in step, deletions included. Each computer now keeps its own settings backup in the
+  shared backup, so they no longer overwrite each other (B252).
 
 ### Fixed
+- **An edit in a synced folder could replace one another computer had just saved.** The newer
+  version from the other computer was left only in the version history. The edit is now kept as
+  a conflict copy (B249).
+- **A version saved on another computer while this one downloaded the previous version never
+  arrived.** (B250)
+- **Syncing a folder into one that already held a file of the same name and size took the two
+  for the same file**, even when their content differed. The content is now compared, and a
+  different file is kept as a conflict copy (B248).
+- **Conflict copies now name the computer that made them**, for example
+  `notes (sync-conflict laptop 1700000000).txt`, so two computers no longer make the same name
+  (B251).
 - **A folder deleted on another device took files with it that had never reached Drive.** A new
   file, an edit or an ignored `.git` in a synced folder was deleted along with the folder. Such a
   folder is now kept and created on Drive again (B211).
