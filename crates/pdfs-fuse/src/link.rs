@@ -280,8 +280,9 @@ impl Core {
         self.relist_offline_listings();
         // Anything written while offline is queued and waiting on exactly this,
         // including ops that failed on the way down and are sitting out a
-        // backoff sized for a server that keeps refusing.
-        if let Err(e) = self.db.retry_failed_ops_now(crate::now_millis()) {
+        // backoff sized for a server that keeps refusing. Ops Drive refused
+        // keep theirs: the link was not why.
+        if let Err(e) = self.db.retry_unrefused_ops_now(crate::now_millis()) {
             warn!(error = %e, "moving backed-off ops up after a reconnect failed");
         }
         self.wake_drain();

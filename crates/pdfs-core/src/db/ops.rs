@@ -1483,12 +1483,26 @@ impl Db {
     }
 
     /// [`retry_op_now`](Self::retry_op_now) for every op that has failed at
-    /// least once. Returns how many rows changed.
+    /// least once, for the user's "Retry all". Returns how many rows changed.
     pub fn retry_failed_ops_now(&self, now: i64) -> Result<usize> {
+        self.retry_ops_now(now, "")
+    }
+
+    /// [`retry_failed_ops_now`](Self::retry_failed_ops_now) for the ops Drive
+    /// did not refuse, for a reconnect. A link coming back changes nothing
+    /// about a full quota or a missing permission, so those keep their backoff
+    /// instead of all being sent again at once.
+    pub fn retry_unrefused_ops_now(&self, now: i64) -> Result<usize> {
+        self.retry_ops_now(now, "AND issue IS NULL")
+    }
+
+    fn retry_ops_now(&self, now: i64, filter: &str) -> Result<usize> {
         let conn = self.conn.lock();
         let changed = conn.execute(
-            "UPDATE pending_op SET next_attempt_at = ?1
-             WHERE attempts > 0 AND next_attempt_at > ?1 AND next_attempt_at < ?2",
+            &format!(
+                "UPDATE pending_op SET next_attempt_at = ?1
+                 WHERE attempts > 0 AND next_attempt_at > ?1 AND next_attempt_at < ?2 {filter}"
+            ),
             params![now, PARK_UNTIL],
         )?;
         Ok(changed)

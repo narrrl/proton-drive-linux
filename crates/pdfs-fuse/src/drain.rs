@@ -389,13 +389,7 @@ impl Core {
                 // A name a change of ours is about to free is a wait, not a
                 // failure: the trash or rename holding it lands in moments.
                 let held = waits_for_name(e.as_ref());
-                let backoff = if held {
-                    DRAIN_BACKOFF_MIN
-                } else {
-                    DRAIN_BACKOFF_MIN
-                        .saturating_mul(1u32 << attempts.min(6))
-                        .min(DRAIN_BACKOFF_MAX)
-                };
+                let backoff = drain_backoff(attempts, held, op.id);
                 warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
                 if let Err(e) = self.db.record_attempt_failure(
                     op.id,
@@ -2787,6 +2781,25 @@ fn waits_for_name(e: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(e), |e| e.source()).any(|e| e.is::<NameHeld>())
 }
 
+/// How long an op waits after its `attempts`-th failure: doubling from
+/// [`DRAIN_BACKOFF_MIN`] up to [`DRAIN_BACKOFF_MAX`], plus up to a fifth more,
+/// different for each op (`seed`), so that ops that failed together are not
+/// all retried in the same second. One that waits for a name (`held`) waits
+/// the minimum.
+///
+/// The doubling stopped at 2^6, 128 s, so the maximum was never reached.
+fn drain_backoff(attempts: i64, held: bool, seed: i64) -> Duration {
+    if held {
+        return DRAIN_BACKOFF_MIN;
+    }
+    let base = DRAIN_BACKOFF_MIN
+        .saturating_mul(1u32 << attempts.clamp(0, 8))
+        .min(DRAIN_BACKOFF_MAX);
+    // A cheap, stable spread: the same op and attempt always wait the same.
+    let spread = (seed.wrapping_mul(0x9E37_79B9).wrapping_add(attempts) as u64 % 21) as u32;
+    base + base * spread / 100
+}
+
 /// How many attempts an op waits for a rename or a create on the wire to free
 /// the name it wants. Two files swapping names each wait for the other, so the
 /// wait has to end; a conflict name ends it.
@@ -3384,6 +3397,22 @@ mod tests {
             direct_role: None,
             share_id: None,
         }
+    }
+
+    #[test]
+    fn a_failing_op_backs_off_to_the_maximum_with_a_spread() {
+        let at = |attempts| drain_backoff(attempts, false, 7);
+        assert!(at(1) >= DRAIN_BACKOFF_MIN * 2);
+        assert!(at(2) > at(1));
+        // Reached, which the doubling capped at 2^6 never did.
+        assert!(at(8) >= DRAIN_BACKOFF_MAX);
+        assert!(at(30) <= DRAIN_BACKOFF_MAX + DRAIN_BACKOFF_MAX / 5);
+        // Ops that failed together do not all come back together.
+        let waits: std::collections::HashSet<_> =
+            (1..=20).map(|id| drain_backoff(8, false, id)).collect();
+        assert!(waits.len() > 5, "{waits:?}");
+        // A wait for a name stays short however often it repeats.
+        assert_eq!(drain_backoff(30, true, 7), DRAIN_BACKOFF_MIN);
     }
 
     #[test]

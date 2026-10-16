@@ -7531,6 +7531,32 @@ fn a_refused_change_names_its_node_by_local_id() {
     );
 }
 
+/// A reconnect moves up the ops that failed for want of a link. One Drive
+/// refused, for quota or access, keeps its backoff: the link coming back
+/// changes nothing about it. "Retry all" still moves both.
+#[test]
+fn a_reconnect_leaves_refused_ops_to_their_backoff() {
+    let db = Db::open_in_memory().unwrap();
+    let offline = queued_op(&db, "vol~a", 2, 90_000);
+    let refused = queued_op(&db, "vol~b", 2, 90_000);
+    db.set_op_issue(refused, Some("quota")).unwrap();
+
+    assert_eq!(db.retry_unrefused_ops_now(5_000).unwrap(), 1);
+    let due = |id: i64| {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(offline), 5_000);
+    assert_eq!(due(refused), 90_000);
+
+    assert_eq!(db.retry_failed_ops_now(5_000).unwrap(), 1);
+    assert_eq!(due(refused), 5_000);
+}
+
 #[test]
 fn retry_all_touches_only_ops_that_have_failed() {
     let db = Db::open_in_memory().unwrap();

@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B237](#b237--every-reconnect-resends-refused-uploads-all-in-the-same-second) | Every reconnect resends refused uploads, all in the same second |
 | [B236](#b236--imported-re-dated-and-app-uploaded-photos-have-no-thumbnail) | Imported, re-dated and app-uploaded photos have no thumbnail |
 | [B235](#b235--scanning-a-large-takeout-folder-takes-half-a-minute) | Scanning a large Takeout folder takes half a minute |
 | [B234](#b234--any-folder-can-become-a-sync-root-the-home-folder-included) | Any folder can become a sync root, the home folder included |
@@ -338,6 +339,33 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B237 — Every reconnect resends refused uploads, all in the same second
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.3.3).
+**Where:** `drain_backoff` in `crates/pdfs-fuse/src/drain.rs`; the reconnect in
+`crates/pdfs-fuse/src/link.rs`; `Db::retry_unrefused_ops_now` in
+`crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Fill the Drive quota and queue a few hundred files, then let the link drop and come
+back a few times.
+
+**Cause.** Three things together:
+- Every reconnect made every failed op due at once, the ones Drive refused for quota or access
+  included. Each reconnect then sent the whole refused queue again.
+- All ops that failed together were retried together: the backoff had no spread.
+- The doubling stopped at 2^6, so the wait never grew past 128 s, and the 300 s maximum was never
+  reached.
+
+**Fix.** A reconnect makes due only the ops without a recorded refusal. "Retry all" still moves
+every op. The backoff doubles up to the 300 s maximum, plus up to a fifth more, which differs
+from op to op.
+
+**Test:** `db::tests::a_reconnect_leaves_refused_ops_to_their_backoff`;
+`drain::tests::a_failing_op_backs_off_to_the_maximum_with_a_spread`.
+
+---
 
 ### B236 — Imported, re-dated and app-uploaded photos have no thumbnail
 
