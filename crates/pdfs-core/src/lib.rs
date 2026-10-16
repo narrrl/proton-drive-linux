@@ -23,6 +23,7 @@ pub mod service;
 pub mod shell;
 pub mod similar;
 pub mod syncignore;
+pub mod syncroot;
 pub mod takeout;
 pub mod tray;
 

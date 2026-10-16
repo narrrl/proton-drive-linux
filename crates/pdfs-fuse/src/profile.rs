@@ -304,6 +304,9 @@ impl Core {
             // offering it as a restorable folder would sync the bookkeeping
             // back onto the machine it describes.
             .filter(|n| n.is_folder() && !n.trashed && n.name != PROFILE_DIR_NAME)
+            // The name becomes a folder under the home folder: one with a `/`
+            // or a `..` in it would put the restore somewhere else.
+            .filter(|n| crate::remote_name_is_safe(&n.name))
             .map(|n| {
                 let uid = n.uid.to_string();
                 let saved = profile
@@ -349,23 +352,29 @@ impl Core {
             .sync_folder_list()
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
 
+        let reserved = crate::devices::sync_root_reserved();
+        let mut roots: Vec<PathBuf> = existing
+            .iter()
+            .map(|f| PathBuf::from(&f.local_path))
+            .collect();
         let mut restored = 0usize;
         let mut skipped: Vec<String> = Vec::new();
         for item in items {
-            let local = PathBuf::from(&item.local_path);
-            if !local.is_absolute() {
-                skipped.push(format!("{}: local path must be absolute", item.local_path));
-                continue;
-            }
+            // The path is proposed from the profile another machine wrote, and
+            // may hold a folder name from Drive: checked like any new root.
+            let local = match pdfs_core::syncroot::resolve(Path::new(&item.local_path)) {
+                Ok(local) => local,
+                Err(e) => {
+                    skipped.push(format!("{}: {e}", item.local_path));
+                    continue;
+                }
+            };
             if existing.iter().any(|f| f.remote_uid == item.remote_uid) {
                 skipped.push(format!("{}: already synced", item.local_path));
                 continue;
             }
-            if existing
-                .iter()
-                .any(|f| Path::new(&f.local_path) == local.as_path())
-            {
-                skipped.push(format!("{}: path already in use", item.local_path));
+            if let Some(problem) = pdfs_core::syncroot::problem(&local, &roots, &reserved) {
+                skipped.push(format!("{}: {problem}", item.local_path));
                 continue;
             }
             if let Err(e) = std::fs::create_dir_all(&local) {
@@ -390,6 +399,7 @@ impl Core {
                 let _ = self.request_sync_folder_mode(id, "ondemand");
             }
             let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+            roots.push(local);
             restored += 1;
         }
         let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);

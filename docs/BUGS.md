@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B234](#b234--any-folder-can-become-a-sync-root-the-home-folder-included) | Any folder can become a sync root, the home folder included |
 | [B233](#b233--signing-out-leaves-the-session-valid-on-proton) | Signing out leaves the session valid on Proton |
 | [B232](#b232--names-with--or--show-as-empty-rows-or-are-drawn-as-markup) | Names with & or < show as empty rows or are drawn as markup |
 | [B231](#b231--a-large-upload-under-a-low-upload-limit-never-finishes) | A large upload under a low upload limit never finishes |
@@ -335,6 +336,39 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B234 — Any folder can become a sync root, the home folder included
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.12).
+**Where:** `crates/pdfs-core/src/syncroot.rs`; `Core::add_sync_folder` and `sync_root_reserved` in
+`crates/pdfs-fuse/src/devices.rs`; `Core::restore_sync_folders` and the restore proposals in
+`crates/pdfs-fuse/src/profile.rs`
+
+**Repro:** `pdfs sync add ~`, or `pdfs sync add /`. Or restore a profile whose recorded path is
+`/home/u/../..`, or whose folder on Drive has a name with a `/`.
+
+**Cause.** A new sync root was only checked for being a directory and not already synced. A
+restore checked only that the path was absolute. Nothing refused `/`, the home folder, a parent
+of either, the Proton Drive mount, the app's own state, cache and config folders, or a root
+inside or around another root. Adding the home folder uploads the decrypted content cache,
+`cache.db` and `~/.ssh`, and walks into the mount, which downloads the Drive only to upload it
+again. A restore proposal joined a folder name from Drive onto the home folder as it was.
+
+**Fix.** One check, `syncroot::problem`, runs wherever a root is added or restored. It refuses
+the cases above. Paths are compared after `syncroot::resolve`, which follows symlinks as far as
+the path exists and refuses `..`. Restore proposals leave out folders whose name could not be a
+local file name.
+
+The audit also suggested not crossing into other file systems during the local walk. That was
+left out on purpose: a btrfs subvolume inside a sync root has a device id of its own, and would
+silently stop syncing.
+
+**Test:** `syncroot::tests` (six cases, among them
+`the_file_system_root_home_and_its_parents_are_refused` and
+`a_root_inside_or_around_another_root_is_refused`).
+
+---
 
 ### B233 — Signing out leaves the session valid on Proton
 
