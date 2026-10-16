@@ -226,11 +226,7 @@ fn scale_thumbnail_with_exiftool(
     exiftool: &OsStr,
     timeout: Duration,
 ) -> ScaleAttempt {
-    let direct = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|reader| reader.decode().ok());
-    let image = match direct {
+    let image = match decode_upright(bytes) {
         Some(image) => image,
         None if is_raw_image_name(name) => {
             let (preview, orientation) =
@@ -254,6 +250,27 @@ fn scale_thumbnail_with_exiftool(
         None => return ScaleAttempt::Undecodable,
     };
     encode_thumb(&image)
+}
+
+/// Decode `bytes` and turn the picture the way its EXIF orientation says.
+///
+/// `ImageReader::decode` does not: a phone stores a portrait photo as landscape
+/// pixels plus an orientation tag, so every such thumbnail came out on its
+/// side, and the drain uploaded it to Drive that way for every client to show
+/// (`docs/BUGS.md` B226).
+fn decode_upright(bytes: &[u8]) -> Option<image::DynamicImage> {
+    use image::ImageDecoder as _;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    Some(image)
 }
 
 /// Shrink a decoded image to a [`THUMB_EDGE`] JPEG, keeping its aspect ratio.
@@ -2147,6 +2164,53 @@ mod thumb_tests {
         };
         assert!(thumb.ratio < 1.0, "portrait stays portrait");
         assert_eq!(ratio_of(&thumb.bytes).map(|r| r < 1.0), Some(true));
+    }
+
+    /// `jpeg` with an EXIF APP1 segment that carries only `orientation`.
+    fn jpeg_with_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let plain = jpeg(width, height);
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+        let mut out = plain[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&u16::try_from(app1.len() + 2).unwrap().to_be_bytes());
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&plain[2..]);
+        out
+    }
+
+    /// A phone stores a portrait photo as landscape pixels and an EXIF
+    /// orientation; its thumbnail came out on its side (`docs/BUGS.md` B226).
+    #[test]
+    fn a_thumbnail_is_turned_the_way_its_exif_says() {
+        let ScaleAttempt::Made(thumb) = scale_thumbnail(
+            &jpeg_with_orientation(2000, 1000, 6),
+            "portrait.jpg",
+            &std::env::temp_dir(),
+        ) else {
+            panic!("a JPEG scales");
+        };
+        assert!(thumb.ratio < 1.0, "turned upright: {}", thumb.ratio);
+        assert_eq!(ratio_of(&thumb.bytes).map(|r| r < 1.0), Some(true));
+
+        let ScaleAttempt::Made(level) = scale_thumbnail(
+            &jpeg_with_orientation(2000, 1000, 1),
+            "landscape.jpg",
+            &std::env::temp_dir(),
+        ) else {
+            panic!("a JPEG scales");
+        };
+        assert!(level.ratio > 1.0);
     }
 
     #[test]

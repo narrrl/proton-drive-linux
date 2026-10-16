@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B226](#b226--thumbnails-of-portrait-phone-photos-lie-on-their-side) | Thumbnails of portrait phone photos lie on their side |
 | [B225](#b225--a-takeout-photo-without-a-sidecar-takes-a-siblings-name-and-date) | A Takeout photo without a sidecar takes a sibling's name and date |
 | [B223](#b223--a-damaged-config-file-is-replaced-with-defaults-on-the-next-settings-change) | A damaged config file is replaced with defaults on the next settings change |
 | [B224](#b224--fallocate-zero-ranges-are-undone-and-collapse-ranges-corrupt-the-file) | `fallocate` zero ranges are undone and collapse ranges corrupt the file |
@@ -327,6 +328,27 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B226 — Thumbnails of portrait phone photos lie on their side
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.4).
+**Where:** `decode_upright` and `scale_thumbnail_with_exiftool` in
+`crates/pdfs-fuse/src/photos.rs`
+
+**Repro:** Upload a portrait photo taken with a phone that stores landscape pixels plus an EXIF
+orientation tag, which most do. Its tile in the app, and in Proton's own apps, lies on its side.
+
+**Cause.** Generated thumbnails were decoded with `ImageReader::decode`, which ignores the EXIF
+orientation. Only the RAW preview path applied it. The drain uploads the generated thumbnail with
+the photo, so every client showed it sideways.
+
+**Fix.** `decode_upright` reads the orientation from the decoder and applies it before the image
+is scaled.
+
+**Test:** `photos::tests::a_thumbnail_is_turned_the_way_its_exif_says`.
+
+---
 
 ### B225 — A Takeout photo without a sidecar takes a sibling's name and date
 
