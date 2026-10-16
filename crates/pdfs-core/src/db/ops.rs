@@ -279,6 +279,45 @@ fn claimable() -> String {
 /// drain replaces it with the uid the server assigns.
 pub const LOCAL_VOLUME: &str = "local";
 
+/// One place a queued create was sent, with when it first was.
+struct SentTarget {
+    parent: String,
+    name: String,
+    at_ms: Option<i64>,
+}
+
+/// The `sent_to` column: `[[parent, name, at_ms], …]`, or `[[parent, name], …]`
+/// as written before the time was kept. `None` when it does not parse.
+fn parse_sent_to(json: Option<&str>) -> Option<Vec<SentTarget>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        At(String, String, i64),
+        Bare(String, String),
+    }
+    let Some(json) = json else {
+        return Some(Vec::new());
+    };
+    let entries: Vec<Entry> = serde_json::from_str(json).ok()?;
+    Some(
+        entries
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::At(parent, name, at) => SentTarget {
+                    parent,
+                    name,
+                    at_ms: Some(at),
+                },
+                Entry::Bare(parent, name) => SentTarget {
+                    parent,
+                    name,
+                    at_ms: None,
+                },
+            })
+            .collect(),
+    )
+}
+
 /// The uid a node made on this machine goes by until Drive gives it one: its
 /// row's local id under [`LOCAL_VOLUME`].
 ///
@@ -541,7 +580,7 @@ impl Db {
     /// land in the order they were made (`docs/BUGS.md` B141). Should it fail,
     /// [`Db::record_op_failure`] or [`Db::release_op_claim`] drops it.
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.durable()?;
         let tx = conn.transaction()?;
         let superseded: Option<String> = if op_supersedes(&op.kind) {
             let lid = node_lid(&tx, &op.uid)?;
@@ -598,7 +637,7 @@ impl Db {
         name: &str,
         created_at: i64,
     ) -> Result<(i64, Vec<String>)> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.durable()?;
         let tx = conn.transaction()?;
         let blobs = drop_doomed_ops(&tx, uid)?;
         tx.execute(
@@ -628,7 +667,7 @@ impl Db {
         blob_path: &str,
         meta_json: &str,
     ) -> Result<Option<AttachedBlob>> {
-        let conn = self.conn.lock();
+        let conn = self.durable()?;
         let lid = node_lid(&conn, uid)?;
         let existing: Option<(i64, Option<String>)> = conn
             .query_row(
@@ -691,7 +730,7 @@ impl Db {
         rewrite: impl FnOnce(&str) -> Option<String>,
     ) -> Result<CreateRetired> {
         let (local, real) = (landing.local, landing.real);
-        let mut conn = self.conn.lock();
+        let mut conn = self.durable()?;
         let tx = conn.transaction()?;
         let row: Option<CreateRow> = tx
             .query_row(
@@ -808,12 +847,19 @@ impl Db {
         Ok(())
     }
 
-    /// Record that queued create `id` is being sent to `parent` under `name`.
+    /// Record that queued create `id` is being sent to `parent` under `name`
+    /// at `at_ms`.
     ///
     /// A rename while the op waits rewrites its target, but the file a lost
     /// answer left stays where it was sent. The retry and the trash look
-    /// there too (`docs/BUGS.md` B184).
-    pub fn note_create_target(&self, id: i64, parent: &str, name: &str) -> Result<()> {
+    /// there too (`docs/BUGS.md` B184). A target sent before keeps its first
+    /// time.
+    ///
+    /// A record that does not parse is left as it is rather than replaced
+    /// with this one target: the earlier ones are what the duplicate checks
+    /// look for. Without them a lost answer forks a conflict copy, which
+    /// loses nothing.
+    pub fn note_create_target(&self, id: i64, parent: &str, name: &str, at_ms: i64) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let sent: Option<String> = tx
@@ -822,15 +868,26 @@ impl Db {
             })
             .optional()?
             .flatten();
-        let mut targets: Vec<(String, String)> = sent
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
-        let target = (parent.to_string(), name.to_string());
-        if !targets.contains(&target) {
-            targets.push(target);
+        let Some(mut targets) = parse_sent_to(sent.as_deref()) else {
+            tracing::warn!(
+                id,
+                "a queued create's send record does not parse; keeping it"
+            );
+            return Ok(());
+        };
+        if !targets.iter().any(|t| t.parent == parent && t.name == name) {
+            targets.push(SentTarget {
+                parent: parent.to_string(),
+                name: name.to_string(),
+                at_ms: Some(at_ms),
+            });
+            let json: Vec<(&str, &str, i64)> = targets
+                .iter()
+                .map(|t| (t.parent.as_str(), t.name.as_str(), t.at_ms.unwrap_or(0)))
+                .collect();
             tx.execute(
                 "UPDATE pending_op SET sent_to = ?2 WHERE id = ?1",
-                params![id, serde_json::to_string(&targets)?],
+                params![id, serde_json::to_string(&json)?],
             )?;
         }
         tx.commit()?;
@@ -840,6 +897,24 @@ impl Db {
     /// The parent and name queued op `id` was sent under as a create, in the
     /// order it was ([`Db::note_create_target`]).
     pub fn create_targets(&self, id: i64) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .sent_targets(id)?
+            .into_iter()
+            .map(|t| (t.parent, t.name))
+            .collect())
+    }
+
+    /// When queued create `id` was first sent, if that was recorded. Rows
+    /// written before the time was kept have none.
+    pub fn create_first_sent(&self, id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .sent_targets(id)?
+            .into_iter()
+            .filter_map(|t| t.at_ms.filter(|&at| at > 0))
+            .min())
+    }
+
+    fn sent_targets(&self, id: i64) -> Result<Vec<SentTarget>> {
         let sent: Option<String> = self
             .conn
             .lock()
@@ -848,9 +923,7 @@ impl Db {
             })
             .optional()?
             .flatten();
-        Ok(sent
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default())
+        Ok(parse_sent_to(sent.as_deref()).unwrap_or_default())
     }
 
     /// The SHA-1 of each blob queued op `id` sent as a create
@@ -898,6 +971,27 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Replace the sidecar of op `id`, but only while it still holds the blob
+    /// at `blob_path`.
+    ///
+    /// The drain fills an incomplete blob in place and then records it as
+    /// whole, so a retry after a lost answer can recognise its own bytes on the
+    /// server. A write that closed meanwhile has pointed the row at a newer
+    /// blob with its own sidecar; that one must not be overwritten. Returns
+    /// false when the row is gone or holds another blob.
+    pub fn update_op_meta_for_blob(
+        &self,
+        id: i64,
+        blob_path: &str,
+        meta_json: &str,
+    ) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE pending_op SET meta_json = ?3 WHERE id = ?1 AND blob_path = ?2",
+            params![id, blob_path, meta_json],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Point a queued create at a new parent and name, for a node renamed or
     /// moved before it ever reached the server.
     ///
@@ -911,7 +1005,7 @@ impl Db {
     /// name it no longer wants, such as one held by a queued change. A parked
     /// create stays parked.
     pub fn rewrite_op_target(&self, uid: &str, parent_uid: &str, name: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.durable()?;
         let lid = node_lid(&conn, uid)?;
         let parent_lid = node_lid(&conn, parent_uid)?;
         let n = conn.execute(

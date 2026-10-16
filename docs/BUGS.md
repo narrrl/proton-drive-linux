@@ -100,6 +100,9 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B230](#b230--a-create-queued-offline-adopts-another-devices-file-of-the-same-name) | A create queued offline adopts another device's file of the same name |
+| [B229](#b229--a-queued-write-can-be-lost-to-a-power-cut-after-close-returned) | A queued write can be lost to a power cut after close returned |
+| [B228](#b228--a-gap-filled-write-whose-upload-answer-was-lost-becomes-a-conflict-copy-of-itself) | A gap-filled write whose upload answer was lost becomes a conflict copy of itself |
 | [B227](#b227--reading-a-file-open-for-writing-downloads-on-the-dispatch-loop) | Reading a file open for writing downloads on the dispatch loop |
 | [B226](#b226--thumbnails-of-portrait-phone-photos-lie-on-their-side) | Thumbnails of portrait phone photos lie on their side |
 | [B225](#b225--a-takeout-photo-without-a-sidecar-takes-a-siblings-name-and-date) | A Takeout photo without a sidecar takes a sibling's name and date |
@@ -329,6 +332,87 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B230 — A create queued offline adopts another device's file of the same name
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.14).
+**Where:** `adoptable` and `Core::first_sent` in `crates/pdfs-fuse/src/drain.rs`;
+`note_create_target`, `create_first_sent` and `parse_sent_to` in
+`crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Offline, create an empty file `notes.txt` in the mount. Before this machine goes
+online again, create an empty `notes.txt` in the same folder on another device. Go online.
+
+**Cause.** A queued create that finds its name taken may adopt the node there, when that node is
+the one an earlier attempt made and lost the answer to (B127, B184). One condition is that the
+node was made around the time of the op. That time was when the op was queued, so an op queued
+offline for days accepted any empty node of the same name made since, including another
+device's file or folder. A folder adopted that way merged both devices' contents.
+
+Separately, a `sent_to` record that did not parse was read as empty, and the next target
+replaced it. That erased the earlier targets the B184 and B191 checks look for.
+
+**Fix.** Each target in `sent_to` now records when it was first sent, and the adoption window
+starts at the op's first send. Records written before this change fall back to the queue time.
+A record that does not parse is kept as it is and a warning is logged. Without it a lost answer
+forks a conflict copy, which loses nothing.
+
+**Test:** `db::tests::a_create_remembers_when_it_was_first_sent`;
+`drain::tests::only_a_fresh_empty_twin_of_the_same_kind_is_adopted`.
+
+---
+
+### B229 — A queued write can be lost to a power cut after close returned
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.13).
+**Where:** `Durable` and `Db::durable` in `crates/pdfs-core/src/db/mod.rs`; `enqueue_op`,
+`replace_ops_with_trash`, `attach_blob_to_create`, `finish_create` and `rewrite_op_target` in
+`crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Write a file into the mount, let `close()` return, and cut the power before the next
+WAL checkpoint.
+
+**Cause.** The write connection runs with `synchronous=NORMAL`. In WAL mode a commit then
+survives a crash of the process but not a power loss, because the WAL is synced only at
+checkpoints. The staged blob is synced to disk before its op is queued, but the `pending_op` row
+that makes it reachable could roll back. The write `close()` reported as done was then gone, and
+the blob was deleted as an orphan later.
+
+**Fix.** The commits that accept a change into the queue raise the writer to
+`synchronous=FULL` for themselves and set it back to NORMAL after. A FULL commit syncs the WAL,
+which covers the NORMAL commits before it too. The other writes keep NORMAL's cost.
+
+**Test:** `db::tests::queueing_a_write_commits_at_full_sync_and_restores_normal`.
+
+---
+
+### B228 — A gap-filled write whose upload answer was lost becomes a conflict copy of itself
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.8).
+**Where:** `Core::drain_revision` in `crates/pdfs-fuse/src/drain.rs`; `Db::update_op_meta_for_blob`
+in `crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Offline, write a few bytes into the middle of a large file that is only on Drive, and
+close it. Go online, and lose the answer to the upload that follows (a timeout, or a daemon
+stopped before the op is retired).
+
+**Cause.** The staged blob of such a write holds only the written ranges. The drain fills the
+gaps from the base before the upload, in place, but the op's sidecar still said
+`complete = false`. The retry then saw a new remote revision, and both checks that recognise
+the daemon's own lost upload (`is_own_self_supersede` and the B155 SHA-1 match) require a
+complete blob. The write was treated as a conflict and uploaded again as a
+`(sync-conflict)` copy of itself.
+
+**Fix.** After a successful gap-fill the drain records the sidecar as complete. The update is
+made only while the op still holds that blob, so a newer write that closed in the meantime keeps
+its own sidecar.
+
+**Test:** `db::tests::marking_a_blob_whole_leaves_a_newer_blob_alone`.
+
+---
 
 ### B227 — Reading a file open for writing downloads on the dispatch loop
 

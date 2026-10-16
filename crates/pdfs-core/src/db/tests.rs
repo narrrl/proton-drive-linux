@@ -2352,6 +2352,100 @@ fn refuses_a_schema_newer_than_the_running_build() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Queueing a write syncs it to disk, and leaves the writer at NORMAL after.
+///
+/// The op row is what makes a staged blob reachable once `close()` has
+/// reported success, so its commit must survive a power loss. Everything else
+/// the writer commits is metadata the next listing re-fetches, and pays only
+/// NORMAL's cost.
+#[test]
+fn queueing_a_write_commits_at_full_sync_and_restores_normal() {
+    let path = std::env::temp_dir().join(format!("pdfs-db-sync-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+    let level = |db: &Db| -> i64 {
+        db.conn
+            .lock()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap()
+    };
+    // 1 = NORMAL, 2 = FULL.
+    assert_eq!(level(&db), 1);
+    {
+        let durable = db.durable().unwrap();
+        let during: i64 = durable
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(during, 2);
+    }
+    assert_eq!(level(&db), 1);
+
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_TRASH.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: Some("a".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(level(&db), 1);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+/// A gap-filled blob is recorded as whole only while the op still holds it.
+///
+/// A write that closes during the drain points the row at a newer blob with
+/// its own sidecar. Overwriting that sidecar with the older blob's would
+/// describe bytes the row no longer holds.
+#[test]
+fn marking_a_blob_whole_leaves_a_newer_blob_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let op = PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/first".to_string()),
+        meta_json: Some(r#"{"complete":false}"#.to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+    let id = db.pending_ops().unwrap()[0].id;
+
+    assert!(
+        db.update_op_meta_for_blob(id, "/staging/first", r#"{"complete":true}"#)
+            .unwrap()
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].meta_json.as_deref(),
+        Some(r#"{"complete":true}"#)
+    );
+
+    assert!(
+        !db.update_op_meta_for_blob(id, "/staging/older", r#"{"stale":true}"#)
+            .unwrap(),
+        "the row holds another blob"
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].meta_json.as_deref(),
+        Some(r#"{"complete":true}"#)
+    );
+}
+
 /// A queued write whose baseline is restamped must keep everything else.
 ///
 /// The restamp happens after our *own* upload seals a new revision under a
@@ -4081,15 +4175,15 @@ fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
             .unwrap();
         assert!(db.create_sent(id).unwrap().is_empty());
         assert!(db.create_targets(id).unwrap().is_empty());
-        db.note_create_target(id, &parent, "c").unwrap();
-        db.note_create_target(id, &parent, "c").unwrap();
+        db.note_create_target(id, &parent, "c", 10).unwrap();
+        db.note_create_target(id, &parent, "c", 20).unwrap();
         db.note_create_sent(id, "aaaa").unwrap();
         db.note_create_sent(id, "aaaa").unwrap();
         db.record_op_failure(id, "no answer", 0).unwrap();
         db.attach_blob_to_create("local~sent", "/staging/second", "{}")
             .unwrap()
             .expect("the create is still queued");
-        db.note_create_target(id, &parent, "d").unwrap();
+        db.note_create_target(id, &parent, "d", 30).unwrap();
         db.note_create_sent(id, "bbbb").unwrap();
         db.record_op_failure(id, "no answer", 0).unwrap();
         db.delete_ops_for_uid("local~sent").unwrap();
@@ -4110,6 +4204,73 @@ fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
     );
     drop(db);
     let _ = std::fs::remove_file(path);
+}
+
+/// A queued create knows when it first went out, which is where the window
+/// for adopting a node its lost answer left starts. Records written before
+/// the time was kept still list their targets, and one that does not parse is
+/// not replaced by the next target.
+#[test]
+fn a_create_remembers_when_it_was_first_sent() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~first".to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("a.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    assert_eq!(db.create_first_sent(id).unwrap(), None, "never sent");
+    db.note_create_target(id, &parent, "a.txt", 500).unwrap();
+    db.note_create_target(id, &parent, "a.txt", 900).unwrap();
+    db.note_create_target(id, &parent, "b.txt", 700).unwrap();
+    assert_eq!(db.create_first_sent(id).unwrap(), Some(500));
+
+    let set = |json: &str| {
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE pending_op SET sent_to = ?2 WHERE id = ?1",
+                rusqlite::params![id, json],
+            )
+            .unwrap();
+    };
+    set(&format!(r#"[["{parent}","old.txt"]]"#));
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![(parent.clone(), "old.txt".to_string())]
+    );
+    assert_eq!(db.create_first_sent(id).unwrap(), None);
+    db.note_create_target(id, &parent, "a.txt", 900).unwrap();
+    assert_eq!(
+        db.create_targets(id).unwrap().len(),
+        2,
+        "the old target stays"
+    );
+    assert_eq!(db.create_first_sent(id).unwrap(), Some(900));
+
+    set("not json");
+    db.note_create_target(id, &parent, "c.txt", 1000).unwrap();
+    let raw: String = db
+        .conn
+        .lock()
+        .query_row("SELECT sent_to FROM pending_op WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        raw, "not json",
+        "an unreadable record is kept, not replaced"
+    );
 }
 
 /// A write after a create failed clears its attempts, so the next try goes
@@ -4135,7 +4296,7 @@ fn a_create_rewritten_after_it_failed_still_leaves_a_trash_when_deleted() {
             next_attempt_at: 0,
         })
         .unwrap();
-    db.note_create_target(id, &parent, "a.txt").unwrap();
+    db.note_create_target(id, &parent, "a.txt", 10).unwrap();
     db.note_create_sent(id, "aaaa").unwrap();
     db.record_op_failure(id, "no answer", 0).unwrap();
     db.attach_blob_to_create("local~sent", "/staging/second", "{}")

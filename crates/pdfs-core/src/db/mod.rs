@@ -179,6 +179,45 @@ impl Drop for Reader<'_> {
     }
 }
 
+/// The write connection with `synchronous=FULL`, back to NORMAL on drop.
+///
+/// NORMAL in WAL mode keeps a commit across a crash of the process but not
+/// across a power loss: the WAL is synced only at checkpoints. That is fine for
+/// metadata the next listing re-fetches, and not for the queue. A staged blob
+/// is synced before its op is queued, and the op row is what makes it
+/// reachable; losing that row loses a write `close()` already reported as
+/// done. A FULL commit syncs the WAL, which covers every NORMAL commit before
+/// it as well.
+pub(super) struct Durable<'a>(parking_lot::MutexGuard<'a, Connection>);
+
+impl<'a> Durable<'a> {
+    pub(super) fn new(conn: parking_lot::MutexGuard<'a, Connection>) -> Result<Self> {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        Ok(Self(conn))
+    }
+}
+
+impl std::ops::Deref for Durable<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Durable<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.0
+    }
+}
+
+impl Drop for Durable<'_> {
+    fn drop(&mut self) {
+        // A failure leaves the writer at FULL: slower, never less safe.
+        let _ = self.0.pragma_update(None, "synchronous", "NORMAL");
+    }
+}
+
 /// Open a second connection to the same file for reads only.
 ///
 /// `SQLITE_OPEN_READ_ONLY` plus `query_only` is belt and braces: the flag stops
@@ -270,6 +309,12 @@ impl Db {
         Ok(db)
     }
 
+    /// The write connection for a commit that accepts a user's change into
+    /// the queue. See [`Durable`].
+    pub(super) fn durable(&self) -> Result<Durable<'_>> {
+        Durable::new(self.conn.lock())
+    }
+
     /// A connection for a `SELECT`-only method.
     ///
     /// Reads see the last committed state, which is the same thing they saw
@@ -297,7 +342,8 @@ impl Db {
     fn open_configured(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
         // WAL: readers never block the single writer. NORMAL sync is the
-        // standard durability/throughput tradeoff for WAL.
+        // standard durability/throughput tradeoff for WAL; the queue commits
+        // that need more raise it to FULL for themselves (`Durable`).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;

@@ -1118,7 +1118,7 @@ impl Core {
             _ => None,
         };
         let sent = self.create_sent_digests(op.id, current);
-        Ok(adoptable(is_dir, &twin, op.created_at, &sent).then_some(twin.uid))
+        Ok(adoptable(is_dir, &twin, self.first_sent(op), &sent).then_some(twin.uid))
     }
 
     /// Record the name the remote actually gave a node, after a conflict forced
@@ -1513,8 +1513,10 @@ impl Core {
             .as_deref()
             .is_some_and(|sha| holds_bytes(&twin, sha));
         let sent = self.create_sent_digests(op.id, current);
-        Ok(adoptable(op.kind == OP_MKDIR, &twin, op.created_at, &sent)
-            .then_some((twin.uid, holds_blob)))
+        Ok(
+            adoptable(op.kind == OP_MKDIR, &twin, self.first_sent(op), &sent)
+                .then_some((twin.uid, holds_blob)),
+        )
     }
 
     /// The SHA-1s of the bytes queued create `id` may have made its file with:
@@ -1529,6 +1531,22 @@ impl Core {
         sent
     }
 
+    /// When create `op` first went out, which is the earliest a node its lost
+    /// answer left can have been made. An op queued offline may wait for days
+    /// before that; measured from when it was queued, the adoption window let
+    /// it take a node another device made in the meantime. Ops sent before the
+    /// time was recorded fall back to when they were queued.
+    fn first_sent(&self, op: &PendingOp) -> i64 {
+        match self.db.create_first_sent(op.id) {
+            Ok(Some(at)) => at.max(op.created_at),
+            Ok(None) => op.created_at,
+            Err(e) => {
+                warn!(id = op.id, error = %e, "reading when a queued create was sent failed");
+                op.created_at
+            }
+        }
+    }
+
     /// Make one queued `create`/`mkdir` real under a given name, and hand back
     /// the API's own error so the caller can tell a name clash from a failure.
     ///
@@ -1541,7 +1559,7 @@ impl Core {
         name: &str,
     ) -> Result<NodeUid, Box<dyn std::error::Error>> {
         self.db
-            .note_create_target(op.id, &parent.to_string(), name)?;
+            .note_create_target(op.id, &parent.to_string(), name, now_millis())?;
         match op.kind == OP_MKDIR {
             true => Ok(self.block_on_bounded(self.drive.create_folder(
                 parent,
@@ -2236,7 +2254,7 @@ impl Core {
             .clone()
             .ok_or("pending op has no staged blob")?;
         let blob = PathBuf::from(blob);
-        let meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
+        let mut meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
         let uid = parse_node_uid(&meta.uid).ok_or("staged write has an unparseable uid")?;
 
         if let Some(reason) = self.revision_conflict(&uid, &meta, &blob)? {
@@ -2275,6 +2293,22 @@ impl Core {
                 &written,
             )
             .map_err(|e| self.errno_error(e, "gap-fill from base failed"))?;
+            // The blob is whole now. Recorded, so that a retry after a lost
+            // answer can match these bytes against the server's revision
+            // (`revision_conflict`) instead of forking a conflict copy of the
+            // user's own write.
+            meta.complete = true;
+            match serde_json::to_string(&meta) {
+                Ok(json) => {
+                    let path = op.blob_path.as_deref().unwrap_or_default();
+                    if let Err(e) = self.db.update_op_meta_for_blob(op.id, path, &json) {
+                        warn!(%uid, error = %e,
+                              "recording a gap-filled blob as whole failed; \
+                               a lost answer may land it as a conflict copy");
+                    }
+                }
+                Err(e) => warn!(%uid, error = %e, "serializing a gap-filled sidecar failed"),
+            }
         }
 
         let name = self.node_name(&uid);
@@ -2758,19 +2792,19 @@ fn waits_for_name(e: &(dyn std::error::Error + 'static)) -> bool {
 /// wait has to end; a conflict name ends it.
 const NAME_HOLD_ATTEMPTS: i64 = 4;
 
-/// How much older than its op a remote node may be and still be the one an
-/// unanswered call made. The op is queued the moment the call gives up, so the
-/// node is at most one call's deadline older; the rest is clock skew between
-/// this machine and Proton.
+/// How much older than its op's first send a remote node may be and still be
+/// the one an unanswered call made. The node is made during that call, so it
+/// is at most one call's deadline older; the rest is clock skew between this
+/// machine and Proton.
 const ADOPT_WINDOW_MS: i64 = 2 * 60 * 1000;
 
 /// Whether `twin`, found holding the name a queued create wants, is the node an
-/// earlier, unanswered attempt at that create made: the same kind, created
-/// around when the op was queued, and for a file still empty, as the mount's
+/// earlier, unanswered attempt at that create made: the same kind, created no
+/// earlier than around when the op was first sent (`first_sent_ms`), and for a file still empty, as the mount's
 /// create leaves it, or holding exactly bytes the op uploaded, whose SHA-1 is
 /// one of `sent`.
-fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64, sent: &[String]) -> bool {
-    if twin.creation_time.saturating_mul(1000) < op_created_ms - ADOPT_WINDOW_MS {
+fn adoptable(is_dir: bool, twin: &Node, first_sent_ms: i64, sent: &[String]) -> bool {
+    if twin.creation_time.saturating_mul(1000) < first_sent_ms - ADOPT_WINDOW_MS {
         return false;
     }
     match &twin.kind {
