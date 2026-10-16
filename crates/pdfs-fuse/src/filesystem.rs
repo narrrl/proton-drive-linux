@@ -556,48 +556,62 @@ impl Filesystem for ProtonFs {
             return;
         }
         let new_end = offset.saturating_add(length);
-        let keep_size = (mode & 1) != 0; // FALLOC_FL_KEEP_SIZE
-
-        let is_punch_hole = (mode & 0x02) != 0; // FALLOC_FL_PUNCH_HOLE
-
-        let res = {
+        // Only the modes whose effect on the scratch file this handle can
+        // record. Anything else went through to the scratch file untracked:
+        // a zeroed range was refilled from the base at commit, and a collapse
+        // or insert shifted bytes that `len` and `written` did not follow
+        // (`docs/BUGS.md` B224). `EOPNOTSUPP` is also what makes glibc's
+        // `posix_fallocate` fall back to writing zeros.
+        let Some(kind) = falloc_kind(mode) else {
+            reply.error(Errno::EOPNOTSUPP);
+            return;
+        };
+        let file = {
+            let st = self.core.state();
+            match st.handles.get(&_fh.0).and_then(|i| st.active_writes.get(i)) {
+                Some(aw) => aw.file.clone(),
+                None => {
+                    reply.error(if st.entries.contains_key(&ino.0) {
+                        Errno::EBADF
+                    } else {
+                        Errno::ENOENT
+                    });
+                    return;
+                }
+            }
+        };
+        // The syscall can take a while on a large range; the state lock is
+        // not held across it, as `write` does not hold it across its I/O.
+        let ret = {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::fallocate(file.as_raw_fd(), mode, offset as i64, length as i64) }
+        };
+        let res = if ret != 0 {
+            Err(Errno::from(std::io::Error::last_os_error()))
+        } else {
             let mut st = self.core.state();
-            match st
+            if let Some(aw) = st
                 .handles
                 .get(&_fh.0)
                 .copied()
                 .and_then(|i| st.active_writes.get_mut(&i))
             {
-                Some(aw) => {
-                    use std::os::unix::io::AsRawFd;
-                    let fd = aw.file.as_raw_fd();
-                    let ret = unsafe { libc::fallocate(fd, mode, offset as i64, length as i64) };
-                    if ret == 0 {
-                        if is_punch_hole {
-                            // A punched range reads as zero. Mark it authored so
-                            // queue_revision does not refill it from the remote
-                            // baseline and silently undo the hole at commit.
-                            aw.written.add(offset, new_end.min(aw.len));
-                            aw.dirty = true;
-                        } else if !keep_size && new_end > aw.len {
-                            aw.written.add(aw.len, new_end);
-                            aw.len = new_end;
-                            aw.dirty = true;
-                            st.set_size(ino.0, new_end);
-                        }
-                        Ok(())
-                    } else {
-                        Err(Errno::EIO)
-                    }
+                let len = aw.len;
+                let (authored, grown) = kind.effect(offset, new_end, len);
+                if let Some((from, to)) = authored {
+                    // Zeroed or punched bytes read as zero. Marked authored so
+                    // queue_revision does not refill them from the remote
+                    // baseline and silently undo them at commit.
+                    aw.written.add(from, to);
+                    aw.dirty = true;
                 }
-                None => {
-                    if st.entries.contains_key(&ino.0) {
-                        Err(Errno::EBADF)
-                    } else {
-                        Err(Errno::ENOENT)
-                    }
+                if let Some(end) = grown {
+                    aw.len = end;
+                    aw.dirty = true;
+                    st.set_size(ino.0, end);
                 }
             }
+            Ok(())
         };
 
         match res {
@@ -606,18 +620,47 @@ impl Filesystem for ProtonFs {
         }
     }
 
-    /// `close(2)` calls flush before release. The upload is queued in `release`
-    /// and performed in the background, so there is nothing
-    /// to push here — the written bytes are already in the scratch file.
+    /// `close(2)` calls flush before release, and flush is the only one of the
+    /// two whose answer reaches the program: the kernel drops `release`'s. So
+    /// the scratch file of a handle with writes on it is synced here, on a
+    /// worker, and a full disk or a failing one is what `close` returns.
+    ///
+    /// Before, flush answered `ok` at once and `release` synced the file, so an
+    /// `ENOSPC` that delayed allocation held back until then was reported to
+    /// nobody, and the program took the save as done (`docs/BUGS.md` B222).
+    /// It also means `release`, which stays on the dispatch loop for ordering,
+    /// finds the pages already on disk instead of writing back a whole file
+    /// while every other request on the mount waits.
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let file = {
+            let st = self.core.state();
+            st.handles
+                .get(&fh.0)
+                .and_then(|ino| st.active_writes.get(ino))
+                .filter(|aw| aw.dirty)
+                .map(|aw| aw.file.clone())
+        };
+        let Some(file) = file else {
+            reply.ok();
+            return;
+        };
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Transfer, "flush", move || match file.sync_data() {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    error!(fh = fh.0, error = %e, "flush of scratch file failed");
+                    reply.error(fs.scratch_sync_errno(&e));
+                }
+            });
     }
 
     /// Durability here means the scratch file, not the remote: a caller asking
@@ -1022,6 +1065,52 @@ fn build_listing(st: &State, ino: u64) -> DirListing {
 /// The cookie handed back is the index of the *next* entry, so a resumed call
 /// continues exactly where the last one stopped — which is only true because
 /// the listing behind those indexes is a snapshot (`docs/BUGS.md` B43).
+/// What an `fallocate` mode does to a write handle, for the modes it can
+/// record (`docs/BUGS.md` B224).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallocKind {
+    /// Reserve space; past the end it grows the file unless `keep_size`.
+    Allocate { keep_size: bool },
+    /// Deallocate a range inside the file, which then reads as zero.
+    Punch,
+    /// Zero a range; past the end it grows the file unless `keep_size`.
+    Zero { keep_size: bool },
+}
+
+fn falloc_kind(mode: i32) -> Option<FallocKind> {
+    const KEEP: i32 = libc::FALLOC_FL_KEEP_SIZE;
+    const PUNCH: i32 = libc::FALLOC_FL_PUNCH_HOLE;
+    const ZERO: i32 = libc::FALLOC_FL_ZERO_RANGE;
+    match mode {
+        0 => Some(FallocKind::Allocate { keep_size: false }),
+        KEEP => Some(FallocKind::Allocate { keep_size: true }),
+        m if m == PUNCH | KEEP => Some(FallocKind::Punch),
+        ZERO => Some(FallocKind::Zero { keep_size: false }),
+        m if m == ZERO | KEEP => Some(FallocKind::Zero { keep_size: true }),
+        _ => None,
+    }
+}
+
+impl FallocKind {
+    /// For `[offset, end)` on a file `len` bytes long: the range that now
+    /// reads as zero and must count as written, and the new length if it grew.
+    fn effect(self, offset: u64, end: u64, len: u64) -> (Option<(u64, u64)>, Option<u64>) {
+        let grow = |keep_size: bool| (!keep_size && end > len).then_some(end);
+        let zeroed = |to: u64| (offset < to).then_some((offset, to));
+        match self {
+            // Space past the old end reads as zero, and nothing before it moved.
+            Self::Allocate { keep_size } => {
+                (grow(keep_size).map(|end| (len, end)), grow(keep_size))
+            }
+            Self::Punch => (zeroed(end.min(len)), None),
+            Self::Zero { keep_size } => {
+                let to = if keep_size { end.min(len) } else { end };
+                (zeroed(to), grow(keep_size))
+            }
+        }
+    }
+}
+
 fn reply_listing(listing: &DirListing, offset: u64, root: u64, mut reply: ReplyDirectory) {
     for (i, (ino, is_dir, name)) in listing.iter().enumerate().skip(offset as usize) {
         let ft = if *is_dir {
@@ -1435,6 +1524,20 @@ impl ProtonFs {
     }
 
     /// The body of [`Filesystem::fsync`], run off the dispatch loop.
+    /// The errno to give a program for a failed sync of a scratch file.
+    /// Delayed allocation means a full disk usually surfaces at the sync
+    /// rather than at `write(2)`, and `ENOSPC` is what a program checks for.
+    fn scratch_sync_errno(&self, e: &std::io::Error) -> Errno {
+        match e.raw_os_error() {
+            Some(libc::ENOSPC) => {
+                self.core.cache.emergency_evict();
+                Errno::ENOSPC
+            }
+            Some(libc::EDQUOT) => Errno::EDQUOT,
+            _ => Errno::EIO,
+        }
+    }
+
     fn serve_fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
         // Everything the durability sidecar needs, copied out so no lock is held
         // across the sync.
@@ -1455,22 +1558,18 @@ impl ProtonFs {
                 )
             })
         };
+        // A handle opened for reading has nothing of its own to make durable,
+        // and POSIX allows `fsync` on it; `EBADF` failed `sync FILE` and
+        // backup tools that sync what they read (`docs/BUGS.md` B222).
         let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
             handle
         else {
-            reply.error(Errno::EBADF);
+            reply.ok();
             return;
         };
         if let Err(e) = f.sync_all() {
             error!(fh = fh.0, error = %e, "fsync of scratch file failed");
-            // Delayed allocation means a full disk usually surfaces here rather
-            // than at `write(2)`; `ENOSPC` is what an application checks for.
-            if e.raw_os_error() == Some(libc::ENOSPC) {
-                self.core.cache.emergency_evict();
-                reply.error(Errno::ENOSPC);
-            } else {
-                reply.error(Errno::EIO);
-            }
+            reply.error(self.scratch_sync_errno(&e));
             return;
         }
         // A clean handle has nothing on it that the remote does not already
@@ -2333,5 +2432,62 @@ impl ProtonFs {
         } else {
             reply.data(&buf);
         }
+    }
+}
+
+#[cfg(test)]
+mod falloc_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_modes_a_handle_can_record_are_accepted() {
+        let keep = libc::FALLOC_FL_KEEP_SIZE;
+        assert_eq!(
+            falloc_kind(0),
+            Some(FallocKind::Allocate { keep_size: false })
+        );
+        assert_eq!(
+            falloc_kind(keep),
+            Some(FallocKind::Allocate { keep_size: true })
+        );
+        assert_eq!(
+            falloc_kind(libc::FALLOC_FL_PUNCH_HOLE | keep),
+            Some(FallocKind::Punch)
+        );
+        assert_eq!(
+            falloc_kind(libc::FALLOC_FL_ZERO_RANGE),
+            Some(FallocKind::Zero { keep_size: false })
+        );
+        for mode in [
+            libc::FALLOC_FL_PUNCH_HOLE,
+            libc::FALLOC_FL_COLLAPSE_RANGE,
+            libc::FALLOC_FL_INSERT_RANGE,
+            libc::FALLOC_FL_UNSHARE_RANGE,
+        ] {
+            assert_eq!(falloc_kind(mode), None, "{mode:#x}");
+        }
+    }
+
+    /// A zeroed range was left unwritten, so the commit filled it back in
+    /// from the remote base (`docs/BUGS.md` B224).
+    #[test]
+    fn a_zeroed_or_punched_range_counts_as_written() {
+        let zero = FallocKind::Zero { keep_size: false };
+        assert_eq!(zero.effect(10, 20, 100), (Some((10, 20)), None));
+        assert_eq!(zero.effect(90, 120, 100), (Some((90, 120)), Some(120)));
+        let zero_keep = FallocKind::Zero { keep_size: true };
+        assert_eq!(zero_keep.effect(90, 120, 100), (Some((90, 100)), None));
+        assert_eq!(
+            FallocKind::Punch.effect(90, 120, 100),
+            (Some((90, 100)), None)
+        );
+        assert_eq!(FallocKind::Punch.effect(120, 130, 100), (None, None));
+        let alloc = FallocKind::Allocate { keep_size: false };
+        assert_eq!(alloc.effect(0, 50, 100), (None, None));
+        assert_eq!(alloc.effect(90, 120, 100), (Some((100, 120)), Some(120)));
+        assert_eq!(
+            FallocKind::Allocate { keep_size: true }.effect(90, 120, 100),
+            (None, None)
+        );
     }
 }

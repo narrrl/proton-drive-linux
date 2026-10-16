@@ -1305,6 +1305,44 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn close_syncs_a_written_file_and_fsync_accepts_a_read_only_one() {
+        // `close` is answered by flush, which now syncs the scratch file so a
+        // failure reaches the program; `fsync` on a descriptor opened for
+        // reading failed with EBADF (B222).
+        use std::io::{Read, Write};
+        let drive = FakeDrive::new();
+        let dir = scratch("flush-fsync");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("notes.txt");
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"written then closed").unwrap();
+        drop(file);
+        let mut again = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        again.write_all(b", twice").unwrap();
+        again.flush().unwrap();
+        drop(again);
+
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        read_only.sync_all().unwrap();
+        let mut text = String::new();
+        read_only.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "written then closed, twice");
+        drop(read_only);
+
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        assert!(drive.lookup("notes.txt").is_some());
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_stop_ends_a_mirror_pass_after_the_uploads_it_is_sending() {
         // A stop that came while a mirror pass was uploading waited for it,
         // and the pass went on to the next level of folders until the stop

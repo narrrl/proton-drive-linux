@@ -100,6 +100,8 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B224](#b224--fallocate-zero-ranges-are-undone-and-collapse-ranges-corrupt-the-file) | `fallocate` zero ranges are undone and collapse ranges corrupt the file |
+| [B222](#b222--a-full-disk-at-close-is-reported-to-nobody-and-fsync-on-a-read-only-file-fails) | A full disk at close is reported to nobody, and `fsync` on a read-only file fails |
 | [B221](#b221--a-cold-listing-holds-the-global-lock-across-a-database-transaction) | A cold listing holds the global lock across a database transaction |
 | [B220](#b220--thumbnails-on-a-stalled-link-hold-up-every-other-request) | Thumbnails on a stalled link hold up every other request |
 | [B219](#b219--listing-a-shared-folder-freezes-the-whole-mount-on-a-slow-link) | Listing a shared folder freezes the whole mount on a slow link |
@@ -323,6 +325,60 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B224 — `fallocate` zero ranges are undone and collapse ranges corrupt the file
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, FUSE semantics).
+**Where:** `fallocate`, `falloc_kind` and `FallocKind::effect` in
+`crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** `fallocate --zero-range -o 0 -l 4096 FILE` on a file in the mount whose content is on
+Drive, then close it: the range comes back with its old bytes. `fallocate --collapse-range` on the
+same file corrupts it.
+
+**Cause.** The handler passed any mode to the scratch file and recorded only a punched hole or
+growth. A zeroed range stayed "not written", so the commit filled it in again from the remote
+base. A collapse or an insert moved bytes in the scratch file that `len` and `written` did not
+follow. Every failure came back as `EIO`, so glibc's `posix_fallocate` did not fall back to
+writing zeros, and `ENOSPC` was lost. The syscall also ran under the global state lock.
+
+**Fix.** Only plain allocation, `KEEP_SIZE`, `PUNCH_HOLE | KEEP_SIZE` and `ZERO_RANGE` with or
+without `KEEP_SIZE` are accepted; anything else gets `EOPNOTSUPP`. A zeroed or punched range
+counts as written, and growth updates the length. The syscall's own errno is passed through, and
+the lock is not held across it.
+
+**Test:** `filesystem::falloc_tests::only_the_modes_a_handle_can_record_are_accepted`,
+`filesystem::falloc_tests::a_zeroed_or_punched_range_counts_as_written`.
+
+---
+
+### B222 — A full disk at close is reported to nobody, and `fsync` on a read-only file fails
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.5 and section 3, FUSE semantics).
+**Where:** `flush`, `serve_fsync` and `scratch_sync_errno` in `crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Fill the disk that holds the cache, then save a file in the mount: the program reports
+success. Separately, `python3 -c 'import os; os.fsync(os.open("FILE", os.O_RDONLY))'` on a file
+in the mount fails with `EBADF`.
+
+**Cause.**
+- `flush` answered `ok` at once, and `release` synced the scratch file and queued it. `close(2)`
+  returns what `flush` answers; the kernel drops the answer to `release`. Delayed allocation
+  usually holds `ENOSPC` back until the sync, so a full disk was reported to nobody.
+- The same sync in `release` wrote back the whole file on the dispatch loop, so copying a large
+  file stalled every other request on the mount.
+- A descriptor opened for reading has no write handle, and `fsync` answered it with `EBADF`,
+  which POSIX does not allow.
+
+**Fix.** `flush` syncs the scratch file of a handle with writes on it, on a transfer worker, and
+returns `ENOSPC`, `EDQUOT` or `EIO` when that fails. `release` then finds the pages already on
+disk. `fsync` on a descriptor without a write handle succeeds.
+
+**Test:** `sim::daemon::tests::close_syncs_a_written_file_and_fsync_accepts_a_read_only_one`.
+
+---
 
 ### B221 — A cold listing holds the global lock across a database transaction
 
