@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-16 16:02+0200\n"
+"POT-Creation-Date: 2026-10-16 17:09+0200\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Italian\n"
@@ -57,7 +57,7 @@ msgstr "%-d %b %Y"
 msgid "%A, %B %-d, %Y, %H:%M"
 msgstr "%A %-d %B %Y, %H:%M"
 
-#: crates/pdfs-gui/src/app/main.rs:767
+#: crates/pdfs-gui/src/app/main.rs:849
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:539
 #: crates/pdfs-gui/src/app/pages/browser.rs:454
 #: crates/pdfs-gui/src/app/pages/browser.rs:833
@@ -70,74 +70,74 @@ msgstr "%A %-d %B %Y, %H:%M"
 msgid "My files"
 msgstr "I miei file"
 
-#: crates/pdfs-gui/src/app/main.rs:770 crates/pdfs-gui/src/app/main.rs:1415
+#: crates/pdfs-gui/src/app/main.rs:852 crates/pdfs-gui/src/app/main.rs:1517
 #: crates/pdfs-gui/src/app/pages/albums.rs:638
 #: crates/pdfs-gui/src/app/pages/photos.rs:845
 #: crates/pdfs-gui/src/app/pages/places.rs:441
 msgid "Photos"
 msgstr "Foto"
 
-#: crates/pdfs-gui/src/app/main.rs:775
+#: crates/pdfs-gui/src/app/main.rs:857
 #: crates/pdfs-gui/src/app/pages/shared.rs:168
 #: crates/pdfs-gui/src/app/pages/shared.rs:484
 msgid "Shared with me"
 msgstr "Condivisi con me"
 
-#: crates/pdfs-gui/src/app/main.rs:780
+#: crates/pdfs-gui/src/app/main.rs:862
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:120
 msgid "Shared by me"
 msgstr "Condivisi da me"
 
-#: crates/pdfs-gui/src/app/main.rs:783
+#: crates/pdfs-gui/src/app/main.rs:865
 #: crates/pdfs-gui/src/app/pages/devices.rs:140
 #: crates/pdfs-gui/src/app/pages/devices.rs:493
 msgid "Computers"
 msgstr "Computer"
 
-#: crates/pdfs-gui/src/app/main.rs:784
+#: crates/pdfs-gui/src/app/main.rs:866
 #: crates/pdfs-gui/src/app/pages/trash.rs:101
 msgid "Trash"
 msgstr "Cestino"
 
 #. Translators: sidebar entry for the page listing this computer's synced folders.
-#: crates/pdfs-gui/src/app/main.rs:786
+#: crates/pdfs-gui/src/app/main.rs:868
 msgid "Sync"
 msgstr "Sincronizzazione"
 
 #. Translators: a failed action's toast. {what} says what failed, such as
 #. "Couldn't rename"; {detail} is the reason, usually untranslated text
 #. from the mount service.
-#: crates/pdfs-gui/src/app/main.rs:1112
+#: crates/pdfs-gui/src/app/main.rs:1214
 #: crates/pdfs-gui/src/app/pages/takeout.rs:714
 #, rust-format
 msgid "{what}: {detail}"
 msgstr "{what}: {detail}"
 
-#: crates/pdfs-gui/src/app/main.rs:1135
+#: crates/pdfs-gui/src/app/main.rs:1237
 msgid "You're offline"
 msgstr "Sei offline"
 
-#: crates/pdfs-gui/src/app/main.rs:1136
+#: crates/pdfs-gui/src/app/main.rs:1238
 msgid "That's not there any more"
 msgstr "Non esiste più"
 
-#: crates/pdfs-gui/src/app/main.rs:1137
+#: crates/pdfs-gui/src/app/main.rs:1239
 msgid "You don't have access to that"
 msgstr "Non hai accesso a questo elemento"
 
-#: crates/pdfs-gui/src/app/main.rs:1138
+#: crates/pdfs-gui/src/app/main.rs:1240
 msgid "Something changed this first"
 msgstr "È stato modificato prima da qualcos'altro"
 
-#: crates/pdfs-gui/src/app/main.rs:1139
+#: crates/pdfs-gui/src/app/main.rs:1241
 msgid "Your Proton Drive is full"
 msgstr "Il tuo Proton Drive è pieno"
 
-#: crates/pdfs-gui/src/app/main.rs:1226
+#: crates/pdfs-gui/src/app/main.rs:1328
 msgid "Proton Drive for Linux"
 msgstr "Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1234
+#: crates/pdfs-gui/src/app/main.rs:1336
 msgid ""
 "Files-on-demand Proton Drive for the Linux desktop.\n"
 "\n"
@@ -148,23 +148,23 @@ msgstr ""
 "\n"
 "Client non ufficiale: non affiliato, approvato né supportato da Proton AG."
 
-#: crates/pdfs-gui/src/app/main.rs:1239
+#: crates/pdfs-gui/src/app/main.rs:1341
 msgid "Source Code"
 msgstr "Codice sorgente"
 
-#: crates/pdfs-gui/src/app/main.rs:1243
+#: crates/pdfs-gui/src/app/main.rs:1345
 msgid "Proton Terms of Service"
 msgstr "Termini di servizio di Proton"
 
-#: crates/pdfs-gui/src/app/main.rs:1247
+#: crates/pdfs-gui/src/app/main.rs:1349
 msgid "Proton Privacy Policy"
 msgstr "Informativa sulla privacy di Proton"
 
-#: crates/pdfs-gui/src/app/main.rs:1252
+#: crates/pdfs-gui/src/app/main.rs:1354
 msgid "Disclaimer"
 msgstr "Esclusione di responsabilità"
 
-#: crates/pdfs-gui/src/app/main.rs:1256
+#: crates/pdfs-gui/src/app/main.rs:1358
 msgid ""
 "This is an unofficial, community-built client. It is not affiliated with, "
 "endorsed by, or supported by Proton AG.\n"
@@ -187,7 +187,7 @@ msgstr ""
 "Questo software è fornito “così com’è”, senza alcuna garanzia. Conserva una "
 "copia dei dati che non puoi permetterti di perdere."
 
-#: crates/pdfs-gui/src/app/main.rs:1264
+#: crates/pdfs-gui/src/app/main.rs:1366
 msgid ""
 "Places are named with data from <a href=\"https://www.geonames.org/"
 "\">GeoNames</a>, licensed under <a href=\"https://creativecommons.org/"
@@ -197,7 +197,7 @@ msgstr ""
 "\">GeoNames</a>, con licenza <a href=\"https://creativecommons.org/licenses/"
 "by/4.0/\">CC BY 4.0</a>."
 
-#: crates/pdfs-gui/src/app/main.rs:1272
+#: crates/pdfs-gui/src/app/main.rs:1374
 msgid ""
 "The places map is drawn from <a href=\"https://www.naturalearthdata.com/"
 "\">Natural Earth</a> land outlines and country borders, which are in the "
@@ -207,7 +207,7 @@ msgstr ""
 "confini nazionali di <a href=\"https://www.naturalearthdata.com/\">Natural "
 "Earth</a>, che sono di pubblico dominio."
 
-#: crates/pdfs-gui/src/app/main.rs:1280
+#: crates/pdfs-gui/src/app/main.rs:1382
 msgid ""
 "The street map, when turned on, comes from <a href=\"https://openfreemap.org/"
 "\">OpenFreeMap</a> in the <a href=\"https://www.openmaptiles.org/"
@@ -223,15 +223,15 @@ msgstr ""
 
 #. Translators: replace with your name(s) and email address(es), one
 #. per line, to be credited in the About dialog.
-#: crates/pdfs-gui/src/app/main.rs:1291
+#: crates/pdfs-gui/src/app/main.rs:1393
 msgid "translator-credits"
 msgstr "Collaboratori di Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1335
+#: crates/pdfs-gui/src/app/main.rs:1437
 msgid "Stop Proton Drive?"
 msgstr "Arrestare Proton Drive?"
 
-#: crates/pdfs-gui/src/app/main.rs:1336
+#: crates/pdfs-gui/src/app/main.rs:1438
 msgid ""
 "My files goes offline and nothing syncs until you connect again. Proton "
 "Drive starts again at your next login."
@@ -239,7 +239,7 @@ msgstr ""
 "I miei file andranno offline e nulla verrà sincronizzato finché non ti "
 "riconnetti. Proton Drive si riavvierà al prossimo accesso."
 
-#: crates/pdfs-gui/src/app/main.rs:1338 crates/pdfs-gui/src/app/main.rs:1613
+#: crates/pdfs-gui/src/app/main.rs:1440 crates/pdfs-gui/src/app/main.rs:1715
 #: crates/pdfs-gui/src/app/pages/albums.rs:243
 #: crates/pdfs-gui/src/app/pages/albums.rs:428
 #: crates/pdfs-gui/src/app/pages/browser.rs:1907
@@ -256,9 +256,9 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/locations.rs:1054
 #: crates/pdfs-gui/src/app/pages/locations.rs:1531
 #: crates/pdfs-gui/src/app/pages/locations.rs:1581
-#: crates/pdfs-gui/src/app/pages/login.rs:400
-#: crates/pdfs-gui/src/app/pages/login.rs:514
-#: crates/pdfs-gui/src/app/pages/login.rs:560
+#: crates/pdfs-gui/src/app/pages/login.rs:480
+#: crates/pdfs-gui/src/app/pages/login.rs:594
+#: crates/pdfs-gui/src/app/pages/login.rs:640
 #: crates/pdfs-gui/src/app/pages/photos.rs:2056
 #: crates/pdfs-gui/src/app/pages/shared.rs:943
 #: crates/pdfs-gui/src/app/pages/shared.rs:1024
@@ -273,30 +273,30 @@ msgstr ""
 msgid "Cancel"
 msgstr "Annulla"
 
-#: crates/pdfs-gui/src/app/main.rs:1339
+#: crates/pdfs-gui/src/app/main.rs:1441
 msgctxt "verb"
 msgid "Stop"
 msgstr "Arresta"
 
-#: crates/pdfs-gui/src/app/main.rs:1356
+#: crates/pdfs-gui/src/app/main.rs:1458
 msgid "Couldn't stop Proton Drive"
 msgstr "Impossibile arrestare Proton Drive"
 
-#: crates/pdfs-gui/src/app/main.rs:1357
+#: crates/pdfs-gui/src/app/main.rs:1459
 msgid "The Proton Drive service did not stop."
 msgstr "Il servizio di Proton Drive non si è arrestato."
 
-#: crates/pdfs-gui/src/app/main.rs:1393
+#: crates/pdfs-gui/src/app/main.rs:1495
 #: crates/pdfs-gui/src/app/pages/status.rs:254
 msgid "General"
 msgstr "Generale"
 
-#: crates/pdfs-gui/src/app/main.rs:1395
+#: crates/pdfs-gui/src/app/main.rs:1497
 #: crates/pdfs-gui/src/app/pages/browser.rs:247
 msgid "Search Drive"
 msgstr "Cerca in Drive"
 
-#: crates/pdfs-gui/src/app/main.rs:1396
+#: crates/pdfs-gui/src/app/main.rs:1498
 #: crates/pdfs-gui/src/app/pages/browser.rs:974
 #: crates/pdfs-gui/src/app/pages/devices.rs:559
 #: crates/pdfs-gui/src/app/pages/shared.rs:581
@@ -305,43 +305,43 @@ msgstr "Cerca in Drive"
 msgid "Refresh"
 msgstr "Aggiorna"
 
-#: crates/pdfs-gui/src/app/main.rs:1397
+#: crates/pdfs-gui/src/app/main.rs:1499
 #: crates/pdfs-gui/src/app/pages/status.rs:388
 msgid "Preferences"
 msgstr "Preferenze"
 
-#: crates/pdfs-gui/src/app/main.rs:1398
+#: crates/pdfs-gui/src/app/main.rs:1500
 msgid "Keyboard shortcuts"
 msgstr "Scorciatoie da tastiera"
 
-#: crates/pdfs-gui/src/app/main.rs:1402
+#: crates/pdfs-gui/src/app/main.rs:1504
 msgid "Files"
 msgstr "File"
 
-#: crates/pdfs-gui/src/app/main.rs:1404
+#: crates/pdfs-gui/src/app/main.rs:1506
 #: crates/pdfs-gui/src/app/pages/browser.rs:294
 msgid "New folder"
 msgstr "Nuova cartella"
 
-#: crates/pdfs-gui/src/app/main.rs:1405
+#: crates/pdfs-gui/src/app/main.rs:1507
 #: crates/pdfs-gui/src/app/pages/browser.rs:290
 msgid "Upload files"
 msgstr "Carica file"
 
-#: crates/pdfs-gui/src/app/main.rs:1406
+#: crates/pdfs-gui/src/app/main.rs:1508
 msgid "Back / forward"
 msgstr "Indietro / avanti"
 
-#: crates/pdfs-gui/src/app/main.rs:1407
+#: crates/pdfs-gui/src/app/main.rs:1509
 #: crates/pdfs-gui/src/app/pages/browser.rs:1958
 msgid "Parent folder"
 msgstr "Cartella superiore"
 
-#: crates/pdfs-gui/src/app/main.rs:1408
+#: crates/pdfs-gui/src/app/main.rs:1510
 msgid "Grid / list"
 msgstr "Griglia / elenco"
 
-#: crates/pdfs-gui/src/app/main.rs:1409
+#: crates/pdfs-gui/src/app/main.rs:1511
 #: crates/pdfs-gui/src/app/pages/albums.rs:298
 #: crates/pdfs-gui/src/app/pages/browser.rs:1886
 #: crates/pdfs-gui/src/app/pages/browser.rs:1908
@@ -350,7 +350,7 @@ msgstr "Griglia / elenco"
 msgid "Rename"
 msgstr "Rinomina"
 
-#: crates/pdfs-gui/src/app/main.rs:1410 crates/pdfs-gui/src/app/main.rs:1430
+#: crates/pdfs-gui/src/app/main.rs:1512 crates/pdfs-gui/src/app/main.rs:1532
 #: crates/pdfs-gui/src/app/pages/browser.rs:357
 #: crates/pdfs-gui/src/app/pages/browser.rs:918
 #: crates/pdfs-gui/src/app/pages/browser.rs:949
@@ -360,73 +360,73 @@ msgstr "Rinomina"
 msgid "Move to Trash"
 msgstr "Sposta nel cestino"
 
-#: crates/pdfs-gui/src/app/main.rs:1411
+#: crates/pdfs-gui/src/app/main.rs:1513
 msgid "Clear the selection"
 msgstr "Annulla la selezione"
 
-#: crates/pdfs-gui/src/app/main.rs:1417
+#: crates/pdfs-gui/src/app/main.rs:1519
 msgid "Larger thumbnails"
 msgstr "Miniature più grandi"
 
-#: crates/pdfs-gui/src/app/main.rs:1418
+#: crates/pdfs-gui/src/app/main.rs:1520
 msgid "Smaller thumbnails"
 msgstr "Miniature più piccole"
 
-#: crates/pdfs-gui/src/app/main.rs:1419
+#: crates/pdfs-gui/src/app/main.rs:1521
 msgid "Reset thumbnail size"
 msgstr "Ripristina la dimensione delle miniature"
 
-#: crates/pdfs-gui/src/app/main.rs:1420
+#: crates/pdfs-gui/src/app/main.rs:1522
 msgid "Select all"
 msgstr "Seleziona tutto"
 
-#: crates/pdfs-gui/src/app/main.rs:1424
+#: crates/pdfs-gui/src/app/main.rs:1526
 msgid "Photo Viewer"
 msgstr "Visualizzatore di foto"
 
-#: crates/pdfs-gui/src/app/main.rs:1426
+#: crates/pdfs-gui/src/app/main.rs:1528
 msgid "Previous / next photo"
 msgstr "Foto precedente / successiva"
 
-#: crates/pdfs-gui/src/app/main.rs:1427
+#: crates/pdfs-gui/src/app/main.rs:1529
 msgid "First / last photo"
 msgstr "Prima / ultima foto"
 
-#: crates/pdfs-gui/src/app/main.rs:1428
+#: crates/pdfs-gui/src/app/main.rs:1530
 msgid "Show details"
 msgstr "Mostra dettagli"
 
-#: crates/pdfs-gui/src/app/main.rs:1429
+#: crates/pdfs-gui/src/app/main.rs:1531
 msgid "Fullscreen"
 msgstr "Schermo intero"
 
-#: crates/pdfs-gui/src/app/main.rs:1431
+#: crates/pdfs-gui/src/app/main.rs:1533
 msgid "Close"
 msgstr "Chiudi"
 
-#: crates/pdfs-gui/src/app/main.rs:1521
+#: crates/pdfs-gui/src/app/main.rs:1623
 msgid "Select a single item to rename it"
 msgstr "Seleziona un solo elemento per rinominarlo"
 
-#: crates/pdfs-gui/src/app/main.rs:1681
+#: crates/pdfs-gui/src/app/main.rs:1783
 #: crates/pdfs-gui/src/app/pages/albums.rs:85
 #: crates/pdfs-gui/src/app/pages/places.rs:104
 #: crates/pdfs-gui/src/app/pages/status.rs:1451
 msgid "Not connected"
 msgstr "Non connesso"
 
-#: crates/pdfs-gui/src/app/main.rs:1682
+#: crates/pdfs-gui/src/app/main.rs:1784
 msgid "The Proton Drive service isn't running."
 msgstr "Il servizio di Proton Drive non è in esecuzione."
 
-#: crates/pdfs-gui/src/app/main.rs:1690
+#: crates/pdfs-gui/src/app/main.rs:1792
 #: crates/pdfs-gui/src/app/pages/status.rs:336
 #: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
 #: crates/pdfs-gui/src/main.rs:475 crates/pdfs-gui/src/main.rs:517
 msgid "Connecting…"
 msgstr "Connessione…"
 
-#: crates/pdfs-gui/src/app/main.rs:1691
+#: crates/pdfs-gui/src/app/main.rs:1793
 msgid "Waiting for the Proton Drive service to start."
 msgstr "In attesa dell’avvio del servizio di Proton Drive."
 
@@ -468,6 +468,7 @@ msgstr "Nessuna voce del registro recente corrisponde a questo filtro."
 #: crates/pdfs-gui/src/app/pages/devices.rs:114
 #: crates/pdfs-gui/src/app/pages/locations.rs:190
 #: crates/pdfs-gui/src/app/pages/locations.rs:726
+#: crates/pdfs-gui/src/app/pages/login.rs:97
 #: crates/pdfs-gui/src/app/pages/photos.rs:468
 #: crates/pdfs-gui/src/app/pages/shared.rs:183
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:94
@@ -3255,55 +3256,61 @@ msgstr "in pausa"
 msgid "not available"
 msgstr "non disponibile"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:24
+#: crates/pdfs-gui/src/app/pages/login.rs:27
 msgid "Sign in to Proton"
 msgstr "Accedi a Proton"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:25
+#: crates/pdfs-gui/src/app/pages/login.rs:28
 msgid "Use your Proton account to connect Drive."
 msgstr "Usa il tuo account Proton per connettere Drive."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:29
+#: crates/pdfs-gui/src/app/pages/login.rs:32
 msgid "Email or username"
 msgstr "Email o nome utente"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:32
+#: crates/pdfs-gui/src/app/pages/login.rs:35
 msgid "Password"
 msgstr "Password"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:41
+#: crates/pdfs-gui/src/app/pages/login.rs:44
 msgid "Sign in"
 msgstr "Accedi"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:77
+#: crates/pdfs-gui/src/app/pages/login.rs:80
 msgid "Create account"
 msgstr "Crea account"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:81
+#: crates/pdfs-gui/src/app/pages/login.rs:84
 msgid "Forgot password?"
 msgstr "Password dimenticata?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:125
+#: crates/pdfs-gui/src/app/pages/login.rs:95
+msgid ""
+"Couldn't read your saved sign-in. Unlock the system keyring, then try again."
+msgstr ""
+"Impossibile leggere l'accesso salvato. Sblocca il portachiavi di sistema, poi riprova."
+
+#: crates/pdfs-gui/src/app/pages/login.rs:204
 msgid "Enter your email and password."
 msgstr "Inserisci la tua email e la password."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:130
+#: crates/pdfs-gui/src/app/pages/login.rs:209
 msgid "Signing in…"
 msgstr "Accesso in corso…"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:160
+#: crates/pdfs-gui/src/app/pages/login.rs:239
 msgid "Complete the verification to continue…"
 msgstr "Completa la verifica per continuare…"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:195
+#: crates/pdfs-gui/src/app/pages/login.rs:274
 msgid "login cancelled"
 msgstr "accesso annullato"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:234
+#: crates/pdfs-gui/src/app/pages/login.rs:314
 msgid "Too many sign-in attempts. Wait a few minutes and try again."
 msgstr "Troppi tentativi di accesso. Attendi qualche minuto e riprova."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:239
+#: crates/pdfs-gui/src/app/pages/login.rs:319
 msgid ""
 "Proton is temporarily refusing sign-in from this device. Your app version is "
 "not the problem. Wait several hours, up to a day, without trying again, then "
@@ -3313,13 +3320,13 @@ msgstr ""
 "versione dell'app non è il problema. Attendi alcune ore, fino a un giorno, "
 "senza riprovare, poi accedi."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:245
+#: crates/pdfs-gui/src/app/pages/login.rs:325
 msgid "Couldn't reach Proton. Check your internet connection and try again."
 msgstr ""
 "Impossibile raggiungere Proton. Controlla la connessione a Internet e "
 "riprova."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:248
+#: crates/pdfs-gui/src/app/pages/login.rs:328
 msgid ""
 "Signed in, but the session couldn't be saved to the system keyring. Make "
 "sure a keyring (GNOME Keyring or KWallet) is running and unlocked."
@@ -3328,24 +3335,24 @@ msgstr ""
 "portachiavi di sistema. Assicurati che un portachiavi (GNOME Keyring o "
 "KWallet) sia in esecuzione e sbloccato."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:251
+#: crates/pdfs-gui/src/app/pages/login.rs:331
 msgid "Sign-in cancelled: no two-factor code was entered."
 msgstr ""
 "Accesso annullato: non è stato inserito alcun codice di autenticazione a due "
 "fattori."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:254
+#: crates/pdfs-gui/src/app/pages/login.rs:334
 msgid "Sign-in cancelled: no mailbox password was entered."
 msgstr ""
 "Accesso annullato: non è stata inserita alcuna password della casella di "
 "posta."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:257
+#: crates/pdfs-gui/src/app/pages/login.rs:337
 msgid "That mailbox password didn't unlock your account."
 msgstr ""
 "Quella password della casella di posta non ha sbloccato il tuo account."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:260
+#: crates/pdfs-gui/src/app/pages/login.rs:340
 msgid ""
 "Sign-in cancelled: the verification wasn't completed. Sign in again to get a "
 "new one."
@@ -3354,37 +3361,37 @@ msgstr ""
 "riceverne una nuova."
 
 #. Translators: {error} is an error message, usually in English.
-#: crates/pdfs-gui/src/app/pages/login.rs:265
+#: crates/pdfs-gui/src/app/pages/login.rs:345
 #, rust-format
 msgid "Sign-in failed: {error}"
 msgstr "Accesso non riuscito: {error}"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:376
+#: crates/pdfs-gui/src/app/pages/login.rs:456
 msgid "That mailbox password didn't unlock your account. Try again."
 msgstr ""
 "Quella password della casella di posta non ha sbloccato il tuo account. "
 "Riprova."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:378
+#: crates/pdfs-gui/src/app/pages/login.rs:458
 msgid ""
 "This account has a separate mailbox password. Enter it to unlock your files."
 msgstr ""
 "Questo account ha una password della casella di posta separata. Inseriscila "
 "per sbloccare i tuoi file."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:381
+#: crates/pdfs-gui/src/app/pages/login.rs:461
 msgid "Mailbox Password"
 msgstr "Password della casella di posta"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:387
+#: crates/pdfs-gui/src/app/pages/login.rs:467
 msgid "Mailbox password"
 msgstr "Password della casella di posta"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:391
+#: crates/pdfs-gui/src/app/pages/login.rs:471
 msgid "Keep unlocked on this computer"
 msgstr "Mantieni sbloccato su questo computer"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:393
+#: crates/pdfs-gui/src/app/pages/login.rs:473
 msgid ""
 "Stores the unlock in the system keyring, so Proton Drive opens without "
 "asking after every login. Otherwise you enter the password once per session."
@@ -3393,50 +3400,50 @@ msgstr ""
 "chiedere dopo ogni accesso. Altrimenti inserisci la password una volta per "
 "sessione."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:401
-#: crates/pdfs-gui/src/app/pages/login.rs:454
+#: crates/pdfs-gui/src/app/pages/login.rs:481
+#: crates/pdfs-gui/src/app/pages/login.rs:534
 msgid "Unlock"
 msgstr "Sblocca"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:453
+#: crates/pdfs-gui/src/app/pages/login.rs:533
 msgid "Proton Drive is locked. Enter your mailbox password to unlock it."
 msgstr ""
 "Proton Drive è bloccato. Inserisci la password della casella di posta per "
 "sbloccarlo."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:482
+#: crates/pdfs-gui/src/app/pages/login.rs:562
 msgid "Unlocked."
 msgstr "Sbloccato."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:487
+#: crates/pdfs-gui/src/app/pages/login.rs:567
 msgid "Couldn't unlock"
 msgstr "Impossibile sbloccare"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:500
+#: crates/pdfs-gui/src/app/pages/login.rs:580
 msgid "Two-Factor Authentication"
 msgstr "Autenticazione a due fattori"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:502
+#: crates/pdfs-gui/src/app/pages/login.rs:582
 msgid ""
 "Enter the code from your authenticator app, or one of your recovery codes."
 msgstr ""
 "Inserisci il codice dell'app di autenticazione o uno dei tuoi codici di "
 "recupero."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:508
+#: crates/pdfs-gui/src/app/pages/login.rs:588
 msgid "Authentication code"
 msgstr "Codice di autenticazione"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:515
+#: crates/pdfs-gui/src/app/pages/login.rs:595
 msgid "Confirm"
 msgstr "Conferma"
 
 #
-#: crates/pdfs-gui/src/app/pages/login.rs:546
+#: crates/pdfs-gui/src/app/pages/login.rs:626
 msgid "Verify in Your Browser"
 msgstr "Verifica nel browser"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:548
+#: crates/pdfs-gui/src/app/pages/login.rs:628
 msgid ""
 "The verification page can't be shown in the app on this system. Open it in "
 "your browser, complete it there, then come back and choose Continue."
@@ -3445,20 +3452,20 @@ msgstr ""
 "Aprila nel browser, completala lì, poi torna qui e scegli “Continua”."
 
 #
-#: crates/pdfs-gui/src/app/pages/login.rs:554
+#: crates/pdfs-gui/src/app/pages/login.rs:634
 msgid "Open Verification Page"
 msgstr "Apri pagina di verifica"
 
 #
-#: crates/pdfs-gui/src/app/pages/login.rs:561
+#: crates/pdfs-gui/src/app/pages/login.rs:641
 msgid "Continue"
 msgstr "Continua"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:600
+#: crates/pdfs-gui/src/app/pages/login.rs:680
 msgid "Sign Out?"
 msgstr "Disconnettersi?"
 
-#: crates/pdfs-gui/src/app/pages/login.rs:602
+#: crates/pdfs-gui/src/app/pages/login.rs:682
 msgid ""
 "Proton Drive will disconnect and stop syncing until you sign in again. Files "
 "already on this computer stay where they are."
@@ -3466,7 +3473,7 @@ msgstr ""
 "Proton Drive si disconnetterà e interromperà la sincronizzazione finché non "
 "accedi di nuovo. I file già presenti su questo computer restano dove sono."
 
-#: crates/pdfs-gui/src/app/pages/login.rs:604
+#: crates/pdfs-gui/src/app/pages/login.rs:684
 msgid "Sign Out"
 msgstr "Disconnetti"
 

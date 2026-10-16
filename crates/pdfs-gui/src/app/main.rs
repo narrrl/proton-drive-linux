@@ -345,8 +345,12 @@ fn build_window(app: &adw::Application) {
     login_frame.add_top_bar(&{
         let header = adw::HeaderBar::new();
         header.set_show_title(false);
+        // The split is collapsed while signed out; going "back" would only
+        // uncover a sidebar with nowhere to go.
+        header.set_show_back_button(false);
         header
     });
+    login_frame.add_top_bar(&login_widgets.keyring_banner);
     login_frame.set_content(Some(&login_page));
     stack.add_named(&login_frame, Some("login"));
     stack.add_named(&browser_page, Some("browser"));
@@ -383,13 +387,17 @@ fn build_window(app: &adw::Application) {
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&split));
 
+    let (startup_session, keyring_error) = match read_session() {
+        Ok(session) => (session, None),
+        Err(e) => (None, Some(e)),
+    };
     let ui = Rc::new(Ui {
         dirs,
         stack: stack.clone(),
         toasts: toasts.clone(),
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
-        session: RefCell::new(auth::load().ok()),
+        session: RefCell::new(startup_session),
         unlock_offered: Cell::new(false),
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
@@ -648,6 +656,9 @@ fn build_window(app: &adw::Application) {
         },
     });
     wire_login(&ui);
+    if let Some(e) = keyring_error {
+        keyring_unreadable(&ui, &e);
+    }
     let ui_status = ui.clone();
     main_widgets
         .status_button

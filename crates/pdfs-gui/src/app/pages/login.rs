@@ -9,6 +9,9 @@ pub(crate) struct LoginState {
     /// Spins inside the Sign in button while a sign-in is running.
     pub(crate) login_spinner: Spinner,
     pub(crate) login_status: gtk4::Label,
+    /// Shown over the form while a saved sign-in exists but the keyring would
+    /// not hand it over; see [`keyring_unreadable`].
+    pub(crate) keyring_banner: adw::Banner,
 }
 
 /// Where the login page's account links go.
@@ -87,6 +90,12 @@ pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
         .child(&inner)
         .build();
     let scroll = gtk4::ScrolledWindow::builder().child(&clamp).build();
+    let keyring_banner = adw::Banner::builder()
+        .title(gettext(
+            "Couldn't read your saved sign-in. Unlock the system keyring, then try again.",
+        ))
+        .button_label(gettext("Retry"))
+        .build();
 
     (
         scroll.upcast(),
@@ -96,8 +105,78 @@ pub(crate) fn build_login_page() -> (gtk4::Widget, LoginState) {
             login_button,
             login_spinner,
             login_status,
+            keyring_banner,
         },
     )
+}
+
+/// The stored session, `None` when there is none, or the keyring's error when
+/// it could not be read. A locked or absent keyring is not a sign-out: the
+/// session is still saved, and signing in again would only replace it.
+pub(crate) fn read_session() -> pdfs_core::Result<Option<auth::StoredSession>> {
+    match auth::load() {
+        Ok(session) => Ok(Some(session)),
+        Err(pdfs_core::Error::NotLoggedIn) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// How long to wait before each automatic retry of an unreadable keyring. A
+/// keyring daemon started with the session is usually up within seconds.
+const KEYRING_RETRIES: [u32; 4] = [2, 5, 10, 30];
+
+/// The keyring refused to hand over the saved session. Keep the login page up,
+/// but say why, and pick the session up as soon as the keyring answers: on its
+/// own a few times, and whenever the user presses Retry.
+pub(crate) fn keyring_unreadable(ui: &Rc<Ui>, error: &pdfs_core::Error) {
+    tracing::warn!("cannot read the saved session: {error}");
+    let banner = &ui.login.keyring_banner;
+    if banner.is_revealed() {
+        return;
+    }
+    banner.set_revealed(true);
+    let ui_retry = ui.clone();
+    let handler = banner.connect_button_clicked(move |_| retry_session(&ui_retry));
+    // Disconnected once the banner goes, so a later failure wires it afresh.
+    let handler = RefCell::new(Some(handler));
+    banner.connect_revealed_notify(move |banner| {
+        if !banner.is_revealed()
+            && let Some(handler) = handler.borrow_mut().take()
+        {
+            banner.disconnect(handler);
+        }
+    });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        for seconds in KEYRING_RETRIES {
+            glib::timeout_future_seconds(seconds).await;
+            if !ui.login.keyring_banner.is_revealed() {
+                return;
+            }
+            retry_session(&ui);
+        }
+    });
+}
+
+/// Read the saved session again after [`keyring_unreadable`]. Found: show the
+/// signed-in window. Gone: the plain login page. Still unreadable: keep waiting.
+fn retry_session(ui: &Rc<Ui>) {
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let Ok(result) = gio::spawn_blocking(read_session).await else {
+            return;
+        };
+        match result {
+            Ok(session) => {
+                ui.login.keyring_banner.set_revealed(false);
+                if session.is_some() && ui.session.borrow().is_none() {
+                    *ui.session.borrow_mut() = session;
+                    refresh(&ui);
+                }
+            }
+            Err(e) => tracing::debug!("the keyring still cannot be read: {e}"),
+        }
+    });
 }
 
 /// Connect the sign-in button: read the fields, run [`auth::login`] on a worker
@@ -202,10 +281,11 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     // Read on a worker: a keyring that has to be unlocked first
                     // answers only once the user has, and the window must not
                     // freeze until then.
-                    *ui.session.borrow_mut() = gio::spawn_blocking(|| auth::load().ok())
-                        .await
-                        .ok()
-                        .flatten();
+                    match gio::spawn_blocking(read_session).await {
+                        Ok(Ok(session)) => *ui.session.borrow_mut() = session,
+                        Ok(Err(e)) => keyring_unreadable(&ui, &e),
+                        Err(_) => {}
+                    }
                     // Enable+start the mount service now that we have a session.
                     let _ = gio::spawn_blocking(service::enable_start).await;
                     refresh(&ui);

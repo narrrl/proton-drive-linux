@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
 | [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
 | [B251](#b251--two-computers-can-make-the-same-conflict-copy-name) | Two computers can make the same conflict copy name |
 | [B250](#b250--a-revision-made-during-a-mirror-download-never-arrives) | A revision made during a mirror download never arrives |
@@ -354,6 +355,31 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B253 — The app shows the sign-in page when the keyring is locked
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, user report: "the login each time you reboot or logout and back in".
+**Where:** `build_window` in `crates/pdfs-gui/src/app/main.rs`; `wire_login` in
+`crates/pdfs-gui/src/app/pages/login.rs`
+
+**Repro:** Sign in, then start `pdfs-app` while the Secret Service is locked, not yet running,
+or unreachable. The app shows the sign-in form as if nobody were signed in. The saved session
+is still in the keyring, and the daemon waits for it.
+
+**Cause.** The app read the session with `auth::load().ok()`, which turns every keyring error
+into "signed out". Only `NotLoggedIn` means that. The tray already told the two apart.
+
+**Fix.** `read_session` keeps `NotLoggedIn` apart from keyring errors. On an error the login
+page shows a banner saying the keyring could not be read, with a Retry button. The app reads
+the keyring again after 2, 5, 10 and 30 seconds and on Retry, and opens on Files once it
+answers, without asking for a sign-in. A sign-in whose session cannot be read back gets the
+same banner.
+
+**Test:** None automated; the GTK window has no test harness. Checked by hand with
+`DBUS_SESSION_BUS_ADDRESS` pointing nowhere: the banner shows over the form.
+
+---
 
 ### B252 — Computers sharing a device overwrite each other's profile
 
