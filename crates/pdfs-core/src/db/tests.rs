@@ -1283,6 +1283,90 @@ fn a_corrupt_database_is_moved_aside_and_rebuilt() {
     let _ = std::fs::remove_file(path.with_extension("db.lock"));
 }
 
+/// A rebuilt database must not lose what only this machine has: writes Drive
+/// has not received, the mirror baselines and the pins (`docs/BUGS.md` B216).
+#[test]
+fn a_rebuild_keeps_the_queue_baselines_and_pins_of_the_damaged_file() {
+    let id = now_test_id();
+    let damaged =
+        std::env::temp_dir().join(format!("pdfs-salvage-old-{}-{id}.db", std::process::id()));
+    let fresh =
+        std::env::temp_dir().join(format!("pdfs-salvage-new-{}-{id}.db", std::process::id()));
+
+    let db = Db::open(&damaged).unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("listed", "root", "listed.txt", 1))
+        .unwrap();
+    db.upsert_node(&file("queued", "root", "queued.txt", 2))
+        .unwrap();
+    db.set_listed(&uid("root"), true).unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("queued").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/queued".into()),
+        meta_json: None,
+        created_at: 1,
+        attempts: 3,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let folder_id = db
+        .sync_folder_add("/home/me/Docs", "vol~docs", "share")
+        .unwrap();
+    db.sync_entry_upsert(
+        folder_id,
+        &StoredSyncEntry {
+            rel_path: "a.txt".into(),
+            remote_uid: Some("vol~a".into()),
+            local_mtime: 5,
+            local_mtime_ns: None,
+            local_size: 6,
+            remote_rev: Some("7".into()),
+            remote_hash: Some("8".into()),
+            remote_revision_id: None,
+        },
+    )
+    .unwrap();
+    db.pin_add("vol~pinned", "/pinned", true).unwrap();
+    drop(db);
+
+    let db = Db::open(&fresh).unwrap();
+    let results = salvage(&db.conn.lock(), &damaged);
+    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].uid, uid("queued").to_string());
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/queued"));
+    // The op's node came with it; the rest of the tree is fetched again.
+    assert!(
+        db.node_by_uid(&uid("queued").to_string())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.node_by_uid(&uid("listed").to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.sync_entries(folder_id).unwrap().len(), 1);
+    assert!(db.is_pinned("vol~pinned").unwrap());
+    drop(db);
+
+    for path in [&damaged, &fresh] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
+        }
+        let _ = std::fs::remove_file(path.with_extension("db.lock"));
+    }
+}
+
 fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {
     LocalEntry {
         path: path.into(),
@@ -1344,6 +1428,77 @@ fn rescanning_an_unchanged_file_keeps_exactly_one_index_entry() {
         assert_eq!(hits.len(), 1, "generation {generation}");
         assert_eq!(hits[0].mtime, mtime);
     }
+}
+
+/// A scan that stopped early or lost a batch did not see every file, so it
+/// must not prune the ones it missed (`docs/BUGS.md` B217).
+#[test]
+fn a_partial_local_scan_prunes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(
+        g,
+        &[
+            local("/home/u/a.txt", "a.txt", false),
+            local("/home/u/b.txt", "b.txt", false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.local_finish_scan(g, 1).unwrap(), 2);
+
+    let g = db.local_begin_scan().unwrap();
+    db.local_upsert_batch(g, &[local("/home/u/a.txt", "a.txt", false)])
+        .unwrap();
+    assert_eq!(db.local_finish_partial_scan(2).unwrap(), 2);
+    assert_eq!(db.search_local("b.txt", 10).unwrap().len(), 1);
+    assert_eq!(db.local_indexed_at().unwrap(), Some(2));
+}
+
+/// Deleted entries pile up in an FTS5 index until it is compacted. The daily
+/// compaction must leave both indexes whole and searchable, and must not run
+/// again the same day (`docs/BUGS.md` B217).
+#[test]
+fn compacting_the_search_indexes_keeps_them_whole_and_runs_once_a_day() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "quarterly-report.pdf", 1))
+        .unwrap();
+    for round in 0..20 {
+        let g = db.local_begin_scan().unwrap();
+        let name = format!("churn-{round}.txt");
+        db.local_upsert_batch(
+            g,
+            &[
+                local("/home/u/keep.txt", "keep.txt", false),
+                local(&format!("/home/u/{name}"), &name, false),
+            ],
+        )
+        .unwrap();
+        // Far in the past, so no scan compacts on its own.
+        db.local_finish_scan(g, 0).unwrap();
+    }
+
+    let day = 24 * 60 * 60;
+    db.compact_search_indexes_if_due(day).unwrap();
+    {
+        let conn = db.conn.lock();
+        for table in ["local_fts", "nodes_fts"] {
+            conn.execute(
+                &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
+                [],
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(db.search_local("keep", 10).unwrap().len(), 1);
+    assert_eq!(db.search_local("churn-19", 10).unwrap().len(), 1);
+    assert!(db.search_local("churn-3.txt", 10).unwrap().is_empty());
+    assert_eq!(db.search("quarterly", 10).unwrap().len(), 1);
+    let stamp = |db: &Db| db.state_str("fts_compacted_at").unwrap();
+    assert_eq!(stamp(&db).as_deref(), Some(day.to_string().as_str()));
+
+    db.compact_search_indexes_if_due(day + 60).unwrap();
+    assert_eq!(stamp(&db).as_deref(), Some(day.to_string().as_str()));
 }
 
 /// Queries below the trigram minimum still match, via the `LIKE` fallback.
@@ -2196,6 +2351,100 @@ fn refuses_a_schema_newer_than_the_running_build() {
     assert_eq!(version, "9999", "failed open must not rewrite the database");
     drop(conn);
     let _ = std::fs::remove_file(path);
+}
+
+/// Queueing a write syncs it to disk, and leaves the writer at NORMAL after.
+///
+/// The op row is what makes a staged blob reachable once `close()` has
+/// reported success, so its commit must survive a power loss. Everything else
+/// the writer commits is metadata the next listing re-fetches, and pays only
+/// NORMAL's cost.
+#[test]
+fn queueing_a_write_commits_at_full_sync_and_restores_normal() {
+    let path = std::env::temp_dir().join(format!("pdfs-db-sync-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open(&path).unwrap();
+    let level = |db: &Db| -> i64 {
+        db.conn
+            .lock()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap()
+    };
+    // 1 = NORMAL, 2 = FULL.
+    assert_eq!(level(&db), 1);
+    {
+        let durable = db.durable().unwrap();
+        let during: i64 = durable
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(during, 2);
+    }
+    assert_eq!(level(&db), 1);
+
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_TRASH.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: Some("a".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(level(&db), 1);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+/// A gap-filled blob is recorded as whole only while the op still holds it.
+///
+/// A write that closes during the drain points the row at a newer blob with
+/// its own sidecar. Overwriting that sidecar with the older blob's would
+/// describe bytes the row no longer holds.
+#[test]
+fn marking_a_blob_whole_leaves_a_newer_blob_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let op = PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("a").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/first".to_string()),
+        meta_json: Some(r#"{"complete":false}"#.to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op).unwrap();
+    let id = db.pending_ops().unwrap()[0].id;
+
+    assert!(
+        db.update_op_meta_for_blob(id, "/staging/first", r#"{"complete":true}"#)
+            .unwrap()
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].meta_json.as_deref(),
+        Some(r#"{"complete":true}"#)
+    );
+
+    assert!(
+        !db.update_op_meta_for_blob(id, "/staging/older", r#"{"stale":true}"#)
+            .unwrap(),
+        "the row holds another blob"
+    );
+    assert_eq!(
+        db.pending_ops().unwrap()[0].meta_json.as_deref(),
+        Some(r#"{"complete":true}"#)
+    );
 }
 
 /// A queued write whose baseline is restamped must keep everything else.
@@ -3927,15 +4176,15 @@ fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
             .unwrap();
         assert!(db.create_sent(id).unwrap().is_empty());
         assert!(db.create_targets(id).unwrap().is_empty());
-        db.note_create_target(id, &parent, "c").unwrap();
-        db.note_create_target(id, &parent, "c").unwrap();
+        db.note_create_target(id, &parent, "c", 10).unwrap();
+        db.note_create_target(id, &parent, "c", 20).unwrap();
         db.note_create_sent(id, "aaaa").unwrap();
         db.note_create_sent(id, "aaaa").unwrap();
         db.record_op_failure(id, "no answer", 0).unwrap();
         db.attach_blob_to_create("local~sent", "/staging/second", "{}")
             .unwrap()
             .expect("the create is still queued");
-        db.note_create_target(id, &parent, "d").unwrap();
+        db.note_create_target(id, &parent, "d", 30).unwrap();
         db.note_create_sent(id, "bbbb").unwrap();
         db.record_op_failure(id, "no answer", 0).unwrap();
         db.delete_ops_for_uid("local~sent").unwrap();
@@ -3956,6 +4205,73 @@ fn what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart() {
     );
     drop(db);
     let _ = std::fs::remove_file(path);
+}
+
+/// A queued create knows when it first went out, which is where the window
+/// for adopting a node its lost answer left starts. Records written before
+/// the time was kept still list their targets, and one that does not parse is
+/// not replaced by the next target.
+#[test]
+fn a_create_remembers_when_it_was_first_sent() {
+    let db = Db::open_in_memory().unwrap();
+    let parent = uid("parent").to_string();
+    let (id, _) = db
+        .enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_CREATE.to_string(),
+            uid: "local~first".to_string(),
+            parent_uid: Some(parent.clone()),
+            name: Some("a.txt".to_string()),
+            blob_path: None,
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    assert_eq!(db.create_first_sent(id).unwrap(), None, "never sent");
+    db.note_create_target(id, &parent, "a.txt", 500).unwrap();
+    db.note_create_target(id, &parent, "a.txt", 900).unwrap();
+    db.note_create_target(id, &parent, "b.txt", 700).unwrap();
+    assert_eq!(db.create_first_sent(id).unwrap(), Some(500));
+
+    let set = |json: &str| {
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE pending_op SET sent_to = ?2 WHERE id = ?1",
+                rusqlite::params![id, json],
+            )
+            .unwrap();
+    };
+    set(&format!(r#"[["{parent}","old.txt"]]"#));
+    assert_eq!(
+        db.create_targets(id).unwrap(),
+        vec![(parent.clone(), "old.txt".to_string())]
+    );
+    assert_eq!(db.create_first_sent(id).unwrap(), None);
+    db.note_create_target(id, &parent, "a.txt", 900).unwrap();
+    assert_eq!(
+        db.create_targets(id).unwrap().len(),
+        2,
+        "the old target stays"
+    );
+    assert_eq!(db.create_first_sent(id).unwrap(), Some(900));
+
+    set("not json");
+    db.note_create_target(id, &parent, "c.txt", 1000).unwrap();
+    let raw: String = db
+        .conn
+        .lock()
+        .query_row("SELECT sent_to FROM pending_op WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        raw, "not json",
+        "an unreadable record is kept, not replaced"
+    );
 }
 
 /// A write after a create failed clears its attempts, so the next try goes
@@ -3981,7 +4297,7 @@ fn a_create_rewritten_after_it_failed_still_leaves_a_trash_when_deleted() {
             next_attempt_at: 0,
         })
         .unwrap();
-    db.note_create_target(id, &parent, "a.txt").unwrap();
+    db.note_create_target(id, &parent, "a.txt", 10).unwrap();
     db.note_create_sent(id, "aaaa").unwrap();
     db.record_op_failure(id, "no answer", 0).unwrap();
     db.attach_blob_to_create("local~sent", "/staging/second", "{}")
@@ -5028,6 +5344,7 @@ fn baseline_row(rel: &str) -> StoredSyncEntry {
         local_size: 7,
         remote_rev: Some("1700000000".into()),
         remote_hash: Some("7".into()),
+        remote_revision_id: None,
     }
 }
 
@@ -5122,6 +5439,7 @@ fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
             local_size: 2,
             remote_rev: Some("3".into()),
             remote_hash: Some("2".into()),
+            remote_revision_id: None,
             local_mtime_ns: None,
         },
     )
@@ -5139,6 +5457,7 @@ fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
             local_size: 2,
             remote_rev: Some("3".into()),
             remote_hash: Some("2".into()),
+            remote_revision_id: None,
             local_mtime_ns: None,
         },
     )
@@ -6316,6 +6635,71 @@ fn migration_v27_adds_the_access_deferral_column_to_a_v26_queue() {
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
 
+/// V44 adds the remote revision a baseline row was synced at. A row carried
+/// over from V43 has none, and the mirror then compares the modification time
+/// and size as before, so upgrading changes nothing about what is in step
+/// (`docs/BUGS.md` B249).
+#[test]
+fn migration_v44_adds_the_synced_revision_without_disturbing_a_v43_baseline() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v43-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let row = StoredSyncEntry {
+        rel_path: "notes.txt".into(),
+        remote_uid: Some("vol~notes".into()),
+        local_mtime: 1_700_000_000,
+        local_mtime_ns: Some(1_700_000_000_123_456_789),
+        local_size: 42,
+        remote_rev: Some("1700000000".into()),
+        remote_hash: Some("42".into()),
+        remote_revision_id: Some("rev-1".into()),
+    };
+    {
+        let db = Db::open(&path).unwrap();
+        let folder = db
+            .sync_folder_add("/home/me/Mirror", "vol~root", "share")
+            .unwrap();
+        db.sync_entry_upsert(folder, &row).unwrap();
+    }
+    {
+        // Put the file back in the state a released V43 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sync_entry DROP COLUMN remote_revision_id;
+             UPDATE sync_state SET value = '43' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    let entry = entries.get("notes.txt").expect("the baseline row survives");
+    assert_eq!(
+        entry,
+        &StoredSyncEntry {
+            remote_revision_id: None,
+            ..row.clone()
+        }
+    );
+
+    // And the column is live, including through a move of the row.
+    db.sync_entry_upsert(1, &row).unwrap();
+    db.sync_entries_move(1, "notes.txt", 1, "moved.txt")
+        .unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    assert_eq!(
+        entries["moved.txt"].remote_revision_id.as_deref(),
+        Some("rev-1")
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A mirror baseline carried over from V27 keeps its rows, and each one reads
 /// back with no nanosecond time. That `None` is the whole point: it makes the
 /// comparison fall back to whole seconds for rows written before the column
@@ -6346,6 +6730,7 @@ fn migration_v28_adds_sub_second_local_times_without_disturbing_a_v27_baseline()
                 local_size: 42,
                 remote_rev: Some("1700000000".into()),
                 remote_hash: Some("42".into()),
+                remote_revision_id: None,
             },
         )
         .unwrap();
@@ -7214,6 +7599,56 @@ fn a_refused_change_names_its_node_by_local_id() {
         db.node_issues().unwrap(),
         std::collections::HashMap::from([(lid, "quota".to_string())])
     );
+}
+
+/// The name checks the drain makes before each op look the name up in an
+/// index. Scanning the queue instead made a large offline batch quadratic.
+#[test]
+fn queue_name_checks_use_an_index() {
+    let db = Db::open_in_memory().unwrap();
+    let conn = db.conn.lock();
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    for sql in [
+        "SELECT 1 FROM pending_op WHERE kind = 'trash' AND name = 'a'",
+        "SELECT 1 FROM pending_op WHERE name = 'a' AND kind IN ('create', 'mkdir', 'rename')",
+        "SELECT 1 FROM pending_op WHERE kind = 'rename'",
+    ] {
+        let plan = plan(sql);
+        assert!(plan.contains("pending_op_kind_name"), "{sql}: {plan}");
+    }
+}
+
+/// A reconnect moves up the ops that failed for want of a link. One Drive
+/// refused, for quota or access, keeps its backoff: the link coming back
+/// changes nothing about it. "Retry all" still moves both.
+#[test]
+fn a_reconnect_leaves_refused_ops_to_their_backoff() {
+    let db = Db::open_in_memory().unwrap();
+    let offline = queued_op(&db, "vol~a", 2, 90_000);
+    let refused = queued_op(&db, "vol~b", 2, 90_000);
+    db.set_op_issue(refused, Some("quota")).unwrap();
+
+    assert_eq!(db.retry_unrefused_ops_now(5_000).unwrap(), 1);
+    let due = |id: i64| {
+        db.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == id)
+            .unwrap()
+            .next_attempt_at
+    };
+    assert_eq!(due(offline), 5_000);
+    assert_eq!(due(refused), 90_000);
+
+    assert_eq!(db.retry_failed_ops_now(5_000).unwrap(), 1);
+    assert_eq!(due(refused), 5_000);
 }
 
 #[test]

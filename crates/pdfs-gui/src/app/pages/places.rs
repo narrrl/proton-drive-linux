@@ -448,7 +448,9 @@ pub(crate) fn close_place(ui: &Rc<Ui>) {
 fn places_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str) {
     ui.gallery.places_status.set_icon_name(Some(icon));
     ui.gallery.places_status.set_title(title);
-    ui.gallery.places_status.set_description(Some(description));
+    ui.gallery
+        .places_status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.gallery.places_stack.set_visible_child_name("status");
 }
 

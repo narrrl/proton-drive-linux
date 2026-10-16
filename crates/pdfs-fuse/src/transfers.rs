@@ -125,6 +125,11 @@ impl TransferRegistry {
         self.download_limit.set(download);
     }
 
+    /// The upload cap in bytes per second, `0` when there is none.
+    pub fn upload_cap(&self) -> u64 {
+        self.upload_limit.rate.load(Ordering::Relaxed)
+    }
+
     fn limit(&self, direction: TransferDirection) -> &RateLimit {
         match direction {
             TransferDirection::Upload => &self.upload_limit,

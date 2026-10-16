@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pdfs-gui"]
 
 [workspace.package]
-version = "3.4.1"
+version = "3.5.0"
 edition = "2024"
 license = "MIT"
 authors = ["Nils Pukropp <contact@narl.io>"]
@@ -61,3 +61,15 @@ async-trait = "0.1"
 futures = "0.3"
 fuser = "0.18"
 libc = "0.2"
+
+[profile.release]
+# No package ships a separate debug package (the PKGBUILD sets `!debug`, the
+# RPM spec sets `debug_package` to nil), and the unstripped binaries weighed
+# 43 MB (`pdfs`), 24 MB (`pdfs-app`) and 12 MB (`pdfs-tray`).
+strip = "symbols"
+# Off on purpose: LTO has broken GTK links for this workspace, which is why
+# the packages turn it off as well.
+lto = false
+# `Workers` and the thumbnail build catch panics to keep the daemon alive, so
+# unwinding must stay on.
+panic = "unwind"

@@ -204,7 +204,9 @@ pub(crate) fn wire_devices(ui: &Rc<Ui>, widgets: &DevicesWidgets) {
 pub(crate) fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.devices.status.set_icon_name(Some(icon));
     ui.devices.status.set_title(title);
-    ui.devices.status.set_description(Some(description));
+    ui.devices
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.devices.retry.set_visible(retry);
     ui.devices.content.set_visible_child_name("status");
 }
@@ -390,6 +392,7 @@ fn this_computer_row(
     let row = adw::ActionRow::builder()
         .title(me.map_or_else(|| gettext("This computer"), |d| d.name.clone()))
         .subtitle(this_computer_subtitle(folders))
+        .use_markup(false)
         .activatable(true)
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
@@ -426,6 +429,7 @@ fn other_computer_row(ui: &Rc<Ui>, dev: &DeviceInfo) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(&dev.name)
         .subtitle(device_subtitle(dev))
+        .use_markup(false)
         .activatable(true)
         .build();
     row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
@@ -438,6 +442,10 @@ fn other_computer_row(ui: &Rc<Ui>, dev: &DeviceInfo) -> adw::ActionRow {
     let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
     menu.item(&gettext("Restore to This Computer…"), move || {
         prompt_restore_folders(&ui_c, Some((uid_c.clone(), name_c.clone())))
+    });
+    let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
+    menu.item(&gettext("Sync With This Computer…"), move || {
+        prompt_join_device(&ui_c, &uid_c, &name_c)
     });
     let (ui_c, uid_c, name_c) = (ui.clone(), uid.clone(), name.clone());
     menu.item(&gettext("Move to This Computer…"), move || {
@@ -763,7 +771,10 @@ fn show_restore_picker(
             .active(true)
             .valign(gtk4::Align::Center)
             .build();
-        let row = adw::EntryRow::builder().title(&f.name).build();
+        let row = adw::EntryRow::builder()
+            .title(&f.name)
+            .use_markup(false)
+            .build();
         row.set_text(&f.local_path);
         row.add_prefix(&check);
         group.add(&row);
@@ -1089,6 +1100,69 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
                 &gettext("Couldn't continue that backup here"),
             );
         }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Ask before syncing into another computer's device alongside it, then offer
+/// its folders for syncing here.
+///
+/// The same adoption as "Continue This Backup Here", but the other computer
+/// goes on syncing, so the dialog says what that means: the two keep the same
+/// folders in step, deletions included.
+pub(crate) fn prompt_join_device(ui: &Rc<Ui>, uid: &str, name: &str) {
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Sync With This Computer?"))
+        // Translators: {name} is the name of the other computer this one syncs with.
+        .body(gettext_f(
+            "This computer and “{name}” keep the same folders in step. A change or a deletion on one reaches the other.\n\nNew synced folders on this computer go under “{name}” in Proton Drive. Folders already synced here stay where they are. Next you choose which of its folders to sync here.",
+            &[("name", name)],
+        ))
+        .build();
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("join", &gettext("Sync Here"));
+    dialog.set_response_appearance("join", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let ui = ui.clone();
+    let uid = uid.to_string();
+    // Translators: {name} is the name of the other computer this one now syncs with.
+    let done = gettext_f("Now syncing with “{name}”", &[("name", name)]);
+    dialog.connect_response(None, move |_, resp| {
+        if resp != "join" {
+            return;
+        }
+        ui.busy_begin();
+        let rx = spawn_request(
+            ui.dirs.control_socket(),
+            Request::AdoptDevice {
+                uid: Some(uid.clone()),
+            },
+        );
+        let (ui, done) = (ui.clone(), done.clone());
+        glib::spawn_future_local(async move {
+            let result = rx.recv().await;
+            ui.busy_end();
+            let failed = gettext("Couldn't sync with that computer");
+            match result {
+                Ok(Ok(Response::Ok { .. })) => {
+                    reload_sync_pages(&ui);
+                    toast(&ui, &done);
+                    // The device is this computer's now, so its own restore
+                    // picker offers the folders.
+                    prompt_restore_folders(&ui, None);
+                }
+                Ok(Ok(Response::Error { message, kind })) => {
+                    toast_failure(&ui, &failed, &message, kind)
+                }
+                _ => toast_error(
+                    &ui,
+                    &failed,
+                    &gettext("The Proton Drive service didn't respond."),
+                ),
+            }
+        });
     });
     dialog.present(win.as_ref());
 }

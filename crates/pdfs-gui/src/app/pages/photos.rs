@@ -609,7 +609,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     select_box.append(&select_done);
     let select_bar = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideDown)
-        .child(&select_box)
+        .child(&scroll_sideways(&select_box))
         .build();
 
     // All / Photos / Videos / Raw filter. Linked toggles acting as one segmented
@@ -1379,11 +1379,9 @@ pub(crate) fn wire_gallery(
                     "tiff" | "tif" => "image/tiff",
                     _ => "image/jpeg",
                 };
-                let capture_time = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
+                // The daemon dates the photo: by its EXIF, or by the file's
+                // modification time when it has none.
+                let capture_time = None;
 
                 ui.busy_begin();
                 let rx = spawn_request(
@@ -3459,7 +3457,9 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
 pub(crate) fn gallery_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.gallery.status.set_icon_name(Some(icon));
     ui.gallery.status.set_title(title);
-    ui.gallery.status.set_description(Some(description));
+    ui.gallery
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.gallery.retry.set_visible(retry);
     // Only the empty timeline offers a way to fill it; every other status turns
     // those buttons back off.
@@ -3479,10 +3479,10 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
 /// right tool for the HEVC `.mkv`s this is aimed at — and falls back to the
 /// user's default handler when mpv isn't installed.
 pub(crate) fn play_external(path: &str) {
-    if Command::new("mpv").arg(path).spawn().is_ok() {
-        return;
+    match Command::new("mpv").arg(path).spawn() {
+        Ok(child) => pdfs_core::opener::reap(child),
+        Err(_) => open_path(path),
     }
-    open_path(path);
 }
 
 #[cfg(test)]

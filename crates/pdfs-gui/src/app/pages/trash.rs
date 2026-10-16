@@ -330,7 +330,9 @@ pub(crate) fn trash_unreachable(ui: &Rc<Ui>) {
 pub(crate) fn trash_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.trash.status.set_icon_name(Some(icon));
     ui.trash.status.set_title(title);
-    ui.trash.status.set_description(Some(description));
+    ui.trash
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.trash.retry.set_visible(retry);
     ui.trash.content.set_visible_child_name("status");
     ui.trash.subtitle.set_subtitle("");

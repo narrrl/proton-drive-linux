@@ -199,14 +199,160 @@ pub(super) fn guard_local_wipe<B, L>(
     Ok(())
 }
 
+/// Refuse to run a pass whose remote side has vanished in its entirety: the
+/// remote twin of [`guard_local_wipe`].
+///
+/// An empty or truncated remote walk reads to the planner as "Drive deleted
+/// everything", which a pass answers by deleting the local copies. When not
+/// one synced path is left on Drive, a failed listing is far likelier than a
+/// deliberate wipe of the whole folder, so the pass stops instead.
+pub(super) fn guard_remote_wipe<B, R>(
+    baseline: &HashMap<String, B>,
+    remote: &HashMap<String, R>,
+) -> Result<(), String> {
+    if !baseline.is_empty() && baseline.keys().all(|rel| !remote.contains_key(rel)) {
+        return Err(format!(
+            "every one of the {} synced paths is missing on Proton Drive; refusing to \
+             delete them here. If they were deleted on purpose, remove the folder from sync.",
+            baseline.len()
+        ));
+    }
+    Ok(())
+}
+
+/// What a remote walk saw but could not read: a node the SDK left out because
+/// it would not decrypt, or a file whose size could not be read.
+///
+/// A path missing from the walk is read as deleted on Drive, so a pass must
+/// not classify one it only failed to read. Since a node that failed to decrypt
+/// has no name, all a walk can say is that a folder's listing came back short;
+/// every path under that folder that the walk did not return is then left out,
+/// as [`Unscanned`] leaves out what the local scan could not read.
+#[derive(Default)]
+pub(super) struct RemoteGaps {
+    /// Folders whose listing came back with fewer nodes than it named.
+    short: HashSet<String>,
+    /// Paths seen, but whose entry could not be read.
+    unread: HashSet<String>,
+}
+
+impl RemoteGaps {
+    /// The listing of `folder` named nodes that did not come back.
+    pub(super) fn short_listing(&mut self, folder: &str) {
+        self.short.insert(folder.to_string());
+    }
+
+    /// `rel` is on Drive, but the walk could not read what it needs of it.
+    pub(super) fn unread(&mut self, rel: String) {
+        self.unread.insert(rel);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.short.is_empty() && self.unread.is_empty()
+    }
+
+    /// Whether `rel` may be missing from `remote` only because the walk could
+    /// not read it. A path the walk returned is never hidden.
+    pub(super) fn hides<R>(
+        &self,
+        rel: &str,
+        remote: &HashMap<String, R>,
+        remote_dirs: &HashMap<String, NodeUid>,
+    ) -> bool {
+        if self.is_empty() || remote.contains_key(rel) {
+            return false;
+        }
+        if self.unread.contains(rel) {
+            return true;
+        }
+        // The deepest folder the walk did list decides: under a short listing,
+        // anything not returned may be one of the nodes it could not read.
+        let mut at = parent_rel(rel);
+        loop {
+            if remote_dirs.contains_key(at) {
+                return self.short.contains(at);
+            }
+            if at.is_empty() {
+                return false;
+            }
+            at = parent_rel(at);
+        }
+    }
+
+    /// The folders to name to the user, sorted.
+    pub(super) fn report(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .short
+            .iter()
+            .map(|rel| {
+                let shown = if rel.is_empty() { "the folder" } else { rel };
+                format!("{shown} (items on Proton Drive that cannot be read)")
+            })
+            .chain(
+                self.unread
+                    .iter()
+                    .map(|rel| format!("{rel} (cannot be read on Proton Drive)")),
+            )
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+}
+
+/// Why the remote folder at `rel` must not be trashed although it was deleted
+/// here: something under it is new or changed on Drive since the last sync,
+/// so it is another device's work that this computer has never had.
+///
+/// Trashing the folder would take that work with it, and the next pass would
+/// then delete the copy this pass just downloaded. `None` when everything under
+/// it is exactly what the baseline recorded.
+pub(super) fn remote_subtree_changed(
+    rel: &str,
+    remote: &HashMap<String, RemoteItem>,
+    baseline: &HashMap<String, StoredSyncEntry>,
+) -> Option<String> {
+    let prefix = format!("{rel}/");
+    let mut changed: Vec<&String> = remote
+        .iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .filter(|(path, item)| match baseline.get(*path) {
+            None => true,
+            Some(_) if item.is_dir => false,
+            Some(base) => {
+                remote_sig(base) != Some((item.mtime, item.size))
+                    || revision_moved(Some(base), item.revision.as_deref())
+            }
+        })
+        .map(|(path, _)| path)
+        .collect();
+    changed.sort_unstable();
+    changed
+        .first()
+        .map(|path| format!("{path} is new or changed on Proton Drive"))
+}
+
 /// The size the baseline recorded for `rel`, if its remote signature's mtime
-/// still matches `mtime`.
+/// still matches `mtime` and its revision is still `revision`.
+///
+/// A row without a revision id, while Drive reports one, cannot vouch for the
+/// revision, so the size is read for real. Such a row comes from before
+/// schema 44, or from an upload Drive did not list yet when it was read back.
+/// Another computer's revision in the same second as that upload kept the
+/// modification time, and only the size could show it (B254). The pass then
+/// records the id on the row, so this costs one read per row.
 pub(super) fn unchanged_remote_size(
     baseline: &HashMap<String, StoredSyncEntry>,
     rel: &str,
     mtime: i64,
+    revision: Option<&str>,
 ) -> Option<i64> {
-    match baseline.get(rel).and_then(remote_sig) {
+    let base = baseline.get(rel)?;
+    if revision_moved(Some(base), revision)
+        || (base.remote_revision_id.is_none() && revision.is_some())
+    {
+        return None;
+    }
+    match remote_sig(base) {
         Some((recorded, size)) if recorded == mtime => Some(size),
         _ => None,
     }
@@ -218,6 +364,17 @@ pub(super) fn join_rel(prefix: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{prefix}/{name}")
+    }
+}
+
+/// Whether Drive's active revision `now` is not the one the baseline row was
+/// synced at. Only a revision id on both sides can say so; a row from before
+/// schema 44, or a node read without one, leaves it to the modification time
+/// and size.
+pub(super) fn revision_moved(base: Option<&StoredSyncEntry>, now: Option<&str>) -> bool {
+    match (base.and_then(|b| b.remote_revision_id.as_deref()), now) {
+        (Some(recorded), Some(now)) => recorded != now,
+        _ => false,
     }
 }
 
@@ -251,7 +408,8 @@ pub(super) fn rel_to_path(rel: &str) -> PathBuf {
     rel.split('/').collect()
 }
 
-/// The name for a conflict copy of `path`, e.g. `notes (sync-conflict 1700000000).txt`.
+/// The name for a conflict copy of `path`, e.g.
+/// `notes (sync-conflict laptop 1700000000).txt`.
 #[cfg(test)]
 pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
     conflict_path_with_suffix(path, stamp, 0)
@@ -260,16 +418,17 @@ pub(super) fn conflict_path(path: &Path, stamp: i64) -> PathBuf {
 /// As [`conflict_path`], with a deterministic suffix used when that name already
 /// exists. This keeps conflict preservation from ever replacing an older copy.
 pub(super) fn conflict_path_with_suffix(path: &Path, stamp: i64, suffix: u32) -> PathBuf {
+    conflict_path_as(path, crate::conflict_label(), stamp, suffix)
+}
+
+/// [`conflict_path_with_suffix`] with the machine's label given.
+pub(super) fn conflict_path_as(path: &Path, label: &str, stamp: i64, suffix: u32) -> PathBuf {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
-    let suffix = if suffix == 0 {
-        String::new()
-    } else {
-        format!("-{suffix}")
-    };
+    let tag = crate::conflict_tag(label, stamp, suffix);
     let name = match ext {
-        Some(ext) => format!("{stem} (sync-conflict {stamp}{suffix}).{ext}"),
-        None => format!("{stem} (sync-conflict {stamp}{suffix})"),
+        Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
+        None => format!("{stem} (sync-conflict {tag})"),
     };
     match path.parent() {
         Some(dir) => dir.join(name),
@@ -290,11 +449,14 @@ pub(super) enum FilePlan {
     DeleteLocal,
     DeleteRemote,
     ForgetBaseline,
-    /// First sync of a file that already exists on both sides with identical
-    /// content: record the baseline without transferring anything. Without this,
+    /// First sync of a file that exists on both sides at the same size, with a
+    /// digest on Drive: record the baseline without transferring anything if
+    /// the local file hashes the same, else keep a conflict copy. Without this,
     /// a folder synced for the first time cuts a `(sync-conflict)` copy of every
     /// pre-existing file, because a missing baseline makes both sides read as
-    /// "changed" (see the mass first-sync conflict storm in docs/BUGS.md).
+    /// "changed" (see the mass first-sync conflict storm in docs/BUGS.md). Size
+    /// alone is not enough: a second machine joining the folder would read a
+    /// different file of the same size as in step (B248).
     AdoptBaseline,
 }
 
@@ -313,8 +475,13 @@ pub(super) fn plan_file(
         // left the file the same length, so it was never uploaded.
         baseline.is_none_or(|base| !LocalSig::from(item).same_content(&LocalSig::from(base)))
     });
+    // Another client's new revision shows in its id even when the link's
+    // modification time and the size come out the same.
     let remote_changed = remote.is_some_and(|item| {
-        baseline.is_none_or(|base| remote_sig(base) != Some((item.mtime, item.size)))
+        baseline.is_none_or(|base| {
+            remote_sig(base) != Some((item.mtime, item.size))
+                || revision_moved(Some(base), item.revision.as_deref())
+        })
     });
 
     match (local, remote) {
@@ -324,10 +491,13 @@ pub(super) fn plan_file(
             (false, true) => FilePlan::Download,
             // With a baseline, both-changed is a genuine concurrent edit and must
             // be preserved as a conflict. Without one, "both changed" only means
-            // this is the first sync and there was nothing to compare to: adopt
-            // the baseline when the sizes already match rather than conflict-copy
-            // an already-identical file. Divergent sizes stay a real conflict.
-            (true, true) if baseline.is_none() && l.size == r.size => FilePlan::AdoptBaseline,
+            // this is the first sync and there was nothing to compare to: when the
+            // sizes match and Drive has a digest to compare against, the apply
+            // step hashes the local file before adopting it. Divergent sizes, or
+            // no digest, stay a real conflict: a missing digest proves nothing.
+            (true, true) if baseline.is_none() && l.size == r.size && r.sha1.is_some() => {
+                FilePlan::AdoptBaseline
+            }
             (true, true) => FilePlan::Conflict,
         },
         (Some(_), None) if baseline.is_none() || local_changed => FilePlan::UploadNew,
@@ -359,6 +529,8 @@ mod file_plan_tests {
             is_dir: false,
             mtime,
             size,
+            revision: None,
+            sha1: None,
         }
     }
 
@@ -376,6 +548,7 @@ mod file_plan_tests {
             local_size,
             remote_rev: Some(remote_mtime.to_string()),
             remote_hash: Some(remote_size.to_string()),
+            remote_revision_id: None,
         }
     }
 
@@ -497,12 +670,28 @@ mod file_plan_tests {
     fn first_sync_of_an_identical_file_adopts_the_baseline_not_a_conflict() {
         // No baseline yet (first sync). Same size on both sides is a pre-existing
         // identical file, not a concurrent edit: adopt it rather than cut a
-        // conflict copy of every file in the folder.
+        // conflict copy of every file in the folder. The apply step still
+        // hashes the local file before it records anything.
+        let local = local(10, 40);
+        let remote = RemoteItem {
+            sha1: Some("da39a3ee".into()),
+            ..remote(30, 40)
+        };
+        assert_eq!(
+            plan_file(Some(&local), Some(&remote), None),
+            FilePlan::AdoptBaseline
+        );
+    }
+
+    /// A file on Drive without a digest cannot be compared without a download,
+    /// and the same size is not the same content (B248).
+    #[test]
+    fn first_sync_without_a_remote_digest_is_a_conflict() {
         let local = local(10, 40);
         let remote = remote(30, 40);
         assert_eq!(
             plan_file(Some(&local), Some(&remote), None),
-            FilePlan::AdoptBaseline
+            FilePlan::Conflict
         );
     }
 
@@ -518,6 +707,73 @@ mod file_plan_tests {
         );
     }
 
+    /// Another computer's new revision can leave the modification time and
+    /// the size as they were. The revision id still tells it apart (B249).
+    #[test]
+    fn a_new_remote_revision_is_a_change_even_at_the_same_mtime_and_size() {
+        let mut base = baseline(10, 20, 30, 40);
+        base.remote_revision_id = Some("r1".into());
+        let unedited = local(10, 20);
+        let same = RemoteItem {
+            revision: Some("r1".into()),
+            ..remote(30, 40)
+        };
+        let newer = RemoteItem {
+            revision: Some("r2".into()),
+            ..remote(30, 40)
+        };
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&same), Some(&base)),
+            FilePlan::Unchanged
+        );
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&newer), Some(&base)),
+            FilePlan::Download
+        );
+        let edited = local(11, 20);
+        assert_eq!(
+            plan_file(Some(&edited), Some(&newer), Some(&base)),
+            FilePlan::Conflict
+        );
+
+        // A row from before schema 44 has no id to compare, and a node read
+        // without one says nothing: both fall back to the signature.
+        let old = baseline(10, 20, 30, 40);
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&newer), Some(&old)),
+            FilePlan::Unchanged
+        );
+        assert_eq!(
+            plan_file(Some(&unedited), Some(&remote(30, 40)), Some(&base)),
+            FilePlan::Unchanged
+        );
+    }
+
+    /// The walk reuses the recorded size only while the revision is the one
+    /// the baseline holds.
+    #[test]
+    fn a_moved_revision_makes_the_walk_read_the_size_again() {
+        let mut base = baseline(10, 20, 30, 40);
+        base.remote_revision_id = Some("r1".into());
+        let rows = HashMap::from([("file".to_string(), base)]);
+        assert_eq!(
+            unchanged_remote_size(&rows, "file", 30, Some("r1")),
+            Some(40)
+        );
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, None), Some(40));
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, Some("r2")), None);
+        assert_eq!(unchanged_remote_size(&rows, "file", 31, Some("r1")), None);
+    }
+
+    /// A row without a revision id reuses its size only while Drive gives no
+    /// id either (B254).
+    #[test]
+    fn a_row_without_a_revision_makes_the_walk_read_the_size_again() {
+        let rows = HashMap::from([("file".to_string(), baseline(10, 20, 30, 40))]);
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, Some("r1")), None);
+        assert_eq!(unchanged_remote_size(&rows, "file", 30, None), Some(40));
+    }
+
     #[test]
     fn a_missing_remote_signature_is_treated_as_changed() {
         let local = local(10, 20);
@@ -529,5 +785,97 @@ mod file_plan_tests {
             plan_file(Some(&local), Some(&remote), Some(&base)),
             FilePlan::Download
         );
+    }
+
+    fn uid(id: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("v"), LinkId::from(id))
+    }
+
+    fn folder() -> RemoteItem {
+        RemoteItem {
+            is_dir: true,
+            mtime: 0,
+            size: 0,
+            ..remote(0, 0)
+        }
+    }
+
+    /// An empty or failed remote listing must not read as "Drive deleted
+    /// everything" and delete the local copies.
+    #[test]
+    fn the_remote_wipe_guard_blocks_only_a_total_disappearance() {
+        let base = HashMap::from([("a".to_string(), ()), ("b".to_string(), ())]);
+        let none: HashMap<String, RemoteItem> = HashMap::new();
+        assert!(guard_remote_wipe(&base, &none).is_err());
+        let one = HashMap::from([("b".to_string(), remote(1, 1))]);
+        assert!(guard_remote_wipe(&base, &one).is_ok());
+        let empty: HashMap<String, ()> = HashMap::new();
+        assert!(guard_remote_wipe(&empty, &none).is_ok());
+    }
+
+    /// A node that failed to decrypt has no name, so everything a short
+    /// listing did not return is left out, and nothing else.
+    #[test]
+    fn a_short_remote_listing_hides_what_it_did_not_return() {
+        let remote = HashMap::from([
+            ("docs".to_string(), folder()),
+            ("docs/a.txt".to_string(), remote(1, 1)),
+            ("pics".to_string(), folder()),
+        ]);
+        let dirs = HashMap::from([
+            (String::new(), uid("root")),
+            ("docs".to_string(), uid("docs")),
+            ("pics".to_string(), uid("pics")),
+        ]);
+        let mut gaps = RemoteGaps::default();
+        assert!(!gaps.hides("docs/b.txt", &remote, &dirs));
+        gaps.short_listing("docs");
+        // Returned paths stand; unreturned ones under the short folder hide,
+        // and so does anything under a subfolder it failed to return.
+        assert!(!gaps.hides("docs/a.txt", &remote, &dirs));
+        assert!(gaps.hides("docs/b.txt", &remote, &dirs));
+        assert!(gaps.hides("docs/sub/deep.txt", &remote, &dirs));
+        // A complete sibling listing still reads deletions as deletions.
+        assert!(!gaps.hides("pics/gone.jpg", &remote, &dirs));
+        assert!(!gaps.hides("top.txt", &remote, &dirs));
+        gaps.short_listing("");
+        assert!(gaps.hides("top.txt", &remote, &dirs));
+    }
+
+    #[test]
+    fn a_file_whose_size_could_not_be_read_is_hidden() {
+        let remote: HashMap<String, RemoteItem> = HashMap::new();
+        let dirs = HashMap::from([(String::new(), uid("root"))]);
+        let mut gaps = RemoteGaps::default();
+        gaps.unread("a.txt".to_string());
+        assert!(gaps.hides("a.txt", &remote, &dirs));
+        assert!(!gaps.hides("b.txt", &remote, &dirs));
+        assert_eq!(gaps.report(), ["a.txt (cannot be read on Proton Drive)"]);
+    }
+
+    /// A folder deleted here holds another device's new work on Drive, so
+    /// trashing it would lose that work.
+    #[test]
+    fn a_remote_folder_with_new_or_changed_files_is_not_trashed() {
+        let mut base = HashMap::from([
+            ("x".to_string(), baseline(0, 0, 0, 0)),
+            ("x/old.txt".to_string(), baseline(1, 1, 5, 6)),
+        ]);
+        let mut remote_tree = HashMap::from([
+            ("x".to_string(), folder()),
+            ("x/old.txt".to_string(), remote(5, 6)),
+            ("xy/new.txt".to_string(), remote(1, 1)),
+        ]);
+        // Unchanged under x; a name-prefixed sibling does not count.
+        assert_eq!(remote_subtree_changed("x", &remote_tree, &base), None);
+
+        remote_tree.insert("x/old.txt".to_string(), remote(9, 6));
+        assert!(remote_subtree_changed("x", &remote_tree, &base).is_some());
+
+        remote_tree.insert("x/old.txt".to_string(), remote(5, 6));
+        remote_tree.insert("x/sub".to_string(), folder());
+        assert!(remote_subtree_changed("x", &remote_tree, &base).is_some());
+        base.insert("x/sub".to_string(), baseline(0, 0, 0, 0));
+        assert_eq!(remote_subtree_changed("x", &remote_tree, &base), None);
     }
 }

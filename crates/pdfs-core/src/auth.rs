@@ -516,8 +516,59 @@ pub fn lock(forget: bool) -> Result<()> {
     Ok(())
 }
 
-/// Forget the persisted session (best-effort; absent entry is not an error).
-pub fn logout() -> Result<()> {
+/// How long [`logout`] waits for Proton to end the session before it signs
+/// out locally without.
+const END_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// End the stored session on Proton's side (`DELETE auth/v4`). Returns false
+/// when there is none or Proton could not be reached in time.
+///
+/// Runs on a thread of its own, so it works the same whether the caller is
+/// inside a tokio runtime or not.
+fn end_server_session() -> bool {
+    let Ok(stored) = load() else {
+        return false;
+    };
+    let ended = std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> std::result::Result<(), String> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                rt.block_on(async {
+                    let session = resume_stored(&stored).map_err(|e| e.to_string())?;
+                    match tokio::time::timeout(END_SESSION_TIMEOUT, session.end()).await {
+                        Ok(result) => result.map_err(|e| e.to_string()),
+                        Err(_) => Err(format!(
+                            "no answer within {}s",
+                            END_SESSION_TIMEOUT.as_secs()
+                        )),
+                    }
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the sign-out thread panicked".into()))
+    });
+    match ended {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "ending the session on Proton failed; signing out locally");
+            false
+        }
+    }
+}
+
+/// End the session on Proton, then forget it here. Returns whether Proton
+/// ended it: offline, the session stays valid on Proton's side until it
+/// expires or is signed out from the account's security settings.
+///
+/// Before this, signing out only deleted the keyring entry. The tokens stayed
+/// valid on Proton, so a copy of them taken from this machine still worked.
+///
+/// The local half is best effort; an absent entry is not an error.
+pub fn logout() -> Result<bool> {
+    let ended = end_server_session();
     // The persisted entity cache describes the account being logged out of. It
     // is encrypted under a key derived from that account's passphrases, but
     // leaving it behind would also mean the next account inherits a store it can
@@ -539,7 +590,7 @@ pub fn logout() -> Result<()> {
     }
     let _ = kernelkey::UNSAVED_TOKENS.clear();
     match keyring_entry()?.delete_credential() {
-        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(ended),
         Err(e) => Err(e.into()),
     }
 }

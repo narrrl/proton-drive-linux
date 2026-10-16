@@ -1591,6 +1591,10 @@ pub struct RedateSummary {
     /// name implies)` — what a dry run is read for.
     #[serde(default)]
     pub samples: Vec<(String, i64, i64)>,
+    /// Why the run as a whole failed, when it did. The counts are then
+    /// empty: the run never got to the photos.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// How a Google Photos Takeout import is going, or how the last one ended
@@ -1620,6 +1624,10 @@ pub struct ImportSummary {
     pub bytes: u64,
     /// True when the run stopped early because it was cancelled.
     pub cancelled: bool,
+    /// Why the run as a whole failed, when it did, such as an archive that
+    /// is not a zip. The counts are then empty.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// One album in a [`Response::Albums`] listing.

@@ -15,7 +15,6 @@ mod thumbs;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
 
 use adw::prelude::*;
 use gtk4::{gdk, gio, glib};
@@ -24,7 +23,7 @@ use pdfs_core::config::AppDirs;
 use pdfs_core::control::{Request, Response, SearchFilters, SearchHit, SearchSource};
 use pdfs_core::opener::{self, OpenWith};
 
-use crate::activation::{DriveActivation, drive_activation, mounted_or_relative, mounted_target};
+use crate::activation::{DriveActivation, drive_activation, mounted_or_relative, present_within};
 use crate::compat::{Spinner, spinner};
 use crate::theme::set_proton_theme;
 use crate::{
@@ -37,10 +36,6 @@ use thumbs::Thumbs;
 
 /// Recent files shown above the pinned ones while the query is empty.
 const RECENT_LIMIT: usize = 8;
-
-/// How long opening waits for the mount to answer whether it has a file. A
-/// frozen mount must not freeze the launcher; the daemon is asked instead.
-const STAT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The titled groups of the result list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,22 +511,11 @@ pub(crate) fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     Some(ui)
 }
 
-/// Whether the mount has `hit`, asked on a worker thread and given up on
-/// after [`STAT_TIMEOUT`]. `None` means "not there" or "no answer"; either
-/// way the daemon is the fallback.
+/// Whether the mount has `hit`, without blocking the window
+/// ([`present_within`]). `None` means "not there" or "no answer"; either way
+/// the daemon is the fallback.
 async fn mounted_target_within(mountpoint: PathBuf, hit: SearchHit) -> Option<PathBuf> {
-    let (tx, rx) = async_channel::bounded(1);
-    std::thread::spawn(move || {
-        let _ = tx.send_blocking(mounted_target(&mountpoint, &hit));
-    });
-    match glib::future_with_timeout(STAT_TIMEOUT, rx.recv()).await {
-        Ok(Ok(target)) => target,
-        Ok(Err(_)) => None,
-        Err(_) => {
-            tracing::warn!("the mount did not answer in time; opening through the daemon");
-            None
-        }
-    }
+    present_within(mounted_or_relative(&mountpoint, &hit)).await
 }
 
 impl Ui {

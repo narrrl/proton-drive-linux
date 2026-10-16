@@ -98,6 +98,8 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
         .title(gettext("Location"))
         .subtitle("—")
         .subtitle_lines(3)
+        // A folder path, which may hold `&` or `<`.
+        .use_markup(false)
         .build();
     path_row.add_css_class("property");
     props.add(&size_row);

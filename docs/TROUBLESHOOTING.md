@@ -97,7 +97,15 @@ this block, 5003 is a release Proton no longer accepts.
 
 **Sign-in works but is forgotten after a restart** — no Secret Service provider is running, or its
 keyring is locked. Install and unlock GNOME Keyring, KWallet or KeePassXC (with Secret Service
-enabled). `pdfs diagnose` shows `keyring session` as failing in that case.
+enabled). `pdfs diagnose` shows `keyring session` as failing in that case. When the app finds
+a saved sign-in it cannot read, it says so above the sign-in form and opens on its own once the
+keyring is unlocked. You don't have to sign in again.
+
+**Asked for the mailbox password after every reboot** — the account has a separate mailbox
+password (two-password mode). Such accounts are locked by default: the unlock lasts until you log
+out or restart. To stay unlocked, turn on **Keep unlocked on this computer** in the unlock dialog,
+or run `pdfs unlock --remember`. Either one stores the unlock in the system keyring.
+[SECURITY_MODEL.md](SECURITY_MODEL.md) explains what that trades away.
 
 ## The Proton Drive folder
 

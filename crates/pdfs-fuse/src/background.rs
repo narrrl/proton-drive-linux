@@ -723,16 +723,24 @@ fn scan_local_once(
     // has seen and stays indeterminate.
     let job = transfers.begin_background_job("Indexing this computer");
     job.detail("Scanning your files");
+    let mut failed = false;
     let walked = localindex::scan(&[home], &excludes, |batch| {
         if let Err(e) = db.local_upsert_batch(generation, &batch) {
             warn!(error = %e, "local index: batch write failed");
+            failed = true;
         }
     });
 
-    // Prune what this scan did not see and rebuild the FTS index over the rest,
-    // even if some batches failed — a partial index still beats none.
+    // Prune what this scan did not see, unless it did not see everything:
+    // a path it never reached, or one whose batch failed to write, is not a
+    // path that is gone (`docs/BUGS.md` B217).
     job.detail("Building the search index");
-    match db.local_finish_scan(generation, now_secs()) {
+    let finished = if failed || walked >= localindex::MAX_ENTRIES {
+        db.local_finish_partial_scan(now_secs())
+    } else {
+        db.local_finish_scan(generation, now_secs())
+    };
+    match finished {
         Ok(indexed) => info!(
             walked,
             indexed,

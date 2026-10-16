@@ -389,13 +389,7 @@ impl Core {
                 // A name a change of ours is about to free is a wait, not a
                 // failure: the trash or rename holding it lands in moments.
                 let held = waits_for_name(e.as_ref());
-                let backoff = if held {
-                    DRAIN_BACKOFF_MIN
-                } else {
-                    DRAIN_BACKOFF_MIN
-                        .saturating_mul(1u32 << attempts.min(6))
-                        .min(DRAIN_BACKOFF_MAX)
-                };
+                let backoff = drain_backoff(attempts, held, op.id);
                 warn!(uid = %op.uid, attempts, error = %err_str, "pending upload failed; will retry");
                 if let Err(e) = self.db.record_attempt_failure(
                     op.id,
@@ -1118,7 +1112,7 @@ impl Core {
             _ => None,
         };
         let sent = self.create_sent_digests(op.id, current);
-        Ok(adoptable(is_dir, &twin, op.created_at, &sent).then_some(twin.uid))
+        Ok(adoptable(is_dir, &twin, self.first_sent(op), &sent).then_some(twin.uid))
     }
 
     /// Record the name the remote actually gave a node, after a conflict forced
@@ -1513,8 +1507,10 @@ impl Core {
             .as_deref()
             .is_some_and(|sha| holds_bytes(&twin, sha));
         let sent = self.create_sent_digests(op.id, current);
-        Ok(adoptable(op.kind == OP_MKDIR, &twin, op.created_at, &sent)
-            .then_some((twin.uid, holds_blob)))
+        Ok(
+            adoptable(op.kind == OP_MKDIR, &twin, self.first_sent(op), &sent)
+                .then_some((twin.uid, holds_blob)),
+        )
     }
 
     /// The SHA-1s of the bytes queued create `id` may have made its file with:
@@ -1529,6 +1525,22 @@ impl Core {
         sent
     }
 
+    /// When create `op` first went out, which is the earliest a node its lost
+    /// answer left can have been made. An op queued offline may wait for days
+    /// before that; measured from when it was queued, the adoption window let
+    /// it take a node another device made in the meantime. Ops sent before the
+    /// time was recorded fall back to when they were queued.
+    fn first_sent(&self, op: &PendingOp) -> i64 {
+        match self.db.create_first_sent(op.id) {
+            Ok(Some(at)) => at.max(op.created_at),
+            Ok(None) => op.created_at,
+            Err(e) => {
+                warn!(id = op.id, error = %e, "reading when a queued create was sent failed");
+                op.created_at
+            }
+        }
+    }
+
     /// Make one queued `create`/`mkdir` real under a given name, and hand back
     /// the API's own error so the caller can tell a name clash from a failure.
     ///
@@ -1541,7 +1553,7 @@ impl Core {
         name: &str,
     ) -> Result<NodeUid, Box<dyn std::error::Error>> {
         self.db
-            .note_create_target(op.id, &parent.to_string(), name)?;
+            .note_create_target(op.id, &parent.to_string(), name, now_millis())?;
         match op.kind == OP_MKDIR {
             true => Ok(self.block_on_bounded(self.drive.create_folder(
                 parent,
@@ -1586,7 +1598,7 @@ impl Core {
             .begin(name, op.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
         let uid = self.block_on_within(
-            link::upload_deadline(meta.len),
+            link::upload_deadline(meta.len, self.transfers.upload_cap()),
             self.drive.upload_file_from(
                 parent,
                 name,
@@ -1983,7 +1995,7 @@ impl Core {
                 .begin(&alt, meta.uid.clone(), TransferDirection::Upload, meta.len);
         let reader = CountingReader::new(File::open(blob)?, &guard);
         self.block_on_within(
-            link::upload_deadline(meta.len),
+            link::upload_deadline(meta.len, self.transfers.upload_cap()),
             self.drive.upload_file_from(
                 &parent,
                 &alt,
@@ -2236,7 +2248,7 @@ impl Core {
             .clone()
             .ok_or("pending op has no staged blob")?;
         let blob = PathBuf::from(blob);
-        let meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
+        let mut meta: StagedWrite = serde_json::from_str(op.meta_json.as_deref().unwrap_or(""))?;
         let uid = parse_node_uid(&meta.uid).ok_or("staged write has an unparseable uid")?;
 
         if let Some(reason) = self.revision_conflict(&uid, &meta, &blob)? {
@@ -2275,6 +2287,22 @@ impl Core {
                 &written,
             )
             .map_err(|e| self.errno_error(e, "gap-fill from base failed"))?;
+            // The blob is whole now. Recorded, so that a retry after a lost
+            // answer can match these bytes against the server's revision
+            // (`revision_conflict`) instead of forking a conflict copy of the
+            // user's own write.
+            meta.complete = true;
+            match serde_json::to_string(&meta) {
+                Ok(json) => {
+                    let path = op.blob_path.as_deref().unwrap_or_default();
+                    if let Err(e) = self.db.update_op_meta_for_blob(op.id, path, &json) {
+                        warn!(%uid, error = %e,
+                              "recording a gap-filled blob as whole failed; \
+                               a lost answer may land it as a conflict copy");
+                    }
+                }
+                Err(e) => warn!(%uid, error = %e, "serializing a gap-filled sidecar failed"),
+            }
         }
 
         let name = self.node_name(&uid);
@@ -2295,7 +2323,7 @@ impl Core {
         let reader = CountingReader::new(File::open(&blob)?, &guard).with_cancel(cancel.flag());
         let started = Instant::now();
         let sent = self.block_on_within(
-            link::upload_deadline(meta.len),
+            link::upload_deadline(meta.len, self.transfers.upload_cap()),
             self.drive
                 .upload_new_revision_from(&uid, reader, meta.len as i64, thumbnails, None),
         );
@@ -2753,24 +2781,43 @@ fn waits_for_name(e: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(e), |e| e.source()).any(|e| e.is::<NameHeld>())
 }
 
+/// How long an op waits after its `attempts`-th failure: doubling from
+/// [`DRAIN_BACKOFF_MIN`] up to [`DRAIN_BACKOFF_MAX`], plus up to a fifth more,
+/// different for each op (`seed`), so that ops that failed together are not
+/// all retried in the same second. One that waits for a name (`held`) waits
+/// the minimum.
+///
+/// The doubling stopped at 2^6, 128 s, so the maximum was never reached.
+fn drain_backoff(attempts: i64, held: bool, seed: i64) -> Duration {
+    if held {
+        return DRAIN_BACKOFF_MIN;
+    }
+    let base = DRAIN_BACKOFF_MIN
+        .saturating_mul(1u32 << attempts.clamp(0, 8))
+        .min(DRAIN_BACKOFF_MAX);
+    // A cheap, stable spread: the same op and attempt always wait the same.
+    let spread = (seed.wrapping_mul(0x9E37_79B9).wrapping_add(attempts) as u64 % 21) as u32;
+    base + base * spread / 100
+}
+
 /// How many attempts an op waits for a rename or a create on the wire to free
 /// the name it wants. Two files swapping names each wait for the other, so the
 /// wait has to end; a conflict name ends it.
 const NAME_HOLD_ATTEMPTS: i64 = 4;
 
-/// How much older than its op a remote node may be and still be the one an
-/// unanswered call made. The op is queued the moment the call gives up, so the
-/// node is at most one call's deadline older; the rest is clock skew between
-/// this machine and Proton.
+/// How much older than its op's first send a remote node may be and still be
+/// the one an unanswered call made. The node is made during that call, so it
+/// is at most one call's deadline older; the rest is clock skew between this
+/// machine and Proton.
 const ADOPT_WINDOW_MS: i64 = 2 * 60 * 1000;
 
 /// Whether `twin`, found holding the name a queued create wants, is the node an
-/// earlier, unanswered attempt at that create made: the same kind, created
-/// around when the op was queued, and for a file still empty, as the mount's
+/// earlier, unanswered attempt at that create made: the same kind, created no
+/// earlier than around when the op was first sent (`first_sent_ms`), and for a file still empty, as the mount's
 /// create leaves it, or holding exactly bytes the op uploaded, whose SHA-1 is
 /// one of `sent`.
-fn adoptable(is_dir: bool, twin: &Node, op_created_ms: i64, sent: &[String]) -> bool {
-    if twin.creation_time.saturating_mul(1000) < op_created_ms - ADOPT_WINDOW_MS {
+fn adoptable(is_dir: bool, twin: &Node, first_sent_ms: i64, sent: &[String]) -> bool {
+    if twin.creation_time.saturating_mul(1000) < first_sent_ms - ADOPT_WINDOW_MS {
         return false;
     }
     match &twin.kind {
@@ -3350,6 +3397,22 @@ mod tests {
             direct_role: None,
             share_id: None,
         }
+    }
+
+    #[test]
+    fn a_failing_op_backs_off_to_the_maximum_with_a_spread() {
+        let at = |attempts| drain_backoff(attempts, false, 7);
+        assert!(at(1) >= DRAIN_BACKOFF_MIN * 2);
+        assert!(at(2) > at(1));
+        // Reached, which the doubling capped at 2^6 never did.
+        assert!(at(8) >= DRAIN_BACKOFF_MAX);
+        assert!(at(30) <= DRAIN_BACKOFF_MAX + DRAIN_BACKOFF_MAX / 5);
+        // Ops that failed together do not all come back together.
+        let waits: std::collections::HashSet<_> =
+            (1..=20).map(|id| drain_backoff(8, false, id)).collect();
+        assert!(waits.len() > 5, "{waits:?}");
+        // A wait for a name stays short however often it repeats.
+        assert_eq!(drain_backoff(30, true, 7), DRAIN_BACKOFF_MIN);
     }
 
     #[test]

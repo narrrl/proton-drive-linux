@@ -188,15 +188,16 @@ Before you shut down a computer for good, check that nothing is waiting: see
 
 When the same file changed on this computer and somewhere else since the last sync, neither side
 is thrown away. The local version is kept as a copy named like
-`report (sync-conflict 1759068180).odt`, where the number is the time of the conflict in seconds
-since 1970, and the remote version takes the original name.
+`report (sync-conflict laptop 1759068180).odt`, where `laptop` is the name of the computer that
+made the copy and the number is the time of the conflict in seconds since 1970. The remote
+version takes the original name. Copies made before 3.5.0 have no computer name.
 
 Conflicts appear under **Sync → Overview → Needs attention** and in `pdfs conflicts`. For each
 one, keep the original, keep the copy, or keep both under a new name:
 
 ```bash
 pdfs conflicts
-pdfs conflicts resolve "Documents/report (sync-conflict 1759068180).odt" --keep copy
+pdfs conflicts resolve "Documents/report (sync-conflict laptop 1759068180).odt" --keep copy
 ```
 
 The version you do not keep goes to the Trash, so a wrong choice can be undone.
@@ -284,11 +285,30 @@ Proton Drive keeps earlier versions of every file. **Details → Versions…** i
   back folders that are backed up under it but not synced here yet.
 - **Another computer** can be browsed read-only in the same list or grid as My files, and
   **Restore to This Computer…** downloads its folders here.
+- **Sync With This Computer…** makes this computer sync the same folders as another one, for
+  example a desktop and a laptop. Both keep the folders in step: a change or a deletion on one
+  reaches the other. See [Syncing several computers](#syncing-several-computers).
 - **Continue This Backup Here…** makes this computer take over another computer's backup, for
   example after reinstalling or replacing a machine. See [RECOVERY.md](RECOVERY.md).
 - **Move to This Computer…** moves another computer's folders into this computer's backup, for
   example when you switch from Windows to Linux, and then offers them for syncing here. The other
   computer stays in the list, without those folders.
+
+### Syncing several computers
+
+Two or more computers can sync the same folders through one backup in Proton Drive.
+
+1. Sync the folders on the first computer as usual.
+2. On the second computer, open **Computers**, open the menu of the first computer and choose
+   **Sync With This Computer…**. From a terminal: `pdfs devices join UID`, with the UID from
+   `pdfs devices list`.
+3. Choose which of its folders to sync here and where, as in a restore.
+
+From then on, both computers sync into that backup. A folder you add later on either computer
+lands there too, and a folder with the same name joins the one already there. An edit on one
+computer reaches the other within about two minutes. When both computers change the same file in
+that time, each keeps the other's version under the original name and its own as a conflict copy
+named after it. Folders that were synced here before joining stay in this computer's own backup.
 
 ## Search launcher
 

@@ -1,4 +1,4 @@
-use crate::activation::{DriveActivation, drive_activation, mounted_path, mounted_target_rel};
+use crate::activation::{DriveActivation, drive_activation, mounted_path, present_within};
 use crate::*;
 
 pub(crate) struct BrowserState {
@@ -376,7 +376,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     bulk_box.append(&bulk_clear);
     let bulk = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideDown)
-        .child(&bulk_box)
+        .child(&scroll_sideways(&bulk_box))
         .build();
 
     // The status bar: contextual text (stretch 1), then the icon-size slider.
@@ -500,7 +500,9 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
 pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &str, retry: bool) {
     ui.browser.status.set_icon_name(Some(icon));
     ui.browser.status.set_title(title);
-    ui.browser.status.set_description(Some(description));
+    ui.browser
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.browser.retry.set_visible(retry);
     // Only the empty-folder state offers a way to fill the folder; every other
     // status (loading, offline, error) turns them back off.
@@ -981,28 +983,27 @@ pub(crate) fn background_context_menu(ui: &Rc<Ui>) -> ActionMenu {
 pub(crate) fn open_entry_with(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
     let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
-    let Some(path) = mounted_target_rel(&mountpoint, &rel) else {
-        toast_error(
-            ui,
-            &gettext("Couldn't open file"),
-            &gettext("Open With needs the Proton Drive service to be running."),
-        );
-        return;
-    };
-    let launcher = gtk4::FileLauncher::new(Some(&gio::File::for_path(path)));
-    launcher.set_always_ask(true);
     let ui = ui.clone();
-    launcher.launch(
-        ui_window(&ui).as_ref(),
-        gio::Cancellable::NONE,
-        move |result| {
+    glib::spawn_future_local(async move {
+        let Some(path) = present_within(mounted_path(&mountpoint, &rel)).await else {
+            toast_error(
+                &ui,
+                &gettext("Couldn't open file"),
+                &gettext("Open With needs the Proton Drive service to be running."),
+            );
+            return;
+        };
+        let launcher = gtk4::FileLauncher::new(Some(&gio::File::for_path(path)));
+        launcher.set_always_ask(true);
+        let window = ui_window(&ui);
+        launcher.launch(window.as_ref(), gio::Cancellable::NONE, move |result| {
             if let Err(e) = result
                 && !e.matches(gtk4::DialogError::Dismissed)
             {
                 toast_error(&ui, &gettext("Couldn't open file"), &e.to_string());
             }
-        },
-    );
+        });
+    });
 }
 
 /// Copy the entry's public link, when it has one this client can read the
@@ -1110,27 +1111,29 @@ pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
 /// [`mounted_target`](crate::activation::mounted_target).
 pub(crate) fn download_and_open(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
-    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
-    if let Some(path) = mounted_target_rel(&mountpoint, &rel) {
-        open_path(&path.to_string_lossy());
-        return;
-    }
-    // Ignore a repeat activation of a file already downloading, so an impatient
-    // double-click doesn't kick off a second round-trip.
+    // Ignore a repeat activation of a file already opening, so an impatient
+    // double-click doesn't open it twice or kick off a second round-trip.
     if !ui.opening.borrow_mut().insert(rel.clone()) {
         return;
     }
-    ui.busy_begin();
-    let name = entry.name.clone();
-    let rx = spawn_request(
-        ui.dirs.control_socket(),
-        Request::OpenFile {
-            path: rel.clone(),
-            uid: Some(entry.uid.clone()),
-        },
-    );
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    let (name, uid) = (entry.name.clone(), entry.uid.clone());
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        // Asked off the main thread: a mount that hangs used to hang the app.
+        if let Some(path) = present_within(mounted_path(&mountpoint, &rel)).await {
+            ui.opening.borrow_mut().remove(&rel);
+            open_path(&path.to_string_lossy());
+            return;
+        }
+        ui.busy_begin();
+        let rx = spawn_request(
+            ui.dirs.control_socket(),
+            Request::OpenFile {
+                path: rel.clone(),
+                uid: Some(uid),
+            },
+        );
         let result = rx.recv().await;
         ui.busy_end();
         ui.opening.borrow_mut().remove(&rel);

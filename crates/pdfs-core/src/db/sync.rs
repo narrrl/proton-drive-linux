@@ -45,6 +45,12 @@ pub struct StoredSyncEntry {
     pub local_mtime_ns: Option<i64>,
     pub remote_rev: Option<String>,
     pub remote_hash: Option<String>,
+    /// The id of the remote revision this row was synced at. A mirror upload
+    /// checks it before it supersedes what Drive holds, because another client
+    /// may have committed a revision since (`docs/BUGS.md` B249). `None` on a
+    /// row written before schema 44, or by a pass that did not learn it; the
+    /// check then falls back to `remote_rev` and `remote_hash`.
+    pub remote_revision_id: Option<String>,
 }
 
 impl Db {
@@ -188,7 +194,7 @@ impl Db {
         let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash,
-                    local_mtime_ns
+                    local_mtime_ns, remote_revision_id
              FROM sync_entry WHERE folder_id = ?1",
         )?;
         let rows = stmt.query_map(params![folder_id], |r| {
@@ -200,6 +206,7 @@ impl Db {
                 remote_rev: r.get(4)?,
                 remote_hash: r.get(5)?,
                 local_mtime_ns: r.get(6)?,
+                remote_revision_id: r.get(7)?,
             })
         })?;
         let mut map = HashMap::new();
@@ -238,15 +245,16 @@ impl Db {
         conn.execute(
             "INSERT INTO sync_entry
                (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev,
-                remote_hash, local_mtime_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                remote_hash, local_mtime_ns, remote_revision_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(folder_id, rel_path) DO UPDATE SET
-               remote_uid     = excluded.remote_uid,
-               local_mtime    = excluded.local_mtime,
-               local_size     = excluded.local_size,
-               remote_rev     = excluded.remote_rev,
-               remote_hash    = excluded.remote_hash,
-               local_mtime_ns = excluded.local_mtime_ns",
+               remote_uid         = excluded.remote_uid,
+               local_mtime        = excluded.local_mtime,
+               local_size         = excluded.local_size,
+               remote_rev         = excluded.remote_rev,
+               remote_hash        = excluded.remote_hash,
+               local_mtime_ns     = excluded.local_mtime_ns,
+               remote_revision_id = excluded.remote_revision_id",
             params![
                 folder_id,
                 e.rel_path,
@@ -256,6 +264,7 @@ impl Db {
                 e.remote_rev,
                 e.remote_hash,
                 e.local_mtime_ns,
+                e.remote_revision_id,
             ],
         )?;
         Ok(())
@@ -306,7 +315,7 @@ impl Db {
         {
             let mut select = tx.prepare(
                 "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash,
-                        local_mtime_ns
+                        local_mtime_ns, remote_revision_id
                    FROM sync_entry
                   WHERE folder_id = ?1
                     AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
@@ -321,6 +330,7 @@ impl Db {
                         remote_rev: r.get(4)?,
                         remote_hash: r.get(5)?,
                         local_mtime_ns: r.get(6)?,
+                        remote_revision_id: r.get(7)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -332,8 +342,8 @@ impl Db {
             let mut insert = tx.prepare(
                 "INSERT OR REPLACE INTO sync_entry
                    (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev,
-                    remote_hash, local_mtime_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    remote_hash, local_mtime_ns, remote_revision_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for row in rows {
                 let rel = format!("{to_rel}{}", &row.rel_path[from_rel.len()..]);
@@ -346,6 +356,7 @@ impl Db {
                     row.remote_rev,
                     row.remote_hash,
                     row.local_mtime_ns,
+                    row.remote_revision_id,
                 ])?;
             }
         }

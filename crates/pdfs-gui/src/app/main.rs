@@ -69,7 +69,7 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 
-use pdfs_core::config::{AppDirs, FileSort, FilesView};
+use pdfs_core::config::{AppDirs, FileSort, FilesView, WindowState};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
@@ -130,8 +130,12 @@ struct Ui {
     /// the page stack; [`sync_sidebar`] mirrors navigation that starts elsewhere.
     sidebar: gtk4::ListBox,
     /// The sidebar/content split. Collapsed while signed out, so the login page
-    /// owns the whole window and no destination is reachable without a session.
+    /// owns the whole window and no destination is reachable without a session,
+    /// and while the window is [`narrow`](Self::narrow).
     nav: adw::NavigationSplitView,
+    /// The window is too narrow for the sidebar beside a page, so the two take
+    /// turns. Set by the narrow breakpoint; [`refresh`] reads it.
+    narrow: Cell<bool>,
     /// Shared thumbnails for ordinary image files outside the Photos gallery.
     /// One cache and request queue serves Files, search, Shared and Trash, so
     /// the same image is downloaded and decoded only once.
@@ -297,7 +301,10 @@ fn present_window(app: &adw::Application) {
 /// Spawn the tray icon process in the background.
 pub(crate) fn spawn_tray() {
     match Command::new("pdfs-tray").spawn() {
-        Ok(_) => tracing::info!("spawned `pdfs-tray`"),
+        Ok(child) => {
+            tracing::info!("spawned `pdfs-tray`");
+            pdfs_core::opener::reap(child);
+        }
         Err(e) => tracing::error!("failed to spawn `pdfs-tray`: {e}"),
     }
 }
@@ -318,7 +325,9 @@ fn build_window(app: &adw::Application) {
         tracing::warn!("cannot create the app's directories: {e}");
     }
 
-    let stack = adw::ViewStack::new();
+    // Not homogeneous: each page sets the window's minimum width only while it
+    // is shown, so the widest page does not hold every other one wide.
+    let stack = adw::ViewStack::builder().hhomogeneous(false).build();
     let (login_page, login_widgets) = build_login_page();
     let main_widgets = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
@@ -336,8 +345,12 @@ fn build_window(app: &adw::Application) {
     login_frame.add_top_bar(&{
         let header = adw::HeaderBar::new();
         header.set_show_title(false);
+        // The split is collapsed while signed out; going "back" would only
+        // uncover a sidebar with nowhere to go.
+        header.set_show_back_button(false);
         header
     });
+    login_frame.add_top_bar(&login_widgets.keyring_banner);
     login_frame.set_content(Some(&login_page));
     stack.add_named(&login_frame, Some("login"));
     stack.add_named(&browser_page, Some("browser"));
@@ -365,6 +378,8 @@ fn build_window(app: &adw::Application) {
         .content(&content_page)
         .min_sidebar_width(200.0)
         .max_sidebar_width(240.0)
+        // A narrow window opens on the page, not the sidebar.
+        .show_content(true)
         .build();
 
     // Toasts float over everything, so a report from a background action reaches
@@ -372,17 +387,22 @@ fn build_window(app: &adw::Application) {
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&split));
 
+    let (startup_session, keyring_error) = match read_session() {
+        Ok(session) => (session, None),
+        Err(e) => (None, Some(e)),
+    };
     let ui = Rc::new(Ui {
         dirs,
         stack: stack.clone(),
         toasts: toasts.clone(),
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
-        session: RefCell::new(auth::load().ok()),
+        session: RefCell::new(startup_session),
         unlock_offered: Cell::new(false),
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
         nav: split.clone(),
+        narrow: Cell::new(false),
         file_thumbs: FileThumbnailState::new(),
         login: login_widgets,
         status: StatusState {
@@ -636,6 +656,9 @@ fn build_window(app: &adw::Application) {
         },
     });
     wire_login(&ui);
+    if let Some(e) = keyring_error {
+        keyring_unreadable(&ui, &e);
+    }
     let ui_status = ui.clone();
     main_widgets
         .status_button
@@ -713,13 +736,18 @@ fn build_window(app: &adw::Application) {
         }
     });
 
+    let saved = ui.dirs.load_config().window.usable();
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Proton Drive")
-        .default_width(980)
-        .default_height(680)
+        .default_width(saved.width)
+        .default_height(saved.height)
+        .maximized(saved.maximized)
+        .width_request(WindowState::MIN_WIDTH)
+        .height_request(WindowState::MIN_HEIGHT)
         .content(&toasts)
         .build();
+    remember_window_state(&ui, app, &window);
     // A wide window docks the details pane beside the files instead of laying it
     // over them.
     let wide = adw::Breakpoint::new(
@@ -727,6 +755,18 @@ fn build_window(app: &adw::Application) {
     );
     wide.add_setter(&ui.browser.split, "collapsed", Some(&false.to_value()));
     window.add_breakpoint(wide);
+    // A narrow window shows the sidebar and the page in turn, so every header
+    // bar keeps room for the window buttons. Signals rather than a setter:
+    // `refresh` decides the collapse while signed out, and would undo one.
+    let narrow = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 760sp").expect("static breakpoint"),
+    );
+    narrow.add_setter(&ui.browser.search, "width-chars", Some(&8.to_value()));
+    let ui_narrow = ui.clone();
+    narrow.connect_apply(move |_| set_narrow(&ui_narrow, true));
+    let ui_wide = ui.clone();
+    narrow.connect_unapply(move |_| set_narrow(&ui_wide, false));
+    window.add_breakpoint(narrow);
     install_shortcuts(&ui, &window);
     install_window_actions(&ui, &window);
     install_launch_actions(&ui, app, &window);
@@ -738,6 +778,51 @@ fn build_window(app: &adw::Application) {
     follow_daemon(&ui, &window);
 
     window.present();
+}
+
+/// Follow the narrow breakpoint. While signed out the login page keeps the
+/// split collapsed whatever the width.
+fn set_narrow(ui: &Ui, narrow: bool) {
+    ui.narrow.set(narrow);
+    if ui.session.borrow().is_some() {
+        ui.nav.set_collapsed(narrow);
+    }
+}
+
+/// Save the window's size when it closes, and when the app quits with the
+/// window still open (Ctrl+Q, the tray's Quit), which never asks it to close.
+fn remember_window_state(ui: &Rc<Ui>, app: &adw::Application, window: &adw::ApplicationWindow) {
+    let ui_close = ui.clone();
+    window.connect_close_request(move |window| {
+        save_window_state(&ui_close, window);
+        glib::Propagation::Proceed
+    });
+    let ui_quit = ui.clone();
+    let window_quit = window.downgrade();
+    app.connect_shutdown(move |_| {
+        if let Some(window) = window_quit.upgrade() {
+            save_window_state(&ui_quit, &window);
+        }
+    });
+}
+
+/// Write the window's unmaximised size and maximised state to the config, if
+/// either changed. Runs as the window goes away, so a failure is only logged.
+fn save_window_state(ui: &Ui, window: &adw::ApplicationWindow) {
+    let (width, height) = window.default_size();
+    let state = WindowState {
+        width,
+        height,
+        maximized: window.is_maximized(),
+    };
+    let mut config = ui.dirs.load_config();
+    if config.window == state {
+        return;
+    }
+    config.window = state;
+    if let Err(e) = ui.dirs.save_config(&config) {
+        tracing::warn!("cannot save the window size: {e}");
+    }
 }
 
 /// Whether `window` is minimised or otherwise out of sight (another workspace,
@@ -867,6 +952,18 @@ fn set_busy_spinners(visible: bool) {
     });
 }
 
+/// `row` in a frame that scrolls sideways once the window is too narrow for it,
+/// so a row of labelled buttons never sets the window's minimum width.
+fn scroll_sideways(row: &impl IsA<gtk4::Widget>) -> gtk4::ScrolledWindow {
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .child(row)
+        .build()
+}
+
 /// A destination page's frame: its own header bar over the page content, the
 /// way GNOME apps lay a split view out. The title sits in the middle with the
 /// busy spinner beside it; the page packs its actions into the returned header
@@ -928,6 +1025,14 @@ fn wire_sidebar(ui: &Rc<Ui>) {
         let current = ui_row.stack.visible_child_name();
         if current.as_deref().map(destination_of) != Some(*page) {
             ui_row.stack.set_visible_child_name(page);
+        }
+    });
+    // In a narrow window the sidebar covers the page, so picking a row, even
+    // the selected one, has to bring the page forward.
+    let ui_open = ui.clone();
+    ui.sidebar.connect_row_activated(move |_, _| {
+        if ui_open.nav.is_collapsed() {
+            ui_open.nav.set_show_content(true);
         }
     });
 }
@@ -1065,8 +1170,17 @@ pub(crate) fn set_sidebar_badge(ui: &Ui, page: &str, count: u64) {
 /// Show a transient toast. Non-blocking by design: an action's outcome is
 /// reported without stealing focus or forcing a click, so the user can keep
 /// working while a slow upload lands.
+///
+/// A toast's title is Pango markup unless told otherwise. Messages carry file
+/// names and daemon errors, and one with a `&` or `<` in it showed as an empty
+/// toast, so every toast here is plain text.
 fn toast(ui: &Rc<Ui>, message: &str) {
-    ui.toasts.add_toast(adw::Toast::new(message));
+    ui.toasts.add_toast(
+        adw::Toast::builder()
+            .title(message)
+            .use_markup(false)
+            .build(),
+    );
 }
 
 /// Show a toast that offers one follow-up action — an Undo, or a way to the page
@@ -1077,6 +1191,7 @@ fn toast(ui: &Rc<Ui>, message: &str) {
 fn toast_action(ui: &Rc<Ui>, message: &str, label: &str, action: impl Fn(&Rc<Ui>) + 'static) {
     let toast = adw::Toast::builder()
         .title(message)
+        .use_markup(false)
         .button_label(label)
         .timeout(8)
         .build();
@@ -1099,7 +1214,11 @@ fn toast_error(ui: &Rc<Ui>, what: &str, detail: &str) {
         gettext_f("{what}: {detail}", &[("what", what), ("detail", detail)])
     };
     tracing::warn!("{message}");
-    let toast = adw::Toast::builder().title(&message).timeout(6).build();
+    let toast = adw::Toast::builder()
+        .title(&message)
+        .use_markup(false)
+        .timeout(6)
+        .build();
     ui.toasts.add_toast(toast);
 }
 
@@ -1699,9 +1818,12 @@ pub(crate) fn flash_copied(button: &gtk4::Button, icon: &'static str) {
 
 /// Open a local path with the handler the user configured — `xdg-open` unless
 /// `open_with` in `config.json` overrides it for this kind of file.
+///
+/// On a thread of its own: telling a folder from a file is a `stat`, and the
+/// path is often in the mount, which may hang.
 fn open_path(path: &str) {
-    let path = Path::new(path);
-    pdfs_core::opener::open_default(path, path.is_dir());
+    let path = PathBuf::from(path);
+    std::thread::spawn(move || pdfs_core::opener::open_default(&path, path.is_dir()));
 }
 
 /// [`open_path`] for a file the daemon materialised into the content cache,

@@ -255,7 +255,9 @@ not one this daemon sealed itself (`own_sealed_rev` table), the queued bytes are
 conflict copy (`Core::revision_conflict`) next to the remote version. A name taken on Drive by a
 node this machine has not seen lands under a conflict name too. Both go to the activity log.
 
-Conflict copies are named `{stem} (sync-conflict {unix_secs}).{ext}`.
+Conflict copies are named `{stem} (sync-conflict {host} {unix_secs}).{ext}`, where `{host}` is the
+hostname cut down to one token (`conflict_label`). `conflict_base_name` also reads the older form
+without a host.
 
 ### Failures and sync issues
 
@@ -342,6 +344,22 @@ Safety rules:
 - **Ignore rules.** `.pdfsignore` (or `.protonignore`) at the folder root plus `ignore_patterns`
   from `config.json`, in gitignore syntax. Ignoring never deletes.
 
+Another client may write the same folder, such as a second computer syncing into the device. The
+baseline therefore also records the active revision id each file was synced at (schema 44):
+
+- **A new revision is a remote change** even when the link's modification time and the size come
+  out the same.
+- **An upload checks first.** `upload_revision` reads the node and leaves a file whose revision
+  moved since the walk for the next pass, which classifies it as a conflict. A revision committed
+  between that check and the SDK's own revision draft is not caught.
+- **The baseline records what was transferred.** A download records the revision the pass
+  planned to fetch, not a read-back that may already show a newer one. An upload records the
+  read-back only when its SHA-1 is the one sent.
+- **A first sync compares content.** A path present on both sides without a baseline is adopted
+  only when the local SHA-1 matches Drive's digest; otherwise it is a conflict.
+
+Remote changes still reach a mirror only through the 120 s poll.
+
 ### Moves between locations
 
 My files and each online-only folder are separate FUSE sessions, and a mirrored folder has none,
@@ -369,11 +387,17 @@ named like the hostname, else a new one. An adopted uid that no longer exists is
 replaced silently.
 
 The local database does not survive a lost machine, so the daemon backs up its arrangement to
-`<device root>/.proton-drive-linux/profile.json` (`pdfs_core::profile`): each synced folder's
+`<device root>/.proton-drive-linux/profile-<machine id>.json` (`pdfs_core::profile`): each synced folder's
 remote uid, local path and mode, the pins, and the ignore patterns. It is uploaded like any other
 file, so it is end-to-end encrypted. `Core::touch_profile` coalesces bursts of changes into one
 upload. `PROFILE_VERSION` guards the format: a profile from a newer client is refused, not applied
 in part.
+
+The machine id is random and lives in `machine-id` next to `config.json`. Each machine has its
+own file because several computers may sync into one device: `pdfs devices join` and **Sync With
+This Computer…** adopt another computer's device without taking it over. Restore reads every
+profile there, the legacy shared `profile.json` included, and prefers the one with this hostname,
+then the newest (`profile::saved_folder`).
 
 Restore lists the device's folders, proposes a local path from the profile, and on confirmation
 adds a synced folder bound to the remote uid. The download is an ordinary pass against an empty

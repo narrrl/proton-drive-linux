@@ -83,6 +83,46 @@ pub(super) struct RemoteItem {
     pub(super) is_dir: bool,
     pub(super) mtime: i64,
     pub(super) size: i64,
+    /// The active revision's id. The light walk carries it for every file, so
+    /// it is the signal that tells another client's new revision from a link
+    /// merely re-stamped.
+    pub(super) revision: Option<String>,
+    /// The active revision's content SHA-1, read only for files the walk
+    /// enumerated in full (no baseline, or a moved mtime). `None` is never
+    /// proof of anything.
+    pub(super) sha1: Option<String>,
+}
+
+/// What a pass saw of a remote file: the signature its baseline records once
+/// the file is synced, and what an upload checks Drive still holds before it
+/// supersedes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RemoteSeen {
+    pub(super) mtime: i64,
+    pub(super) size: i64,
+    pub(super) revision: Option<String>,
+}
+
+impl RemoteSeen {
+    /// Whether `node` is still the revision this was taken from. The revision
+    /// id decides it when both sides have one; otherwise the modification time
+    /// and size, which is all a baseline row from before schema 44 holds.
+    pub(super) fn still_current(&self, node: &Node) -> bool {
+        match (&self.revision, crate::node_revision_id(node)) {
+            (Some(seen), Some(now)) => *seen == now,
+            _ => (self.mtime, self.size) == remote_file_sig(node),
+        }
+    }
+}
+
+impl From<&RemoteItem> for RemoteSeen {
+    fn from(item: &RemoteItem) -> Self {
+        Self {
+            mtime: item.mtime,
+            size: item.size,
+            revision: item.revision.clone(),
+        }
+    }
 }
 
 /// The result of a reconcile pass: what it moved, how many paths were kept as
@@ -113,7 +153,7 @@ impl Outcome {
             Applied::Uploaded => self.uploaded += 1,
             Applied::Downloaded => self.downloaded += 1,
             Applied::Conflict => self.conflicts += 1,
-            Applied::Vanished => {}
+            Applied::Vanished | Applied::Adopted => {}
         }
     }
 
@@ -157,10 +197,16 @@ pub(super) enum Pending {
     CreateDir { rel: String, parent: NodeUid },
     /// Upload a brand-new local file into `parent`.
     UploadNew { rel: String, parent: NodeUid },
-    /// Upload a changed local file as a new revision of `uid`.
-    UploadRevision { rel: String, uid: NodeUid },
-    /// Download remote `uid` to the local path, stamping `mtime`. `size` is the
-    /// remote's reported size, used as the transfer's expected total.
+    /// Upload a changed local file as a new revision of `uid`, if Drive still
+    /// holds the revision `seen` describes (B249).
+    UploadRevision {
+        rel: String,
+        uid: NodeUid,
+        seen: RemoteSeen,
+    },
+    /// Download remote `uid` to the local path, stamping `seen.mtime`.
+    /// `seen.size` is the remote's reported size, used as the transfer's
+    /// expected total.
     ///
     /// `local` is what the planning walk saw at this path, or `None` if nothing
     /// was there. A download can run for minutes, so the apply step revalidates
@@ -170,16 +216,26 @@ pub(super) enum Pending {
     Download {
         rel: String,
         uid: NodeUid,
-        mtime: i64,
-        size: i64,
+        seen: RemoteSeen,
         local: Option<LocalSig>,
+    },
+    /// First sync of a path present on both sides at the same size, with a
+    /// digest on Drive: hash the local file, and record the baseline if it holds
+    /// the same bytes. A different file of the same size goes the way of
+    /// [`Pending::Conflict`]: two machines syncing one folder must not read as
+    /// in step while they hold different content.
+    Adopt {
+        rel: String,
+        uid: NodeUid,
+        seen: RemoteSeen,
+        sha1: String,
+        local: LocalSig,
     },
     /// Both sides changed: set the local copy aside, then download remote `uid`.
     Conflict {
         rel: String,
         uid: NodeUid,
-        mtime: i64,
-        size: i64,
+        seen: RemoteSeen,
     },
     /// Both sides changed during a [`push pass`](Core::push_pass): upload the local
     /// copy into `parent` under a conflict name, leaving the remote file as it is.
@@ -194,6 +250,7 @@ impl Pending {
             | Pending::UploadNew { rel, .. }
             | Pending::UploadRevision { rel, .. }
             | Pending::Download { rel, .. }
+            | Pending::Adopt { rel, .. }
             | Pending::Conflict { rel, .. }
             | Pending::PushConflict { rel, .. } => rel,
         }
@@ -206,7 +263,9 @@ impl Pending {
             Pending::UploadNew { .. }
             | Pending::UploadRevision { .. }
             | Pending::PushConflict { .. } => ActivityKind::Upload,
-            Pending::Download { .. } | Pending::Conflict { .. } => ActivityKind::Download,
+            Pending::Download { .. } | Pending::Adopt { .. } | Pending::Conflict { .. } => {
+                ActivityKind::Download
+            }
         }
     }
 
@@ -217,6 +276,7 @@ impl Pending {
             Pending::UploadNew { .. } => "new file",
             Pending::UploadRevision { .. } => "new version",
             Pending::Download { .. } => "from Drive",
+            Pending::Adopt { .. } => "already the same on Drive",
             Pending::Conflict { .. } => "local changes kept as a conflict copy",
             Pending::PushConflict { .. } => "local changes uploaded as a conflict copy",
         }

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pdfs_core::control::{ActivityKind, ImportSummary, TransferDirection};
 use pdfs_core::takeout::{Bucket, TakeoutPhoto, TakeoutScan, scan_archives};
@@ -36,6 +36,7 @@ use sha1::{Digest, Sha1};
 use tracing::{info, warn};
 
 use super::Core;
+use crate::photos::can_make_thumbnail;
 use crate::transfers::CountingReader;
 
 /// The one import this daemon may be running, and how the last one ended.
@@ -136,6 +137,30 @@ fn read_entry<R>(
 }
 
 impl Core {
+    /// Copy archive entry `entry` into the thumbnail staging folder and return
+    /// its path. The caller removes it.
+    fn stage_takeout_entry(
+        &self,
+        archive: &mut zip::ZipArchive<std::io::BufReader<std::fs::File>>,
+        entry: &str,
+    ) -> CoreResult<PathBuf> {
+        static STAGED: AtomicU64 = AtomicU64::new(0);
+        let path = self.cache.raw_thumbnail_staging_dir().join(format!(
+            "takeout-{}-{}",
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed)
+        ));
+        let copied = read_entry(archive, entry, |reader| {
+            let mut file = std::fs::File::create(&path)?;
+            std::io::copy(reader, &mut file)
+        })?;
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&path);
+            return Err(CoreError::internal(format!("copy {entry}: {e}")));
+        }
+        Ok(path)
+    }
+
     /// Import Google Photos Takeout archives. Blocking; run on its own thread.
     ///
     /// `cancel` stops the run at the next photo boundary — an upload already on
@@ -321,18 +346,65 @@ impl Core {
                     capture_time: photo.capture_time,
                     ..Default::default()
                 };
-                let uploaded = read_entry(&mut archive, &photo.entry, |reader| {
-                    let counting = CountingReader::new(reader, &guard);
-                    self.rt.block_on(photos.upload_photo_from(
-                        &photo.name,
-                        &photo.media_type,
-                        counting,
-                        photo.size as i64,
-                        Vec::new(),
-                        metadata,
-                        false,
-                    ))
-                });
+                // A thumbnail is made from a file, so a photo that can have one
+                // is copied out of the archive first and uploaded from the copy.
+                // Without one, Proton's apps show a blank tile until they make
+                // their own.
+                let staged = can_make_thumbnail(&photo.name, photo.size)
+                    .then(|| self.stage_takeout_entry(&mut archive, &photo.entry))
+                    .and_then(|staged| {
+                        staged
+                            .inspect_err(|e| {
+                                warn!(name = photo.name, error = %e,
+                                      "copying a takeout photo out failed; uploading it without a thumbnail")
+                            })
+                            .ok()
+                    });
+                let uploaded = match &staged {
+                    Some(path) => {
+                        let thumbnails = self.upload_thumbnails(path, &photo.name);
+                        // No sidecar and no date in the name: the photo's own
+                        // EXIF, before Drive files it under today.
+                        let metadata = PhotoUploadMetadata {
+                            capture_time: metadata
+                                .capture_time
+                                .or_else(|| pdfs_core::exiftime::capture_time_of(path)),
+                            ..metadata
+                        };
+                        std::fs::File::open(path)
+                            .map_err(|e| {
+                                CoreError::internal(format!("open {}: {e}", path.display()))
+                            })
+                            .map(|file| {
+                                let counting =
+                                    CountingReader::new(std::io::BufReader::new(file), &guard);
+                                self.rt.block_on(photos.upload_photo_from(
+                                    &photo.name,
+                                    &photo.media_type,
+                                    counting,
+                                    photo.size as i64,
+                                    thumbnails,
+                                    metadata,
+                                    false,
+                                ))
+                            })
+                    }
+                    None => read_entry(&mut archive, &photo.entry, |reader| {
+                        let counting = CountingReader::new(reader, &guard);
+                        self.rt.block_on(photos.upload_photo_from(
+                            &photo.name,
+                            &photo.media_type,
+                            counting,
+                            photo.size as i64,
+                            Vec::new(),
+                            metadata,
+                            false,
+                        ))
+                    }),
+                };
+                if let Some(path) = staged {
+                    let _ = std::fs::remove_file(path);
+                }
                 drop(guard);
                 job.step();
 
@@ -480,7 +552,15 @@ impl Core {
                 let mut state = IMPORT.lock();
                 state.running = false;
                 state.cancel = None;
-                state.last = outcome.as_ref().ok().cloned();
+                // A failed run is reported too: without it, `--wait` read
+                // "no import has run" and exited as if all was well.
+                state.last = Some(match &outcome {
+                    Ok(summary) => summary.clone(),
+                    Err(e) => ImportSummary {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                });
             }
             match outcome {
                 Ok(summary) => {
@@ -545,7 +625,7 @@ pub(crate) fn sha1_of(reader: &mut (dyn Read + Send)) -> CoreResult<String> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));

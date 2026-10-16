@@ -14,6 +14,7 @@ and where the client keeps its data.
 | Path | Contents |
 |---|---|
 | `~/.config/proton-drive-linux/config.json` | Settings (this page) |
+| `~/.config/proton-drive-linux/machine-id` | A random id for this machine. It names this machine's profile in a computer's backup that several computers may share |
 | `~/.local/state/proton-drive-linux/cache.db` | Metadata database: names, folder tree, sync state, upload queue, photo index |
 | `~/.local/state/proton-drive-linux/sdk_cache.db` | Encrypted cache of Proton Drive metadata. Safe to delete while the service is stopped |
 | `~/.local/state/proton-drive-linux/control.sock` | Socket the app, tray, prompt and CLI use to reach the service |
@@ -61,6 +62,7 @@ fix it.
   "online_map": false,
   "tray_hidden": false,
   "files_view": { "list": true, "sort": "modified", "descending": true, "folders_first": true },
+  "window": { "width": 980, "height": 680, "maximized": false },
   "open_with": {
     "terminal": ["alacritty", "-e"],
     "rules": [{ "match": ["@text"], "command": ["nvim"], "terminal": true }]
@@ -78,7 +80,7 @@ fix it.
 | `upload_limit` | bytes/s | none | General → Network | Shared cap for all uploads. `0` or `null` means none |
 | `download_limit` | bytes/s | none | General → Network | Shared cap for all downloads, reads from the mount included |
 | `ignore_patterns` | list | see below | — | Global ignore rules for synced folders |
-| `device_uid` | string | none | Computers → Continue This Backup Here… | The computer this machine continues. Unset means "match by hostname" |
+| `device_uid` | string | none | Computers → Continue This Backup Here… or Sync With This Computer… | The computer this machine syncs into. Unset means "match by hostname" |
 | `conflict_sweep` | `off` / `report` / `enforce` | `report` | — | See [`conflict_sweep`](#conflict_sweep) |
 | `local_first` | bool | `true` | — | See [`local_first`](#local_first) |
 | `language` | gettext code | system | General → Appearance | Language of the app, tray and prompt, such as `de` or `pt_BR` |
@@ -86,6 +88,7 @@ fix it.
 | `online_map` | bool | `false` | General → Appearance | Street map for Places from OpenFreeMap |
 | `tray_hidden` | bool | `false` | General → Appearance | Hide the tray icon |
 | `files_view` | object | grid, by name | My files view menu | `list`, `sort` (`name`, `size`, `modified`), `descending`, `folders_first` |
+| `window` | object | 980 × 680 | Resizing the app window | `width`, `height` (the unmaximized size), `maximized` |
 | `open_with` | object | `xdg-open` | — | See [`open_with`](#open_with) |
 | `prompt` | object | built-in window | — | See [`prompt`](#prompt) |
 

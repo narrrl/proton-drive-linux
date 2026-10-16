@@ -19,8 +19,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::mounts::MountMode;
 
-/// File name of the profile.
+/// File name of the profile clients before 3.5.0 wrote, one per device.
+///
+/// Read, never written: two computers sharing a device each overwrote the
+/// other's. See [`profile_file_name`].
 pub const PROFILE_FILE_NAME: &str = "profile.json";
+
+/// File name of one machine's profile: `profile-<machine id>.json`.
+///
+/// One per machine, because several computers may sync into one device, and
+/// each describes its own arrangement. A single shared file went to whichever
+/// computer saved last.
+pub fn profile_file_name(machine_id: &str) -> String {
+    format!("profile-{machine_id}.json")
+}
+
+/// Whether `name` is a profile: [`PROFILE_FILE_NAME`] or one machine's
+/// [`profile_file_name`].
+pub fn is_profile_file_name(name: &str) -> bool {
+    name == PROFILE_FILE_NAME
+        || name
+            .strip_prefix("profile-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
 
 /// Folder, directly under the device root, that holds the profile.
 ///
@@ -74,6 +96,10 @@ pub struct Profile {
     /// Hostname of the machine that wrote it, so a restore prompt can say
     /// *"restore settings from laptop-xyz?"* rather than quoting a uid.
     pub hostname: String,
+    /// The writing machine's id, as in its [`profile_file_name`]. `None` in a
+    /// profile written before 3.5.0.
+    #[serde(default)]
+    pub machine_id: Option<String>,
     /// When it was written, epoch seconds.
     pub saved_at: i64,
     #[serde(default)]
@@ -90,6 +116,25 @@ pub struct Profile {
     pub cache_budget: Option<u64>,
     #[serde(default)]
     pub mountpoint: Option<String>,
+}
+
+/// The saved arrangement of the folder with uid `remote_uid`, from the
+/// profiles of every computer that syncs the device.
+///
+/// The profile of the machine named `hostname` wins, since it describes this
+/// computer; otherwise the most recently saved one that has the folder.
+pub fn saved_folder<'a>(
+    profiles: &'a [Profile],
+    remote_uid: &str,
+    hostname: &str,
+) -> Option<&'a ProfileFolder> {
+    let holding = |p: &&'a Profile| p.folders.iter().any(|f| f.remote_uid == remote_uid);
+    let profile = profiles
+        .iter()
+        .filter(holding)
+        .find(|p| p.hostname == hostname)
+        .or_else(|| profiles.iter().filter(holding).max_by_key(|p| p.saved_at))?;
+    profile.folders.iter().find(|f| f.remote_uid == remote_uid)
 }
 
 impl Profile {
@@ -122,6 +167,7 @@ mod tests {
             version: PROFILE_VERSION,
             device_uid: "dev-1".to_string(),
             hostname: "laptop-xyz".to_string(),
+            machine_id: Some("0123456789abcdef0123456789abcdef".to_string()),
             saved_at: 1_700_000_000,
             folders: vec![ProfileFolder {
                 remote_uid: "vol~link".to_string(),
@@ -217,6 +263,52 @@ mod tests {
         let p = Profile::parse(json).unwrap();
         assert!(p.pins.is_empty());
         assert!(p.ignore_patterns.is_none());
+    }
+
+    #[test]
+    fn a_profile_name_is_the_legacy_one_or_one_per_machine() {
+        assert!(is_profile_file_name(PROFILE_FILE_NAME));
+        let name = profile_file_name("0123456789abcdef0123456789abcdef");
+        assert_eq!(name, "profile-0123456789abcdef0123456789abcdef.json");
+        assert!(is_profile_file_name(&name));
+        assert!(!is_profile_file_name("profile-.json"));
+        assert!(!is_profile_file_name("profile-a/b.json"));
+        assert!(!is_profile_file_name("profile (1).json"));
+        assert!(!is_profile_file_name("notes.json"));
+    }
+
+    /// A profile written before 3.5.0 has no machine id and still parses.
+    #[test]
+    fn a_profile_without_a_machine_id_parses() {
+        let json = br#"{"version":1,"device_uid":"d","hostname":"h","saved_at":0}"#;
+        assert_eq!(Profile::parse(json).unwrap().machine_id, None);
+    }
+
+    /// Several computers sync one device, each with its own profile. This
+    /// computer's own wins, then the newest that has the folder.
+    #[test]
+    fn the_saved_folder_comes_from_this_computer_then_the_newest_profile() {
+        let profile = |hostname: &str, saved_at: i64, path: &str| Profile {
+            hostname: hostname.to_string(),
+            saved_at,
+            folders: vec![ProfileFolder {
+                remote_uid: "vol~docs".to_string(),
+                local_path: path.to_string(),
+                mode: MountMode::Mirror,
+            }],
+            ..sample()
+        };
+        let profiles = vec![
+            profile("desktop", 10, "/home/a/Docs"),
+            profile("laptop", 5, "/home/b/Docs"),
+            profile("old", 1, "/home/c/Docs"),
+        ];
+        let path =
+            |host: &str| saved_folder(&profiles, "vol~docs", host).map(|f| f.local_path.as_str());
+        assert_eq!(path("laptop"), Some("/home/b/Docs"));
+        assert_eq!(path("new-machine"), Some("/home/a/Docs"));
+        assert_eq!(saved_folder(&profiles, "vol~other", "laptop"), None);
+        assert_eq!(saved_folder(&[], "vol~docs", "laptop"), None);
     }
 
     #[test]

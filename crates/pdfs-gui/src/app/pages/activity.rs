@@ -378,7 +378,9 @@ pub(crate) fn activity_status(
 ) {
     ui.activity.status.set_icon_name(Some(icon));
     ui.activity.status.set_title(title);
-    ui.activity.status.set_description(Some(description));
+    ui.activity
+        .status
+        .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.activity.retry.set_visible(retry);
     ui.activity.content.set_visible_child_name("status");
 }

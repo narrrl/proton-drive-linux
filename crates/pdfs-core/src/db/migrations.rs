@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 42;
+pub(super) const SCHEMA_VERSION: i64 = 44;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -438,6 +438,33 @@ impl Db {
             )? > 0;
             if has_ops && !has_column {
                 tx.execute_batch(MIGRATION_V42)?;
+            }
+        }
+        if current < 43 {
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops {
+                tx.execute_batch(MIGRATION_V43)?;
+            }
+        }
+        if current < 44 {
+            // Same guards as V26-V42.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sync_entry') \
+                 WHERE name = 'remote_revision_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_entries: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_entry'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_entries && !has_column {
+                tx.execute_batch(MIGRATION_V44)?;
             }
         }
         tx.execute(
@@ -1329,4 +1356,29 @@ DROP TABLE local_v41;
 const MIGRATION_V42: &str = "
 ALTER TABLE pending_op ADD COLUMN sent_sha1 TEXT;
 ALTER TABLE pending_op ADD COLUMN sent_to TEXT;
+";
+
+/// Schema v43: queued ops by kind and name.
+///
+/// Before each create, rename and trash the drain asks whether a queued trash
+/// or rename holds the name it wants, and a released name wakes the ops
+/// waiting for it. Each of those scanned the whole queue, so a large offline
+/// batch made draining it quadratic. The kind leads, so a lookup of every
+/// queued rename uses the index too.
+const MIGRATION_V43: &str = "
+CREATE INDEX IF NOT EXISTS pending_op_kind_name ON pending_op(kind, name);
+";
+
+/// Schema v44: a synced file's baseline remembers the revision it was synced
+/// at.
+///
+/// A mirrored file edited here is uploaded as a new revision of whatever is
+/// current on Drive, and another computer syncing the same folder may have
+/// committed one since this pass looked. The revision id is what the upload
+/// checks first, so that edit becomes a conflict copy instead of being
+/// replaced (B249). `NULL` means "this row predates the column", and the check
+/// falls back to the modification time and size; each row gains a real value
+/// the next time its path is synced.
+const MIGRATION_V44: &str = "
+ALTER TABLE sync_entry ADD COLUMN remote_revision_id TEXT;
 ";

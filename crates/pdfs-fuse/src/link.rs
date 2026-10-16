@@ -29,6 +29,13 @@ use crate::{Core, ONLINE_PROBE_MAX, ONLINE_PROBE_MIN};
 /// keep waiting for; queueing the change is the better answer.
 pub(crate) const INTERACTIVE_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a mount thread waits on a remote read that answers a batch: a
+/// chunk of file sizes, or the list of shares. Longer than an interactive call,
+/// since its answer grows with the batch, but well short of the SDK's own retry
+/// budget, which held a worker for minutes on a stalled link
+/// (`docs/BUGS.md` B220).
+pub(crate) const BATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How long one probe may wait for an answer. A probe is a single small request,
 /// and a probe stuck in the SDK's retry budget would delay noticing the link is
 /// back by as long as it waits.
@@ -112,10 +119,25 @@ pub(crate) fn no_answer(after: Duration) -> ProtonError {
 /// transfer that has stopped moving runs into it.
 const SLOWEST_UPLOAD: u64 = 32 * 1024;
 
+/// How many uploads can share the upload cap at once: one per drain worker
+/// and one per mirror sync task.
+const UPLOAD_SLOTS: u64 = (crate::DRAIN_WORKERS + crate::sync::SYNC_CONCURRENCY) as u64;
+
 /// How long an upload of `len` bytes may take before the link is treated as
 /// down: the budget of a metadata call, plus the bytes at [`SLOWEST_UPLOAD`].
-pub(crate) fn upload_deadline(len: u64) -> Duration {
-    INTERACTIVE_CALL_TIMEOUT + Duration::from_secs(len / SLOWEST_UPLOAD)
+///
+/// An upload cap of `cap` bytes per second (`0` for none) is shared by every
+/// upload running, so each may get as little as its share of it. Below
+/// [`SLOWEST_UPLOAD`] a share counts as the slowest rate instead: measured
+/// against the fixed rate, a large file under a low cap ran out of time on
+/// every attempt, took the mount offline each time, and started over from
+/// its first byte.
+pub(crate) fn upload_deadline(len: u64, cap: u64) -> Duration {
+    let slowest = match cap {
+        0 => SLOWEST_UPLOAD,
+        cap => SLOWEST_UPLOAD.min((cap / UPLOAD_SLOTS).max(1)),
+    };
+    INTERACTIVE_CALL_TIMEOUT + Duration::from_secs(len / slowest)
 }
 
 /// Run a remote call, giving up after [`INTERACTIVE_CALL_TIMEOUT`].
@@ -258,8 +280,9 @@ impl Core {
         self.relist_offline_listings();
         // Anything written while offline is queued and waiting on exactly this,
         // including ops that failed on the way down and are sitting out a
-        // backoff sized for a server that keeps refusing.
-        if let Err(e) = self.db.retry_failed_ops_now(crate::now_millis()) {
+        // backoff sized for a server that keeps refusing. Ops Drive refused
+        // keep theirs: the link was not why.
+        if let Err(e) = self.db.retry_unrefused_ops_now(crate::now_millis()) {
             warn!(error = %e, "moving backed-off ops up after a reconnect failed");
         }
         self.wake_drain();
@@ -403,11 +426,29 @@ mod tests {
 
     #[test]
     fn an_upload_gets_longer_the_bigger_it_is() {
-        assert_eq!(upload_deadline(0), INTERACTIVE_CALL_TIMEOUT);
+        assert_eq!(upload_deadline(0, 0), INTERACTIVE_CALL_TIMEOUT);
         assert_eq!(
-            upload_deadline(1 << 30),
+            upload_deadline(1 << 30, 0),
             INTERACTIVE_CALL_TIMEOUT + Duration::from_secs(32_768)
         );
+    }
+
+    #[test]
+    fn an_upload_under_a_low_cap_gets_the_time_its_share_of_the_cap_needs() {
+        // A generous cap leaves the deadline as it was.
+        assert_eq!(
+            upload_deadline(1 << 30, 100 << 20),
+            upload_deadline(1 << 30, 0)
+        );
+        // 512 KiB/s shared by every upload slot is below the slowest rate.
+        let share = (512 << 10) / UPLOAD_SLOTS;
+        assert!(share < SLOWEST_UPLOAD);
+        assert_eq!(
+            upload_deadline(1 << 30, 512 << 10),
+            INTERACTIVE_CALL_TIMEOUT + Duration::from_secs((1 << 30) / share)
+        );
+        // A cap below one byte per slot still gives a finite deadline.
+        assert!(upload_deadline(1 << 20, 1) > upload_deadline(1 << 20, 512 << 10));
     }
 
     #[test]

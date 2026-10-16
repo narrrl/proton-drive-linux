@@ -10,6 +10,7 @@ pub mod config;
 pub mod control;
 pub mod db;
 pub mod error;
+pub mod exiftime;
 pub mod kernelkey;
 pub mod localindex;
 pub mod menu;
@@ -23,6 +24,7 @@ pub mod service;
 pub mod shell;
 pub mod similar;
 pub mod syncignore;
+pub mod syncroot;
 pub mod takeout;
 pub mod tray;
 

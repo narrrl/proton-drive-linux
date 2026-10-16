@@ -209,7 +209,8 @@ fn ask(view: &Rc<FinderView>, finder: Finder, generation: u32) {
             Ok(Ok(Response::Error { message, .. })) => {
                 view.status.set_icon_name(Some("dialog-warning-symbolic"));
                 view.status.set_title(&failed);
-                view.status.set_description(Some(&message));
+                view.status
+                    .set_description(Some(&gtk4::glib::markup_escape_text(&message)));
                 view.progress.set_visible(false);
                 return;
             }

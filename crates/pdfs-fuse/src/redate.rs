@@ -190,6 +190,7 @@ impl Core {
             .map_err(|e| CoreError::internal(format!("stat {}: {e}", path.display())))?
             .len();
         let media_type = media_type_of(&candidate.name).unwrap_or("application/octet-stream");
+        let thumbnails = self.upload_thumbnails(&path, &candidate.name);
 
         let guard =
             self.transfers
@@ -206,7 +207,7 @@ impl Core {
             media_type,
             reader,
             size as i64,
-            Vec::new(),
+            thumbnails,
             metadata,
             false,
         ));
@@ -291,7 +292,14 @@ impl Core {
             let mut state = REDATE.lock();
             state.running = false;
             state.cancel = None;
-            state.last = outcome.as_ref().ok().cloned();
+            state.last = Some(match &outcome {
+                Ok(summary) => summary.clone(),
+                Err(e) => RedateSummary {
+                    error: Some(e.to_string()),
+                    dry_run,
+                    ..Default::default()
+                },
+            });
             match &outcome {
                 Ok(summary) => info!(
                     candidates = summary.candidates,

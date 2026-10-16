@@ -23,6 +23,11 @@ const SCRIPTS: [(&str, &str); 2] = [
 /// `NAUTILUS_SCRIPT_SELECTED_FILE_PATHS`; the positional args carry the same
 /// selection when the script runs on a local (non-URI) folder, so we prefer the
 /// environment and fall back to `"$@"` for the Nemo/Caja variants.
+///
+/// The `--` keeps a file named like an option, such as `--json`, a path. A
+/// name with a newline in it still arrives split in two from Nautilus, whose
+/// list is newline-separated; `pdfs` then fails on both halves, which touches
+/// nothing.
 fn script_body(subcommand: &str) -> String {
     format!(
         "#!/bin/sh\n\
@@ -41,7 +46,7 @@ fn script_body(subcommand: &str) -> String {
          \n\
          printf '%s' \"$paths\" | while IFS= read -r path; do\n\
          \x20   [ -n \"$path\" ] || continue\n\
-         \x20   pdfs {subcommand} \"$path\" || exit 1\n\
+         \x20   pdfs {subcommand} -- \"$path\" || exit 1\n\
          done\n"
     )
 }
@@ -94,4 +99,14 @@ fn write_scripts(dir: &PathBuf) -> io::Result<()> {
     }
     tracing::debug!("installed file-manager scripts in {dir:?}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::script_body;
+
+    #[test]
+    fn the_script_ends_options_before_each_path() {
+        assert!(script_body("pin").contains(r#"pdfs pin -- "$path""#));
+    }
 }

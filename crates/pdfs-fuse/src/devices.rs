@@ -105,6 +105,15 @@ pub(crate) fn adopted_device_uid() -> Option<String> {
     (!uid.is_empty()).then_some(uid)
 }
 
+/// The paths no sync root may overlap, with the mountpoint as the config says
+/// now.
+pub(crate) fn sync_root_reserved() -> pdfs_core::syncroot::Reserved {
+    let config = pdfs_core::config::AppDirs::new()
+        .map(|dirs| dirs.load_config())
+        .unwrap_or_default();
+    pdfs_core::syncroot::Reserved::current(&config)
+}
+
 /// Pin (or, with `None`, unpin) the adopted device uid in `config.json`.
 pub(crate) fn set_adopted_device_uid(uid: Option<&str>) -> CoreResult<()> {
     let dirs = pdfs_core::config::AppDirs::new()
@@ -517,18 +526,20 @@ impl Core {
             .map_err(|e| CoreError::internal(format!("canonicalize {}: {e}", local.display())))?;
         let local_str = local.to_string_lossy().to_string();
 
-        // Reject duplicates up front for a clear error (UNIQUE would also catch it).
-        if self
+        // `/`, the home folder, the mount, this app's own data, and a folder
+        // inside or around another root are refused (`syncroot::problem`). A
+        // duplicate is one of those, refused here for a clear error before
+        // the UNIQUE constraint would catch it.
+        let others = self
             .db
             .sync_folder_list()
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
             .iter()
-            .any(|f| f.local_path == local_str)
-        {
-            return Err(CoreError::invalid(format!(
-                "{} is already synced",
-                local.display()
-            )));
+            .map(|f| PathBuf::from(&f.local_path))
+            .collect::<Vec<_>>();
+        let reserved = sync_root_reserved();
+        if let Some(problem) = pdfs_core::syncroot::problem(&local, &others, &reserved) {
+            return Err(CoreError::invalid(problem));
         }
 
         let name = local

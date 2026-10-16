@@ -860,7 +860,7 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
                 if ui.stack.visible_child_name().as_deref() == Some("login") {
                     ui.stack.set_visible_child_name("browser");
                 }
-                ui.nav.set_collapsed(false);
+                ui.nav.set_collapsed(ui.narrow.get());
                 if ui.status.account_name.label() != s.username {
                     ui.status.account_name.set_label(&s.username);
                     ui.status.account_name.set_tooltip_text(Some(&s.username));
@@ -1566,6 +1566,7 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         let row = adw::ActionRow::builder()
             .title(&name)
             .subtitle(&pin.path)
+            .use_markup(false)
             .build();
         let icon = gtk4::Image::from_icon_name("pdfs-offline-symbolic");
         row.add_prefix(&icon);

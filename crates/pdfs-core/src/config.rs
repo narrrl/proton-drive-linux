@@ -163,6 +163,10 @@ pub struct AppConfig {
     /// Defaulted for configs predating the field.
     #[serde(default)]
     pub files_view: FilesView,
+    /// The desktop app's main window size, remembered between runs. Defaulted
+    /// for configs predating the field.
+    #[serde(default)]
+    pub window: WindowState,
     /// The user hid the tray icon from its own menu. The tray exits at start
     /// while this is set, and the app does not spawn it; Preferences turns it
     /// back on. Defaulted for configs predating the field.
@@ -207,6 +211,44 @@ impl Default for FilesView {
             sort: FileSort::Name,
             descending: false,
             folders_first: true,
+        }
+    }
+}
+
+/// The desktop app's main window, as it was when it last closed.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct WindowState {
+    /// The unmaximised size, in logical pixels.
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+impl WindowState {
+    /// Below this the saved size is taken for damage and the default is used.
+    pub const MIN_WIDTH: i32 = 480;
+    pub const MIN_HEIGHT: i32 = 400;
+
+    /// This state, with a size too small to use replaced by the default.
+    pub fn usable(self) -> Self {
+        if self.width < Self::MIN_WIDTH || self.height < Self::MIN_HEIGHT {
+            Self {
+                maximized: self.maximized,
+                ..Self::default()
+            }
+        } else {
+            self
+        }
+    }
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            width: 980,
+            height: 680,
+            maximized: false,
         }
     }
 }
@@ -310,6 +352,22 @@ impl AppConfig {
     }
 }
 
+/// Fail when the config file at `path` exists but does not parse, so that
+/// [`AppDirs::save_config`] never writes over settings it could not read.
+fn refuse_to_replace_unreadable(path: &Path) -> Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Error::Other(format!(
+                "{} cannot be read ({e}); fix it or move it aside before changing settings",
+                path.display()
+            ))),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Resolved XDG locations for state, cache, and the default mountpoint.
 pub struct AppDirs {
     dirs: ProjectDirs,
@@ -341,6 +399,7 @@ impl AppDirs {
                     // Preserve the original bytes for diagnosis/recovery.  In
                     // particular, never replace a truncated config with defaults
                     // and silently lose mount, device, or ignore settings.
+                    // `save_config` refuses to write over it for the same reason.
                     tracing::error!(path = %path.display(), error = %e, "config is unreadable; using in-memory defaults without overwriting it");
                     return AppConfig::default();
                 }
@@ -348,9 +407,8 @@ impl AppDirs {
         }
 
         let default_config = AppConfig::default();
-        if let Ok(content) = serde_json::to_string_pretty(&default_config) {
-            let _ = std::fs::create_dir_all(self.dirs.config_dir());
-            let _ = std::fs::write(&path, content);
+        if let Err(e) = self.save_config(&default_config) {
+            tracing::warn!(path = %path.display(), error = %e, "could not write the default config");
         }
         default_config
     }
@@ -358,8 +416,15 @@ impl AppDirs {
     /// Persist `config` to [`config_path`](Self::config_path), creating the
     /// config dir if missing. The Settings page calls this after editing the
     /// cache budget or mountpoint; the daemon re-reads the file on its next mount.
+    ///
+    /// Refuses while the file on disk does not parse. Every caller loads,
+    /// changes one field and saves, and [`load_config`](Self::load_config)
+    /// gives defaults for a file it cannot read, so the first change after
+    /// the file was damaged wrote defaults over the mountpoint, the device and
+    /// the ignore rules the user had (`docs/BUGS.md` B223).
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
         let path = self.config_path();
+        refuse_to_replace_unreadable(&path)?;
         let parent = path
             .parent()
             .ok_or_else(|| Error::Other("configuration path has no parent".into()))?;
@@ -381,6 +446,46 @@ impl AppDirs {
         std::fs::rename(&tmp, &path)?;
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
+    }
+
+    /// This machine's id (e.g. ~/.config/proton-drive-linux/machine-id). See
+    /// [`machine_id`](Self::machine_id).
+    pub fn machine_id_path(&self) -> PathBuf {
+        self.dirs.config_dir().join("machine-id")
+    }
+
+    /// A random id for this machine, made on first use and kept in
+    /// [`machine_id_path`](Self::machine_id_path).
+    ///
+    /// It names this machine's profile in a device it may share with other
+    /// computers. Random rather than `/etc/machine-id`, so nothing that
+    /// identifies the host goes to Drive. In a file of its own rather than
+    /// `config.json`, because the app saves the config from a copy it loaded
+    /// earlier, and that would drop an id the daemon had just added.
+    pub fn machine_id(&self) -> Result<String> {
+        let path = self.machine_id_path();
+        match std::fs::read_to_string(&path) {
+            Ok(id) if is_machine_id(id.trim()) => return Ok(id.trim().to_string()),
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "machine id is unusable; making a new one");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let mut bytes = [0u8; 16];
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Other("machine id path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, format!("{id}\n"))?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(id)
     }
 
     /// Persistent state: inode map / cache index DB lives here.
@@ -471,6 +576,12 @@ impl AppDirs {
     }
 }
 
+/// Whether `id` is what [`AppDirs::machine_id`] writes: 32 lowercase hex
+/// digits.
+fn is_machine_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Make `dir` owner-only (`0700`). These directories contain decrypted bytes,
 /// plaintext names, and an authenticated control socket, so failure is fatal.
 fn restrict_dir(dir: &Path) -> Result<()> {
@@ -524,6 +635,28 @@ mod tests {
 
     fn mode_of(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A damaged config must not be replaced by defaults the next time a
+    /// setting changes (`docs/BUGS.md` B223).
+    #[test]
+    fn an_unreadable_config_is_never_written_over() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-cfg-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        assert!(refuse_to_replace_unreadable(&path).is_ok(), "no file yet");
+        std::fs::write(&path, serde_json::to_vec(&AppConfig::default()).unwrap()).unwrap();
+        assert!(refuse_to_replace_unreadable(&path).is_ok());
+        std::fs::write(&path, br#"{"mountpoint": "/home/me/Pro"#).unwrap();
+        assert!(refuse_to_replace_unreadable(&path).is_err(), "truncated");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `docs/BUGS.md` B6. A permissive mode here is not a cosmetic problem: these
@@ -611,6 +744,11 @@ mod tests {
                 descending: true,
                 folders_first: false,
             },
+            window: WindowState {
+                width: 1200,
+                height: 800,
+                maximized: true,
+            },
             tray_hidden: true,
             language: Some("de".to_string()),
             online_map: true,
@@ -630,6 +768,39 @@ mod tests {
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
+        assert_eq!(decoded.window, config.window);
+    }
+
+    #[test]
+    fn a_config_without_a_window_opens_at_the_default_size() {
+        let decoded: AppConfig =
+            serde_json::from_str(r#"{"app_version":"a","user_agent":"b"}"#).unwrap();
+        assert_eq!(decoded.window, WindowState::default());
+        let partial: WindowState = serde_json::from_str(r#"{"maximized":true}"#).unwrap();
+        assert_eq!((partial.width, partial.height), (980, 680));
+        assert!(partial.maximized);
+    }
+
+    #[test]
+    fn a_window_saved_too_small_opens_at_the_default_size() {
+        let tiny = WindowState {
+            width: 0,
+            height: 500,
+            maximized: true,
+        };
+        assert_eq!(
+            tiny.usable(),
+            WindowState {
+                maximized: true,
+                ..WindowState::default()
+            }
+        );
+        let fine = WindowState {
+            width: 640,
+            height: 480,
+            maximized: false,
+        };
+        assert_eq!(fine.usable(), fine);
     }
 
     #[test]
@@ -758,6 +929,15 @@ mod tests {
         assert!(json.contains(r#""conflict_sweep":"enforce""#), "{json}");
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.conflict_sweep, Some(SweepMode::Enforce));
+    }
+
+    #[test]
+    fn a_machine_id_is_32_lowercase_hex_digits() {
+        assert!(is_machine_id("0123456789abcdef0123456789abcdef"));
+        assert!(!is_machine_id("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!is_machine_id("0123456789abcdef"));
+        assert!(!is_machine_id("../../../../etc/passwd/0123456789"));
+        assert!(!is_machine_id(""));
     }
 
     #[test]

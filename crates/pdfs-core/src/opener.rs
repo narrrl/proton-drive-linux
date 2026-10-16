@@ -189,9 +189,19 @@ fn spawn(argv: &[String], path: &Path) {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn();
-    if let Err(e) = spawned {
-        tracing::error!(command = ?argv, "open failed: {e}");
+    match spawned {
+        Ok(child) => reap(child),
+        Err(e) => tracing::error!(command = ?argv, "open failed: {e}"),
     }
+}
+
+/// Wait for `child` on a thread of its own. A child nobody waits for stays a
+/// zombie for as long as its parent lives, which for the app and the tray is
+/// the whole session.
+pub fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// [`open`] with the policy from the user's `config.json`, read once per
@@ -471,6 +481,21 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reaped_child_does_not_stay_a_zombie() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let proc_entry = std::path::PathBuf::from(format!("/proc/{}", child.id()));
+        reap(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_entry.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !proc_entry.exists(),
+            "the child is still in the process table"
+        );
+    }
 
     fn rule(patterns: &[&str], command: &[&str], terminal: bool) -> OpenRule {
         OpenRule {

@@ -100,6 +100,50 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
+| [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
+| [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
+| [B251](#b251--two-computers-can-make-the-same-conflict-copy-name) | Two computers can make the same conflict copy name |
+| [B250](#b250--a-revision-made-during-a-mirror-download-never-arrives) | A revision made during a mirror download never arrives |
+| [B249](#b249--a-mirror-edit-replaces-a-revision-another-computer-made-since) | A mirror edit replaces a revision another computer made since |
+| [B248](#b248--a-joining-mirror-takes-a-same-size-file-for-the-same-file) | A joining mirror takes a same-size file for the same file |
+| [B247](#b247--tray-status-lines-are-not-translated) | Tray status lines are not translated |
+| [B246](#b246--signing-in-with-a-locked-keyring-freezes-the-app-window) | Signing in with a locked keyring freezes the app window |
+| [B245](#b245--any-child-of-the-daemon-can-answer-the-watchdog-for-it) | Any child of the daemon can answer the watchdog for it |
+| [B244](#b244--photos-without-a-sidecar-or-a-dated-name-are-filed-under-the-upload-day) | Photos without a sidecar or a dated name are filed under the upload day |
+| [B243](#b243--a-hung-mount-freezes-the-app-when-a-file-is-opened) | A hung mount freezes the app when a file is opened |
+| [B242](#b242--opening-a-large-photo-freezes-the-app) | Opening a large photo freezes the app |
+| [B241](#b241--every-closed-photo-viewer-stays-in-memory-with-its-photo) | Every closed photo viewer stays in memory with its photo |
+| [B240](#b240--pdfs-mount-can-be-core-dumped-with-the-keys-in-memory) | pdfs mount can be core-dumped with the keys in memory |
+| [B239](#b239----wait-reports-success-for-imports-and-re-dates-that-failed) | --wait reports success for imports and re-dates that failed |
+| [B238](#b238--draining-a-large-offline-batch-is-quadratic-in-its-size) | Draining a large offline batch is quadratic in its size |
+| [B237](#b237--every-reconnect-resends-refused-uploads-all-in-the-same-second) | Every reconnect resends refused uploads, all in the same second |
+| [B236](#b236--imported-re-dated-and-app-uploaded-photos-have-no-thumbnail) | Imported, re-dated and app-uploaded photos have no thumbnail |
+| [B235](#b235--scanning-a-large-takeout-folder-takes-half-a-minute) | Scanning a large Takeout folder takes half a minute |
+| [B234](#b234--any-folder-can-become-a-sync-root-the-home-folder-included) | Any folder can become a sync root, the home folder included |
+| [B233](#b233--signing-out-leaves-the-session-valid-on-proton) | Signing out leaves the session valid on Proton |
+| [B232](#b232--names-with--or--show-as-empty-rows-or-are-drawn-as-markup) | Names with & or < show as empty rows or are drawn as markup |
+| [B231](#b231--a-large-upload-under-a-low-upload-limit-never-finishes) | A large upload under a low upload limit never finishes |
+| [B230](#b230--a-create-queued-offline-adopts-another-devices-file-of-the-same-name) | A create queued offline adopts another device's file of the same name |
+| [B229](#b229--a-queued-write-can-be-lost-to-a-power-cut-after-close-returned) | A queued write can be lost to a power cut after close returned |
+| [B228](#b228--a-gap-filled-write-whose-upload-answer-was-lost-becomes-a-conflict-copy-of-itself) | A gap-filled write whose upload answer was lost becomes a conflict copy of itself |
+| [B227](#b227--reading-a-file-open-for-writing-downloads-on-the-dispatch-loop) | Reading a file open for writing downloads on the dispatch loop |
+| [B226](#b226--thumbnails-of-portrait-phone-photos-lie-on-their-side) | Thumbnails of portrait phone photos lie on their side |
+| [B225](#b225--a-takeout-photo-without-a-sidecar-takes-a-siblings-name-and-date) | A Takeout photo without a sidecar takes a sibling's name and date |
+| [B224](#b224--fallocate-zero-ranges-are-undone-and-collapse-ranges-corrupt-the-file) | `fallocate` zero ranges are undone and collapse ranges corrupt the file |
+| [B223](#b223--a-damaged-config-file-is-replaced-with-defaults-on-the-next-settings-change) | A damaged config file is replaced with defaults on the next settings change |
+| [B222](#b222--a-full-disk-at-close-is-reported-to-nobody-and-fsync-on-a-read-only-file-fails) | A full disk at close is reported to nobody, and `fsync` on a read-only file fails |
+| [B221](#b221--a-cold-listing-holds-the-global-lock-across-a-database-transaction) | A cold listing holds the global lock across a database transaction |
+| [B220](#b220--thumbnails-on-a-stalled-link-hold-up-every-other-request) | Thumbnails on a stalled link hold up every other request |
+| [B219](#b219--listing-a-shared-folder-freezes-the-whole-mount-on-a-slow-link) | Listing a shared folder freezes the whole mount on a slow link |
+| [B218](#b218--pdfs-diagnose-freezes-the-mount-while-it-checks-the-database) | `pdfs diagnose` freezes the mount while it checks the database |
+| [B217](#b217--the-search-indexes-grow-to-many-times-their-size-and-slow-search-down) | The search indexes grow to many times their size and slow search down |
+| [B216](#b216--a-damaged-database-is-rebuilt-without-the-writes-still-queued-in-it) | A damaged database is rebuilt without the writes still queued in it |
+| [B215](#b215--a-remote-name-holding--or--becomes-a-path-outside-the-sync-folder) | A remote name holding `/` or `..` becomes a path outside the sync folder |
+| [B214](#b214--deleting-a-mirror-folder-here-trashes-another-devices-new-files-in-it) | Deleting a mirror folder here trashes another device's new files in it |
+| [B213](#b213--a-file-edited-during-a-mirror-pass-is-deleted-because-drive-deleted-it-earlier) | A file edited during a mirror pass is deleted because Drive deleted it earlier |
+| [B212](#b212--a-node-on-drive-that-cannot-be-decrypted-is-deleted-from-the-mirror) | A node on Drive that cannot be decrypted is deleted from the mirror |
+| [B211](#b211--a-folder-deleted-on-drive-takes-unsynced-local-files-with-it) | A folder deleted on Drive takes unsynced local files with it |
 | [B210](#b210--after-a-password-reset-the-mount-retries-missing-key-forever) | After a password reset, the mount retries "missing key" forever |
 | [B209](#b209--a-blocked-sign-in-says-the-app-version-is-no-longer-supported) | A blocked sign-in says the app version is no longer supported |
 | [B208](#b208--a-file-landing-while-its-folder-is-pinned-is-kept-but-not-available-offline) | A file landing while its folder is pinned is kept but not available offline |
@@ -312,6 +356,1107 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B254 — An edit in the same second as a new upload never arrives
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, the B250 simulation failing about one run in five on CI.
+**Where:** `unchanged_remote_size` in `crates/pdfs-fuse/src/sync/planner.rs`; the
+`FilePlan::Unchanged` arm of `do_reconcile` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** A mirror pass uploads a new file, and Drive does not list it yet when the pass
+reads it back. Another computer saves a new revision with the same modification time, to the
+second. The mirror keeps the old content, and no pass ever downloads the new one.
+
+**Cause.** The read-back found no node, so the baseline row got the local modification time
+and size but no revision id. The next walk reused the recorded size whenever the modification
+time matched and the revision id had not moved. A row without an id never counts as moved, so
+the walk never read the new size, and the file looked unchanged.
+
+**Fix.** A row without a revision id reuses its size only while Drive gives no id either.
+Otherwise the walk reads the size for real. If the file is still unchanged, the pass writes
+Drive's revision id into the row, so the cost is one extra read per row. Rows from before
+schema 44 have no id either, so the first pass after upgrading reads every file's size once.
+
+**Test:** `a_row_without_a_revision_makes_the_walk_read_the_size_again` in `pdfs-fuse`. The
+simulation `a_revision_made_during_a_mirror_download_still_arrives` failed 3 of about 15 runs
+before the fix and passed 25 of 25 after it.
+
+---
+
+### B253 — The app shows the sign-in page when the keyring is locked
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, user report: "the login each time you reboot or logout and back in".
+**Where:** `build_window` in `crates/pdfs-gui/src/app/main.rs`; `wire_login` in
+`crates/pdfs-gui/src/app/pages/login.rs`
+
+**Repro:** Sign in, then start `pdfs-app` while the Secret Service is locked, not yet running,
+or unreachable. The app shows the sign-in form as if nobody were signed in. The saved session
+is still in the keyring, and the daemon waits for it.
+
+**Cause.** The app read the session with `auth::load().ok()`, which turns every keyring error
+into "signed out". Only `NotLoggedIn` means that. The tray already told the two apart.
+
+**Fix.** `read_session` keeps `NotLoggedIn` apart from keyring errors. On an error the login
+page shows a banner saying the keyring could not be read, with a Retry button. The app reads
+the keyring again after 2, 5, 10 and 30 seconds and on Retry, and opens on Files once it
+answers, without asking for a sign-in. A sign-in whose session cannot be read back gets the
+same banner.
+
+**Test:** None automated; the GTK window has no test harness. Checked by hand with
+`DBUS_SESSION_BUS_ADDRESS` pointing nowhere: the banner shows over the form.
+
+---
+
+### B252 — Computers sharing a device overwrite each other's profile
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `save_profile` and `load_profiles` in `crates/pdfs-fuse/src/profile.rs`
+
+**Repro:** Adopt one device on two computers and sync a different folder on each. The
+device's `profile.json` lists only the folders of whichever computer saved last.
+
+**Cause.** The profile was one file per device, written as a new revision by every computer
+that synced into it, each with only its own folders.
+
+**Fix.** Each machine writes `profile-<machine id>.json`. The id is random, made on first use
+and kept in `machine-id` next to `config.json`, so nothing that identifies the host goes to
+Drive. Restore reads every profile in the folder, including the shared `profile.json` of older
+clients. A folder's proposal comes from this computer's own profile, otherwise from the newest
+one that has the folder. The legacy file is left alone.
+
+**Test:** `the_saved_folder_comes_from_this_computer_then_the_newest_profile` and
+`a_profile_name_is_the_legacy_one_or_one_per_machine` in `pdfs-core`;
+`each_machine_saves_its_own_profile` in `pdfs-fuse`.
+
+---
+
+### B251 — Two computers can make the same conflict copy name
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `conflict_path_with_suffix` in `crates/pdfs-fuse/src/sync/planner.rs`, `conflict_name`
+in `crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Two computers sync one folder and each keeps a conflict copy of the same file in the
+same second. Both name it `notes (sync-conflict 1700000000).txt`, so the second upload meets
+the first on Drive, and neither copy says which computer it came from.
+
+**Cause.** The name held only the time. The `-<n>` suffix is made unique on the local disk, not
+on Drive.
+
+**Fix.** Conflict copies carry the hostname, cut down to one token of letters, digits, `-`, `_`
+and `.`: `notes (sync-conflict laptop 1700000000).txt`. `conflict_base_name` reads both forms,
+so the sweep and **Resolve** still find copies made before.
+
+**Test:** `a_hostname_becomes_one_safe_token`, `conflict_name_keeps_the_extension`,
+`conflict_path_keeps_extension_and_directory` and `parses_conflict_names_and_leaves_others_alone`.
+
+---
+
+### B250 — A revision made during a mirror download never arrives
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `download_file` and `record_file_baseline` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Another computer saves a file in a mirrored folder while this computer downloads the
+previous version. This computer keeps the previous version, and later passes do not fetch the
+newer one.
+
+**Cause.** After a download the baseline read the node again and recorded what Drive held then.
+A revision committed while the download ran was recorded as synced, although the disk held the
+older one.
+
+**Fix.** The baseline records the revision the pass planned to download. If the download already
+fetched the newer one, the next pass fetches it once more, which costs a transfer and loses
+nothing. After an upload the read-back is still used, but only when Drive's digest is the one
+just sent; otherwise the baseline is left as it was and the next pass keeps a conflict copy.
+
+**Test:** `a_revision_made_during_a_mirror_download_still_arrives` (simulation, FUSE). It fails
+with the old read-back.
+
+---
+
+### B249 — A mirror edit replaces a revision another computer made since
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `upload_revision` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Edit a file in a mirrored folder while another computer saves its own edit of the
+same file, after this computer's pass looked at Drive and before it uploads. This computer's
+revision becomes the current one. The other edit survives only in the version history, and no
+conflict copy is made.
+
+**Cause.** The upload made a new revision of whatever Drive held at that moment, from a plan
+that could be minutes old. Nothing compared Drive with the baseline before uploading. Change
+detection used only the link's modification time and the size.
+
+**Fix.** The baseline records the revision id it was synced at (schema 44). The upload reads
+the node first and leaves a file whose revision moved for the next pass, which keeps the local
+edit as a conflict copy. A new revision id counts as a remote change even at the same
+modification time and size. A revision committed between the check and the upload's own draft
+is not caught, because the SDK reads the current revision itself; the read-back after the upload
+catches one committed after it.
+
+**Test:** `a_mirror_edit_does_not_replace_a_revision_another_computer_made_since` (simulation,
+FUSE), `a_new_remote_revision_is_a_change_even_at_the_same_mtime_and_size` and
+`migration_v44_adds_the_synced_revision_without_disturbing_a_v43_baseline`.
+
+---
+
+### B248 — A joining mirror takes a same-size file for the same file
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, design review for syncing several computers into one device.
+**Where:** `plan_file` in `crates/pdfs-fuse/src/sync/planner.rs`
+
+**Repro:** Sync a local folder into a folder on Drive that already holds a file of the same name
+and size but different content, for example on a second computer joining a folder. The first
+pass records both as in step, and the two computers go on holding different files.
+
+**Cause.** The first sync of a path present on both sides adopted the baseline whenever the sizes
+matched, to avoid a conflict copy of every pre-existing file.
+
+**Fix.** The adoption needs Drive's content digest, and the local file is hashed first. A match
+is adopted; a different file, or one without a digest on Drive, is kept as a conflict copy.
+
+**Test:** `a_joining_mirror_keeps_a_same_size_different_file_as_a_conflict` (simulation, FUSE)
+and `first_sync_without_a_remote_digest_is_a_conflict`.
+
+---
+
+### B247 — Tray status lines are not translated
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, tray strings).
+**Where:** `sync_line` in `crates/pdfs-gui/src/main.rs`
+
+**Repro:** Run the tray in German or French while one file uploads. The tray's status line reads
+`↑ report.pdf (45%)`, with the percent sign as English writes it.
+
+**Cause.** Three status lines of the tray were built with `format!`, outside gettext, so no
+language could adapt them.
+
+**Fix.** They go through `gettext_f` and are translated in every catalog. German and French put
+a space before the percent sign, as they already do for the storage quota.
+
+**Test:** `msgfmt --check --statistics` on every catalog reports only translated messages.
+
+---
+
+### B246 — Signing in with a locked keyring freezes the app window
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.4).
+**Where:** `sign_in` in `crates/pdfs-gui/src/app/pages/login.rs`
+
+**Repro:** Sign in from the app while the system keyring is locked. The keyring asks for its
+password, and the app window stops redrawing until that prompt is answered.
+
+**Cause.** After a successful sign-in the app read the stored session back from the keyring on
+the GTK main thread. A locked keyring answers that read only once it is unlocked.
+
+**Fix.** The read runs in `gio::spawn_blocking`. The read at startup was left as it is: it runs
+before any window exists, and the launch actions (`--page`, `--confirm-stop`) need the window
+built in the same turn.
+
+**Test:** none automated; the GUI tests run without a display.
+
+---
+
+### B245 — Any child of the daemon can answer the watchdog for it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, systemd unit).
+**Where:** `packaging/proton-drive.service`
+
+**Repro:** A child of the daemon, such as `ffmpeg` making a video thumbnail, inherits
+`NOTIFY_SOCKET` and can send `WATCHDOG=1` while the daemon itself is wedged.
+
+**Cause.** The unit set `NotifyAccess=all`, which accepts notifications from every process of the
+unit. The watchdog exists to restart a daemon that stopped answering, and any child could keep it
+from doing that.
+
+**Fix.** `NotifyAccess=main`: only the daemon's own process is heard. The rest of the hardening
+the audit listed was left out on purpose. In a user unit every seccomp-based option implies
+`NoNewPrivileges`, which stops the setuid `fusermount3` from mounting.
+
+**Test:** none automated; `systemd-analyze verify --user` accepts the unit.
+
+---
+
+### B244 — Photos without a sidecar or a dated name are filed under the upload day
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.3).
+**Where:** `crates/pdfs-core/src/exiftime.rs`; the `UploadPhoto` request in
+`crates/pdfs-fuse/src/control.rs`; `Core::import_takeout` in `crates/pdfs-fuse/src/takeout.rs`;
+the upload in `crates/pdfs-gui/src/app/pages/photos.rs`
+
+**Repro:**
+- Import a Takeout export in which a photo has no sidecar and no date in its name, such as
+  `DSC01234.JPG`. It lands in the timeline under the day of the import.
+- Copy a photo from a camera card with a tool that does not keep modification times, and upload
+  it from the app's gallery. It lands under the day of the copy.
+
+**Cause.** Nothing read a photo's own EXIF for its capture time. A Takeout photo fell back to its
+sidecar, then to a date in its name, then to nothing, which Drive files as "now". The app sent
+the file's modification time.
+
+**Fix.** `exiftime::capture_time` reads `DateTimeOriginal`, then `DateTimeDigitized`, each moved
+by its `OffsetTime…` tag when present and read as UTC otherwise, like a date in a file name. A
+Takeout photo with no other date uses it when the photo was copied out of the archive for its
+thumbnail (B236). The app no longer sends a time; the daemon dates the upload by EXIF, then by
+the modification time.
+
+**Test:** `exiftime::tests` (four cases, among them
+`a_photo_is_dated_by_its_original_time_and_offset`).
+
+---
+
+### B243 — A hung mount freezes the app when a file is opened
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.3, and the unreaped child processes
+in section 3).
+**Where:** `present_within` in `crates/pdfs-gui/src/activation.rs`; `download_and_open` and
+`open_entry_with` in `crates/pdfs-gui/src/app/pages/browser.rs`; `open_path` in
+`crates/pdfs-gui/src/app/main.rs`; `reap` in `crates/pdfs-core/src/opener.rs`
+
+**Repro:** Let the mount hang (a stalled link with a request stuck in the kernel), then
+double-click a file in the app's browser, or open the Proton Drive location. Separately, open a
+few files from the app and look for `<defunct>` children of `pdfs-app` in `ps`.
+
+**Cause.** Opening a file asked the mount whether it had the file with a `stat` on the GTK main
+thread, and opening a location asked whether it was a folder the same way. A hung mount never
+answers, so the whole app hung with it. The search launcher already asked on a worker with a
+2 s limit. Separately, nothing waited for the applications the app, the tray and the player
+button started, so each one stayed a zombie until the app quit.
+
+**Fix.** The browser's Open and Open With ask through `present_within`, which the launcher now
+shares: a thread of its own, given up on after 2 s, with the daemon as the fallback. Opening a
+location runs on a thread. Every child the GUI starts is waited for on a thread of its own.
+
+**Test:** `opener::tests::a_reaped_child_does_not_stay_a_zombie`; the mount checks have no
+automated test, as the GUI tests run without a display.
+
+---
+
+### B242 — Opening a large photo freezes the app
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.1).
+**Where:** `load_photo` and `show_info` in `crates/pdfs-gui/src/app/pages/photo_viewer.rs`
+
+**Repro:** Open a 50-megapixel photo in the viewer and press → repeatedly while each one loads.
+
+**Cause.** When the full-size file arrived, the viewer decoded it with
+`Texture::from_filename`, read its EXIF and stat'ed it on the GTK main thread. For a large photo
+that took a good part of a second each time, and the whole app froze for it: no redraw, no
+input, no other page.
+
+**Fix.** The decode, the EXIF read and the stat run on a worker (`gio::spawn_blocking`). The
+result is used only if the viewer still shows that photo; a reply for one the user has left is
+dropped.
+
+**Test:** none automated; the GUI tests run without a display.
+
+---
+
+### B241 — Every closed photo viewer stays in memory with its photo
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.5.2).
+**Where:** `open_photo_viewer` in `crates/pdfs-gui/src/app/pages/photo_viewer.rs`;
+`repaint_share_people` and `repaint_share_link` in
+`crates/pdfs-gui/src/app/widgets/share_dialog.rs`
+
+**Repro:** Open and close the photo viewer twenty times on large photos, and watch the app's
+memory. Or open and close the Share dialog of a shared folder many times.
+
+**Cause.** Every handler of the viewer held a strong `Rc<Viewer>`, and the viewer holds the
+widgets those handlers belong to. Several handlers also held the window, which owns them. Each
+pair was a reference cycle, so a closed viewer was never freed: not its window, and not the
+full-size photo its picture showed. The Share dialog had the same cycle between its state and
+the handlers of the rows inside the groups that state holds.
+
+**Fix.** The handlers hold weak handles to the viewer and its window. The one strong handle sits
+in the window's close handler, which drops it on close and clears the picture. The Share
+dialog's row handlers hold the state weakly too.
+
+**Test:** none automated; the GUI tests run without a display. Checked by reading every handler
+`open_photo_viewer` and the share rows connect.
+
+---
+
+### B240 — pdfs mount can be core-dumped with the keys in memory
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, core dumps and the
+file-manager script).
+**Where:** `main` in `crates/pdfs-cli/src/main.rs`; `script_body` in
+`crates/pdfs-core/src/shell.rs`
+
+**Repro:**
+- Run `pdfs mount` and send it `SIGSEGV`, with core dumps enabled. The dump holds the key
+  passphrases.
+- In the mount, name a file `--json` and choose **Scripts → Keep offline** on it in Nautilus.
+
+**Cause.** Only `pdfs daemon` marked itself non-dumpable. `pdfs mount`, `login`, `unlock` and
+`logout` hold the password, the key passphrases or the session tokens too, and could be
+core-dumped or ptraced by another process of the same user. Separately, the file-manager script
+ran `pdfs pin "$path"`, so a file named like an option was read as one.
+
+**Fix.** Those five commands mark themselves non-dumpable at start. The script passes each path
+after `--`. A name with a newline still arrives split from Nautilus, whose list is
+newline-separated; `pdfs` then fails on both halves and changes nothing.
+
+The app's own login was left as it is: a non-dumpable GUI process hides its `/proc` entries from
+the desktop portal, which identifies the caller through them.
+
+**Test:** `tests::a_path_after_a_double_dash_is_a_path_even_when_it_looks_like_a_flag` in
+`crates/pdfs-cli/src/main.rs`; `shell::tests::the_script_ends_options_before_each_path`.
+
+---
+
+### B239 — --wait reports success for imports and re-dates that failed
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, CLI).
+**Where:** `finished_run`, `cmd_import_google_photos` and `cmd_redate_photos` in
+`crates/pdfs-cli/src/main.rs`; the run threads in `crates/pdfs-fuse/src/takeout.rs` and
+`redate.rs`; `ImportSummary::error` and `RedateSummary::error` in `crates/pdfs-core/src/control.rs`;
+`refresh_takeout` in `crates/pdfs-gui/src/app/pages/takeout.rs`
+
+**Repro:** `pdfs import-google-photos --wait notes.txt; echo $?`, or an import where some photos
+fail to upload, or one cancelled from the app.
+
+**Cause.** `--wait` exited 0 however the run ended. A run that failed as a whole (an archive that
+is not a zip) left no summary at all, so the CLI printed "No import has run yet" and the app
+announced "Import finished". A run with failed photos, or a cancelled one, also exited 0. A
+script could not tell any of these from a clean run.
+
+**Fix.** A run that fails as a whole now leaves a summary with the reason. `--wait` exits 1 when
+the run failed, was cancelled, left photos failed, or ended without a result, and says which.
+The app shows the reason instead of "Import finished".
+
+**Test:** `tests::a_waited_for_run_that_did_not_fully_succeed_exits_with_an_error` in
+`crates/pdfs-cli/src/main.rs`.
+
+---
+
+### B238 — Draining a large offline batch is quadratic in its size
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.2.5).
+**Where:** `MIGRATION_V43` in `crates/pdfs-core/src/db/migrations.rs`; the queries in
+`has_pending_trash_named`, `has_withdrawn_create`, `has_pending_move_from` and
+`wake_ops_waiting_for_tx` in `crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Offline, copy a folder of 20,000 small files into the mount, then go online and watch
+the queue drain.
+
+**Cause.** Before each create, rename and trash, the drain asks whether a queued trash or rename
+holds the name it wants, and a name that is let go wakes the ops waiting for it. Nothing indexed
+the queue by name, so each of those questions read the whole queue. Draining a large offline
+batch therefore took time quadratic in its size, under the database's write lock for the wake.
+
+**Fix.** Schema 43 adds an index on `pending_op(kind, name)`. The kind leads, so the lookup of
+every queued rename uses it too. The `json_extract` on a rename's original name still reads the
+renames, which are few.
+
+**Test:** `db::tests::queue_name_checks_use_an_index`, which checks the query plans.
+
+---
+
+### B237 — Every reconnect resends refused uploads, all in the same second
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.3.3).
+**Where:** `drain_backoff` in `crates/pdfs-fuse/src/drain.rs`; the reconnect in
+`crates/pdfs-fuse/src/link.rs`; `Db::retry_unrefused_ops_now` in
+`crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Fill the Drive quota and queue a few hundred files, then let the link drop and come
+back a few times.
+
+**Cause.** Three things together:
+- Every reconnect made every failed op due at once, the ones Drive refused for quota or access
+  included. Each reconnect then sent the whole refused queue again.
+- All ops that failed together were retried together: the backoff had no spread.
+- The doubling stopped at 2^6, so the wait never grew past 128 s, and the 300 s maximum was never
+  reached.
+
+**Fix.** A reconnect makes due only the ops without a recorded refusal. "Retry all" still moves
+every op. The backoff doubles up to the 300 s maximum, plus up to a fifth more, which differs
+from op to op.
+
+**Test:** `db::tests::a_reconnect_leaves_refused_ops_to_their_backoff`;
+`drain::tests::a_failing_op_backs_off_to_the_maximum_with_a_spread`.
+
+---
+
+### B236 — Imported, re-dated and app-uploaded photos have no thumbnail
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.2).
+**Where:** `Core::import_takeout` and `stage_takeout_entry` in `crates/pdfs-fuse/src/takeout.rs`;
+`Core::redate_one` in `redate.rs`; the `UploadPhoto` request in `control.rs`;
+`can_make_thumbnail` in `photos.rs`
+
+**Repro:** Import a Google Takeout export, re-date a photo, or upload a photo from the app's
+gallery. Look at the new photos in Proton's web or phone app.
+
+**Cause.** All three paths uploaded with an empty thumbnail list. The drain and the mirror sync
+make thumbnails for what they upload, but these three did not, so the photos showed as blank
+tiles in Proton's apps. The 3.0 changelog says imports carry thumbnails.
+
+**Fix.** The re-date and the app's upload make thumbnails from the file they upload. A Takeout
+photo that can have a thumbnail (an image small enough to decode, or a video while ffmpeg is
+installed) is copied out of the archive into the private staging folder first. The thumbnail is
+made from the copy, the upload reads the copy, and the copy is removed. When the copy fails, the
+photo is uploaded from the archive without a thumbnail, as before.
+
+**Test:** `photos::thumb_tests::only_a_photo_that_can_have_a_thumbnail_is_worth_copying_out`; the
+thumbnail itself is covered by the existing `thumb_tests`.
+
+---
+
+### B235 — Scanning a large Takeout folder takes half a minute
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.1).
+**Where:** `SidecarIndex` and `find_sidecar` in `crates/pdfs-core/src/takeout.rs`
+
+**Repro:** Scan a Google Takeout export with 10,000 photos in one folder, as "Photos from 2019"
+folders often are.
+
+**Cause.** Each photo was ranked against every sidecar of its folder, so the scan grew with the
+square of the folder size: 2,000 photos took 0.8 s, 10,000 took 27–32 s before the import
+showed anything.
+
+**Fix.** The sidecars of a folder are kept in a sorted map by stem. Every matching rule needs the
+stem to start with a prefix that the photo name determines, so each photo is ranked only against
+the stems found by a few range lookups. On the same 10,000 photos the scan takes 0.1 s, with the
+same matches: ties still go to the first sidecar by name.
+
+**Test:** `takeout::tests::the_sidecar_index_finds_what_ranking_every_sidecar_finds`, which
+compares the index with ranking every sidecar, across every rule.
+
+---
+
+### B234 — Any folder can become a sync root, the home folder included
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.12).
+**Where:** `crates/pdfs-core/src/syncroot.rs`; `Core::add_sync_folder` and `sync_root_reserved` in
+`crates/pdfs-fuse/src/devices.rs`; `Core::restore_sync_folders` and the restore proposals in
+`crates/pdfs-fuse/src/profile.rs`
+
+**Repro:** `pdfs sync add ~`, or `pdfs sync add /`. Or restore a profile whose recorded path is
+`/home/u/../..`, or whose folder on Drive has a name with a `/`.
+
+**Cause.** A new sync root was only checked for being a directory and not already synced. A
+restore checked only that the path was absolute. Nothing refused `/`, the home folder, a parent
+of either, the Proton Drive mount, the app's own state, cache and config folders, or a root
+inside or around another root. Adding the home folder uploads the decrypted content cache,
+`cache.db` and `~/.ssh`, and walks into the mount, which downloads the Drive only to upload it
+again. A restore proposal joined a folder name from Drive onto the home folder as it was.
+
+**Fix.** One check, `syncroot::problem`, runs wherever a root is added or restored. It refuses
+the cases above. Paths are compared after `syncroot::resolve`, which follows symlinks as far as
+the path exists and refuses `..`. Restore proposals leave out folders whose name could not be a
+local file name.
+
+The audit also suggested not crossing into other file systems during the local walk. That was
+left out on purpose: a btrfs subvolume inside a sync root has a device id of its own, and would
+silently stop syncing.
+
+**Test:** `syncroot::tests` (six cases, among them
+`the_file_system_root_home_and_its_parents_are_refused` and
+`a_root_inside_or_around_another_root_is_refused`).
+
+---
+
+### B233 — Signing out leaves the session valid on Proton
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, logout).
+**Where:** `logout` and `end_server_session` in `crates/pdfs-core/src/auth.rs`; `cmd_logout` in
+`crates/pdfs-cli/src/main.rs`
+
+**Repro:** Copy the keyring entry, run `pdfs logout` (or **Sign Out** in the app), and resume a
+session from the copy.
+
+**Cause.** Signing out only deleted the keyring entry and the local caches. The session was never
+ended on Proton's side, so its tokens stayed valid until they expired. The SDK has the call for
+it (`ProtonApiSession::end`, `DELETE auth/v4`); nothing used it.
+
+**Fix.** Logout resumes the stored session and ends it on Proton before it clears anything
+locally. The call is bounded to 10 s and runs on a thread of its own. When Proton cannot be
+reached, the local sign-out still happens, and `pdfs logout` says that the session stays valid
+until it expires or is signed out in the account's security settings.
+
+**Test:** none automated; ending a session needs a live account.
+
+---
+
+### B232 — Names with & or < show as empty rows or are drawn as markup
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, Pango markup injection).
+**Where:** the toast helpers in `crates/pdfs-gui/src/app/main.rs`; rows in
+`app/pages/shared.rs`, `devices.rs`, `status.rs`, `takeout.rs`, `photo_viewer.rs`,
+`app/widgets/share_dialog.rs`, `details.rs`, `versions_dialog.rs`; every status page helper
+
+**Repro:** Accept an invitation to a folder named `R&D`, or name a computer `Tom & Jerry`.
+Its row in the app is empty. A name such as `<span size="80000">x</span>` is drawn as markup.
+
+**Cause.** Libadwaita rows, toasts and status page descriptions read their text as Pango markup
+unless told otherwise. Names that other people control (shared items, inviter addresses, device
+names, link URLs), file paths, EXIF values and daemon error messages went in unescaped. Text that
+did not parse showed as an empty row; text that did was drawn as markup.
+
+**Fix.** Rows and toasts that show such text are built with `use_markup(false)`. Status page
+descriptions, which have no such switch, are escaped with `markup_escape_text`.
+
+**Test:** none automated; the change only sets a widget property. Checked by reading every row,
+toast and status page that takes text from outside the program.
+
+---
+
+### B231 — A large upload under a low upload limit never finishes
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.9).
+**Where:** `upload_deadline` in `crates/pdfs-fuse/src/link.rs`; `TransferRegistry::upload_cap` in
+`crates/pdfs-fuse/src/transfers.rs`; the three uploads in `crates/pdfs-fuse/src/drain.rs`
+
+**Repro:** Set the upload limit to 512 KiB/s or less, and queue several large files.
+
+**Cause.** An upload's deadline allowed for at least 32 KiB/s. The upload cap is one budget
+shared by every running upload: up to 16 drain workers and 8 mirror sync tasks. Under a low cap
+each upload got less than 32 KiB/s, so a large file ran out of time on every attempt. The
+timeout took the mount offline, and on reconnect the upload started again from its first byte.
+
+**Fix.** The deadline counts an upload's share of the cap as the slowest rate when that share is
+below 32 KiB/s. Without a cap, or with a generous one, the deadline is unchanged.
+
+**Test:** `link::tests::an_upload_under_a_low_cap_gets_the_time_its_share_of_the_cap_needs`.
+
+---
+
+### B230 — A create queued offline adopts another device's file of the same name
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.14).
+**Where:** `adoptable` and `Core::first_sent` in `crates/pdfs-fuse/src/drain.rs`;
+`note_create_target`, `create_first_sent` and `parse_sent_to` in
+`crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Offline, create an empty file `notes.txt` in the mount. Before this machine goes
+online again, create an empty `notes.txt` in the same folder on another device. Go online.
+
+**Cause.** A queued create that finds its name taken may adopt the node there, when that node is
+the one an earlier attempt made and lost the answer to (B127, B184). One condition is that the
+node was made around the time of the op. That time was when the op was queued, so an op queued
+offline for days accepted any empty node of the same name made since, including another
+device's file or folder. A folder adopted that way merged both devices' contents.
+
+Separately, a `sent_to` record that did not parse was read as empty, and the next target
+replaced it. That erased the earlier targets the B184 and B191 checks look for.
+
+**Fix.** Each target in `sent_to` now records when it was first sent, and the adoption window
+starts at the op's first send. Records written before this change fall back to the queue time.
+A record that does not parse is kept as it is and a warning is logged. Without it a lost answer
+forks a conflict copy, which loses nothing.
+
+**Test:** `db::tests::a_create_remembers_when_it_was_first_sent`;
+`drain::tests::only_a_fresh_empty_twin_of_the_same_kind_is_adopted`.
+
+---
+
+### B229 — A queued write can be lost to a power cut after close returned
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.13).
+**Where:** `Durable` and `Db::durable` in `crates/pdfs-core/src/db/mod.rs`; `enqueue_op`,
+`replace_ops_with_trash`, `attach_blob_to_create`, `finish_create` and `rewrite_op_target` in
+`crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Write a file into the mount, let `close()` return, and cut the power before the next
+WAL checkpoint.
+
+**Cause.** The write connection runs with `synchronous=NORMAL`. In WAL mode a commit then
+survives a crash of the process but not a power loss, because the WAL is synced only at
+checkpoints. The staged blob is synced to disk before its op is queued, but the `pending_op` row
+that makes it reachable could roll back. The write `close()` reported as done was then gone, and
+the blob was deleted as an orphan later.
+
+**Fix.** The commits that accept a change into the queue raise the writer to
+`synchronous=FULL` for themselves and set it back to NORMAL after. A FULL commit syncs the WAL,
+which covers the NORMAL commits before it too. The other writes keep NORMAL's cost.
+
+**Test:** `db::tests::queueing_a_write_commits_at_full_sync_and_restores_normal`.
+
+---
+
+### B228 — A gap-filled write whose upload answer was lost becomes a conflict copy of itself
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.8).
+**Where:** `Core::drain_revision` in `crates/pdfs-fuse/src/drain.rs`; `Db::update_op_meta_for_blob`
+in `crates/pdfs-core/src/db/ops.rs`
+
+**Repro:** Offline, write a few bytes into the middle of a large file that is only on Drive, and
+close it. Go online, and lose the answer to the upload that follows (a timeout, or a daemon
+stopped before the op is retired).
+
+**Cause.** The staged blob of such a write holds only the written ranges. The drain fills the
+gaps from the base before the upload, in place, but the op's sidecar still said
+`complete = false`. The retry then saw a new remote revision, and both checks that recognise
+the daemon's own lost upload (`is_own_self_supersede` and the B155 SHA-1 match) require a
+complete blob. The write was treated as a conflict and uploaded again as a
+`(sync-conflict)` copy of itself.
+
+**Fix.** After a successful gap-fill the drain records the sidecar as complete. The update is
+made only while the op still holds that blob, so a newer write that closed in the meantime keeps
+its own sidecar.
+
+**Test:** `db::tests::marking_a_blob_whole_leaves_a_newer_blob_alone`.
+
+---
+
+### B227 — Reading a file open for writing downloads on the dispatch loop
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.2).
+**Where:** `read` in `crates/pdfs-fuse/src/filesystem.rs`; `Core::serve_open_read_local` and
+`assemble_open_read` in `crates/pdfs-fuse/src/reads.rs`
+
+**Repro:** On a slow link, open a large file that is only on Drive with `O_RDWR`, write a few
+bytes, and read elsewhere in it, as SQLite and many editors do, while another program uses the
+mount.
+
+**Cause.** A read on a file open for writing was always answered on the dispatch loop, so that it
+kept its order with the writes on the same handle. When the bytes it asked for were neither
+written nor cached, it downloaded them there, for up to the 120 s read deadline plus the wait
+for a connection. Every other request of the mount waited behind it.
+
+**Fix.** The dispatch loop answers such a read from the scratch file and the local caches only.
+When a range of the base would have to be downloaded, the read goes to a transfer worker, with
+the handle as it was when the read came in. The kernel issued the read before any later write,
+so that is the content it asked for.
+
+**Test:** `reads::open_read_tests::a_read_needing_the_base_says_so_instead_of_fetching`; the
+simulation runs cover the order of writes and reads on one handle.
+
+---
+
+### B226 — Thumbnails of portrait phone photos lie on their side
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.4.4).
+**Where:** `decode_upright` and `scale_thumbnail_with_exiftool` in
+`crates/pdfs-fuse/src/photos.rs`
+
+**Repro:** Upload a portrait photo taken with a phone that stores landscape pixels plus an EXIF
+orientation tag, which most do. Its tile in the app, and in Proton's own apps, lies on its side.
+
+**Cause.** Generated thumbnails were decoded with `ImageReader::decode`, which ignores the EXIF
+orientation. Only the RAW preview path applied it. The drain uploads the generated thumbnail with
+the photo, so every client showed it sideways.
+
+**Fix.** `decode_upright` reads the orientation from the decoder and applies it before the image
+is scaled.
+
+**Test:** `photos::tests::a_thumbnail_is_turned_the_way_its_exif_says`.
+
+---
+
+### B225 — A Takeout photo without a sidecar takes a sibling's name and date
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.11). A scratch import through
+`scan_archives` gave `IMG_12.jpg`, which had no sidecar, the name `IMG_1.jpg` and IMG_1's capture
+time. It gave `IMG_2-edited.jpg` the title of its original.
+**Where:** `sidecar_rank`, `find_sidecar` and `is_edited_copy_of` in
+`crates/pdfs-core/src/takeout.rs`
+
+**Repro:** Import a Takeout folder holding `IMG_1.jpg` with its sidecar and `IMG_12.jpg` without
+one.
+
+**Cause.** The last matching rule accepted any sidecar whose stem, cut at a `.`, was a prefix of
+the photo's name. That rule exists for sidecar names Google cut at its 51-character cap, but it
+also matched short names that had not been cut, so `IMG_1`'s sidecar claimed `IMG_12.jpg`. The
+photo then went up under another photo's title and date, and two photos ended up with the same
+name. Edited copies, which Google exports without a sidecar of their own, matched the same way
+and took their original's title.
+
+**Fix.** The prefix rule applies only to a sidecar name that reaches the cap. An edited copy,
+`<original>-<word>.<ext>` with the word in any language, is matched to its original's sidecar
+by its own rule. It takes the capture time from that sidecar and keeps its own name.
+
+**Test:** `takeout::tests::a_photo_without_a_sidecar_does_not_take_a_shorter_named_siblings`,
+`takeout::tests::an_edited_copy_takes_its_originals_date_and_keeps_its_name`,
+`takeout::tests::longest_prefix_wins_when_the_photo_name_itself_was_truncated`.
+
+---
+
+### B224 — `fallocate` zero ranges are undone and collapse ranges corrupt the file
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` section 3, FUSE semantics).
+**Where:** `fallocate`, `falloc_kind` and `FallocKind::effect` in
+`crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** `fallocate --zero-range -o 0 -l 4096 FILE` on a file in the mount whose content is on
+Drive, then close it: the range comes back with its old bytes. `fallocate --collapse-range` on the
+same file corrupts it.
+
+**Cause.** The handler passed any mode to the scratch file and recorded only a punched hole or
+growth. A zeroed range stayed "not written", so the commit filled it in again from the remote
+base. A collapse or an insert moved bytes in the scratch file that `len` and `written` did not
+follow. Every failure came back as `EIO`, so glibc's `posix_fallocate` did not fall back to
+writing zeros, and `ENOSPC` was lost. The syscall also ran under the global state lock.
+
+**Fix.** Only plain allocation, `KEEP_SIZE`, `PUNCH_HOLE | KEEP_SIZE` and `ZERO_RANGE` with or
+without `KEEP_SIZE` are accepted; anything else gets `EOPNOTSUPP`. A zeroed or punched range
+counts as written, and growth updates the length. The syscall's own errno is passed through, and
+the lock is not held across it.
+
+**Test:** `filesystem::falloc_tests::only_the_modes_a_handle_can_record_are_accepted`,
+`filesystem::falloc_tests::a_zeroed_or_punched_range_counts_as_written`.
+
+---
+
+### B223 — A damaged config file is replaced with defaults on the next settings change
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.10).
+**Where:** `AppDirs::save_config`, `AppDirs::load_config` and `refuse_to_replace_unreadable` in
+`crates/pdfs-core/src/config.rs`
+
+**Repro:** Truncate `~/.config/proton-drive-linux/config.json`, then change any setting in the
+app, or let the daemon record its device.
+
+**Cause.** `load_config` gives defaults for a file it cannot parse, and logs that it leaves the
+file alone. But every setter loads, changes one field and saves, in the daemon and in the app.
+So the first change after the damage wrote the defaults over the file, losing the mountpoint,
+the device the client had adopted, the ignore rules and the `open_with` choices. ARCHITECTURE
+§10.5 says the file is never replaced with defaults. The first-run default was also written with a
+plain `std::fs::write`, which is not atomic and takes the umask's mode.
+
+**Fix.** `save_config` refuses while the file on disk exists and does not parse, and says which
+file to fix. The first-run default goes through `save_config`, so it is written atomically with
+mode 0600.
+
+**Test:** `config::tests::an_unreadable_config_is_never_written_over`.
+
+---
+
+### B222 — A full disk at close is reported to nobody, and `fsync` on a read-only file fails
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.5 and section 3, FUSE semantics).
+**Where:** `flush`, `serve_fsync` and `scratch_sync_errno` in `crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Fill the disk that holds the cache, then save a file in the mount: the program reports
+success. Separately, `python3 -c 'import os; os.fsync(os.open("FILE", os.O_RDONLY))'` on a file
+in the mount fails with `EBADF`.
+
+**Cause.**
+- `flush` answered `ok` at once, and `release` synced the scratch file and queued it. `close(2)`
+  returns what `flush` answers; the kernel drops the answer to `release`. Delayed allocation
+  usually holds `ENOSPC` back until the sync, so a full disk was reported to nobody.
+- The same sync in `release` wrote back the whole file on the dispatch loop, so copying a large
+  file stalled every other request on the mount.
+- A descriptor opened for reading has no write handle, and `fsync` answered it with `EBADF`,
+  which POSIX does not allow.
+
+**Fix.** `flush` syncs the scratch file of a handle with writes on it, on a transfer worker, and
+returns `ENOSPC`, `EDQUOT` or `EIO` when that fails. `release` then finds the pages already on
+disk. `fsync` on a descriptor without a write handle succeeds.
+
+**Test:** `sim::daemon::tests::close_syncs_a_written_file_and_fsync_accepts_a_read_only_one`.
+
+---
+
+### B221 — A cold listing holds the global lock across a database transaction
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.4).
+**Where:** `Core::list_children` in `crates/pdfs-fuse/src/lib.rs`; `State::intern_batch_with_inos`,
+`inos_for` and `State::record_listed` in `crates/pdfs-fuse/src/state.rs`; `serve_mkdir` in
+`crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** List a large folder for the first time while another program stats files elsewhere in
+the mount, and while the drain is busy.
+
+**Cause.** A new node's inode comes from its row's local id, which `Db::lids_for` allocates in a
+write transaction. A cold listing ran that transaction for every new child while it held the
+global state lock, and then marked the folder listed, also under the lock. Every inline handler
+of every mount waits on that lock, and the transaction itself waits on the single write
+connection that the drain and the sync engine also use. That went against the `StateGuard`
+outbox, which exists so that the lock is released before the writes are done. Marking the folder
+listed before its children's rows were written also meant a crash in between left a folder
+recorded as complete with no children.
+
+**Fix.** `inos_for` allocates the listing's ids before the lock is taken, and
+`intern_batch_with_inos` uses them. Marking a folder listed goes through the outbox with
+`record_listed`, after the children's rows.
+
+**Test:** `state::tests::inodes_allocated_before_the_lock_are_the_ones_the_node_keeps`,
+`state::tests::a_listing_is_recorded_complete_after_its_children`.
+
+---
+
+### B220 — Thumbnails on a stalled link hold up every other request
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.3 and 2.1.11).
+**Where:** `Core::thumbnail`, `Core::run_size_upgrade` and `Core::ensure_shared_children` in
+`crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Open a folder of photos in a file manager while the link stalls.
+
+**Cause.** A file manager asks for a thumbnail per file, through `getxattr` on the metadata
+workers. The download had no deadline of its own, so on a stalled link each one held a worker for
+the SDK's whole retry budget, about two minutes. Only three workers are kept for metadata, so
+every cold `lookup`, `create` and `rename` on the mount queued behind them. Offline, every
+uncached thumbnail still went to the network. The size upgrade and the Shared with me listing
+had the same unbounded calls.
+
+**Fix.** Offline, a thumbnail that is not cached is answered as absent. Online, its download
+gives up after `INTERACTIVE_CALL_TIMEOUT` (20 s). Each chunk of a size upgrade and the two calls
+behind the Shared with me listing give up after `BATCH_CALL_TIMEOUT` (60 s).
+
+**Test:** `tests::a_handler_does_not_wait_out_the_sdk_retry_budget`.
+
+---
+
+### B219 — Listing a shared folder freezes the whole mount on a slow link
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.1.1).
+**Where:** `Core::children_cached` in `crates/pdfs-fuse/src/lib.rs`; `lookup`, `opendir` and
+`readdir` in `crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Open a folder shared with you, wait more than a minute, then `ls` it on a slow link
+while another program reads files elsewhere on the mount.
+
+**Cause.** A handler answered inline whenever the folder's listing was resident, and handed off
+to a worker only otherwise. But `list_children` fetches a shared folder again once its listing is
+a minute old, and the Shared with me root likewise. That fetch ran on the dispatch loop, the
+single thread that reads every request of the mount, so all of them waited for Drive.
+
+**Fix.** `children_cached` asks the same question `list_children` does: a shared listing that
+would be fetched again counts as not cached, so the request goes to a metadata worker.
+
+**Test:** `tests::a_stale_shared_listing_is_fetched_off_the_dispatch_loop`.
+
+---
+
+### B218 — `pdfs diagnose` freezes the mount while it checks the database
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.2.2). `PRAGMA integrity_check` took
+33.9 s on a copy of a live 567 MiB `cache.db`.
+**Where:** `Db::integrity_check` and `Db::stats` in `crates/pdfs-core/src/db/maintenance.rs`
+
+**Repro:** Run `pdfs diagnose` or `pdfs cache inspect` on a large database while copying files
+into the mount.
+
+**Cause.** Both read the whole file through the single write connection. Every write in the
+daemon took that connection's mutex in the meantime: the write-through of the tree, the drain's
+claims, every enqueue. So the mount looked hung for as long as the check ran.
+
+**Fix.** Both run on a pooled read connection. WAL lets them read a consistent snapshot while the
+writer goes on. `VACUUM` still needs the write connection and remains a deliberate command.
+
+**Test:** `db::maintenance::tests::the_integrity_check_and_stats_do_not_wait_for_the_writer`.
+
+---
+
+### B217 — The search indexes grow to many times their size and slow search down
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 2.2.1 and 2.2.3). On a live 567 MiB
+`cache.db`, `local_fts` held 317 MiB for 40,000 indexed paths. Rebuilt, it was 20 MiB, and a
+search candidate query went from 27 ms to 7 ms. `nodes_fts` shrank from 21 to 16 MiB.
+**Where:** `Db::local_finish_scan`, `Db::compact_search_indexes_if_due` in
+`crates/pdfs-core/src/db/local.rs`; `index_local_files` in `crates/pdfs-fuse/src/background.rs`
+
+**Repro:** Run the daemon for weeks with a home directory where files come and go, then compare
+the size of `local_fts_data` with what a `rebuild` leaves.
+
+**Cause.** FTS5 keeps a deleted entry's data until the segments holding it are merged, and with
+the few large segments these indexes settle into, that is close to never. The client never ran
+`optimize` or `rebuild`. The local scan made it worse: a scan that stopped at the entry cap, or
+lost a batch, still pruned every path it had not reached, and the next scan put them all back.
+
+**Fix.** The search indexes are compacted at most once a day, at the end of a local scan:
+`local_fts` is rebuilt from `local_files`, and `nodes_fts` is merged into one segment. Each takes
+about half a second at that size. A scan that did not see everything closes with
+`local_finish_partial_scan`, which prunes nothing.
+
+**Test:** `db::tests::compacting_the_search_indexes_keeps_them_whole_and_runs_once_a_day`,
+`db::tests::a_partial_local_scan_prunes_nothing`.
+
+---
+
+### B216 — A damaged database is rebuilt without the writes still queued in it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.7).
+**Where:** `Db::open`, `salvage` and `quarantine_corrupt_db` in `crates/pdfs-core/src/db/mod.rs`
+
+**Repro:** Damage `cache.db` so that SQLite reports `SQLITE_CORRUPT` or `SQLITE_NOTADB` at open,
+with writes still queued.
+
+**Cause.** Opening a damaged database moved it aside and started an empty one, logging that
+"no user data is stored here". The same file holds the upload queue (`pending_op`), the mirror
+baselines (`sync_entry`, `sync_folder`), the pins and the record of revisions this machine sealed.
+Every queued create, rename and trash was dropped without a word. The staged blobs lost their ops,
+and those of files made here could never be queued again.
+
+**Fix.** After the rebuild, `salvage` attaches the damaged file read only and copies those tables
+back, each in its own transaction and with only the columns both files have. The queue keeps the
+node rows it names by local id, so files made here keep their identity; those rows come back
+unlisted, so their folders are fetched again. A table SQLite cannot read to the end is left out
+and logged as an error.
+
+**Test:** `db::tests::a_rebuild_keeps_the_queue_baselines_and_pins_of_the_damaged_file`,
+`db::tests::a_corrupt_database_is_moved_aside_and_rebuilt`.
+
+---
+
+### B215 — A remote name holding `/` or `..` becomes a path outside the sync folder
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.2).
+**Where:** `walk_remote` and `walk_remote_dirs` in `crates/pdfs-fuse/src/sync.rs`; `node_visible`
+in `crates/pdfs-fuse/src/lib.rs`
+
+**Repro:** Needs a node whose decrypted name holds `/`, `..` or NUL. Drive checks names only when
+a client creates or renames a node, and only for length, so another client or a server that
+should not be trusted can make one. Then let a mirror pass or a listing of its folder run.
+
+**Cause.** The mirror engine joined each decrypted name onto its parent's relative path and
+turned that into a local path, so `x/../../.config/autostart/a.desktop` named a file outside the
+sync root. The pass then created, replaced or removed it there. In the mount, the kernel refuses a
+whole `readdir` with EIO when one name in it is not a single path component.
+
+**Fix.** `remote_name_is_safe` accepts a name only if it is one path component: not empty, not
+`.` or `..`, no `/` or NUL, at most 255 bytes. Both remote walks of the mirror engine and the
+listing filter of the mount leave out any other name, with a warning. A name left out cannot be a
+local path at all, so leaving it out cannot read as a deletion of anything local.
+
+**Test:** `tests::a_remote_name_that_is_not_one_path_component_is_left_out`.
+
+---
+
+### B214 — Deleting a mirror folder here trashes another device's new files in it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.5).
+**Where:** `Core::do_reconcile` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Delete a synced folder locally while another device adds a file to it on Drive, before
+the next pass.
+
+**Cause.** The pass planned the new file as a download, which recreated the folder locally. At
+the end of the same pass it trashed the remote folder, because the folder was in the baseline and
+gone locally, and took the new file with it. The next pass then saw the downloaded copy unchanged
+and its remote gone, so it deleted that too. The other device's work survived only in the Drive
+trash, and nothing said so.
+
+**Fix.** Before a pass trashes a remote folder, `remote_subtree_changed` looks for anything under
+it on Drive that is not in the baseline or whose signature moved. If there is, the folder stays on
+Drive with its row, the activity feed says why, and only its unchanged files are trashed, one by
+one, as local deletions.
+
+**Test:** `planner::file_plan_tests::a_remote_folder_with_new_or_changed_files_is_not_trashed`.
+
+---
+
+### B213 — A file edited during a mirror pass is deleted because Drive deleted it earlier
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.6).
+**Where:** `Core::do_reconcile`, `FilePlan::DeleteLocal`, in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Delete a synced file on another device. On this one, edit the file while a pass over a
+large folder walks Drive.
+
+**Cause.** A pass takes its local signatures before the remote walk, which takes minutes on a
+large tree, and deleted a file that Drive had deleted without looking at it again. Downloads got
+that second look in B39 (`keep_racing_local_edit`); deletions did not, so the edit was lost with
+no conflict copy.
+
+**Fix.** `changed_since_scan` compares the file's signature with the one the scan planned on, right
+before the deletion. A changed file stays, and the next pass uploads it as a new file.
+
+**Test:** `tests::a_file_changed_since_the_scan_is_not_deleted`.
+
+---
+
+### B212 — A node on Drive that cannot be decrypted is deleted from the mirror
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.4). The SDK leaves out nodes it cannot
+decrypt, which B112 showed on real accounts and B97 during cancellation.
+**Where:** `Core::walk_remote` and `Core::do_reconcile` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Make one synced file or folder fail to decrypt, for example with a key the session
+cannot unlock, and let a pass run.
+
+**Cause.** The remote walk kept what the SDK returned and nothing else. A node the SDK left out
+was then missing from the remote map, and the planner reads "in the baseline and here, but not on
+Drive" as a deletion on Drive. A file was deleted locally; a folder was removed with
+`remove_dir_all`. The local side had a guard against a scan that came back empty
+(`guard_local_wipe`), the remote side had none.
+
+**Fix.**
+- A listing that returns fewer nodes than it named marks its folder as short. A file whose size
+  could not be read is marked unread.
+- `RemoteGaps::hides` leaves out of the pass every path such a gap could explain, as `Unscanned`
+  does for the local scan. The folder is reported with the paths that cannot be synced.
+- `guard_remote_wipe` refuses a pass in which none of the synced paths is left on Drive.
+
+**Test:** `planner::file_plan_tests::a_short_remote_listing_hides_what_it_did_not_return`,
+`planner::file_plan_tests::a_file_whose_size_could_not_be_read_is_hidden`,
+`planner::file_plan_tests::the_remote_wipe_guard_blocks_only_a_total_disappearance`.
+
+---
+
+### B211 — A folder deleted on Drive takes unsynced local files with it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-16, architecture audit (`FINDINGS.md` 1.1).
+**Where:** `Core::do_reconcile` and `remove_local_dirs` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** In a mirror folder, add a file to a synced subfolder. Before the next pass, delete the
+subfolder on another device.
+
+**Cause.** The pass put the folder on its list of local deletions. The upload of the new file
+failed for want of a remote parent and was counted as an error. At the end of the pass,
+`remove_dir_all` removed the folder with everything in it: new files, edits, files open for
+writing, and ignored content such as `.git`, none of which had ever been on Drive.
+
+**Fix.** `remove_local_dirs` asks `mirror_subtree_unsynced` about each folder before it removes
+it, against the baseline as the pass has left it. A folder that holds anything Drive does not
+have stays, and loses its baseline row, so the next pass creates it on Drive again and uploads
+what it holds. What was synced in it is still deleted.
+
+**Test:** `tests::a_folder_deleted_on_drive_keeps_what_drive_never_had`,
+`tests::a_folder_deleted_on_drive_with_only_synced_content_is_removed`.
+
+---
 
 ### B210 — After a password reset, the mount retries "missing key" forever
 

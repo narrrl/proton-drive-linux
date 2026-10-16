@@ -10,8 +10,13 @@
 //! `dead_code` allowances below are for — not code nobody uses.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pdfs_core::control::{PhotoKind, SearchHit};
+
+/// How long a `stat` of the mount may take before the file counts as not
+/// there. A frozen mount never answers, and every caller has a fallback.
+const STAT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriveActivation {
@@ -55,16 +60,30 @@ pub(crate) fn mounted_target(mountpoint: &Path, hit: &SearchHit) -> Option<PathB
     present(mounted_or_relative(mountpoint, hit))
 }
 
-/// [`mounted_target`] for callers holding a mountpoint-relative path rather
-/// than a search hit — the browser's listing entries, which are by definition
-/// paths in the primary mount's tree.
-#[allow(dead_code)] // browser only
-pub(crate) fn mounted_target_rel(mountpoint: &Path, relative_path: &str) -> Option<PathBuf> {
-    present(mounted_path(mountpoint, relative_path))
-}
-
 fn present(path: PathBuf) -> Option<PathBuf> {
     path.symlink_metadata().is_ok().then_some(path)
+}
+
+/// Whether anything is at `path`, asked on a thread of its own and given up
+/// on after [`STAT_TIMEOUT`]. `None` means "not there" or "no answer".
+///
+/// For the GTK binaries, whose main thread must not `stat` the mount: a
+/// mount that hangs hung the whole window with it. The thread of a `stat`
+/// that never returns is left behind; there is no way to cancel one.
+#[allow(dead_code)] // GTK binaries only
+pub(crate) async fn present_within(path: PathBuf) -> Option<PathBuf> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(present(path));
+    });
+    match gtk4::glib::future_with_timeout(STAT_TIMEOUT, rx.recv()).await {
+        Ok(Ok(target)) => target,
+        Ok(Err(_)) => None,
+        Err(_) => {
+            tracing::warn!("the mount did not answer in time");
+            None
+        }
+    }
 }
 
 /// The mount path for a hit, whether or not anything is there — for callers

@@ -11,6 +11,126 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.5.0] — 2026-10-16
+
+Schema: **44**. Queued changes get an index by kind and name, and each synced file remembers the
+version on Proton Drive it was synced at. Nothing is rewritten, and the upgrade takes a moment.
+
+### Added
+- **Several computers can sync the same folders.** On the Computers page, **Sync With This
+  Computer…** on another computer, or `pdfs devices join`, makes this computer sync into that
+  computer's backup alongside it, then offers its folders for syncing here. Both computers keep
+  them in step, deletions included. Each computer now keeps its own settings backup in the
+  shared backup, so they no longer overwrite each other (B252).
+- **The app remembers its window size**, and whether it was maximized, between runs.
+
+### Fixed
+- **The app's window could not shrink to fit a small or scaled screen**, so the minimize,
+  maximize and close buttons ended up off-screen. Below about 760 pixels the sidebar and the
+  page now take turns, and every page fits in a window 480 pixels wide.
+- **The app showed the sign-in page when the system keyring was locked or not running yet**, as
+  if the sign-in had been lost. It now says that the keyring could not be read, and opens on its
+  own once the keyring answers (B253).
+- **A new version saved on another computer in the same second as an upload from here could
+  be missed for good** when Drive had not listed the uploaded file yet. The first sync pass
+  after upgrading reads each file's size from Drive once more to close this (B254).
+- **An edit in a synced folder could replace one another computer had just saved.** The newer
+  version from the other computer was left only in the version history. The edit is now kept as
+  a conflict copy (B249).
+- **A version saved on another computer while this one downloaded the previous version never
+  arrived.** (B250)
+- **Syncing a folder into one that already held a file of the same name and size took the two
+  for the same file**, even when their content differed. The content is now compared, and a
+  different file is kept as a conflict copy (B248).
+- **Conflict copies now name the computer that made them**, for example
+  `notes (sync-conflict laptop 1700000000).txt`, so two computers no longer make the same name
+  (B251).
+- **A folder deleted on another device took files with it that had never reached Drive.** A new
+  file, an edit or an ignored `.git` in a synced folder was deleted along with the folder. Such a
+  folder is now kept and created on Drive again (B211).
+- **Files on Drive that could not be decrypted were deleted from the synced folder.** They read
+  as deleted on Drive. They are now left alone and named in the activity feed, and a pass in which
+  nothing synced is left on Drive is refused (B212).
+- **An edit made while a synced folder was being checked could be deleted** when another device
+  had deleted the file. It is now kept and uploaded (B213).
+- **Deleting a synced folder sent another device's new files in it to the trash.** The folder now
+  stays on Drive with them (B214).
+- **A file name on Drive containing `/` or `..` could write outside the synced folder**, and made
+  its folder in the mount fail to list. Such names are left out (B215).
+- **A damaged database lost the changes still waiting to upload.** It is still moved aside and
+  rebuilt, but queued changes, synced folders' state and files kept offline are copied out of it
+  first (B216).
+- **Search slowed down over time, and the database grew far larger than needed.** The search
+  indexes are now compacted once a day; on one machine that took the local index from 317 MiB to
+  20 MiB (B217).
+- **`pdfs diagnose` and `pdfs cache inspect` froze the drive while they checked the database**,
+  for half a minute on a large one. They no longer hold up anything else (B218).
+- **Listing a folder shared with you could freeze the whole drive on a slow connection**, and so
+  could folders of photos asking for thumbnails while the connection stalled (B219, B220).
+- **Opening a large folder for the first time held up every other file operation on the drive.**
+  (B221)
+- **A full disk while saving a file was not reported.** The program saving it now gets the error
+  when it closes the file. Copying a large file into the drive no longer stalls everything else at
+  the end, `fsync` on a file opened for reading no longer fails, and `fallocate` modes the drive
+  cannot honour are refused instead of corrupting the file (B222, B224, B227).
+- **A damaged settings file was replaced with defaults at the next settings change**, losing the
+  mount location and the ignore rules. Settings are no longer saved over a file that cannot be
+  read (B223).
+- **Google Photos import gave some photos another photo's name and date.** A photo without its
+  own metadata file took a similarly named one's, and an edited copy took its original's name. An
+  edited copy now takes its original's date and keeps its own name (B225).
+- **Thumbnails of portrait photos lay on their side**, here and in Proton's own apps (B226).
+- **A write could be lost to a power cut after the program saving it had closed the file.** Saving
+  a change into the upload queue is now written through to disk (B229).
+- **A partly written file whose upload answer was lost came back as a conflict copy of itself.**
+  The retry now recognises its own upload (B228).
+- **A file or folder created offline could merge with another device's of the same name** made
+  while this computer was offline (B230).
+- **A large upload under a low upload limit never finished.** It ran out of time on every try,
+  took the drive offline and started over. Its time limit now allows for its share of the limit
+  (B231).
+- **Every reconnect sent all failed uploads again at once,** including those Proton had refused
+  for a full quota or missing access, and failed uploads were retried no later than every two
+  minutes. Refused uploads now keep their wait, which grows to five minutes, and retries are
+  spread out (B237).
+- **Signing out left the session valid on Proton.** It is now ended there too; `pdfs logout` says
+  so when Proton cannot be reached (B233).
+- **Any folder could be synced, the home folder included,** which uploaded the app's own cache
+  and walked into the drive itself. The root of the file system, the home folder and the folders
+  above it, the Proton Drive folder, the app's own data and folders inside or around another
+  synced folder are now refused, also when restoring another computer's folders (B234).
+- **Names with `&` or `<` showed as empty rows in the app**, and some names were drawn as
+  formatting, for example shared items, computer names and link addresses (B232).
+- **Photos imported from Google Photos, re-dated, or uploaded from the app had no thumbnail** in
+  Proton's apps (B236).
+- **Photos with no other date were filed under the day they were uploaded.** Their own EXIF date
+  is now used, for Google Photos imports and for uploads from the app (B244).
+- **Scanning a Google Photos export with a large folder took up to half a minute.** 10,000 photos
+  now take a tenth of a second (B235).
+- **Every photo opened in the viewer stayed in memory**, with its full-size image, until the app
+  quit. The Share dialog leaked the same way (B241).
+- **Opening a large photo froze the app** while it was decoded (B242).
+- **The app froze when opening a file while the drive did not respond.** It now falls back to
+  downloading the file after two seconds. Applications the app started also no longer linger as
+  zombie processes (B243).
+- **`pdfs import-google-photos --wait` and `pdfs redate-photos --wait` succeeded when the run
+  failed.** They now exit with an error when the run failed, was cancelled or left photos failed,
+  and the app shows why an import failed (B239).
+- **`pdfs mount`, `login`, `unlock` and `logout` could be core-dumped with the account's keys in
+  memory.** Only the background service was protected. A file named like an option, such as
+  `--json`, also broke the file manager's "Keep offline" script (B240).
+- **Signing in while the system keyring was locked froze the app window** until the keyring was
+  unlocked (B246).
+- **A program the background service started could keep it from being restarted when it hung**
+  (B245).
+- **The tray's transfer line was not translated** (B247).
+
+### Changed
+- **Draining a large batch of offline changes no longer slows down with its size.** The queue is
+  indexed by name (schema 43, B238).
+- **Release binaries are stripped of their symbols**: `pdfs` goes from 43 to 35 MB, `pdfs-app`
+  from 24 to 19 MB and `pdfs-tray` from 12 to 8 MB.
+
 ## [3.4.1] — 2026-10-16
 
 Schema: **42**, unchanged.
@@ -1804,6 +1924,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[3.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.5.0
 [3.4.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.1
 [3.4.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.4.0
 [3.3.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v3.3.0

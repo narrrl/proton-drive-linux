@@ -116,6 +116,7 @@ mod upload;
 mod r#virtual;
 mod workers;
 use background::{forget_and_notify, run_event_sync, run_local_index, run_photos_event_sync};
+use link::BATCH_CALL_TIMEOUT;
 pub(crate) use mount::is_stale_mount;
 pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
@@ -2120,12 +2121,39 @@ impl Core {
         }
     }
 
-    /// Whether `ino`'s listing is already in memory, i.e. whether
-    /// [`Core::ensure_children`] would return without touching the network.
-    /// Lets a handler decide between answering inline and handing off to a
-    /// worker, at the cost of one uncontended map lookup.
+    /// Whether [`Core::ensure_children`] would answer for `ino` without
+    /// touching the network. Lets a handler decide between answering inline
+    /// and handing off to a worker.
+    ///
+    /// A resident listing is not enough on its own. A shared folder's, or the
+    /// Shared with me root's, is fetched again once it is a minute old, and
+    /// that fetch ran on the dispatch loop, so every request on the mount
+    /// waited for Drive to answer (`docs/BUGS.md` B219).
     fn children_cached(&self, ino: u64) -> bool {
-        self.state().children.contains_key(&ino)
+        let (uid, resident) = {
+            let st = self.state();
+            match st.entries.get(&ino) {
+                Some(e) => (e.uid.clone(), st.children.contains_key(&ino)),
+                // `list_children` answers ENOENT without the network.
+                None => return true,
+            }
+        };
+        if !resident {
+            return false;
+        }
+        let freshness = if is_virtual_uid(&uid) {
+            Some(SHARED_WITH_ME_SYNCED_MS.to_string())
+        } else if !self.is_own_or_virtual(&uid) && !is_local_uid(&uid) {
+            Some(Self::shared_folder_freshness_key(&uid))
+        } else {
+            None
+        };
+        freshness.is_none_or(|key| {
+            !listing_needs_refresh(
+                self.online.load(Ordering::Relaxed),
+                self.shared_listing_stale(&key),
+            )
+        })
     }
 
     /// Re-apply the optimistic size of any queued write to `nodes`.
@@ -2293,8 +2321,7 @@ impl Core {
 
         let generation = self.shared_generation.load(Ordering::SeqCst);
         let accepted = accepted_share_provenance(
-            self.rt
-                .block_on(self.client.enumerate_shared_with_me())
+            self.block_on_within(BATCH_CALL_TIMEOUT, self.client.enumerate_shared_with_me())
                 .map_err(|error| {
                     error!(%error, "enumerating shared roots failed");
                     Errno::EIO
@@ -2303,12 +2330,14 @@ impl Core {
         let nodes = if accepted.uids.is_empty() {
             Vec::new()
         } else {
-            self.rt
-                .block_on(self.drive.enumerate_nodes_light(&accepted.uids))
-                .map_err(|error| {
-                    error!(%error, "materializing shared roots failed");
-                    Errno::EIO
-                })?
+            self.block_on_within(
+                BATCH_CALL_TIMEOUT,
+                self.drive.enumerate_nodes_light(&accepted.uids),
+            )
+            .map_err(|error| {
+                error!(%error, "materializing shared roots failed");
+                Errno::EIO
+            })?
         };
         let virtual_uid = shared_with_me_uid();
         let published = prepare_shared_roots(&accepted, nodes, &virtual_uid);
@@ -2687,6 +2716,7 @@ impl Core {
             return Ok(());
         }
 
+        let preassigned = state::inos_for(&self.db, &filtered_nodes);
         let mut st = self.state();
         // Lost the race? Another thread already populated it.
         if st.children.contains_key(&ino) {
@@ -2708,15 +2738,14 @@ impl Core {
             })
             .map(|n| n.uid.clone())
             .collect();
-        let inos = st.intern_batch(ino, filtered_nodes);
+        let inos = st.intern_batch_with_inos(ino, filtered_nodes, preassigned);
         child_inos.extend(inos);
         st.children.insert(ino, child_inos);
         let root_snapshot = primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
         // Record the listing as complete so a later restart (or a trimmed hot
-        // cache) can rebuild it from the DB without the API.
-        if let Err(e) = self.db.set_listed(&folder_uid, true) {
-            warn!(%folder_uid, error = %e, "db set_listed(true) failed");
-        }
+        // cache) can rebuild it from the DB without the API. Written with the
+        // children's rows when the lock goes, not under it.
+        st.record_listed(folder_uid.clone());
         drop(st);
         self.flush_access_changes();
         if let Some(snapshot) = root_snapshot {
@@ -2879,7 +2908,8 @@ impl Core {
         let (mut key, mut uids, mut slot) = (key, uids, slot);
         loop {
             for chunk in uids.chunks(SIZE_UPGRADE_CHUNK) {
-                let result = self.rt.block_on(self.drive.enumerate_nodes(chunk));
+                let result =
+                    self.block_on_within(BATCH_CALL_TIMEOUT, self.drive.enumerate_nodes(chunk));
                 self.apply_size_upgrade(key, result);
                 slot.chunk_done();
             }
@@ -4378,9 +4408,15 @@ impl Core {
         if self.thumbnail_misses.lock().remote_contains(&key, mtime) {
             return Ok(None);
         }
+        // A file manager asks for one per file in a folder, on the metadata
+        // workers. Offline, or on a stalled link, each one held a worker for
+        // the SDK's whole retry budget, and every cold lookup, create and
+        // rename on the mount queued behind them (`docs/BUGS.md` B220).
+        if !self.is_online() {
+            return Ok(None);
+        }
         let bytes = self
-            .rt
-            .block_on(self.client.download_thumbnail(&uid, ttype))
+            .block_on_bounded(self.client.download_thumbnail(&uid, ttype))
             .map_err(|e| {
                 warn!(%uid, error = %e, "download thumbnail failed");
                 Errno::EIO
@@ -6129,11 +6165,61 @@ fn is_gone(e: &(dyn std::error::Error + 'static)) -> bool {
 /// (`sync.rs`, `conflict_path`), so the two halves of the product name the same
 /// situation the same way and a user only has to learn it once.
 fn conflict_name(name: &str, stamp: i64) -> String {
+    conflict_name_as(name, conflict_label(), stamp)
+}
+
+/// [`conflict_name`] with the machine's label given.
+fn conflict_name_as(name: &str, label: &str, stamp: i64) -> String {
     let path = Path::new(name);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let tag = conflict_tag(label, stamp, 0);
     match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => format!("{stem} (sync-conflict {stamp}).{ext}"),
-        None => format!("{stem} (sync-conflict {stamp})"),
+        Some(ext) => format!("{stem} (sync-conflict {tag}).{ext}"),
+        None => format!("{stem} (sync-conflict {tag})"),
+    }
+}
+
+/// This machine's name as its conflict copies carry it (`docs/BUGS.md` B251).
+///
+/// Two computers syncing one folder that each keep a copy of the same file in
+/// the same second would otherwise make the same name on Drive, and nobody
+/// could tell which computer a copy came from. Read once, from the hostname.
+fn conflict_label() -> &'static str {
+    static LABEL: OnceLock<String> = OnceLock::new();
+    LABEL.get_or_init(|| conflict_label_of(&this_hostname()))
+}
+
+/// `host` as one token: anything but ASCII letters, digits, `-`, `_` and `.`
+/// becomes `-`, so the label holds no space for `conflict_base_name` to trip
+/// on and no `/` or `)` to break the name.
+fn conflict_label_of(host: &str) -> String {
+    let label: String = host
+        .chars()
+        .take(32)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    label.trim_matches('-').to_string()
+}
+
+/// The inside of a conflict copy's marker: `<label> <stamp>`, with `-<n>`
+/// when an earlier copy already holds that name. Without a label it is the
+/// bare stamp that copies had before B251.
+fn conflict_tag(label: &str, stamp: i64, suffix: u32) -> String {
+    let suffix = if suffix == 0 {
+        String::new()
+    } else {
+        format!("-{suffix}")
+    };
+    if label.is_empty() {
+        format!("{stamp}{suffix}")
+    } else {
+        format!("{label} {stamp}{suffix}")
     }
 }
 
@@ -6743,7 +6829,27 @@ fn fuse_name(name: &OsStr) -> Result<String, Errno> {
     name.to_str().map(str::to_owned).ok_or(Errno::EILSEQ)
 }
 
+/// Whether a decrypted remote name can stand as one local path component.
+///
+/// Drive checks names only when a client creates or renames a node, and only
+/// for length, so a name made by another client, or by a server that should
+/// not be trusted, can hold anything. Joined onto a local path, a `/` or a `..`
+/// in it walks out of the folder it belongs to, and the mirror engine would
+/// then write or delete outside the sync root. In the mount, the kernel fails
+/// the whole listing with EIO on a single such name (`docs/BUGS.md` B215).
+pub(crate) fn remote_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name.contains(['/', '\0'])
+}
+
 fn node_visible(node: &Node, folder_uid: &NodeUid, hidden: &HashSet<NodeUid>) -> bool {
+    if !remote_name_is_safe(&node.name) {
+        warn!(uid = %node.uid, "a remote name cannot be a local file name; leaving it out");
+        return false;
+    }
     !node.trashed && node.uid != *folder_uid && !hidden.contains(&node.uid)
 }
 
@@ -7492,14 +7598,15 @@ mod tests {
     use super::{
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
         SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
-        accepted_share_provenance, conflict_name, copy_pending_for_truncate, expand_restore,
-        first_seen_in_trash, fuse_name, is_stale_mount, node_visible, note_self_change,
-        off_the_runtime, orphan_past_retention, parse_node_uid, prepare_shared_roots,
-        preserve_on_access_denied, publish_virtual_root_in_listing,
-        reconcile_virtual_root_in_listing, release_can_discard_unlinked,
-        release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
-        require_node_parent_access, require_rename_access, resolve_anywhere_with,
-        shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
+        accepted_share_provenance, conflict_label, conflict_label_of, conflict_name,
+        conflict_name_as, copy_pending_for_truncate, expand_restore, first_seen_in_trash,
+        fuse_name, is_stale_mount, node_visible, note_self_change, off_the_runtime,
+        orphan_past_retention, parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
+        publish_virtual_root_in_listing, reconcile_virtual_root_in_listing,
+        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
+        rename_needs_queue, require_node_parent_access, require_rename_access,
+        resolve_anywhere_with, shared_with_me_uid, take_self_change, uid_write_authority,
+        virtual_node,
     };
     use super::{Db, WriteAuthority};
     use std::time::Duration;
@@ -8454,15 +8561,38 @@ mod tests {
     #[test]
     fn conflict_name_keeps_the_extension() {
         assert_eq!(
-            conflict_name("notes.txt", 1700),
-            "notes (sync-conflict 1700).txt"
+            conflict_name_as("notes.txt", "laptop", 1700),
+            "notes (sync-conflict laptop 1700).txt"
         );
-        assert_eq!(conflict_name("README", 42), "README (sync-conflict 42)");
         assert_eq!(
-            conflict_name("archive.tar.gz", 7),
-            "archive.tar (sync-conflict 7).gz",
+            conflict_name_as("README", "laptop", 42),
+            "README (sync-conflict laptop 42)"
+        );
+        assert_eq!(
+            conflict_name_as("archive.tar.gz", "laptop", 7),
+            "archive.tar (sync-conflict laptop 7).gz",
             "only the last extension is one, as everywhere else"
         );
+        assert_eq!(
+            conflict_name_as("notes.txt", "", 1700),
+            "notes (sync-conflict 1700).txt"
+        );
+        assert_eq!(
+            conflict_name("notes.txt", 1700),
+            conflict_name_as("notes.txt", conflict_label(), 1700)
+        );
+    }
+
+    /// A hostname goes into a file name, so it is cut down to one safe token
+    /// (B251).
+    #[test]
+    fn a_hostname_becomes_one_safe_token() {
+        assert_eq!(conflict_label_of("laptop"), "laptop");
+        assert_eq!(conflict_label_of("my-pc.local"), "my-pc.local");
+        assert_eq!(conflict_label_of("Linux device"), "Linux-device");
+        assert_eq!(conflict_label_of("a/b) c"), "a-b--c");
+        assert_eq!(conflict_label_of("  "), "");
+        assert_eq!(conflict_label_of(&"x".repeat(40)).len(), 32);
     }
 
     #[test]
@@ -8652,6 +8782,28 @@ mod tests {
             &folder_uid,
             &std::collections::HashSet::from([node.uid.clone()])
         ));
+    }
+
+    #[test]
+    fn a_remote_name_that_is_not_one_path_component_is_left_out() {
+        let folder_uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("folder"));
+        let none = std::collections::HashSet::new();
+        for name in [
+            "a/b",
+            "../../.bashrc",
+            "..",
+            ".",
+            "",
+            "a\0b",
+            &"x".repeat(256),
+        ] {
+            let node = node_helper("child", "folder", name, false);
+            assert!(!node_visible(&node, &folder_uid, &none), "{name:?}");
+        }
+        for name in [".hidden", "a..b", "unicodé-文件", &"x".repeat(255)] {
+            let node = node_helper("child", "folder", name, false);
+            assert!(node_visible(&node, &folder_uid, &none), "{name:?}");
+        }
     }
 
     #[test]
@@ -9157,6 +9309,32 @@ mod tests {
         assert_eq!(ensure.matches("adopt_stale_listing(").count(), 3);
         let online = function_source(include_str!("link.rs"), "fn mark_online(");
         assert!(online.contains("self.relist_offline_listings();"));
+    }
+
+    #[test]
+    fn a_stale_shared_listing_is_fetched_off_the_dispatch_loop() {
+        // A resident listing that `list_children` would fetch again anyway
+        // must not be answered inline (B219).
+        let cached = function_source(include_str!("lib.rs"), "fn children_cached(");
+        assert!(cached.contains("SHARED_WITH_ME_SYNCED_MS"));
+        assert!(cached.contains("Self::shared_folder_freshness_key(&uid)"));
+        assert!(cached.contains("listing_needs_refresh("));
+        assert!(cached.contains("self.shared_listing_stale(&key)"));
+    }
+
+    #[test]
+    fn a_handler_does_not_wait_out_the_sdk_retry_budget() {
+        // Thumbnails, size upgrades and the share list held mount threads for
+        // minutes on a stalled link (B220).
+        let lib = include_str!("lib.rs");
+        let thumbnail = function_source(lib, "fn thumbnail(");
+        assert_before(thumbnail, "if !self.is_online()", "download_thumbnail");
+        assert!(thumbnail.contains(".block_on_bounded(self.client.download_thumbnail("));
+        let upgrade = function_source(lib, "fn run_size_upgrade(");
+        assert!(upgrade.contains("block_on_within(BATCH_CALL_TIMEOUT"));
+        let shared = function_source(lib, "fn ensure_shared_children(");
+        assert!(shared.contains("block_on_within(BATCH_CALL_TIMEOUT"));
+        assert!(!shared.contains("self.rt"));
     }
 
     #[test]

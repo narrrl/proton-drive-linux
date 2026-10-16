@@ -630,6 +630,16 @@ enum DeviceCmd {
         #[arg(long, conflicts_with = "uid")]
         clear: bool,
     },
+    /// Sync the same folders as another computer: this machine continues that
+    /// computer's device alongside it, and its folders are offered for syncing
+    /// here. Both computers keep them in step.
+    Join {
+        /// Device uid (from `devices list`).
+        uid: String,
+        /// Skip the confirmation and accept every proposed local path.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Move another computer's folders into this computer's backup and sync
     /// them here. The other computer stays registered, without those folders.
     Migrate {
@@ -831,6 +841,20 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
+    // The commands that hold the password, the key passphrases or the session
+    // tokens in memory: keep them out of core dumps and away from same-user
+    // ptrace. Only the daemon did, though `mount` holds the same keys for as
+    // long as it runs.
+    if matches!(
+        cli.command,
+        Command::Login { .. }
+            | Command::Unlock { .. }
+            | Command::Logout
+            | Command::Mount { .. }
+            | Command::Daemon { .. }
+    ) {
+        pdfs_core::kernelkey::forbid_dumps();
+    }
     match cli.command {
         Command::Login { username, remember } => cmd_login(username, remember),
         Command::Unlock { remember } => cmd_unlock(remember),
@@ -977,6 +1001,26 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
             }
             let uid = if clear { None } else { uid };
             ok_or_bail(control_request(CtlRequest::AdoptDevice { uid })?)?
+        }
+        DeviceCmd::Join { uid, yes } => {
+            if !yes {
+                println!(
+                    "This computer syncs into that device alongside it. Its folders are kept\n\
+                     in step on both computers: an edit or a deletion on one reaches the other.\n\
+                     New synced folders here go under that device too. Folders already synced\n\
+                     here stay where they are."
+                );
+                confirm("Sync with it?")?;
+            }
+            let response = control_request(CtlRequest::AdoptDevice { uid: Some(uid) })?;
+            // A script gets the one reply and runs `sync restore` itself.
+            if emit_json(&response)? {
+                return Ok(());
+            }
+            ok_or_bail(response)?;
+            // The device is this machine's now, so the plain restore offers its
+            // folders.
+            cmd_sync_restore(yes, None)?
         }
         DeviceCmd::Migrate { uid, yes } => {
             if !yes {
@@ -1977,8 +2021,14 @@ fn key_state_name() -> &'static str {
 }
 
 fn cmd_logout() -> Result<()> {
-    auth::logout()?;
-    println!("Stored session cleared.");
+    if auth::logout()? {
+        println!("Signed out: the session is ended on Proton and cleared here.");
+    } else {
+        println!(
+            "Stored session cleared. Proton could not be reached to end the session; \
+             it stays valid until it expires or is signed out in your account's security settings."
+        );
+    }
     Ok(())
 }
 
@@ -2221,9 +2271,6 @@ where
 /// an external unmount triggers a remount; errors back off and retry. This is
 /// the entry point for the systemd user service.
 fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
-    // The daemon holds the account's key passphrases in memory; keep them out
-    // of core dumps and away from same-user ptrace.
-    pdfs_core::kernelkey::forbid_dumps();
     loop {
         // Wait until a session is stored. The GUI enables this service on login,
         // but the service may also start at boot before the user has logged in.
@@ -2592,7 +2639,10 @@ fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -
             } => continue,
             CtlResponse::ImportStatus { summary, .. } => {
                 print_import_summary(summary.as_ref());
-                return Ok(());
+                return finished_run(
+                    "the import",
+                    summary.map(|s| (s.failed, s.cancelled, s.error)),
+                );
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
@@ -2635,11 +2685,30 @@ fn cmd_redate_photos(
             CtlResponse::RedateStatus { running: true, .. } => continue,
             CtlResponse::RedateStatus { summary, .. } => {
                 print_redate_summary(summary.as_ref());
-                return Ok(());
+                return finished_run(
+                    "the re-date",
+                    summary.map(|s| (s.failed, s.cancelled, s.error)),
+                );
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         }
+    }
+}
+
+/// How a run `--wait` followed ended, as the exit status: an error when it
+/// failed, was cancelled, or left photos failed, so a script can tell.
+/// `outcome` is `(failed, cancelled, error)`; `None` when the daemon has no
+/// result, which happens when it restarted during the run.
+fn finished_run(what: &str, outcome: Option<(usize, bool, Option<String>)>) -> Result<()> {
+    match outcome {
+        None => bail!("{what} ended without a result; the service may have restarted"),
+        Some((_, _, Some(error))) => bail!("{what} failed: {error}"),
+        Some((_, true, None)) => bail!("{what} was cancelled"),
+        Some((failed, false, None)) if failed > 0 => {
+            bail!("{what} finished, but {failed} photo(s) failed")
+        }
+        Some(_) => Ok(()),
     }
 }
 
@@ -2678,6 +2747,10 @@ fn print_redate_summary(summary: Option<&pdfs_core::control::RedateSummary>) {
         println!("No re-date has run yet.");
         return;
     };
+    if let Some(error) = &summary.error {
+        println!("Failed           : {error}");
+        return;
+    }
     println!("Photos examined  : {}", summary.examined);
     println!("Mis-dated        : {}", summary.candidates);
     if summary.dry_run {
@@ -2737,6 +2810,10 @@ fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
         println!("No import has run yet.");
         return;
     };
+    if let Some(error) = &summary.error {
+        println!("Failed           : {error}");
+        return;
+    }
     println!("Photos in export : {}", summary.found);
     println!("Uploaded         : {}", summary.uploaded);
     println!("Already on Proton: {}", summary.duplicates);
@@ -3749,6 +3826,28 @@ mod login_wait_tests {
         // past the width of the shift; that must cap, not panic.
         assert_eq!(login_poll_delay(64), Duration::from_secs(15));
         assert_eq!(login_poll_delay(u32::MAX), Duration::from_secs(15));
+    }
+
+    /// The file-manager script passes each selected path after `--`, so a
+    /// file named like an option is still the path.
+    #[test]
+    fn a_path_after_a_double_dash_is_a_path_even_when_it_looks_like_a_flag() {
+        let cli = Cli::try_parse_from(["pdfs", "pin", "--", "--json"]).unwrap();
+        assert!(!cli.json);
+        match cli.command {
+            Command::Pin { path } => assert_eq!(path, PathBuf::from("--json")),
+            _ => panic!("not a pin"),
+        }
+    }
+
+    #[test]
+    fn a_waited_for_run_that_did_not_fully_succeed_exits_with_an_error() {
+        assert!(finished_run("the import", Some((0, false, None))).is_ok());
+        assert!(finished_run("the import", Some((3, false, None))).is_err());
+        assert!(finished_run("the import", Some((0, true, None))).is_err());
+        let failed = finished_run("the import", Some((0, false, Some("not a zip".into()))));
+        assert!(failed.unwrap_err().to_string().contains("not a zip"));
+        assert!(finished_run("the import", None).is_err());
     }
 
     #[test]
