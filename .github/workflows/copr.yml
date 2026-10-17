@@ -32,7 +32,7 @@ jobs:
     container: fedora:latest
     env:
       VERSION: ${{ inputs.version }}
-      COPR_PROJECT: narrrl/proton-drive-linux
+      COPR_PROJECT: narl-rs/proton-drive-linux
 
     steps:
       - name: Install packaging tools

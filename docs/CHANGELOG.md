@@ -13,7 +13,7 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Added
 - **A COPR repository for Fedora**, so `dnf upgrade` brings each new release:
-  `sudo dnf copr enable narrrl/proton-drive-linux`. Every release also ships the vendored crates
+  `sudo dnf copr enable narl-rs/proton-drive-linux`. Every release also ships the vendored crates
   as `proton-drive-linux-vendor-<version>.tar.xz`, which the COPR build uses offline (#42).
 - **The app can tell you about a new release.** Turn on **Check for updates** in Preferences, and
   the app asks GitHub once a day and shows a banner with a **Download** button when a newer

@@ -74,14 +74,14 @@ scriptable CLI.
 | Distribution | Package |
 |---|---|
 | Debian, Ubuntu 24.04 or newer | `.deb` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
-| Fedora 44 or newer | [`narrrl/proton-drive-linux`](https://copr.fedorainfracloud.org/coprs/narrrl/proton-drive-linux/) in COPR, or the `.rpm` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
+| Fedora 44 or newer | [`narl-rs/proton-drive-linux`](https://copr.fedorainfracloud.org/coprs/narl-rs/proton-drive-linux/) in COPR, or the `.rpm` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
 | Arch Linux | [`proton-drive-for-linux`](https://aur.archlinux.org/packages/proton-drive-for-linux) (also `-bin` and `-git`) in the AUR |
 | NixOS | The flake in this repository: see [Install → NixOS](docs/INSTALL.md#nixos-flake) |
 | Anything else | [Build from source](docs/INSTALL.md#build-from-source) |
 
 ```bash
 sudo apt install ./proton-drive-linux_*.deb        # Debian, Ubuntu
-sudo dnf copr enable narrrl/proton-drive-linux     # Fedora
+sudo dnf copr enable narl-rs/proton-drive-linux    # Fedora
 sudo dnf install proton-drive-linux
 paru -S proton-drive-for-linux                     # Arch
 ```

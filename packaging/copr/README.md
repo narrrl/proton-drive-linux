@@ -1,7 +1,7 @@
 # COPR repository
 
 Fedora users install from the COPR project
-[`narrrl/proton-drive-linux`](https://copr.fedorainfracloud.org/coprs/narrrl/proton-drive-linux/),
+[`narl-rs/proton-drive-linux`](https://copr.fedorainfracloud.org/coprs/narl-rs/proton-drive-linux/),
 so `dnf upgrade` brings every release. COPR builds `packaging/proton-drive-linux.spec` from two
 release assets:
 
@@ -33,7 +33,7 @@ To do the same by hand:
 ```bash
 spectool -g -C ~/rpmbuild/SOURCES packaging/proton-drive-linux.spec
 rpmbuild -bs packaging/proton-drive-linux.spec
-copr-cli build narrrl/proton-drive-linux ~/rpmbuild/SRPMS/proton-drive-linux-*.src.rpm
+copr-cli build narl-rs/proton-drive-linux ~/rpmbuild/SRPMS/proton-drive-linux-*.src.rpm
 ```
 
 ## Project settings
