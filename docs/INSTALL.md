@@ -288,6 +288,13 @@ starts; to switch at once:
 systemctl --user restart proton-drive.service
 ```
 
+With the `.deb`, the release `.rpm` or the `.tar.gz`, nothing tells you about a new release.
+Turn on **Preferences → General → Check for updates** and the app asks GitHub once a day and
+shows a banner over the sidebar when a newer version is out. Packages that a package manager
+updates do not offer the setting. A package shows this by installing the empty file
+`share/proton-drive-linux/managed-updates` under the prefix of its `bin/` directory, for example
+`/usr/share/proton-drive-linux/managed-updates`.
+
 Coming from 2.8.0 or older, re-enable the service once. Those releases hooked it into
 `default.target`, which starts it before the desktop session is ready; on KDE that crashes
 `ksecretd` at every login. Signing in again or toggling "Start on login" does this as well:

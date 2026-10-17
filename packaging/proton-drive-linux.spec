@@ -114,6 +114,10 @@ install -D -m0644 %{src}/packaging/io.narl.proton-drive-linux.svg \
 install -D -m0644 %{src}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
 %{src}/po/build.sh %{buildroot}%{_datadir}/locale
+%if 0%{!?git_dir:1}
+# dnf brings new releases from COPR, so the app does not offer its own check.
+install -D -m0644 /dev/null %{buildroot}%{_datadir}/proton-drive-linux/managed-updates
+%endif
 
 # Removing the package does not stop a running daemon: it keeps serving the
 # mount from the deleted binary, so files deleted under the mount afterwards,
@@ -145,6 +149,9 @@ fi
 %{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
 /usr/lib/systemd/user/proton-drive.service
 %{_datadir}/locale/*/LC_MESSAGES/pdfs.mo
+%if 0%{!?git_dir:1}
+%{_datadir}/proton-drive-linux/managed-updates
+%endif
 
 %changelog
 * Sun Jul 19 2026 Local Packager - 0.4.0-1

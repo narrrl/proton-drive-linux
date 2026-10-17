@@ -10,6 +10,7 @@ pub(crate) mod pages;
 pub(crate) mod reload;
 #[path = "../theme.rs"]
 pub(crate) mod theme;
+pub(crate) mod update;
 pub(crate) mod widgets;
 
 use compat::*;
@@ -33,6 +34,7 @@ use pages::trash::*;
 use pages::verify::*;
 use reload::{LoadTicket, Loader, replace_items};
 use theme::{load_resources, proton_theme_active, set_proton_theme};
+use update::*;
 use widgets::compat::*;
 use widgets::crumb::*;
 use widgets::details::*;
@@ -155,6 +157,7 @@ struct Ui {
     pub(crate) locations: LocationsState,
     pub(crate) activity: ActivityState,
     pub(crate) takeout: TakeoutState,
+    pub(crate) update: UpdateState,
 }
 
 impl Ui {
@@ -365,7 +368,8 @@ fn build_window(app: &adw::Application) {
     // Sidebar: the signed-in destinations. Selecting a row swaps the page stack;
     // `sync_sidebar` pushes the other way when navigation happens elsewhere (e.g.
     // login lands on Files).
-    let (sidebar_page, sidebar_list) = build_sidebar(&main_widgets.footer);
+    let update = UpdateState::new();
+    let (sidebar_page, sidebar_list) = build_sidebar(&main_widgets.footer, &update.banner);
 
     // Every page brings its own header bar (see `page_frame`), so the content
     // side is the bare stack.
@@ -432,6 +436,7 @@ fn build_window(app: &adw::Application) {
             theme_row: main_widgets.theme_row.clone(),
             online_map_row: main_widgets.online_map_row.clone(),
             tray_row: main_widgets.tray_row.clone(),
+            update_row: main_widgets.update_row.clone(),
             language_row: main_widgets.language_row.clone(),
             settings_suppress: Cell::new(false),
             budget_source: RefCell::new(None),
@@ -654,6 +659,7 @@ fn build_window(app: &adw::Application) {
             running: Cell::new(false),
             dry_run: Cell::new(false),
         },
+        update,
     });
     wire_login(&ui);
     if let Some(e) = keyring_error {
@@ -700,6 +706,7 @@ fn build_window(app: &adw::Application) {
     wire_activity(&ui, &activity_widgets);
     wire_takeout(&ui, &takeout_widgets);
     wire_retry(&ui);
+    wire_update(&ui);
 
     // Lazily load the Files / Photos pages the first time they're shown, so the
     // network round-trip only happens on demand rather than on every refresh.
@@ -871,10 +878,13 @@ const DESTINATIONS: [(&str, &str, &str); 7] = [
 /// Index of the first row in the sidebar's sync section.
 const SIDEBAR_SYNC_SECTION: i32 = 6;
 
-/// The navigation sidebar: the destinations over a footer carrying the sync
-/// status, the account quota and the account menu. Returns the page (for the
+/// The navigation sidebar: the destinations under the update banner and over a
+/// footer carrying the sync status, the account quota and the account menu. Returns the page (for the
 /// split view) and the list (to drive + reflect the current page).
-fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
+fn build_sidebar(
+    footer: &gtk4::Box,
+    update_banner: &adw::Banner,
+) -> (adw::NavigationPage, gtk4::ListBox) {
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -927,6 +937,7 @@ fn build_sidebar(footer: &gtk4::Box) -> (adw::NavigationPage, gtk4::ListBox) {
         .build();
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(update_banner);
     toolbar.set_content(Some(&scroll));
     toolbar.add_bottom_bar(footer);
 

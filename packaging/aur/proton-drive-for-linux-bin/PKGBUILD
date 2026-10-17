@@ -65,4 +65,7 @@ package() {
   cp -r --no-preserve=ownership "$srcdir/locale" "$pkgdir/usr/share/locale"
 
   install -Dm644 "$srcdir/LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # pacman brings new releases, so the app never checks for them itself.
+  install -Dm644 /dev/null "$pkgdir/usr/share/proton-drive-linux/managed-updates"
 }

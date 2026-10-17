@@ -52,6 +52,9 @@ pub(crate) struct StatusState {
     pub(crate) online_map_row: adw::SwitchRow,
     /// "Show tray icon" toggle. Guarded by [`Self::settings_suppress`].
     pub(crate) tray_row: adw::SwitchRow,
+    /// "Check for updates" toggle, not shown where a package manager brings
+    /// updates. Guarded by [`Self::settings_suppress`].
+    pub(crate) update_row: adw::SwitchRow,
     /// Language picker: "System Default", then [`i18n::LANGUAGES`]. Guarded by
     /// [`Self::settings_suppress`].
     pub(crate) language_row: adw::ComboRow,
@@ -164,6 +167,7 @@ pub(crate) struct MainWidgets {
     pub(crate) theme_row: adw::SwitchRow,
     pub(crate) online_map_row: adw::SwitchRow,
     pub(crate) tray_row: adw::SwitchRow,
+    pub(crate) update_row: adw::SwitchRow,
     pub(crate) language_row: adw::ComboRow,
 }
 
@@ -250,6 +254,17 @@ pub(crate) fn build_main_page() -> MainWidgets {
     let language_row = build_language_row();
     appearance_group.add(&language_row);
 
+    let updates_group = adw::PreferencesGroup::builder()
+        .title(gettext("Updates"))
+        .build();
+    let update_row = adw::SwitchRow::builder()
+        .title(gettext("Check for updates"))
+        .subtitle(gettext(
+            "Ask GitHub once a day whether a new version is out. GitHub learns your IP address and which version you use.",
+        ))
+        .build();
+    updates_group.add(&update_row);
+
     let general = adw::PreferencesPage::builder()
         .title(gettext("General"))
         .icon_name("preferences-system-symbolic")
@@ -258,6 +273,10 @@ pub(crate) fn build_main_page() -> MainWidgets {
     general.add(&location_group);
     general.add(&network_group);
     general.add(&appearance_group);
+    // A package manager brings new versions, so there is nothing to tell.
+    if !updates_managed_here() {
+        general.add(&updates_group);
+    }
 
     // ---- Preferences: Storage
     let storage_group = adw::PreferencesGroup::builder()
@@ -442,6 +461,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
         theme_row,
         online_map_row,
         tray_row,
+        update_row,
         language_row,
     }
 }
@@ -541,6 +561,7 @@ pub(crate) fn wire_settings(
         .set_active(config.proton_theme.unwrap_or(false));
     ui.status.online_map_row.set_active(config.online_map);
     ui.status.tray_row.set_active(!config.tray_hidden);
+    ui.status.update_row.set_active(config.update_check);
     ui.status
         .language_row
         .set_selected(language_index(config.language.as_deref()));
@@ -688,6 +709,26 @@ pub(crate) fn wire_settings(
                 &e.to_string(),
             );
         }
+    });
+
+    // Update check: saved, and the first check runs right away if one is due.
+    let ui_update = ui.clone();
+    ui.status.update_row.connect_active_notify(move |row| {
+        if ui_update.status.settings_suppress.get() {
+            return;
+        }
+        let mut config = ui_update.dirs.load_config();
+        config.update_check = row.is_active();
+        if let Err(e) = ui_update.dirs.save_config(&config) {
+            toast_error(
+                &ui_update,
+                &gettext("Couldn't save the update setting"),
+                &e.to_string(),
+            );
+            return;
+        }
+        show_latest(&ui_update);
+        start_update_checks(&ui_update);
     });
 
     // Tray icon: the tray reads the same flag at start, so hiding it here also

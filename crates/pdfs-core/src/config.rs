@@ -190,6 +190,24 @@ pub struct AppConfig {
     /// the field.
     #[serde(default)]
     pub local_first: Option<bool>,
+    /// Ask GitHub once a day whether a newer release is out, and say so in the
+    /// desktop app. Off by default: GitHub then sees the address and version
+    /// asking. Never used where a package manager installs updates (see
+    /// [`crate::update::updates_managed`]). Defaulted for configs predating the
+    /// field.
+    #[serde(default)]
+    pub update_check: bool,
+    /// When the update check last asked GitHub, in Unix seconds, so a restart
+    /// does not ask again within [`crate::update::CHECK_INTERVAL`]. Defaulted
+    /// for configs predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_last_checked: Option<i64>,
+    /// The latest release that check found, such as `3.6.0`, so the app can
+    /// say so again after a restart without asking. Older than or equal to the
+    /// running version once the update is installed. Defaulted for configs
+    /// predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_latest: Option<String>,
 }
 
 /// The My Files page's view choices, remembered between runs.
@@ -753,6 +771,9 @@ mod tests {
             language: Some("de".to_string()),
             online_map: true,
             local_first: Some(false),
+            update_check: true,
+            update_last_checked: Some(1_760_000_000),
+            update_latest: Some("3.6.0".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
@@ -764,6 +785,9 @@ mod tests {
         assert_eq!(decoded.proton_theme, Some(true));
         assert!(decoded.tray_hidden);
         assert!(decoded.online_map);
+        assert!(decoded.update_check);
+        assert_eq!(decoded.update_last_checked, Some(1_760_000_000));
+        assert_eq!(decoded.update_latest.as_deref(), Some("3.6.0"));
         assert_eq!(decoded.language.as_deref(), Some("de"));
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
