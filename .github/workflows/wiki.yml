@@ -1,0 +1,77 @@
+name: Wiki
+
+# docs/ is the source of the GitHub wiki (docs/DEVELOPMENT.md#common-changes).
+# Every change to the documentation checks its links; release.yml calls this
+# once the release is published, so the wiki documents the latest release. Run
+# it from the Actions tab to publish main in between.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'images/**'
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'scripts/publish-wiki.sh'
+      - '.github/workflows/wiki.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'images/**'
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'scripts/publish-wiki.sh'
+      - '.github/workflows/wiki.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Tag or branch to publish'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag or branch to publish'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check documentation links
+    if: inputs.ref == ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check links
+        run: scripts/publish-wiki.sh --check "$RUNNER_TEMP"
+
+  publish:
+    name: Publish to the wiki
+    # Set only by release.yml and the Actions tab, so pushes and pull requests
+    # never publish.
+    if: inputs.ref != ''
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: wiki-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Publish
+        env:
+          WIKI_REMOTE: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.wiki.git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          scripts/publish-wiki.sh --push "$RUNNER_TEMP"

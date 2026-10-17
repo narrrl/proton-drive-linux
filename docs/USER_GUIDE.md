@@ -1,29 +1,27 @@
 # User guide
 
-How Proton Drive for Linux works and how to use it day to day. For installation see
-[INSTALL.md](INSTALL.md); every command mentioned here is described in [CLI.md](CLI.md).
+How Proton Drive for Linux works and how to use it day to day. To install it, see
+[Installation](INSTALL.md). If you are new, [Getting started](GETTING_STARTED.md) is the quicker
+read.
 
-- [How it works](#how-it-works)
-- [My files](#my-files)
-- [Keeping files on this computer](#keeping-files-on-this-computer)
-- [Syncing local folders](#syncing-local-folders)
-- [Changes waiting for Proton Drive](#changes-waiting-for-proton-drive)
-- [Conflicts](#conflicts)
-- [Pausing and limiting sync](#pausing-and-limiting-sync)
-- [Photos](#photos)
-- [Sharing](#sharing)
-- [Trash and version history](#trash-and-version-history)
-- [Computers](#computers)
-- [Search launcher](#search-launcher)
-- [Choosing how files open](#choosing-how-files-open)
-- [Tray](#tray)
-- [Preferences](#preferences)
+## Topics
+
+| Page | What it covers |
+|---|---|
+| [Files and offline access](FILES.md) | The `~/ProtonDrive` folder, keeping files available offline, the Trash, earlier versions |
+| [Synced folders](SYNCED_FOLDERS.md) | Backing up local folders, excluding files, changes waiting to upload, conflicts, pausing |
+| [Photos](PHOTOS.md) | Timeline, albums, places, duplicates, importing from Google Photos |
+| [Sharing](SHARING.md) | Invitations, public links, items shared with you |
+| [Computers](COMPUTERS.md) | Other computers in your account, syncing several computers |
+| [Search launcher and tray](LAUNCHER_AND_TRAY.md) | Finding files from a keyboard shortcut, the tray icon |
+
+Every command mentioned in these pages is listed in the
+[command-line reference](CLI.md).
 
 ## How it works
 
 A background service, `proton-drive.service`, runs `pdfs daemon`. It holds your session, talks to
-Proton Drive, and keeps your Drive mounted as a folder. Everything else is a front end that asks
-the service to do things over a local socket:
+Proton Drive, and shows your Drive as a folder. Everything else asks the service to do things:
 
 | Program | What it is |
 |---|---|
@@ -32,357 +30,30 @@ the service to do things over a local socket:
 | `pdfs-prompt` | A search launcher for a keyboard shortcut |
 | `pdfs` | The command-line client, for everything above and for scripts |
 
-Your Drive, your file names and your photos are end-to-end encrypted by Proton. On this computer,
-the service must decrypt what it shows you, and it keeps a decrypted cache and index on disk. Use
-full-disk or home-directory encryption. [ARCHITECTURE.md §10](ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext)
+Your files, file names and photos are end-to-end encrypted by Proton. To show them to you, the
+service decrypts them on this computer and keeps a cache, which is not encrypted. Use full-disk or
+home-folder encryption. The [security model](SECURITY_MODEL.md#what-is-kept-on-this-computer)
 lists exactly what is stored.
 
-The app uses these words consistently, and so does this guide:
+## Words used in the app
+
+The app uses these words, and so do these pages:
 
 | Term | Meaning |
 |---|---|
-| **My files** | The root of your Drive |
-| **Proton Drive folder** | Where My files appears on disk, `~/ProtonDrive` by default |
-| **Online only** | A file or folder whose content downloads when opened |
+| **My files** | Everything in your Proton Drive, apart from Photos and computer backups |
+| **Proton Drive folder** | Where My files appears on this computer, `~/ProtonDrive` by default |
+| **Online only** | A file or folder that downloads when you open it |
 | **Available offline** | A file, or a folder with everything in it, kept on this computer |
 | **Synced folder** | A local folder with a full copy on this computer, backed up to Proton Drive |
 | **Proton Drive service** | The background service (`proton-drive.service`) |
-
-## My files
-
-My files is mounted at `~/ProtonDrive`. Every file and folder appears immediately, but content
-downloads only when a program reads it:
-
-- **Reads fetch only what is needed.** A video player that seeks, or a tool that reads a file
-  header, downloads only those parts. Media streams while it plays.
-- **Changes work at local speed.** Creating, renaming, moving and deleting files and folders
-  returns at once, online or offline. When a program closes a file it wrote, the new content is
-  stored on disk. Every change is queued and sent to Proton Drive in the background; the changes
-  to one file are sent in the order you made them. The queue survives network loss, restarts and
-  crashes. See [Changes waiting for Proton Drive](#changes-waiting-for-proton-drive).
-- **Recently read content is cached** on disk up to the cache size limit (5 GiB by default) and
-  evicted oldest first.
-- **Items shared with you** appear under `Shared with me/` inside the Proton Drive folder. Shares
-  where you are a viewer are read-only.
-
-The **My files** page of the app browses the same tree without going through the mount. It has a
-grid and a list view, sorting, thumbnails (including camera RAW previews), multi-select and drag
-and drop upload. **Details** (Alt+Enter) shows size, dates, sharing and version history for the
-selected item.
-
-Symbolic links, hard links, device files and FIFOs cannot be stored on Proton Drive. Programs that
-try to create them get a clean error, not a hang or `EIO`.
-
-## Keeping files on this computer
-
-Turn on **Available offline** for a file or folder in My files, or run `pdfs pin <path>`. A file
-is downloaded completely and never evicted from the cache. For a folder, every file in it and in
-its subfolders downloads in the background, and the tray and the app show the progress.
-`pdfs pins` lists what is kept, and **Preferences → Storage → Available offline** shows it in the
-app.
-
-Turning it off (`pdfs unpin <path>`) frees the space. The files stay on Proton Drive. A file inside
-a folder kept offline stays with its folder: turn the folder off instead.
-
-## Syncing local folders
-
-A synced folder is an ordinary folder on this computer, for example `~/Documents`, that is
-backed up to Proton Drive under this computer's name. It appears on the **Computers** page of the
-app and in the web app.
-
-- Add one with **Add Folder to Sync** on the **Computers** page, or `pdfs sync add ~/Documents`.
-- Changes flow both ways. Local edits upload a few seconds after the file is closed; remote edits
-  download on the next pass.
-- A file that another program still holds open for writing is not uploaded until it is closed.
-- **Sync → Folders** in the app, and `pdfs sync list`, show every folder and its state.
-
-Each synced folder can also be switched to **Online only**. The local copy is replaced by a mount
-of the folder, so the files stay visible but take no disk space until opened. Switch with the
-**Synced / Online only** switch on the folder's card, or `pdfs sync mode <id> ondemand` and back
-with `pdfs sync mode <id> mirror`. The switch waits until everything in the folder is on Proton
-Drive, and refuses while the folder holds something that never goes there: an ignored path such
-as `.git/`, a symlink, or a folder you may not read. The message names it. `pdfs locations` lists every local place the service occupies.
-
-### Moving between synced folders and My files
-
-`~/ProtonDrive` and each online-only folder are separate mounts, and a mirrored folder is a plain
-folder on disk. `mv`, and dragging in a file manager, cannot rename across them, so they copy
-and then delete: every file is downloaded, uploaded again, and the original goes to the Trash.
-
-Use `pdfs move <path> <folder>` or **Move to…** in the app instead. The move happens on Proton
-Drive, so it takes seconds whatever the size. For example:
-
-```sh
-pdfs move ~/Documents/Scans ~/ProtonDrive/Archive
-pdfs move ~/Documents/a.pdf ~/Documents/b.pdf ~/ProtonDrive/Archive
-```
-
-The last path is the destination folder; everything before it moves there.
-Files already opened in an online-only folder are not downloaded again when
-they move into a mirrored one.
-
-A move out of a synced folder waits until its files are on Proton Drive. A file that is still
-uploading, has changes that are not uploaded, or is excluded by `.pdfsignore` stops the move,
-and the message names it.
-
-Removing a synced folder (**Stop Syncing** or `pdfs sync rm <id>`) keeps the local files and the
-copy on Proton Drive. Add `--delete-remote` (or tick **Also delete from Proton Drive**) to delete
-the copy on Proton Drive as well.
-
-### Excluding files with `.pdfsignore`
-
-Synced folders skip build output, dependency folders and editor leftovers. Rules come from two
-places, and both apply:
-
-1. A `.pdfsignore` file at the root of the synced folder (`.protonignore` also works), using
-   gitignore syntax, including `!` to re-include:
-
-   ```gitignore
-   build/
-   *.log
-   !important.log
-   ```
-
-2. The global `ignore_patterns` list in `config.json` (see
-   [CONFIGURATION.md](CONFIGURATION.md#ignore_patterns)). When unset, it defaults to `.git/`,
-   `.hg/`, `.svn/`, `node_modules/`, `target/`, `.venv/`, `__pycache__/`, `*~`, `*.swp`, `*.tmp`,
-   `.DS_Store` and `Thumbs.db`.
-
-Rules are re-read on every pass. Ignoring never deletes anything: a file that becomes ignored is
-simply no longer tracked, and its copy on Proton Drive stays.
-
-A folder you may not read, such as a cache a container created as root, is skipped the same way,
-and the activity feed names it once. Add it to `.pdfsignore` to stop that message.
-
-## Changes waiting for Proton Drive
-
-A change you made in the Proton Drive folder exists only on this computer until it reaches
-Proton Drive. `pdfs status`, the tray and **Sync → Overview** count what is still waiting, and
-`pdfs sync queue` lists it.
-
-Sometimes Proton Drive refuses a change: the storage is full, a share was taken away, the folder
-is gone, the folder holds too many items, or Drive does not accept a name. The change then needs
-your attention. It shows at once in **Sync → Overview**, in the tray, and in `pdfs sync issues`,
-with what it means and what you can do. A file or folder with such a change carries a warning
-badge in **Files**; hover it to see why.
-
-Nothing is deleted. The change stays queued and is retried. You can:
-
-- **Retry** it now, from the same list or with `pdfs sync retry`, for example after freeing space.
-- **Export** a file's content to keep your version (`pdfs sync export <id> <file>`).
-- **Discard** the change (`pdfs sync discard <id>`). It is undone here and never sent: a new file
-  or folder goes away, anything else goes back to what Proton Drive has. Export first if you want
-  to keep the content.
-
-Two cases are not refused, and the activity log records both:
-
-- A new file or folder whose name is already taken on Proton Drive by something this computer had
-  not seen yet lands under a `(sync-conflict …)` name, as described below.
-- A new file whose folder was deleted on another device meanwhile lands at the top of My files,
-  so its content is not lost.
-
-Before you shut down a computer for good, check that nothing is waiting: see
-[RECOVERY.md](RECOVERY.md#lost-with-the-machine).
-
-## Conflicts
-
-When the same file changed on this computer and somewhere else since the last sync, neither side
-is thrown away. The local version is kept as a copy named like
-`report (sync-conflict laptop 1759068180).odt`, where `laptop` is the name of the computer that
-made the copy and the number is the time of the conflict in seconds since 1970. The remote
-version takes the original name. Copies made before 3.5.0 have no computer name.
-
-Conflicts appear under **Sync → Overview → Needs attention** and in `pdfs conflicts`. For each
-one, keep the original, keep the copy, or keep both under a new name:
-
-```bash
-pdfs conflicts
-pdfs conflicts resolve "Documents/report (sync-conflict laptop 1759068180).odt" --keep copy
-```
-
-The version you do not keep goes to the Trash, so a wrong choice can be undone.
-
-## Pausing and limiting sync
-
-- **Pause** from the tray, the Sync page, or `pdfs sync pause`. Uploads and synced folders wait;
-  reading files keeps working. `pdfs sync resume` continues.
-- **Limit bandwidth** under **Preferences → General → Network**, or with
-  `pdfs sync limit --up 2M --down 10M`. `0` removes a limit.
-
-## Photos
-
-The **Photos** page shows your Proton Photos library. Photos are stored separately from My files
-and do not appear in the Proton Drive folder.
-
-- **Timeline** groups photos by day, month or year as you zoom. Drag the scrubber on the right edge
-  to jump through the years. **On this day** shows photos from the same date in earlier years.
-- **Filters** narrow the timeline to images, videos or RAW files, to favorites, or to photos that
-  are in no album.
-- **RAW + JPEG pairs** of the same shot show as one tile. The viewer switches between them, and
-  moving the tile to the Trash removes both.
-- **Albums** lists your albums and albums shared with you. Create, rename and delete albums, and
-  add or remove photos.
-- **Places** groups photos by the town they were taken in, as cards or on a map. Towns come from
-  bundled [GeoNames](https://www.geonames.org/) data (CC BY 4.0) and the map from
-  [Natural Earth](https://www.naturalearthdata.com/) (public domain), so nothing is fetched online.
-  An optional street map from [OpenFreeMap](https://openfreemap.org/) (© OpenStreetMap
-  contributors) can be enabled under **Preferences → General → Appearance**. It is off by default
-  because the tile server learns which areas you look at.
-- **Viewer**: favorites, EXIF details, show on map, slideshow (F5).
-- **Find Duplicates…** in the page menu lists byte-identical copies. The **Similar** switch also
-  finds resized or re-encoded copies and burst shots by comparing thumbnails.
-- **Upload** adds photos. Its menu holds **Import from Google Photos…**.
-
-### Importing from Google Photos
-
-Request a Google Takeout export of Google Photos, then pass every `.zip` of it at once. A photo's
-metadata often sits in a different part of the export than the photo itself.
-
-```bash
-pdfs import-google-photos --dry-run ~/Downloads/takeout-*.zip   # see what would happen
-pdfs import-google-photos --wait ~/Downloads/takeout-*.zip
-```
-
-Albums are recreated, capture dates and locations are taken from the metadata, and photos already
-on the account are skipped, so an interrupted import can be run again. `pdfs import-status` and
-`pdfs cancel-import` follow or stop an import that runs in the background.
-
-If photos from an earlier import are filed under the day they were uploaded,
-`pdfs redate-photos --dry-run` finds those whose file name carries a different date, and
-`pdfs redate-photos` fixes them. Proton cannot change a capture date in place, so each fix
-re-uploads the photo and moves the original to the Trash, keeping favorites and albums.
-
-## Sharing
-
-- **Share…** on a file or folder invites people by email as viewer or editor, or creates a public
-  link with an optional password and expiry. `pdfs share`, `pdfs members`, `pdfs share-role`,
-  `pdfs unshare` and `pdfs public-link` do the same from a terminal.
-- **Shared by me** lists everything you share, filtered by links, people or expired links. Copy a
-  live link or stop several shares at once.
-- **Shared with me** lists what others share with you, with who shared it and your access.
-  Pending invitations wait in a banner; `pdfs invitations` accepts or rejects them. Saved public
-  links (`pdfs bookmarks`) have their own view.
-
-## Trash and version history
-
-The **Trash** page lists trashed items with the date they were deleted. Restore puts an item back
-where it was, together with trashed folders above it. **Delete Forever** and **Empty Trash** are
-permanent. The CLI equivalents are `pdfs trash`, `pdfs restore`, `pdfs delete-forever` and
-`pdfs empty-trash`.
-
-Proton Drive keeps earlier versions of every file. **Details → Versions…** in the app, or
-`pdfs versions list <path>`, shows them. You can:
-
-- **Restore** a version. This happens on the server; nothing is re-uploaded.
-- **Save** a version to a separate local file without touching the current one.
-- **Delete** an old version permanently. The current version cannot be deleted.
-
-## Computers
-
-**Computers** lists this computer and every other computer that backs up to your account.
-
-- **This computer** shows its synced folders with their state, and **Restore Folders…** brings
-  back folders that are backed up under it but not synced here yet.
-- **Another computer** can be browsed read-only in the same list or grid as My files, and
-  **Restore to This Computer…** downloads its folders here.
-- **Sync With This Computer…** makes this computer sync the same folders as another one, for
-  example a desktop and a laptop. Both keep the folders in step: a change or a deletion on one
-  reaches the other. See [Syncing several computers](#syncing-several-computers).
-- **Continue This Backup Here…** makes this computer take over another computer's backup, for
-  example after reinstalling or replacing a machine. See [RECOVERY.md](RECOVERY.md).
-- **Move to This Computer…** moves another computer's folders into this computer's backup, for
-  example when you switch from Windows to Linux, and then offers them for syncing here. The other
-  computer stays in the list, without those folders.
-
-### Syncing several computers
-
-Two or more computers can sync the same folders through one backup in Proton Drive.
-
-1. Sync the folders on the first computer as usual.
-2. On the second computer, open **Computers**, open the menu of the first computer and choose
-   **Sync With This Computer…**. From a terminal: `pdfs devices join UID`, with the UID from
-   `pdfs devices list`.
-3. Choose which of its folders to sync here and where, as in a restore.
-
-From then on, both computers sync into that backup. A folder you add later on either computer
-lands there too, and a folder with the same name joins the one already there. An edit on one
-computer reaches the other within about two minutes. When both computers change the same file in
-that time, each keeps the other's version under the original name and its own as a conflict copy
-named after it. Folders that were synced here before joining stay in this computer's own backup.
-
-## Search launcher
-
-`pdfs-prompt` searches Proton Drive and your home folder together, in one ranked list. It
-tolerates prefixes, abbreviations, typos and swapped letters, and matches on parent folder names
-as well. Bind it to a keyboard shortcut in your desktop settings.
-
-The window stays loaded after the first use, so later shortcuts open it instantly. Folders, audio
-and video open straight from the Proton Drive folder, so players can start before the whole file
-downloads. Other Drive files download first, then open.
-
-To make the first shortcut instant as well, start the launcher hidden with your session.
-`pdfs-prompt --preload` loads the window without showing it and does nothing if the launcher is
-already running. For Hyprland:
-
-```ini
-exec-once = pdfs-prompt --preload
-bind = SUPER, space, exec, pdfs-prompt
-```
-
-### Using your own launcher
-
-`pdfs-prompt --dmenu` shows the results in fuzzel, rofi, wofi, tofi, bemenu or dmenu, whichever is
-installed:
-
-```bash
-pdfs-prompt --dmenu
-pdfs-prompt --dmenu --menu 'fuzzel --dmenu --width 60'
-pdfs-prompt --dmenu --query invoice
-```
-
-A dmenu-style launcher filters a fixed list and cannot ask for new results per keystroke, so the
-search takes two steps. The first list, `Search Drive ›`, shows your available-offline files; type
-a query and press Enter to search. The second, `Drive: invoice ›`, shows the results; Enter opens
-one, and typing something else searches again.
-
-### Search as you type with fzf
-
-`pdfs-prompt --fzf` re-queries the service on every keystroke, like the built-in window. When
-started from a keybinding without a terminal, it opens one itself (foot, ghostty, kitty,
-alacritty, wezterm or xterm) with the app ID `pdfs-prompt`, so one window rule covers all of them.
-For Hyprland:
-
-```ini
-windowrulev2 = float, class:^(pdfs-prompt)$
-windowrulev2 = size 900 500, class:^(pdfs-prompt)$
-windowrulev2 = center, class:^(pdfs-prompt)$
-bind = SUPER, space, exec, pdfs-prompt --fzf
-```
-
-To make `--dmenu` or `--fzf` the default without changing your keybinding, set `prompt.mode` in
-`config.json` ([CONFIGURATION.md](CONFIGURATION.md#prompt)). `--gtk` forces the built-in window.
-
-## Choosing how files open
-
-Files open with `xdg-open` by default. The `open_with` section of `config.json` overrides that per
-file type, for example text in Neovim inside a terminal. The rules apply to the search launcher
-and to the app. See [CONFIGURATION.md](CONFIGURATION.md#open_with).
-
-## Tray
-
-`pdfs-tray` starts at login and shows whether files are up to date, syncing, paused or offline.
-Its menu opens the app or the Proton Drive folder, pauses or resumes sync, and stops or connects
-the service. **Hide Tray Icon** removes it until you turn it back on under
-**Preferences → General → Appearance → Show tray icon**.
-
-GNOME needs the AppIndicator extension to show tray icons.
 
 ## Preferences
 
 | Page | Settings |
 |---|---|
-| **General** | Start on login · Proton Drive folder location · upload and download limits · Proton theme, street map for Places, tray icon · language |
+| **General** | Start on login · Proton Drive folder location · upload and download limits · Proton theme, street map for Places, tray icon · language · check for updates |
 | **Storage** | Cache size limit · clear the cache · files kept available offline |
 
-The account menu shows storage used and holds **Sign Out…**. Settings not exposed in the app are
-listed in [CONFIGURATION.md](CONFIGURATION.md).
+The account menu shows the storage you use and holds **Sign Out…**. Settings that are not in the
+app are described in [Configuration](CONFIGURATION.md).

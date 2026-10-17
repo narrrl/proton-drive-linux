@@ -39,7 +39,7 @@ Inside `content/`:
 > not reached Proton Drive and exists nowhere else.
 
 Everything in these directories except the keyring is **decrypted**. See
-[ARCHITECTURE.md §10](ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
+the [security model](SECURITY_MODEL.md#what-is-kept-on-this-computer).
 
 ## `config.json`
 
@@ -113,7 +113,7 @@ Gitignore-style rules applied to every synced folder, in addition to each folder
 ```
 
 Set it to `[]` to turn the defaults off. See
-[USER_GUIDE.md](USER_GUIDE.md#excluding-files-with-pdfsignore) for how ignoring behaves.
+[Synced folders](SYNCED_FOLDERS.md#excluding-files-with-pdfsignore) for how excluding behaves.
 
 ### `conflict_sweep`
 
@@ -202,7 +202,7 @@ Command-line flags win over the file: `--gtk`, `--dmenu`, `--fzf` and `--menu`.
 | `PDFS_STAND_IN_WIDGETS` | app | `1` uses the libadwaita 1.5 fallback widgets on newer systems (development) |
 
 The tests have their own variables (`PDFS_ACCEPTANCE_*`, `PDFS_SIM_*`, `PDFS_MIGRATE_DB`),
-listed in [TESTING.md](TESTING.md).
+listed in [Testing](TESTING.md).
 
 ## The systemd service
 

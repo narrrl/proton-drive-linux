@@ -73,17 +73,30 @@ scriptable CLI.
 
 | Distribution | Package |
 |---|---|
-| Debian, Ubuntu 24.04 or newer | `.deb` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
-| Fedora 44 or newer | [`narl-rs/proton-drive-linux`](https://copr.fedorainfracloud.org/coprs/narl-rs/proton-drive-linux/) in COPR, or the `.rpm` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
+| Fedora 44 or newer | [`narl-rs/proton-drive-linux`](https://copr.fedorainfracloud.org/coprs/narl-rs/proton-drive-linux/) in COPR, updated with `dnf upgrade` |
 | Arch Linux | [`proton-drive-for-linux`](https://aur.archlinux.org/packages/proton-drive-for-linux) (also `-bin` and `-git`) in the AUR |
-| NixOS | The flake in this repository: see [Install → NixOS](docs/INSTALL.md#nixos-flake) |
+| Debian, Ubuntu 24.04 or newer | `.deb` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
+| NixOS | The flake in this repository: see [Installation → NixOS](docs/INSTALL.md#nixos-flake) |
 | Anything else | [Build from source](docs/INSTALL.md#build-from-source) |
 
+**Fedora**
+
 ```bash
-sudo apt install ./proton-drive-linux_*.deb        # Debian, Ubuntu
-sudo dnf copr enable narl-rs/proton-drive-linux    # Fedora
+sudo dnf copr enable narl-rs/proton-drive-linux
 sudo dnf install proton-drive-linux
-paru -S proton-drive-for-linux                     # Arch
+```
+
+**Arch Linux**
+
+```bash
+paru -S proton-drive-for-linux
+```
+
+**Debian and Ubuntu:** download the `.deb` from the
+[latest release](https://github.com/narrrl/proton-drive-linux/releases/latest), then:
+
+```bash
+sudo apt install ./proton-drive-linux_*_amd64.deb
 ```
 
 Then open **Proton Drive** from your applications menu and sign in. The app starts the background
@@ -98,14 +111,20 @@ systemctl --user enable --now proton-drive.service
 pdfs status
 ```
 
-[docs/INSTALL.md](docs/INSTALL.md) has the requirements, optional extras (tray on GNOME, RAW and
-video thumbnails), headless use and uninstalling.
+New to the client? [Getting started](docs/GETTING_STARTED.md) walks through the first steps.
+[Installation](docs/INSTALL.md) has the optional extras (tray on GNOME, RAW and video
+thumbnails), updating, headless use and uninstalling.
 
 ## Documentation
 
+The documentation is in [`docs/`](docs/README.md) and on the
+[wiki](https://github.com/narrrl/proton-drive-linux/wiki).
+
 | | |
 |---|---|
+| [Getting started](docs/GETTING_STARTED.md) | From installing to your first synced folder |
 | [User guide](docs/USER_GUIDE.md) | Everything the app, tray and launcher do |
+| [FAQ](docs/FAQ.md) | Short answers to common questions |
 | [Command-line reference](docs/CLI.md) | Every `pdfs` command and scripting with `--json` |
 | [Configuration](docs/CONFIGURATION.md) | `config.json`, file locations, environment variables, the service |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Diagnosing problems and fixing common ones |
@@ -152,7 +171,8 @@ keys before it leaves the machine, through a Rust implementation of Proton's Dri
 
 Files you open are decrypted into a local cache so programs can read them. What that means for
 the security of the machine is spelled out in the
-[threat model](docs/ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
+[security model](docs/SECURITY_MODEL.md#what-is-kept-on-this-computer), and in full detail in
+the [threat model](docs/ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
 
 ## Contributing
 
