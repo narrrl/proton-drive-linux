@@ -3519,10 +3519,13 @@ fn cmd_diagnose() -> Result<()> {
     );
 
     println!("\nAccount");
+    let mut keys_unlocked = false;
     match pdfs_core::auth::load() {
         Ok(session) => {
             report.finding(DiagnoseLevel::Ok, "  keyring session", session.username);
-            match key_state_name() {
+            let key_state = key_state_name();
+            keys_unlocked = key_state != "locked";
+            match key_state {
                 "locked" => report.finding(
                     DiagnoseLevel::Fail,
                     "  account keys",
@@ -3561,6 +3564,7 @@ fn cmd_diagnose() -> Result<()> {
     );
     // A stale socket file with no listener is the common failure, so the reply
     // is what decides this rather than the file's existence.
+    let mut daemon_responding = false;
     match control_request(CtlRequest::Status) {
         Ok(CtlResponse::Status {
             mountpoint,
@@ -3572,6 +3576,7 @@ fn cmd_diagnose() -> Result<()> {
             version,
             ..
         }) => {
+            daemon_responding = true;
             report.finding(DiagnoseLevel::Ok, "  daemon responding", "");
             if daemon_outdated(&version) {
                 report.finding(
@@ -3713,6 +3718,14 @@ fn cmd_diagnose() -> Result<()> {
         mountpoint.display().to_string(),
     );
 
+    // The daemon opens its control socket only once My Files is mounted, so a
+    // daemon that answers has the keys it needs. One that does not may be stuck
+    // on a key that does not open (#40); only then is Proton asked.
+    if keys_unlocked && !daemon_responding {
+        println!("\nKeys");
+        diagnose_keys(&mut report);
+    }
+
     if report.failures == 0 {
         if report.warnings == 0 {
             println!("\nNo problems found.");
@@ -3729,6 +3742,43 @@ fn cmd_diagnose() -> Result<()> {
             report.failures,
             report.warnings
         )
+    }
+}
+
+/// Ask Proton which account and address keys open, and which of them the My
+/// Files share needs. The findings hold key IDs and no secrets.
+fn diagnose_keys(report: &mut DiagnoseReport) {
+    use pdfs_core::keycheck::{self, Level};
+
+    let checked = tokio::runtime::Runtime::new()
+        .map_err(anyhow::Error::from)
+        .and_then(|rt| {
+            rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), keycheck::run())
+                    .await
+                    .map_err(|_| anyhow!("Proton did not answer within 30 seconds"))?
+                    .map_err(anyhow::Error::from)
+            })
+        });
+    let (keys, share) = match checked {
+        Ok(checked) => checked,
+        Err(e) => {
+            report.finding(DiagnoseLevel::Warn, "  key check", format!("{e:#}"));
+            return;
+        }
+    };
+    let findings = keycheck::findings(&keys, &share);
+    let any_failed = findings.iter().any(|f| f.level != Level::Ok);
+    for finding in findings {
+        let level = match finding.level {
+            Level::Ok => DiagnoseLevel::Ok,
+            Level::Warn => DiagnoseLevel::Warn,
+            Level::Fail => DiagnoseLevel::Fail,
+        };
+        report.finding(level, &format!("  {}", finding.label), finding.detail);
+    }
+    if any_failed {
+        println!("         (key IDs are not secret; include this section when you report it)");
     }
 }
 

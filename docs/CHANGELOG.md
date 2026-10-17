@@ -11,6 +11,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **`pdfs diagnose` names the key that keeps My Files closed.** When you are signed in and the
+  service does not answer, a new **Keys** section asks Proton which account and address keys
+  open, which account key each address key depends on, and which address key the My Files share
+  is encrypted to. It shows key IDs only, no secrets (#40).
+
 ## [3.5.0] — 2026-10-16
 
 Schema: **44**. Queued changes get an index by kind and name, and each synced file remembers the
