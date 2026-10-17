@@ -1,0 +1,66 @@
+name: COPR
+
+on:
+  # Called by release.yml once the GitHub release and its assets exist: COPR
+  # downloads the tag archive and the vendored crates from the release.
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+    secrets:
+      COPR_CONFIG:
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release to build, such as 3.5.0. It must already have its vendor tarball.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copr
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build in COPR
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    env:
+      VERSION: ${{ inputs.version }}
+      COPR_PROJECT: narrrl/proton-drive-linux
+
+    steps:
+      - name: Install packaging tools
+        run: dnf -y install copr-cli rpm-build rpmdevtools
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure COPR access
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          install -d -m700 ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+
+      # COPR rebuilds the source package without our --define, so the version
+      # has to be written into the spec itself.
+      - name: Build the source package
+        run: |
+          version="${VERSION#v}"
+          spec=packaging/proton-drive-linux.spec
+          sed -i -E "s/^(%\{!\?version: %global version )[^}]*\}/\1${version}}/" "$spec"
+          grep -qF "%global version ${version}}" "$spec"
+          mkdir -p rpmbuild/SOURCES
+          spectool -g -C rpmbuild/SOURCES "$spec"
+          rpmbuild -bs --define "_topdir $PWD/rpmbuild" "$spec"
+
+      # Waits for the build, so a failed COPR build fails this job.
+      - name: Submit to COPR
+        run: copr-cli build "$COPR_PROJECT" rpmbuild/SRPMS/*.src.rpm

@@ -59,6 +59,17 @@ sudo apt install ./proton-drive-linux_*_amd64.deb
 
 ### Fedora (44 or newer)
 
+The [COPR repository](https://copr.fedorainfracloud.org/coprs/narrrl/proton-drive-linux/) builds
+every release, so `dnf upgrade` keeps the client up to date:
+
+```bash
+sudo dnf copr enable narrrl/proton-drive-linux
+sudo dnf install proton-drive-linux
+```
+
+The `.rpm` from the release page installs the same files, but you have to download each new
+version yourself:
+
 ```bash
 sudo dnf install ./proton-drive-linux-*.x86_64.rpm
 ```

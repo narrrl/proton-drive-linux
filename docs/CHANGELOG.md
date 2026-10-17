@@ -11,6 +11,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+- **A COPR repository for Fedora**, so `dnf upgrade` brings each new release:
+  `sudo dnf copr enable narrrl/proton-drive-linux`. Every release also ships the vendored crates
+  as `proton-drive-linux-vendor-<version>.tar.xz`, which the COPR build uses offline (#42).
+
 ## [3.5.0] — 2026-10-16
 
 Schema: **44**. Queued changes get an index by kind and name, and each synced file remembers the

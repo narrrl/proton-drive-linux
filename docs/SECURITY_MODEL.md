@@ -75,7 +75,9 @@ operations, and the client only writes them to its local log.
 
 ## Packages
 
-- The `.rpm` is signed with GPG.
+- The `.rpm` on the release page is signed with GPG.
+- The COPR packages are built by Fedora's COPR service from the tagged source and the vendored
+  crates of the release, and are signed with the COPR project's own key.
 - The `.deb` and the `.tar.gz` are built by GitHub Actions from the tagged source, and are not
   signed.
 - The AUR packages build from the tagged source or from `main`, or install the release binaries
