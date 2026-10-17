@@ -3,6 +3,9 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/narrrl/proton-drive-linux/security/advisories/new
     about: Report privately — never in a public issue.
+  - name: Troubleshooting and FAQ
+    url: https://github.com/narrrl/proton-drive-linux/wiki/Troubleshooting
+    about: Fixes for common problems, and what to include in a bug report.
   - name: Known issues
     url: https://github.com/narrrl/proton-drive-linux/blob/main/docs/BUGS.md
     about: The authoritative ledger of tracked bugs and their status.

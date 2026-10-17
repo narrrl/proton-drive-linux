@@ -20,6 +20,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   version is out. It is off by default, and not offered for packages that a package manager
   updates (COPR, the AUR, Nix) (#42).
 
+### Changed
+- **Reorganised documentation, now also on the
+  [wiki](https://github.com/narrrl/proton-drive-linux/wiki).** A new
+  [Getting started](https://github.com/narrrl/proton-drive-linux/wiki/Getting-Started) page and
+  an [FAQ](https://github.com/narrrl/proton-drive-linux/wiki/FAQ). The user guide is split into
+  pages for files, synced folders, Photos, sharing, computers, and the launcher and tray.
+  Installation puts the COPR repository first for Fedora and explains updating and uninstalling
+  for each kind of package. Each release publishes `docs/` to the wiki.
+
 ## [3.5.0] — 2026-10-16
 
 Schema: **44**. Queued changes get an index by kind and name, and each synced file remembers the

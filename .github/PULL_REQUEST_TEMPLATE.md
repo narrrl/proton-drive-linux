@@ -21,6 +21,7 @@ cargo test --workspace --locked
 - [ ] Touches recovery, staging, or anything that can be the only copy of user data
 - [ ] Changes packaging, the systemd unit, or desktop entries
 - [ ] Changes the control protocol (daemon and front ends updated together)
+- [ ] Adds or renames a page in `docs/` (listed in `SECTIONS` in `scripts/publish-wiki.sh`, which publishes it to the wiki)
 - [ ] None of the above
 
 <!-- Screenshots for GTK changes. -->
