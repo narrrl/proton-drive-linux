@@ -20,6 +20,11 @@ information listed under [Reporting a problem](#reporting-a-problem).
 Checks the installation and prints a report. It does not need the service, because the state
 worth diagnosing is often the one where the service will not start.
 
+When you are signed in but the service does not answer, it also asks Proton which of your keys
+open, under **Keys**: each account key, each address key, and the address key your My Files
+share is encrypted to. A key that does not open is named with the key it depends on. The section
+shows key IDs, which are not secret, so you can post it in an issue.
+
 ```console
 $ pdfs diagnose
 Paths
@@ -125,7 +130,8 @@ systemctl --user restart proton-drive.service
 keys cannot open your Drive volume, which happens after a password reset. Proton locks the volume
 that was encrypted to the old keys. From 3.4.1 the client starts a new, empty My Files volume
 in that case. Your old files stay in the locked volume: open [drive.proton.me](https://drive.proton.me)
-and restore them there with your previous password.
+and restore them there with your previous password. If the volume is not locked and the error
+stays, run `pdfs diagnose` and post its **Keys** section in an issue.
 
 **The folder is empty or missing** — check that the service runs and is signed in
 (`pdfs status`). The service waits for a stored session before it mounts.
