@@ -150,22 +150,25 @@ to the GitHub wiki, so keep their file names.
 
 Releases are cut from `main` by pushing a `v*` tag. `.github/workflows/release.yml` then:
 
-1. checks that the tag, the workspace version in `Cargo.toml` and `pkgver` in
-   `packaging/PKGBUILD` agree;
+1. checks that the tag, the workspace version in `Cargo.toml`, `pkgver` in
+   `packaging/PKGBUILD` and the default version in `packaging/proton-drive-linux.spec` agree;
 2. runs the quality gates;
-3. builds the release binaries and packages a `.tar.gz`, a `.deb` and a GPG-signed `.rpm`, and
-   builds the Nix flake at the tag, which is what a flake input pinned to `vX.Y.Z` gets, and
-   pushes it to the `proton-drive-linux` Cachix cache (secret `CACHIX_AUTH_TOKEN`);
+3. builds the release binaries and packages a `.tar.gz`, a `.deb`, a GPG-signed `.rpm` and a
+   `.tar.xz` of the vendored crates, and builds the Nix flake at the tag, which is what a flake
+   input pinned to `vX.Y.Z` gets, and pushes it to the `proton-drive-linux` Cachix cache (secret
+   `CACHIX_AUTH_TOKEN`);
 4. publishes them as a GitHub release, with the version's section of `docs/CHANGELOG.md` as the
    notes;
 5. calls `.github/workflows/aur.yml`, which updates and pushes the AUR recipes and commits them
-   back to `main`.
+   back to `main`;
+6. calls `.github/workflows/copr.yml`, which builds the release in the
+   [COPR repository](../packaging/copr/README.md) (secret `COPR_CONFIG`).
 
 To prepare a release:
 
 ```bash
-# 1. Bump the version in Cargo.toml, packaging/PKGBUILD, po/pdfs.pot and the pinned flake
-#    URL in docs/INSTALL.md, then refresh the lock file.
+# 1. Bump the version in Cargo.toml, packaging/PKGBUILD, packaging/proton-drive-linux.spec,
+#    po/pdfs.pot and the pinned flake URL in docs/INSTALL.md, then refresh the lock file.
 cargo update --workspace
 # 2. Move the [Unreleased] notes in docs/CHANGELOG.md under the new version.
 # 3. Commit, tag and push.

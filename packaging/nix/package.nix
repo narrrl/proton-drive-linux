@@ -106,6 +106,9 @@ rustPlatform.buildRustPackage {
 
     patchShebangs po/build.sh
     po/build.sh $out/share/locale
+
+    # Nix brings new releases, so the app never checks for them itself.
+    install -Dm644 /dev/null $out/share/proton-drive-linux/managed-updates
   '';
 
   # Thumbnails shell out to exiftool, and to ffmpeg for video. Suffixed, so a
