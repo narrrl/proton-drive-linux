@@ -61,6 +61,12 @@ a list view, sorting, thumbnails (including camera RAW previews), multi-select, 
 to upload. **Details** (Alt+Enter) shows the size, dates, sharing and version history of the
 selected item.
 
+Right-click an item for more. **Make a Copy** copies it into the same folder, and **Copy To…**
+copies it, or a whole selection, into another folder in My files. The copy is made on Proton
+Drive, so nothing is downloaded or uploaded, and a name already taken gets a " (1)" suffix. An
+item with changes that have not reached Proton Drive yet can be copied once they have. From a
+terminal: `pdfs copy PATH... NEW_PARENT`.
+
 ## Trash
 
 Deleted files go to the Trash, both from `~/ProtonDrive` and from the app. The **Trash** page

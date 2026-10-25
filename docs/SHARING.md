@@ -47,6 +47,7 @@ a viewer are read-only.
 
 - **Invitations** wait in a banner at the top of the page until you accept or reject them. From a
   terminal: `pdfs invitations list`, then `accept ID` or `reject ID`.
-- **Saved public links** have their own view. `pdfs bookmarks` manages them.
+- **Saved public links** have their own view, listed by the name of what they point at.
+  `pdfs bookmarks` manages them.
 - **Leave…** a share you no longer need, or run `pdfs leave UID` with the ID from
   `pdfs shared-with-me`.

@@ -19,10 +19,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   the app asks GitHub once a day and shows a banner with a **Download** button when a newer
   version is out. It is off by default, and not offered for packages that a package manager
   updates (COPR, the AUR, Nix) (#42).
-- **`pdfs copy` copies files and folders on Proton Drive**, without downloading or uploading
-  them: `pdfs copy ~/ProtonDrive/report.pdf ~/ProtonDrive/Archive`. A folder is copied with
-  everything in it, and a name already taken gets a " (1)" suffix. A file or folder with changes
-  that have not synced yet is refused until they have.
+- **Copy files and folders on Proton Drive**, without downloading or uploading them. In My files,
+  right-click an item and choose **Make a Copy** to copy it next to itself, or **Copy To…** to pick
+  another folder; **Copy To…** also works on a selection. From a terminal:
+  `pdfs copy ~/ProtonDrive/report.pdf ~/ProtonDrive/Archive`. A folder is copied with everything
+  in it, and a name already taken gets a " (1)" suffix. A file or folder with changes that have
+  not synced yet is refused until they have.
 
 ### Changed
 - **Reorganised documentation, now also on the
@@ -32,6 +34,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   pages for files, synced folders, Photos, sharing, computers, and the launcher and tray.
   Installation puts the COPR repository first for Fedora and explains updating and uninstalling
   for each kind of package. Each release publishes `docs/` to the wiki.
+
+### Fixed
+
+- **Saved public links show the name of what they point at**, in the app and in `pdfs bookmarks`,
+  instead of "Shared link". For a link with a custom password, the address no longer has the custom
+  password stuck to its end, so it matches the link the web shows and the page asks for the
+  password.
 
 ## [3.5.0] — 2026-10-16
 
