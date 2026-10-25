@@ -350,6 +350,11 @@ pub enum Request {
     /// taken in `new_parent` gets the next free ` (n)` suffix. Replies with
     /// [`Response::Ok`].
     Copy { path: String, new_parent: String },
+    /// Ask Proton Drive how much the folder at mountpoint-relative `path`
+    /// holds. Replies with [`Response::FolderSize`].
+    FolderSize { path: String },
+    /// The by-uid twin of [`Request::FolderSize`].
+    FolderSizeByUid { uid: String },
     /// Trash a file or folder. `path` is mountpoint-relative. Replies with
     /// [`Response::Ok`].
     Delete { path: String },
@@ -602,6 +607,24 @@ pub enum Request {
     RemovePublicLink { path: String, id: String },
     /// The by-uid twin of [`Request::RemovePublicLink`].
     RemovePublicLinkByUid { uid: String, id: String },
+    /// Change the public link `id` on the node at `path`, keeping its URL.
+    /// `role` is "viewer" or "editor", or `None` to keep the current one.
+    /// Replies with [`Response::PublicLink`].
+    UpdatePublicLink {
+        path: String,
+        id: String,
+        role: Option<String>,
+        password: LinkChange<String>,
+        expires: LinkChange<i64>,
+    },
+    /// The by-uid twin of [`Request::UpdatePublicLink`].
+    UpdatePublicLinkByUid {
+        uid: String,
+        id: String,
+        role: Option<String>,
+        password: LinkChange<String>,
+        expires: LinkChange<i64>,
+    },
     /// Stop sharing the node at `path`: remove its public link, every pending
     /// invitation and every member. Each removal is attempted even if an
     /// earlier one fails. Replies with [`Response::Ok`], or an error naming
@@ -1079,6 +1102,18 @@ pub struct PublicLinkInfo {
     /// When the link was made, epoch seconds; 0 when unknown.
     #[serde(default)]
     pub created: i64,
+}
+
+/// What [`Request::UpdatePublicLink`] does with one option of a link: its
+/// custom password or its expiry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum LinkChange<T> {
+    /// Leave the option as it is.
+    Keep,
+    /// Remove the option: no custom password, or no expiry.
+    Remove,
+    /// Set the option to this value.
+    Set(T),
 }
 
 /// One invitation addressed to me (in [`Response::Invitations`]).
@@ -2192,9 +2227,14 @@ pub enum Response {
         entries: Vec<ShareEntry>,
         link: Option<PublicLinkInfo>,
     },
-    /// A freshly created public link, carrying the shareable URL (reply to
-    /// [`Request::CreatePublicLink`]).
+    /// A freshly created or changed public link, carrying the shareable URL
+    /// (reply to [`Request::CreatePublicLink`] and
+    /// [`Request::UpdatePublicLink`]).
     PublicLink { link: PublicLinkInfo },
+    /// What a folder holds on Proton Drive (reply to [`Request::FolderSize`]):
+    /// the bytes on storage and the number of items below it, folders and
+    /// trashed items included.
+    FolderSize { size: u64, items: u64 },
     /// Invitations addressed to me (reply to [`Request::ListInvitations`]).
     Invitations { items: Vec<InvitationInfo> },
     /// Saved public links (reply to [`Request::ListBookmarks`]).
@@ -3258,6 +3298,24 @@ mod tests {
                 uid: "vol~link".into(),
                 id: "url-1".into(),
             },
+            Request::UpdatePublicLink {
+                path: "a/b".into(),
+                id: "url-1".into(),
+                role: Some("editor".into()),
+                password: LinkChange::Set("pw".into()),
+                expires: LinkChange::Remove,
+            },
+            Request::UpdatePublicLinkByUid {
+                uid: "vol~link".into(),
+                id: "url-1".into(),
+                role: None,
+                password: LinkChange::Keep,
+                expires: LinkChange::Set(1_700_000_000),
+            },
+            Request::FolderSize { path: "a".into() },
+            Request::FolderSizeByUid {
+                uid: "vol~link".into(),
+            },
             Request::ListSharedByMe,
             Request::ListActivity { limit: 100 },
             Request::ListSharedWithMe,
@@ -3633,6 +3691,16 @@ mod tests {
                 "RemovePublicLinkByUid",
             ),
             (
+                Request::UpdatePublicLinkByUid {
+                    uid: "vol~link".into(),
+                    id: "link".into(),
+                    role: None,
+                    password: LinkChange::Keep,
+                    expires: LinkChange::Keep,
+                },
+                "UpdatePublicLinkByUid",
+            ),
+            (
                 Request::StopSharingByUid {
                     uid: "vol~link".into(),
                 },
@@ -3657,12 +3725,32 @@ mod tests {
                 | Request::RemoveShareEntryByUid { uid, .. }
                 | Request::CreatePublicLinkByUid { uid, .. }
                 | Request::RemovePublicLinkByUid { uid, .. }
+                | Request::UpdatePublicLinkByUid { uid, .. }
                 | Request::StopSharingByUid { uid } => uid,
                 other => panic!("decoded into the wrong dispatch variant: {other:?}"),
             };
             assert_eq!(decoded_uid, "vol~link");
             assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
         }
+    }
+
+    #[test]
+    fn a_link_update_names_what_it_keeps_removes_and_sets() {
+        let request = Request::UpdatePublicLink {
+            path: "a/b".into(),
+            id: "url-1".into(),
+            role: None,
+            password: LinkChange::Keep,
+            expires: LinkChange::Set(1_700_000_000),
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"UpdatePublicLink":{"path":"a/b","id":"url-1","role":null,"password":"Keep","expires":{"Set":1700000000}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LinkChange::<String>::Remove).unwrap(),
+            r#""Remove""#
+        );
     }
 
     #[test]

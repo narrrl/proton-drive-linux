@@ -59,7 +59,8 @@ folder off instead.
 The **My files** page shows the same files without going through the folder. It has a grid and
 a list view, sorting, thumbnails (including camera RAW previews), multi-select, and drag and drop
 to upload. **Details** (Alt+Enter) shows the size, dates, sharing and version history of the
-selected item.
+selected item. For a folder, the size and the number of items in it come from Proton Drive and
+include items in the trash; `pdfs du PATH` prints the same.
 
 Right-click an item for more. **Make a Copy** copies it into the same folder, and **Copy To…**
 copies it, or a whole selection, into another folder in My files. The copy is made on Proton

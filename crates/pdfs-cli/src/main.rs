@@ -13,7 +13,7 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ConflictKeep, ErrorKind, MountKind, RefreshScope, Request as CtlRequest,
+    ConflictKeep, ErrorKind, LinkChange, MountKind, RefreshScope, Request as CtlRequest,
     Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncIssue, SyncPhase,
     daemon_outdated, pending_summary,
 };
@@ -367,6 +367,14 @@ enum Command {
         /// or relative to the mountpoint.
         #[arg(required = true, num_args = 2.., value_name = "PATH")]
         paths: Vec<PathBuf>,
+    },
+    /// Show how much a folder holds on Proton Drive.
+    ///
+    /// Proton Drive adds it up, so nothing is downloaded. The size is the
+    /// encrypted bytes on storage and includes items in the trash.
+    Du {
+        /// Folder path, inside My files or relative to the mountpoint.
+        path: PathBuf,
     },
     /// Trash a file or folder via the running daemon.
     Rm {
@@ -789,6 +797,29 @@ enum PublicLinkCmd {
         #[arg(long)]
         expires: Option<i64>,
     },
+    /// Change a node's public link. The URL stays the same; an option not
+    /// given is kept.
+    Update {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Public-link id, from `pdfs members`.
+        id: String,
+        /// New role: viewer or editor.
+        #[arg(long)]
+        role: Option<String>,
+        /// New custom password protecting the link.
+        #[arg(long, conflicts_with = "no_password")]
+        password: Option<String>,
+        /// Remove the custom password.
+        #[arg(long)]
+        no_password: bool,
+        /// New expiry, Unix epoch seconds.
+        #[arg(long, conflicts_with = "no_expiry")]
+        expires: Option<i64>,
+        /// Remove the expiry.
+        #[arg(long)]
+        no_expiry: bool,
+    },
     /// Remove a node's public link.
     Remove {
         /// File/folder path, inside the mountpoint or relative to it.
@@ -935,6 +966,7 @@ fn main() -> Result<()> {
             let new_parent = paths.pop().expect("clap requires at least two paths");
             cmd_copy(paths, new_parent)
         }
+        Command::Du { path } => cmd_du(path),
         Command::Rm { path } => cmd_rm(path),
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
         Command::Upload { sources, parent } => cmd_upload(sources, parent),
@@ -1528,7 +1560,11 @@ fn cmd_members(path: PathBuf) -> Result<()> {
                 Some(l) => {
                     let url = l.url.as_deref().unwrap_or("(url hidden)");
                     let pw = if l.has_password { " +password" } else { "" };
-                    println!("public link ({}{pw}): {url}  [{}]", l.role, l.id);
+                    let expiry = l
+                        .expires
+                        .map(|at| format!(", expires {}", format_epoch_utc(at)))
+                        .unwrap_or_default();
+                    println!("public link ({}{pw}{expiry}): {url}  [{}]", l.role, l.id);
                 }
                 None => println!("public link: none"),
             }
@@ -1580,6 +1616,27 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
+        PublicLinkCmd::Update {
+            path,
+            id,
+            role,
+            password,
+            no_password,
+            expires,
+            no_expiry,
+        } => match control_request(CtlRequest::UpdatePublicLink {
+            path: path_arg(&path)?,
+            id,
+            role,
+            password: link_change(password, no_password),
+            expires: link_change(expires, no_expiry),
+        })? {
+            CtlResponse::PublicLink { link } => {
+                println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        },
         PublicLinkCmd::Remove { path, id } => {
             ok_or_bail(control_request(CtlRequest::RemovePublicLink {
                 path: path_arg(&path)?,
@@ -1588,6 +1645,15 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A `--x VALUE` / `--no-x` flag pair as one link option change.
+fn link_change<T>(value: Option<T>, remove: bool) -> LinkChange<T> {
+    match (value, remove) {
+        (Some(value), _) => LinkChange::Set(value),
+        (None, true) => LinkChange::Remove,
+        (None, false) => LinkChange::Keep,
+    }
 }
 
 fn cmd_shared() -> Result<()> {
@@ -2966,6 +3032,23 @@ fn cmd_copy(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn cmd_du(path: PathBuf) -> Result<()> {
+    match control_request(CtlRequest::FolderSize {
+        path: path_arg(&path)?,
+    })? {
+        CtlResponse::FolderSize { size, items } => {
+            let noun = if items == 1 { "item" } else { "items" };
+            println!(
+                "{} in {items} {noun} (on Proton Drive, trash included)",
+                human_bytes(size)
+            );
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
 fn cmd_rm(path: PathBuf) -> Result<()> {
     match control_request(CtlRequest::Delete {
         path: path_arg(&path)?,
@@ -3950,6 +4033,13 @@ mod login_wait_tests {
         let mut slept = 0;
         wait_for_session(|| Ok(()), |_| slept += 1).unwrap();
         assert_eq!(slept, 0);
+    }
+
+    #[test]
+    fn a_link_flag_pair_keeps_removes_or_sets() {
+        assert_eq!(link_change::<i64>(None, false), LinkChange::Keep);
+        assert_eq!(link_change::<i64>(None, true), LinkChange::Remove);
+        assert_eq!(link_change(Some(5), false), LinkChange::Set(5));
     }
 
     #[test]

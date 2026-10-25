@@ -33,6 +33,12 @@ In **Share…**, create a public link. Anyone with the link can open the item. Y
 link with a password and let it expire on a date. From a terminal, use `pdfs public-link create`
 and `pdfs public-link remove`.
 
+To change a link later, open **Link settings** under it. You can switch it between Viewer and
+Editor, set, change or remove its password, and change or remove its expiry. The address stays
+the same, so everyone who has the link keeps it. From a terminal, use `pdfs public-link update`;
+`pdfs members` shows the link's id. A link made long ago by an older Proton app may not be
+changeable; remove it and create a new one instead.
+
 ## See what you share
 
 **Shared by me** lists everything you share. Filter it by links, by people, or by expired links.

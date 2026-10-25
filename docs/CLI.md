@@ -59,6 +59,7 @@ browser, complete it, then press Enter.
 | `pdfs rename PATH NEW_NAME` | Rename a file or folder. |
 | `pdfs move PATH... NEW_PARENT` | Move one or more files or folders into another folder. The two may be in different locations (My files, an on-demand or a mirrored synced folder); the move happens on Proton Drive, without downloading or uploading anything. |
 | `pdfs copy PATH... NEW_PARENT` | Copy one or more files or folders into another folder in My files. The copy happens on Proton Drive, without downloading or uploading anything; a name already taken gets a " (1)" suffix. Changes that have not synced yet must sync first. |
+| `pdfs du PATH` | Show how much a folder holds on Proton Drive and how many items are in it. The size includes items in the trash. |
 | `pdfs rm PATH` | Move to the Trash. |
 | `pdfs upload SOURCES... [-t FOLDER]` | Upload local files and folders (recursively) in the background. Follow with `pdfs transfers`. |
 | `pdfs refresh [TARGET] [--full]` | Forget a cached listing so the next read fetches it again. `TARGET` is a folder, `trash` or `photos`; `--full` with `photos` re-reads every photo's metadata. |
@@ -134,10 +135,11 @@ commands are for scripts and for cases where the mount is not available.
 | Command | Description |
 |---|---|
 | `pdfs share PATH EMAILS... [--role viewer\|editor\|admin] [--message TEXT]` | Invite people to a file or folder. |
-| `pdfs members PATH` | List members, pending invitations and the public link. |
+| `pdfs members PATH` | List members, pending invitations and the public link, with the link's id and expiry. |
 | `pdfs share-role PATH ID KIND ROLE` | Change a member's or invitation's role. |
 | `pdfs unshare PATH [ID KIND]` | Stop sharing, or remove one member or invitation. |
 | `pdfs public-link create PATH [--role] [--password] [--expires EPOCH]` | Create a public link. `--expires` takes Unix seconds. |
+| `pdfs public-link update PATH ID [--role] [--password TEXT \| --no-password] [--expires EPOCH \| --no-expiry]` | Change a public link's role, password or expiry. The URL stays the same, and an option you leave out is kept. |
 | `pdfs public-link remove PATH ID` | Remove a public link. |
 | `pdfs shared` | List what you share. |
 | `pdfs shared-with-me [UID]` | List what others share with you, or the contents of one shared folder. |

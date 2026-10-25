@@ -5288,6 +5288,43 @@ impl Core {
         Ok(copy_name)
     }
 
+    /// What the folder at `rel` holds on Proton Drive: bytes on storage and the
+    /// number of items below it. Drive adds it up, so nothing is listed here;
+    /// trashed items count, and the bytes are encrypted ones.
+    pub(crate) fn folder_size(&self, rel: &Path) -> CoreResult<proton_drive_rs::FolderSize> {
+        let (ino, uid) = self.resolve(rel)?;
+        let is_folder = self
+            .state()
+            .entries
+            .get(&ino)
+            .is_some_and(|entry| entry.node.is_folder());
+        if !is_folder {
+            return Err(CoreError::invalid(format!(
+                "{} is not a folder",
+                rel.display()
+            )));
+        }
+        self.folder_size_for_uid(&uid)
+    }
+
+    /// [`Core::folder_size`] for a folder addressed through any daemon location.
+    pub(crate) fn folder_size_by_uid(&self, uid: &str) -> CoreResult<proton_drive_rs::FolderSize> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.folder_size_for_uid(&uid)
+    }
+
+    fn folder_size_for_uid(&self, uid: &NodeUid) -> CoreResult<proton_drive_rs::FolderSize> {
+        if is_local_uid(uid) {
+            return Err(CoreError::conflict("the folder is not on Proton Drive yet"));
+        }
+        if !self.is_online() {
+            return Err(CoreError::offline());
+        }
+        self.rt
+            .block_on(self.client.get_folder_size(uid))
+            .map_err(|e| CoreError::from_api(&e, "folder size"))
+    }
+
     /// Trash a file or folder. `rel` is mountpoint-relative. Forgets the node,
     /// evicts any cached content, and invalidates the parent listing.
     fn delete(&self, rel: &Path) -> CoreResult<String> {

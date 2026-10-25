@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use pdfs_core::control::{
-    BookmarkInfo, DirEntry, InvitationInfo, PublicLinkInfo, ShareEntry, ShareEntryKind, SharedItem,
+    BookmarkInfo, DirEntry, InvitationInfo, LinkChange, PublicLinkInfo, ShareEntry, ShareEntryKind,
+    SharedItem,
 };
 use pdfs_core::{CoreError, CoreResult};
 use tracing::debug;
@@ -364,6 +365,89 @@ impl Core {
             .rt
             .block_on(self.client.create_public_link(uid, role, password, expires))
             .map_err(|e| CoreError::from_api(&e, "create public link"))?;
+        Ok(public_link_info(link))
+    }
+
+    /// Change the public link `id` on the node at `rel`, keeping its URL.
+    pub(crate) fn update_public_link(
+        &self,
+        rel: &Path,
+        id: &str,
+        role: Option<&str>,
+        password: LinkChange<String>,
+        expires: LinkChange<i64>,
+    ) -> CoreResult<PublicLinkInfo> {
+        let (_ino, uid) = self.resolve(rel)?;
+        self.update_public_link_for_uid(&uid, id, role, password, expires)
+    }
+
+    /// [`Core::update_public_link`] for a node addressed through any daemon
+    /// location.
+    pub(crate) fn update_public_link_by_uid(
+        &self,
+        uid: &str,
+        id: &str,
+        role: Option<&str>,
+        password: LinkChange<String>,
+        expires: LinkChange<i64>,
+    ) -> CoreResult<PublicLinkInfo> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.update_public_link_for_uid(&uid, id, role, password, expires)
+    }
+
+    /// The SDK sets all three options on every update, so each `Keep` is
+    /// filled in from the link as it stands.
+    fn update_public_link_for_uid(
+        &self,
+        uid: &NodeUid,
+        id: &str,
+        role: Option<&str>,
+        password: LinkChange<String>,
+        expires: LinkChange<i64>,
+    ) -> CoreResult<PublicLinkInfo> {
+        let link = self
+            .rt
+            .block_on(self.client.get_public_link(uid))
+            .map_err(|e| CoreError::from_api(&e, "get public link"))?
+            .filter(|l| l.public_link_id == id)
+            .ok_or_else(|| CoreError::not_found("public link not found"))?;
+        let role = match role {
+            Some(role) => role_from_str(role)?,
+            None => link.role,
+        };
+        let unchanged = role == link.role
+            && matches!(password, LinkChange::Keep)
+            && matches!(expires, LinkChange::Keep);
+        if unchanged {
+            return Ok(public_link_info(link));
+        }
+        let password = match password {
+            LinkChange::Keep if link.has_custom_password => {
+                // Sending `None` here would quietly remove the password.
+                Some(link.custom_password.clone().ok_or_else(|| {
+                    CoreError::conflict(
+                        "the link's password could not be read; set a new one or remove it",
+                    )
+                })?)
+            }
+            LinkChange::Keep | LinkChange::Remove => None,
+            LinkChange::Set(password) if password.is_empty() => {
+                return Err(CoreError::invalid("the new password is empty"));
+            }
+            LinkChange::Set(password) => Some(password),
+        };
+        let expires = match expires {
+            LinkChange::Keep => link.expiration_time,
+            LinkChange::Remove => None,
+            LinkChange::Set(at) => Some(at),
+        };
+        let link = self
+            .rt
+            .block_on(
+                self.client
+                    .update_public_link(uid, role, password.as_deref(), expires),
+            )
+            .map_err(|e| CoreError::from_api(&e, "update public link"))?;
         Ok(public_link_info(link))
     }
 

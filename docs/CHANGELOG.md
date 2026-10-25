@@ -25,6 +25,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   `pdfs copy ~/ProtonDrive/report.pdf ~/ProtonDrive/Archive`. A folder is copied with everything
   in it, and a name already taken gets a " (1)" suffix. A file or folder with changes that have
   not synced yet is refused until they have.
+- **Change a public link without getting a new one.** In **Share…**, open **Link settings** under
+  the link to switch between Viewer and Editor, set, change or remove the password, and change or
+  remove the expiry. The address stays the same, so people who already have the link keep it.
+  From a terminal: `pdfs public-link update PATH ID [--role] [--password | --no-password]
+  [--expires EPOCH | --no-expiry]`. `pdfs members` now also shows when a link expires.
+- **Folder sizes.** **Details** shows how much a folder holds and how many items are in it, as
+  Proton Drive counts it, including items in the trash. From a terminal: `pdfs du PATH`.
 
 ### Changed
 - **Reorganised documentation, now also on the

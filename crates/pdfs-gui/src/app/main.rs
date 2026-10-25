@@ -75,11 +75,11 @@ use pdfs_core::config::{AppDirs, FileSort, FilesView, WindowState};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
-    DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, MappingProgress, PendingOpInfo,
-    PhotoItem, PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope, Request, Response,
-    RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
-    SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress, ThumbnailBuildStatus, Topic,
-    TransferDirection, TransferItem, send,
+    DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, LinkChange, MappingProgress,
+    PendingOpInfo, PhotoItem, PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope,
+    Request, Response, RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry,
+    ShareEntryKind, SharedItem, SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress,
+    ThumbnailBuildStatus, Topic, TransferDirection, TransferItem, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
