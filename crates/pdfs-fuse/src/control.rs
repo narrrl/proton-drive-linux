@@ -1063,6 +1063,31 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 (Err(e), _) | (_, Err(e)) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::Copy { path, new_parent }) => {
+            match (
+                rel_to_mount(mountpoint, &path),
+                rel_to_mount(mountpoint, &new_parent),
+            ) {
+                (Ok(rel), Ok(parent_rel)) => match core.copy_to(&rel, &parent_rel) {
+                    Ok(name) => {
+                        let dest = if new_parent.is_empty() {
+                            "My files".to_string()
+                        } else {
+                            new_parent.clone()
+                        };
+                        core.log_activity(ActivityKind::Copy, &name, format!("to {dest}"), true);
+                        CtlResponse::Ok {
+                            message: format!("copied to {name}"),
+                        }
+                    }
+                    Err(e) => {
+                        core.log_activity(ActivityKind::Copy, &path, &e, false);
+                        CtlResponse::error(e)
+                    }
+                },
+                (Err(e), _) | (_, Err(e)) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::Delete { path }) => match route_node(core, mountpoint, &path) {
             Ok((core, rel)) => match core.delete(&rel) {
                 Ok(name) => {

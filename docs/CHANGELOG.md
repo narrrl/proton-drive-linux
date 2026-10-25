@@ -19,6 +19,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   the app asks GitHub once a day and shows a banner with a **Download** button when a newer
   version is out. It is off by default, and not offered for packages that a package manager
   updates (COPR, the AUR, Nix) (#42).
+- **`pdfs copy` copies files and folders on Proton Drive**, without downloading or uploading
+  them: `pdfs copy ~/ProtonDrive/report.pdf ~/ProtonDrive/Archive`. A folder is copied with
+  everything in it, and a name already taken gets a " (1)" suffix. A file or folder with changes
+  that have not synced yet is refused until they have.
 
 ### Changed
 - **Reorganised documentation, now also on the

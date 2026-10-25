@@ -344,6 +344,12 @@ pub enum Request {
     /// or a mirror synced folder), and the move is still made on Proton Drive
     /// without transferring content. Replies with [`Response::Ok`].
     Move { path: String, new_parent: String },
+    /// Copy a file or folder into a folder on Proton Drive, without
+    /// downloading or uploading it. Both `path` and `new_parent` are
+    /// mountpoint-relative, or absolute paths inside My files. A name already
+    /// taken in `new_parent` gets the next free ` (n)` suffix. Replies with
+    /// [`Response::Ok`].
+    Copy { path: String, new_parent: String },
     /// Trash a file or folder. `path` is mountpoint-relative. Replies with
     /// [`Response::Ok`].
     Delete { path: String },
@@ -1169,6 +1175,7 @@ pub enum ActivityKind {
     Sync,
     Rename,
     Move,
+    Copy,
     CreateFolder,
     Trash,
     Restore,
@@ -2684,6 +2691,10 @@ mod tests {
                 new_name: "c.txt".into(),
             },
             Request::Move {
+                path: "a/b.txt".into(),
+                new_parent: "d".into(),
+            },
+            Request::Copy {
                 path: "a/b.txt".into(),
                 new_parent: "d".into(),
             },

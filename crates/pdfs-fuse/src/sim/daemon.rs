@@ -2216,6 +2216,75 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_pdfs_copy_copies_on_drive_and_waits_for_unsynced_changes() {
+        let drive = FakeDrive::new();
+        let dir = scratch("pdfs-copy");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+
+        let mount = &daemon.mountpoint;
+        std::fs::create_dir_all(mount.join("src/inner")).unwrap();
+        std::fs::create_dir_all(mount.join("dest")).unwrap();
+        std::fs::write(mount.join("src/a.txt"), b"alpha").unwrap();
+        std::fs::write(mount.join("src/inner/b.txt"), b"beta").unwrap();
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.tree().get("src/inner/b.txt").cloned() == file(b"beta")
+                && daemon.pending().is_ok_and(|ops| ops.is_empty())
+        }));
+
+        let path = |rel: &str| mount.join(rel).to_string_lossy().into_owned();
+        let copy = |from: &str, to: &str| {
+            daemon.request(&Request::Copy {
+                path: path(from),
+                new_parent: path(to),
+            })
+        };
+        let uploads = drive.tree().len();
+        copy("src/a.txt", "dest").unwrap();
+        // A name already taken gets a suffix rather than an error.
+        copy("src/a.txt", "dest").unwrap();
+        copy("src", "dest").unwrap();
+        assert_eq!(std::fs::read(mount.join("dest/a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(mount.join("dest/a (1).txt")).unwrap(),
+            b"alpha"
+        );
+        assert_eq!(
+            std::fs::read(mount.join("dest/src/inner/b.txt")).unwrap(),
+            b"beta"
+        );
+        let tree = drive.tree();
+        assert_eq!(tree.get("dest/src/a.txt").cloned(), file(b"alpha"));
+        assert_eq!(
+            tree.len(),
+            uploads + 6,
+            "{:?}",
+            tree.keys().collect::<Vec<_>>()
+        );
+
+        // Drive would copy what it has, not the bytes still queued.
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        std::fs::write(mount.join("src/a.txt"), b"alpha, edited").unwrap();
+        match copy("src/a.txt", "dest") {
+            Err(e) => assert!(e.to_string().contains("not reached Proton Drive"), "{e}"),
+            Ok(answer) => panic!("the copy went ahead: {answer:?}"),
+        }
+        match copy("src", "dest") {
+            Err(e) => assert!(e.to_string().contains("not reached Proton Drive"), "{e}"),
+            Ok(answer) => panic!("the folder copy went ahead: {answer:?}"),
+        }
+        daemon.request(&paused(false)).unwrap();
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_pdfs_rename_after_a_queued_rename_is_not_undone() {
         // `pdfs rename` and `pdfs move` went straight to Drive, and the
         // mount's own rename, still queued, landed after them and put the old

@@ -58,6 +58,7 @@ browser, complete it, then press Enter.
 | `pdfs mkdir PARENT NAME` | Create a folder. |
 | `pdfs rename PATH NEW_NAME` | Rename a file or folder. |
 | `pdfs move PATH... NEW_PARENT` | Move one or more files or folders into another folder. The two may be in different locations (My files, an on-demand or a mirrored synced folder); the move happens on Proton Drive, without downloading or uploading anything. |
+| `pdfs copy PATH... NEW_PARENT` | Copy one or more files or folders into another folder in My files. The copy happens on Proton Drive, without downloading or uploading anything; a name already taken gets a " (1)" suffix. Changes that have not synced yet must sync first. |
 | `pdfs rm PATH` | Move to the Trash. |
 | `pdfs upload SOURCES... [-t FOLDER]` | Upload local files and folders (recursively) in the background. Follow with `pdfs transfers`. |
 | `pdfs refresh [TARGET] [--full]` | Forget a cached listing so the next read fetches it again. `TARGET` is a folder, `trash` or `photos`; `--full` with `photos` re-reads every photo's metadata. |

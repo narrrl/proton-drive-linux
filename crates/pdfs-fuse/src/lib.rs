@@ -74,8 +74,8 @@ use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_drive_rs::{
-    DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, NodeMoveItem, ProtonDriveClient,
-    ProtonPhotosClient, SharedWithMeItem, ThumbnailType,
+    AvailableNameTarget, DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, NodeMoveItem,
+    ProtonDriveClient, ProtonPhotosClient, SharedWithMeItem, ThumbnailType,
 };
 
 mod albums;
@@ -5204,6 +5204,88 @@ impl Core {
         self.invalidate_parent_listing(rel);
         self.state().invalidate_listing(pino);
         Ok(name)
+    }
+
+    /// Copy a file or folder into `new_parent_rel` on Proton Drive, which copies
+    /// the content there: nothing is downloaded or uploaded. Both paths are
+    /// mountpoint-relative. A name already taken in the folder gets the next
+    /// free ` (n)` suffix. Returns the copy's name.
+    ///
+    /// Drive copies what it holds, so the copy is refused offline and while the
+    /// mount still owes Drive part of it: a node or folder only queued locally,
+    /// a file with a queued upload or unsaved writes, or — for a folder, whose
+    /// queued changes could sit anywhere below it — any queued op at all.
+    fn copy_to(&self, rel: &Path, new_parent_rel: &Path) -> CoreResult<String> {
+        let (ino, uid) = self.resolve(rel)?;
+        let (pino, new_parent_uid) = self
+            .resolve_path(new_parent_rel)
+            .map_err(|e| self.errno_error(e, "resolve new parent"))?;
+        self.ensure_children(pino)
+            .map_err(|e| self.errno_error(e, "enumerate"))?;
+        self.require_uid_writable(&new_parent_uid)
+            .map_err(|error| self.errno_error(error, "copy access"))?;
+        let (name, is_folder, unsaved) = {
+            let st = self.state();
+            let entry = st
+                .entries
+                .get(&ino)
+                .ok_or_else(|| CoreError::not_found(format!("{} is gone", rel.display())))?;
+            let unsaved = st.active_writes.get(&ino).is_some_and(|w| w.dirty);
+            (entry.node.name.clone(), entry.node.is_folder(), unsaved)
+        };
+        // Unlike a move, a copy cannot wait in the queue: it needs the node as
+        // Drive has it, so it goes now or not at all, local-first or not.
+        if !self.is_online() {
+            return Err(CoreError::offline());
+        }
+        let owed = unsaved
+            || is_local_uid(&uid)
+            || is_local_uid(&new_parent_uid)
+            || self.db.has_any_op(&uid.to_string()).unwrap_or(true)
+            || (is_folder
+                && self
+                    .db
+                    .pending_op_counts()
+                    .map(|counts| counts.uploads + counts.changes > 0)
+                    .unwrap_or(true));
+        if owed {
+            return Err(CoreError::conflict(format!(
+                "{name} has changes that have not reached Proton Drive yet; \
+                 copy it once they have synced"
+            )));
+        }
+        let target = if is_folder {
+            AvailableNameTarget::Folder
+        } else {
+            AvailableNameTarget::File
+        };
+        let copy_name = self
+            .rt
+            .block_on(
+                self.drive
+                    .get_available_name(&new_parent_uid, &name, target),
+            )
+            .map_err(|e| CoreError::from_api(&e, "copy"))?;
+        let new_uid = self
+            .rt
+            .block_on(
+                self.drive
+                    .copy_node(&uid, &new_parent_uid, Some(&copy_name)),
+            )
+            .map_err(|e| CoreError::from_api(&e, "copy"))?;
+        let node = self
+            .fetch_minted_node(&new_uid, &copy_name)
+            .ok_or_else(|| minted_but_unlisted(&copy_name))?;
+        let mut st = self.state();
+        let copy_ino = st.intern(pino, node);
+        if let Some(kids) = st.children.get_mut(&pino)
+            && !kids.contains(&copy_ino)
+        {
+            kids.push(copy_ino);
+        }
+        drop(st);
+        self.flush_access_changes();
+        Ok(copy_name)
     }
 
     /// Trash a file or folder. `rel` is mountpoint-relative. Forgets the node,

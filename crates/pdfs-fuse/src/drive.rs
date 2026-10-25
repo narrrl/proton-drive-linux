@@ -28,8 +28,8 @@ use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::error::Result;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid};
 use proton_drive_rs::{
-    Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem, ProtonDriveClient,
-    RevisionReader, Thumbnail,
+    AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem,
+    ProtonDriveClient, RevisionReader, Thumbnail,
 };
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
@@ -137,6 +137,22 @@ pub(crate) trait DriveApi: Send + Sync {
     ) -> Result<()>;
 
     async fn move_node(&self, uid: &NodeUid, new_parent: &NodeUid) -> Result<()>;
+
+    /// See [`ProtonDriveClient::copy_node`].
+    async fn copy_node(
+        &self,
+        uid: &NodeUid,
+        new_parent: &NodeUid,
+        name: Option<&str>,
+    ) -> Result<NodeUid>;
+
+    /// See [`ProtonDriveClient::get_available_name`].
+    async fn get_available_name(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        target: AvailableNameTarget,
+    ) -> Result<String>;
 
     fn move_nodes_streaming<'a>(
         &'a self,
@@ -446,6 +462,24 @@ impl DriveApi for ProtonDriveClient {
 
     async fn move_node(&self, uid: &NodeUid, new_parent: &NodeUid) -> Result<()> {
         ProtonDriveClient::move_node(self, uid, new_parent).await
+    }
+
+    async fn copy_node(
+        &self,
+        uid: &NodeUid,
+        new_parent: &NodeUid,
+        name: Option<&str>,
+    ) -> Result<NodeUid> {
+        ProtonDriveClient::copy_node(self, uid, new_parent, name).await
+    }
+
+    async fn get_available_name(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        target: AvailableNameTarget,
+    ) -> Result<String> {
+        ProtonDriveClient::get_available_name(self, parent_uid, name, target).await
     }
 
     fn move_nodes_streaming<'a>(

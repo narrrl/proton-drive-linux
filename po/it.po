@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-17 01:23+0200\n"
+"POT-Creation-Date: 2026-10-25 20:52+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Italian\n"
@@ -58,7 +58,7 @@ msgid "%A, %B %-d, %Y, %H:%M"
 msgstr "%A %-d %B %Y, %H:%M"
 
 #: crates/pdfs-gui/src/app/main.rs:856
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:539
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:543
 #: crates/pdfs-gui/src/app/pages/browser.rs:454
 #: crates/pdfs-gui/src/app/pages/browser.rs:833
 #: crates/pdfs-gui/src/app/pages/browser.rs:1239
@@ -820,192 +820,204 @@ msgstr "Spostato {name}"
 msgid "Couldn't move {name}"
 msgstr "Impossibile spostare {name}"
 
-#. Translators: {name} is a folder name.
+#. Translators: {name} is a file or folder name.
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:183
+#, rust-format
+msgid "Copied {name}"
+msgstr "Copiato {name}"
+
+#. Translators: {name} is a file or folder name.
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:185
+#, rust-format
+msgid "Couldn't copy {name}"
+msgstr "Impossibile copiare {name}"
+
+#. Translators: {name} is a folder name.
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:187
 #, rust-format
 msgid "Created folder {name}"
 msgstr "Creata la cartella {name}"
 
 #. Translators: {name} is a folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:185
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:189
 #, rust-format
 msgid "Couldn't create folder {name}"
 msgstr "Impossibile creare la cartella {name}"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:187
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:191
 #, rust-format
 msgid "Moved {name} to the Trash"
 msgstr "Spostato {name} nel cestino"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:189
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:193
 #, rust-format
 msgid "Couldn't move {name} to the Trash"
 msgstr "Impossibile spostare {name} nel cestino"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:191
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:195
 #, rust-format
 msgid "Restored {name}"
 msgstr "Ripristinato {name}"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:193
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:197
 #, rust-format
 msgid "Couldn't restore {name}"
 msgstr "Impossibile ripristinare {name}"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:195
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:199
 #, rust-format
 msgid "Deleted {name} forever"
 msgstr "Eliminato {name} per sempre"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:197
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:201
 #, rust-format
 msgid "Couldn't delete {name}"
 msgstr "Impossibile eliminare {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:198
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:202
 msgid "Emptied the Trash"
 msgstr "Svuotato il cestino"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:199
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:203
 msgid "Couldn't empty the Trash"
 msgstr "Impossibile svuotare il cestino"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:201
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:205
 #, rust-format
 msgid "Shared {name}"
 msgstr "Condiviso {name}"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:203
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:207
 #, rust-format
 msgid "Couldn't share {name}"
 msgstr "Impossibile condividere {name}"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:205
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:209
 #, rust-format
 msgid "Created a link to {name}"
 msgstr "Creato un collegamento a {name}"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:207
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:211
 #, rust-format
 msgid "Couldn't create a link to {name}"
 msgstr "Impossibile creare un collegamento a {name}"
 
 #. Translators: {name} is a file or folder name.
 #. Translators: {name} is the item's name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:209
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:213
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:559
 #, rust-format
 msgid "Stopped sharing {name}"
 msgstr "Condivisione di {name} interrotta"
 
 #. Translators: {name} is a file or folder name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:211
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:215
 #, rust-format
 msgid "Couldn't stop sharing {name}"
 msgstr "Impossibile interrompere la condivisione di {name}"
 
 #. Translators: {name} is the name of the conflicting copy.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:213
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:217
 #, rust-format
 msgid "Conflicting copy {name}"
 msgstr "Copia in conflitto {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:236
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:240
 msgid "Removed on Proton Drive"
 msgstr "Rimosso su Proton Drive"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:237
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:241
 msgid "Removed on this computer"
 msgstr "Rimosso su questo computer"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:239
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:243
 msgid "Replaced by a renamed file"
 msgstr "Sostituito da un file rinominato"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:243
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:247
 msgid ""
 "The destination folder no longer exists, so the file stayed where it was"
 msgstr ""
 "La cartella di destinazione non esiste più, quindi il file è rimasto dov’era"
 
 #. Translators: {name} is the folder an item was moved into.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:262
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:266
 #, rust-format
 msgid "To {name}"
 msgstr "In {name}"
 
 #. Translators: {name} is an item's previous name.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:266
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:270
 #, rust-format
 msgid "Previously {name}"
 msgstr "In precedenza {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:269
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:273
 msgid "Restored an earlier version"
 msgstr "Ripristinata una versione precedente"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:272
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:276
 msgid "Deleted an earlier version"
 msgstr "Eliminata una versione precedente"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:279
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:283
 #, rust-format
 msgid "Saved an earlier version to {path}"
 msgstr "Salvata una versione precedente in {path}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:286
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:290
 #, rust-format
 msgid "Kept both; the copy is now {name}"
 msgstr "Mantenuti entrambi; la copia ora è {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:296
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:300
 #, rust-format
 msgid "Kept {name}; the copy is in the Trash"
 msgstr "Mantenuto {name}; la copia è nel cestino"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:301
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:305
 msgid "Kept the conflicting copy"
 msgstr "Mantenuta la copia in conflitto"
 
 #. Translators: {name} is the file that was kept.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:305
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:309
 #, rust-format
 msgid "Kept {name}"
 msgstr "Mantenuto {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:310
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:314
 #, rust-format
 msgid "Same as {name}, so it was removed"
 msgstr "Uguale a {name}, quindi è stato rimosso"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:317
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:321
 #, rust-format
 msgid "The name was taken, so it was moved as {name}"
 msgstr "Il nome era già in uso, quindi è stato spostato come {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:324
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:328
 #, rust-format
 msgid "The name was taken on Proton Drive, so it was renamed to {name}"
 msgstr ""
 "Il nome era già in uso su Proton Drive, quindi è stato rinominato in {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:331
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:335
 #, rust-format
 msgid "The name was taken on Proton Drive, so it was created as {name}"
 msgstr ""
 "Il nome era già in uso su Proton Drive, quindi è stato creato come {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:340
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:344
 #, rust-format
 msgid ""
 "Its folder was moved to the Trash on Proton Drive, so it was created at the "
@@ -1014,7 +1026,7 @@ msgstr ""
 "La sua cartella è stata spostata nel cestino su Proton Drive, quindi è stato "
 "creato al primo livello come {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:350
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:354
 #, rust-format
 msgid ""
 "It no longer exists on Proton Drive, so your changes were uploaded as {name}"
@@ -1022,7 +1034,7 @@ msgstr ""
 "Non esiste più su Proton Drive, quindi le tue modifiche sono state caricate "
 "come {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:356
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:360
 #, rust-format
 msgid ""
 "It was moved to the Trash on Proton Drive, so your changes were uploaded as "
@@ -1031,7 +1043,7 @@ msgstr ""
 "È stato spostato nel cestino su Proton Drive, quindi le tue modifiche sono "
 "state caricate come {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:362
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:366
 #, rust-format
 msgid "It was changed on Proton Drive, so your changes were uploaded as {name}"
 msgstr ""
@@ -1040,12 +1052,12 @@ msgstr ""
 
 #. Translators: {name} is the copy the changes made on this
 #. computer were uploaded as.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:367
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:371
 #, rust-format
 msgid "Your changes were uploaded as {name}"
 msgstr "Le tue modifiche sono state caricate come {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:377
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:381
 #, rust-format
 msgid ""
 "It no longer exists on Proton Drive, so your changes were kept in {path}"
@@ -1053,7 +1065,7 @@ msgstr ""
 "Non esiste più su Proton Drive, quindi le tue modifiche sono state "
 "conservate in {path}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:383
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:387
 #, rust-format
 msgid ""
 "It was moved to the Trash on Proton Drive, so your changes were kept in "
@@ -1062,7 +1074,7 @@ msgstr ""
 "È stato spostato nel cestino su Proton Drive, quindi le tue modifiche sono "
 "state conservate in {path}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:389
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:393
 #, rust-format
 msgid "It was changed on Proton Drive, so your changes were kept in {path}"
 msgstr ""
@@ -1071,59 +1083,59 @@ msgstr ""
 
 #. Translators: {path} is the file on this computer that holds the
 #. changes which could not be uploaded.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:394
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:398
 #, rust-format
 msgid "Your changes were kept in {path}"
 msgstr "Le tue modifiche sono state conservate in {path}"
 
 #. Translators: {name} is the file the conflicting copy was made from.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:399
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:403
 #: crates/pdfs-gui/src/app/pages/locations.rs:989
 #, rust-format
 msgid "Differs from {name}"
 msgstr "Diverso da {name}"
 
 #. Translators: {name} is the file the conflicting copy was made from.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:406
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:410
 #, rust-format
 msgid "{name} no longer exists"
 msgstr "{name} non esiste più"
 
 #. Translators: {name} is the file the conflicting copy was made from.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:413
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:417
 #, rust-format
 msgid "Same as {name}"
 msgstr "Uguale a {name}"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:420
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:424
 #, rust-format
 msgid "{n} person can view"
 msgid_plural "{n} people can view"
 msgstr[0] "{n} persona può visualizzare"
 msgstr[1] "{n} persone possono visualizzare"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:421
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:425
 #, rust-format
 msgid "{n} person can edit"
 msgid_plural "{n} people can edit"
 msgstr[0] "{n} persona può modificare"
 msgstr[1] "{n} persone possono modificare"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:422
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:426
 #, rust-format
 msgid "{n} person invited"
 msgid_plural "{n} people invited"
 msgstr[0] "{n} persona invitata"
 msgstr[1] "{n} persone invitate"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:427
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:431
 #, rust-format
 msgid "{n} file kept as a conflicting copy"
 msgid_plural "{n} files kept as conflicting copies"
 msgstr[0] "{n} file mantenuto come copia in conflitto"
 msgstr[1] "{n} file mantenuti come copie in conflitto"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:435
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:439
 #, rust-format
 msgid "{n} item failed and will be tried again"
 msgid_plural "{n} items failed and will be tried again"
@@ -1131,8 +1143,8 @@ msgstr[0] "{n} elemento non riuscito, verrà riprovato"
 msgstr[1] "{n} elementi non riusciti, verranno riprovati"
 
 #. Translators: part of a list summing up a sync pass.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:473
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:504
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:477
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:508
 #, rust-format
 msgid "{n} uploaded"
 msgid_plural "{n} uploaded"
@@ -1140,7 +1152,7 @@ msgstr[0] "{n} caricato"
 msgstr[1] "{n} caricati"
 
 #. Translators: part of a list summing up a sync pass.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:475
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:479
 #, rust-format
 msgid "{n} downloaded"
 msgid_plural "{n} downloaded"
@@ -1148,7 +1160,7 @@ msgstr[0] "{n} scaricato"
 msgstr[1] "{n} scaricati"
 
 #. Translators: part of a list summing up a sync pass.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:477
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:481
 #, rust-format
 msgid "{n} folder created"
 msgid_plural "{n} folders created"
@@ -1156,7 +1168,7 @@ msgstr[0] "{n} cartella creata"
 msgstr[1] "{n} cartelle create"
 
 #. Translators: part of a list summing up a sync pass.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:479
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:483
 #, rust-format
 msgid "{n} deleted"
 msgid_plural "{n} deleted"
@@ -1164,7 +1176,7 @@ msgstr[0] "{n} eliminato"
 msgstr[1] "{n} eliminati"
 
 #. Translators: part of a list summing up a sync pass.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:481
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:485
 #, rust-format
 msgid "{n} in conflict"
 msgid_plural "{n} in conflict"
@@ -1173,7 +1185,7 @@ msgstr[1] "{n} in conflitto"
 
 #. Translators: part of a list summing up a sync pass; the files are
 #. still open in another app.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:484
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:488
 #, rust-format
 msgid "{n} still open"
 msgid_plural "{n} still open"
@@ -1181,28 +1193,28 @@ msgstr[0] "{n} ancora aperto"
 msgstr[1] "{n} ancora aperti"
 
 #. Translators: part of a list summing up a sync pass.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:486
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:509
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:490
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:513
 #, rust-format
 msgid "{n} failed"
 msgid_plural "{n} failed"
 msgstr[0] "{n} non riuscito"
 msgstr[1] "{n} non riusciti"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:498
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:502
 msgid "Cancelled"
 msgstr "Annullato"
 
 #. Translators: photos an import skipped because they were already
 #. in Proton Drive.
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:507
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:511
 #, rust-format
 msgid "{n} already there"
 msgid_plural "{n} already there"
 msgstr[0] "{n} già presente"
 msgstr[1] "{n} già presenti"
 
-#: crates/pdfs-gui/src/app/pages/activity_text.rs:508
+#: crates/pdfs-gui/src/app/pages/activity_text.rs:512
 #: crates/pdfs-gui/src/app/pages/albums.rs:107
 #: crates/pdfs-gui/src/app/pages/albums.rs:694
 #, rust-format

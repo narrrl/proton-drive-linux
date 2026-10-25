@@ -356,6 +356,18 @@ enum Command {
         #[arg(required = true, num_args = 2.., value_name = "PATH")]
         paths: Vec<PathBuf>,
     },
+    /// Copy files or folders into another folder in My files via the running
+    /// daemon.
+    ///
+    /// The copy happens on Proton Drive, so nothing is downloaded or uploaded,
+    /// unlike `cp` inside the mount. A name already taken in the destination
+    /// gets a " (1)" suffix. The last path is the destination folder.
+    Copy {
+        /// Files/folders to copy, then the destination folder: inside My files,
+        /// or relative to the mountpoint.
+        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
     /// Trash a file or folder via the running daemon.
     Rm {
         /// File/folder path, inside My files or an on-demand synced folder, or
@@ -918,6 +930,10 @@ fn main() -> Result<()> {
         Command::Move { mut paths } => {
             let new_parent = paths.pop().expect("clap requires at least two paths");
             cmd_move(paths, new_parent)
+        }
+        Command::Copy { mut paths } => {
+            let new_parent = paths.pop().expect("clap requires at least two paths");
+            cmd_copy(paths, new_parent)
         }
         Command::Rm { path } => cmd_rm(path),
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
@@ -1765,6 +1781,7 @@ fn activity_verb(kind: pdfs_core::control::ActivityKind) -> &'static str {
         Sync => "sync",
         Rename => "rename",
         Move => "move",
+        Copy => "copy",
         CreateFolder => "mkdir",
         Trash => "trash",
         Restore => "restore",
@@ -2916,6 +2933,35 @@ fn cmd_move(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
     }
     if failed > 0 {
         bail!("{failed} of {} could not be moved", sources.len());
+    }
+    Ok(())
+}
+
+fn cmd_copy(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
+    let new_parent = path_arg(&new_parent)?;
+    let mut failed = 0;
+    for source in &sources {
+        let outcome = path_arg(source).and_then(|path| {
+            match control_request(CtlRequest::Copy {
+                path,
+                new_parent: new_parent.clone(),
+            })? {
+                CtlResponse::Ok { message } => Ok(message),
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        });
+        match outcome {
+            Ok(message) => println!("{message}"),
+            Err(e) if sources.len() == 1 => return Err(e),
+            Err(e) => {
+                eprintln!("{}: {e:#}", source.display());
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} could not be copied", sources.len());
     }
     Ok(())
 }
