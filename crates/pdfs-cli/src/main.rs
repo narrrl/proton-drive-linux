@@ -1556,9 +1556,13 @@ fn cmd_versions(action: VersionCmd) -> Result<()> {
 }
 
 fn cmd_members(path: PathBuf) -> Result<()> {
-    match control_request(CtlRequest::ListShare {
+    let response = control_request(CtlRequest::ListShare {
         path: path_arg(&path)?,
-    })? {
+    })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::Share { entries, link } => {
             if entries.is_empty() {
                 println!("No members or pending invitations.");
@@ -1625,6 +1629,7 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
             password,
             expires,
         })? {
+            response if emit_json(&response)? => {}
             CtlResponse::PublicLink { link } => {
                 println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
             }
@@ -1646,6 +1651,7 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
             password: link_change(password, no_password),
             expires: link_change(expires, no_expiry),
         })? {
+            response if emit_json(&response)? => {}
             CtlResponse::PublicLink { link } => {
                 println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
             }
@@ -3048,9 +3054,13 @@ fn cmd_copy(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
 }
 
 fn cmd_du(path: PathBuf) -> Result<()> {
-    match control_request(CtlRequest::FolderSize {
+    let response = control_request(CtlRequest::FolderSize {
         path: path_arg(&path)?,
-    })? {
+    })?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
         CtlResponse::FolderSize { size, items } => {
             let noun = if items == 1 { "item" } else { "items" };
             println!(
