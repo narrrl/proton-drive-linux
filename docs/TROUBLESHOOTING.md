@@ -226,6 +226,22 @@ Check that:
 
 `pdfs sync now` starts a sync pass at once.
 
+### A synced folder stays in error and nothing downloads
+
+The log says `every one of the N synced paths is missing locally; refusing to trash them on
+Drive`. The folder synced before, and now none of its files are on this computer. The sync
+stops so that it does not delete them on Proton Drive too. Check that the folder is the right
+one and that its disk is mounted. To get the files back, choose **Sync From Scratch…** in the
+folder's menu on **Sync → Folders**, or run:
+
+```bash
+pdfs sync list            # find the folder's ID
+pdfs sync reset 1
+```
+
+This downloads what Proton Drive has and uploads what only this computer has. Nothing is deleted.
+If you deleted the files on purpose, delete them on Proton Drive too, or stop syncing the folder.
+
 ### Files named `(sync-conflict …)` appeared
 
 The file changed in two places at once. Nothing was lost. See

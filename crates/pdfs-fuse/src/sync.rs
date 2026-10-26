@@ -369,7 +369,20 @@ impl Core {
         // guard on every pass — wedging the folder's sync permanently — the
         // moment a rule covers the whole tree.
         let tracked = tracked_baseline(&baseline, rules, &unscanned);
-        guard_local_wipe(&tracked, &local)?;
+        // A local copy that is gone in its entirety is not trashed on Drive,
+        // for the reason `guard_local_wipe` gives. A full pass stops there, but
+        // this one exists for a switch to on-demand, which needs nothing local
+        // and leaves Drive as it is: refusing the pass would only keep the
+        // folder out of `idle`, wedging the switch for good (#46). So the pass
+        // forgets those paths instead of trashing them, and the mount then
+        // shows everything Drive still has.
+        let local_gone = match guard_local_wipe(&tracked, &local) {
+            Ok(()) => false,
+            Err(reason) => {
+                warn!(id = folder_id, %reason, "sync: going on-demand without trashing anything on Drive");
+                true
+            }
+        };
 
         // The remote folder uids come from the baseline instead of a walk: every
         // directory this device has synced recorded its uid there when it was
@@ -579,8 +592,27 @@ impl Core {
         // showing the folder's remote contents — otherwise everything they deleted
         // comes back the moment the switch lands. Shallowest first, skipping anything
         // under a folder already trashed (its children went with it).
+        let deletions = local_deletions(&tracked, &local);
+        if local_gone {
+            // Forgotten instead of trashed. A row left behind would read to
+            // the switch as a deletion not on Drive yet and withdraw it, and
+            // to a later full pass as a reason to stop again. Forgotten, a full
+            // pass downloads the paths again.
+            let mut forgotten: HashSet<&str> = HashSet::new();
+            for rel in &deletions {
+                let mut parent = parent_rel(rel);
+                while !parent.is_empty() && !forgotten.contains(parent) {
+                    parent = parent_rel(parent);
+                }
+                if parent.is_empty() {
+                    let _ = self.db.sync_entries_remove_subtree(folder_id, rel);
+                    forgotten.insert(rel);
+                }
+            }
+            return Ok(outcome);
+        }
         let mut trashed: Vec<String> = Vec::new();
-        for rel in &local_deletions(&tracked, &local) {
+        for rel in &deletions {
             if trashed
                 .iter()
                 .any(|dir| rel.starts_with(&format!("{dir}/")))

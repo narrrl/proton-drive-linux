@@ -709,6 +709,13 @@ enum SyncCmd {
         /// Optional synced-folder id; omit to reconcile every folder.
         id: Option<i64>,
     },
+    /// Forget what a synced folder synced before and compare it with Proton
+    /// Drive afresh: what one side has alone is copied to the other, and a file
+    /// that differs keeps both versions. Nothing is deleted.
+    Reset {
+        /// Synced-folder id (from `sync list`).
+        id: i64,
+    },
     /// Pause syncing: queued uploads and mirror folders wait, reads keep working.
     Pause {
         /// End the pause by itself after this long, e.g. `30m`, `1h`, `2d`.
@@ -1165,6 +1172,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Now { id } => ok_or_bail(control_request(CtlRequest::SyncNow { id })?)?,
+        SyncCmd::Reset { id } => ok_or_bail(control_request(CtlRequest::ResetSyncFolder { id })?)?,
         SyncCmd::Pause {
             folder: Some(id), ..
         } => ok_or_bail(control_request(CtlRequest::SetSyncFolderPaused {

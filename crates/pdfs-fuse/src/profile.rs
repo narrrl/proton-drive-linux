@@ -450,6 +450,10 @@ impl Core {
         }
         let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
 
+        // The reply is gone once the app has shown it; the log keeps why.
+        for reason in &skipped {
+            info!(reason, "restore skipped a folder");
+        }
         let mut message = format!("restored {restored} folder(s)");
         if !skipped.is_empty() {
             message.push_str(&format!("; skipped: {}", skipped.join(", ")));

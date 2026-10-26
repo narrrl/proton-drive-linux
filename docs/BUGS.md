@@ -101,6 +101,7 @@ a live account since.
 | Entry | Title |
 |---|---|
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
+| [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
 | [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
@@ -379,6 +380,36 @@ refuses a file or folder with unsaved writes, or a release still queueing, at it
 A move checks the same set.
 
 **Test:** The simulation above passed 6 of 6 runs after the fix.
+
+---
+
+### B255 — A synced folder whose files are all gone here is stuck for good
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-26, issue #46: a folder restored from another computer never downloaded.
+**Where:** `push_pass` in `crates/pdfs-fuse/src/sync.rs`; `reset_sync_folder` in
+`crates/pdfs-fuse/src/devices.rs`
+
+**Repro:** Sync a folder in mirror mode, then delete all of its files on this computer while
+the folder is paused. Resume it. Every pass stops with `every one of the N synced paths is
+missing locally`, the folder stays in error, and a switch to online only waits for good.
+
+**Cause.** The wipe guard is right to stop a pass that would trash the whole folder on Drive.
+But nothing got the folder out of that state. A switch to on-demand waits for a pass that ends
+`idle`, and its push pass hit the same guard. The baseline that made the empty folder read as
+"delete everything" could only be cleared by removing the folder from sync. How the reporter's
+folder lost its files is not known yet.
+
+**Fix.** The push pass for a switch to on-demand forgets the baseline rows of a local copy that
+is gone in full, instead of trashing them on Drive, so the switch goes ahead and the mount shows
+what Drive has. **Sync From Scratch…** in the app and `pdfs sync reset ID` clear a mirror
+folder's baseline, so the next pass compares both sides as on the first sync: one-sided files
+are copied across, files that differ keep both versions, and nothing is deleted. Restore now
+logs why it skipped a folder.
+
+**Test:** The simulations `a_folder_whose_local_copy_is_gone_still_goes_on_demand` (which
+failed in exactly the reported state before the fix) and
+`a_folder_whose_local_copy_is_gone_downloads_again_after_a_reset`.
 
 ---
 

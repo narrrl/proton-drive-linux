@@ -33,6 +33,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 - **Folder sizes.** **Details** shows how much a folder holds and how many items are in it, as
   Proton Drive counts it, including items in the trash. From a terminal: `pdfs du PATH`.
 
+- **Sync a folder from scratch.** In a synced folder's menu on **Sync → Folders**, **Sync From
+  Scratch…** forgets what was synced before and compares the folder with Proton Drive again. A
+  file on one side only is copied to the other, and a file that differs keeps both versions.
+  Nothing is deleted. From the terminal: `pdfs sync reset ID`.
+
 ### Changed
 - **Copying a file inside the mount is faster** when the computer already has the file, for
   example with `cp` or a file manager: the copy is made on this computer, about four times
@@ -47,6 +52,12 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   for each kind of package. Each release publishes `docs/` to the wiki.
 
 ### Fixed
+
+- **A synced folder whose files were all gone from this computer no longer gets stuck** (#46).
+  The sync still refuses to delete everything on Proton Drive, but a switch to online only now
+  goes ahead and shows what Proton Drive has, instead of waiting for good. To download the
+  files again instead, sync the folder from scratch. Restoring folders also logs why it
+  skipped a folder.
 
 - **Saved public links show the name of what they point at**, in the app and in `pdfs bookmarks`,
   instead of "Shared link". For a link with a custom password, the address no longer has the custom

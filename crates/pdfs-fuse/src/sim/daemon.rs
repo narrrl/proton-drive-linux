@@ -2873,4 +2873,112 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The synced folder `id` as the daemon lists it.
+    fn listed_folder(daemon: &Daemon, id: i64) -> Option<control::SyncFolderInfo> {
+        match daemon.request(&Request::ListSyncFolders) {
+            Ok(Response::SyncFolders { items }) => items.into_iter().find(|f| f.id == id),
+            _ => None,
+        }
+    }
+
+    /// A mirror folder holding `a.txt` and `sub/b.txt`, synced to Drive, whose
+    /// local copy is then deleted in full while the folder is paused, so no
+    /// pass sees half of it. Waits for the pass that refuses to run (#46).
+    fn folder_whose_local_copy_is_gone(daemon: &Daemon, drive: &FakeDrive, local: &Path) -> i64 {
+        let id = sync_folder(daemon, local, "mirror");
+        std::fs::write(local.join("a.txt"), b"alpha").unwrap();
+        std::fs::create_dir(local.join("sub")).unwrap();
+        std::fs::write(local.join("sub/b.txt"), b"beta").unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        let on_drive = |name: &str, content: &[u8]| {
+            drive.tree().iter().any(|(path, entry)| {
+                path.ends_with(name) && *entry == Entry::File(Arc::new(content.to_vec()))
+            })
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || on_drive("a.txt", b"alpha")
+                && on_drive("sub/b.txt", b"beta")
+                && listed_folder(daemon, id).is_some_and(|f| f.state == "idle")),
+            "the folder synced: {:?} {:?}",
+            listed_folder(daemon, id),
+            drive.tree().keys().collect::<Vec<_>>()
+        );
+
+        daemon
+            .request(&Request::SetSyncFolderPaused { id, paused: true })
+            .unwrap();
+        std::fs::remove_file(local.join("a.txt")).unwrap();
+        std::fs::remove_dir_all(local.join("sub")).unwrap();
+        daemon
+            .request(&Request::SetSyncFolderPaused { id, paused: false })
+            .unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || listed_folder(daemon, id)
+                .is_some_and(|f| f.state == "error")),
+            "the pass refused to trash everything: {:?}",
+            listed_folder(daemon, id)
+        );
+        assert!(
+            on_drive("a.txt", b"alpha") && on_drive("sub/b.txt", b"beta"),
+            "nothing was trashed on Drive: {:?}",
+            drive.tree().keys().collect::<Vec<_>>()
+        );
+        id
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_folder_whose_local_copy_is_gone_downloads_again_after_a_reset() {
+        let drive = FakeDrive::new();
+        let dir = scratch("reset-gone-local-copy");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let local = dir.join("docs");
+        let id = folder_whose_local_copy_is_gone(&daemon, &drive, &local);
+
+        daemon.request(&Request::ResetSyncFolder { id }).unwrap();
+        let has = |rel: &str, content: &[u8]| {
+            std::fs::read(local.join(rel)).is_ok_and(|bytes| bytes == content)
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || has("a.txt", b"alpha")
+                && has("sub/b.txt", b"beta")
+                && listed_folder(&daemon, id).is_some_and(|f| f.state == "idle")),
+            "the reset downloaded the folder again: {:?}",
+            listed_folder(&daemon, id)
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_folder_whose_local_copy_is_gone_still_goes_on_demand() {
+        let drive = FakeDrive::new();
+        let dir = scratch("ondemand-gone-local-copy");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let local = dir.join("docs");
+        let id = folder_whose_local_copy_is_gone(&daemon, &drive, &local);
+
+        daemon
+            .request(&Request::SetSyncFolderMode {
+                id,
+                mode: "ondemand".into(),
+            })
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || listed_folder(&daemon, id)
+                .is_some_and(|f| f.mode == "ondemand" && f.pending_mode.is_none())
+                && is_mounted(&local)),
+            "the queued switch landed: {:?}",
+            listed_folder(&daemon, id)
+        );
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(local.join("sub/b.txt")).unwrap(), b"beta");
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

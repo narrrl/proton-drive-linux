@@ -480,6 +480,11 @@ pub enum Request {
     /// Pause or resume one mirror folder's reconcile, independent of the
     /// global pause. Persisted until resumed. Replies with [`Response::Ok`].
     SetSyncFolderPaused { id: i64, paused: bool },
+    /// Forget what a mirror folder synced before, so its next pass compares
+    /// both sides afresh: what is on one side only is copied to the other, and
+    /// a file that differs keeps both versions. Nothing is deleted. Replies
+    /// with [`Response::Ok`].
+    ResetSyncFolder { id: i64 },
     /// Force a reconcile pass: one folder by id, or all when `id` is `None`.
     /// Replies with [`Response::Ok`].
     SyncNow { id: Option<i64> },
@@ -3209,6 +3214,7 @@ mod tests {
                 id: 3,
                 paused: true,
             },
+            Request::ResetSyncFolder { id: 3 },
             Request::SetBandwidthLimits {
                 upload: 1_000_000,
                 download: 0,

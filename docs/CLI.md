@@ -84,6 +84,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs sync rm ID [--delete-remote]` | Stop syncing. Local files stay; `--delete-remote` also removes the copy on Proton Drive. |
 | `pdfs sync mode ID mirror\|ondemand` | Switch between a full local copy (`mirror`) and online only (`ondemand`). |
 | `pdfs sync now [ID]` | Start a sync pass now, for all folders or one. |
+| `pdfs sync reset ID` | Forget what a synced folder synced before and compare it with Proton Drive again. A file on one side only is copied to the other, and a file that differs keeps both versions. Nothing is deleted. |
 | `pdfs sync pause [--for 1h] [--folder ID]` | Pause uploads and synced folders. Reading files keeps working. `--for` ends the pause by itself (`30m`, `1h`, `2d`). |
 | `pdfs sync resume [--folder ID]` | Resume after a pause. |
 | `pdfs sync limit [--up RATE] [--down RATE]` | Cap bandwidth, for example `500K` or `2M` per second. `0` removes a cap. Without options, prints the current caps. |

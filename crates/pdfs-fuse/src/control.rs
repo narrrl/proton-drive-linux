@@ -388,6 +388,7 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
         | R::RemoveSyncFolder { .. }
         | R::SetSyncFolderMode { .. }
         | R::SetSyncFolderPaused { .. }
+        | R::ResetSyncFolder { .. }
         | R::RestoreSyncFolders { .. }
         | R::RestoreDeviceFolders { .. } => &[Topic::Locations, Topic::Devices],
         R::RetryPendingOp { .. } => &[Topic::Queue],
@@ -1432,6 +1433,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::ResetSyncFolder { id }) => match core.reset_sync_folder(id) {
+            Ok(message) => {
+                core.log_activity(ActivityKind::Sync, &message, "", true);
+                CtlResponse::Ok { message }
+            }
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::SyncNow { id }) => {
             core.sync_now(id);
             CtlResponse::Ok {

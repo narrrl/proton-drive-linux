@@ -1506,8 +1506,13 @@ fn add_device_items(ui: &Rc<Ui>, menu: &mut ActionMenu, spec: &MountSpec, id: i6
         } else {
             gettext("Pause Syncing")
         };
+        let ui_pause = ui.clone();
+        menu.item(&label, move || set_folder_paused(&ui_pause, id, !paused));
         let ui = ui.clone();
-        menu.item(&label, move || set_folder_paused(&ui, id, !paused));
+        let path = spec.local_path.clone();
+        menu.item(&gettext("Sync From Scratch…"), move || {
+            confirm_reset_sync_folder(&ui, id, &path)
+        });
         menu.section();
     }
     let ui = ui.clone();
@@ -1517,6 +1522,51 @@ fn add_device_items(ui: &Rc<Ui>, menu: &mut ActionMenu, spec: &MountSpec, id: i6
     let is_ondemand = spec.mode == MountMode::OnDemand;
     menu.item(&gettext("Stop Syncing…"), move || {
         prompt_remove_sync_folder(&ui, id, &path, is_ondemand)
+    });
+}
+
+/// Ask before syncing a folder from scratch. Nothing is deleted, but files
+/// that differ come back as conflict copies, so it is not a click to make by
+/// accident.
+fn confirm_reset_sync_folder(ui: &Rc<Ui>, id: i64, path: &str) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Sync From Scratch?"))
+        // Translators: {path} is a local folder path.
+        .body(gettext_f("This computer forgets what it synced in {path} before and compares the folder with Proton Drive again. Nothing is deleted: a file on one side only is copied to the other, and a file that differs keeps both versions.", &[("path", path)]))
+        .build();
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("reset", &gettext("Sync From Scratch"));
+    dialog.set_response_appearance("reset", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let win = ui_window(ui);
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "reset" {
+            reset_sync_folder(&ui, id);
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Forget a folder's sync records, then repaint so its row shows the new pass.
+fn reset_sync_folder(ui: &Rc<Ui>, id: i64) {
+    let rx = spawn_request(ui.dirs.control_socket(), Request::ResetSyncFolder { id });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let failed = gettext("Couldn't sync the folder from scratch");
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => toast(&ui, &gettext("Syncing folder…")),
+            Ok(Ok(Response::Error { message, kind })) => {
+                toast_failure(&ui, &failed, &message, kind)
+            }
+            _ => toast_error(
+                &ui,
+                &failed,
+                &gettext("The Proton Drive service didn't respond."),
+            ),
+        }
+        refresh_locations(&ui);
     });
 }
 
