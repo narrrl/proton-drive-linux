@@ -5877,6 +5877,13 @@ Only the three namespace ops were strictly required (the other four silence
 themselves once the kernel caches `ENOSYS`), but implementing all seven keeps the
 refusal explicit and documented at the call site rather than inherited.
 
+`copy_file_range` has since been implemented: the daemon copies a range whose bytes are on this
+machine (an open write handle, a queued write, the cache) into the destination's scratch file,
+and answers `EOPNOTSUPP` for anything it would have to download. Unlike `ENOSYS`, that errno makes
+the kernel copy that one call through read and write and keeps asking the daemon next time.
+A warm `cp` of a 256 MiB file inside the mount went from about 100 MiB/s to about 450 MiB/s
+(sim, debug build; `a_copy_inside_the_mount_measures_its_speed`).
+
 **Verified:** full live acceptance run after the fix — 19 pass / 1 skip, the
 capability diff identical to the pre-fix run, and **0** `Not Implemented` lines
 in the journal across the whole run (was 17, 10 of them `link`).

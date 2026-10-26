@@ -1101,6 +1101,92 @@ impl Core {
         })
     }
 
+    /// Bytes `[offset, offset + size)` of file `ino` as `read` would serve
+    /// them, but only from this machine: an open write handle, a queued write,
+    /// or the caches. `Ok(None)` the moment any of it would have to be
+    /// downloaded, and for a size still provisional (B100), which only the
+    /// network settles. Short or empty past the end of the file.
+    ///
+    /// `copy_file_range` answers with this and leaves anything else to the
+    /// kernel's read/write copy.
+    pub(super) fn read_local(
+        &self,
+        ino: u64,
+        offset: u64,
+        size: u64,
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        let handle = self.state().active_writes.get(&ino).map(|h| {
+            (
+                h.file.clone(),
+                h.len,
+                h.uid.clone(),
+                h.base_mtime,
+                h.base_size,
+                h.written.clone(),
+            )
+        });
+        if let Some((file, len, uid, base_mtime, base_size, written)) = handle {
+            return self.serve_open_read_local(
+                &file, len, &uid, base_mtime, base_size, &written, offset, size,
+            );
+        }
+        let (uid, mtime, fsize, provisional) = {
+            let st = self.state();
+            match st.entries.get(&ino) {
+                Some(e) if e.node.is_file() => (
+                    e.uid.clone(),
+                    e.node.modification_time,
+                    node_size(&e.node),
+                    matches!(
+                        &e.node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    ),
+                ),
+                Some(_) => return Err(Errno::EISDIR),
+                None => return Err(Errno::ENOENT),
+            }
+        };
+        let uid = match is_local_uid(&uid) {
+            true => self.landed_stand_in_uid(&uid).unwrap_or(uid),
+            false => uid,
+        };
+        if let Some(pending) = self.pending.lock().get(&uid).cloned() {
+            let m = &pending.meta;
+            let file = File::open(&pending.path).map_err(|e| {
+                error!(%uid, path = %pending.path.display(), error = %e, "open staged blob failed");
+                Errno::EIO
+            })?;
+            let mut written = Intervals::default();
+            for &(s, e) in &m.authored {
+                written.add(s, e);
+            }
+            return self.serve_open_read_local(
+                &Arc::new(file),
+                m.len,
+                &uid,
+                m.base_mtime,
+                m.base_size,
+                &written,
+                offset,
+                size,
+            );
+        }
+        // Created here and never written: an empty file.
+        if is_local_uid(&uid) {
+            return Ok(Some(Vec::new()));
+        }
+        if provisional {
+            return Ok(None);
+        }
+        if offset >= fsize || size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(self.cached_range(&uid, mtime, fsize, offset, size.min(fsize - offset)))
+    }
+
     /// The largest amount [`Core::fill_gaps_cached`] will copy out of the local
     /// caches while a `release(2)` is in progress.
     ///

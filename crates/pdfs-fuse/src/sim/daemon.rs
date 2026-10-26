@@ -2433,6 +2433,152 @@ mod tests {
         eprintln!("wifi: syscalls {wifi_syscalls:?}, drain {wifi_drain:?}");
     }
 
+    /// `copy_file_range` inside the mount is answered from the bytes the daemon
+    /// holds, and left to the kernel for bytes it would have to download. Every
+    /// source kind has to come out byte for byte: cached, queued, open with
+    /// unsaved writes, and on Drive only.
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_copy_inside_the_mount_has_the_source_bytes() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::FileExt as _;
+
+        fn copy_range(from: &std::fs::File, at: u64, to: &std::fs::File, to_at: u64, len: usize) {
+            let (mut at, mut to_at) = (at as i64, to_at as i64);
+            let mut left = len;
+            while left > 0 {
+                // SAFETY: both descriptors are open; the offsets are ours.
+                let n = unsafe {
+                    libc::copy_file_range(
+                        from.as_raw_fd(),
+                        &mut at,
+                        to.as_raw_fd(),
+                        &mut to_at,
+                        left,
+                        0,
+                    )
+                };
+                assert!(n > 0, "copy_file_range: {}", io::Error::last_os_error());
+                left -= n as usize;
+            }
+        }
+
+        let pattern = |len: usize, seed: u8| -> Vec<u8> {
+            (0..len).map(|i| (i % 253) as u8 ^ seed).collect()
+        };
+        let drive = FakeDrive::new();
+        // On Drive before the mount knows it, so nothing of it is cached.
+        let remote = pattern(9 << 20, 1);
+        drive.device().write("remote.bin", &remote);
+        let dir = scratch("copy-range");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mount = &daemon.mountpoint;
+
+        // Downloaded through the kernel's own copy, then served from the cache.
+        std::fs::copy(mount.join("remote.bin"), mount.join("remote-1.bin")).unwrap();
+        assert!(std::fs::read(mount.join("remote-1.bin")).unwrap() == remote);
+        std::fs::copy(mount.join("remote.bin"), mount.join("remote-2.bin")).unwrap();
+        assert!(std::fs::read(mount.join("remote-2.bin")).unwrap() == remote);
+
+        // Queued and not on Drive yet: the staged blob is the content.
+        let paused = |paused| Request::SetSyncPaused {
+            paused,
+            until: None,
+        };
+        daemon.request(&paused(true)).unwrap();
+        let queued = pattern(20 << 20, 2);
+        std::fs::write(mount.join("queued.bin"), &queued).unwrap();
+        std::fs::copy(mount.join("queued.bin"), mount.join("queued-copy.bin")).unwrap();
+        assert!(std::fs::read(mount.join("queued-copy.bin")).unwrap() == queued);
+
+        // Open with writes not saved yet: the copy sees them, as a read would.
+        let open = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mount.join("queued.bin"))
+            .unwrap();
+        open.write_all_at(b"UNSAVED", 100).unwrap();
+        let target = std::fs::File::create(mount.join("unsaved-copy.bin")).unwrap();
+        copy_range(&open, 96, &target, 0, 16);
+        drop(target);
+        drop(open);
+        let mut expected = queued[96..112].to_vec();
+        expected[4..11].copy_from_slice(b"UNSAVED");
+        assert_eq!(
+            std::fs::read(mount.join("unsaved-copy.bin")).unwrap(),
+            expected
+        );
+
+        // A range into the middle of a file keeps the bytes around it.
+        std::fs::write(mount.join("middle.bin"), b"0123456789").unwrap();
+        let source = std::fs::File::open(mount.join("remote.bin")).unwrap();
+        let target = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mount.join("middle.bin"))
+            .unwrap();
+        copy_range(&source, 5, &target, 3, 4);
+        drop(target);
+        let mut expected = b"0123456789".to_vec();
+        expected[3..7].copy_from_slice(&remote[5..9]);
+        assert_eq!(std::fs::read(mount.join("middle.bin")).unwrap(), expected);
+
+        daemon.request(&paused(false)).unwrap();
+        let mut edited = queued.clone();
+        edited[100..107].copy_from_slice(b"UNSAVED");
+        let file = |bytes: &[u8]| Some(Entry::File(Arc::new(bytes.to_vec())));
+        assert!(wait_until(Duration::from_secs(120), || {
+            let tree = drive.tree();
+            daemon.pending().is_ok_and(|ops| ops.is_empty())
+                && tree.get("queued.bin").cloned() == file(&edited)
+                && tree.get("queued-copy.bin").cloned() == file(&queued)
+                && tree.get("remote-2.bin").cloned() == file(&remote)
+                && tree.get("middle.bin").cloned() == file(&expected)
+        }));
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long `cp` inside the mount takes for a file the daemon already
+    /// holds, cold and from the page cache. It decides whether the daemon
+    /// should answer `copy_file_range` itself rather than leave the kernel to
+    /// copy through read and write. Runs when `PDFS_SIM_MEASURE` is set.
+    #[test]
+    #[ignore = "mounts FUSE: run with `PDFS_SIM_MEASURE=1 cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_copy_inside_the_mount_measures_its_speed() {
+        if std::env::var_os("PDFS_SIM_MEASURE").is_none() {
+            eprintln!("skipped: set PDFS_SIM_MEASURE to measure the copy");
+            return;
+        }
+        const SIZE: usize = 256 << 20;
+        let drive = FakeDrive::new();
+        let dir = scratch("copy-speed");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let mount = &daemon.mountpoint;
+        let bytes: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        std::fs::write(mount.join("big.bin"), &bytes).unwrap();
+        assert!(wait_until(Duration::from_secs(120), || {
+            daemon.pending().is_ok_and(|ops| ops.is_empty())
+        }));
+        for (round, name) in ["copy-1.bin", "copy-2.bin", "copy-3.bin"]
+            .into_iter()
+            .enumerate()
+        {
+            let start = Instant::now();
+            let status = std::process::Command::new("cp")
+                .arg(mount.join("big.bin"))
+                .arg(mount.join(name))
+                .status()
+                .unwrap();
+            let took = start.elapsed();
+            assert!(status.success());
+            let mib_per_s = (SIZE >> 20) as f64 / took.as_secs_f64();
+            eprintln!("cp round {round}: {took:?}, {mib_per_s:.0} MiB/s");
+            assert!(std::fs::read(mount.join(name)).unwrap() == bytes);
+        }
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn half_of_a_wide_folder_unlinked_at_once_leaves_the_other_half() {

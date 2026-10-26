@@ -430,58 +430,10 @@ impl Filesystem for ProtonFs {
             reply.error(error);
             return;
         }
-        let fh = fh.0;
-        // Stage the bytes straight into the scratch file (no base download): only
-        // the untouched remainder is pulled from the remote, and only at commit.
-        let file = {
-            let st = self.core.state();
-            match st.handles.get(&fh).and_then(|&i| st.active_writes.get(&i)) {
-                Some(aw) => aw.file.clone(),
-                None => {
-                    reply.error(Errno::EBADF);
-                    return;
-                }
-            }
-        };
-        if let Err(e) = file.write_all_at(data, offset) {
-            error!(ino = ino.0, fh, error = %e, "scratch write failed");
-            // A full local disk is not a broken file: answer `ENOSPC` so the
-            // application can say so (and so `cp`/editors take their own
-            // out-of-space path), and free what the cache is holding — the
-            // scratch file the next write goes to shares that filesystem.
-            if e.raw_os_error() == Some(libc::ENOSPC) {
-                self.core.cache.emergency_evict();
-                reply.error(Errno::ENOSPC);
-            } else {
-                reply.error(Errno::EIO);
-            }
-            return;
+        match self.stage_write(ino.0, fh.0, offset, data) {
+            Ok(()) => reply.written(data.len() as u32),
+            Err(error) => reply.error(error),
         }
-        let new_len = {
-            let mut st = self.core.state();
-            let Some(aw) = st
-                .handles
-                .get(&fh)
-                .copied()
-                .and_then(|i| st.active_writes.get_mut(&i))
-            else {
-                reply.error(Errno::EBADF);
-                return;
-            };
-            aw.record_write(offset, offset + data.len() as u64);
-            let len = aw.len;
-            st.set_size(ino.0, len);
-            len
-        };
-        debug!(
-            ino = ino.0,
-            fh,
-            offset,
-            len = data.len(),
-            new_len,
-            "staged write"
-        );
-        reply.written(data.len() as u32);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1016,20 +968,59 @@ impl Filesystem for ProtonFs {
     fn copy_file_range(
         &self,
         _req: &Request,
-        _ino_in: INodeNo,
+        ino_in: INodeNo,
         _fh_in: FileHandle,
-        _offset_in: u64,
-        _ino_out: INodeNo,
-        _fh_out: FileHandle,
-        _offset_out: u64,
-        _len: u64,
-        _flags: CopyFileRangeFlags,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
-        // Also must stay ENOSYS: there is no server-side copy, and this is the
-        // errno that sends coreutils (and the kernel) down the read/write path
-        // instead of failing the copy outright.
-        reply.error(Errno::ENOSYS);
+        // Copied here when the source bytes are on this machine, as `write`
+        // would stage them, minus a FUSE round trip per page: `cp` of a cached
+        // 256 MiB file ran at about 100 MiB/s through read and write. Anything
+        // that would have to be downloaded gets `EOPNOTSUPP`, which makes the
+        // kernel copy that one call through read and write itself; `ENOSYS`
+        // would turn the op off for the whole mount. There is no server-side
+        // copy into a file `cp` has already created, so the copy still uploads.
+        //
+        // On the dispatch loop, like `write`, so it keeps its order with the
+        // reads and writes of the same handle. [`COPY_RANGE_MAX`] bounds how
+        // long one call holds the loop.
+        let (ino_in, ino_out) = (self.tree(ino_in), self.tree(ino_out));
+        if !flags.is_empty() || ino_in == ino_out {
+            reply.error(Errno::EOPNOTSUPP);
+            return;
+        }
+        if let Err(error) = self.core.require_writable(ino_out.0) {
+            reply.error(error);
+            return;
+        }
+        let bytes = match self
+            .core
+            .read_local(ino_in.0, offset_in, len.min(COPY_RANGE_MAX))
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                debug!(ino_in = ino_in.0, offset_in, "copy range not local");
+                reply.error(Errno::EOPNOTSUPP);
+                return;
+            }
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
+        if bytes.is_empty() {
+            reply.written(0);
+            return;
+        }
+        match self.stage_write(ino_out.0, fh_out.0, offset_out, &bytes) {
+            Ok(()) => reply.written(bytes.len() as u32),
+            Err(error) => reply.error(error),
+        }
     }
 }
 
@@ -1056,6 +1047,11 @@ pub struct ProtonFs {
 /// file being republished continuously, and looping on it would keep a FUSE
 /// worker busy indefinitely.
 const OPEN_BASE_ATTEMPTS: u32 = 3;
+
+/// The most one `copy_file_range` call copies; the caller loops for the rest.
+/// A local copy of this much takes milliseconds, which is how long it holds
+/// the dispatch loop.
+const COPY_RANGE_MAX: u64 = 16 * 1024 * 1024;
 
 /// One directory's entries as `readdir` reports them: `.` and `..` first, then
 /// the interned children in `children` order.
@@ -1641,6 +1637,48 @@ impl ProtonFs {
     }
 
     /// The body of [`Filesystem::create`], run off the dispatch loop.
+    /// Stage `data` at `offset` of the write handle `fh` on `ino`, straight into
+    /// its scratch file (no base download): only the untouched remainder is
+    /// pulled from the remote, and only at commit.
+    fn stage_write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
+        let file = {
+            let st = self.core.state();
+            match st.handles.get(&fh).and_then(|&i| st.active_writes.get(&i)) {
+                Some(aw) => aw.file.clone(),
+                None => return Err(Errno::EBADF),
+            }
+        };
+        if let Err(e) = file.write_all_at(data, offset) {
+            error!(ino, fh, error = %e, "scratch write failed");
+            // A full local disk is not a broken file: answer `ENOSPC` so the
+            // application can say so (and so `cp`/editors take their own
+            // out-of-space path), and free what the cache is holding — the
+            // scratch file the next write goes to shares that filesystem.
+            if e.raw_os_error() == Some(libc::ENOSPC) {
+                self.core.cache.emergency_evict();
+                return Err(Errno::ENOSPC);
+            }
+            return Err(Errno::EIO);
+        }
+        let new_len = {
+            let mut st = self.core.state();
+            let Some(aw) = st
+                .handles
+                .get(&fh)
+                .copied()
+                .and_then(|i| st.active_writes.get_mut(&i))
+            else {
+                return Err(Errno::EBADF);
+            };
+            aw.record_write(offset, offset + data.len() as u64);
+            let len = aw.len;
+            st.set_size(ino, len);
+            len
+        };
+        debug!(ino, fh, offset, len = data.len(), new_len, "staged write");
+        Ok(())
+    }
+
     fn serve_create(&self, parent: u64, name: &str, reply: ReplyCreate) {
         if let Err(error) = self.core.require_writable(parent) {
             reply.error(error);

@@ -34,6 +34,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   Proton Drive counts it, including items in the trash. From a terminal: `pdfs du PATH`.
 
 ### Changed
+- **Copying a file inside the mount is faster** when the computer already has the file, for
+  example with `cp` or a file manager: the copy is made on this computer, about four times
+  faster for a 256 MiB file, instead of going through the mount page by page. A file that is
+  only on Proton Drive is copied as before. The copy is then uploaded as usual.
 - **Reorganised documentation, now also on the
   [wiki](https://github.com/narrrl/proton-drive-linux/wiki).** A new
   [Getting started](https://github.com/narrrl/proton-drive-linux/wiki/Getting-Started) page and
