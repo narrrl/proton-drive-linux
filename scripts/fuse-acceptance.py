@@ -787,7 +787,9 @@ def test_server_copy_never_copies_an_old_version(ctx: Context) -> None:
     root = ctx.root
     path = root / "being-written.txt"
     write_durable(path, b"first version")
-    dest = root / "copies"
+    # Its own folder: every case of a run shares the root, and "pdfs copy"
+    # already made "copies" there.
+    dest = root / "b256-copies"
     dest.mkdir()
     daemon.wait_for_queue()
 
