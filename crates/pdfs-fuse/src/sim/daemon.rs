@@ -130,6 +130,15 @@ impl Daemon {
         }
     }
 
+    /// Whether the mount believes Proton is reachable, as `pdfs status` shows
+    /// it.
+    pub(crate) fn online(&self) -> io::Result<bool> {
+        match self.request(&Request::Status)? {
+            Response::Status { online, .. } => Ok(online),
+            other => Err(io::Error::other(format!("unexpected answer {other:?}"))),
+        }
+    }
+
     /// Send one control request, as the `pdfs` CLI does, and fail on a
     /// refusal.
     pub(crate) fn request(&self, request: &Request) -> io::Result<Response> {
@@ -648,7 +657,19 @@ mod tests {
                 .pending()
                 .is_ok_and(|items| items.iter().any(|item| item.attempts > 0))
         }));
+        // The drain records the failure just before it takes the mount
+        // offline. Left online, only the event poll would, much later.
+        assert!(wait_until(Duration::from_secs(2), || daemon
+            .online()
+            .is_ok_and(|online| !online)));
         daemon.client.set_online(true);
+        // The probe that sees the link return runs 2 s after the drop, then
+        // 6 s, and a loaded run can reach this line after the first one. So
+        // the 3 s below count from the mount being back, not from the link:
+        // an op left on its backoff waits 4 s or more after its failure.
+        assert!(wait_until(Duration::from_secs(30), || daemon
+            .online()
+            .unwrap_or(false)));
         assert!(
             wait_until(Duration::from_secs(3), || {
                 daemon.pending().is_ok_and(|items| items.is_empty())
