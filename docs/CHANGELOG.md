@@ -11,7 +11,7 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-## [3.6.0] — 2026-10-26
+## [3.6.0] — 2026-10-27
 
 Schema: **44**, unchanged.
 
@@ -46,6 +46,9 @@ Schema: **44**, unchanged.
   file on one side only is copied to the other, and a file that differs keeps both versions.
   Nothing is deleted. From the terminal: `pdfs sync reset ID`.
 
+- **`--json` for `pdfs members`, `pdfs du` and `pdfs public-link create` / `update`**, so scripts
+  can read a link's id, role, password flag and expiry, and a folder's size and item count.
+
 ### Changed
 - **Copying a file inside the mount is faster** when the computer already has the file, for
   example with `cp` or a file manager: the copy is made on this computer, about four times
@@ -58,6 +61,10 @@ Schema: **44**, unchanged.
   pages for files, synced folders, Photos, sharing, computers, and the launcher and tray.
   Installation puts the COPR repository first for Fedora and explains updating and uninstalling
   for each kind of package. Each release publishes `docs/` to the wiki.
+- **Acceptance cases for the 3.6.0 features:** `copy_file_range` over several calls and at
+  offsets, `pdfs copy` (including B256), `pdfs du`, `pdfs public-link update`, Sync From Scratch,
+  and the switch of an emptied mirror folder to on-demand (B255). `docs/TESTING.md` lists what to
+  check by hand in the app.
 
 ### Fixed
 

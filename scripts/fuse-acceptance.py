@@ -566,6 +566,355 @@ def test_mmap_and_copy_paths(ctx: Context) -> None:
         )
 
 
+def _copy_range(ctx: Context, key: str, src: int, dst: int, count: int, offset_src: int, offset_dst: int) -> int | None:
+    """`copy_file_range` until `count` bytes moved or the source ran out.
+
+    Returns how many bytes moved, or None when the first call was refused
+    cleanly. The mount copies at most 16 MiB a call, and `cp` loops the same
+    way, so a large copy reaches it as several calls with growing offsets.
+    """
+    moved = 0
+    first = ctx.probe(
+        key,
+        lambda: os.copy_file_range(src, dst, count, offset_src, offset_dst),
+        allow=CLEAN_UNSUPPORTED | {errno.EXDEV},
+    )
+    if not first.ok:
+        return None
+    step = first.value
+    calls = 1
+    while step and moved + step < count:
+        moved += step
+        step = os.copy_file_range(src, dst, count - moved, offset_src + moved, offset_dst + moved)
+        calls += 1
+    ctx.note(f"{key}.calls", calls)
+    return moved + step
+
+
+def test_copy_file_range_ranges(ctx: Context) -> None:
+    """`copy_file_range` beyond the first call, at offsets, and from an open file.
+
+    The mount answers the call from bytes this machine already has: the write
+    handle's scratch, a pending upload, or the cache. Each answer is a write
+    into the destination, so it has to land exactly where the offsets say,
+    fill a gap past the end with zeros, and survive the upload.
+    """
+    root = ctx.root
+    big = pattern(17 * 1024 * 1024 + 4099, "cfr-big")
+    source = root / "cfr-source.bin"
+    write_durable(source, big)
+
+    def copy(key: str, src_path: Path, dst_path: Path, count: int, offset_src: int = 0, offset_dst: int = 0) -> int | None:
+        src = os.open(src_path, os.O_RDONLY)
+        dst = os.open(dst_path, os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            moved = _copy_range(ctx, key, src, dst, count, offset_src, offset_dst)
+            os.fsync(dst)
+        finally:
+            os.close(src)
+            os.close(dst)
+        return moved
+
+    expected: dict[Path, bytes] = {}
+
+    whole = root / "cfr-whole.bin"
+    moved = copy("whole", source, whole, len(big))
+    if moved is not None:
+        check(moved == len(big), f"whole: copy_file_range moved {moved} bytes, expected {len(big)}")
+        expected[whole] = big
+
+    # Into the middle of a file that exists, and past the end of another.
+    middle = root / "cfr-middle.bin"
+    base = pattern(300_000, "cfr-base")
+    write_durable(middle, base)
+    moved = copy("middle", source, middle, 100_000, offset_src=5_000_000, offset_dst=123_457)
+    if moved is not None:
+        check(moved == 100_000, f"middle: copy_file_range moved {moved} bytes, expected {100_000}")
+        expected[middle] = base[:123_457] + big[5_000_000:5_100_000] + base[223_457:]
+    gap = root / "cfr-gap.bin"
+    write_durable(gap, b"head")
+    moved = copy("gap", source, gap, 70_001, offset_src=1, offset_dst=200_000)
+    if moved is not None:
+        check(moved == 70_001, f"gap: copy_file_range moved {moved} bytes, expected {70_001}")
+        expected[gap] = b"head" + bytes(200_000 - 4) + big[1:70_002]
+
+    # Past the source's end the copy is short, and at it nothing moves.
+    tail = root / "cfr-tail.bin"
+    moved = copy("tail", source, tail, 10_000, offset_src=len(big) - 99)
+    if moved is not None:
+        check(moved == 99, f"tail: copy_file_range moved {moved} bytes, expected {99}")
+        expected[tail] = big[-99:]
+
+    # From a file whose last write has not been released yet.
+    unsaved = root / "cfr-unsaved.bin"
+    fresh = pattern(600_001, "cfr-unsaved")
+    writer = os.open(unsaved, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+    try:
+        write_all(writer, fresh)
+        moved = copy("unsaved", unsaved, root / "cfr-from-unsaved.bin", len(fresh))
+    finally:
+        os.close(writer)
+    if moved is not None:
+        check(moved == len(fresh), f"unsaved: copy_file_range moved {moved} bytes, expected {len(fresh)}")
+        expected[root / "cfr-from-unsaved.bin"] = fresh
+
+    def verify(when: str) -> None:
+        for path, data in expected.items():
+            size = os.lstat(path).st_size
+            check(size == len(data), f"{path.name} {when}: {size} bytes, expected {len(data)}")
+            check_bytes(read(path), data, f"{path.name} {when}")
+
+    verify("right after the copy")
+    if not ctx.is_live or ctx.daemon is None:
+        return
+    ctx.daemon.wait_for_queue()
+    verify("after the upload")
+    # A server-side copy has a new uid, so nothing of it is cached: reading
+    # it reads what Drive holds.
+    if _my_files_root(ctx) is None:
+        return
+    landed = root / "cfr-landed"
+    landed.mkdir()
+    ctx.daemon.wait_for_queue()
+    for path in expected:
+        _pdfs_copy(ctx.daemon, path, landed)
+    for path, data in expected.items():
+        check_bytes(read(landed / path.name), data, f"{path.name} as Drive holds it")
+
+
+def _my_files_root(ctx: Context) -> Path | None:
+    """The My files mount the case runs in, or None anywhere else.
+
+    `pdfs copy`, `pdfs du` and public links address a path inside My files;
+    synced folders have no path of their own there.
+    """
+    if ctx.daemon is None:
+        return None
+    mountpoint = (ctx.daemon.status().get("mount") or {}).get("mountpoint")
+    if not mountpoint:
+        return None
+    mountpoint = Path(mountpoint).resolve()
+    return mountpoint if mountpoint in ctx.root.resolve().parents else None
+
+
+def _require_my_files(ctx: Context) -> Daemon:
+    daemon = ctx.require_daemon()
+    if _my_files_root(ctx) is None:
+        raise Skip("needs a root inside My files")
+    return daemon
+
+
+COPIED_TO = re.compile(r"^copied to (.+)$")
+
+
+def _pdfs_copy(daemon: Daemon, source: Path, dest: Path) -> str:
+    """`pdfs copy`, returning the name the copy got."""
+    message = daemon.command("copy", str(source), str(dest)).strip()
+    match = COPIED_TO.match(message)
+    check(match is not None, f"pdfs copy {source.name}: unexpected reply {message!r}")
+    return match[1]
+
+
+def _pdfs_copy_refused(daemon: Daemon, source: Path, dest: Path) -> str | None:
+    """`pdfs copy` expected to be refused for changes Drive lacks: the refusal,
+    or None if the copy went ahead (and returned its name in the log)."""
+    try:
+        daemon.command("copy", str(source), str(dest))
+    except RuntimeError as error:
+        detail = str(error)
+        check("have not reached Proton Drive" in detail, f"pdfs copy {source.name}: unexpected refusal: {detail}")
+        return detail
+    return None
+
+
+def test_server_copy(ctx: Context) -> None:
+    """`pdfs copy` makes an exact copy on Drive and uploads nothing.
+
+    A tree and a lone file are copied; the file into its own folder, where
+    its name is taken and the copy gets the next free one. The copy is read
+    back as listed and again after its listing is dropped, and nothing of it
+    may wait in the queue: Drive made it, so there is nothing to send.
+    """
+    daemon = _require_my_files(ctx)
+    root = ctx.root
+    name = f"tree-{uuid.uuid4().hex[:8]}"
+    files = _move_tree(root, name)
+    dest = root / "copies"
+    dest.mkdir()
+    daemon.wait_for_queue()
+
+    check(_pdfs_copy(daemon, root / name, dest) == name, f"the copy of {name} was renamed")
+    note = root / name / "note.txt"
+    twin = _pdfs_copy(daemon, note, note.parent)
+    check(twin != note.name, f"the copy of {note.name} beside it kept the name {twin!r}")
+    check((note.parent / twin).is_file(), f"{twin} is not listed beside {note.name}")
+    queued = [
+        item
+        for item in daemon.queue()
+        if root.name in (parts := Path(item.get("path", "")).parts) and ("copies" in parts or twin in parts)
+    ]
+    check(not queued, f"a server copy queued work: {_describe_uploads(queued)}")
+
+    def verify(when: str) -> None:
+        for relative, data in files.items():
+            size = os.lstat(dest / relative).st_size
+            check(size == len(data), f"{relative} {when}: {size} bytes, expected {len(data)}")
+            check_bytes(read(dest / relative), data, f"{relative} {when}")
+        check((dest / name / "empty-dir").is_dir(), f"the empty folder is missing {when}")
+        check_bytes(read(note.parent / twin), files[Path(name) / "note.txt"], f"{twin} {when}")
+
+    verify("right after the copy")
+    folders = sorted({dest / relative.parent for relative in files} | {dest / name, note.parent})
+    for folder in folders:
+        daemon.command("refresh", str(folder))
+    verify("after dropping the cached listing")
+    _unchanged_at(root, files, "after copying it")
+
+
+def _unchanged_at(root: Path, files: dict[Path, bytes], what: str) -> None:
+    for relative, data in files.items():
+        check_bytes(read(root / relative), data, f"{relative} {what}")
+
+
+def test_server_copy_never_copies_an_old_version(ctx: Context) -> None:
+    """`pdfs copy` of a file being written is refused, and never copies the
+    version before the last save (B256).
+
+    Drive copies what it holds. A file open with unsaved writes, or saved but
+    not yet uploaded, holds more here than there: the copy has to wait.
+    """
+    daemon = _require_my_files(ctx)
+    root = ctx.root
+    path = root / "being-written.txt"
+    write_durable(path, b"first version")
+    dest = root / "copies"
+    dest.mkdir()
+    daemon.wait_for_queue()
+
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    try:
+        write_all(fd, b"second version, still open")
+        check(
+            _pdfs_copy_refused(daemon, path, dest) is not None,
+            "pdfs copy went ahead while the file had unsaved writes",
+        )
+        check(not (dest / path.name).exists(), "a refused copy left a file behind")
+    finally:
+        os.close(fd)
+
+    # Right after the close: refused while the upload is owed, then the new
+    # bytes. Never the first version.
+    saved = b"third version, saved"
+    write_durable(path, saved)
+    deadline = time.monotonic() + daemon.timeout
+    refusals = 0
+    while _pdfs_copy_refused(daemon, path, dest) is not None:
+        refusals += 1
+        check(time.monotonic() < deadline, f"pdfs copy was still refused after {daemon.timeout}s")
+        time.sleep(1)
+    ctx.note("refusals before the upload landed", refusals)
+    check_bytes(read(dest / path.name), saved, "the copy made right after a save")
+
+
+def test_folder_size(ctx: Context) -> None:
+    """`pdfs du` counts exactly what is below a folder, trash included.
+
+    Drive adds the size up from encrypted bytes, so it is at least the sum of
+    the files. A file moved to the trash still counts, as `pdfs du` says.
+    """
+    daemon = _require_my_files(ctx)
+    root = ctx.root
+    name = f"sized-{uuid.uuid4().hex[:8]}"
+    files = _move_tree(root, name)
+    folder = root / name
+    items = sum(1 for _ in folder.rglob("*"))
+    daemon.wait_for_queue()
+
+    def size() -> dict:
+        return json.loads(daemon.command("du", str(folder), json_output=True))
+
+    # Drive may add a new tree up a moment after it lands.
+    deadline = time.monotonic() + daemon.timeout
+    while (answer := size())["items"] != items and time.monotonic() < deadline:
+        time.sleep(2)
+    check(answer["items"] == items, f"pdfs du counts {answer['items']} items, expected {items}")
+    total = sum(len(data) for data in files.values())
+    check(answer["size"] >= total, f"pdfs du reports {answer['size']} bytes for {total} bytes of files")
+    ctx.info(f"{answer['size']} bytes on Drive for {total} bytes in {items} items")
+
+    os.unlink(folder / "note.txt")
+    daemon.wait_for_queue()
+    check(size()["items"] == items, "a file moved to the trash stopped counting in pdfs du")
+
+
+def _public_link(daemon: Daemon, path: Path) -> dict | None:
+    return json.loads(daemon.command("members", str(path), json_output=True)).get("link")
+
+
+def _link_token(url: str | None) -> str:
+    """The part of a public link's URL that names the link, without the
+    password fragment."""
+    check(bool(url), "the link has no URL")
+    return url.split("#", 1)[0]
+
+
+def test_public_link_update(ctx: Context) -> None:
+    """`pdfs public-link update` changes a link and keeps its URL.
+
+    Each option changed alone leaves the others as they were: a role change
+    keeps the password, removing the password keeps the expiry. A link id
+    that is not the folder's link is refused.
+    """
+    daemon = _require_my_files(ctx)
+    folder = ctx.root / "linked"
+    folder.mkdir()
+    write_durable(folder / "inside.txt", b"behind a public link")
+    daemon.wait_for_queue()
+
+    password = f"pw-{uuid.uuid4().hex[:12]}"
+    created = json.loads(
+        daemon.command("public-link", "create", str(folder), "--password", password, json_output=True)
+    )["link"]
+    link_id, token = created["id"], _link_token(created["url"])
+    try:
+        check(created["has_password"], "the new link has no password")
+
+        def update(*args: str) -> dict:
+            link = json.loads(
+                daemon.command("public-link", "update", str(folder), link_id, *args, json_output=True)
+            )["link"]
+            check(link["id"] == link_id, f"the update replaced the link: {link['id']} for {link_id}")
+            if link.get("url"):
+                check(_link_token(link["url"]) == token, "the update changed the link's URL")
+            listed = _public_link(daemon, folder)
+            check(listed is not None and listed["id"] == link_id, f"the link is gone after the update: {listed}")
+            return listed
+
+        listed = update("--role", "editor")
+        check(listed["role"] == "editor", f"the role is {listed['role']} after changing it to editor")
+        check(listed["has_password"], "changing the role removed the password")
+
+        expires = int(time.time()) + 7 * 24 * 3600
+        listed = update("--no-password", "--expires", str(expires))
+        check(not listed["has_password"], "--no-password kept the password")
+        check(listed["expires"] == expires, f"the expiry is {listed['expires']}, expected {expires}")
+        check(listed["role"] == "editor", "removing the password changed the role")
+
+        listed = update("--no-expiry")
+        check(listed["expires"] is None, f"--no-expiry kept the expiry {listed['expires']}")
+
+        try:
+            daemon.command("public-link", "update", str(folder), f"not-{link_id}", "--role", "viewer")
+        except RuntimeError as error:
+            check("not found" in str(error), f"a wrong link id was refused for another reason: {error}")
+        else:
+            check(False, "an update with a wrong link id went ahead")
+        check(_public_link(daemon, folder)["role"] == "editor", "a refused update changed the link")
+    finally:
+        with contextlib.suppress(Exception):
+            daemon.command("public-link", "remove", str(folder), link_id)
+
+
 def test_namespace_and_errors(ctx: Context) -> None:
     root = ctx.root
     a, b = root / "dir-a", root / "dir-b"
@@ -2625,6 +2974,7 @@ TESTS = [
     Case("positioned and vectored I/O", test_positioned_and_vectored_io),
     Case("truncate, growth, sparse ranges, and EOF", test_resize_and_sparse_io),
     Case("mmap and zero-copy copy paths", test_mmap_and_copy_paths),
+    Case("copy_file_range across calls, at offsets, and from an open file", test_copy_file_range_ranges),
     Case("namespace operations and POSIX errors", test_namespace_and_errors),
     Case("open-handle lifetime across unlink and rename", test_open_lifetime),
     Case("names, lookup, stat, and enumeration", test_names_and_enumeration),
@@ -2670,6 +3020,10 @@ TESTS = [
     Case("regression B116: trashing a folder drops the creates queued in its subfolders", test_regression_b116_trashed_folder_drops_deeper_creates, (LIVE,)),
     Case("regression B117: a moved file's queued upload keeps its path", test_regression_b117_moved_upload_keeps_its_path, (LIVE,)),
     Case("regression B119: an uploaded file stays cached", test_regression_b119_uploaded_file_stays_cached, (LIVE,)),
+    Case("pdfs copy: a copy on Drive reads back exactly and uploads nothing", test_server_copy, (LIVE,)),
+    Case("regression B256: pdfs copy never copies the version before a save", test_server_copy_never_copies_an_old_version, (LIVE,)),
+    Case("pdfs du counts what is below a folder, trash included", test_folder_size, (LIVE,)),
+    Case("pdfs public-link update keeps the URL and the options not changed", test_public_link_update, (LIVE,)),
     Case("durability across a daemon restart", test_durability_across_restart, (LIVE,)),
 ]
 
@@ -2942,7 +3296,7 @@ def select_cases(kind: str, pool: list[Case] | None = None) -> list[Case]:
     # typo worth failing on.
     for needle in needles:
         check(
-            any(needle in case.name.lower() for case in TESTS + MOVE_CASES),
+            any(needle in case.name.lower() for case in TESTS + MOVE_CASES + RECOVERY_CASES),
             f"PDFS_ACCEPTANCE_ONLY: {needle!r} matched no tests",
         )
     return [case for case in cases if any(needle in case.name.lower() for needle in needles)]
@@ -3894,7 +4248,7 @@ class ManagedSyncPair:
             raise RuntimeError(
                 f"cannot find {self.pdfs!r}; set PDFS_ACCEPTANCE_PDFS to the CLI binary"
             )
-        if self.paths[0] == self.paths[1]:
+        if len(set(self.paths)) != len(self.paths):
             raise ValueError("managed live paths must be different directories")
         deadline = time.monotonic() + self.timeout
         last_error = None
@@ -4537,6 +4891,138 @@ def run_move_contract(
     return run
 
 
+# --------------------------------------------------------------------------
+# Getting a synced folder unstuck
+# --------------------------------------------------------------------------
+
+
+class RecoveryContext:
+    """One mirror folder of the run's own, for cases that reset or empty it.
+
+    The mode matrix needs its folders' sentinels intact, so these cases get a
+    folder nobody else checks.
+    """
+
+    def __init__(self, pair: ManagedSyncPair, daemon: Daemon) -> None:
+        self.pair = pair
+        self.daemon = daemon
+        self.root = pair.paths[0]
+        self.id = pair.ids[self.root]
+        self.infos: list[str] = []
+
+    def folder(self) -> dict:
+        return next(item for item in self.pair.folders() if Path(item["local_path"]).resolve() == self.root)
+
+    def tree(self) -> tuple[str, dict[Path, bytes]]:
+        """A fresh tree in the folder, with one file named after it, so that a
+        trash entry of it cannot be the user's."""
+        name = f"kept-{uuid.uuid4().hex[:8]}"
+        files = _move_tree(self.root, name)
+        files[Path(name) / f"{name}.txt"] = b"named after its tree " + name.encode()
+        write_durable(self.root / name / f"{name}.txt", files[Path(name) / f"{name}.txt"])
+        return name, files
+
+    def trashed(self, names: set[str]) -> list[str]:
+        self.daemon.command("refresh", "trash")
+        return sorted(entry["name"] for entry in self.daemon.trash() if entry["name"] in names)
+
+
+def test_sync_reset_changes_nothing(rc: RecoveryContext) -> None:
+    """Sync From Scratch compares the folder with Drive again and changes
+    nothing that already matched: no deletes, no conflict copies.
+
+    `pdfs sync reset` forgets the folder's record of what it synced. The next
+    pass then sees every file on both sides with no history, which is the
+    case that must copy what is missing and leave matching files alone.
+    """
+    name, files = rc.tree()
+    rc.pair.force_sync(rc.root)
+    rc.daemon.command("sync", "reset", str(rc.id))
+    # Added after the reset, so the pass after it has to upload it.
+    later = Path(name) / "added-after-the-reset.txt"
+    files[later] = b"only here when the pass starts " + name.encode()
+    write_durable(rc.root / later, files[later])
+    rc.pair.force_sync(rc.root)
+    rc.pair.force_sync(rc.root)
+
+    _unchanged_at(rc.root, files, "after Sync From Scratch")
+    copies = [str(path) for path in rc.root.rglob("*") if "(sync-conflict" in path.name]
+    check(not copies, f"Sync From Scratch made conflict copies: {copies}")
+    trashed = rc.trashed({name, f"{name}.txt"})
+    check(not trashed, f"Sync From Scratch trashed {trashed}")
+    state = rc.folder()
+    check(state["state"] == "idle", f"the folder is {state['state']} after Sync From Scratch")
+
+
+def test_emptied_folder_switches_to_ondemand(rc: RecoveryContext) -> None:
+    """A mirror folder whose local files are all gone switches to online only,
+    and Drive keeps every file (B255, issue #46).
+
+    The wipe guard rightly refuses to pass the local loss on to Drive, but it
+    also blocked the push pass a queued switch runs first, so the switch never
+    landed and the folder stayed in error. Through the mount afterwards, every
+    file has to read back as it was.
+    """
+    names: set[str] = set()
+    files: dict[Path, bytes] = {}
+    for _ in range(2):
+        name, tree = rc.tree()
+        names |= {name, f"{name}.txt"}
+        files.update(tree)
+    rc.pair.force_sync(rc.root)
+    for child in list(rc.root.iterdir()):
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    rc.daemon.command("sync", "mode", str(rc.id), "ondemand")
+
+    # The folder may pass through error while the guard holds the deletions
+    # back; the switch has to land anyway.
+    deadline = time.monotonic() + rc.pair.timeout
+    while True:
+        state = rc.folder()
+        if state["mode"] == "ondemand" and state.get("pending_mode") is None and is_mountpoint(rc.root):
+            break
+        check(time.monotonic() < deadline, f"the switch to on-demand did not land: {state}")
+        time.sleep(2)
+
+    for relative, data in files.items():
+        data_read = rc.pair.through_outage(lambda relative=relative: read(rc.root / relative), f"reading {relative}", rc.infos)
+        check_bytes(data_read, data, f"{relative} on Drive after the local copy was gone")
+    sentinel = rc.root / "pdfs-mode-preservation.bin"
+    check_bytes(read(sentinel), rc.pair.sentinels[rc.root], f"{sentinel.name} on Drive")
+    trashed = rc.trashed(names)
+    check(not trashed, f"the switch trashed {trashed} on Drive")
+
+
+RECOVERY_CASES = [
+    Case("Sync From Scratch changes nothing that already matched", test_sync_reset_changes_nothing, (LIVE,)),
+    Case("regression B255: an emptied mirror folder switches to on-demand", test_emptied_folder_switches_to_ondemand, (LIVE,)),
+]
+
+
+def run_sync_recovery(janitor: Janitor, args) -> None:
+    """The recovery cases, in a sync folder of their own."""
+    cases = select_cases(LIVE, RECOVERY_CASES)
+    if not cases:
+        return
+    timeout = int(os.environ.get("PDFS_ACCEPTANCE_SYNC_TIMEOUT", "180"))
+    path = janitor.new_sync_folder()
+    pair = ManagedSyncPair([path], timeout)
+    daemon = Daemon.discover(timeout)
+    check(daemon is not None, "the daemon stopped answering")
+    run = Run("sync folder recovery", LIVE, path)
+    REPORT.append(run)
+    announce(run, {"folder": f"mirror, {path}", "cases": describe_cases(LIVE, cases, RECOVERY_CASES)})
+    started = time.monotonic()
+    pair.create()
+    context = RecoveryContext(pair, daemon)
+    run_cases(run, cases, lambda _case: context, max(args.timeout, 8 * timeout), args.fail_fast)
+    run.wall = time.monotonic() - started
+    CONSOLE.fact("result", tally(run.counts(), run.wall))
+
+
 def is_mountpoint(path: Path) -> bool:
     """True for a distinct mount, including FUSE mounts over an existing dir."""
     return os.path.ismount(path)
@@ -4694,6 +5180,8 @@ def main() -> int:
             print(f"{','.join(case.kinds):<18} {case.name}")
         for case in MOVE_CASES:
             print(f"{'managed':<18} {case.name}")
+        for case in RECOVERY_CASES:
+            print(f"{'account':<18} {case.name}")
         return 0
 
     install_interrupt_handlers()
@@ -4814,6 +5302,7 @@ def run_account(reference: Run, args) -> None:
         )
         paths = [janitor.new_sync_folder(), janitor.new_sync_folder()]
         run_managed_matrix(paths, reference, args, janitor)
+        run_sync_recovery(janitor, args)
     finally:
         started = time.monotonic()
         leftovers = janitor.cleanup()

@@ -116,7 +116,10 @@ for something a network filesystem cannot do.
    the move cases in every pairing of on-demand and mirror. Before a folder switches to on-demand,
    a new file is written into it; once mounted, the file must be listed with its bytes. In every
    pairing each folder must still hold the file written into it at setup.
-4. Removes everything it made, locally and on Drive, and reports `cleanup`. A run that leaves
+4. Registers a third sync folder for the recovery cases (`account` in `--list`): Sync From Scratch
+   must change nothing that already matched, and a mirror folder whose local files are all gone
+   must still switch to on-demand, with every file intact on Drive (B255).
+5. Removes everything it made, locally and on Drive, and reports `cleanup`. A run that leaves
    anything behind fails.
 
 Cleanup finds remote folders by uid, never by name, so nothing of yours is touched. It removes
@@ -199,6 +202,15 @@ Besides the syscall contract:
   both directions, several sources in one `pdfs move`, and a tree through My files and out again.
   The refusals must move nothing and lose nothing: a name already taken, a folder into itself, a
   mirrored source holding something Drive lacks, a file still open for writing.
+- **`copy_file_range`.** A 17 MiB copy that takes several calls, copies into the middle of a file
+  and past its end, a short copy at the source's end, and a copy from a file whose writes are not
+  released yet. On a live mount the results are also read back from Drive.
+- **Copies, sizes and links on Drive** (My files only). `pdfs copy` of a tree and of a file beside
+  itself, read back as listed and after `pdfs refresh`, with nothing queued; the refusal while a
+  file has writes Drive lacks, and never the version before a save (B256). `pdfs du` counts every
+  item below a folder and keeps counting one moved to the trash. `pdfs public-link update` keeps
+  the URL and every option it was not asked to change, and refuses a link id that is not the
+  folder's.
 - **The CLI.** `pdfs` into a closed pipe exits 0 with nothing on stderr; `pdfs mkdir`, `rename`
   and `rm` by local path, and their refusals.
 
@@ -263,3 +275,21 @@ typo it is. A release run leaves it unset.
 
 What no automated run covers yet is listed under
 [Verification still owed](ROADMAP.md#verification-still-owed).
+
+### By hand in the app
+
+The suite drives the CLI, not the app. Before a release that changes one of these screens, check
+it by hand on a test account:
+
+1. **Make a Copy** on a file in My files: the copy appears beside it with ` (1)`, and opens with
+   the same content. **Copy To…** a folder into another folder: the whole tree arrives.
+2. Make a Copy on a file that is still open in an editor with unsaved changes: the app refuses,
+   and no copy appears.
+3. **Details** of a folder: **Size on Proton Drive** shows a size and an item count, and its
+   tooltip says items in the trash are counted. Details of a file still shows **Size**.
+4. **Share → Link settings** on a link with a password: change **Link role**. The link in the
+   dialog stays the same, and **Remove the password** is still offered. Then remove the password
+   and pick an expiry under **Expires**: the link row shows when it expires.
+5. **Sync From Scratch…** on a mirror folder: after the pass, the folder holds the same files and
+   no conflict copies.
+6. Each of the above in a second language (`LANGUAGE=de pdfs-app`): no English left.
