@@ -102,7 +102,7 @@ for l in $(cat po/LINGUAS); do msgfmt --check --statistics -o /dev/null po/$l.po
 | Tool | Use |
 |---|---|
 | `RUST_LOG` | Log filter for every binary, for example `RUST_LOG=pdfs_fuse::sync=trace,info` |
-| `pdfs diagnose` | Static checks: directories, FUSE, keyring, socket, database integrity. Works without the daemon |
+| `pdfs diagnose` | Static checks: directories, FUSE, keyring, socket, database integrity. Works without the daemon. When the daemon does not answer, also traces which account and address keys open (`pdfs_core::keycheck`) |
 | `pdfs diagnostics` | Live state of a running daemon: each worker's current job and its age, queue depth, control requests in flight, memory |
 | `pdfs cache inspect --deep` | Database size, row counts and SQLite `integrity_check` |
 | `pdfs --json …` | Raw protocol payloads for query commands |

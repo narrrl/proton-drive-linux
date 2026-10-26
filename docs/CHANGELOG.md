@@ -12,6 +12,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 ## [Unreleased]
 
 ### Added
+- **`pdfs diagnose` names the key that keeps My Files closed.** When you are signed in and the
+  service does not answer, a new **Keys** section asks Proton which account and address keys
+  open, which account key each address key depends on, and which address key the My Files share
+  is encrypted to. It shows key IDs only, no secrets (#40).
 - **A COPR repository for Fedora**, so `dnf upgrade` brings each new release:
   `sudo dnf copr enable narl-rs/proton-drive-linux`. Every release also ships the vendored crates
   as `proton-drive-linux-vendor-<version>.tar.xz`, which the COPR build uses offline (#42).
