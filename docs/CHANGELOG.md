@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.6.0] — 2026-10-26
+
+Schema: **44**, unchanged.
+
 ### Added
 - **`pdfs diagnose` names the key that keeps My Files closed.** When you are signed in and the
   service does not answer, a new **Keys** section asks Proton which account and address keys

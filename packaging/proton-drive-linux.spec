@@ -10,7 +10,7 @@
 # Match Arch PKGBUILD `!lto` — LTO has broken some GTK/Rust links in practice.
 %global _lto_cflags %{nil}
 
-%{!?version: %global version 3.5.0}
+%{!?version: %global version 3.6.0}
 %global forge https://github.com/narrrl/proton-drive-linux
 # Files come from the checkout, or from the unpacked tag archive.
 %global src %{?git_dir}%{!?git_dir:.}
