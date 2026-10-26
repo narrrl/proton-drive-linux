@@ -12,6 +12,7 @@ pub mod db;
 pub mod error;
 pub mod exiftime;
 pub mod kernelkey;
+pub mod keycheck;
 pub mod localindex;
 pub mod menu;
 pub mod mounts;

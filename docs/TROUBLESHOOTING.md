@@ -20,6 +20,11 @@ information listed under [Reporting a problem](#reporting-a-problem).
 Checks the installation and prints a report. It does not need the service, because the state
 worth diagnosing is often the one where the service will not start.
 
+When you are signed in but the service does not answer, it also asks Proton which of your keys
+open, under **Keys**: each account key, each address key, and the address key your My Files
+share is encrypted to. A key that does not open is named with the key it depends on. The section
+shows key IDs, which are not secret, so you can post it in an issue.
+
 ```console
 $ pdfs diagnose
 Paths
@@ -146,7 +151,8 @@ session before it shows your files.
 Your account keys cannot open your Drive, which happens after a password reset: Proton locks the
 files that were encrypted with the old keys. Since 3.4.1 the client then starts a new, empty My
 files. Your old files are still there, locked: open [drive.proton.me](https://drive.proton.me) and
-restore them with your previous password.
+restore them with your previous password. If your files are not locked and the error stays, run
+`pdfs diagnose` and post its **Keys** section in an issue.
 
 ### Everything in the folder hangs
 
