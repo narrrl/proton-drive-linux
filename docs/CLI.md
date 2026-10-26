@@ -4,7 +4,8 @@
 talks to the running service (`proton-drive.service`); `login`, `logout`, `mount`, `daemon` and
 `diagnose` work without it.
 
-`pdfs <command> --help` prints the full help of any command. This page groups them by task.
+`pdfs <command> --help` prints the full help of any command. This page groups them by task. For
+what the commands do in the app, see the [user guide](USER_GUIDE.md).
 
 - [Conventions](#conventions)
 - [Account and service](#account-and-service)
@@ -35,7 +36,9 @@ talks to the running service (`proton-drive.service`); `login`, `logout`, `mount
 
 | Command | Description |
 |---|---|
-| `pdfs login [-u EMAIL]` | Sign in (password, then a 2FA code if the account has one) and store the session in the system keyring. Restarts the service if it is running. |
+| `pdfs login [-u EMAIL] [--remember]` | Sign in (password, then a 2FA code if the account has one) and store the session in the system keyring. Restarts the service if it is running. `--remember` keeps a two-password account unlocked across logins. |
+| `pdfs unlock [--remember]` | Enter the mailbox password of a two-password account, so the service can open your files. Needed once per login session, or once with `--remember`. |
+| `pdfs lock` | Forget the unlock held in memory; the account is locked again. |
 | `pdfs logout` | End the session on Proton and remove the stored session. |
 | `pdfs status` | Account, mount, queue and cache state. |
 | `pdfs quota` | Storage used across all Proton products. |
@@ -43,7 +46,8 @@ talks to the running service (`proton-drive.service`); `login`, `logout`, `mount
 | `pdfs daemon [MOUNTPOINT]` | Run the service in the foreground: wait for a session, mount, stay mounted. `proton-drive.service` runs this. |
 | `pdfs mount [MOUNTPOINT]` | Mount once and block until unmounted. Defaults to `~/ProtonDrive`. |
 
-`pdfs login` cannot show a CAPTCHA. If Proton asks for one, sign in with `pdfs-app` instead.
+If Proton asks for a CAPTCHA, `pdfs login` prints the address of the page. Open it in your
+browser, complete it, then press Enter.
 
 ## Files
 
@@ -86,7 +90,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs sync export ID DEST` | Save a copy of a queued upload's content. `DEST` may be a folder; an existing file is never overwritten. The upload stays queued. |
 | `pdfs sync discard ID [--yes]` | Drop a queued change and undo it here: a new file or folder goes, anything else goes back to what Proton Drive has. Content not exported first is lost. |
 | `pdfs sync retry [ID]` | Retry one queued operation, or every failed one. |
-| `pdfs sync restore [--device UID] [--yes]` | Re-attach this computer's backed-up folders to local folders and download them. `--device` restores another computer's folders. See [RECOVERY.md](RECOVERY.md). |
+| `pdfs sync restore [--device UID] [--yes]` | Re-attach this computer's backed-up folders to local folders and download them. `--device` restores another computer's folders. See [Recovery](RECOVERY.md). |
 
 ## Conflicts
 
@@ -104,7 +108,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs devices rm UID` | Remove a computer and its backup from the account. |
 | `pdfs devices join UID [--yes]` | Sync the same folders as another computer. This machine syncs into that computer's backup alongside it, then offers its folders like `pdfs sync restore`. Both computers keep them in step. `--yes` skips the confirmation and accepts every proposed path. |
 | `pdfs devices adopt UID` | Make this machine continue another computer's backup, for example after a reinstall. `--clear` returns to matching by hostname. |
-| `pdfs devices migrate UID [--yes]` | Move another computer's folders into this computer's backup, then restore them here like `pdfs sync restore`. The other computer stays registered, without those folders. `--yes` skips the confirmation and accepts every proposed path. See [RECOVERY.md](RECOVERY.md). |
+| `pdfs devices migrate UID [--yes]` | Move another computer's folders into this computer's backup, then restore them here like `pdfs sync restore`. The other computer stays registered, without those folders. `--yes` skips the confirmation and accepts every proposed path. See [Recovery](RECOVERY.md). |
 
 ## Trash
 
@@ -177,7 +181,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs cache vacuum` | Compact the database. Needs free space for a second copy of it while it runs. |
 | `pdfs cache clear` | Delete cached file content. Files kept available offline stay. |
 
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md) explains when to use each of these.
+[Troubleshooting](TROUBLESHOOTING.md) explains when to use each of these.
 
 ## Scripting with `--json`
 

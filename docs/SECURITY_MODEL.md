@@ -60,8 +60,12 @@ The client connects only to:
 - **Proton**, for the Drive and account API, and for the CAPTCHA page when Proton asks for one.
 - **OpenFreeMap**, for the street map of Places in Photos, only if you turn it on in Preferences. It is off by default, because the tile server learns which parts of the
   world you look at. The default map is drawn from data shipped with the app.
+- **GitHub**, once a day, to ask for the latest release, only if you turn on **Check for updates**
+  in Preferences. It is off by default, because GitHub learns your IP address and, from the user
+  agent, which version you run. Packages updated by a package manager (COPR, the AUR, Nix) do
+  not offer the setting and never ask.
 
-There is no telemetry, no analytics and no update check. The SDK can report timings of its own
+There is no telemetry and no analytics. The SDK can report timings of its own
 operations, and the client only writes them to its local log.
 
 ## What this client does not protect against
@@ -75,7 +79,9 @@ operations, and the client only writes them to its local log.
 
 ## Packages
 
-- The `.rpm` is signed with GPG.
+- The `.rpm` on the release page is signed with GPG.
+- The COPR packages are built by Fedora's COPR service from the tagged source and the vendored
+  crates of the release, and are signed with the COPR project's own key.
 - The `.deb` and the `.tar.gz` are built by GitHub Actions from the tagged source, and are not
   signed.
 - The AUR packages build from the tagged source or from `main`, or install the release binaries

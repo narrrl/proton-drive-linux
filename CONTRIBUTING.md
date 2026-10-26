@@ -6,10 +6,10 @@ deliberately high — everything else is ordinary Rust review.
 
 ## Before you start
 
-- Read [`AGENTS.md`](AGENTS.md) for repository conventions,
-  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for building, running and debugging from source,
-  and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the daemon, front ends, and SDK fit
-  together. [`docs/README.md`](docs/README.md) indexes the rest.
+- Read [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for building, running and debugging from
+  source, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the daemon, front ends, and
+  SDK fit together. [`docs/README.md`](docs/README.md) indexes the rest. The same pages are on
+  the [wiki](https://github.com/narrrl/proton-drive-linux/wiki).
 - Check [`docs/BUGS.md`](docs/BUGS.md) — it is the authoritative issue ledger, and your problem may
   already be tracked there with context.
 - For anything larger than a fix, open an issue first so the design can be discussed before you
@@ -58,8 +58,10 @@ runs are destructive: use a dedicated test account, never one holding data you c
   catalog in `po/LINGUAS` in the same change. See [`docs/TRANSLATING.md`](docs/TRANSLATING.md).
   The CLI and daemon messages stay in English.
 - **Document what users see.** A new command, setting or behaviour belongs in the matching page
-  under `docs/` (user guide, CLI reference or configuration) and in the `[Unreleased]` section of
-  [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+  under `docs/` (a user guide topic, the CLI reference or configuration) and in the `[Unreleased]`
+  section of [`docs/CHANGELOG.md`](docs/CHANGELOG.md). Each release publishes `docs/` to the
+  wiki. A new page goes into `SECTIONS` in `scripts/publish-wiki.sh`, and
+  `scripts/publish-wiki.sh --check` must pass. CI runs it on every change to `docs/`.
 
 ## Commits and pull requests
 

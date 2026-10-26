@@ -16,6 +16,22 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   service does not answer, a new **Keys** section asks Proton which account and address keys
   open, which account key each address key depends on, and which address key the My Files share
   is encrypted to. It shows key IDs only, no secrets (#40).
+- **A COPR repository for Fedora**, so `dnf upgrade` brings each new release:
+  `sudo dnf copr enable narl-rs/proton-drive-linux`. Every release also ships the vendored crates
+  as `proton-drive-linux-vendor-<version>.tar.xz`, which the COPR build uses offline (#42).
+- **The app can tell you about a new release.** Turn on **Check for updates** in Preferences, and
+  the app asks GitHub once a day and shows a banner with a **Download** button when a newer
+  version is out. It is off by default, and not offered for packages that a package manager
+  updates (COPR, the AUR, Nix) (#42).
+
+### Changed
+- **Reorganised documentation, now also on the
+  [wiki](https://github.com/narrrl/proton-drive-linux/wiki).** A new
+  [Getting started](https://github.com/narrrl/proton-drive-linux/wiki/Getting-Started) page and
+  an [FAQ](https://github.com/narrrl/proton-drive-linux/wiki/FAQ). The user guide is split into
+  pages for files, synced folders, Photos, sharing, computers, and the launcher and tray.
+  Installation puts the COPR repository first for Fedora and explains updating and uninstalling
+  for each kind of package. Each release publishes `docs/` to the wiki.
 
 ## [3.5.0] — 2026-10-16
 

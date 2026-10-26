@@ -3,6 +3,10 @@
 Your laptop is lost, stolen or reinstalled. This page explains what survives, and how to get
 your synced folders back on the replacement machine.
 
+**In short:** sign the old machine out of your Proton account. Then, on the new one, install the
+client and sign in. On the **Computers** page, choose **Continue This Backup Here…** on the old
+computer, then **Restore Folders…** on this one.
+
 - [1. What survives](#1-what-survives)
 - [2. Restore your synced folders](#2-restore-your-synced-folders)
 - [3. How the restore works](#3-how-the-restore-works)
@@ -52,7 +56,7 @@ be decrypted.
 
 ### Step 1: Install and sign in
 
-Install the client as described in [INSTALL.md](INSTALL.md) and sign in with `pdfs-app`. Signing
+Install the client as described in [Installation](INSTALL.md) and sign in with `pdfs-app`. Signing
 in from the app also starts the service.
 
 ### Step 2: Continue the old computer's backup
@@ -100,7 +104,7 @@ progress on **Sync → Overview** or with `pdfs sync list`.
 > Restore into empty or missing directories. If a directory already holds files, for example
 > from another backup, the client cannot tell which side is newer. It keeps both: your local file
 > is renamed to a `(sync-conflict …)` copy and the version from Proton Drive is downloaded. See
-> [Conflicts](USER_GUIDE.md#conflicts).
+> [Conflicts](SYNCED_FOLDERS.md#conflicts).
 
 ### Step 4: Restore the rest by hand
 
@@ -191,4 +195,4 @@ This section is for the curious and for anyone debugging a restore.
 | No warning at shutdown or sign-out while changes are queued | Check `pdfs sync queue` before you retire a machine |
 | The full disaster drill (delete all local state, restore, compare byte for byte) has not been run against a live account | The individual steps are tested; the whole sequence is not |
 
-Planned work is tracked in [ROADMAP.md](ROADMAP.md).
+Planned work is tracked in the [roadmap](ROADMAP.md).

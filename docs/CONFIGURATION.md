@@ -39,7 +39,7 @@ Inside `content/`:
 > not reached Proton Drive and exists nowhere else.
 
 Everything in these directories except the keyring is **decrypted**. See
-[ARCHITECTURE.md §10](ARCHITECTURE.md#10-threat-model-what-this-client-writes-to-disk-in-plaintext).
+the [security model](SECURITY_MODEL.md#what-is-kept-on-this-computer).
 
 ## `config.json`
 
@@ -61,6 +61,7 @@ fix it.
   "proton_theme": true,
   "online_map": false,
   "tray_hidden": false,
+  "update_check": false,
   "files_view": { "list": true, "sort": "modified", "descending": true, "folders_first": true },
   "window": { "width": 980, "height": 680, "maximized": false },
   "open_with": {
@@ -87,6 +88,9 @@ fix it.
 | `proton_theme` | bool | follow system | General → Appearance | Proton's colours instead of the system theme |
 | `online_map` | bool | `false` | General → Appearance | Street map for Places from OpenFreeMap |
 | `tray_hidden` | bool | `false` | General → Appearance | Hide the tray icon |
+| `update_check` | bool | `false` | General → Updates | Ask GitHub once a day for a newer release and show it over the sidebar. Not offered where a package manager installs updates |
+| `update_last_checked` | Unix seconds | none | — | Written by the update check, so a restart does not ask again within a day |
+| `update_latest` | version | none | — | The latest release the update check found |
 | `files_view` | object | grid, by name | My files view menu | `list`, `sort` (`name`, `size`, `modified`), `descending`, `folders_first` |
 | `window` | object | 980 × 680 | Resizing the app window | `width`, `height` (the unmaximized size), `maximized` |
 | `open_with` | object | `xdg-open` | — | See [`open_with`](#open_with) |
@@ -109,7 +113,7 @@ Gitignore-style rules applied to every synced folder, in addition to each folder
 ```
 
 Set it to `[]` to turn the defaults off. See
-[USER_GUIDE.md](USER_GUIDE.md#excluding-files-with-pdfsignore) for how ignoring behaves.
+[Synced folders](SYNCED_FOLDERS.md#excluding-files-with-pdfsignore) for how excluding behaves.
 
 ### `conflict_sweep`
 
@@ -198,7 +202,7 @@ Command-line flags win over the file: `--gtk`, `--dmenu`, `--fzf` and `--menu`.
 | `PDFS_STAND_IN_WIDGETS` | app | `1` uses the libadwaita 1.5 fallback widgets on newer systems (development) |
 
 The tests have their own variables (`PDFS_ACCEPTANCE_*`, `PDFS_SIM_*`, `PDFS_MIGRATE_DB`),
-listed in [TESTING.md](TESTING.md).
+listed in [Testing](TESTING.md).
 
 ## The systemd service
 
