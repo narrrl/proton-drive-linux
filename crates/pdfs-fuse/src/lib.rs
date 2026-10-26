@@ -5230,7 +5230,15 @@ impl Core {
                 .entries
                 .get(&ino)
                 .ok_or_else(|| CoreError::not_found(format!("{} is gone", rel.display())))?;
-            let unsaved = st.active_writes.get(&ino).is_some_and(|w| w.dirty);
+            // Unsaved writes, or a release still queueing them, to the file or,
+            // for a folder, to any file below it.
+            let unsaved = st
+                .active_writes
+                .iter()
+                .filter(|(_, w)| w.dirty)
+                .map(|(&open, _)| open)
+                .chain(st.releasing.iter().copied())
+                .any(|open| relocate::ino_is_under(&st, open, ino));
             (entry.node.name.clone(), entry.node.is_folder(), unsaved)
         };
         // Unlike a move, a copy cannot wait in the queue: it needs the node as

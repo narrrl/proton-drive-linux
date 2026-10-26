@@ -100,6 +100,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
 | [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
@@ -356,6 +357,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B256 — `pdfs copy` right after a save copies the old version
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-26, the simulation `a_pdfs_copy_copies_on_drive_and_waits_for_unsynced_changes`
+failing on most runs. The feature was not released yet.
+**Where:** `release` in `crates/pdfs-fuse/src/filesystem.rs`; `copy_to` in
+`crates/pdfs-fuse/src/lib.rs`; `has_pending_work_under` in `crates/pdfs-fuse/src/relocate.rs`
+
+**Repro:** Save a file in the mount and copy it, or its folder, with `pdfs copy` straight away.
+The copy goes ahead and Drive copies the version before the save.
+
+**Cause.** `close(2)` returns before the kernel sends `release`. `release` takes the write handle
+out of the open writes and then queues the revision, which takes a few milliseconds. A copy
+checked in between found the edit in neither place. A folder copy looked only at the queue, so
+it also missed a file still open with unsaved writes.
+
+**Fix.** `release` keeps the inode in `State::releasing` until the revision is queued. A copy
+refuses a file or folder with unsaved writes, or a release still queueing, at it or below it.
+A move checks the same set.
+
+**Test:** The simulation above passed 6 of 6 runs after the fix.
+
+---
 
 ### B254 — An edit in the same second as a new upload never arrives
 

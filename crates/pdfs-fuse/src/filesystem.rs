@@ -671,7 +671,7 @@ impl Filesystem for ProtonFs {
         reply: ReplyEmpty,
     ) {
         let ino = self.tree(ino);
-        let (handle, unlinked_uid) = {
+        let (handle, unlinked_uid, releasing) = {
             let mut st = self.core.state();
             let unlinked_uid = release_unlinked_entry(&mut st, ino.0);
             let ino = st.handles.remove(&fh.0);
@@ -684,7 +684,11 @@ impl Filesystem for ProtonFs {
                     None
                 }
             });
-            (h, unlinked_uid)
+            let releasing = ino.filter(|_| h.is_some());
+            if let Some(ino) = releasing {
+                st.releasing.insert(ino);
+            }
+            (h, unlinked_uid, releasing)
         };
         // Deliberately **not** handed to a worker, unlike the other slow
         // handlers here. The kernel does not wait for a `release` reply before
@@ -701,6 +705,9 @@ impl Filesystem for ProtonFs {
         // finish it (audit F1). What is left is a rename, two fsyncs, a database
         // insert, and at most a bounded copy out of the local cache.
         self.finish_release(handle, unlinked_uid, reply);
+        if let Some(ino) = releasing {
+            self.core.state().releasing.remove(&ino);
+        }
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
