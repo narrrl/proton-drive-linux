@@ -190,8 +190,9 @@ commands are for scripts and for cases where the mount is not available.
 ## Scripting with `--json`
 
 The global `--json` flag makes query commands print JSON: `status`, `ls`, `pins`, `sync list`,
-`devices list`, `locations`, `transfers`, `activity`, `trash` and `cache inspect`. Commands that change
-something keep their human-readable output; check their exit code.
+`devices list`, `locations`, `transfers`, `activity`, `trash`, `cache inspect`, `members` and `du`.
+`public-link create` and `public-link update` print the link they made or changed. Other commands
+that change something keep their human-readable output; check their exit code.
 
 ```bash
 pdfs --json status | jq -r '.mount.mountpoint'
