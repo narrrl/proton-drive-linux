@@ -1143,7 +1143,14 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                         // A pass in flight says what it is doing, indented under it.
                         if let Some(p) = &f.progress {
                             match p.phase {
-                                SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
+                                SyncPhase::Scanning if p.total == 0 && p.done == 0 => {
+                                    println!("      scanning…")
+                                }
+                                // A first pass has no estimate yet; the count alone
+                                // shows a long first scan is moving.
+                                SyncPhase::Scanning if p.total == 0 => {
+                                    println!("      scanning: {} checked", p.done)
+                                }
                                 SyncPhase::Scanning => {
                                     println!(
                                         "      scanning: {} of {}",

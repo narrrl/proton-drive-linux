@@ -59,6 +59,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   files again instead, sync the folder from scratch. Restoring folders also logs why it
   skipped a folder.
 
+- **The first sync of a folder shows how far its scan got** (#46). Before anything downloads,
+  the first pass reads every item on Proton Drive, which takes many minutes for a large folder.
+  The folder showed only "checking for changes…" all that time, and `pdfs sync list` only
+  `scanning…`, which looked stuck. Both now count the items checked so far.
+
 - **Saved public links show the name of what they point at**, in the app and in `pdfs bookmarks`,
   instead of "Shared link". For a link with a custom password, the address no longer has the custom
   password stuck to its end, so it matches the link the web shows and the page asks for the
