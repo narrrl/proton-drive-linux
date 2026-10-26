@@ -61,8 +61,8 @@ use proton_drive_rs::proton_sdk::ids::{
     DeviceUid, DriveEventId, LinkId, NodeUid, ShareId, VolumeId,
 };
 use proton_drive_rs::{
-    Device as Computer, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeKind, NodeMoveItem,
-    RevisionState, Thumbnail,
+    AvailableNameTarget, Device as Computer, DeviceType, DriveEvent, DriveEventScopeId, Node,
+    NodeKind, NodeMoveItem, RevisionState, Thumbnail,
 };
 use sha1::{Digest as _, Sha1};
 
@@ -183,6 +183,39 @@ impl Server {
             last_sync_time: None,
             share_id: ShareId::new(format!("device-share{}", n + 1)),
         }
+    }
+
+    /// Copy `uid` and, for a folder, everything live below it under `parent` as
+    /// `name`, the way Drive's copy endpoint does. Returns the copy's uid.
+    fn copy_subtree(&mut self, uid: &NodeUid, parent: &NodeUid, name: String) -> NodeUid {
+        let source = self
+            .current(uid)
+            .cloned()
+            .expect("the caller checked the source");
+        let copy = self.mint_uid();
+        let now = now_secs();
+        self.put(
+            &copy,
+            Some(Remote {
+                parent: Some(parent.clone()),
+                name,
+                created: now,
+                ..source
+            }),
+        );
+        let children: Vec<(NodeUid, String)> = self
+            .nodes
+            .keys()
+            .filter_map(|child| {
+                let remote = self.current(child)?;
+                (remote.parent.as_ref() == Some(uid) && !remote.trashed)
+                    .then(|| (child.clone(), remote.name.clone()))
+            })
+            .collect();
+        for (child, child_name) in children {
+            self.copy_subtree(&child, &copy, child_name);
+        }
+        copy
     }
 
     fn mint_uid(&mut self) -> NodeUid {
@@ -1486,6 +1519,61 @@ impl DriveApi for FakeClient {
     async fn move_node(&self, uid: &NodeUid, new_parent: &NodeUid) -> Result<()> {
         self.request(true, |server| {
             self.rename_or_move(server, uid, Some(new_parent), None)
+        })
+        .await
+    }
+
+    async fn copy_node(
+        &self,
+        uid: &NodeUid,
+        new_parent: &NodeUid,
+        name: Option<&str>,
+    ) -> Result<NodeUid> {
+        self.request(true, |server| {
+            if !server.is_folder(new_parent) {
+                return Err(api(ResponseCode::DoesNotExist, "parent folder not found"));
+            }
+            let source = server
+                .current(uid)
+                .filter(|remote| !remote.trashed)
+                .cloned()
+                .ok_or_else(|| api(ResponseCode::DoesNotExist, "node not found"))?;
+            if server.is_below(new_parent, uid) {
+                return Err(api(
+                    ResponseCode::InvalidRequirements,
+                    "cannot copy a folder into itself",
+                ));
+            }
+            let name = name.map_or(source.name.clone(), str::to_owned);
+            if server.live_child_named(new_parent, &name).is_some() {
+                return Err(api(
+                    ResponseCode::AlreadyExists,
+                    "a file or folder with that name already exists",
+                ));
+            }
+            Ok(server.copy_subtree(uid, new_parent, name))
+        })
+        .await
+    }
+
+    async fn get_available_name(
+        &self,
+        parent_uid: &NodeUid,
+        name: &str,
+        target: AvailableNameTarget,
+    ) -> Result<String> {
+        self.request(false, |server| {
+            let (stem, extension) = match (target, name.rsplit_once('.')) {
+                (AvailableNameTarget::File, Some((stem, ext))) if !stem.is_empty() => {
+                    (stem, format!(".{ext}"))
+                }
+                _ => (name, String::new()),
+            };
+            let free = std::iter::once(name.to_owned())
+                .chain((1..).map(|n| format!("{stem} ({n}){extension}")))
+                .find(|candidate| server.live_child_named(parent_uid, candidate).is_none())
+                .expect("an unbounded sequence has a free name");
+            Ok(free)
         })
         .await
     }

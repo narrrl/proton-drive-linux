@@ -904,6 +904,12 @@ pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     menu.item(&gettext("Move To…"), move || {
         prompt_move(&ui_c, vec![entry_c.clone()])
     });
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item(&gettext("Make a Copy"), move || make_copy(&ui_c, &entry_c));
+    let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    menu.item(&gettext("Copy To…"), move || {
+        prompt_copy(&ui_c, vec![entry_c.clone()])
+    });
     if !entry.is_dir {
         let (ui_c, entry_c) = (ui.clone(), entry.clone());
         menu.item(&gettext("Versions…"), move || {
@@ -937,6 +943,10 @@ pub(crate) fn bulk_context_menu(ui: &Rc<Ui>, entries: Vec<DirEntry>) -> ActionMe
     let (ui_c, batch) = (ui.clone(), entries.clone());
     menu.item(&gettext("Move To…"), move || {
         prompt_move(&ui_c, batch.clone())
+    });
+    let (ui_c, batch) = (ui.clone(), entries.clone());
+    menu.item(&gettext("Copy To…"), move || {
+        prompt_copy(&ui_c, batch.clone())
     });
     menu.labelled_section(&ngettext_f(
         "{n} selected",
@@ -1940,17 +1950,63 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
 /// still made on Proton Drive, so nothing is downloaded or uploaded again; it
 /// is sent with absolute paths, which is how the daemon tells locations apart.
 pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
+    prompt_destination(ui, entries, PickerKind::Move);
+}
+
+/// Ask where to copy `entries`, then copy them there on Proton Drive. Only
+/// My files is offered: a copy is made on the server, inside the mount.
+pub(crate) fn prompt_copy(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
+    prompt_destination(ui, entries, PickerKind::Copy);
+}
+
+/// Copy one entry into the folder it is in. The copy gets a free name, such
+/// as "report (1).pdf".
+pub(crate) fn make_copy(ui: &Rc<Ui>, entry: &DirEntry) {
+    let source = entry_rel(ui, entry);
+    let parent = source
+        .rfind('/')
+        .map(|i| source[..i].to_string())
+        .unwrap_or_default();
+    run_bulk_copy(ui, vec![source], parent);
+}
+
+/// What the folder picker chooses a destination for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PickerKind {
+    Move,
+    Copy,
+}
+
+fn prompt_destination(ui: &Rc<Ui>, entries: Vec<DirEntry>, kind: PickerKind) {
     if entries.is_empty() {
         return;
     }
     let sources: Vec<String> = entries.iter().map(|e| entry_rel(ui, e)).collect();
-    let heading = match entries.as_slice() {
-        [one] => gettext_f("Move “{name}”", &[("name", &one.name)]),
-        many => ngettext_f("Move {n} item", "Move {n} items", many.len() as u64, &[]),
+    let (heading, body, confirm) = match (kind, entries.as_slice()) {
+        (PickerKind::Move, [one]) => (
+            gettext_f("Move “{name}”", &[("name", &one.name)]),
+            gettext("Choose the folder to move into."),
+            gettext("Move Here"),
+        ),
+        (PickerKind::Move, many) => (
+            ngettext_f("Move {n} item", "Move {n} items", many.len() as u64, &[]),
+            gettext("Choose the folder to move into."),
+            gettext("Move Here"),
+        ),
+        (PickerKind::Copy, [one]) => (
+            gettext_f("Copy “{name}”", &[("name", &one.name)]),
+            gettext("Choose the folder to copy into."),
+            gettext("Copy Here"),
+        ),
+        (PickerKind::Copy, many) => (
+            ngettext_f("Copy {n} item", "Copy {n} items", many.len() as u64, &[]),
+            gettext("Choose the folder to copy into."),
+            gettext("Copy Here"),
+        ),
     };
     let dialog = adw::AlertDialog::builder()
         .heading(heading)
-        .body(gettext("Choose the folder to move into."))
+        .body(body)
         .build();
 
     let up = gtk4::Button::builder()
@@ -1981,7 +2037,7 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
     body.append(&scroll);
     dialog.set_extra_child(Some(&body));
     dialog.add_response("cancel", &gettext("Cancel"));
-    dialog.add_response("move", &gettext("Move Here"));
+    dialog.add_response("move", &confirm);
     dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("move"));
     dialog.set_close_response("cancel");
@@ -1994,6 +2050,7 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
         list,
         up: up.clone(),
         sources: sources.clone(),
+        kind,
         folder: RefCell::new(MoveTarget::Locations),
         generation: Cell::new(0),
     });
@@ -2013,6 +2070,10 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
         }
         match picker_done.folder.borrow().clone() {
             MoveTarget::Locations => {}
+            MoveTarget::Drive(folder) if kind == PickerKind::Copy => {
+                run_bulk_copy(&ui, sources.clone(), folder)
+            }
+            MoveTarget::Synced { .. } if kind == PickerKind::Copy => {}
             MoveTarget::Drive(folder) => run_bulk_move(&ui, sources.clone(), folder),
             MoveTarget::Synced { path, .. } => {
                 let absolute = sources
@@ -2088,8 +2149,9 @@ struct MovePicker {
     location: gtk4::Label,
     list: gtk4::ListBox,
     up: gtk4::Button,
-    /// What is being moved, mountpoint-relative.
+    /// What is being moved or copied, mountpoint-relative.
     sources: Vec<String>,
+    kind: PickerKind,
     /// The folder on show, and the destination if the user confirms now.
     folder: RefCell<MoveTarget>,
     /// Drops a listing that arrives after the user went elsewhere.
@@ -2110,11 +2172,13 @@ impl MovePicker {
         self.location.set_tooltip_text(Some(&tooltip));
         self.up
             .set_sensitive(!matches!(folder, MoveTarget::Locations));
-        let allowed = match &folder {
-            MoveTarget::Locations => false,
-            MoveTarget::Drive(rel) => move_target_allowed(&self.sources, rel),
+        let allowed = match (&folder, self.kind) {
+            (MoveTarget::Locations, _) => false,
+            (MoveTarget::Drive(rel), PickerKind::Move) => move_target_allowed(&self.sources, rel),
+            (MoveTarget::Drive(rel), PickerKind::Copy) => copy_target_allowed(&self.sources, rel),
             // What is moved is in My files, so it cannot be in a synced folder.
-            MoveTarget::Synced { .. } => true,
+            (MoveTarget::Synced { .. }, PickerKind::Move) => true,
+            (MoveTarget::Synced { .. }, PickerKind::Copy) => false,
         };
         self.dialog.set_response_enabled("move", allowed);
         *self.folder.borrow_mut() = folder.clone();
@@ -2180,6 +2244,10 @@ impl MovePicker {
     /// My files and every synced folder, as rows of the top level.
     async fn locations(&self) -> Option<Vec<PickerRow>> {
         let mut rows = vec![(gettext("My files"), None, MoveTarget::Drive(String::new()))];
+        // A copy is made on the server, so it can only land in My files.
+        if self.kind == PickerKind::Copy {
+            return Some(rows);
+        }
         let rx = spawn_request(self.ui.dirs.control_socket(), Request::ListSyncFolders);
         let Ok(Ok(Response::SyncFolders { mut items })) = rx.recv().await else {
             // My files alone is still somewhere to move to.
@@ -2286,11 +2354,16 @@ pub(crate) fn move_target_allowed(sources: &[String], target: &str) -> bool {
             .map(|i| path[..i].to_string())
             .unwrap_or_default()
     };
-    let inside = sources
-        .iter()
-        .any(|src| target == src || target.starts_with(&format!("{src}/")));
     let all_here = sources.iter().all(|src| parent(src) == target);
-    !inside && !all_here
+    copy_target_allowed(sources, target) && !all_here
+}
+
+/// Whether `target` is somewhere `sources` can be copied to: anywhere but into
+/// one of themselves. The folder they are in is fine; the copy gets a free name.
+pub(crate) fn copy_target_allowed(sources: &[String], target: &str) -> bool {
+    !sources
+        .iter()
+        .any(|src| target == src || target.starts_with(&format!("{src}/")))
 }
 
 /// Move each of `sources` into `target`, one request at a time, then report
@@ -2309,38 +2382,14 @@ pub(crate) fn run_bulk_move(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
     clear_selection(ui);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let mut done = 0usize;
-        let mut failure: Option<(String, ErrorKind)> = None;
-        for path in sources {
-            let rx = spawn_request(
-                socket.clone(),
-                Request::Move {
-                    path,
-                    new_parent: target.clone(),
-                },
-            );
-            match rx.recv().await {
-                Ok(Ok(Response::Ok { .. })) => done += 1,
-                Ok(Ok(Response::Error { message, kind })) => {
-                    failure.get_or_insert((message, kind));
-                }
-                _ => {
-                    failure.get_or_insert_with(|| {
-                        (
-                            gettext("The Proton Drive service didn't respond."),
-                            ErrorKind::Internal,
-                        )
-                    });
-                }
-            }
-        }
+        let (done, failure) = send_each(&socket, sources, |path| Request::Move {
+            path,
+            new_parent: target.clone(),
+        })
+        .await;
         ui.busy_end();
         reload_listing(&ui);
-        let place = match target.rsplit('/').next() {
-            // Translators: a folder name in quotes, filled in as {place} in "Moved to {place}".
-            Some(name) if !name.is_empty() => gettext_f("“{name}”", &[("name", name)]),
-            _ => "Proton Drive".to_string(),
-        };
+        let place = quoted_place(&target);
         match (done, failure) {
             (0, Some((message, kind))) => {
                 toast_failure(&ui, &gettext("Couldn't move"), &message, kind)
@@ -2371,6 +2420,101 @@ pub(crate) fn run_bulk_move(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
             ),
         }
     });
+}
+
+/// Copy each of `sources` into `target` on Proton Drive, one request at a
+/// time, then report once for the lot.
+pub(crate) fn run_bulk_copy(ui: &Rc<Ui>, sources: Vec<String>, target: String) {
+    if !*ui.mounted.borrow() {
+        toast_error(
+            ui,
+            &gettext("Couldn't copy"),
+            &gettext("Proton Drive isn't connected."),
+        );
+        return;
+    }
+    let socket = ui.dirs.control_socket();
+    ui.busy_begin();
+    clear_selection(ui);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let (done, failure) = send_each(&socket, sources, |path| Request::Copy {
+            path,
+            new_parent: target.clone(),
+        })
+        .await;
+        ui.busy_end();
+        reload_listing(&ui);
+        let place = quoted_place(&target);
+        match (done, failure) {
+            (0, Some((message, kind))) => {
+                toast_failure(&ui, &gettext("Couldn't copy"), &message, kind)
+            }
+            (0, None) => {}
+            (n, Some((message, _))) => toast_error(
+                &ui,
+                // Translators: {place} is a quoted folder name or "Proton Drive".
+                &ngettext_f(
+                    "Copied {n} item to {place}, but not all",
+                    "Copied {n} items to {place}, but not all",
+                    n as u64,
+                    &[("place", &place)],
+                ),
+                &message,
+            ),
+            // Translators: {place} is a quoted folder name or "Proton Drive".
+            (1, None) => toast(&ui, &gettext_f("Copied to {place}", &[("place", &place)])),
+            (n, None) => toast(
+                &ui,
+                // Translators: {place} is a quoted folder name or "Proton Drive".
+                &ngettext_f(
+                    "Copied {n} item to {place}",
+                    "Copied {n} items to {place}",
+                    n as u64,
+                    &[("place", &place)],
+                ),
+            ),
+        }
+    });
+}
+
+/// Send one request per source, in order, and count how many succeeded. The
+/// first failure is kept for the report.
+async fn send_each(
+    socket: &Path,
+    sources: Vec<String>,
+    request: impl Fn(String) -> Request,
+) -> (usize, Option<(String, ErrorKind)>) {
+    let mut done = 0usize;
+    let mut failure: Option<(String, ErrorKind)> = None;
+    for path in sources {
+        let rx = spawn_request(socket.to_path_buf(), request(path));
+        match rx.recv().await {
+            Ok(Ok(Response::Ok { .. })) => done += 1,
+            Ok(Ok(Response::Error { message, kind })) => {
+                failure.get_or_insert((message, kind));
+            }
+            _ => {
+                failure.get_or_insert_with(|| {
+                    (
+                        gettext("The Proton Drive service didn't respond."),
+                        ErrorKind::Internal,
+                    )
+                });
+            }
+        }
+    }
+    (done, failure)
+}
+
+/// The destination folder for a report: its name in quotes, or "Proton Drive"
+/// for My files.
+fn quoted_place(target: &str) -> String {
+    match target.rsplit('/').next() {
+        // Translators: a folder name in quotes, filled in as {place} in "Moved to {place}".
+        Some(name) if !name.is_empty() => gettext_f("“{name}”", &[("name", name)]),
+        _ => "Proton Drive".to_string(),
+    }
 }
 
 /// Move one entry to Trash, through the batch path so it gets the same Undo.
@@ -2978,8 +3122,8 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoveTarget, badge_for, hit_location, listing_summary, move_target_allowed,
-        show_thumbnail_build_progress, sort_entries,
+        MoveTarget, badge_for, copy_target_allowed, hit_location, listing_summary,
+        move_target_allowed, show_thumbnail_build_progress, sort_entries,
     };
     use pdfs_core::config::{FileSort, FilesView};
     use pdfs_core::control::{DirEntry, SyncIssue, ThumbnailBuildStatus};
@@ -3065,6 +3209,16 @@ mod tests {
         assert!(move_target_allowed(&sources, "Docs/Workshop"));
         let mixed = ["a.txt".to_string(), "Docs/b.txt".to_string()];
         assert!(move_target_allowed(&mixed, ""));
+    }
+
+    #[test]
+    fn copy_refuses_its_own_subtree_but_not_the_folder_it_is_in() {
+        let sources = ["Docs/Work".to_string()];
+        assert!(!copy_target_allowed(&sources, "Docs/Work"));
+        assert!(!copy_target_allowed(&sources, "Docs/Work/Old"));
+        assert!(copy_target_allowed(&sources, "Docs"));
+        assert!(copy_target_allowed(&sources, ""));
+        assert!(copy_target_allowed(&sources, "Docs/Workshop"));
     }
 
     #[test]

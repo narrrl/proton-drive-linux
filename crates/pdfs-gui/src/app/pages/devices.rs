@@ -629,9 +629,17 @@ pub(crate) fn sync_state_label(state: &str) -> String {
 /// — so both read "12 of 40" rather than a percentage that could go backwards.
 pub(crate) fn sync_progress_label(p: &SyncProgress) -> String {
     match p.phase {
-        // Before the first pass finishes there is no estimate, so the count would
-        // be "checked 12 of 12" — worse than saying nothing.
-        SyncPhase::Scanning if p.total == 0 => gettext("checking for changes…"),
+        SyncPhase::Scanning if p.total == 0 && p.done == 0 => gettext("checking for changes…"),
+        // Before the first pass finishes there is no estimate, so "12 of 12" would
+        // say nothing. The count alone still shows a first scan of a large folder
+        // moving, which can take many minutes before anything downloads.
+        // Translators: {n} counts the folders and files checked so far.
+        SyncPhase::Scanning if p.total == 0 => ngettext_f(
+            "checking for changes — {n} item checked",
+            "checking for changes — {n} items checked",
+            p.done as u64,
+            &[],
+        ),
         // Translators: {done} and {total} count folders and files checked so far.
         SyncPhase::Scanning => gettext_f(
             "checking for changes — {done} of {total}",
@@ -1293,6 +1301,37 @@ mod tests {
         assert_eq!(
             this_computer_subtitle(&[folder("conflict"), folder("error")]),
             "2 folders backed up · 2 need attention"
+        );
+    }
+
+    fn scanning(done: usize, total: usize) -> SyncProgress {
+        SyncProgress {
+            phase: SyncPhase::Scanning,
+            done,
+            total,
+            current: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_first_scan_counts_what_it_checked() {
+        // A first sync of a large folder scans for many minutes before anything
+        // downloads; without a count it reads as stuck (#46).
+        assert_eq!(
+            sync_progress_label(&scanning(0, 0)),
+            "checking for changes…"
+        );
+        assert_eq!(
+            sync_progress_label(&scanning(1, 0)),
+            "checking for changes — 1 item checked"
+        );
+        assert_eq!(
+            sync_progress_label(&scanning(1234, 0)),
+            "checking for changes — 1234 items checked"
+        );
+        assert_eq!(
+            sync_progress_label(&scanning(12, 40)),
+            "checking for changes — 12 of 40"
         );
     }
 

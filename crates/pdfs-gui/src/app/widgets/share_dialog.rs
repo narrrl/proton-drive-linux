@@ -51,6 +51,48 @@ pub(crate) fn link_expiry_at(idx: u32, now: i64) -> Option<i64> {
         .map(|days| now + days * 86_400)
 }
 
+/// The labels of the Expires dropdown on an existing link. When the link has
+/// an expiry, the first entry is that expiry, so the dropdown shows what is
+/// set and choosing it again changes nothing.
+pub(crate) fn link_expiry_choices(current: Option<i64>, now: i64) -> Vec<String> {
+    let current = current.map(|at| capitalize(&link_expiry_label(at, now)));
+    current
+        .into_iter()
+        .chain(LINK_EXPIRY.iter().map(|(name, _)| gettext(name)))
+        .collect()
+}
+
+/// What choosing entry `idx` of [`link_expiry_choices`] does to the expiry.
+pub(crate) fn link_expiry_change(idx: u32, current: Option<i64>, now: i64) -> LinkChange<i64> {
+    let idx = match (current, idx) {
+        (Some(_), 0) => return LinkChange::Keep,
+        (Some(_), idx) => idx - 1,
+        (None, idx) => idx,
+    };
+    match link_expiry_at(idx, now) {
+        Some(at) => LinkChange::Set(at),
+        None if current.is_some() => LinkChange::Remove,
+        None => LinkChange::Keep,
+    }
+}
+
+/// A row with a title and a dropdown of `labels` as its suffix.
+fn dropdown_row(title: &str, labels: &[String], selected: u32) -> (adw::ActionRow, gtk4::DropDown) {
+    let drop = gtk4::DropDown::builder()
+        .model(&string_list(labels))
+        .selected(selected)
+        .valign(gtk4::Align::Center)
+        .build();
+    let row = adw::ActionRow::builder().title(title).build();
+    row.add_suffix(&drop);
+    (row, drop)
+}
+
+/// The roles a public link can grant, in dropdown order.
+fn link_roles() -> [String; 2] {
+    [pgettext("role", "Viewer"), pgettext("role", "Editor")]
+}
+
 /// A loose shape check for an email address: one `@` with something before
 /// it and a dotted domain after it. The server does the real validation; this
 /// only catches typos before the Invite button is pressed.
@@ -230,6 +272,31 @@ impl ShareTarget {
             },
             ShareTarget::Uid(uid) => Request::CreatePublicLinkByUid {
                 uid: uid.clone(),
+                role,
+                password,
+                expires,
+            },
+        }
+    }
+
+    fn update_link(
+        &self,
+        id: String,
+        role: Option<String>,
+        password: LinkChange<String>,
+        expires: LinkChange<i64>,
+    ) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::UpdatePublicLink {
+                path: path.clone(),
+                id,
+                role,
+                password,
+                expires,
+            },
+            ShareTarget::Uid(uid) => Request::UpdatePublicLinkByUid {
+                uid: uid.clone(),
+                id,
                 role,
                 password,
                 expires,
@@ -585,8 +652,8 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
     *state.people_rows.borrow_mut() = rows;
 }
 
-/// Rebuild the public-link section: an existing link (copy / remove) or a
-/// create control.
+/// Rebuild the public-link section: an existing link (copy / remove, and its
+/// settings) or a create control.
 pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLinkInfo>) {
     for row in state.link_rows.borrow_mut().drain(..) {
         state.link_group.remove(&row);
@@ -670,30 +737,19 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
 
             state.link_group.add(&row);
             rows.push(row.upcast());
+
+            let settings = link_settings_row(state, link);
+            state.link_group.add(&settings);
+            rows.push(settings.upcast());
         }
         None => {
-            let role_model = string_list(&[pgettext("role", "Viewer"), pgettext("role", "Editor")]);
-            let role_drop = gtk4::DropDown::builder()
-                .model(&role_model)
-                .selected(0)
-                .valign(gtk4::Align::Center)
-                .build();
-            let role_row = adw::ActionRow::builder()
-                .title(gettext("Link role"))
-                .build();
-            role_row.add_suffix(&role_drop);
+            let (role_row, role_drop) = dropdown_row(&gettext("Link role"), &link_roles(), 0);
             let pw_row = adw::PasswordEntryRow::builder()
                 .title(gettext("Password (optional)"))
                 .build();
             let expiry_names: Vec<String> =
                 LINK_EXPIRY.iter().map(|(name, _)| gettext(name)).collect();
-            let expiry_drop = gtk4::DropDown::builder()
-                .model(&string_list(&expiry_names))
-                .selected(0)
-                .valign(gtk4::Align::Center)
-                .build();
-            let expiry_row = adw::ActionRow::builder().title(gettext("Expires")).build();
-            expiry_row.add_suffix(&expiry_drop);
+            let (expiry_row, expiry_drop) = dropdown_row(&gettext("Expires"), &expiry_names, 0);
             let create = group_button(&gettext("Create Public Link"));
 
             // Enter in the password field creates the link.
@@ -732,6 +788,142 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
         }
     }
     *state.link_rows.borrow_mut() = rows;
+}
+
+/// The settings of an existing link, collapsed under one row. Each control
+/// applies at once, the way a member's role does. While a change is on its way
+/// the whole row is insensitive: the daemon fills in what a change keeps from
+/// the link as it stands, so two changes in flight could undo each other.
+fn link_settings_row(state: &Rc<ShareDialog>, link: &PublicLinkInfo) -> adw::ExpanderRow {
+    let now = glib::real_time() / 1_000_000;
+    let expander = adw::ExpanderRow::builder()
+        .title(gettext("Link settings"))
+        .subtitle(gettext(
+            "Change who can edit, the password or the expiry. The link stays the same.",
+        ))
+        .build();
+
+    let selected_role = u32::from(link.role == "editor");
+    let (role_row, role_drop) = dropdown_row(&gettext("Link role"), &link_roles(), selected_role);
+    let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
+    role_drop.connect_selected_notify(move |d| {
+        let Some(state) = state_w.upgrade() else {
+            return;
+        };
+        let role = if d.selected() == 1 {
+            "editor"
+        } else {
+            "viewer"
+        };
+        let request = state.target.update_link(
+            id.clone(),
+            Some(role.into()),
+            LinkChange::Keep,
+            LinkChange::Keep,
+        );
+        share_dialog_update_link(&state, request, &expander_w);
+    });
+    expander.add_row(&role_row);
+
+    let current = link.expires;
+    let (expiry_row, expiry_drop) =
+        dropdown_row(&gettext("Expires"), &link_expiry_choices(current, now), 0);
+    let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
+    expiry_drop.connect_selected_notify(move |d| {
+        let Some(state) = state_w.upgrade() else {
+            return;
+        };
+        let expires = link_expiry_change(d.selected(), current, glib::real_time() / 1_000_000);
+        if expires == LinkChange::Keep {
+            return;
+        }
+        let request = state
+            .target
+            .update_link(id.clone(), None, LinkChange::Keep, expires);
+        share_dialog_update_link(&state, request, &expander_w);
+    });
+    expander.add_row(&expiry_row);
+
+    let pw_row = adw::PasswordEntryRow::builder()
+        .title(if link.has_password {
+            gettext("New password")
+        } else {
+            gettext("Add a password")
+        })
+        .show_apply_button(true)
+        .build();
+    let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
+    pw_row.connect_apply(move |row| {
+        let Some(state) = state_w.upgrade() else {
+            return;
+        };
+        let password = row.text().to_string();
+        if password.is_empty() {
+            return;
+        }
+        let request = state.target.update_link(
+            id.clone(),
+            None,
+            LinkChange::Set(password),
+            LinkChange::Keep,
+        );
+        share_dialog_update_link(&state, request, &expander_w);
+    });
+    expander.add_row(&pw_row);
+
+    if link.has_password {
+        let remove = gtk4::Button::builder()
+            .label(gettext("Remove"))
+            .valign(gtk4::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        let row = adw::ActionRow::builder()
+            .title(gettext("Remove the password"))
+            .subtitle(gettext(
+                "Anyone with the link can open it without a password.",
+            ))
+            .build();
+        row.add_suffix(&remove);
+        let (state_w, expander_w, id) = (Rc::downgrade(state), expander.clone(), link.id.clone());
+        remove.connect_clicked(move |_| {
+            let Some(state) = state_w.upgrade() else {
+                return;
+            };
+            let request =
+                state
+                    .target
+                    .update_link(id.clone(), None, LinkChange::Remove, LinkChange::Keep);
+            share_dialog_update_link(&state, request, &expander_w);
+        });
+        expander.add_row(&row);
+    }
+    expander
+}
+
+/// Send a link change, then reload the dialog: on success to show the link as
+/// it now is, on failure to put the controls back to what the link still is.
+fn share_dialog_update_link(
+    state: &Rc<ShareDialog>,
+    request: Request,
+    settings: &adw::ExpanderRow,
+) {
+    settings.set_sensitive(false);
+    let rx = spawn_request(state.ui.dirs.control_socket(), request);
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::PublicLink { .. })) => toast(&state.ui, &gettext("Link updated")),
+            Ok(Ok(Response::Error { message, .. })) => {
+                toast_error(&state.ui, &gettext("Couldn't change the link"), &message)
+            }
+            _ => toast_error(
+                &state.ui,
+                &gettext("Couldn't change the link"),
+                &gettext("The Proton Drive service didn't respond."),
+            ),
+        }
+        share_dialog_reload(&state);
+    });
 }
 
 /// Create a public link, then reload the dialog so the copy/remove controls
@@ -861,6 +1053,28 @@ mod tests {
         assert_eq!(link_expiry_at(1, 1_000), Some(1_000 + 86_400));
         assert_eq!(link_expiry_at(3, 0), Some(30 * 86_400));
         assert_eq!(link_expiry_at(99, 0), None);
+    }
+
+    #[test]
+    fn choosing_an_expiry_keeps_removes_or_sets_it() {
+        let now = 1_000;
+        // No expiry yet: the choices are just Never and the lifetimes.
+        assert_eq!(link_expiry_choices(None, now).len(), LINK_EXPIRY.len());
+        assert_eq!(link_expiry_change(0, None, now), LinkChange::Keep);
+        assert_eq!(
+            link_expiry_change(2, None, now),
+            LinkChange::Set(now + 7 * 86_400)
+        );
+
+        // An expiry set: it comes first, then Never and the lifetimes.
+        let at = Some(2_000_000_000);
+        assert_eq!(link_expiry_choices(at, now).len(), LINK_EXPIRY.len() + 1);
+        assert_eq!(link_expiry_change(0, at, now), LinkChange::Keep);
+        assert_eq!(link_expiry_change(1, at, now), LinkChange::Remove);
+        assert_eq!(
+            link_expiry_change(2, at, now),
+            LinkChange::Set(now + 86_400)
+        );
     }
 
     #[test]

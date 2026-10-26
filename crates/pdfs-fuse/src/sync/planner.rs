@@ -192,7 +192,8 @@ pub(super) fn guard_local_wipe<B, L>(
     if !baseline.is_empty() && baseline.keys().all(|rel| !local.contains_key(rel)) {
         return Err(format!(
             "every one of the {} synced paths is missing locally; refusing to trash \
-             them on Drive. Check that the folder is mounted and readable.",
+             them on Drive. Check that the folder is mounted and readable; to download \
+             them again, sync the folder from scratch.",
             baseline.len()
         ));
     }
@@ -213,7 +214,8 @@ pub(super) fn guard_remote_wipe<B, R>(
     if !baseline.is_empty() && baseline.keys().all(|rel| !remote.contains_key(rel)) {
         return Err(format!(
             "every one of the {} synced paths is missing on Proton Drive; refusing to \
-             delete them here. If they were deleted on purpose, remove the folder from sync.",
+             delete them here. If they were deleted on purpose, remove the folder from sync; \
+             to upload them again, sync the folder from scratch.",
             baseline.len()
         ));
     }

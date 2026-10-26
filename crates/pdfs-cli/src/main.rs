@@ -13,7 +13,7 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ConflictKeep, ErrorKind, MountKind, RefreshScope, Request as CtlRequest,
+    ConflictKeep, ErrorKind, LinkChange, MountKind, RefreshScope, Request as CtlRequest,
     Response as CtlResponse, RestoreItem as CtlRestoreItem, ShareEntryKind, SyncIssue, SyncPhase,
     daemon_outdated, pending_summary,
 };
@@ -356,6 +356,26 @@ enum Command {
         #[arg(required = true, num_args = 2.., value_name = "PATH")]
         paths: Vec<PathBuf>,
     },
+    /// Copy files or folders into another folder in My files via the running
+    /// daemon.
+    ///
+    /// The copy happens on Proton Drive, so nothing is downloaded or uploaded,
+    /// unlike `cp` inside the mount. A name already taken in the destination
+    /// gets a " (1)" suffix. The last path is the destination folder.
+    Copy {
+        /// Files/folders to copy, then the destination folder: inside My files,
+        /// or relative to the mountpoint.
+        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
+    /// Show how much a folder holds on Proton Drive.
+    ///
+    /// Proton Drive adds it up, so nothing is downloaded. The size is the
+    /// encrypted bytes on storage and includes items in the trash.
+    Du {
+        /// Folder path, inside My files or relative to the mountpoint.
+        path: PathBuf,
+    },
     /// Trash a file or folder via the running daemon.
     Rm {
         /// File/folder path, inside My files or an on-demand synced folder, or
@@ -689,6 +709,13 @@ enum SyncCmd {
         /// Optional synced-folder id; omit to reconcile every folder.
         id: Option<i64>,
     },
+    /// Forget what a synced folder synced before and compare it with Proton
+    /// Drive afresh: what one side has alone is copied to the other, and a file
+    /// that differs keeps both versions. Nothing is deleted.
+    Reset {
+        /// Synced-folder id (from `sync list`).
+        id: i64,
+    },
     /// Pause syncing: queued uploads and mirror folders wait, reads keep working.
     Pause {
         /// End the pause by itself after this long, e.g. `30m`, `1h`, `2d`.
@@ -776,6 +803,29 @@ enum PublicLinkCmd {
         /// Optional expiry, Unix epoch seconds.
         #[arg(long)]
         expires: Option<i64>,
+    },
+    /// Change a node's public link. The URL stays the same; an option not
+    /// given is kept.
+    Update {
+        /// File/folder path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Public-link id, from `pdfs members`.
+        id: String,
+        /// New role: viewer or editor.
+        #[arg(long)]
+        role: Option<String>,
+        /// New custom password protecting the link.
+        #[arg(long, conflicts_with = "no_password")]
+        password: Option<String>,
+        /// Remove the custom password.
+        #[arg(long)]
+        no_password: bool,
+        /// New expiry, Unix epoch seconds.
+        #[arg(long, conflicts_with = "no_expiry")]
+        expires: Option<i64>,
+        /// Remove the expiry.
+        #[arg(long)]
+        no_expiry: bool,
     },
     /// Remove a node's public link.
     Remove {
@@ -919,6 +969,11 @@ fn main() -> Result<()> {
             let new_parent = paths.pop().expect("clap requires at least two paths");
             cmd_move(paths, new_parent)
         }
+        Command::Copy { mut paths } => {
+            let new_parent = paths.pop().expect("clap requires at least two paths");
+            cmd_copy(paths, new_parent)
+        }
+        Command::Du { path } => cmd_du(path),
         Command::Rm { path } => cmd_rm(path),
         Command::Mkdir { parent, name } => cmd_mkdir(parent, name),
         Command::Upload { sources, parent } => cmd_upload(sources, parent),
@@ -1088,7 +1143,14 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                         // A pass in flight says what it is doing, indented under it.
                         if let Some(p) = &f.progress {
                             match p.phase {
-                                SyncPhase::Scanning if p.total == 0 => println!("      scanning…"),
+                                SyncPhase::Scanning if p.total == 0 && p.done == 0 => {
+                                    println!("      scanning…")
+                                }
+                                // A first pass has no estimate yet; the count alone
+                                // shows a long first scan is moving.
+                                SyncPhase::Scanning if p.total == 0 => {
+                                    println!("      scanning: {} checked", p.done)
+                                }
                                 SyncPhase::Scanning => {
                                     println!(
                                         "      scanning: {} of {}",
@@ -1117,6 +1179,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
             })?)?
         }
         SyncCmd::Now { id } => ok_or_bail(control_request(CtlRequest::SyncNow { id })?)?,
+        SyncCmd::Reset { id } => ok_or_bail(control_request(CtlRequest::ResetSyncFolder { id })?)?,
         SyncCmd::Pause {
             folder: Some(id), ..
         } => ok_or_bail(control_request(CtlRequest::SetSyncFolderPaused {
@@ -1512,7 +1575,11 @@ fn cmd_members(path: PathBuf) -> Result<()> {
                 Some(l) => {
                     let url = l.url.as_deref().unwrap_or("(url hidden)");
                     let pw = if l.has_password { " +password" } else { "" };
-                    println!("public link ({}{pw}): {url}  [{}]", l.role, l.id);
+                    let expiry = l
+                        .expires
+                        .map(|at| format!(", expires {}", format_epoch_utc(at)))
+                        .unwrap_or_default();
+                    println!("public link ({}{pw}{expiry}): {url}  [{}]", l.role, l.id);
                 }
                 None => println!("public link: none"),
             }
@@ -1564,6 +1631,27 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         },
+        PublicLinkCmd::Update {
+            path,
+            id,
+            role,
+            password,
+            no_password,
+            expires,
+            no_expiry,
+        } => match control_request(CtlRequest::UpdatePublicLink {
+            path: path_arg(&path)?,
+            id,
+            role,
+            password: link_change(password, no_password),
+            expires: link_change(expires, no_expiry),
+        })? {
+            CtlResponse::PublicLink { link } => {
+                println!("{}", link.url.as_deref().unwrap_or("(no url returned)"));
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        },
         PublicLinkCmd::Remove { path, id } => {
             ok_or_bail(control_request(CtlRequest::RemovePublicLink {
                 path: path_arg(&path)?,
@@ -1572,6 +1660,15 @@ fn cmd_public_link(action: PublicLinkCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A `--x VALUE` / `--no-x` flag pair as one link option change.
+fn link_change<T>(value: Option<T>, remove: bool) -> LinkChange<T> {
+    match (value, remove) {
+        (Some(value), _) => LinkChange::Set(value),
+        (None, true) => LinkChange::Remove,
+        (None, false) => LinkChange::Keep,
+    }
 }
 
 fn cmd_shared() -> Result<()> {
@@ -1765,6 +1862,7 @@ fn activity_verb(kind: pdfs_core::control::ActivityKind) -> &'static str {
         Sync => "sync",
         Rename => "rename",
         Move => "move",
+        Copy => "copy",
         CreateFolder => "mkdir",
         Trash => "trash",
         Restore => "restore",
@@ -2920,6 +3018,52 @@ fn cmd_move(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn cmd_copy(sources: Vec<PathBuf>, new_parent: PathBuf) -> Result<()> {
+    let new_parent = path_arg(&new_parent)?;
+    let mut failed = 0;
+    for source in &sources {
+        let outcome = path_arg(source).and_then(|path| {
+            match control_request(CtlRequest::Copy {
+                path,
+                new_parent: new_parent.clone(),
+            })? {
+                CtlResponse::Ok { message } => Ok(message),
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        });
+        match outcome {
+            Ok(message) => println!("{message}"),
+            Err(e) if sources.len() == 1 => return Err(e),
+            Err(e) => {
+                eprintln!("{}: {e:#}", source.display());
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} could not be copied", sources.len());
+    }
+    Ok(())
+}
+
+fn cmd_du(path: PathBuf) -> Result<()> {
+    match control_request(CtlRequest::FolderSize {
+        path: path_arg(&path)?,
+    })? {
+        CtlResponse::FolderSize { size, items } => {
+            let noun = if items == 1 { "item" } else { "items" };
+            println!(
+                "{} in {items} {noun} (on Proton Drive, trash included)",
+                human_bytes(size)
+            );
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
 fn cmd_rm(path: PathBuf) -> Result<()> {
     match control_request(CtlRequest::Delete {
         path: path_arg(&path)?,
@@ -3954,6 +4098,13 @@ mod login_wait_tests {
         let mut slept = 0;
         wait_for_session(|| Ok(()), |_| slept += 1).unwrap();
         assert_eq!(slept, 0);
+    }
+
+    #[test]
+    fn a_link_flag_pair_keeps_removes_or_sets() {
+        assert_eq!(link_change::<i64>(None, false), LinkChange::Keep);
+        assert_eq!(link_change::<i64>(None, true), LinkChange::Remove);
+        assert_eq!(link_change(Some(5), false), LinkChange::Set(5));
     }
 
     #[test]

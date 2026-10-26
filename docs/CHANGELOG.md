@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.6.0] — 2026-10-26
+
+Schema: **44**, unchanged.
+
 ### Added
 - **`pdfs diagnose` names the key that keeps My Files closed.** When you are signed in and the
   service does not answer, a new **Keys** section asks Proton which account and address keys
@@ -23,8 +27,30 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   the app asks GitHub once a day and shows a banner with a **Download** button when a newer
   version is out. It is off by default, and not offered for packages that a package manager
   updates (COPR, the AUR, Nix) (#42).
+- **Copy files and folders on Proton Drive**, without downloading or uploading them. In My files,
+  right-click an item and choose **Make a Copy** to copy it next to itself, or **Copy To…** to pick
+  another folder; **Copy To…** also works on a selection. From a terminal:
+  `pdfs copy ~/ProtonDrive/report.pdf ~/ProtonDrive/Archive`. A folder is copied with everything
+  in it, and a name already taken gets a " (1)" suffix. A file or folder with changes that have
+  not synced yet is refused until they have.
+- **Change a public link without getting a new one.** In **Share…**, open **Link settings** under
+  the link to switch between Viewer and Editor, set, change or remove the password, and change or
+  remove the expiry. The address stays the same, so people who already have the link keep it.
+  From a terminal: `pdfs public-link update PATH ID [--role] [--password | --no-password]
+  [--expires EPOCH | --no-expiry]`. `pdfs members` now also shows when a link expires.
+- **Folder sizes.** **Details** shows how much a folder holds and how many items are in it, as
+  Proton Drive counts it, including items in the trash. From a terminal: `pdfs du PATH`.
+
+- **Sync a folder from scratch.** In a synced folder's menu on **Sync → Folders**, **Sync From
+  Scratch…** forgets what was synced before and compares the folder with Proton Drive again. A
+  file on one side only is copied to the other, and a file that differs keeps both versions.
+  Nothing is deleted. From the terminal: `pdfs sync reset ID`.
 
 ### Changed
+- **Copying a file inside the mount is faster** when the computer already has the file, for
+  example with `cp` or a file manager: the copy is made on this computer, about four times
+  faster for a 256 MiB file, instead of going through the mount page by page. A file that is
+  only on Proton Drive is copied as before. The copy is then uploaded as usual.
 - **Reorganised documentation, now also on the
   [wiki](https://github.com/narrrl/proton-drive-linux/wiki).** A new
   [Getting started](https://github.com/narrrl/proton-drive-linux/wiki/Getting-Started) page and
@@ -32,6 +58,24 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   pages for files, synced folders, Photos, sharing, computers, and the launcher and tray.
   Installation puts the COPR repository first for Fedora and explains updating and uninstalling
   for each kind of package. Each release publishes `docs/` to the wiki.
+
+### Fixed
+
+- **A synced folder whose files were all gone from this computer no longer gets stuck** (#46).
+  The sync still refuses to delete everything on Proton Drive, but a switch to online only now
+  goes ahead and shows what Proton Drive has, instead of waiting for good. To download the
+  files again instead, sync the folder from scratch. Restoring folders also logs why it
+  skipped a folder.
+
+- **The first sync of a folder shows how far its scan got** (#46). Before anything downloads,
+  the first pass reads every item on Proton Drive, which takes many minutes for a large folder.
+  The folder showed only "checking for changes…" all that time, and `pdfs sync list` only
+  `scanning…`, which looked stuck. Both now count the items checked so far.
+
+- **Saved public links show the name of what they point at**, in the app and in `pdfs bookmarks`,
+  instead of "Shared link". For a link with a custom password, the address no longer has the custom
+  password stuck to its end, so it matches the link the web shows and the page asks for the
+  password.
 
 ## [3.5.0] — 2026-10-16
 

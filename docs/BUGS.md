@@ -100,6 +100,8 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
+| [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
 | [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
@@ -356,6 +358,60 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B256 — `pdfs copy` right after a save copies the old version
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-26, the simulation `a_pdfs_copy_copies_on_drive_and_waits_for_unsynced_changes`
+failing on most runs. The feature was not released yet.
+**Where:** `release` in `crates/pdfs-fuse/src/filesystem.rs`; `copy_to` in
+`crates/pdfs-fuse/src/lib.rs`; `has_pending_work_under` in `crates/pdfs-fuse/src/relocate.rs`
+
+**Repro:** Save a file in the mount and copy it, or its folder, with `pdfs copy` straight away.
+The copy goes ahead and Drive copies the version before the save.
+
+**Cause.** `close(2)` returns before the kernel sends `release`. `release` takes the write handle
+out of the open writes and then queues the revision, which takes a few milliseconds. A copy
+checked in between found the edit in neither place. A folder copy looked only at the queue, so
+it also missed a file still open with unsaved writes.
+
+**Fix.** `release` keeps the inode in `State::releasing` until the revision is queued. A copy
+refuses a file or folder with unsaved writes, or a release still queueing, at it or below it.
+A move checks the same set.
+
+**Test:** The simulation above passed 6 of 6 runs after the fix.
+
+---
+
+### B255 — A synced folder whose files are all gone here is stuck for good
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-26, issue #46: a folder restored from another computer never downloaded.
+**Where:** `push_pass` in `crates/pdfs-fuse/src/sync.rs`; `reset_sync_folder` in
+`crates/pdfs-fuse/src/devices.rs`
+
+**Repro:** Sync a folder in mirror mode, then delete all of its files on this computer while
+the folder is paused. Resume it. Every pass stops with `every one of the N synced paths is
+missing locally`, the folder stays in error, and a switch to online only waits for good.
+
+**Cause.** The wipe guard is right to stop a pass that would trash the whole folder on Drive.
+But nothing got the folder out of that state. A switch to on-demand waits for a pass that ends
+`idle`, and its push pass hit the same guard. The baseline that made the empty folder read as
+"delete everything" could only be cleared by removing the folder from sync. How the reporter's
+folder lost its files is not known yet.
+
+**Fix.** The push pass for a switch to on-demand forgets the baseline rows of a local copy that
+is gone in full, instead of trashing them on Drive, so the switch goes ahead and the mount shows
+what Drive has. **Sync From Scratch…** in the app and `pdfs sync reset ID` clear a mirror
+folder's baseline, so the next pass compares both sides as on the first sync: one-sided files
+are copied across, files that differ keep both versions, and nothing is deleted. Restore now
+logs why it skipped a folder.
+
+**Test:** The simulations `a_folder_whose_local_copy_is_gone_still_goes_on_demand` (which
+failed in exactly the reported state before the fix) and
+`a_folder_whose_local_copy_is_gone_downloads_again_after_a_reset`.
+
+---
 
 ### B254 — An edit in the same second as a new upload never arrives
 
@@ -5876,6 +5932,13 @@ byte for byte:
 Only the three namespace ops were strictly required (the other four silence
 themselves once the kernel caches `ENOSYS`), but implementing all seven keeps the
 refusal explicit and documented at the call site rather than inherited.
+
+`copy_file_range` has since been implemented: the daemon copies a range whose bytes are on this
+machine (an open write handle, a queued write, the cache) into the destination's scratch file,
+and answers `EOPNOTSUPP` for anything it would have to download. Unlike `ENOSYS`, that errno makes
+the kernel copy that one call through read and write and keeps asking the daemon next time.
+A warm `cp` of a 256 MiB file inside the mount went from about 100 MiB/s to about 450 MiB/s
+(sim, debug build; `a_copy_inside_the_mount_measures_its_speed`).
 
 **Verified:** full live acceptance run after the fix — 19 pass / 1 skip, the
 capability diff identical to the pre-fix run, and **0** `Not Implemented` lines

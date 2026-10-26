@@ -368,12 +368,19 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     } else {
         gettext("File")
     });
-    d.size_row.set_subtitle(&if entry.is_dir {
-        "—".to_string()
+    // A folder's size is Proton Drive's count, which takes a request; it lands
+    // in `load_details_extras`.
+    if entry.is_dir {
+        d.size_row.set_title(&gettext("Size on Proton Drive"));
+        d.size_row.set_subtitle("—");
+        d.size_row.set_tooltip_text(Some(&gettext(
+            "Counted by Proton Drive, including items in the trash.",
+        )));
     } else {
-        human_bytes(entry.size)
-    });
-    d.size_row.set_visible(!entry.is_dir);
+        d.size_row.set_title(&pgettext("column", "Size"));
+        d.size_row.set_subtitle(&human_bytes(entry.size));
+        d.size_row.set_tooltip_text(None);
+    }
     d.modified_row
         .set_subtitle(&dates::short_date(entry.modified));
     let rel = entry_rel(ui, entry);
@@ -426,8 +433,8 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     d.pages.set_visible_child_name("details");
 }
 
-/// Fill the Sharing and Versions rows, which need the network. The answers
-/// land only if the pane still shows the same entry.
+/// Fill the Sharing and Versions rows, and a folder's size, which need the
+/// network. The answers land only if the pane still shows the same entry.
 fn load_details_extras(ui: &Rc<Ui>, entry: &DirEntry) {
     let by_uid = entry.path.is_empty() && !entry.uid.is_empty();
     let rel = entry_rel(ui, entry);
@@ -453,6 +460,24 @@ fn load_details_extras(ui: &Rc<Ui>, entry: &DirEntry) {
     });
 
     if entry.is_dir {
+        let req = if by_uid {
+            Request::FolderSizeByUid {
+                uid: entry.uid.clone(),
+            }
+        } else {
+            Request::FolderSize { path: rel }
+        };
+        let rx = spawn_request(ui.dirs.control_socket(), req);
+        let (ui_c, uid) = (ui.clone(), entry.uid.clone());
+        glib::spawn_future_local(async move {
+            let text = match rx.recv().await {
+                Ok(Ok(Response::FolderSize { size, items })) => folder_size_summary(size, items),
+                _ => gettext("Couldn't load the size"),
+            };
+            if details_showing(&ui_c, &uid) {
+                ui_c.details.details.size_row.set_subtitle(&text);
+            }
+        });
         return;
     }
     let req = if by_uid {
@@ -497,6 +522,18 @@ pub(crate) fn sharing_summary(people: usize, link: bool) -> String {
             &[],
         ),
     }
+}
+
+/// "1.2 GiB · 340 items": what a folder holds, as Proton Drive counts it.
+pub(crate) fn folder_size_summary(size: u64, items: u64) -> String {
+    // Translators: {size} is a size such as "1.2 GiB"; {n} counts the files
+    // and folders inside a folder.
+    ngettext_f(
+        "{size} · {n} item",
+        "{size} · {n} items",
+        items,
+        &[("size", &human_bytes(size))],
+    )
 }
 
 /// "3 versions · latest 2 Sep 2026".
@@ -546,6 +583,12 @@ pub(crate) fn selected_entry(ui: &Rc<Ui>) -> Option<DirEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_size_summary_reads_size_and_item_count() {
+        assert_eq!(folder_size_summary(0, 0), "0 bytes · 0 items");
+        assert_eq!(folder_size_summary(2048, 1), "2.0 KiB · 1 item");
+    }
 
     #[test]
     fn sharing_summary_names_people_and_link() {

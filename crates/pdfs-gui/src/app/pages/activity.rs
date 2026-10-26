@@ -1043,6 +1043,7 @@ pub(crate) fn activity_icon(kind: ActivityKind) -> &'static str {
         ActivityKind::Sync => "pdfs-sync-symbolic",
         ActivityKind::Rename => "document-edit-symbolic",
         ActivityKind::Move => "go-jump-symbolic",
+        ActivityKind::Copy => "edit-copy-symbolic",
         ActivityKind::CreateFolder => "folder-new-symbolic",
         ActivityKind::Trash => "user-trash-symbolic",
         ActivityKind::DeleteForever | ActivityKind::EmptyTrash => "edit-delete-symbolic",

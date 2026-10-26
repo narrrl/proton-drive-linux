@@ -76,6 +76,14 @@ again when they move into a synced one.
 Proton Drive. To delete the copy on Proton Drive as well, tick **Also delete from Proton Drive**,
 or add `--delete-remote`.
 
+## Sync a folder from scratch
+
+**Sync From Scratch…** in the folder's menu, or `pdfs sync reset ID`, makes this computer forget
+what it synced in the folder before and compare it with Proton Drive again, as on the first sync.
+A file on one side only is copied to the other, and a file that differs keeps both versions.
+Nothing is deleted. Use it when a folder's files went missing on this computer and the sync
+refuses to go on (see [Troubleshooting](TROUBLESHOOTING.md#a-synced-folder-stays-in-error-and-nothing-downloads)).
+
 ## Excluding files with `.pdfsignore`
 
 Synced folders skip build output, dependency folders and editor leftovers. Two sets of rules

@@ -133,7 +133,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Whether inode `ino` is `root` or lies under it in the tree. Bounded, so a
 /// parent cycle in corrupt data cannot hang the caller.
-fn ino_is_under(st: &State, mut ino: u64, root: u64) -> bool {
+pub(crate) fn ino_is_under(st: &State, mut ino: u64, root: u64) -> bool {
     for _ in 0..MAX_TREE_DEPTH {
         if ino == root {
             return true;
@@ -456,6 +456,7 @@ impl Core {
             writing = st
                 .active_writes
                 .keys()
+                .chain(&st.releasing)
                 .any(|&open| ino_is_under(st, open, ino));
         });
         Ok(writing)

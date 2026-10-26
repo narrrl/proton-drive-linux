@@ -3474,7 +3474,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pdfs-cli"
-version = "3.5.0"
+version = "3.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3490,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-core"
-version = "3.5.0"
+version = "3.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3517,7 +3517,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-fuse"
-version = "3.5.0"
+version = "3.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3539,7 +3539,7 @@ dependencies = [
 
 [[package]]
 name = "pdfs-gui"
-version = "3.5.0"
+version = "3.6.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3779,9 +3779,9 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.9.2"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "266b40b9a6d2b4176a48c230d68c6fab7203cad59abf8a44aea0153e1250185a"
+checksum = "8f70318394b2815b009c52f804d75747086db93a338ceb6eae62541f2b25d5bf"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3806,9 +3806,9 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.9.2"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e2b607b0a22dfc34d971794d619084d39fd06c49b58b23229855330c4a7cc1"
+checksum = "4196392032f56b3bbaac0bb1f24eea62fa7e2a0af72004de8d08e518d14720fb"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",

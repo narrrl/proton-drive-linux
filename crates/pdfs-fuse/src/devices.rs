@@ -1080,6 +1080,50 @@ impl Core {
         }
     }
 
+    /// Forget what a mirror folder synced before, so its next pass compares the
+    /// two sides as on the first sync: what one side has alone is copied to the
+    /// other, and a file that differs is kept twice as a conflict. Nothing is
+    /// deleted on either side.
+    ///
+    /// This is the way out for a folder whose passes refuse to run because its
+    /// whole local copy, or its whole copy on Drive, is gone (#46). The baseline
+    /// is what makes that read as "delete everything", and it is what this
+    /// drops. A queued switch to on-demand is dropped with it: the push pass
+    /// that switch runs reads an unrecorded local file as new and would upload
+    /// a second copy of every file Drive already has.
+    pub(crate) fn reset_sync_folder(&self, id: i64) -> CoreResult<String> {
+        let lock = self.sync_lock(id);
+        let Some(_guard) = lock.try_lock() else {
+            return Err(CoreError::conflict(
+                "this folder is syncing; try again when the pass ends",
+            ));
+        };
+        let folder = self
+            .db
+            .sync_folder_get(id)
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
+            .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
+        if folder.mode != "mirror" {
+            return Err(CoreError::invalid(
+                "an online-only folder keeps nothing on this computer to sync from scratch",
+            ));
+        }
+        self.db
+            .sync_entries_clear(id)
+            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+        if folder.pending_mode.as_deref() == Some("ondemand") {
+            self.db
+                .sync_folder_set_pending_mode(id, None)
+                .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+        }
+        let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
+        info!(id, path = %folder.local_path, "sync folder reset");
+        Ok(format!(
+            "{} will sync from scratch",
+            base_name(&folder.local_path)
+        ))
+    }
+
     /// Spawn a secondary FUSE session rooted at `root` over `local` from a
     /// [`Core::fork_state`] sibling. Clears any stale kernel mount first (a crashed run can leave
     /// one, which would fail the fresh mount with EBUSY).

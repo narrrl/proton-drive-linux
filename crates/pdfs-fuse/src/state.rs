@@ -266,6 +266,11 @@ pub(crate) struct State {
     pub(crate) next_ino: u64,
     /// Shared write state keyed by inode. Concurrent writers share the scratch file.
     pub(crate) active_writes: HashMap<u64, WriteHandle>,
+    /// Inodes whose last write handle `release` has taken out of
+    /// [`State::active_writes`] and is still queueing. `close(2)` returns
+    /// before that, and in between the edit is in neither the handles nor the
+    /// queue, so a check for changes not on Drive yet looks here too.
+    pub(crate) releasing: HashSet<u64>,
     /// Maps file handle id (fh) to inode (ino). Read-only opens use fh 0 and
     /// have no entry here.
     pub(crate) handles: HashMap<u64, u64>,
@@ -428,6 +433,7 @@ impl State {
             roots: HashSet::new(),
             next_ino: FALLBACK_INO,
             active_writes: HashMap::new(),
+            releasing: HashSet::new(),
             handles: HashMap::new(),
             next_fh: 1,
             dir_snapshots: HashMap::new(),

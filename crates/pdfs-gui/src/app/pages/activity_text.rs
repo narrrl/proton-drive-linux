@@ -179,6 +179,10 @@ pub(crate) fn activity_title(kind: ActivityKind, ok: bool, name: &str) -> String
         (ActivityKind::Move, true) => gettext_f("Moved {name}", &args),
         // Translators: {name} is a file or folder name.
         (ActivityKind::Move, false) => gettext_f("Couldn't move {name}", &args),
+        // Translators: {name} is a file or folder name.
+        (ActivityKind::Copy, true) => gettext_f("Copied {name}", &args),
+        // Translators: {name} is a file or folder name.
+        (ActivityKind::Copy, false) => gettext_f("Couldn't copy {name}", &args),
         // Translators: {name} is a folder name.
         (ActivityKind::CreateFolder, true) => gettext_f("Created folder {name}", &args),
         // Translators: {name} is a folder name.

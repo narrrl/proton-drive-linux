@@ -29,6 +29,17 @@ use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
 
 const MAX_CONTROL_REQUEST_BYTES: u64 = 1024 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Answer a [`CtlRequest::FolderSize`].
+fn folder_size_reply(size: CoreResult<proton_drive_rs::FolderSize>) -> CtlResponse {
+    match size {
+        Ok(size) => CtlResponse::FolderSize {
+            size: size.size,
+            items: size.descendants,
+        },
+        Err(e) => CtlResponse::error(e),
+    }
+}
+
 /// Answer a [`CtlRequest::StopSharing`]: log it, and turn a partial removal
 /// into an error that names what is still shared.
 fn stop_sharing_reply(
@@ -377,6 +388,7 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
         | R::RemoveSyncFolder { .. }
         | R::SetSyncFolderMode { .. }
         | R::SetSyncFolderPaused { .. }
+        | R::ResetSyncFolder { .. }
         | R::RestoreSyncFolders { .. }
         | R::RestoreDeviceFolders { .. } => &[Topic::Locations, Topic::Devices],
         R::RetryPendingOp { .. } => &[Topic::Queue],
@@ -392,6 +404,8 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
         | R::CreatePublicLinkByUid { .. }
         | R::RemovePublicLink { .. }
         | R::RemovePublicLinkByUid { .. }
+        | R::UpdatePublicLink { .. }
+        | R::UpdatePublicLinkByUid { .. }
         | R::StopSharing { .. }
         | R::StopSharingByUid { .. } => &[Topic::Shares, Topic::Files],
         R::LeaveShared { .. }
@@ -1063,6 +1077,36 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 (Err(e), _) | (_, Err(e)) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::Copy { path, new_parent }) => {
+            match (
+                rel_to_mount(mountpoint, &path),
+                rel_to_mount(mountpoint, &new_parent),
+            ) {
+                (Ok(rel), Ok(parent_rel)) => match core.copy_to(&rel, &parent_rel) {
+                    Ok(name) => {
+                        let dest = if new_parent.is_empty() {
+                            "My files".to_string()
+                        } else {
+                            new_parent.clone()
+                        };
+                        core.log_activity(ActivityKind::Copy, &name, format!("to {dest}"), true);
+                        CtlResponse::Ok {
+                            message: format!("copied to {name}"),
+                        }
+                    }
+                    Err(e) => {
+                        core.log_activity(ActivityKind::Copy, &path, &e, false);
+                        CtlResponse::error(e)
+                    }
+                },
+                (Err(e), _) | (_, Err(e)) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::FolderSize { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => folder_size_reply(core.folder_size(&rel)),
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::FolderSizeByUid { uid }) => folder_size_reply(core.folder_size_by_uid(&uid)),
         Ok(CtlRequest::Delete { path }) => match route_node(core, mountpoint, &path) {
             Ok((core, rel)) => match core.delete(&rel) {
                 Ok(name) => {
@@ -1389,6 +1433,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::ResetSyncFolder { id }) => match core.reset_sync_folder(id) {
+            Ok(message) => {
+                core.log_activity(ActivityKind::Sync, &message, "", true);
+                CtlResponse::Ok { message }
+            }
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::SyncNow { id }) => {
             core.sync_now(id);
             CtlResponse::Ok {
@@ -1629,6 +1680,31 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 core.log_activity(ActivityKind::PublicLink, &uid, &e, false);
                 CtlResponse::error(e)
             }
+        },
+        Ok(CtlRequest::UpdatePublicLink {
+            path,
+            id,
+            role,
+            password,
+            expires,
+        }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => {
+                match core.update_public_link(&rel, &id, role.as_deref(), password, expires) {
+                    Ok(link) => CtlResponse::PublicLink { link },
+                    Err(e) => CtlResponse::error(e),
+                }
+            }
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::UpdatePublicLinkByUid {
+            uid,
+            id,
+            role,
+            password,
+            expires,
+        }) => match core.update_public_link_by_uid(&uid, &id, role.as_deref(), password, expires) {
+            Ok(link) => CtlResponse::PublicLink { link },
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::RemovePublicLink { path, id }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.remove_public_link(&rel, &id) {
