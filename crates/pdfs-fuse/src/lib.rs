@@ -7312,13 +7312,15 @@ mod size_upgrade_tests {
     fn a_listing_waits_for_the_whole_size_batch_but_not_forever() {
         let slot = Arc::new(SizeUpgrade::default());
         let worker = slot.clone();
+        // Read before the spawn: the worker's sleeps can start before this
+        // thread runs again, which made the bound below fail on a busy runner.
+        let started = Instant::now();
         let t = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             worker.chunk_done();
             std::thread::sleep(Duration::from_millis(60));
             worker.finish();
         });
-        let started = Instant::now();
         slot.wait_finished(started + Duration::from_secs(5));
         // Past the first chunk, up to the end of the batch.
         assert!(started.elapsed() >= Duration::from_millis(90));
