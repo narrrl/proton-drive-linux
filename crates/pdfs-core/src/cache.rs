@@ -621,10 +621,20 @@ impl ContentCache {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
+                // A `.meta` tags the blob named like it without the suffix. One
+                // whose blob is gone is what an eviction leaves between its two
+                // removals, by a crash or by a store of the same uid landing in
+                // between, and nothing else would ever remove it.
+                if let Some(blob) = name.strip_suffix(".meta") {
+                    if !dir.join(blob).exists() {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                    continue;
+                }
                 // `.geom` is a block-geometry sidecar (see `GeometryMeta`), tens
                 // of bytes and not a cached block; like `.meta` it is neither
                 // budgeted nor evictable on its own.
-                if name.ends_with(".meta") || name.ends_with(".geom") {
+                if name.ends_with(".geom") {
                     continue;
                 }
                 // A `.tmp` is a staging file from a store that never completed
@@ -2248,6 +2258,28 @@ mod tests {
             .map(|(_, s)| s)
             .sum();
         assert!(total <= 8, "budget enforced after reconcile, total={total}");
+    }
+
+    /// An eviction removes the blob, then its tag. A crash in between, or a
+    /// store of the same uid landing in between, left the tag on its own, and
+    /// nothing removed it.
+    #[test]
+    fn a_tag_without_its_blob_is_swept_at_open() {
+        let dir = TempDir::new();
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        {
+            let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+            c.store(&uid("kept"), 1, 4, b"kept").unwrap();
+            c.store(&uid("gone"), 1, 4, b"gone").unwrap();
+            std::fs::remove_file(c.blob_path(&uid("gone"))).unwrap();
+        }
+
+        let c = ContentCache::open(content, pins, 0, db).unwrap();
+        assert!(!c.meta_path(&uid("gone")).exists());
+        assert!(c.meta_path(&uid("kept")).exists());
+        assert_eq!(c.read_range(&uid("kept"), 1, 4, 0, 4).unwrap(), b"kept");
     }
 
     #[test]

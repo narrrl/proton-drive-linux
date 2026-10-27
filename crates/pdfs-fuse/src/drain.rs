@@ -1281,6 +1281,13 @@ impl Core {
             sent: (&sent.0, &sent.1),
             landed: (&home.to_string(), &name),
         };
+        // Counted from the op's retirement until the bytes are cached and the
+        // tree has the real uid, as an upload is. Uncounted, the queue read
+        // empty while that still ran: a delete in between took an open file
+        // for closed and dropped what its handle reads, and a script that
+        // waited for an empty queue read the file before it was cached
+        // (`docs/BUGS.md` B257).
+        let _landing = LandingUpload::begin(&self.landing_uploads);
         let newer = match self.retire_create(op, uploaded, &landing, &local, &real)? {
             CreateRetired::Withdrawn { trash } => {
                 return self.trash_withdrawn_create(op, trash, &local, &real, &name);

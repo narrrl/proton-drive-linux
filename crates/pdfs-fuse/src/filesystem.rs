@@ -2368,7 +2368,7 @@ impl ProtonFs {
         // regardless — the file is gone from their point of view the moment the
         // command returns. The same when the network goes
         // away under the remote call below.
-        let queue_it = |reply: ReplyEmpty| match self.core.queue_trash(&uid, name) {
+        let queue_it = |reply: ReplyEmpty| match self.core.queue_trash(&uid, name, open_now) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         };
