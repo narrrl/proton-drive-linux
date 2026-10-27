@@ -3002,4 +3002,69 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Emptied before any pass saw it, the folder is still `idle`, and the
+    /// switch was refused for good: every path read as "deleted here but not on
+    /// Proton Drive yet" (B255, found by the account run).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_folder_emptied_before_any_pass_still_goes_on_demand() {
+        let drive = FakeDrive::new();
+        let dir = scratch("ondemand-emptied-idle");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let local = dir.join("docs");
+        let id = sync_folder(&daemon, &local, "mirror");
+        std::fs::create_dir(local.join("sub")).unwrap();
+        std::fs::write(local.join("sub/a.txt"), b"alpha").unwrap();
+        std::fs::write(local.join("sub/b.txt"), b"beta").unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        let on_drive = |name: &str, content: &[u8]| {
+            drive.tree().iter().any(|(path, entry)| {
+                path.ends_with(name) && *entry == Entry::File(Arc::new(content.to_vec()))
+            })
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || on_drive("sub/a.txt", b"alpha")
+                && on_drive("sub/b.txt", b"beta")
+                && listed_folder(&daemon, id).is_some_and(|f| f.state == "idle")),
+            "the folder synced: {:?}",
+            listed_folder(&daemon, id)
+        );
+
+        // In one rename, so no pass sees half of it, and asked at once, well
+        // inside the watcher's debounce, so no pass sees it empty either.
+        std::fs::rename(local.join("sub"), dir.join("moved-away")).unwrap();
+        let asked = daemon.request(&Request::SetSyncFolderMode {
+            id,
+            mode: "ondemand".into(),
+        });
+        assert!(
+            matches!(asked, Ok(Response::Ok { .. })),
+            "the switch was refused: {asked:?}"
+        );
+        assert!(
+            listed_folder(&daemon, id)
+                .is_some_and(|f| f.pending_mode.as_deref() == Some("ondemand")),
+            "the switch waits for a pass: {:?}",
+            listed_folder(&daemon, id)
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(30), || listed_folder(&daemon, id)
+                .is_some_and(|f| f.mode == "ondemand" && f.pending_mode.is_none())
+                && is_mounted(&local)),
+            "the queued switch landed: {:?}",
+            listed_folder(&daemon, id)
+        );
+        assert_eq!(std::fs::read(local.join("sub/a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(local.join("sub/b.txt")).unwrap(), b"beta");
+        assert!(
+            on_drive("sub/a.txt", b"alpha") && on_drive("sub/b.txt", b"beta"),
+            "nothing was trashed on Drive: {:?}",
+            drive.tree().keys().collect::<Vec<_>>()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

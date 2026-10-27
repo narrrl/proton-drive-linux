@@ -70,9 +70,10 @@ Schema: **44**, unchanged.
 
 - **A synced folder whose files were all gone from this computer no longer gets stuck** (#46).
   The sync still refuses to delete everything on Proton Drive, but a switch to online only now
-  goes ahead and shows what Proton Drive has, instead of waiting for good. To download the
-  files again instead, sync the folder from scratch. Restoring folders also logs why it
-  skipped a folder.
+  goes ahead and shows what Proton Drive has, instead of waiting for good. This includes a
+  switch asked for right after the files went, which was refused with "… was deleted here but
+  not on Proton Drive yet". To download the files again instead, sync the folder from scratch.
+  Restoring folders also logs why it skipped a folder.
 
 - **The first sync of a folder shows how far its scan got** (#46). Before anything downloads,
   the first pass reads every item on Proton Drive, which takes many minutes for a large folder.

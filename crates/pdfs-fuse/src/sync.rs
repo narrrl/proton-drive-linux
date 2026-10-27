@@ -2253,6 +2253,27 @@ pub(crate) fn mirror_tree_unsynced(
         .map(|r| format!("{r} was deleted here but not on Proton Drive yet"))
 }
 
+/// Whether a mirror folder's local copy is gone in full: the folder is still
+/// there, but not one tracked path of its baseline is.
+///
+/// [`mirror_tree_unsynced`] reads that as deletions not carried up yet, which
+/// would refuse the switch to on-demand for good. It is the wipe guard's case
+/// instead, which the push pass a queued switch runs settles without trashing
+/// anything on Drive (#46), so the switch waits for that pass.
+pub(crate) fn mirror_tree_gone(
+    root: &Path,
+    baseline: &HashMap<String, StoredSyncEntry>,
+    rules: &IgnoreRules,
+) -> bool {
+    let tracked = filter_baseline(baseline, rules);
+    root.is_dir()
+        && !tracked.is_empty()
+        && tracked.keys().all(|rel| {
+            std::fs::symlink_metadata(root.join(rel_to_path(rel)))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+}
+
 /// The walk behind both checks. `rules`, when given, only names an ignored
 /// path as such in the reason; it is still something only this disk has.
 fn unsynced_local(
@@ -3536,6 +3557,26 @@ mod tests {
         let reason = mirror_tree_unsynced(&root, &baseline, &rules_for(&[]));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(reason.unwrap().contains("link"));
+    }
+
+    /// Emptied before any pass saw it, the folder waits for the push pass that
+    /// forgets those paths, instead of being refused for good (B255).
+    #[test]
+    fn only_a_local_copy_gone_in_full_counts_as_gone() {
+        let (root, baseline) = synced_subtree("evict-gone");
+        let rules = rules_for(&[]);
+        let whole = mirror_tree_gone(&root, &baseline, &rules);
+        std::fs::remove_dir_all(root.join("dir/sub")).unwrap();
+        let partly = mirror_tree_gone(&root, &baseline, &rules);
+        std::fs::remove_dir_all(root.join("dir")).unwrap();
+        let emptied = mirror_tree_gone(&root, &baseline, &rules);
+        let none_synced = mirror_tree_gone(&root, &HashMap::new(), &rules);
+        std::fs::remove_dir_all(&root).unwrap();
+        let no_root = mirror_tree_gone(&root, &baseline, &rules);
+        assert!(!whole && !partly, "a deletion with survivors is a real one");
+        assert!(emptied);
+        assert!(!none_synced, "an empty baseline has nothing to lose");
+        assert!(!no_root, "a missing folder is the pass's error to report");
     }
 
     /// The same rule one level up: if the sync root itself cannot be read, the

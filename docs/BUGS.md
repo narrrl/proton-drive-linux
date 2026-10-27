@@ -402,14 +402,20 @@ folder lost its files is not known yet.
 
 **Fix.** The push pass for a switch to on-demand forgets the baseline rows of a local copy that
 is gone in full, instead of trashing them on Drive, so the switch goes ahead and the mount shows
-what Drive has. **Sync From Scratch…** in the app and `pdfs sync reset ID` clear a mirror
+what Drive has. A switch asked for before any pass saw the folder empty found it still `idle`,
+and the check for what only this computer has refused it at once: every path read as "deleted
+here but not on Proton Drive yet". The account run found that. Such a switch now waits for the
+same push pass (`mirror_tree_gone` in `crates/pdfs-fuse/src/sync.rs`, checked in
+`apply_sync_folder_mode`). **Sync From Scratch…** in the app and `pdfs sync reset ID` clear a mirror
 folder's baseline, so the next pass compares both sides as on the first sync: one-sided files
 are copied across, files that differ keep both versions, and nothing is deleted. Restore now
 logs why it skipped a folder.
 
 **Test:** The simulations `a_folder_whose_local_copy_is_gone_still_goes_on_demand` (which
-failed in exactly the reported state before the fix) and
-`a_folder_whose_local_copy_is_gone_downloads_again_after_a_reset`.
+failed in exactly the reported state before the fix),
+`a_folder_emptied_before_any_pass_still_goes_on_demand` (which failed with the account run's
+error) and `a_folder_whose_local_copy_is_gone_downloads_again_after_a_reset`; the acceptance case
+"an emptied mirror folder switches to on-demand".
 
 ---
 
