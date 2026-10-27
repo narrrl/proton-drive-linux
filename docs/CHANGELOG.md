@@ -11,6 +11,15 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A new file reads without the network as soon as `pdfs status` shows nothing queued**
+  (B257). A new file's upload counted as done before its bytes were cached, so a script that
+  waited for an empty queue and then went offline could not read it. A new file deleted while
+  open in that moment could also lose the bytes its open handle reads, which made a write or
+  read through that handle fail with "Input/output error". The cache also removes leftover
+  tags of evicted files when it opens.
+
 ## [3.6.0] — 2026-10-27
 
 Schema: **44**, unchanged.
