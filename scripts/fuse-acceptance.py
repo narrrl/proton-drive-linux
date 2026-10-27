@@ -4014,30 +4014,36 @@ class Janitor:
         return [
             f"{name} ({entry['uid']}) is still in the trash"
             for entry in matches
-            if not self.purge(entry["uid"], name)
+            if not self.purge(entry["uid"], name, listed=True)
         ]
 
-    def purge(self, uid: str, name: str) -> bool:
+    def purge(self, uid: str, name: str, listed: bool = False) -> bool:
         """Permanently delete one trashed node the run owns, by uid.
 
         By uid and never by name: a name can match something of the user's, a
         uid cannot. The node has to show up in the trash first, which is also
         what proves the trash step before it worked, and it has to be gone from
-        a fresh listing afterwards.
+        a fresh listing afterwards. `listed` says the caller just found it in
+        the trash.
 
         The server's own answer comes first, though: it only deletes a node
         that is in the trash, and it answers per uid. A listing is a whole-trash
         enumeration, which on a large trash can time out on every attempt and
         would otherwise keep a folder the server would delete on request.
         """
-        with contextlib.suppress(Exception):
+        last_error = ""
+        try:
             reply = self.daemon.command("delete-forever", uid, stdin="yes\n")
             if re.search(r"\bpermanently deleted 1 item", reply):
                 print(f"[cleanup] permanently deleted {name}")
                 return True
+        except Exception as error:  # noqa: BLE001 - retried, then reported
+            last_error = f": {error}"
         deadline = time.monotonic() + self.daemon.timeout
-        attempted = False
-        last_error = ""
+        # A node seen in the trash before that delete and gone after it was
+        # deleted by it, whatever it answered. Counting it as never sent kept
+        # waiting for a node that was already gone, and failed the run.
+        attempted = listed
         while True:
             try:
                 if self.daemon.trashed(uid):
@@ -4149,7 +4155,7 @@ class Janitor:
         for entry in trashed:
             if STALE_ROOT.match(entry["name"]) and entry["name"] not in live_names:
                 print(f"[reap] permanently deleting an abandoned root from the trash: {entry['name']}")
-                if not orphan.purge(entry["uid"], entry["name"]):
+                if not orphan.purge(entry["uid"], entry["name"], listed=True):
                     leftovers.append(f"{entry['name']} ({entry['uid']}) is still in the trash")
         return leftovers
 

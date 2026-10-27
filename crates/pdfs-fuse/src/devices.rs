@@ -989,9 +989,15 @@ impl Core {
                     .db
                     .sync_entries(id)
                     .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?;
-                if let Some(reason) =
-                    sync::mirror_tree_unsynced(&local, &baseline, &self.ignore_rules(&local))
-                {
+                let rules = self.ignore_rules(&local);
+                // Emptied before any pass saw it, the folder is still `idle`, and
+                // the check below would refuse the switch for good. The push pass
+                // of a queued switch forgets those paths instead (`docs/BUGS.md`
+                // B255).
+                if sync::mirror_tree_gone(&local, &baseline, &rules) {
+                    return Err(SwitchBlocked::NotNow);
+                }
+                if let Some(reason) = sync::mirror_tree_unsynced(&local, &baseline, &rules) {
                     return Err(SwitchBlocked::Failed(format!(
                         "going online-only would delete what is only on this computer: {reason}"
                     )));
