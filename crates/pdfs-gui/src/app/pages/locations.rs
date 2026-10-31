@@ -1729,7 +1729,10 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
         parts.push(match &spec.progress {
             Some(p) => sync_progress_label(p),
             None if spec.paused => pgettext("state", "paused"),
-            None => sync_state_label(&spec.state).to_string(),
+            None => sync_state_label(
+                &spec.state,
+                spec.mode == MountMode::Mirror && spec.last_sync == 0,
+            ),
         });
     }
     // Only the locations that are supposed to have a session report its absence:
@@ -1775,7 +1778,25 @@ mod tests {
             MountMode::Mirror,
             false,
         );
+        assert_eq!(location_subtitle(&spec), "Synced · waiting for first sync");
+    }
+
+    /// A folder whose first pass has not run is not up to date, though its
+    /// state column starts out `idle` (`docs/BUGS.md` B261).
+    #[test]
+    fn a_folder_reads_up_to_date_only_after_its_first_sync() {
+        let mut spec = spec(
+            MountKind::Device { sync_folder_id: 7 },
+            MountMode::Mirror,
+            false,
+        );
+        assert_eq!(location_subtitle(&spec), "Synced · waiting for first sync");
+        spec.last_sync = 1_700_000_000;
         assert_eq!(location_subtitle(&spec), "Synced · up to date");
+        // A folder that failed before it ever synced says so.
+        spec.last_sync = 0;
+        spec.state = "error".into();
+        assert_eq!(location_subtitle(&spec), "Synced · sync error");
     }
 
     #[test]
