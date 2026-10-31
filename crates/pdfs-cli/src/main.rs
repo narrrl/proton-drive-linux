@@ -3446,6 +3446,79 @@ fn cmd_sync_limit(up: Option<u64>, down: Option<u64>) -> Result<()> {
     })?)
 }
 
+/// How long the oldest write may wait to upload before `diagnose` calls it
+/// out. Under a day it is a slow link or a big file; past it, something is
+/// holding the queue.
+const STAGED_STALE_SECS: u64 = 86_400;
+
+/// `diagnose` findings for the queue and the pause, from the `Status` reply.
+/// `paused_for` is how long a timed pause still runs, in seconds.
+fn sync_health(
+    failing_ops: u64,
+    failing_error: Option<&str>,
+    staged_bytes: u64,
+    staged_oldest_secs: u64,
+    paused: bool,
+    paused_for: Option<i64>,
+) -> Vec<(DiagnoseLevel, &'static str, String)> {
+    let mut findings = Vec::new();
+    if failing_ops > 0 {
+        findings.push((
+            DiagnoseLevel::Warn,
+            "  failing writes",
+            match failing_error {
+                Some(error) => format!("{failing_ops} keep failing; the last error: {error}"),
+                None => format!("{failing_ops} keep failing"),
+            },
+        ));
+    }
+    if staged_bytes > 0 && staged_oldest_secs >= STAGED_STALE_SECS {
+        findings.push((
+            DiagnoseLevel::Warn,
+            "  oldest unsent write",
+            format!(
+                "{} old, {} only on this computer",
+                human_secs(staged_oldest_secs),
+                human_bytes(staged_bytes)
+            ),
+        ));
+    }
+    if paused {
+        findings.push((
+            DiagnoseLevel::Warn,
+            "  sync",
+            match paused_for {
+                Some(left) if left > 0 => {
+                    format!("paused for another {}", human_secs(left as u64))
+                }
+                _ => "paused until resumed (`pdfs sync resume`)".to_string(),
+            },
+        ));
+    }
+    findings
+}
+
+/// `diagnose` findings for the synced folders that need someone to look.
+fn folder_health(
+    folders: &[pdfs_core::control::SyncFolderInfo],
+) -> Vec<(DiagnoseLevel, String, String)> {
+    folders
+        .iter()
+        .filter_map(|folder| {
+            let what = match folder.state.as_str() {
+                "error" => "sync error; `pdfs sync list` and the activity feed say more",
+                "conflict" => "conflict copies to look at",
+                _ => return None,
+            };
+            Some((
+                DiagnoseLevel::Warn,
+                format!("  synced folder [{}]", folder.id),
+                format!("{}: {what}", folder.local_path),
+            ))
+        })
+        .collect()
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3782,21 +3855,26 @@ fn cmd_diagnose() -> Result<()> {
     let socket_exists = socket.exists();
     let socket_kind_ok =
         std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket());
+    // A stale socket file with no listener is the common failure, so the reply
+    // is what decides this rather than the file's existence.
+    let status = control_request(CtlRequest::Status);
     report.finding(
         if socket_exists && !socket_kind_ok {
             DiagnoseLevel::Fail
-        } else if socket_exists {
+        } else if socket_exists && status.is_ok() {
             DiagnoseLevel::Ok
         } else {
             DiagnoseLevel::Warn
         },
         "  control socket",
-        socket.display().to_string(),
+        if socket_exists && socket_kind_ok && status.is_err() {
+            format!("{} (left over; nothing listens on it)", socket.display())
+        } else {
+            socket.display().to_string()
+        },
     );
-    // A stale socket file with no listener is the common failure, so the reply
-    // is what decides this rather than the file's existence.
     let mut daemon_responding = false;
-    match control_request(CtlRequest::Status) {
+    match status {
         Ok(CtlResponse::Status {
             mountpoint,
             online,
@@ -3804,6 +3882,12 @@ fn cmd_diagnose() -> Result<()> {
             tokens_unsaved,
             pending_uploads,
             pending_changes,
+            failing_ops,
+            failing_error,
+            staged_bytes,
+            staged_oldest_secs,
+            paused,
+            paused_until,
             version,
             ..
         }) => {
@@ -3878,6 +3962,27 @@ fn cmd_diagnose() -> Result<()> {
                     format!("{pending} waiting to upload")
                 },
             );
+            // The rest of the daemon's state that the report used to drop:
+            // writes that keep failing, a pause, a folder in error. Each of
+            // them stops changes from reaching Drive while everything above
+            // reads as fine (`docs/BUGS.md` B268).
+            for (level, check, detail) in sync_health(
+                failing_ops,
+                failing_error.as_deref(),
+                staged_bytes,
+                staged_oldest_secs,
+                paused,
+                paused_until.map(|until| until - unix_now()),
+            ) {
+                report.finding(level, check, detail);
+            }
+            if let Ok(CtlResponse::SyncFolders { items }) =
+                control_request(CtlRequest::ListSyncFolders)
+            {
+                for (level, check, detail) in folder_health(&items) {
+                    report.finding(level, &check, detail);
+                }
+            }
             match await_integrity_check() {
                 Ok(CtlResponse::CacheReport {
                     integrity_problems,
@@ -4074,6 +4179,50 @@ mod pause_tests {
 #[cfg(test)]
 mod diagnose_tests {
     use super::*;
+
+    /// A healthy queue says nothing; writes that keep failing, an old unsent
+    /// write and a pause each say so (`docs/BUGS.md` B268).
+    #[test]
+    fn a_stuck_queue_or_a_pause_is_reported() {
+        assert!(sync_health(0, None, 0, 0, false, None).is_empty());
+        assert!(sync_health(0, None, 4096, STAGED_STALE_SECS - 1, false, None).is_empty());
+        let checks: Vec<&str> = sync_health(
+            2,
+            Some("upload a.txt: quota"),
+            4096,
+            STAGED_STALE_SECS,
+            true,
+            Some(600),
+        )
+        .into_iter()
+        .map(|(level, check, _)| {
+            assert!(matches!(level, DiagnoseLevel::Warn));
+            check.trim()
+        })
+        .collect();
+        assert_eq!(checks, ["failing writes", "oldest unsent write", "sync"]);
+    }
+
+    /// Issue #53: a folder that would not sync, and `diagnose` found nothing.
+    #[test]
+    fn a_synced_folder_in_error_is_reported() {
+        let folder = |id: i64, state: &str| pdfs_core::control::SyncFolderInfo {
+            id,
+            local_path: format!("/home/u/f{id}"),
+            remote_uid: "vol~link".into(),
+            mode: "mirror".into(),
+            state: state.into(),
+            last_sync: 0,
+            pending_mode: None,
+            progress: None,
+            paused: false,
+        };
+        let findings =
+            folder_health(&[folder(1, "idle"), folder(2, "error"), folder(3, "syncing")]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].1.trim(), "synced folder [2]");
+        assert!(findings[0].2.starts_with("/home/u/f2: sync error"));
+    }
 
     #[test]
     fn finding_severity_is_counted_centrally() {
