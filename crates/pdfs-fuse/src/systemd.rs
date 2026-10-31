@@ -64,9 +64,17 @@ fn send_abstract(socket: &UnixDatagram, name: &str, message: &str) -> bool {
 /// so `systemctl --user start` returns when the mount actually works rather than
 /// when the process exists.
 pub(crate) fn ready() {
-    if notify("READY=1\n") {
+    if notify("READY=1\nSTATUS=Mounted\n") {
         debug!("notified systemd: ready");
     }
+}
+
+/// Set the one-line status `systemctl --user status` shows for the unit, such
+/// as why the mount keeps failing (`docs/BUGS.md` B263).
+pub fn status(text: &str) {
+    // A newline would end the `STATUS=` line and start another variable.
+    let line = text.replace('\n', " ");
+    notify(&format!("STATUS={line}\n"));
 }
 
 /// Tell the manager the daemon is still healthy.

@@ -124,7 +124,7 @@ use mount::{
 };
 use reads::{BlockFlight, BlockRing, PREFETCH_BUDGET, Prefetch, ReaderSlot, STREAM_BYPASS_MIN};
 use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle};
-pub use systemd::idle_sleep;
+pub use systemd::{idle_sleep, status as notify_status};
 use tracing::{debug, error, info, warn};
 use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
 use r#virtual::{

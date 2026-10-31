@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-26 22:26+0100\n"
+"POT-Creation-Date: 2026-10-31 10:37+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Dutch\n"
@@ -421,14 +421,25 @@ msgstr "Niet verbonden"
 msgid "The Proton Drive service isn't running."
 msgstr "De Proton Drive-service draait niet."
 
-#: crates/pdfs-gui/src/app/main.rs:1803
+#: crates/pdfs-gui/src/app/main.rs:1813
+msgid "Can't open your Drive"
+msgstr "Kan Proton Drive niet openen"
+
+#: crates/pdfs-gui/src/app/main.rs:1816
+#, rust-format
+msgid ""
+"The Proton Drive service keeps failing to start and tries again on its own. "
+"The last error was: {error}"
+msgstr "De Proton Drive-service kan steeds niet starten en probeert het zelf opnieuw. Laatste fout: {error}"
+
+#: crates/pdfs-gui/src/app/main.rs:1824
 #: crates/pdfs-gui/src/app/pages/status.rs:355
 #: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
-#: crates/pdfs-gui/src/main.rs:475 crates/pdfs-gui/src/main.rs:517
+#: crates/pdfs-gui/src/main.rs:493 crates/pdfs-gui/src/main.rs:535
 msgid "Connecting…"
 msgstr "Verbinden…"
 
-#: crates/pdfs-gui/src/app/main.rs:1804
+#: crates/pdfs-gui/src/app/main.rs:1825
 msgid "Waiting for the Proton Drive service to start."
 msgstr "Wachten tot de Proton Drive-service is gestart."
 
@@ -2896,7 +2907,7 @@ msgid "Sync paused until you resume"
 msgstr "Synchronisatie gepauzeerd totdat je hervat"
 
 #: crates/pdfs-gui/src/app/pages/locations.rs:570
-#: crates/pdfs-gui/src/app/pages/status.rs:1445 crates/pdfs-gui/src/main.rs:290
+#: crates/pdfs-gui/src/app/pages/status.rs:1445 crates/pdfs-gui/src/main.rs:308
 msgid "Sync paused"
 msgstr "Synchronisatie gepauzeerd"
 
@@ -5108,7 +5119,7 @@ msgstr "Hervat {time}"
 msgid "Until you resume"
 msgstr "Totdat je hervat"
 
-#: crates/pdfs-gui/src/app/pages/status.rs:1464 crates/pdfs-gui/src/main.rs:292
+#: crates/pdfs-gui/src/app/pages/status.rs:1464 crates/pdfs-gui/src/main.rs:310
 #, rust-format
 msgid "{n} change needs attention"
 msgid_plural "{n} changes need attention"
@@ -6337,52 +6348,57 @@ msgstr "Proton Drive reageert niet"
 msgid "Signed in as {username} — locked"
 msgstr "Aangemeld als {username} — vergrendeld"
 
-#: crates/pdfs-gui/src/main.rs:200
+#: crates/pdfs-gui/src/main.rs:209
+#, rust-format
+msgid "Signed in as {username} — can't open your Drive"
+msgstr "Aangemeld als {username} — kan Proton Drive niet openen"
+
+#: crates/pdfs-gui/src/main.rs:218
 #, rust-format
 msgid "Signed in as {username} — not connected"
 msgstr "Aangemeld als {username} — niet verbonden"
 
-#: crates/pdfs-gui/src/main.rs:205
+#: crates/pdfs-gui/src/main.rs:223
 msgid "Not signed in"
 msgstr "Niet aangemeld"
 
 #. Translators: {error} is an error message, in English.
-#: crates/pdfs-gui/src/main.rs:208
+#: crates/pdfs-gui/src/main.rs:226
 #, rust-format
 msgid "Error: {error}"
 msgstr "Fout: {error}"
 
-#: crates/pdfs-gui/src/main.rs:230
+#: crates/pdfs-gui/src/main.rs:248
 msgid "Proton Drive sent an unexpected reply"
 msgstr "Proton Drive gaf een onverwacht antwoord"
 
-#: crates/pdfs-gui/src/main.rs:284
+#: crates/pdfs-gui/src/main.rs:302
 msgid "Session expired — sign in again"
 msgstr "Sessie verlopen — meld je opnieuw aan"
 
-#: crates/pdfs-gui/src/main.rs:286
+#: crates/pdfs-gui/src/main.rs:304
 msgid "Sign-in not saved — unlock your keyring"
 msgstr "Aanmelding niet opgeslagen — ontgrendel je sleutelbos"
 
-#: crates/pdfs-gui/src/main.rs:289
+#: crates/pdfs-gui/src/main.rs:307
 msgid "Update not finished — restart Proton Drive"
 msgstr "Update niet voltooid — start Proton Drive opnieuw"
 
-#: crates/pdfs-gui/src/main.rs:299
+#: crates/pdfs-gui/src/main.rs:317
 #, rust-format
 msgid "Up to date in {mountpoint} ({n} pinned)"
 msgid_plural "Up to date in {mountpoint} ({n} pinned)"
 msgstr[0] "Bijgewerkt in {mountpoint} ({n} vastgezet)"
 msgstr[1] "Bijgewerkt in {mountpoint} ({n} vastgezet)"
 
-#: crates/pdfs-gui/src/main.rs:306
+#: crates/pdfs-gui/src/main.rs:324
 #, rust-format
 msgid "Syncing — {queued} ({n} pinned)"
 msgid_plural "Syncing — {queued} ({n} pinned)"
 msgstr[0] "Synchroniseren — {queued} ({n} vastgezet)"
 msgstr[1] "Synchroniseren — {queued} ({n} vastgezet)"
 
-#: crates/pdfs-gui/src/main.rs:313
+#: crates/pdfs-gui/src/main.rs:331
 #, rust-format
 msgid "Offline — cached files only ({n} pinned)"
 msgid_plural "Offline — cached files only ({n} pinned)"
@@ -6390,60 +6406,60 @@ msgstr[0] "Offline — alleen bestanden in cache ({n} vastgezet)"
 msgstr[1] "Offline — alleen bestanden in cache ({n} vastgezet)"
 
 #. Translators: {queued} is a queue summary such as "3 uploads queued".
-#: crates/pdfs-gui/src/main.rs:319
+#: crates/pdfs-gui/src/main.rs:337
 #, rust-format
 msgid "Offline — {queued}"
 msgstr "Offline — {queued}"
 
 #. Translators: a menu item that opens the list of failing changes.
-#: crates/pdfs-gui/src/main.rs:358
+#: crates/pdfs-gui/src/main.rs:376
 #, rust-format
 msgid "{n} issue — View"
 msgid_plural "{n} issues — View"
 msgstr[0] "{n} probleem — Bekijken"
 msgstr[1] "{n} problemen — Bekijken"
 
-#: crates/pdfs-gui/src/main.rs:465
+#: crates/pdfs-gui/src/main.rs:483
 msgid "Sign In…"
 msgstr "Aanmelden…"
 
-#: crates/pdfs-gui/src/main.rs:466
+#: crates/pdfs-gui/src/main.rs:484
 msgid "Sign In Again…"
 msgstr "Opnieuw aanmelden…"
 
-#: crates/pdfs-gui/src/main.rs:469
+#: crates/pdfs-gui/src/main.rs:487
 msgid "Open Proton Drive"
 msgstr "Proton Drive openen"
 
-#: crates/pdfs-gui/src/main.rs:473
+#: crates/pdfs-gui/src/main.rs:491
 msgid "Restart Proton Drive"
 msgstr "Proton Drive opnieuw starten"
 
-#: crates/pdfs-gui/src/main.rs:482
+#: crates/pdfs-gui/src/main.rs:500
 msgid "Open Folder"
 msgstr "Map openen"
 
-#: crates/pdfs-gui/src/main.rs:494
+#: crates/pdfs-gui/src/main.rs:512
 msgid "Resume Sync"
 msgstr "Synchronisatie hervatten"
 
-#: crates/pdfs-gui/src/main.rs:496
+#: crates/pdfs-gui/src/main.rs:514
 msgid "Pause Sync"
 msgstr "Synchronisatie pauzeren"
 
-#: crates/pdfs-gui/src/main.rs:515
+#: crates/pdfs-gui/src/main.rs:533
 msgid "Connect"
 msgstr "Verbinden"
 
-#: crates/pdfs-gui/src/main.rs:522
+#: crates/pdfs-gui/src/main.rs:540
 msgid "Hide Tray Icon"
 msgstr "Pictogram in systeemvak verbergen"
 
-#: crates/pdfs-gui/src/main.rs:526
+#: crates/pdfs-gui/src/main.rs:544
 msgid "Stop Proton Drive…"
 msgstr "Proton Drive stoppen…"
 
-#: crates/pdfs-gui/src/main.rs:530
+#: crates/pdfs-gui/src/main.rs:548
 msgid "Quit"
 msgstr "Afsluiten"
 

@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-26 22:26+0100\n"
+"POT-Creation-Date: 2026-10-31 10:37+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Spanish\n"
@@ -422,14 +422,25 @@ msgstr "Sin conexión"
 msgid "The Proton Drive service isn't running."
 msgstr "El servicio de Proton Drive no está en ejecución."
 
-#: crates/pdfs-gui/src/app/main.rs:1803
+#: crates/pdfs-gui/src/app/main.rs:1813
+msgid "Can't open your Drive"
+msgstr "No se puede abrir Proton Drive"
+
+#: crates/pdfs-gui/src/app/main.rs:1816
+#, rust-format
+msgid ""
+"The Proton Drive service keeps failing to start and tries again on its own. "
+"The last error was: {error}"
+msgstr "El servicio de Proton Drive no consigue iniciarse y vuelve a intentarlo por sí solo. Último error: {error}"
+
+#: crates/pdfs-gui/src/app/main.rs:1824
 #: crates/pdfs-gui/src/app/pages/status.rs:355
 #: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
-#: crates/pdfs-gui/src/main.rs:475 crates/pdfs-gui/src/main.rs:517
+#: crates/pdfs-gui/src/main.rs:493 crates/pdfs-gui/src/main.rs:535
 msgid "Connecting…"
 msgstr "Conectando…"
 
-#: crates/pdfs-gui/src/app/main.rs:1804
+#: crates/pdfs-gui/src/app/main.rs:1825
 msgid "Waiting for the Proton Drive service to start."
 msgstr "Esperando a que se inicie el servicio de Proton Drive."
 
@@ -2891,7 +2902,7 @@ msgid "Sync paused until you resume"
 msgstr "Sincronización en pausa hasta que la reanude"
 
 #: crates/pdfs-gui/src/app/pages/locations.rs:570
-#: crates/pdfs-gui/src/app/pages/status.rs:1445 crates/pdfs-gui/src/main.rs:290
+#: crates/pdfs-gui/src/app/pages/status.rs:1445 crates/pdfs-gui/src/main.rs:308
 msgid "Sync paused"
 msgstr "Sincronización en pausa"
 
@@ -5095,7 +5106,7 @@ msgstr "Se reanuda {time}"
 msgid "Until you resume"
 msgstr "Hasta que la reanude"
 
-#: crates/pdfs-gui/src/app/pages/status.rs:1464 crates/pdfs-gui/src/main.rs:292
+#: crates/pdfs-gui/src/app/pages/status.rs:1464 crates/pdfs-gui/src/main.rs:310
 #, rust-format
 msgid "{n} change needs attention"
 msgid_plural "{n} changes need attention"
@@ -6327,52 +6338,57 @@ msgstr "Proton Drive no responde"
 msgid "Signed in as {username} — locked"
 msgstr "Sesión iniciada como {username} — bloqueado"
 
-#: crates/pdfs-gui/src/main.rs:200
+#: crates/pdfs-gui/src/main.rs:209
+#, rust-format
+msgid "Signed in as {username} — can't open your Drive"
+msgstr "Sesión iniciada como {username} — no se puede abrir Proton Drive"
+
+#: crates/pdfs-gui/src/main.rs:218
 #, rust-format
 msgid "Signed in as {username} — not connected"
 msgstr "Sesión iniciada como {username} — sin conexión"
 
-#: crates/pdfs-gui/src/main.rs:205
+#: crates/pdfs-gui/src/main.rs:223
 msgid "Not signed in"
 msgstr "Sesión no iniciada"
 
 #. Translators: {error} is an error message, in English.
-#: crates/pdfs-gui/src/main.rs:208
+#: crates/pdfs-gui/src/main.rs:226
 #, rust-format
 msgid "Error: {error}"
 msgstr "Error: {error}"
 
-#: crates/pdfs-gui/src/main.rs:230
+#: crates/pdfs-gui/src/main.rs:248
 msgid "Proton Drive sent an unexpected reply"
 msgstr "Proton Drive envió una respuesta inesperada"
 
-#: crates/pdfs-gui/src/main.rs:284
+#: crates/pdfs-gui/src/main.rs:302
 msgid "Session expired — sign in again"
 msgstr "Sesión caducada: vuelva a iniciar sesión"
 
-#: crates/pdfs-gui/src/main.rs:286
+#: crates/pdfs-gui/src/main.rs:304
 msgid "Sign-in not saved — unlock your keyring"
 msgstr "Inicio de sesión no guardado: desbloquee el depósito de claves"
 
-#: crates/pdfs-gui/src/main.rs:289
+#: crates/pdfs-gui/src/main.rs:307
 msgid "Update not finished — restart Proton Drive"
 msgstr "Actualización sin terminar: reinicie Proton Drive"
 
-#: crates/pdfs-gui/src/main.rs:299
+#: crates/pdfs-gui/src/main.rs:317
 #, rust-format
 msgid "Up to date in {mountpoint} ({n} pinned)"
 msgid_plural "Up to date in {mountpoint} ({n} pinned)"
 msgstr[0] "Actualizado en {mountpoint} ({n} fijado)"
 msgstr[1] "Actualizado en {mountpoint} ({n} fijados)"
 
-#: crates/pdfs-gui/src/main.rs:306
+#: crates/pdfs-gui/src/main.rs:324
 #, rust-format
 msgid "Syncing — {queued} ({n} pinned)"
 msgid_plural "Syncing — {queued} ({n} pinned)"
 msgstr[0] "Sincronizando: {queued} ({n} anclado)"
 msgstr[1] "Sincronizando: {queued} ({n} anclados)"
 
-#: crates/pdfs-gui/src/main.rs:313
+#: crates/pdfs-gui/src/main.rs:331
 #, rust-format
 msgid "Offline — cached files only ({n} pinned)"
 msgid_plural "Offline — cached files only ({n} pinned)"
@@ -6380,60 +6396,60 @@ msgstr[0] "Sin conexión: solo archivos en caché ({n} anclado)"
 msgstr[1] "Sin conexión: solo archivos en caché ({n} anclados)"
 
 #. Translators: {queued} is a queue summary such as "3 uploads queued".
-#: crates/pdfs-gui/src/main.rs:319
+#: crates/pdfs-gui/src/main.rs:337
 #, rust-format
 msgid "Offline — {queued}"
 msgstr "Sin conexión: {queued}"
 
 #. Translators: a menu item that opens the list of failing changes.
-#: crates/pdfs-gui/src/main.rs:358
+#: crates/pdfs-gui/src/main.rs:376
 #, rust-format
 msgid "{n} issue — View"
 msgid_plural "{n} issues — View"
 msgstr[0] "{n} problema: ver"
 msgstr[1] "{n} problemas: ver"
 
-#: crates/pdfs-gui/src/main.rs:465
+#: crates/pdfs-gui/src/main.rs:483
 msgid "Sign In…"
 msgstr "Iniciar sesión…"
 
-#: crates/pdfs-gui/src/main.rs:466
+#: crates/pdfs-gui/src/main.rs:484
 msgid "Sign In Again…"
 msgstr "Volver a iniciar sesión…"
 
-#: crates/pdfs-gui/src/main.rs:469
+#: crates/pdfs-gui/src/main.rs:487
 msgid "Open Proton Drive"
 msgstr "Abrir Proton Drive"
 
-#: crates/pdfs-gui/src/main.rs:473
+#: crates/pdfs-gui/src/main.rs:491
 msgid "Restart Proton Drive"
 msgstr "Reiniciar Proton Drive"
 
-#: crates/pdfs-gui/src/main.rs:482
+#: crates/pdfs-gui/src/main.rs:500
 msgid "Open Folder"
 msgstr "Abrir carpeta"
 
-#: crates/pdfs-gui/src/main.rs:494
+#: crates/pdfs-gui/src/main.rs:512
 msgid "Resume Sync"
 msgstr "Reanudar la sincronización"
 
-#: crates/pdfs-gui/src/main.rs:496
+#: crates/pdfs-gui/src/main.rs:514
 msgid "Pause Sync"
 msgstr "Pausar la sincronización"
 
-#: crates/pdfs-gui/src/main.rs:515
+#: crates/pdfs-gui/src/main.rs:533
 msgid "Connect"
 msgstr "Conectar"
 
-#: crates/pdfs-gui/src/main.rs:522
+#: crates/pdfs-gui/src/main.rs:540
 msgid "Hide Tray Icon"
 msgstr "Ocultar el icono de la bandeja"
 
-#: crates/pdfs-gui/src/main.rs:526
+#: crates/pdfs-gui/src/main.rs:544
 msgid "Stop Proton Drive…"
 msgstr "Detener Proton Drive…"
 
-#: crates/pdfs-gui/src/main.rs:530
+#: crates/pdfs-gui/src/main.rs:548
 msgid "Quit"
 msgstr "Salir"
 
