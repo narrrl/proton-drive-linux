@@ -79,7 +79,6 @@ original wording.
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running | Not fixed |
 | [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Not fixed |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" | Not fixed |
-| [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged | Not fixed |
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
 | [B67](#b67--fresh-state-restore-can-silently-select-a-new-device-high-22) | Fresh-state restore can silently select a new device (HIGH-22) | An ambiguous device after a loss of local state is not asked about |
@@ -116,6 +115,7 @@ a live account since.
 |---|---|
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder |
+| [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
@@ -742,7 +742,7 @@ is why it helps.
 
 ### B258 — `journalctl -p warning` shows nothing, whatever the daemon logged
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, issue #53: the reporter ran `journalctl --user -u proton-drive.service -b
 -p warning`, as `docs/TROUBLESHOOTING.md` tells them to, and got `-- No entries --`.
 **Where:** `main` in `crates/pdfs-cli/src/main.rs`; `packaging/proton-drive.service`
@@ -755,8 +755,15 @@ stores every line of a service's output at the unit's default priority, info, un
 starts with a `<N>` prefix. So every `WARN` and `ERROR` line is stored as info, and the
 troubleshooting guide's filter hides all of them.
 
-**Fix.** Not done. When `JOURNAL_STREAM` says the output goes to journald, start each line with
-the `<N>` prefix for its level.
+**Fix.** When standard output is the journal stream (`JOURNAL_STREAM` names the same
+device and inode as fd 1), each line starts with the `<N>` prefix for its level, and ANSI colours
+are off. A terminal that merely inherited `JOURNAL_STREAM` keeps the plain format
+(`crates/pdfs-cli/src/journal.rs`).
+
+**Test:** `each_line_opens_with_the_priority_of_its_level` and
+`journal_stream_must_name_the_same_file` in `pdfs-cli`. On 2026-10-31, `pdfs diagnose` run with
+`RUST_LOG=debug` under `systemd-run --user -p StandardOutput=journal` stored its debug lines at
+`PRIORITY=7` and its report at 6.
 
 ---
 
