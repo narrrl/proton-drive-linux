@@ -1135,14 +1135,22 @@ impl Core {
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(folder))
-            .map_err(|e| format!("enumerate {folder}: {e}"))?;
+            .map_err(|e| format!("enumerate {folder}: {e}"));
+        let uids = match unlisted_gap(walk, prefix, uids)? {
+            Some(uids) => uids,
+            None => return Ok(()),
+        };
         if uids.is_empty() {
             return Ok(());
         }
         let nodes = self
             .rt
             .block_on(self.drive.enumerate_nodes_light(&uids))
-            .map_err(|e| format!("resolve nodes: {e}"))?;
+            .map_err(|e| format!("resolve nodes: {e}"));
+        let nodes = match unlisted_gap(walk, prefix, nodes)? {
+            Some(nodes) => nodes,
+            None => return Ok(()),
+        };
         // The SDK leaves out a node it cannot decrypt, and says so only in its
         // log. Its name went with it, so all this can record is the folder.
         if nodes.len() < uids.len() {
@@ -1186,10 +1194,14 @@ impl Core {
         let sized: HashMap<String, (i64, Option<String>)> = if stale.is_empty() {
             HashMap::new()
         } else {
-            self.rt
+            let full = self
+                .rt
                 .block_on(self.drive.enumerate_nodes(&stale))
-                .map_err(|e| format!("resolve nodes: {e}"))?
-                .iter()
+                .map_err(|e| format!("resolve nodes: {e}"));
+            let Some(full) = unlisted_gap(walk, prefix, full)? else {
+                return Ok(());
+            };
+            full.iter()
                 .map(|n| {
                     (
                         n.uid.to_string(),
@@ -2005,6 +2017,34 @@ struct RemoteWalk<'a> {
     dirs: &'a mut HashMap<String, NodeUid>,
     /// What it saw but could not read.
     gaps: &'a mut RemoteGaps,
+}
+
+/// A listing call's result in [`Core::walk_remote`]. A failure below the root
+/// records `prefix` as unlisted and returns `None`, so the walk goes on
+/// without that folder. A failure at the root still fails the pass, since
+/// nothing would be left to compare.
+///
+/// One listing error, after the SDK's own retries, used to fail the whole
+/// walk. Nothing is applied before the walk ends, so on a link that drops a
+/// request now and then a large first sync started over from nothing on
+/// every pass and never got past it (`docs/BUGS.md` B271).
+fn unlisted_gap<T>(
+    walk: &mut RemoteWalk<'_>,
+    prefix: &str,
+    result: Result<T, String>,
+) -> Result<Option<T>, PassAbort> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if prefix.is_empty() => Err(error.into()),
+        Err(error) => {
+            warn!(
+                folder = prefix,
+                error, "sync: a folder on Drive could not be listed; leaving it out of this pass"
+            );
+            walk.gaps.unlisted(prefix);
+            Ok(None)
+        }
+    }
 }
 
 /// Whether the file at `path` is no longer what the scan saw as `planned`.

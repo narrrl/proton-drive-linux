@@ -388,7 +388,7 @@ impl Core {
         &self,
         items: &[pdfs_core::control::RestoreItem],
         device: Option<&str>,
-    ) -> CoreResult<String> {
+    ) -> CoreResult<RestoreOutcome> {
         if items.is_empty() {
             return Err(CoreError::invalid("nothing to restore"));
         }
@@ -434,10 +434,19 @@ impl Core {
                     continue;
                 }
             };
-            let id = self
-                .db
-                .sync_folder_add(&local.to_string_lossy(), &item.remote_uid, &device.share_id)
-                .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
+            let id = match self.db.sync_folder_add(
+                &local.to_string_lossy(),
+                &item.remote_uid,
+                &device.share_id,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    // The folders restored before this one still need their
+                    // watches.
+                    let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
+                    return Err(CoreError::internal(format!("db: {e:?}")));
+                }
+            };
             // `ondemand` is applied through the normal request path, which
             // mounts the FUSE session and handles the folder being busy — the
             // restore does not get its own copy of that logic.
@@ -454,12 +463,35 @@ impl Core {
         for reason in &skipped {
             info!(reason, "restore skipped a folder");
         }
-        let mut message = format!("restored {restored} folder(s)");
-        if !skipped.is_empty() {
-            message.push_str(&format!("; skipped: {}", skipped.join(", ")));
-        }
         info!(restored, skipped = skipped.len(), "restore complete");
-        Ok(message)
+        Ok(RestoreOutcome { restored, skipped })
+    }
+}
+
+/// What a restore did: how many folders it attached, and why it left out the
+/// others.
+pub(crate) struct RestoreOutcome {
+    pub(crate) restored: usize,
+    pub(crate) skipped: Vec<String>,
+}
+
+impl RestoreOutcome {
+    /// The activity entry's headline.
+    pub(crate) fn summary(&self) -> String {
+        match (self.restored, self.skipped.len()) {
+            (n, 0) => format!("restored {n} folder(s)"),
+            (0, k) => format!("restored no folders; skipped {k}"),
+            (n, k) => format!("restored {n} folder(s); skipped {k}"),
+        }
+    }
+
+    /// Whether the restore did all it was asked. A skipped folder is a
+    /// failure the user has to see: the reply went out as "restoring folders"
+    /// before any work, and a restore that skipped every folder used to be
+    /// logged as a success, so nothing anywhere said that nothing would
+    /// download (`docs/BUGS.md` B269).
+    pub(crate) fn complete(&self) -> bool {
+        self.skipped.is_empty()
     }
 }
 

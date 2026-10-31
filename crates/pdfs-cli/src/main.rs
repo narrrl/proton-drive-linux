@@ -1458,7 +1458,11 @@ fn cmd_sync_restore(yes: bool, device: Option<String>) -> Result<()> {
             items: chosen,
         },
         None => CtlRequest::RestoreSyncFolders { items: chosen },
-    })?)
+    })?)?;
+    // The daemon acks before it works, so the outcome, and any folder it had
+    // to skip, only shows up later.
+    println!("Run `pdfs activity` to see which folders were restored.");
+    Ok(())
 }
 
 /// Expand a leading `~` in a hand-typed path. The daemon requires an absolute
