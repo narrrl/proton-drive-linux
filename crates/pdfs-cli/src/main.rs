@@ -20,6 +20,8 @@ use pdfs_core::control::{
 use pdfs_core::db::Db;
 use pdfs_core::service;
 
+mod journal;
+
 /// `println!` for this binary, shadowing std's, which panics when stdout is
 /// closed: `pdfs ls | head` ended in a "Broken pipe" panic once `head` had its
 /// lines. This one hands the failure to [`stdout_written`] instead.
@@ -879,15 +881,22 @@ fn cli_error(kind: ErrorKind, message: &str) -> String {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // `pgp` logs a benign WARN when it re-serializes a Proton secret-key
-                // packet with a longer (but equivalent) length encoding than the
-                // original; drop it to error so normal runs stay quiet.
-                .unwrap_or_else(|_| "info,pgp=error".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        // `pgp` logs a benign WARN when it re-serializes a Proton secret-key
+        // packet with a longer (but equivalent) length encoding than the
+        // original; drop it to error so normal runs stay quiet.
+        .unwrap_or_else(|_| "info,pgp=error".into());
+    if journal::stdout_is_journal() {
+        // journalctl colours lines by the priority the prefix gives them, so
+        // the escape codes would only be noise in the stored text.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .event_format(journal::Prioritized(tracing_subscriber::fmt::format()))
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let cli = Cli::parse();
     JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
@@ -3143,6 +3152,24 @@ fn human_secs(secs: u64) -> String {
     }
 }
 
+/// The sync engine's line in `pdfs diagnostics`: whether it runs, and which
+/// folder's pass it is on.
+fn sync_engine_line(sync: &pdfs_core::control::SyncEngineState) -> String {
+    let mut line = match (sync.running, sync.pass_folder) {
+        (false, _) => "STOPPED; synced folders do not sync until the daemon restarts".to_string(),
+        (true, None) => "idle".to_string(),
+        (true, Some(folder)) => format!(
+            "pass on folder {folder} for {}, last progress {} ago",
+            human_secs(sync.pass_age_secs),
+            human_secs(sync.pass_idle_secs),
+        ),
+    };
+    if sync.panics > 0 {
+        line.push_str(&format!("; {} pass(es) panicked", sync.panics));
+    }
+    line
+}
+
 fn cmd_diagnostics() -> Result<()> {
     let response = control_request(CtlRequest::Diagnostics)?;
     if emit_json(&response)? {
@@ -3177,6 +3204,9 @@ fn cmd_diagnostics() -> Result<()> {
                     what,
                     human_secs(worker.age_secs)
                 );
+            }
+            if let Some(sync) = &d.sync {
+                println!("sync engine: {}", sync_engine_line(sync));
             }
             if d.inflight.is_empty() {
                 println!("in-flight requests: none");

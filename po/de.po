@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-10-31 10:37+0100\n"
+"POT-Creation-Date: 2026-10-31 19:26+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: German\n"
@@ -249,13 +249,13 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/browser.rs:1917
 #: crates/pdfs-gui/src/app/pages/browser.rs:2039
 #: crates/pdfs-gui/src/app/pages/browser.rs:2540
-#: crates/pdfs-gui/src/app/pages/devices.rs:804
-#: crates/pdfs-gui/src/app/pages/devices.rs:957
-#: crates/pdfs-gui/src/app/pages/devices.rs:995
-#: crates/pdfs-gui/src/app/pages/devices.rs:1047
-#: crates/pdfs-gui/src/app/pages/devices.rs:1091
-#: crates/pdfs-gui/src/app/pages/devices.rs:1131
-#: crates/pdfs-gui/src/app/pages/devices.rs:1194
+#: crates/pdfs-gui/src/app/pages/devices.rs:826
+#: crates/pdfs-gui/src/app/pages/devices.rs:979
+#: crates/pdfs-gui/src/app/pages/devices.rs:1017
+#: crates/pdfs-gui/src/app/pages/devices.rs:1069
+#: crates/pdfs-gui/src/app/pages/devices.rs:1113
+#: crates/pdfs-gui/src/app/pages/devices.rs:1153
+#: crates/pdfs-gui/src/app/pages/devices.rs:1216
 #: crates/pdfs-gui/src/app/pages/locations.rs:850
 #: crates/pdfs-gui/src/app/pages/locations.rs:1054
 #: crates/pdfs-gui/src/app/pages/locations.rs:1537
@@ -350,7 +350,7 @@ msgstr "Raster / Liste"
 #: crates/pdfs-gui/src/app/pages/albums.rs:298
 #: crates/pdfs-gui/src/app/pages/browser.rs:1896
 #: crates/pdfs-gui/src/app/pages/browser.rs:1918
-#: crates/pdfs-gui/src/app/pages/devices.rs:996
+#: crates/pdfs-gui/src/app/pages/devices.rs:1018
 #: crates/pdfs-gui/src/app/widgets/details.rs:161
 msgid "Rename"
 msgstr "Umbenennen"
@@ -433,7 +433,9 @@ msgstr "Proton Drive kann nicht geöffnet werden"
 msgid ""
 "The Proton Drive service keeps failing to start and tries again on its own. "
 "The last error was: {error}"
-msgstr "Der Proton-Drive-Dienst kann wiederholt nicht starten und versucht es selbstständig erneut. Letzter Fehler: {error}"
+msgstr ""
+"Der Proton-Drive-Dienst kann wiederholt nicht starten und versucht es "
+"selbstständig erneut. Letzter Fehler: {error}"
 
 #: crates/pdfs-gui/src/app/main.rs:1824
 #: crates/pdfs-gui/src/app/pages/status.rs:355
@@ -693,7 +695,7 @@ msgid "Couldn't add a sync folder"
 msgstr "Synchronisierungsordner konnte nicht hinzugefügt werden"
 
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:58
-#: crates/pdfs-gui/src/app/pages/devices.rs:839
+#: crates/pdfs-gui/src/app/pages/devices.rs:861
 msgid "Couldn't restore folders"
 msgstr "Ordner konnten nicht wiederhergestellt werden"
 
@@ -1285,12 +1287,12 @@ msgstr "Alben konnten nicht geladen werden"
 #: crates/pdfs-gui/src/app/pages/browser.rs:1873
 #: crates/pdfs-gui/src/app/pages/browser.rs:2500
 #: crates/pdfs-gui/src/app/pages/browser.rs:2650
-#: crates/pdfs-gui/src/app/pages/devices.rs:707
-#: crates/pdfs-gui/src/app/pages/devices.rs:747
-#: crates/pdfs-gui/src/app/pages/devices.rs:900
-#: crates/pdfs-gui/src/app/pages/devices.rs:1170
-#: crates/pdfs-gui/src/app/pages/devices.rs:1231
-#: crates/pdfs-gui/src/app/pages/devices.rs:1260
+#: crates/pdfs-gui/src/app/pages/devices.rs:729
+#: crates/pdfs-gui/src/app/pages/devices.rs:769
+#: crates/pdfs-gui/src/app/pages/devices.rs:922
+#: crates/pdfs-gui/src/app/pages/devices.rs:1192
+#: crates/pdfs-gui/src/app/pages/devices.rs:1253
+#: crates/pdfs-gui/src/app/pages/devices.rs:1282
 #: crates/pdfs-gui/src/app/pages/duplicates.rs:221
 #: crates/pdfs-gui/src/app/pages/locations.rs:577
 #: crates/pdfs-gui/src/app/pages/locations.rs:824
@@ -1940,7 +1942,7 @@ msgid "{status}. {message}"
 msgstr "{status}. {message}"
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:1900
-#: crates/pdfs-gui/src/app/pages/devices.rs:989
+#: crates/pdfs-gui/src/app/pages/devices.rs:1011
 msgid "New name"
 msgstr "Neuer Name"
 
@@ -1965,7 +1967,7 @@ msgstr "Den Zielordner auswählen."
 
 #: crates/pdfs-gui/src/app/pages/browser.rs:1989
 #: crates/pdfs-gui/src/app/pages/browser.rs:1994
-#: crates/pdfs-gui/src/app/pages/devices.rs:1195
+#: crates/pdfs-gui/src/app/pages/devices.rs:1217
 msgid "Move Here"
 msgstr "Hierher verschieben"
 
@@ -2290,76 +2292,87 @@ msgid_plural "{n} folders backed up"
 msgstr[0] "{n} Ordner gesichert"
 msgstr[1] "{n} Ordner gesichert"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:608
+#: crates/pdfs-gui/src/app/pages/devices.rs:607
+#, rust-format
+msgid "{folders} · {n} waiting for its first sync"
+msgid_plural "{folders} · {n} waiting for their first sync"
+msgstr[0] "{folders} · {n} wartet auf die erste Synchronisierung"
+msgstr[1] "{folders} · {n} warten auf die erste Synchronisierung"
+
+#: crates/pdfs-gui/src/app/pages/devices.rs:621
 #, rust-format
 msgid "{folders} · {n} needs attention"
 msgid_plural "{folders} · {n} need attention"
 msgstr[0] "{folders} · {n} erfordert Aufmerksamkeit"
 msgstr[1] "{folders} · {n} erfordern Aufmerksamkeit"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:619
+#: crates/pdfs-gui/src/app/pages/devices.rs:640
 msgid "syncing…"
 msgstr "wird synchronisiert …"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:620
+#: crates/pdfs-gui/src/app/pages/devices.rs:641
 msgid "sync error"
 msgstr "Synchronisierungsfehler"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:621
+#: crates/pdfs-gui/src/app/pages/devices.rs:642
 msgid "needs attention"
 msgstr "erfordert Aufmerksamkeit"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:622
+#: crates/pdfs-gui/src/app/pages/devices.rs:643
+msgid "waiting for first sync"
+msgstr "wartet auf erste Synchronisierung"
+
+#: crates/pdfs-gui/src/app/pages/devices.rs:644
 msgid "up to date"
 msgstr "aktuell"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:632
+#: crates/pdfs-gui/src/app/pages/devices.rs:654
 msgid "checking for changes…"
 msgstr "wird auf Änderungen geprüft …"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:638
+#: crates/pdfs-gui/src/app/pages/devices.rs:660
 #, rust-format
 msgid "checking for changes — {n} item checked"
 msgid_plural "checking for changes — {n} items checked"
 msgstr[0] "wird auf Änderungen geprüft – {n} Element geprüft"
 msgstr[1] "wird auf Änderungen geprüft – {n} Elemente geprüft"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:645
+#: crates/pdfs-gui/src/app/pages/devices.rs:667
 #, rust-format
 msgid "checking for changes — {done} of {total}"
 msgstr "wird auf Änderungen geprüft – {done} von {total}"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:657
+#: crates/pdfs-gui/src/app/pages/devices.rs:679
 #, rust-format
 msgid "syncing {done} of {total}"
 msgstr "{done} von {total} wird synchronisiert"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:663
+#: crates/pdfs-gui/src/app/pages/devices.rs:685
 #, rust-format
 msgid "syncing {file} — {done} of {total}"
 msgstr "{file} wird synchronisiert – {done} von {total}"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:675
+#: crates/pdfs-gui/src/app/pages/devices.rs:697
 msgid "Add Folder to Sync"
 msgstr "Ordner zur Synchronisierung hinzufügen"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:699
+#: crates/pdfs-gui/src/app/pages/devices.rs:721
 #: crates/pdfs-gui/src/app/pages/locations.rs:1559
 #: crates/pdfs-gui/src/app/pages/locations.rs:1686
 msgid "Syncing folder…"
 msgstr "Ordner wird synchronisiert …"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:702
-#: crates/pdfs-gui/src/app/pages/devices.rs:706
+#: crates/pdfs-gui/src/app/pages/devices.rs:724
+#: crates/pdfs-gui/src/app/pages/devices.rs:728
 msgid "Couldn't add folder"
 msgstr "Ordner konnte nicht hinzugefügt werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:740
-#: crates/pdfs-gui/src/app/pages/devices.rs:746
+#: crates/pdfs-gui/src/app/pages/devices.rs:762
+#: crates/pdfs-gui/src/app/pages/devices.rs:768
 msgid "Couldn't list folders to restore"
 msgstr "Wiederherstellbare Ordner konnten nicht aufgelistet werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:772
+#: crates/pdfs-gui/src/app/pages/devices.rs:794
 msgid ""
 "Tick the folders to sync to this machine, and adjust where each one should "
 "live."
@@ -2367,19 +2380,19 @@ msgstr ""
 "Die Ordner ankreuzen, die mit diesem Rechner synchronisiert werden sollen, "
 "und für jeden den Speicherort anpassen."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:798
+#: crates/pdfs-gui/src/app/pages/devices.rs:820
 msgid "Restore Folders"
 msgstr "Ordner wiederherstellen"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:805
+#: crates/pdfs-gui/src/app/pages/devices.rs:827
 msgid "Restore"
 msgstr "Wiederherstellen"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:838
+#: crates/pdfs-gui/src/app/pages/devices.rs:860
 msgid "Restoring folders…"
 msgstr "Ordner werden wiederhergestellt …"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:850
+#: crates/pdfs-gui/src/app/pages/devices.rs:872
 #, rust-format
 msgid ""
 "These folders are backed up from “{name}”. Restored folders keep syncing "
@@ -2388,37 +2401,37 @@ msgstr ""
 "Diese Ordner werden von „{name}“ gesichert. Wiederhergestellte Ordner werden "
 "weiterhin mit der Kopie dieses Computers synchronisiert."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:853
+#: crates/pdfs-gui/src/app/pages/devices.rs:875
 msgid "These folders are backed up under this computer in Proton Drive."
 msgstr "Diese Ordner werden in Proton Drive unter diesem Computer gesichert."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:862
+#: crates/pdfs-gui/src/app/pages/devices.rs:884
 #, rust-format
 msgid "Nothing to restore — “{name}”'s folders are all synced here."
 msgstr ""
 "Nichts wiederherzustellen – alle Ordner von „{name}“ werden bereits hier "
 "synchronisiert."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:865
+#: crates/pdfs-gui/src/app/pages/devices.rs:887
 msgid "Nothing to restore — this computer's folders are all synced here."
 msgstr ""
 "Nichts wiederherzustellen – alle Ordner dieses Computers werden bereits hier "
 "synchronisiert."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:889
+#: crates/pdfs-gui/src/app/pages/devices.rs:911
 msgid "Folder will switch to online only"
 msgstr "Ordner wird auf „Nur online“ umgestellt"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:891
+#: crates/pdfs-gui/src/app/pages/devices.rs:913
 msgid "Folder will download and stay synced"
 msgstr "Ordner wird heruntergeladen und bleibt synchronisiert"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:895
-#: crates/pdfs-gui/src/app/pages/devices.rs:899
+#: crates/pdfs-gui/src/app/pages/devices.rs:917
+#: crates/pdfs-gui/src/app/pages/devices.rs:921
 msgid "Couldn't change mode"
 msgstr "Modus konnte nicht geändert werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:931
+#: crates/pdfs-gui/src/app/pages/devices.rs:953
 #, rust-format
 msgid ""
 "Stop syncing “{path}”?\n"
@@ -2436,7 +2449,7 @@ msgstr ""
 "Ordner auf „Synchronisiert“ umstellen und vor dem Entfernen warten, bis der "
 "Download abgeschlossen ist."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:937
+#: crates/pdfs-gui/src/app/pages/devices.rs:959
 #, rust-format
 msgid ""
 "Stop syncing “{path}”?\n"
@@ -2450,68 +2463,68 @@ msgstr ""
 "mehr synchronisiert. Es kann zusätzlich ausgewählt werden, die Kopie in "
 "Proton Drive zu löschen."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:942
+#: crates/pdfs-gui/src/app/pages/devices.rs:964
 msgid "Stop Syncing Folder?"
 msgstr "Synchronisierung des Ordners beenden?"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:947
+#: crates/pdfs-gui/src/app/pages/devices.rs:969
 msgid "Also delete from Proton Drive"
 msgstr "Auch aus Proton Drive löschen"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:949
+#: crates/pdfs-gui/src/app/pages/devices.rs:971
 msgid "Deletes the only copy of these files."
 msgstr "Löscht die einzige Kopie dieser Dateien."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:951
+#: crates/pdfs-gui/src/app/pages/devices.rs:973
 msgid "The local copy is unaffected."
 msgstr "Die lokale Kopie bleibt unverändert."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:958
+#: crates/pdfs-gui/src/app/pages/devices.rs:980
 msgid "Stop Syncing"
 msgstr "Synchronisierung beenden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:971
+#: crates/pdfs-gui/src/app/pages/devices.rs:993
 msgid "Stopped syncing folder"
 msgstr "Synchronisierung des Ordners beendet"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:972
+#: crates/pdfs-gui/src/app/pages/devices.rs:994
 msgid "Couldn't stop syncing the folder"
 msgstr "Synchronisierung des Ordners konnte nicht beendet werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:983
+#: crates/pdfs-gui/src/app/pages/devices.rs:1005
 msgid "Rename Computer"
 msgstr "Computer umbenennen"
 
 #. Translators: {name} is the computer's current name.
-#: crates/pdfs-gui/src/app/pages/devices.rs:985
+#: crates/pdfs-gui/src/app/pages/devices.rs:1007
 #, rust-format
 msgid "Rename “{name}”."
 msgstr "„{name}“ umbenennen."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1010
-#: crates/pdfs-gui/src/app/pages/devices.rs:1022
+#: crates/pdfs-gui/src/app/pages/devices.rs:1032
+#: crates/pdfs-gui/src/app/pages/devices.rs:1044
 msgid "Couldn't rename the computer"
 msgstr "Der Computer konnte nicht umbenannt werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1011
+#: crates/pdfs-gui/src/app/pages/devices.rs:1033
 msgid "A name is required."
 msgstr "Ein Name ist erforderlich."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1021
+#: crates/pdfs-gui/src/app/pages/devices.rs:1043
 msgid "Computer renamed"
 msgstr "Computer umbenannt"
 
 #. Translators: {name} is the computer's name, which the user must type.
-#: crates/pdfs-gui/src/app/pages/devices.rs:1034
+#: crates/pdfs-gui/src/app/pages/devices.rs:1056
 #, rust-format
 msgid "Type “{name}” to confirm"
 msgstr "Zur Bestätigung „{name}“ eingeben"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1039
+#: crates/pdfs-gui/src/app/pages/devices.rs:1061
 msgid "Remove Computer?"
 msgstr "Computer entfernen?"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1042
+#: crates/pdfs-gui/src/app/pages/devices.rs:1064
 #, rust-format
 msgid ""
 "Remove “{name}” from this account?\n"
@@ -2526,26 +2539,26 @@ msgstr ""
 "gelöscht. Die Dateien auf dem Computer selbst bleiben unberührt – dies kann "
 "jedoch von hier aus nicht rückgängig gemacht werden."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1048
+#: crates/pdfs-gui/src/app/pages/devices.rs:1070
 #: crates/pdfs-gui/src/app/pages/shared.rs:1025
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:634
 #: crates/pdfs-gui/src/app/widgets/share_dialog.rs:876
 msgid "Remove"
 msgstr "Entfernen"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1065
+#: crates/pdfs-gui/src/app/pages/devices.rs:1087
 msgid "Computer removed"
 msgstr "Computer entfernt"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1066
+#: crates/pdfs-gui/src/app/pages/devices.rs:1088
 msgid "Couldn't remove the computer"
 msgstr "Der Computer konnte nicht entfernt werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1084
+#: crates/pdfs-gui/src/app/pages/devices.rs:1106
 msgid "Continue This Backup Here?"
 msgstr "Diese Sicherung hier fortsetzen?"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1087
+#: crates/pdfs-gui/src/app/pages/devices.rs:1109
 #, rust-format
 msgid ""
 "This computer takes over the backup of “{name}”, for example after a "
@@ -2564,25 +2577,25 @@ msgstr ""
 "werden nicht verschoben. Mit „Auf diesem Computer wiederherstellen“ lässt "
 "sich danach zurückholen, was „{name}“ synchronisiert hat."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1092
+#: crates/pdfs-gui/src/app/pages/devices.rs:1114
 msgid "Continue Here"
 msgstr "Hier fortsetzen"
 
 #. Translators: {name} is the name of the computer whose backup this one took over.
-#: crates/pdfs-gui/src/app/pages/devices.rs:1099
+#: crates/pdfs-gui/src/app/pages/devices.rs:1121
 #, rust-format
 msgid "Now backing up as “{name}”"
 msgstr "Sicherung jetzt als „{name}“"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1108
+#: crates/pdfs-gui/src/app/pages/devices.rs:1130
 msgid "Couldn't continue that backup here"
 msgstr "Diese Sicherung konnte hier nicht fortgesetzt werden"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1124
+#: crates/pdfs-gui/src/app/pages/devices.rs:1146
 msgid "Sync With This Computer?"
 msgstr "Mit diesem Computer synchronisieren?"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1127
+#: crates/pdfs-gui/src/app/pages/devices.rs:1149
 #, rust-format
 msgid ""
 "This computer and “{name}” keep the same folders in step. A change or a "
@@ -2599,25 +2612,25 @@ msgstr ""
 "„{name}“. Bereits hier synchronisierte Ordner bleiben, wo sie sind. Als "
 "Nächstes wählen Sie, welche seiner Ordner hier synchronisiert werden."
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1132
+#: crates/pdfs-gui/src/app/pages/devices.rs:1154
 msgid "Sync Here"
 msgstr "Hier synchronisieren"
 
 #. Translators: {name} is the name of the other computer this one now syncs with.
-#: crates/pdfs-gui/src/app/pages/devices.rs:1139
+#: crates/pdfs-gui/src/app/pages/devices.rs:1161
 #, rust-format
 msgid "Now syncing with “{name}”"
 msgstr "Jetzt synchron mit „{name}“"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1155
+#: crates/pdfs-gui/src/app/pages/devices.rs:1177
 msgid "Couldn't sync with that computer"
 msgstr "Synchronisierung mit diesem Computer nicht möglich"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1187
+#: crates/pdfs-gui/src/app/pages/devices.rs:1209
 msgid "Move Backup to This Computer?"
 msgstr "Sicherung auf diesen Computer verschieben?"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1190
+#: crates/pdfs-gui/src/app/pages/devices.rs:1212
 #, rust-format
 msgid ""
 "The folders backed up by “{name}” move into this computer's backup in Proton "
@@ -2634,12 +2647,12 @@ msgstr ""
 "verschwinden."
 
 #. Translators: {name} is the name of the computer whose folders moved to this one.
-#: crates/pdfs-gui/src/app/pages/devices.rs:1202
+#: crates/pdfs-gui/src/app/pages/devices.rs:1224
 #, rust-format
 msgid "Moved the backup of “{name}”"
 msgstr "Sicherung von „{name}“ verschoben"
 
-#: crates/pdfs-gui/src/app/pages/devices.rs:1216
+#: crates/pdfs-gui/src/app/pages/devices.rs:1238
 msgid "Couldn't move that backup"
 msgstr "Diese Sicherung konnte nicht verschoben werden"
 
@@ -3385,7 +3398,7 @@ msgid "paused"
 msgstr "pausiert"
 
 #. Translators: a folder's files can't be opened right now.
-#: crates/pdfs-gui/src/app/pages/locations.rs:1742
+#: crates/pdfs-gui/src/app/pages/locations.rs:1745
 msgid "not available"
 msgstr "nicht verfügbar"
 
