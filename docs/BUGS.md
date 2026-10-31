@@ -70,9 +70,7 @@ original wording.
 |---|---|---|
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id | Not fixed |
-| [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing | Not fixed |
 | [B270](#b270--one-file-left-in-a-mirror-folder-clears-the-wipe-guard-for-all-the-others) | One file left in a mirror folder clears the wipe guard for all the others | Not fixed |
-| [B269](#b269--a-restore-that-skipped-every-folder-reports-success) | A restore that skipped every folder reports success | Not fixed |
 | [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" | Not fixed |
@@ -96,6 +94,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B269](#b269--a-restore-that-skipped-every-folder-reports-success) | A restore that skipped every folder reports success | The app shows the result only in the activity feed; no offer to replace or reset the folder in the way |
 | [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
@@ -116,6 +115,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
@@ -414,7 +414,7 @@ watched.
 
 ### B271 — One failed listing makes a large first sync start over from nothing
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, code audit after issue #46: a folder of about 19,900 items restored on a
 second computer sat at `scanning…` with nothing downloaded, and the journal showed
 `RequestTimeout (http 408)`.
@@ -431,8 +431,13 @@ the walk is done. Files that did download keep their baseline rows, so only the 
 but on a first sync that is all of it. Progress is also counted only after a folder's full
 listing, so a large folder shows `scanning…` with 0 checked for a long time.
 
-**Fix.** Not done. Record a failed subtree as a gap, as undecryptable nodes already are: no
-deletions under it, and the rest of the pass still applies.
+**Fix.** A listing that fails below the sync root records that folder as a gap in
+`RemoteGaps`, next to the folders whose listing came back short. The planner deletes nothing
+under a gap, the rest of the pass still applies, and the pass report names the folder as
+tried again next pass. A failed listing of the root itself still fails the pass, since there is
+nothing left to apply. The progress count inside one large folder is unchanged.
+
+**Test:** `a_folder_that_failed_to_list_hides_everything_under_it` in `sync::planner`.
 
 ---
 
@@ -459,7 +464,7 @@ choice to the user: delete on the other side, or sync from scratch.
 
 ### B269 — A restore that skipped every folder reports success
 
-**Status:** Open
+**Status:** Partly fixed
 **Found:** 2026-10-31, code audit after issue #46: the journal showed `restore complete
 restored=0 skipped=1` several times, and the user saw nothing.
 **Where:** the `RestoreSyncFolders` and `RestoreDeviceFolders` handler in
@@ -474,9 +479,14 @@ result, `restored 0 folder(s); skipped: …`, is then logged as a successful act
 reason is only in the activity text and the journal. When the database insert fails partway,
 the `?` also skips the `Rewatch` for the folders already restored.
 
-**Fix.** Not done. Log a restore that skipped folders as a failure, name the reason in the app
-and the CLI, and offer to replace or reset the folder in the way. Send the `Rewatch` on every
-exit path.
+**Fix.** `restore_sync_folders` returns what it restored and what it skipped, with the reason
+for each skip. The daemon logs a restore that skipped any folder as a failed activity, with the
+reasons as its detail, and warns in the journal. A database error partway now sends the
+`Rewatch` for the folders already restored before it returns. `pdfs devices join` points to
+`pdfs activity` for the result.
+
+Left: the app shows the result only in the activity feed, and nothing offers to replace or reset
+the folder in the way.
 
 ---
 
