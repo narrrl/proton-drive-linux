@@ -77,8 +77,6 @@ original wording.
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" | Not fixed |
 | [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open | Needs an SDK change; not reproduced |
-| [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running | Not fixed |
-| [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Not fixed |
 | [B262](#b262--watching-a-large-synced-folder-holds-up-the-sync-engine-and-a-failed-watch-is-never-retried) | Watching a large synced folder holds up the sync engine, and a failed watch is never retried | Not fixed |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" | Not fixed |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder | Not fixed |
@@ -96,6 +94,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Errors no retry fixes back off like network errors |
 | [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
@@ -116,6 +115,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
@@ -567,7 +567,7 @@ tokens, and only the active ones for signing. Skip and log an address that canno
 
 ### B264 — A mount that fails after starting its workers leaves them running
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, code audit after issue #40.
 **Where:** `run_mount` in `crates/pdfs-fuse/src/mount.rs`
 
@@ -581,14 +581,20 @@ permission check, a `spawn_session` error, and a `?` on a later thread spawn) sk
 the `flock` held, every later attempt fails with "another daemon is using cache.db" instead
 of the real error. That part is inferred from the code and not observed.
 
-**Fix.** Not done. Bind the socket and check the mountpoint before any worker starts, and stop
-the workers on every error path.
+**Fix.** Every early return in `mount` after the first worker starts stops the workers
+(`abandon_workers`, `keep_or_abandon` in `crates/pdfs-fuse/src/mount.rs`). Unlike a normal stop
+it does not send `STOPPING=1`, because the daemon is about to retry and systemd would
+otherwise wait for it to exit and then kill it. The control-thread failure path, which already
+stopped its workers, no longer sends it either.
+
+**Test:** none of its own; the simulations (`sim::daemon`, 55 passed) cover the normal start
+and stop.
 
 ---
 
 ### B263 — A mount that can never succeed retries every 5 s and tells only the journal
 
-**Status:** Open
+**Status:** Partly fixed. Errors that no retry fixes are not told apart from network errors yet.
 **Found:** 2026-10-31, issue #40: the app showed "Connecting… waiting for the Proton Drive
 service" for days, `pdfs diagnose` only reported the control socket missing, and the reporter
 uninstalled.
@@ -605,9 +611,23 @@ four requests, so a broken account sends tens of thousands a day, which may also
 Proton's sign-in blocks (#39). The control socket is bound only after the mount succeeds, and
 the error is written nowhere a front end can read it.
 
-**Fix.** Not done. Back off exponentially, treat key, `KeysLocked` and 4xx errors as permanent
-with a long back-off, and write the last error where the app, the tray and `diagnose` can
-show it (a state file, and `STATUS=` to systemd).
+**Fix.**
+- The retry doubles from 5 s to a 2-minute ceiling (`mount_retry_delay` in
+  `crates/pdfs-cli/src/main.rs`), about 720 attempts a day instead of 17,000. The ceiling stays
+  at minutes because a cold start without a network fails the same way and has to mount soon
+  after the network returns.
+- Each failure is written to `mount-failure.json` in the state directory
+  (`crates/pdfs-core/src/mountfail.rs`), with the error, since when it fails and the attempt
+  count. A mount that comes up removes it, and so does a new daemon.
+- The app shows "Can't open your Drive" with the error and a Retry button instead of
+  "Connecting…". The tray says "Signed in as … — can't open your Drive". `pdfs diagnose` reports
+  `[FAIL] mount: failing for …`. `systemctl --user status` shows the error as the unit's status.
+- Not done: key, `KeysLocked` and 4xx errors still retry like network errors, only less often.
+
+**Test:** `a_failing_mount_backs_off_to_a_ceiling` in `pdfs-cli`;
+`a_recorded_failure_reads_back_until_cleared` in `pdfs-core`. On 2026-10-31 a second
+`pdfs daemon` beside the running one failed on the database lock three times in 18 s (at 0, 5
+and 15 s) and recorded `attempts: 3` with the lock error.
 
 ---
 

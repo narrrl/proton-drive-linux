@@ -1797,13 +1797,35 @@ pub(crate) fn service_unreachable(
             );
             return;
         }
-        status(
-            &ui,
-            "network-idle-symbolic",
-            &gettext("Connecting…"),
-            &gettext("Waiting for the Proton Drive service to start."),
-            false,
-        );
+        // Running but not answering may be a mount that fails on every try,
+        // which never opens the socket. Its reason is in a file the daemon
+        // keeps for this (B263); "Connecting…" alone looked like a slow start
+        // for as long as it lasted.
+        let state_dir = ui.dirs.state_dir();
+        let failure = gio::spawn_blocking(move || pdfs_core::mountfail::read(&state_dir))
+            .await
+            .ok()
+            .flatten();
+        match failure {
+            Some(failure) => status(
+                &ui,
+                "dialog-warning-symbolic",
+                &gettext("Can't open your Drive"),
+                // Translators: {error} is an error message, in English.
+                &gettext_f(
+                    "The Proton Drive service keeps failing to start and tries again on its own. The last error was: {error}",
+                    &[("error", &failure.error)],
+                ),
+                true,
+            ),
+            None => status(
+                &ui,
+                "network-idle-symbolic",
+                &gettext("Connecting…"),
+                &gettext("Waiting for the Proton Drive service to start."),
+                false,
+            ),
+        }
         glib::timeout_add_local_once(CONNECT_RETRY_INTERVAL, move || {
             if ui.stack.visible_child_name().as_deref() == Some(page) {
                 reload(&ui);
