@@ -72,7 +72,6 @@ original wording.
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B270](#b270--one-file-left-in-a-mirror-folder-clears-the-wipe-guard-for-all-the-others) | One file left in a mirror folder clears the wipe guard for all the others | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
-| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open | Needs an SDK change; not reproduced |
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
 | [B67](#b67--fresh-state-restore-can-silently-select-a-new-device-high-22) | Fresh-state restore can silently select a new device (HIGH-22) | An ambiguous device after a loss of local state is not asked about |
@@ -110,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
 | [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" |
@@ -618,7 +618,7 @@ error, reads as offline. That covers every caller at once, the database ones inc
 
 ### B265 — Address keys whose token is for an inactive account key never open
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, code audit after issue #40: a Duo account whose mount failed on every
 start with `fetch My Files root: cryptography error: failed to decrypt: missing key`, after three
 `failed to decrypt address key token` warnings. The web app worked. B210's fix does not apply,
@@ -635,8 +635,17 @@ already reports "token is for inactive account key", so the case is known. Separ
 `addresses()` fails as a whole through `?` when one address has no usable primary key, which
 takes the working addresses down with it.
 
-**Fix.** Not done, and it belongs in the SDK. Use every account key that opens for decrypting
-tokens, and only the active ones for signing. Skip and log an address that cannot be opened.
+**Fix.** In `proton-sdk` 0.10.1 (narrrl/proton-sdk-rs#3). Tokens are tried with every account
+key that opens, active ones first, and signing uses active keys only. An address that cannot be
+opened is left out with a warning, and the others work; `addresses()` fails only when none
+opens. When the left-out address is the default, `default_address` fails with the reason
+rather than signing with another address. `key_report` walks the same chain, so `pdfs diagnose`
+reports such a key as opening. Not verified against an account with an inactive key, since
+none is at hand; issue #40's reporter can confirm.
+
+**Test:** `an_address_key_whose_token_is_for_an_inactive_account_key_opens`,
+`an_address_whose_keys_do_not_open_leaves_the_others_working` and
+`an_account_whose_addresses_all_fail_to_open_is_an_error` in `proton-sdk`.
 
 ---
 
