@@ -74,7 +74,6 @@ original wording.
 | [B269](#b269--a-restore-that-skipped-every-folder-reports-success) | A restore that skipped every folder reports success | Not fixed |
 | [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
-| [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" | Not fixed |
 | [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open | Needs an SDK change; not reproduced |
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
@@ -111,6 +110,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" |
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
@@ -525,7 +525,7 @@ report the others as their own state through `Status`.
 
 ### B266 — Pin, unpin, search and node loads report a database error as "offline"
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, code audit after issue #38. B205 fixed the photo upload path only.
 **Where:** `CoreError::from_api` in `crates/pdfs-core/src/error.rs`; its callers in
 `crates/pdfs-fuse/src/lib.rs` (`pin`, `unpin`, the searches, `load node`)
@@ -538,8 +538,11 @@ it was written for SDK calls, where that means a transport error. These callers 
 `pdfs_core::Error` values from the cache and the database. A `ProtonError` wrapped in
 `pdfs_core::Error::Proton` also misses the downcast, since the source chain is not walked.
 
-**Fix.** Not done. Use `CoreError::internal` at the database callers, and walk the source
-chain in `from_api` before falling back.
+**Fix.** `from_api` walks the source chain. The first `ProtonError` or `pdfs_core::Error` in it
+decides the kind, the same way `From<Error>` does, and only an error with neither, a transport
+error, reads as offline. That covers every caller at once, the database ones included.
+
+**Test:** `a_database_error_handed_to_from_api_is_not_offline` in `pdfs-core`.
 
 ---
 
