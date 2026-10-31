@@ -597,6 +597,19 @@ pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
         folders.len() as u64,
         &[],
     );
+    // A folder whose first pass has not run is not backed up yet, whatever its
+    // state column says (`docs/BUGS.md` B261).
+    let waiting = folders.iter().filter(|f| never_synced(f)).count();
+    let count = match waiting {
+        0 => count,
+        // Translators: {folders} is "N folders backed up"; {n} counts the folders whose first sync has not run yet.
+        n => ngettext_f(
+            "{folders} · {n} waiting for its first sync",
+            "{folders} · {n} waiting for their first sync",
+            n as u64,
+            &[("folders", &count)],
+        ),
+    };
     let attention = folders
         .iter()
         .filter(|f| f.state == "error" || f.state == "conflict")
@@ -613,12 +626,21 @@ pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
     }
 }
 
-/// Human label for a synced folder's `state` column.
-pub(crate) fn sync_state_label(state: &str) -> String {
+/// Whether a synced folder is a mirror whose first pass has not finished.
+/// Its `state` starts out `idle`, which would read as "up to date".
+fn never_synced(folder: &SyncFolderInfo) -> bool {
+    folder.mode == "mirror" && folder.last_sync == 0 && folder.state == "idle"
+}
+
+/// Human label for a synced folder's `state` column. `never_synced` is a
+/// mirror folder whose first pass has not finished: its `state` starts out
+/// `idle`, and "up to date" would say the opposite of the truth (B261).
+pub(crate) fn sync_state_label(state: &str, never_synced: bool) -> String {
     match state {
         "syncing" => gettext("syncing…"),
         "error" => gettext("sync error"),
         "conflict" => gettext("needs attention"),
+        _ if never_synced => gettext("waiting for first sync"),
         _ => gettext("up to date"),
     }
 }
@@ -1274,7 +1296,7 @@ mod tests {
             remote_uid: "vol~link".into(),
             mode: "mirror".into(),
             state: state.into(),
-            last_sync: 0,
+            last_sync: 1_700_000_000,
             pending_mode: None,
             progress: None,
             paused: false,
@@ -1284,6 +1306,33 @@ mod tests {
     #[test]
     fn a_machine_with_no_folders_says_so() {
         assert_eq!(this_computer_subtitle(&[]), "No folders backed up yet");
+    }
+
+    /// A folder added a moment ago is not backed up yet, and the row must not
+    /// say it is (`docs/BUGS.md` B261). An on-demand folder has no first sync.
+    #[test]
+    fn a_folder_before_its_first_sync_is_not_counted_as_backed_up() {
+        let new = SyncFolderInfo {
+            last_sync: 0,
+            ..folder("idle")
+        };
+        assert_eq!(
+            this_computer_subtitle(&[folder("idle"), new.clone()]),
+            "2 folders backed up · 1 waiting for its first sync"
+        );
+        let failed = SyncFolderInfo {
+            state: "error".into(),
+            ..new.clone()
+        };
+        assert_eq!(
+            this_computer_subtitle(&[new.clone(), failed]),
+            "2 folders backed up · 1 waiting for its first sync · 1 needs attention"
+        );
+        let on_demand = SyncFolderInfo {
+            mode: "ondemand".into(),
+            ..new
+        };
+        assert_eq!(this_computer_subtitle(&[on_demand]), "1 folder backed up");
     }
 
     #[test]

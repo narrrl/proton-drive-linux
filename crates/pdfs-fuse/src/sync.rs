@@ -49,7 +49,9 @@ mod local_scan;
 mod model;
 mod planner;
 pub(crate) use engine::SYNC_CONCURRENCY;
-pub(crate) use engine::{SyncMsg, spawn};
+pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
+#[cfg(test)]
+use engine::{Running, burst_order, keep_wanted};
 #[cfg(test)]
 use engine::{classify, event_target, settle_with};
 #[cfg(test)]
@@ -67,6 +69,11 @@ use planner::{
     plan_file, rel_to_path, remote_sig, remote_subtree_changed, revision_moved, tracked_baseline,
     unchanged_remote_size,
 };
+
+/// A pass that took at least this long is logged at info even when it changed
+/// nothing, so the journal says where a slow engine spends its time.
+const SLOW_PASS: Duration = Duration::from_secs(30);
+
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
 enum Applied {
@@ -154,6 +161,14 @@ impl Core {
         // The cost is one small file read against a pass that is about to walk the
         // whole tree.
         let rules = self.ignore_rules(&local_root);
+        // A first pass is the one a user waits on after adding or restoring a
+        // folder, so it is said at info; the poll's passes stay at debug.
+        if folder.last_sync == 0 {
+            info!(id = folder.id, path = %folder.local_path, "sync: first pass starting");
+        } else {
+            debug!(id = folder.id, "sync: pass starting");
+        }
+        let started = Instant::now();
         self.progress_begin(folder.id);
         let result = if push_only {
             self.push_pass(folder.id, &local_root, &remote_root, &rules)
@@ -195,6 +210,18 @@ impl Core {
                     "idle"
                 };
                 let _ = self.db.sync_folder_set_state(folder.id, state, now_secs());
+                let elapsed = started.elapsed();
+                if folder.last_sync == 0 || !outcome.is_empty() || elapsed >= SLOW_PASS {
+                    info!(
+                        id = folder.id,
+                        state,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        summary = %outcome.summary(),
+                        "sync: pass finished"
+                    );
+                } else {
+                    debug!(id = folder.id, state, "sync: pass finished");
+                }
                 self.report_unscanned(folder.id, name, &outcome.unscanned);
                 // Summarise a pass that actually moved something. A poll over an
                 // unchanged folder does nothing and says nothing — otherwise the
@@ -1135,14 +1162,22 @@ impl Core {
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(folder))
-            .map_err(|e| format!("enumerate {folder}: {e}"))?;
+            .map_err(|e| format!("enumerate {folder}: {e}"));
+        let uids = match unlisted_gap(walk, prefix, uids)? {
+            Some(uids) => uids,
+            None => return Ok(()),
+        };
         if uids.is_empty() {
             return Ok(());
         }
         let nodes = self
             .rt
             .block_on(self.drive.enumerate_nodes_light(&uids))
-            .map_err(|e| format!("resolve nodes: {e}"))?;
+            .map_err(|e| format!("resolve nodes: {e}"));
+        let nodes = match unlisted_gap(walk, prefix, nodes)? {
+            Some(nodes) => nodes,
+            None => return Ok(()),
+        };
         // The SDK leaves out a node it cannot decrypt, and says so only in its
         // log. Its name went with it, so all this can record is the folder.
         if nodes.len() < uids.len() {
@@ -1186,10 +1221,14 @@ impl Core {
         let sized: HashMap<String, (i64, Option<String>)> = if stale.is_empty() {
             HashMap::new()
         } else {
-            self.rt
+            let full = self
+                .rt
                 .block_on(self.drive.enumerate_nodes(&stale))
-                .map_err(|e| format!("resolve nodes: {e}"))?
-                .iter()
+                .map_err(|e| format!("resolve nodes: {e}"));
+            let Some(full) = unlisted_gap(walk, prefix, full)? else {
+                return Ok(());
+            };
+            full.iter()
                 .map(|n| {
                     (
                         n.uid.to_string(),
@@ -2007,6 +2046,34 @@ struct RemoteWalk<'a> {
     gaps: &'a mut RemoteGaps,
 }
 
+/// A listing call's result in [`Core::walk_remote`]. A failure below the root
+/// records `prefix` as unlisted and returns `None`, so the walk goes on
+/// without that folder. A failure at the root still fails the pass, since
+/// nothing would be left to compare.
+///
+/// One listing error, after the SDK's own retries, used to fail the whole
+/// walk. Nothing is applied before the walk ends, so on a link that drops a
+/// request now and then a large first sync started over from nothing on
+/// every pass and never got past it (`docs/BUGS.md` B271).
+fn unlisted_gap<T>(
+    walk: &mut RemoteWalk<'_>,
+    prefix: &str,
+    result: Result<T, String>,
+) -> Result<Option<T>, PassAbort> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if prefix.is_empty() => Err(error.into()),
+        Err(error) => {
+            warn!(
+                folder = prefix,
+                error, "sync: a folder on Drive could not be listed; leaving it out of this pass"
+            );
+            walk.gaps.unlisted(prefix);
+            Ok(None)
+        }
+    }
+}
+
 /// Whether the file at `path` is no longer what the scan saw as `planned`.
 /// A file that is gone has nothing left to lose, so it has not changed.
 fn changed_since_scan(path: &Path, planned: &LocalItem) -> bool {
@@ -2437,6 +2504,72 @@ fn system_mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in a pass ends that pass and is counted; the engine is not
+    /// left believing the pass still runs (`docs/BUGS.md` B259).
+    #[test]
+    fn a_panicking_pass_is_contained_and_counted() {
+        let health = EngineHealth::default();
+        assert!(!health.contain(7, || panic!("a pass that panics")));
+        let report = health.report();
+        assert_eq!(report.panics, 1);
+        assert_eq!(report.pass_folder, None);
+        assert!(health.contain(7, || {}));
+        assert_eq!(health.report().panics, 1);
+    }
+
+    /// Folders named by id run before the rest of a `ReconcileAll` in the
+    /// same burst, so a folder just added does not wait behind a pass over
+    /// every other folder (`docs/BUGS.md` B260).
+    #[test]
+    fn named_folders_run_before_the_rest_of_a_burst() {
+        let ids: HashSet<i64> = [9, 4].into();
+        assert_eq!(burst_order(&ids, &[1, 4, 6, 9]), [4, 9, 1, 6]);
+        assert_eq!(burst_order(&HashSet::new(), &[1, 4]), [1, 4]);
+        // A folder the list no longer has still gets the pass it asked for.
+        assert_eq!(burst_order(&[12].into(), &[1]), [12, 1]);
+    }
+
+    /// A folder removed and added again keeps its watch under the new id;
+    /// a folder that is gone loses its watch (`docs/BUGS.md` B272).
+    #[test]
+    fn a_re_added_folder_keeps_its_watch_under_the_new_id() {
+        let mut have = vec![(PathBuf::from("/a"), 1), (PathBuf::from("/b"), 2)];
+        let dropped = keep_wanted(&mut have, &[(PathBuf::from("/a"), 7)]);
+        assert_eq!(have, [(PathBuf::from("/a"), 7)]);
+        assert_eq!(dropped, [PathBuf::from("/b")]);
+    }
+
+    /// While a pass runs, the report names its folder, which is what tells a
+    /// long pass apart from an idle engine.
+    #[test]
+    fn the_running_pass_is_reported() {
+        let health = EngineHealth::default();
+        let mut seen = None;
+        health.contain(7, || seen = health.report().pass_folder);
+        assert_eq!(seen, Some(7));
+    }
+
+    /// The engine reads as running only while its thread lives, including
+    /// when the thread ends in a panic.
+    #[test]
+    fn the_engine_reads_as_stopped_once_its_thread_ends() {
+        let health = Arc::new(EngineHealth::default());
+        let thread_health = health.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (end_tx, end_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _running = Running::start(&thread_health);
+            started_tx.send(()).unwrap();
+            let _ = end_rx.recv();
+            panic!("the engine thread panics");
+        });
+        started_rx.recv().unwrap();
+        assert!(health.report().running);
+        end_tx.send(()).unwrap();
+        assert!(thread.join().is_err());
+        assert!(!health.report().running);
+    }
 
     /// A removal of something already gone has produced the state the sync
     /// engine wanted, so its baseline is dropped rather than retried forever.
