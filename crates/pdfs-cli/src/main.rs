@@ -2467,12 +2467,28 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
             "could not save the refreshed session tokens; the next start may need `pdfs login`"
         );
     }
-    // Dropping the runtime waits for every blocking task, however long; a call
-    // still stuck on Drive would hold the stop until systemd kills it (B165).
-    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    release_runtime(rt, matches!(result, Ok(pdfs_fuse::MountOutcome::Shutdown)));
 
     let outcome = result.context("mount failed")?;
     Ok(outcome)
+}
+
+/// Let go of a mount's runtime once the mount has ended.
+///
+/// On a stop the process exits right after, so the runtime is left running
+/// for it to end with. Shutting it down first broke every thread the mount
+/// does not join, such as a size lookup or a profile backup a request started
+/// during the stop: its next call to Drive panicked with "A Tokio 1.x context
+/// was found, but it is being shutdown" (`docs/BUGS.md` B276). A mount that
+/// is about to be tried again does shut it down, because a new runtime
+/// replaces it. Dropping it would wait for every blocking task, however long;
+/// a call still stuck on Drive would hold the retry (B165).
+fn release_runtime(rt: tokio::runtime::Runtime, exiting: bool) {
+    if exiting {
+        std::mem::forget(rt);
+    } else {
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
 }
 
 fn cmd_pin(path: PathBuf) -> Result<()> {
@@ -3942,6 +3958,47 @@ fn control_request(req: CtlRequest) -> Result<CtlResponse> {
     let socket = AppDirs::new()?.control_socket();
     pdfs_core::control::send(&socket, &req)
         .with_context(|| format!("talk to mount daemon at {}", socket.display()))
+}
+
+#[cfg(test)]
+mod release_runtime_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A thread the mount never joined still reaches Drive after a stop. It
+    /// used to panic on its first timer once the runtime was shut down.
+    #[test]
+    fn a_thread_left_running_at_a_stop_can_still_use_the_runtime() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let straggler = std::thread::spawn(move || {
+            released_rx.recv().unwrap();
+            handle.block_on(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                7
+            })
+        });
+        release_runtime(rt, true);
+        released_tx.send(()).unwrap();
+        assert_eq!(straggler.join().expect("the thread must not panic"), 7);
+    }
+
+    #[test]
+    fn a_mount_tried_again_shuts_its_runtime_down() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        rt.spawn(async move {
+            let _done = done_tx;
+            std::future::pending::<()>().await;
+        });
+        release_runtime(rt, false);
+        // The task is dropped with the runtime, and its sender with it.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
 }
 
 #[cfg(test)]

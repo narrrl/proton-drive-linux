@@ -116,6 +116,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
@@ -374,6 +375,65 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B276 — A stop can end with a panic in a thread the stop never waited for
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, by an account run of `scripts/fuse-acceptance.sh --journal-check
+--durability` against the audit branches. Every case passed, and the run still failed. During
+the restart in the durability case on My files, the journal had three
+`ERROR fuser::reply: Failed to send FUSE reply: No such file or directory (os error 2)` lines,
+and after them a panic that the check did not report:
+
+```
+thread '<unnamed>' (1536340) panicked at .../tokio-1.53.1/src/runtime/time/entry.rs:539:9:
+A Tokio 1.x context was found, but it is being shutdown.
+```
+
+The same panic is in the journal of a 3.6.0 stop on 2026-10-28, twice. B91 first saw it in a
+meta worker.
+
+**Where:** `mount_once` and `release_runtime` in `crates/pdfs-cli/src/main.rs`;
+`JournalWatch` and `journal_problems` in `scripts/fuse-acceptance.py`.
+
+**Cause.** A stop joins the drain workers, the sync engine and the FUSE worker pool, and then
+`mount_once` shut the tokio runtime down. Other threads also use the runtime and are never
+joined: a size lookup for a listing, a profile backup, a control request, a database vacuum.
+A request still in progress when the stop began can start one of them. The thread id here is
+nine below the next daemon's pid, so this thread started during the stop. Once the runtime is
+shut down, that thread's next timer panics. Every call to Drive has a timer, because each one is
+bounded.
+
+The three `fuser::reply` lines are part of a correct stop. The stop aborts each mount's FUSE
+connection so the unmount cannot hang. A request that was still running replies after that,
+and the kernel answers a reply on an aborted connection with `ENOENT`.
+
+The journal check matched only the `ERROR` token. A panic goes to stderr with no tracing level,
+so the check did not see it.
+
+**Fix.**
+
+- On a stop, `release_runtime` leaves the runtime running for the process to end with, instead
+  of shutting it down. The process exits right after, so a thread the stop did not wait for
+  can finish its call or be ended by the exit, but it cannot panic. A mount that is about to
+  be tried again still shuts its runtime down with the 2 s limit from B165, because a new
+  runtime replaces it.
+- The journal check counts `panicked at` lines.
+- The journal check ignores the `ENOENT` reply error between the connection abort and the end
+  of that stop ("daemon stopping", or "control socket listening" for a mount that comes back).
+  At any other time the error still counts.
+
+Making the bounded call helpers refuse new calls once the stop flag is set was rejected. The
+stop sets that flag before it waits up to 10 s for the drain workers, so the refusal would cut
+off the second half of an upload the stop is waiting for.
+
+**Test:** `a_thread_left_running_at_a_stop_can_still_use_the_runtime` and
+`a_mount_tried_again_shuts_its_runtime_down` in `crates/pdfs-cli/src/main.rs`. With the old
+shutdown, the first one fails with the same panic at `entry.rs:539`. The new journal
+filter was run on the journal of the run that found this: the three reply errors are no longer
+counted, and the panic is.
+
+---
 
 ### B273 — A restore proposes another computer's paths when the two share a hostname
 
