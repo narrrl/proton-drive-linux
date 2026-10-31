@@ -76,7 +76,6 @@ original wording.
 | [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" | Not fixed |
-| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open | Needs an SDK change; not reproduced |
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running | Not fixed |
 | [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Not fixed |
 | [B262](#b262--watching-a-large-synced-folder-holds-up-the-sync-engine-and-a-failed-watch-is-never-retried) | Watching a large synced folder holds up the sync engine, and a failed watch is never retried | Not fixed |
@@ -116,6 +115,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
@@ -543,7 +543,7 @@ chain in `from_api` before falling back.
 
 ### B265 — Address keys whose token is for an inactive account key never open
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, code audit after issue #40: a Duo account whose mount failed on every
 start with `fetch My Files root: cryptography error: failed to decrypt: missing key`, after three
 `failed to decrypt address key token` warnings. The web app worked. B210's fix does not apply,
@@ -560,8 +560,17 @@ already reports "token is for inactive account key", so the case is known. Separ
 `addresses()` fails as a whole through `?` when one address has no usable primary key, which
 takes the working addresses down with it.
 
-**Fix.** Not done, and it belongs in the SDK. Use every account key that opens for decrypting
-tokens, and only the active ones for signing. Skip and log an address that cannot be opened.
+**Fix.** In `proton-sdk` 0.10.1 (narrrl/proton-sdk-rs#3). Tokens are tried with every account
+key that opens, active ones first, and signing uses active keys only. An address that cannot be
+opened is left out with a warning, and the others work; `addresses()` fails only when none
+opens. When the left-out address is the default, `default_address` fails with the reason
+rather than signing with another address. `key_report` walks the same chain, so `pdfs diagnose`
+reports such a key as opening. Not verified against an account with an inactive key, since
+none is at hand; issue #40's reporter can confirm.
+
+**Test:** `an_address_key_whose_token_is_for_an_inactive_account_key_opens`,
+`an_address_whose_keys_do_not_open_leaves_the_others_working` and
+`an_account_whose_addresses_all_fail_to_open_is_an_error` in `proton-sdk`.
 
 ---
 
