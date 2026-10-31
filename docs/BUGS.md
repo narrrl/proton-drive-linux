@@ -68,6 +68,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id | Not fixed |
 | [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing | Not fixed |
@@ -375,6 +376,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B275 — On a slow link, a file's last write can land only in a conflict copy
+
+**Status:** Open
+**Found:** 2026-10-31, CI on #60: `one_client_on_a_slow_link`, profile `one-client-wifi` seed 2,
+failed with `Drive does not hold what the clients wrote, 120s after the links came up`. The
+same seed passed 4 times locally, and #60 changes no daemon logic, so the failure depends on
+timing.
+**Where:** not located; the drain's conflict check in `crates/pdfs-fuse/src/drain.rs` is the
+first suspect
+
+**Repro:** Only the CI run above. The last steps created `x/z/y/a.txt` (37 bytes), wrote 42
+bytes into it at offset 20, and brought every link up. Drive then held the file at its first
+37 bytes, and the full content was in `x/z/y/a (sync-conflict …).txt`. No other client wrote
+to it.
+
+**Cause.** Not known. Nothing was lost, since the conflict copy holds the bytes, but the file
+conflicted with its own create. B183 and B184 found the same symptom after a lost create
+reply.
+
+**Fix.** Not done. Needs a reproduction: run the seed in a loop under load and keep the state
+directory of a failing run.
+
+---
 
 ### B274 — Opening a file for writing fails with EIO while its queued revision lands
 
