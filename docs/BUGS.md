@@ -82,7 +82,6 @@ original wording.
 | [B262](#b262--watching-a-large-synced-folder-holds-up-the-sync-engine-and-a-failed-watch-is-never-retried) | Watching a large synced folder holds up the sync engine, and a failed watch is never retried | Not fixed |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" | Not fixed |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder | Not fixed |
-| [B259](#b259--the-sync-engine-can-die-or-hang-and-nothing-shows-it-until-a-restart) | The sync engine can die or hang, and nothing shows it until a restart | Not fixed; the trigger in #53 is not known |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged | Not fixed |
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
@@ -96,6 +95,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B259](#b259--the-sync-engine-can-die-or-hang-and-nothing-shows-it-until-a-restart) | The sync engine can die or hang, and nothing shows it until a restart | No pass deadline; an ended engine is reported, not restarted; the trigger in #53 is not known |
 | [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
@@ -680,7 +680,8 @@ while a pass runs.
 
 ### B259 — The sync engine can die or hang, and nothing shows it until a restart
 
-**Status:** Open
+**Status:** Partly fixed. A hung pass is reported but not ended, and a panic outside a pass
+still stops the engine; it is reported, not restarted.
 **Found:** 2026-10-31, issue #53: a newly added folder did not sync until the reporter restarted
 the app. All FUSE workers were idle, nothing was queued, and the warning-level journal was
 empty (B258).
@@ -704,9 +705,24 @@ is why it helps.
   nothing about sync.
 - A database error when the engine reads a folder drops that folder's request without a log.
 
-**Fix.** Not done. Catch a panic per pass, end its progress and set the folder to `error`. Have
-the supervisor restart a finished engine thread. Log passes at info, and report the folder,
-the pass age and the queue in `Diagnostics`.
+**Fix.**
+- Each pass runs under `catch_unwind` (`EngineHealth::contain` in
+  `crates/pdfs-fuse/src/sync/engine.rs`). A panic ends that pass only: its progress is cleared,
+  the folder is set to `error`, the activity feed says so, and the next poll tries again.
+- `Diagnostics` carries the engine's state: running or not, the folder of the running pass, how
+  long it has run and how long since it last reported progress, and how many passes panicked.
+  `pdfs diagnostics` prints it as `sync engine: …`.
+- The supervisor warns when the engine thread has ended, and when a pass has reported no
+  progress for 15 minutes.
+- A first pass logs its start and end at info, as does any pass that changed something or
+  took 30 s or more. A request for a folder the database cannot read is logged.
+- Not done: a deadline for a pass, and restarting an engine thread that has ended. The
+  channel's receiver ends with the thread, so a restart needs a new channel in every `Core`
+  clone.
+
+**Test:** `a_panicking_pass_is_contained_and_counted`, `the_running_pass_is_reported` and
+`the_engine_reads_as_stopped_once_its_thread_ends` in `pdfs-fuse`;
+`a_stopped_sync_engine_is_a_stall` and `only_a_quiet_sync_pass_is_a_stall` in the supervisor.
 
 ---
 

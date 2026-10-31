@@ -1,5 +1,11 @@
 //! Filesystem watcher, polling, and debounce control plane.
 
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use pdfs_core::control::SyncEngineState;
+use tracing::error;
+
 use super::*;
 
 /// How long the watcher must go quiet before a burst counts as finished.
@@ -53,8 +59,124 @@ pub(crate) fn spawn(core: Core, rx: Receiver<SyncMsg>) -> Option<std::thread::Jo
     }
 }
 
+/// Whether the engine is alive and which pass it is on, for
+/// [`Core::diagnostics`] and the supervisor.
+///
+/// A panic in a pass used to end the engine thread. Every later add, sync-now,
+/// file event and poll then went into a channel nobody read, the folder stayed
+/// `syncing`, and nothing said so until a restart (`docs/BUGS.md` B259).
+#[derive(Default)]
+pub(crate) struct EngineHealth {
+    running: AtomicBool,
+    pass: Mutex<Option<PassClock>>,
+    panics: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct PassClock {
+    folder: i64,
+    started: Instant,
+    moved: Instant,
+}
+
+impl EngineHealth {
+    /// Note that the running pass reported progress.
+    pub(crate) fn moved(&self) {
+        if let Some(pass) = self.pass.lock().as_mut() {
+            pass.moved = Instant::now();
+        }
+    }
+
+    /// The engine's state now. `try_lock`, like the rest of the diagnostics:
+    /// a report must not wait on the thing it reports about.
+    pub(crate) fn report(&self) -> SyncEngineState {
+        let pass = self.pass.try_lock().and_then(|pass| *pass);
+        SyncEngineState {
+            running: self.running.load(Ordering::Relaxed),
+            pass_folder: pass.map(|p| p.folder),
+            pass_age_secs: pass.map_or(0, |p| p.started.elapsed().as_secs()),
+            pass_idle_secs: pass.map_or(0, |p| p.moved.elapsed().as_secs()),
+            panics: self.panics.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Run `pass` over `folder` as the current pass. Returns `false` when it
+    /// panicked: the panic ends that pass, not the engine.
+    pub(super) fn contain(&self, folder: i64, pass: impl FnOnce()) -> bool {
+        let now = Instant::now();
+        *self.pass.lock() = Some(PassClock {
+            folder,
+            started: now,
+            moved: now,
+        });
+        let finished = std::panic::catch_unwind(AssertUnwindSafe(pass)).is_ok();
+        *self.pass.lock() = None;
+        if !finished {
+            self.panics.fetch_add(1, Ordering::Relaxed);
+        }
+        finished
+    }
+}
+
+/// Marks the engine running for as long as it lives.
+pub(super) struct Running<'a>(&'a EngineHealth);
+
+impl<'a> Running<'a> {
+    pub(super) fn start(health: &'a EngineHealth) -> Self {
+        health.running.store(true, Ordering::Relaxed);
+        Self(health)
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Relaxed);
+        if std::thread::panicking() {
+            error!("sync engine stopped by a panic; nothing syncs until the daemon restarts");
+        }
+    }
+}
+
+/// One folder's pass, contained: a panic in it sets the folder to `error` and
+/// leaves the engine running for the next one.
+fn run_pass(core: &Core, folder: &StoredSyncFolder) {
+    if core
+        .sync_engine
+        .contain(folder.id, || core.reconcile_folder(folder))
+    {
+        return;
+    }
+    core.progress_end(folder.id);
+    let _ = core
+        .db
+        .sync_folder_set_state(folder.id, "error", folder.last_sync);
+    error!(
+        id = folder.id,
+        path = %folder.local_path,
+        "sync: pass panicked; the folder is set to error and tried again on the next poll"
+    );
+    core.log_activity(
+        ActivityKind::Sync,
+        format!("sync failed for {}", base_name(&folder.local_path)),
+        "an internal error stopped the pass; it is tried again on the next poll",
+        false,
+    );
+}
+
+/// The pass a `Reconcile(id)` asked for. A folder removed since, or one the
+/// database cannot read, is said so rather than dropped in silence.
+fn run_pass_by_id(core: &Core, id: i64) {
+    match core.db.sync_folder_get(id) {
+        Ok(Some(folder)) => run_pass(core, &folder),
+        Ok(None) => debug!(id, "sync: folder removed before its pass; skipping"),
+        Err(e) => warn!(id, error = ?e, "sync: cannot read folder; skipping its pass"),
+    }
+}
+
 /// The engine control loop. Single-threaded so reconcile passes never overlap.
 fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
+    let health = core.sync_engine.clone();
+    let _running = Running::start(&health);
     // Paths the watcher currently covers, mapped to their folder id, so an event
     // path can be resolved back to the folder it belongs to.
     let watched: Arc<Mutex<Vec<(PathBuf, i64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -120,9 +242,7 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
                 if core.sync_paused() {
                     break;
                 }
-                if let Ok(Some(folder)) = core.db.sync_folder_get(id) {
-                    core.reconcile_folder(&folder);
-                }
+                run_pass_by_id(&core, id);
             }
         }
     }
@@ -159,9 +279,7 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
                 if core.sync_paused() {
                     break;
                 }
-                if let Ok(Some(folder)) = core.db.sync_folder_get(id) {
-                    core.reconcile_folder(&folder);
-                }
+                run_pass_by_id(core, id);
             }
         }
     }
@@ -254,7 +372,7 @@ fn reconcile_all(core: &Core) {
         }
     };
     for folder in folders {
-        core.reconcile_folder(&folder);
+        run_pass(core, &folder);
     }
 }
 

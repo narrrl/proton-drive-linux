@@ -163,6 +163,7 @@ impl Core {
             control_handlers: super::control::active_handlers(),
             control_handler_limit: super::control::handler_limit(),
             pending_ops: self.pending_ops_quickly(),
+            sync: Some(self.sync_engine.report()),
         }
     }
 
