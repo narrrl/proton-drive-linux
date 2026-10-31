@@ -3105,6 +3105,24 @@ fn human_secs(secs: u64) -> String {
     }
 }
 
+/// The sync engine's line in `pdfs diagnostics`: whether it runs, and which
+/// folder's pass it is on.
+fn sync_engine_line(sync: &pdfs_core::control::SyncEngineState) -> String {
+    let mut line = match (sync.running, sync.pass_folder) {
+        (false, _) => "STOPPED; synced folders do not sync until the daemon restarts".to_string(),
+        (true, None) => "idle".to_string(),
+        (true, Some(folder)) => format!(
+            "pass on folder {folder} for {}, last progress {} ago",
+            human_secs(sync.pass_age_secs),
+            human_secs(sync.pass_idle_secs),
+        ),
+    };
+    if sync.panics > 0 {
+        line.push_str(&format!("; {} pass(es) panicked", sync.panics));
+    }
+    line
+}
+
 fn cmd_diagnostics() -> Result<()> {
     let response = control_request(CtlRequest::Diagnostics)?;
     if emit_json(&response)? {
@@ -3139,6 +3157,9 @@ fn cmd_diagnostics() -> Result<()> {
                     what,
                     human_secs(worker.age_secs)
                 );
+            }
+            if let Some(sync) = &d.sync {
+                println!("sync engine: {}", sync_engine_line(sync));
             }
             if d.inflight.is_empty() {
                 println!("in-flight requests: none");
