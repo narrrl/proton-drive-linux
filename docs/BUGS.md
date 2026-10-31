@@ -73,7 +73,6 @@ original wording.
 | [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing | Not fixed |
 | [B270](#b270--one-file-left-in-a-mirror-folder-clears-the-wipe-guard-for-all-the-others) | One file left in a mirror folder clears the wipe guard for all the others | Not fixed |
 | [B269](#b269--a-restore-that-skipped-every-folder-reports-success) | A restore that skipped every folder reports success | Not fixed |
-| [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" | Not fixed |
 | [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open | Needs an SDK change; not reproduced |
@@ -96,6 +95,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | The sync engine's state is not checked |
 | [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
@@ -482,7 +482,7 @@ exit path.
 
 ### B268 — `pdfs diagnose` says "No problems found" while sync is stuck
 
-**Status:** Open
+**Status:** Partly fixed. The sync engine's own state is not checked yet.
 **Found:** 2026-10-31, issue #53: a folder that never synced, and `diagnose` found nothing.
 **Where:** `diagnose` in `crates/pdfs-cli/src/main.rs`
 
@@ -495,8 +495,16 @@ folders or for `Diagnostics`, so a folder in error and a stalled worker are not 
 control socket file with no daemon behind it is also reported `[ok]`; only the next line says
 the daemon does not answer.
 
-**Fix.** Not done. Warn on failing or parked writes, a pause, old staged data and folders in
-error, and report the sync engine's state once B259 exposes it.
+**Fix.** `diagnose` warns about writes that keep failing (with the last error), a write that
+has waited a day or more to upload, a pause, and each synced folder in `error` or `conflict`
+(`sync_health` and `folder_health` in `crates/pdfs-cli/src/main.rs`). A control socket file
+that nothing listens on is a warning, not `[ok]`. Parked uploads are left out: a file still
+wearing a download's temporary name is normal. Not done: the sync engine's state, which
+`Diagnostics` reports once B259's change is in.
+
+**Test:** `a_stuck_queue_or_a_pause_is_reported` and `a_synced_folder_in_error_is_reported` in
+`pdfs-cli`. On 2026-10-31 the new `diagnose` against a healthy 3.6.0 daemon still reported
+"No problems found".
 
 ---
 
