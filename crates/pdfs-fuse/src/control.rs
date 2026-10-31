@@ -1526,9 +1526,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             let core = core.clone();
             std::thread::spawn(move || {
                 match core.restore_sync_folders(&items, device.as_deref()) {
-                    Ok(message) => {
+                    Ok(outcome) => {
                         core.touch_profile();
-                        core.log_activity(ActivityKind::Download, &message, "", true);
+                        if !outcome.complete() {
+                            warn!(skipped = ?outcome.skipped, "restore skipped folders");
+                        }
+                        core.log_activity(
+                            ActivityKind::Download,
+                            outcome.summary(),
+                            outcome.skipped.join("; "),
+                            outcome.complete(),
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, "restore failed");
