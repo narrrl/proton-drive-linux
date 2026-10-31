@@ -29,6 +29,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(120);
 /// unusable done one-at-a-time; this bounds concurrency like the bulk-upload
 /// engine does.
 pub(crate) const SYNC_CONCURRENCY: usize = 8;
+/// How long after a failed watch the engine tries the watches again. Each try
+/// walks the folder's whole tree, so not on every burst.
+const REWATCH_RETRY: Duration = Duration::from_secs(600);
 
 /// A message to the sync engine's control thread.
 pub(crate) enum SyncMsg {
@@ -183,24 +186,35 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
 
     let tx_events = core.sync_tx.clone();
     let watched_events = watched.clone();
-    let mut watcher =
-        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            // Ignore pure metadata/access noise; content changes are what matter.
-            if matches!(event.kind, notify::EventKind::Access(_)) {
-                return;
-            }
-            let msg = event_target(&watched_events.lock(), &event.paths);
-            let _ = tx_events.send(msg);
-        }) {
-            Ok(w) => w,
+    let handler = move |res: notify::Result<notify::Event>| {
+        let event = match res {
+            Ok(event) => event,
+            // Running out of inotify watches for a new subfolder, say: that
+            // subfolder's changes are then found by the poll only (B262).
             Err(e) => {
-                warn!(error = %e, "filesystem watcher unavailable; sync is poll-only");
-                // Still run the loop so polling and explicit SyncNow work.
-                poll_only_loop(&core, rx);
+                warn!(error = %e, "sync: filesystem watcher error");
                 return;
             }
         };
+        // Ignore pure metadata/access noise; content changes are what matter.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+        let msg = event_target(&watched_events.lock(), &event.paths);
+        let _ = tx_events.send(msg);
+    };
+    // The local walk skips symlinks, so following them here would only watch
+    // trees outside the folder, and run passes over it for changes made there.
+    let config = notify::Config::default().with_follow_symlinks(false);
+    let mut watcher = match notify::RecommendedWatcher::new(handler, config) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!(error = %e, "filesystem watcher unavailable; sync is poll-only");
+            // Still run the loop so polling and explicit SyncNow work.
+            poll_only_loop(&core, rx);
+            return;
+        }
+    };
 
     // Periodic remote poll.
     {
@@ -218,8 +232,9 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
             .ok();
     }
 
-    rewatch(&core, &mut watcher, &watched);
-    reconcile_all(&core);
+    let mut unwatched = rewatch(&core, &mut watcher, &watched);
+    let mut last_rewatch = Instant::now();
+    run_burst(&core, &HashSet::new(), true);
 
     while let Ok(msg) = rx.recv() {
         let mut ids: HashSet<i64> = HashSet::new();
@@ -232,19 +247,16 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
             return;
         }
 
+        // A folder whose watch failed is tried again now and then, not only
+        // when the folder set changes.
+        if unwatched && last_rewatch.elapsed() >= REWATCH_RETRY {
+            do_rewatch = true;
+        }
         if do_rewatch {
-            rewatch(&core, &mut watcher, &watched);
+            unwatched = rewatch(&core, &mut watcher, &watched);
+            last_rewatch = Instant::now();
         }
-        if all {
-            reconcile_all(&core);
-        } else {
-            for id in ids {
-                if core.sync_paused() {
-                    break;
-                }
-                run_pass_by_id(&core, id);
-            }
-        }
+        run_burst(&core, &ids, all);
     }
 }
 
@@ -261,7 +273,7 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
             }
         });
     }
-    reconcile_all(core);
+    run_burst(core, &HashSet::new(), true);
     while let Ok(msg) = rx.recv() {
         let mut ids: HashSet<i64> = HashSet::new();
         let mut all = false;
@@ -272,17 +284,57 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
             info!("sync engine stopping");
             return;
         }
-        if all {
-            reconcile_all(core);
-        } else {
-            for id in ids {
-                if core.sync_paused() {
-                    break;
-                }
-                run_pass_by_id(core, id);
+        run_burst(core, &ids, all);
+    }
+}
+
+/// Run the passes one burst asked for: the folders named by id, then, when the
+/// burst also holds a `ReconcileAll`, every other folder.
+///
+/// The named folders go first. A poll's `ReconcileAll` in the same burst used
+/// to take their place, and a folder just added, which has the highest id,
+/// waited behind a full pass over every other folder (`docs/BUGS.md` B260).
+///
+/// Skipped while sync is paused, and cut short when a pause lands between
+/// passes: the resume sends a fresh [`SyncMsg::ReconcileAll`], which walks
+/// everything the watcher reported meanwhile.
+fn run_burst(core: &Core, ids: &HashSet<i64>, all: bool) {
+    if core.sync_paused() {
+        debug!("sync: paused, skipping reconcile");
+        return;
+    }
+    let folders = if all {
+        match core.db.sync_folder_list() {
+            Ok(folders) => folders,
+            Err(e) => {
+                warn!(error = ?e, "sync: cannot list folders");
+                Vec::new()
             }
         }
+    } else {
+        Vec::new()
+    };
+    let listed: Vec<i64> = folders.iter().map(|f| f.id).collect();
+    for id in burst_order(ids, &listed) {
+        if core.sync_paused() {
+            break;
+        }
+        // A folder named by id is read again: it may have been added or
+        // changed after the list was read.
+        match folders.iter().find(|f| f.id == id) {
+            Some(folder) if !ids.contains(&id) => run_pass(core, folder),
+            _ => run_pass_by_id(core, id),
+        }
     }
+}
+
+/// The order of a burst's passes: the folders named by id, lowest first, then
+/// the rest of `listed` in its own order.
+pub(super) fn burst_order(ids: &HashSet<i64>, listed: &[i64]) -> Vec<i64> {
+    let mut order: Vec<i64> = ids.iter().copied().collect();
+    order.sort_unstable();
+    order.extend(listed.iter().copied().filter(|id| !ids.contains(id)));
+    order
 }
 
 /// Absorb the rest of an event burst, returning once the watcher has been quiet
@@ -356,26 +408,6 @@ pub(super) fn classify(
     true
 }
 
-/// Reconcile every mirror folder in turn. Skipped while sync is paused: the
-/// resume sends a fresh [`SyncMsg::ReconcileAll`], which walks everything the
-/// watcher reported meanwhile.
-fn reconcile_all(core: &Core) {
-    if core.sync_paused() {
-        debug!("sync: paused, skipping reconcile");
-        return;
-    }
-    let folders = match core.db.sync_folder_list() {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = ?e, "sync: cannot list folders");
-            return;
-        }
-    };
-    for folder in folders {
-        run_pass(core, &folder);
-    }
-}
-
 /// The reconcile a watcher event asks for: the one mirror folder all its paths
 /// lie in, so an edit in one folder does not walk every other one too. An event
 /// that spans folders, or that no watched folder claims (a watch list a moment
@@ -396,7 +428,8 @@ pub(super) fn event_target(watched: &[(PathBuf, i64)], paths: &[PathBuf]) -> Syn
 }
 
 /// Bring the filesystem watches in line with the current mirror-folder set:
-/// watch newly-added folders, drop removed ones.
+/// watch newly-added folders, drop removed ones. Returns whether a folder is
+/// left unwatched because its watch failed.
 ///
 /// The watch calls run on a copy, outside the lock: the watcher's event
 /// callback takes the same lock, and a backend that hands a watch request to
@@ -405,7 +438,7 @@ fn rewatch(
     core: &Core,
     watcher: &mut notify::RecommendedWatcher,
     watched: &Mutex<Vec<(PathBuf, i64)>>,
-) {
+) -> bool {
     let want: Vec<(PathBuf, i64)> = match core.db.sync_folder_list() {
         Ok(f) => f
             .into_iter()
@@ -414,30 +447,60 @@ fn rewatch(
             .collect(),
         Err(e) => {
             warn!(error = ?e, "sync: cannot list folders to watch");
-            return;
+            return false;
         }
     };
     let mut have = watched.lock().clone();
     // Drop watches no longer wanted.
-    have.retain(|(path, _)| {
-        if want.iter().any(|(p, _)| p == path) {
-            true
-        } else {
-            let _ = watcher.unwatch(path);
-            false
-        }
-    });
+    for path in keep_wanted(&mut have, &want) {
+        let _ = watcher.unwatch(&path);
+    }
     // Add newly wanted watches.
+    let mut failed = false;
     for (path, id) in &want {
         if have.iter().any(|(p, _)| p == path) {
             continue;
         }
         match watcher.watch(path, RecursiveMode::Recursive) {
             Ok(()) => have.push((path.clone(), *id)),
-            Err(e) => warn!(path = %path.display(), error = %e, "sync: watch failed"),
+            Err(e) => {
+                // A recursive watch that fails partway keeps the watches it had
+                // added. Their events would match no folder and run a pass over
+                // every one, and they hold watches the next folder needs (B262).
+                let _ = watcher.unwatch(path);
+                failed = true;
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "sync: watch failed; the poll finds this folder's changes until a retry \
+                     works. A low fs.inotify.max_user_watches is the usual cause"
+                );
+            }
         }
     }
     *watched.lock() = have;
+    failed
+}
+
+/// Keep the watches in `have` that `want` still asks for, and return the paths
+/// of the others, to unwatch.
+///
+/// A path is matched alone, but takes the id `want` gives it: a folder removed
+/// and added again in one burst keeps its watch, and its events go to the new
+/// row rather than to the removed one (`docs/BUGS.md` B272).
+pub(super) fn keep_wanted(have: &mut Vec<(PathBuf, i64)>, want: &[(PathBuf, i64)]) -> Vec<PathBuf> {
+    let mut dropped = Vec::new();
+    have.retain_mut(|(path, id)| match want.iter().find(|(p, _)| p == path) {
+        Some((_, wanted)) => {
+            *id = *wanted;
+            true
+        }
+        None => {
+            dropped.push(path.clone());
+            false
+        }
+    });
+    dropped
 }
 
 // ---- reconcile ------------------------------------------------------------
