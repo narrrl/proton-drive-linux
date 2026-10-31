@@ -1980,6 +1980,29 @@ pub struct Diagnostics {
     pub control_handler_limit: usize,
     /// Queued mutations not yet drained.
     pub pending_ops: u64,
+    /// The folder-sync engine. `None` from a daemon that predates the field.
+    #[serde(default)]
+    pub sync: Option<SyncEngineState>,
+}
+
+/// What the folder-sync engine is doing, for [`Diagnostics`].
+///
+/// The engine is one thread that runs every synced folder's passes in turn.
+/// Dead or stuck, it looked exactly like an idle one: workers idle, nothing
+/// queued, nothing in the journal (`docs/BUGS.md` B259).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SyncEngineState {
+    /// Whether the engine thread is running. Once it has ended, nothing syncs
+    /// until the daemon restarts.
+    pub running: bool,
+    /// The synced folder whose pass is running, if one is.
+    pub pass_folder: Option<i64>,
+    /// How long that pass has been running.
+    pub pass_age_secs: u64,
+    /// How long since that pass last reported progress.
+    pub pass_idle_secs: u64,
+    /// Passes that ended in a panic since the daemon started.
+    pub panics: u64,
 }
 
 /// The daemon's reply to a [`Request`].

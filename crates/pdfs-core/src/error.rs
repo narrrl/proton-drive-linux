@@ -160,13 +160,14 @@ impl CoreError {
     /// telling the user their connection is down beats telling them the
     /// server refused. The SDK's other failures say what went wrong instead
     /// (see [`proton_kind`]).
+    ///
+    /// Callers also hand it this crate's [`Error`] from the cache and the
+    /// database, which is not a transport error at all. Taking those for
+    /// "offline" told the user their connection was down when a pin failed on
+    /// the database (`docs/BUGS.md` B266), so the source chain is searched for
+    /// either type before falling back.
     pub fn from_api(e: &(dyn std::error::Error + 'static), what: &str) -> Self {
-        let kind = match e.downcast_ref::<proton_sdk::ProtonError>() {
-            Some(proton) => proton_kind(proton),
-            // Not the SDK's at all: a timeout around the call, or the socket.
-            None => ErrorKind::Offline,
-        };
-        Self::new(kind, format!("{what}: {e}"))
+        Self::new(api_kind_of(e), format!("{what}: {e}"))
     }
 
     /// Prefix the message while keeping the classification.
@@ -208,17 +209,38 @@ impl From<serde_json::Error> for CoreError {
 
 impl From<Error> for CoreError {
     fn from(e: Error) -> Self {
-        let kind = match &e {
-            Error::NotLoggedIn
-            | Error::ReloginRequired
-            | Error::Locked
-            | Error::WrongMailboxPassword
-            | Error::HumanVerificationRequired(_) => ErrorKind::Denied,
-            Error::Proton(proton) => proton_kind(proton),
-            _ => ErrorKind::Internal,
-        };
-        Self::new(kind, e.to_string())
+        Self::new(core_kind(&e), e.to_string())
     }
+}
+
+/// What this crate's [`Error`] means to a front-end.
+fn core_kind(e: &Error) -> ErrorKind {
+    match e {
+        Error::NotLoggedIn
+        | Error::ReloginRequired
+        | Error::Locked
+        | Error::WrongMailboxPassword
+        | Error::HumanVerificationRequired(_) => ErrorKind::Denied,
+        Error::Proton(proton) => proton_kind(proton),
+        _ => ErrorKind::Internal,
+    }
+}
+
+/// The kind for [`CoreError::from_api`]: the first SDK or crate error in `e`'s
+/// source chain decides it.
+fn api_kind_of(e: &(dyn std::error::Error + 'static)) -> ErrorKind {
+    let mut cause = Some(e);
+    while let Some(err) = cause {
+        if let Some(proton) = err.downcast_ref::<proton_sdk::ProtonError>() {
+            return proton_kind(proton);
+        }
+        if let Some(core) = err.downcast_ref::<Error>() {
+            return core_kind(core);
+        }
+        cause = err.source();
+    }
+    // Not the SDK's at all: a timeout around the call, or the socket.
+    ErrorKind::Offline
 }
 
 /// What a failed SDK call means to a front-end.
@@ -412,6 +434,20 @@ mod tests {
         assert!(e.message.ends_with("account has no photos volume"));
         let e: CoreError = Error::Proton(ProtonError::KeysLocked).into();
         assert_ne!(e.kind, ErrorKind::Offline);
+    }
+
+    /// A pin or a search that fails on the database is not the connection, so
+    /// it must not say "You're offline" (`docs/BUGS.md` B266). An SDK error
+    /// wrapped in this crate's type classifies as the SDK error does.
+    #[test]
+    fn a_database_error_handed_to_from_api_is_not_offline() {
+        let db = Error::Other("database is locked".into());
+        assert_eq!(CoreError::from_api(&db, "pin").kind, ErrorKind::Internal);
+        let wrapped = Error::Proton(api(C::DoesNotExist));
+        assert_eq!(
+            CoreError::from_api(&wrapped, "load node").kind,
+            ErrorKind::NotFound
+        );
     }
 
     /// `Error` is the plumbing type; converting it must classify as sharply as
