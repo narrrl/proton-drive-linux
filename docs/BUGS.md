@@ -80,7 +80,6 @@ original wording.
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running | Not fixed |
 | [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Not fixed |
 | [B262](#b262--watching-a-large-synced-folder-holds-up-the-sync-engine-and-a-failed-watch-is-never-retried) | Watching a large synced folder holds up the sync engine, and a failed watch is never retried | Not fixed |
-| [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" | Not fixed |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder | Not fixed |
 | [B259](#b259--the-sync-engine-can-die-or-hang-and-nothing-shows-it-until-a-restart) | The sync engine can die or hang, and nothing shows it until a restart | Not fixed; the trigger in #53 is not known |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged | Not fixed |
@@ -116,6 +115,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
@@ -638,7 +638,7 @@ turn off symlink following, and show a watch failure in the folder's state.
 
 ### B261 — A folder that has never synced reads "up to date"
 
-**Status:** Open
+**Status:** Fixed, not verified live
 **Found:** 2026-10-31, issue #53: "In Computers I add the folder. It appears as synced."
 **Where:** `sync_folder` in `crates/pdfs-core/src/db/migrations.rs`; `sync_state_label` in
 `crates/pdfs-gui/src/app/pages/devices.rs`; the location rows in
@@ -653,8 +653,15 @@ every folder while sync is paused for the whole account.
 it, and a test pins the label for that case. The rows only show a folder's own pause, not the
 account-wide one.
 
-**Fix.** Not done. Show "waiting for first sync" when `last_sync` is 0, and show the
-account-wide pause on the folder rows.
+**Fix.** A mirror folder whose `last_sync` is 0 and whose state is `idle` reads "waiting for
+first sync" on its row. The This computer row on the Computers page counts such folders, as in
+"2 folders backed up · 1 waiting for its first sync". An on-demand folder has no first sync,
+so it is left out. The account-wide pause stays where it already is, the pause card at the top
+of the page; repeating it on every row would only add noise.
+
+**Test:** `a_folder_reads_up_to_date_only_after_its_first_sync` and
+`a_folder_before_its_first_sync_is_not_counted_as_backed_up` in `pdfs-gui`; the pinned test now
+expects the new label.
 
 ---
 
