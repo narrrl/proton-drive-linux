@@ -48,8 +48,10 @@ mod engine;
 mod local_scan;
 mod model;
 mod planner;
+#[cfg(test)]
+use engine::Running;
 pub(crate) use engine::SYNC_CONCURRENCY;
-pub(crate) use engine::{SyncMsg, spawn};
+pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
 #[cfg(test)]
 use engine::{classify, event_target, settle_with};
 #[cfg(test)]
@@ -67,6 +69,11 @@ use planner::{
     plan_file, rel_to_path, remote_sig, remote_subtree_changed, revision_moved, tracked_baseline,
     unchanged_remote_size,
 };
+
+/// A pass that took at least this long is logged at info even when it changed
+/// nothing, so the journal says where a slow engine spends its time.
+const SLOW_PASS: Duration = Duration::from_secs(30);
+
 /// What a [`Pending`] op did, so the reconcile can update shared state on the
 /// engine thread (never inside a task).
 enum Applied {
@@ -154,6 +161,14 @@ impl Core {
         // The cost is one small file read against a pass that is about to walk the
         // whole tree.
         let rules = self.ignore_rules(&local_root);
+        // A first pass is the one a user waits on after adding or restoring a
+        // folder, so it is said at info; the poll's passes stay at debug.
+        if folder.last_sync == 0 {
+            info!(id = folder.id, path = %folder.local_path, "sync: first pass starting");
+        } else {
+            debug!(id = folder.id, "sync: pass starting");
+        }
+        let started = Instant::now();
         self.progress_begin(folder.id);
         let result = if push_only {
             self.push_pass(folder.id, &local_root, &remote_root, &rules)
@@ -195,6 +210,18 @@ impl Core {
                     "idle"
                 };
                 let _ = self.db.sync_folder_set_state(folder.id, state, now_secs());
+                let elapsed = started.elapsed();
+                if folder.last_sync == 0 || !outcome.is_empty() || elapsed >= SLOW_PASS {
+                    info!(
+                        id = folder.id,
+                        state,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        summary = %outcome.summary(),
+                        "sync: pass finished"
+                    );
+                } else {
+                    debug!(id = folder.id, state, "sync: pass finished");
+                }
                 self.report_unscanned(folder.id, name, &outcome.unscanned);
                 // Summarise a pass that actually moved something. A poll over an
                 // unchanged folder does nothing and says nothing — otherwise the
@@ -2437,6 +2464,50 @@ fn system_mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in a pass ends that pass and is counted; the engine is not
+    /// left believing the pass still runs (`docs/BUGS.md` B259).
+    #[test]
+    fn a_panicking_pass_is_contained_and_counted() {
+        let health = EngineHealth::default();
+        assert!(!health.contain(7, || panic!("a pass that panics")));
+        let report = health.report();
+        assert_eq!(report.panics, 1);
+        assert_eq!(report.pass_folder, None);
+        assert!(health.contain(7, || {}));
+        assert_eq!(health.report().panics, 1);
+    }
+
+    /// While a pass runs, the report names its folder, which is what tells a
+    /// long pass apart from an idle engine.
+    #[test]
+    fn the_running_pass_is_reported() {
+        let health = EngineHealth::default();
+        let mut seen = None;
+        health.contain(7, || seen = health.report().pass_folder);
+        assert_eq!(seen, Some(7));
+    }
+
+    /// The engine reads as running only while its thread lives, including
+    /// when the thread ends in a panic.
+    #[test]
+    fn the_engine_reads_as_stopped_once_its_thread_ends() {
+        let health = Arc::new(EngineHealth::default());
+        let thread_health = health.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (end_tx, end_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _running = Running::start(&thread_health);
+            started_tx.send(()).unwrap();
+            let _ = end_rx.recv();
+            panic!("the engine thread panics");
+        });
+        started_rx.recv().unwrap();
+        assert!(health.report().running);
+        end_tx.send(()).unwrap();
+        assert!(thread.join().is_err());
+        assert!(!health.report().running);
+    }
 
     /// A removal of something already gone has produced the state the sync
     /// engine wanted, so its baseline is dropped rather than retried forever.
