@@ -110,13 +110,13 @@ a live account since.
 | Entry | Title |
 |---|---|
 | [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
-| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
+| [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
 | [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" |
+| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
-| [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
