@@ -36,6 +36,11 @@ const TICK: Duration = Duration::from_secs(15);
 /// would train everyone to ignore the real one.
 const STALL_AFTER: Duration = Duration::from_secs(120);
 
+/// How long a sync pass may go without reporting progress before it is called
+/// out. Much longer than [`STALL_AFTER`]: one large file in a pass reports
+/// nothing until its whole transfer is done.
+const SYNC_STALL_AFTER: Duration = Duration::from_secs(900);
+
 /// How often resident size goes into the log.
 const RSS_EVERY: Duration = Duration::from_secs(300);
 
@@ -137,6 +142,26 @@ fn report_stalls(report: &pdfs_core::control::Diagnostics, last_completed: (u64,
             "the transfer lane has not completed a job since the last check"
         );
     }
+    // The engine is one thread for every synced folder, so a dead or stuck one
+    // stops all of them while the worker pool looks idle (B259).
+    if let Some(sync) = &report.sync {
+        if !sync.running {
+            stalled = true;
+            warn!(
+                "the sync engine is not running; synced folders do not sync until the daemon restarts"
+            );
+        } else if let Some(folder) = sync.pass_folder
+            && sync.pass_idle_secs >= SYNC_STALL_AFTER.as_secs()
+        {
+            stalled = true;
+            warn!(
+                folder,
+                age_secs = sync.pass_age_secs,
+                idle_secs = sync.pass_idle_secs,
+                "a sync pass has not reported progress for a long time"
+            );
+        }
+    }
     stalled
 }
 
@@ -169,7 +194,7 @@ fn probe(control_socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfs_core::control::{Diagnostics, InflightRequest, WorkerState};
+    use pdfs_core::control::{Diagnostics, InflightRequest, SyncEngineState, WorkerState};
 
     fn busy_worker(age_secs: u64) -> WorkerState {
         WorkerState {
@@ -225,5 +250,46 @@ mod tests {
         };
         assert!(!report_stalls(&report, (0, 30)));
         assert!(report_stalls(&report, (0, 40)));
+    }
+
+    fn with_sync(sync: SyncEngineState) -> Diagnostics {
+        Diagnostics {
+            sync: Some(sync),
+            ..Default::default()
+        }
+    }
+
+    /// A sync engine that has ended stops every synced folder while the
+    /// workers look idle, which is what issue #53 looked like (B259).
+    #[test]
+    fn a_stopped_sync_engine_is_a_stall() {
+        assert!(report_stalls(
+            &with_sync(SyncEngineState::default()),
+            (0, 0)
+        ));
+    }
+
+    /// A pass that keeps reporting progress is working, however long it runs;
+    /// one that has gone quiet past the threshold is not.
+    #[test]
+    fn only_a_quiet_sync_pass_is_a_stall() {
+        let busy = SyncEngineState {
+            running: true,
+            pass_folder: Some(3),
+            pass_age_secs: SYNC_STALL_AFTER.as_secs() * 4,
+            pass_idle_secs: 5,
+            panics: 0,
+        };
+        assert!(!report_stalls(&with_sync(busy.clone()), (0, 0)));
+        let quiet = SyncEngineState {
+            pass_idle_secs: SYNC_STALL_AFTER.as_secs(),
+            ..busy
+        };
+        assert!(report_stalls(&with_sync(quiet), (0, 0)));
+        let idle = SyncEngineState {
+            running: true,
+            ..Default::default()
+        };
+        assert!(!report_stalls(&with_sync(idle), (0, 0)));
     }
 }
