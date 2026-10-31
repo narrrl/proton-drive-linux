@@ -20,6 +20,8 @@ use pdfs_core::control::{
 use pdfs_core::db::Db;
 use pdfs_core::service;
 
+mod journal;
+
 /// `println!` for this binary, shadowing std's, which panics when stdout is
 /// closed: `pdfs ls | head` ended in a "Broken pipe" panic once `head` had its
 /// lines. This one hands the failure to [`stdout_written`] instead.
@@ -879,15 +881,22 @@ fn cli_error(kind: ErrorKind, message: &str) -> String {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // `pgp` logs a benign WARN when it re-serializes a Proton secret-key
-                // packet with a longer (but equivalent) length encoding than the
-                // original; drop it to error so normal runs stay quiet.
-                .unwrap_or_else(|_| "info,pgp=error".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        // `pgp` logs a benign WARN when it re-serializes a Proton secret-key
+        // packet with a longer (but equivalent) length encoding than the
+        // original; drop it to error so normal runs stay quiet.
+        .unwrap_or_else(|_| "info,pgp=error".into());
+    if journal::stdout_is_journal() {
+        // journalctl colours lines by the priority the prefix gives them, so
+        // the escape codes would only be noise in the stored text.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .event_format(journal::Prioritized(tracing_subscriber::fmt::format()))
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let cli = Cli::parse();
     JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
