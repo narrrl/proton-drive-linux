@@ -48,10 +48,10 @@ mod engine;
 mod local_scan;
 mod model;
 mod planner;
-#[cfg(test)]
-use engine::Running;
 pub(crate) use engine::SYNC_CONCURRENCY;
 pub(crate) use engine::{EngineHealth, SyncMsg, spawn};
+#[cfg(test)]
+use engine::{Running, burst_order, keep_wanted};
 #[cfg(test)]
 use engine::{classify, event_target, settle_with};
 #[cfg(test)]
@@ -2476,6 +2476,28 @@ mod tests {
         assert_eq!(report.pass_folder, None);
         assert!(health.contain(7, || {}));
         assert_eq!(health.report().panics, 1);
+    }
+
+    /// Folders named by id run before the rest of a `ReconcileAll` in the
+    /// same burst, so a folder just added does not wait behind a pass over
+    /// every other folder (`docs/BUGS.md` B260).
+    #[test]
+    fn named_folders_run_before_the_rest_of_a_burst() {
+        let ids: HashSet<i64> = [9, 4].into();
+        assert_eq!(burst_order(&ids, &[1, 4, 6, 9]), [4, 9, 1, 6]);
+        assert_eq!(burst_order(&HashSet::new(), &[1, 4]), [1, 4]);
+        // A folder the list no longer has still gets the pass it asked for.
+        assert_eq!(burst_order(&[12].into(), &[1]), [12, 1]);
+    }
+
+    /// A folder removed and added again keeps its watch under the new id;
+    /// a folder that is gone loses its watch (`docs/BUGS.md` B272).
+    #[test]
+    fn a_re_added_folder_keeps_its_watch_under_the_new_id() {
+        let mut have = vec![(PathBuf::from("/a"), 1), (PathBuf::from("/b"), 2)];
+        let dropped = keep_wanted(&mut have, &[(PathBuf::from("/a"), 7)]);
+        assert_eq!(have, [(PathBuf::from("/a"), 7)]);
+        assert_eq!(dropped, [PathBuf::from("/b")]);
     }
 
     /// While a pass runs, the report names its folder, which is what tells a
