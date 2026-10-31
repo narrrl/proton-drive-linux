@@ -1434,6 +1434,14 @@ impl ProtonFs {
                     // (`ContentCache::clone_or_copy`).
                     if let Err(e) = ContentCache::clone_or_copy(&pending.path, &path) {
                         let _ = std::fs::remove_file(&path);
+                        // The drain lets go of the pending entry before it
+                        // discards the blob, so a blob that went away under the
+                        // copy is a revision that landed or was replaced: the
+                        // same race the re-check below catches, only earlier.
+                        if self.core.pending_blob(&uid).as_ref() != Some(&pending.path) {
+                            warn!(%uid, attempt, "queued revision went away while opening for write; retrying");
+                            continue;
+                        }
                         error!(%uid, source = %pending.path.display(), error = %e,
                             "copy queued revision into write scratch failed");
                         break 'install Err(Errno::EIO);
