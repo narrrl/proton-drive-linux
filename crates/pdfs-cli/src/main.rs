@@ -2384,12 +2384,21 @@ where
 /// an external unmount triggers a remount; errors back off and retry. This is
 /// the entry point for the systemd user service.
 fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
+    let state_dir = AppDirs::new()?.state_dir();
+    // A failure an earlier daemon recorded is not this one's.
+    pdfs_core::mountfail::clear(&state_dir);
+    let mut failure: Option<pdfs_core::mountfail::MountFailure> = None;
     loop {
         // Wait until a session is stored. The GUI enables this service on login,
         // but the service may also start at boot before the user has logged in.
         wait_for_session(auth::ready, pdfs_fuse::idle_sleep)?;
 
-        match mount_once(mountpoint.clone()) {
+        let outcome = mount_once(mountpoint.clone());
+        if outcome.is_ok() {
+            // The mount came up, so the next failure starts a new run of them.
+            failure = None;
+        }
+        match outcome {
             Ok(pdfs_fuse::MountOutcome::Shutdown) => {
                 tracing::info!("daemon stopping");
                 return Ok(());
@@ -2404,11 +2413,49 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
             Err(e) => {
                 // `{:#}` so the whole anyhow chain lands in the log — the top
                 // context alone ("mount failed") never says *why*.
-                tracing::error!(error = format!("{e:#}"), "mount failed; retrying in 5s");
-                pdfs_fuse::idle_sleep(std::time::Duration::from_secs(5));
+                let error = format!("{e:#}");
+                let now = unix_now();
+                let attempts = failure.as_ref().map_or(1, |f| f.attempts.saturating_add(1));
+                let delay = mount_retry_delay(attempts);
+                tracing::error!(
+                    error,
+                    attempts,
+                    retry_secs = delay.as_secs(),
+                    "mount failed; retrying"
+                );
+                let record = pdfs_core::mountfail::MountFailure {
+                    error: error.clone(),
+                    since: failure.as_ref().map_or(now, |f| f.since),
+                    attempts,
+                    next_attempt: now + delay.as_secs() as i64,
+                };
+                if let Err(e) = pdfs_core::mountfail::record(&state_dir, &record) {
+                    tracing::warn!(error = %e, "could not record the mount failure");
+                }
+                pdfs_fuse::notify_status(&format!("Mount failing: {error}"));
+                failure = Some(record);
+                pdfs_fuse::idle_sleep(delay);
             }
         }
     }
+}
+
+/// How long to wait before mount attempt `attempts + 1`, after `attempts`
+/// failures in a row.
+///
+/// Doubles from 5 s to a 2-minute ceiling. A flat 5 s retry sent about four
+/// requests to Proton per attempt, tens of thousands a day from an account
+/// whose mount fails on a key, which no retry fixes (`docs/BUGS.md` B263). The
+/// ceiling stays at minutes because a cold start without a network fails the
+/// same way, and must mount soon after the network returns.
+fn mount_retry_delay(attempts: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 5;
+    const MAX_SECS: u64 = 120;
+
+    let factor = 1u64
+        .checked_shl(attempts.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    std::time::Duration::from_secs(BASE_SECS.saturating_mul(factor).min(MAX_SECS))
 }
 
 /// One mount run: resume the session, mount, and block until the mount ends
@@ -3887,7 +3934,23 @@ fn cmd_diagnose() -> Result<()> {
                 "  daemon responding",
                 format!("stopped or unreachable: {e:#}"),
             );
-            println!("         (start it with `systemctl --user start proton-drive.service`)");
+            match pdfs_core::mountfail::read(&dirs.state_dir()) {
+                // A daemon whose mount keeps failing never opens the socket,
+                // so this is the only place its reason shows (B263).
+                Some(failure) => report.finding(
+                    DiagnoseLevel::Fail,
+                    "  mount",
+                    format!(
+                        "failing for {}, {} attempt(s): {}",
+                        human_secs(unix_now().saturating_sub(failure.since).max(0) as u64),
+                        failure.attempts,
+                        failure.error
+                    ),
+                ),
+                None => println!(
+                    "         (start it with `systemctl --user start proton-drive.service`)"
+                ),
+            }
         }
     }
 
@@ -4047,6 +4110,15 @@ mod diagnose_tests {
 #[cfg(test)]
 mod login_wait_tests {
     use super::*;
+
+    /// The mount retry backs off from 5 s to a ceiling of minutes, rather than
+    /// asking Proton every 5 s forever (`docs/BUGS.md` B263).
+    #[test]
+    fn a_failing_mount_backs_off_to_a_ceiling() {
+        let secs: Vec<u64> = (1..=8).map(|n| mount_retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 80, 120, 120, 120]);
+        assert_eq!(mount_retry_delay(u32::MAX).as_secs(), 120);
+    }
     use std::time::Duration;
 
     #[test]

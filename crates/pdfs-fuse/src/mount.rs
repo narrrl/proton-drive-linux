@@ -541,12 +541,11 @@ pub(crate) fn mount_with(
     // and sweeps all operating on a mount that no longer exists (`docs/BUGS.md` B44).
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for worker in 0..DRAIN_WORKERS {
-        let core = core.clone();
-        workers.push(
-            std::thread::Builder::new()
-                .name(format!("pdfs-drain-{worker}"))
-                .spawn(move || core.run_pending_drain(worker == 0))?,
-        );
+        let drain_core = core.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("pdfs-drain-{worker}"))
+            .spawn(move || drain_core.run_pending_drain(worker == 0));
+        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
     }
 
     // Start the folder-sync engine. It watches every mirror folder, polls the
@@ -566,24 +565,22 @@ pub(crate) fn mount_with(
         info!("conflict sweep disabled by configuration");
     } else {
         info!(mode = ?sweep_mode, "conflict sweep enabled");
-        let core = core.clone();
-        workers.push(
-            std::thread::Builder::new()
-                .name("pdfs-conflict-sweep".into())
-                .spawn(move || core.run_conflict_sweep_loop())?,
-        );
+        let sweep_core = core.clone();
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-conflict-sweep".into())
+            .spawn(move || sweep_core.run_conflict_sweep_loop());
+        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
     }
 
     // Watch the link for the life of the mount: a mount from the cache waits for
     // the network to come back, and an online one can lose it at any moment and
     // must notice it coming back just the same.
     {
-        let core = core.clone();
-        workers.push(
-            std::thread::Builder::new()
-                .name("pdfs-online-probe".into())
-                .spawn(move || core.run_online_probe())?,
-        );
+        let probe_core = core.clone();
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-online-probe".into())
+            .spawn(move || probe_core.run_online_probe());
+        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
     }
 
     // Keep the launcher prompt's "This computer" index fresh. Its own thread:
@@ -594,11 +591,10 @@ pub(crate) fn mount_with(
         let transfers = core.transfers.clone();
         let mountpoint = mountpoint.to_path_buf();
         let shutdown = core.shutdown.clone();
-        workers.push(
-            std::thread::Builder::new()
-                .name("pdfs-localindex".into())
-                .spawn(move || run_local_index(db, indexing, transfers, mountpoint, shutdown))?,
-        );
+        let spawned = std::thread::Builder::new()
+            .name("pdfs-localindex".into())
+            .spawn(move || run_local_index(db, indexing, transfers, mountpoint, shutdown));
+        keep_or_abandon(&core, control_socket, &mut workers, spawned)?;
     }
 
     // Bind the control socket before the FUSE session takes over the thread. A
@@ -607,12 +603,18 @@ pub(crate) fn mount_with(
     let old_umask = unsafe { libc::umask(0o77) };
     let listener_res = UnixListener::bind(control_socket);
     unsafe { libc::umask(old_umask) };
-    let listener = listener_res?;
+    let listener = match listener_res {
+        Ok(listener) => listener,
+        Err(error) => {
+            abandon_workers(&core, control_socket, workers);
+            return Err(error);
+        }
+    };
     // Owner-only before anything can connect: a peer on this socket commands the
     // daemon's authenticated session without a credential of its own (B6).
     if let Err(e) = pdfs_core::config::restrict_socket(control_socket) {
         error!(error = %e, "cannot restrict control socket permissions; refusing to serve");
-        let _ = std::fs::remove_file(control_socket);
+        abandon_workers(&core, control_socket, workers);
         return Err(std::io::Error::other(format!(
             "control socket permissions: {e}"
         )));
@@ -623,7 +625,7 @@ pub(crate) fn mount_with(
     let bg = match spawn_session(&core, mountpoint, root) {
         Ok(session) => session,
         Err(error) => {
-            let _ = std::fs::remove_file(control_socket);
+            abandon_workers(&core, control_socket, workers);
             return Err(error);
         }
     };
@@ -643,7 +645,7 @@ pub(crate) fn mount_with(
             Err(error) => {
                 // A failure here abandons the mount, so the background threads
                 // started above have to be told to stop with it.
-                stop_workers(&core, control_socket, workers);
+                abandon_workers(&core, control_socket, workers);
                 let secondaries = core.mounts.lock().close_and_drain();
                 for (id, mount) in secondaries {
                     if let Err(unmount_error) = mount.teardown() {
@@ -693,8 +695,12 @@ pub(crate) fn mount_with(
         }
     }
     // The mount is live and the control socket answers: this is the moment the
-    // unit is actually usable, which is what `Type=notify` reports.
+    // unit is actually usable, which is what `Type=notify` reports. Whatever
+    // failure an earlier attempt recorded for the front ends is over.
     systemd::ready();
+    if let Some(state_dir) = control_socket.parent() {
+        pdfs_core::mountfail::clear(state_dir);
+    }
 
     // Re-establish on-demand mounts only after the primary session is live.
     // Keep the worker so shutdown can close publication, wait for any in-flight
@@ -860,6 +866,43 @@ fn stop_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::Jo
     // Say so before the joins: a teardown that takes a while must not be read as
     // a missed watchdog ping and turned into a kill.
     systemd::stopping();
+    halt_workers(core, control_socket, workers);
+}
+
+/// Stop the threads a mount attempt started before it failed.
+///
+/// The early returns used to leave them running: every retry started another
+/// set beside the last one's, and their `Core` kept the database open, so the
+/// next attempt could fail on its lock instead of the real error
+/// (`docs/BUGS.md` B264). Unlike [`stop_workers`] this does not tell systemd
+/// the daemon is stopping, because it is about to try again, and a manager
+/// told so would wait for the process to exit and then kill it.
+fn abandon_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::JoinHandle<()>>) {
+    halt_workers(core, control_socket, workers);
+}
+
+/// Keep a worker the mount just spawned, or, if the spawn failed, stop the
+/// ones already running and hand the error back.
+fn keep_or_abandon(
+    core: &Core,
+    control_socket: &Path,
+    workers: &mut Vec<std::thread::JoinHandle<()>>,
+    spawned: std::io::Result<std::thread::JoinHandle<()>>,
+) -> std::io::Result<()> {
+    match spawned {
+        Ok(handle) => {
+            workers.push(handle);
+            Ok(())
+        }
+        Err(error) => {
+            abandon_workers(core, control_socket, std::mem::take(workers));
+            Err(error)
+        }
+    }
+}
+
+/// Signal every worker to stop, then join them up to [`WORKER_JOIN_DEADLINE`].
+fn halt_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::JoinHandle<()>>) {
     core.shutdown.stop();
     core.wake_drain();
     let _ = core.sync_tx.send(sync::SyncMsg::Stop);
