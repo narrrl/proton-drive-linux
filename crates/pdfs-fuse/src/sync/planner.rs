@@ -236,6 +236,9 @@ pub(super) struct RemoteGaps {
     short: HashSet<String>,
     /// Paths seen, but whose entry could not be read.
     unread: HashSet<String>,
+    /// Folders whose listing failed outright, after the SDK's retries. Nothing
+    /// under one is known, so all of it is left out of the pass (B271).
+    unlisted: HashSet<String>,
 }
 
 impl RemoteGaps {
@@ -249,8 +252,13 @@ impl RemoteGaps {
         self.unread.insert(rel);
     }
 
+    /// The listing of `folder` failed, so nothing under it was walked.
+    pub(super) fn unlisted(&mut self, folder: &str) {
+        self.unlisted.insert(folder.to_string());
+    }
+
     pub(super) fn is_empty(&self) -> bool {
-        self.short.is_empty() && self.unread.is_empty()
+        self.short.is_empty() && self.unread.is_empty() && self.unlisted.is_empty()
     }
 
     /// Whether `rel` may be missing from `remote` only because the walk could
@@ -272,7 +280,7 @@ impl RemoteGaps {
         let mut at = parent_rel(rel);
         loop {
             if remote_dirs.contains_key(at) {
-                return self.short.contains(at);
+                return self.short.contains(at) || self.unlisted.contains(at);
             }
             if at.is_empty() {
                 return false;
@@ -295,6 +303,9 @@ impl RemoteGaps {
                     .iter()
                     .map(|rel| format!("{rel} (cannot be read on Proton Drive)")),
             )
+            .chain(self.unlisted.iter().map(|rel| {
+                format!("{rel} (could not be listed on Proton Drive; tried again next pass)")
+            }))
             .collect();
         lines.sort_unstable();
         lines
@@ -842,6 +853,32 @@ mod file_plan_tests {
         assert!(!gaps.hides("top.txt", &remote, &dirs));
         gaps.short_listing("");
         assert!(gaps.hides("top.txt", &remote, &dirs));
+    }
+
+    /// A folder whose listing failed was walked no further: nothing under it
+    /// reads as deleted on Drive, and a sibling that listed still does
+    /// (`docs/BUGS.md` B271).
+    #[test]
+    fn a_folder_that_failed_to_list_hides_everything_under_it() {
+        let remote = HashMap::from([
+            ("docs".to_string(), folder()),
+            ("pics".to_string(), folder()),
+        ]);
+        let dirs = HashMap::from([
+            (String::new(), uid("root")),
+            ("docs".to_string(), uid("docs")),
+            ("pics".to_string(), uid("pics")),
+        ]);
+        let mut gaps = RemoteGaps::default();
+        gaps.unlisted("docs");
+        assert!(gaps.hides("docs/a.txt", &remote, &dirs));
+        assert!(gaps.hides("docs/sub/deep.txt", &remote, &dirs));
+        assert!(!gaps.hides("docs", &remote, &dirs));
+        assert!(!gaps.hides("pics/gone.jpg", &remote, &dirs));
+        assert_eq!(
+            gaps.report(),
+            ["docs (could not be listed on Proton Drive; tried again next pass)"]
+        );
     }
 
     #[test]
