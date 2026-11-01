@@ -40,4 +40,4 @@ pangocairo = "0.22"
 # Map tiles for the opt-in online map. The same build proton-sdk already pulls in.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
 # The system libintl (glibc) rather than a bundled gettext build.
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
+gettext-rs = { version = "0.8", features = ["gettext-system"] }
