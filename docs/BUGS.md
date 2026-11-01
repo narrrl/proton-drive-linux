@@ -119,8 +119,7 @@ a live account since.
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
-| [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
-| [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
+| [B257](#b257--deleting-a-new-file-while-it-is-open-can-drop-the-bytes-its-handle-reads) | Deleting a new file while it is open can drop the bytes its handle reads |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
 | [B252](#b252--computers-sharing-a-device-overwrite-each-others-profile) | Computers sharing a device overwrite each other's profile |
@@ -295,6 +294,8 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
+| [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B194](#b194--on-a-fresh-install-the-tray-exits-and-the-takeout-page-cannot-remember-its-archives) | On a fresh install the tray exits and the Takeout page cannot remember its archives |
 | [B192](#b192--a-new-file-closed-empty-reaches-drive-only-half-a-minute-later) | A new file closed empty reaches Drive only half a minute later |
 | [B181](#b181--the-app-shows-a-queued-edit-kept-as-a-conflict-copy-in-english) | The app shows a queued edit kept as a conflict copy in English |
@@ -936,9 +937,46 @@ are off. A terminal that merely inherited `JOURNAL_STREAM` keeps the plain forma
 
 ---
 
-### B256 — `pdfs copy` right after a save copies the old version
+### B257 — Deleting a new file while it is open can drop the bytes its handle reads
 
 **Status:** Fixed, not verified live
+**Found:** 2026-10-27, the simulation
+`a_file_deleted_offline_while_open_still_reads_and_takes_writes` failing once on CI with a cache
+tag left behind, then on every run with a 50 ms pause added to `ContentCache::store_file`.
+**Where:** `retire_create` in `crates/pdfs-fuse/src/drain.rs`; `queue_trash` and
+`remove_replaced` in `crates/pdfs-fuse/src/lib.rs`; `trash_child` in
+`crates/pdfs-fuse/src/filesystem.rs`; `ContentCache::reconcile` in `crates/pdfs-core/src/cache.rs`
+
+**Repro:** Create a file in the mount, wait until `pdfs status` shows nothing queued, open it,
+and delete it while the link is down. If the create was still landing, a partial write or a read
+through the open handle fails with "Input/output error", and the cache can keep a tag with no
+bytes until the next start.
+
+**Cause.** A create that carries the file's bytes retires its op, then reads the node back,
+caches the bytes and only then gives the tree the real uid. Nothing counted that window, so the
+queue read empty while it ran, which B119 promises means the file reads without the network. A
+delete in that window found the placeholder uid in the tree, and trashed the node by its real
+uid. `queue_trash` asked the tree whether that uid was open, found no entry for it, and dropped
+the cached bytes the open handle reads, which B186 had kept. When the cache store was running at
+the same moment, its tag was written after the eviction, and nothing removed it.
+
+**Fix.** The create's landing is counted like an upload's, from the op's retirement until the
+tree has the real uid. The delete and the replace pass whether they found the file open, so
+`queue_trash` no longer depends on the tree having the new uid. Opening the cache removes a tag
+whose bytes are gone, which also covers a crash between an eviction's two removals.
+
+**Test:** The simulation `a_new_file_deleted_while_open_as_its_create_lands_still_reads` holds a
+create's landing and fails without the count. The simulation above passes again with the 50 ms
+pause, since it now waits for `Daemon::drained`, which counts the landing. Unit test
+`a_tag_without_its_blob_is_swept_at_open` in `crates/pdfs-core/src/cache.rs`. No test hits the
+delete inside the cache store itself: the window is too short to hold from the simulation.
+
+---
+
+### B256 — `pdfs copy` right after a save copies the old version
+
+**Status:** Fixed, checked on 2026-10-27 by the acceptance case "regression B256" on a live
+account
 **Found:** 2026-10-26, the simulation `a_pdfs_copy_copies_on_drive_and_waits_for_unsynced_changes`
 failing on most runs. The feature was not released yet.
 **Where:** `release` in `crates/pdfs-fuse/src/filesystem.rs`; `copy_to` in
@@ -962,7 +1000,8 @@ A move checks the same set.
 
 ### B255 — A synced folder whose files are all gone here is stuck for good
 
-**Status:** Fixed, not verified live
+**Status:** Fixed, checked on 2026-10-27 by the acceptance case "regression B255" on a live
+account
 **Found:** 2026-10-26, issue #46: a folder restored from another computer never downloaded.
 **Where:** `push_pass` in `crates/pdfs-fuse/src/sync.rs`; `reset_sync_folder` in
 `crates/pdfs-fuse/src/devices.rs`

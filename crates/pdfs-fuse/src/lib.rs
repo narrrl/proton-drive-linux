@@ -3999,7 +3999,12 @@ impl Core {
     /// the cached ones, as when the trash is sent at once: a partial write
     /// fills its gaps from them, offline too (`docs/BUGS.md` B186). The final
     /// close or the trash landing, whichever comes last, lets go of them.
-    fn queue_trash(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
+    ///
+    /// `open` is whether the caller found the file open. A create that landed
+    /// under a delete is trashed by its real uid before the tree has it, so
+    /// asking the tree alone took an open file for closed (`docs/BUGS.md`
+    /// B257).
+    fn queue_trash(&self, uid: &NodeUid, name: &str, open: bool) -> Result<(), Errno> {
         self.require_uid_writable(uid)?;
         // The bytes below are about to be discarded, and a drain worker may be
         // reading them onto the wire right now. Stop it first: with several
@@ -4014,7 +4019,7 @@ impl Core {
                 error!(%uid, error = %e, "queueing trash failed");
                 Errno::EIO
             })?;
-        let open_now = self.is_open_anywhere(uid);
+        let open_now = open || self.is_open_anywhere(uid);
         if open_now {
             let read_from = self.pending_blob(uid);
             self.release_dropped_below(
@@ -5383,9 +5388,12 @@ impl Core {
     /// `unlink` under an open handle. Its queued ops go now, or the drain would
     /// upload to the node after it was trashed (`docs/BUGS.md` B106).
     fn remove_replaced(&self, ino: u64, uid: &NodeUid, name: &str) -> Result<(), Errno> {
+        // Asked under the uid the tree has now: a landed create's real uid is
+        // not in the tree yet (`docs/BUGS.md` B257).
+        let open = self.is_open_anywhere(uid);
         let landed;
         let uid = if is_local_uid(uid) {
-            if self.is_open_anywhere(uid) {
+            if open {
                 self.withdraw_queued_ops(uid)?;
             } else {
                 self.discard_queued_ops(uid)?;
@@ -5410,7 +5418,7 @@ impl Core {
         // Local-first or offline, or the network goes away under the call:
         // queue the trash. The rename that follows queues as well, behind it.
         if !self.sends_inline() {
-            return self.queue_trash(uid, name);
+            return self.queue_trash(uid, name, open);
         }
         self.require_uid_writable(uid)?;
         if let Err(e) = self
@@ -5418,7 +5426,7 @@ impl Core {
             .and_then(batch::into_unit)
         {
             if self.lost_link(&e, "trash a replaced node") {
-                return self.queue_trash(uid, name);
+                return self.queue_trash(uid, name, open);
             }
             error!(%uid, name, error = %e, "trashing the node a rename replaces failed");
             self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
@@ -9258,7 +9266,7 @@ mod tests {
         assert!(!replaced.contains("st.forget(uid)"));
         assert_before(
             replaced,
-            "if self.is_open_anywhere(uid)",
+            "let open = self.is_open_anywhere(uid)",
             "self.discard_queued_ops(uid)",
         );
         assert_before(replaced, "if open_now", "self.cache.evict(uid)");

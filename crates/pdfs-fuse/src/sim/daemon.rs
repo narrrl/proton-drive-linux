@@ -130,6 +130,22 @@ impl Daemon {
         }
     }
 
+    /// Whether nothing is queued and no upload is still landing, as `pdfs
+    /// status` counts it. An empty [`Self::pending`] is not enough before a
+    /// read that needs the cache: the op goes before the uploaded bytes are
+    /// cached, so a test that went offline at once raced the drain.
+    pub(crate) fn drained(&self) -> bool {
+        self.pending().is_ok_and(|items| items.is_empty())
+            && matches!(
+                self.request(&Request::Status),
+                Ok(Response::Status {
+                    pending_uploads: 0,
+                    pending_changes: 0,
+                    ..
+                })
+            )
+    }
+
     /// Whether the mount believes Proton is reachable, as `pdfs status` shows
     /// it.
     pub(crate) fn online(&self) -> io::Result<bool> {
@@ -565,7 +581,7 @@ mod tests {
 
         std::fs::write(&path, b"0123456789").unwrap();
         assert!(wait_until(Duration::from_secs(30), || {
-            daemon.pending().is_ok_and(|items| items.is_empty())
+            daemon.drained()
                 && drive.tree().get("f.txt") == Some(&Entry::File(Arc::new(b"0123456789".to_vec())))
         }));
         daemon.client.set_online(false);
@@ -694,6 +710,55 @@ mod tests {
 
     #[test]
     #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_new_file_deleted_while_open_as_its_create_lands_still_reads() {
+        // The create's op was retired and the tree still had the placeholder.
+        // The queue read empty, and the delete trashed the node by its real
+        // uid, which the tree did not have yet: it took the open file for
+        // closed and dropped the bytes its handle reads (B257).
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let drive = FakeDrive::new();
+        let dir = scratch("delete-open-as-create-lands");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let path = daemon.mountpoint.join("f.txt");
+
+        let landing = daemon.client.hold_next_landing_of_any();
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || landing.reached()));
+        assert!(!daemon.drained(), "the landing create is counted");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        drop(landing);
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()));
+
+        daemon.client.set_online(false);
+        std::fs::remove_file(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"ab").unwrap();
+        let mut read = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"0123456789ab");
+        drop(file);
+
+        daemon.client.set_online(true);
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                daemon.drained() && drive.tree().is_empty()
+            }),
+            "{:?} {:?}",
+            daemon.pending(),
+            drive.tree()
+        );
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
     fn a_restart_does_not_bring_back_the_write_of_a_file_deleted_while_open() {
         // The bytes kept for the open handle outlived a restart, which queued
         // them again as a revision; the trash then landed and removed them, and
@@ -706,7 +771,7 @@ mod tests {
 
         std::fs::write(&path, b"0123456789").unwrap();
         assert!(wait_until(Duration::from_secs(30), || {
-            daemon.pending().is_ok_and(|items| items.is_empty())
+            daemon.drained()
                 && drive.tree().get("f.txt") == Some(&Entry::File(Arc::new(b"0123456789".to_vec())))
         }));
         daemon.client.set_online(false);
