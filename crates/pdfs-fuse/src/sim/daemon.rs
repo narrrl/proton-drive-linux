@@ -409,6 +409,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A folder with files in it is not mounted over, and its files stay where
+    /// they are; once it is empty, the mount comes up (B277, #67).
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_mount_over_local_files_is_refused_and_leaves_them_alone() {
+        let drive = FakeDrive::new();
+        let dir = scratch("not-empty");
+        let mountpoint = dir.join("mnt");
+        std::fs::create_dir_all(mountpoint.join("Work")).unwrap();
+        std::fs::write(mountpoint.join("notes.txt"), b"local only").unwrap();
+
+        let error = Daemon::start(&dir, drive.client(1, Faults::lan()))
+            .err()
+            .expect("the mount must be refused");
+        let found = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<pdfs_core::mountpoint::NotEmpty>())
+            .unwrap_or_else(|| panic!("refused for another reason: {error}"));
+        assert_eq!(found.entries, ["Work", "notes.txt"]);
+        assert!(!is_mounted(&mountpoint));
+        assert_eq!(
+            std::fs::read(mountpoint.join("notes.txt")).unwrap(),
+            b"local only"
+        );
+        assert!(
+            drive.tree().is_empty(),
+            "nothing went to Drive: {:?}",
+            drive.tree()
+        );
+
+        std::fs::remove_file(mountpoint.join("notes.txt")).unwrap();
+        std::fs::remove_dir(mountpoint.join("Work")).unwrap();
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Write `bytes` at `offset` into an existing file, without truncating it.
     fn write_at(path: &Path, offset: u64, bytes: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;

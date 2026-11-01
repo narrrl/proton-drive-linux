@@ -16,6 +16,7 @@ pub mod keycheck;
 pub mod localindex;
 pub mod menu;
 pub mod mountfail;
+pub mod mountpoint;
 pub mod mounts;
 pub mod opener;
 pub mod places;

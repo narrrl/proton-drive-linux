@@ -196,6 +196,29 @@ pub(super) fn clear_stale_mount(mountpoint: &Path) {
     }
 }
 
+/// Refuse to mount My files over a folder that already has files in it: FUSE
+/// would hide them, unsent and out of sight, until the service stops
+/// (`docs/BUGS.md` B277). Runs before the root fetch and before any worker
+/// starts, so a refusal costs nothing to retry.
+///
+/// A dead mount is cleared first, since it cannot be listed. One of this
+/// client's own live mounts is left to [`spawn_session`], which clears it as it
+/// always has; listing it would show Drive's files, not the folder's.
+pub(super) fn check_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
+    if is_stale_mount(mountpoint) {
+        clear_stale_mount(mountpoint);
+    }
+    if pdfs_core::mountpoint::mounted_fs_type(mountpoint).as_deref()
+        == Some(pdfs_core::mountpoint::OWN_FS_TYPE)
+    {
+        return Ok(());
+    }
+    match pdfs_core::mountpoint::not_empty(mountpoint)? {
+        Some(found) => Err(std::io::Error::other(found)),
+        None => Ok(()),
+    }
+}
+
 /// `sync_state` key holding the uid of the My Files root, so a later run can
 /// recover it from `nodes` without the API.
 const ROOT_UID_KEY: &str = "root_uid";
@@ -427,6 +450,7 @@ pub(crate) fn mount_with(
     // Start the uptime clock here rather than at the first `pdfs diagnostics`,
     // so the age it reports is the daemon's own.
     super::diagnostics::start_clock();
+    check_mountpoint(mountpoint)?;
     let (root, start) = fetch_or_recall_root(drive.as_ref(), &rt, &db)?;
     let online = start == Start::Online;
     let scope = root.tree_event_scope_id();

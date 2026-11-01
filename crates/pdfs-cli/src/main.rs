@@ -2432,6 +2432,7 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
                     since: failure.as_ref().map_or(now, |f| f.since),
                     attempts,
                     next_attempt: now + delay.as_secs() as i64,
+                    not_empty: not_empty_cause(&e),
                 };
                 if let Err(e) = pdfs_core::mountfail::record(&state_dir, &record) {
                     tracing::warn!(error = %e, "could not record the mount failure");
@@ -2442,6 +2443,23 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
             }
         }
     }
+}
+
+/// The folder in the way, when `error` is a mount refused over a folder that
+/// already has files in it. The refusal travels inside an `io::Error`, whose
+/// `source` skips the error it wraps, so each link is unwrapped by hand.
+fn not_empty_cause(error: &anyhow::Error) -> Option<pdfs_core::mountpoint::NotEmpty> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<pdfs_core::mountpoint::NotEmpty>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<std::io::Error>()?
+                    .get_ref()?
+                    .downcast_ref::<pdfs_core::mountpoint::NotEmpty>()
+            })
+            .cloned()
+    })
 }
 
 /// How long to wait before mount attempt `attempts + 1`, after `attempts`
@@ -3738,26 +3756,6 @@ fn executable_on_path(name: &str) -> bool {
     })
 }
 
-fn mounted_fs_type(path: &Path) -> Option<String> {
-    let wanted = path.canonicalize().ok()?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    mounts
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            let separator = fields.iter().position(|field| *field == "-")?;
-            let encoded = *fields.get(4)?;
-            let decoded = encoded.replace("\\040", " ").replace("\\011", "\t");
-            let mountpoint = PathBuf::from(decoded);
-            if mountpoint.canonicalize().ok()? == wanted {
-                Some(fields.get(separator + 1)?.to_string())
-            } else {
-                None
-            }
-        })
-        .next()
-}
-
 /// Create, sync, and remove a new file without ever replacing an existing one.
 fn writable_probe(dir: &Path) -> std::io::Result<()> {
     let name = format!(".pdfs-diagnose-probe-{}", std::process::id());
@@ -3920,7 +3918,7 @@ fn cmd_diagnose() -> Result<()> {
                     outdated_daemon_note(&version),
                 );
             }
-            let live_type = mounted_fs_type(Path::new(&mountpoint));
+            let live_type = pdfs_core::mountpoint::mounted_fs_type(Path::new(&mountpoint));
             let is_fuse = live_type
                 .as_deref()
                 .is_some_and(|kind| kind.starts_with("fuse"));
@@ -4328,6 +4326,23 @@ mod login_wait_tests {
         let secs: Vec<u64> = (1..=8).map(|n| mount_retry_delay(n).as_secs()).collect();
         assert_eq!(secs, [5, 10, 20, 40, 80, 120, 120, 120]);
         assert_eq!(mount_retry_delay(u32::MAX).as_secs(), 120);
+    }
+
+    /// A refusal over a folder with files in it reaches the failure record
+    /// through the `io::Error` and the context around it (`docs/BUGS.md` B277).
+    #[test]
+    fn a_mount_refused_over_files_is_recorded_as_such() {
+        let found = pdfs_core::mountpoint::NotEmpty {
+            path: PathBuf::from("/home/you/ProtonDrive"),
+            entries: vec!["Work".into()],
+            count: 1,
+        };
+        let error =
+            anyhow::Error::new(std::io::Error::other(found.clone())).context("mount failed");
+        assert_eq!(not_empty_cause(&error), Some(found));
+        let other =
+            anyhow::Error::new(std::io::Error::other("missing key")).context("mount failed");
+        assert_eq!(not_empty_cause(&other), None);
     }
     use std::time::Duration;
 

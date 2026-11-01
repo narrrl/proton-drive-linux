@@ -13,6 +13,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ### Fixed
 
+- **My files no longer opens over a folder that already has files in it** (#67, B277). The files
+  were hidden under it, not uploaded, and came back only when the service stopped, so they looked
+  deleted. The service now waits until the folder is empty, and the app says why and offers to
+  open the folder or choose another one. The folder picker in Preferences refuses a folder with
+  files in it. **After upgrading:** if your `~/ProtonDrive` has files underneath, for example
+  saved there while the service was stopped, My files does not open until you move them out.
+
 - **A new file reads without the network as soon as `pdfs status` shows nothing queued**
   (B257). A new file's upload counted as done before its bytes were cached, so a script that
   waited for an empty queue and then went offline could not read it. A new file deleted while

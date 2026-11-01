@@ -24,6 +24,11 @@ pub struct MountFailure {
     pub attempts: u32,
     /// Unix seconds of the next attempt.
     pub next_attempt: i64,
+    /// Set when the mount was refused because the folder already has files in
+    /// it, so the app can explain that in the user's language. Absent in a
+    /// file an older daemon wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_empty: Option<crate::mountpoint::NotEmpty>,
 }
 
 /// Where the failure is kept for the state directory `state_dir`.
@@ -65,11 +70,20 @@ mod tests {
             since: 1_700_000_000,
             attempts: 3,
             next_attempt: 1_700_000_040,
+            not_empty: None,
         };
         record(&dir, &failure).unwrap();
         assert_eq!(read(&dir), Some(failure));
         clear(&dir);
         assert_eq!(read(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failure_an_older_daemon_wrote_still_reads() {
+        let old = r#"{"error":"missing key","since":1,"attempts":2,"next_attempt":3}"#;
+        let failure: MountFailure = serde_json::from_str(old).unwrap();
+        assert_eq!(failure.not_empty, None);
+        assert_eq!(failure.attempts, 2);
     }
 }

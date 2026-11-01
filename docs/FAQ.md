@@ -28,7 +28,9 @@ Yes. `~/ProtonDrive` is your Proton Drive, not a copy. A deleted file moves to t
 Trash, and you can restore it from **Trash** in the app or the web. See [Trash](FILES.md#trash).
 
 Stopping the service is not the same: once the service stops, `~/ProtonDrive` is just an empty
-folder, and your files stay on Proton Drive.
+folder, and your files stay on Proton Drive. Keep it empty: the service does not open My files
+over a folder with files in it, because it would hide them. See
+[My files does not open: the folder is not empty](TROUBLESHOOTING.md#my-files-does-not-open-the-folder-is-not-empty).
 
 ## Online only, available offline or synced folder: which do I want?
 

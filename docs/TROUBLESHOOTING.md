@@ -141,6 +141,20 @@ fusermount3 -uz ~/ProtonDrive
 systemctl --user restart proton-drive.service
 ```
 
+### My files does not open: the folder is not empty
+
+The app says **Your Proton Drive Folder Isn't Empty**, and `pdfs diagnose` reports
+`mount: failing … is not empty`. The folder chosen for My files has files in it, and the service
+does not open My files over them: they would be hidden, and not uploaded, for as long as the
+service runs.
+
+Move the files out of the folder, or choose another folder in **Preferences → General →
+Location**. The service tries again on its own and opens once the folder is empty. To put the
+files on Proton Drive, copy them into My files once it is open.
+
+Files saved into `~/ProtonDrive` while the service was stopped are in the same place: in the
+local folder, not on Proton Drive.
+
 ### The folder is empty or missing
 
 Check that the service runs and is signed in, with `pdfs status`. The service waits for a stored
