@@ -20,6 +20,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   files in it. **After upgrading:** if your `~/ProtonDrive` has files underneath, for example
   saved there while the service was stopped, My files does not open until you move them out.
 
+- **A synced folder stops instead of deleting when nearly all of it vanishes at once** (B270).
+  The guard against a lost folder, such as a disk that is not mounted, stopped a pass only when
+  every synced file was gone. One file left over was enough to clear it, and the next pass
+  trashed everything else on Proton Drive, and on every other computer syncing the folder. A
+  folder with 20 or more files and folders now also stops when nine in ten of them are missing,
+  on this computer or on Proton Drive. **Sync From Scratch…** brings them back.
+
 - **A new file reads without the network as soon as `pdfs status` shows nothing queued**
   (B257). A new file's upload counted as done before its bytes were cached, so a script that
   waited for an empty queue and then went offline could not read it. A new file deleted while

@@ -248,9 +248,10 @@ Check that:
 
 ### A synced folder stays in error and nothing downloads
 
-The log says `every one of the N synced paths is missing locally; refusing to trash them on
-Drive`. The folder synced before, and now none of its files are on this computer. The sync
-stops so that it does not delete them on Proton Drive too. Check that the folder is the right
+The log says `M of the N synced paths are missing locally; refusing to trash them on Drive`.
+The folder synced before, and now all or nearly all of its files are gone from this computer:
+everything, or nine in ten of a folder with 20 or more files and folders. The sync stops so that
+it does not delete them on Proton Drive too. Check that the folder is the right
 one and that its disk is mounted. To get the files back, choose **Sync From Scratch…** in the
 folder's menu on **Sync → Folders**, or run:
 

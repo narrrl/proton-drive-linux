@@ -2867,7 +2867,7 @@ mod tests {
     /// from being read as "the user deleted everything" and trashing the folder
     /// on Drive.
     #[test]
-    fn guard_local_wipe_blocks_only_a_total_disappearance() {
+    fn guard_local_wipe_blocks_a_total_disappearance() {
         let base: HashMap<String, ()> = ["a.txt", "b.txt", "d/c.txt"]
             .iter()
             .map(|r| ((*r).to_string(), ()))
@@ -2881,7 +2881,7 @@ mod tests {
         );
         assert!(
             guard_local_wipe(&base, &one).is_ok(),
-            "one survivor means the tree is readable; the rest are real deletions"
+            "in a small folder, one survivor means the tree is readable; the rest are real deletions"
         );
         // A one-entry folder can disappear because its mount or parent became
         // unavailable just as easily as a larger tree can.
