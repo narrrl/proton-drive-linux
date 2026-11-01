@@ -246,7 +246,7 @@ remaining cases are skipped. Cases that make many round trips by design get twic
 | `--report-json PATH` | Every result and recorded observation. Attach it to a bug report |
 | `--report-junit PATH` | JUnit XML. `known` is reported as skipped |
 | `--budget SECONDS` | Flags cases that pass but take longer (`PDFS_ACCEPTANCE_BUDGET`) |
-| `--journal-check` | Fails the run if `proton-drive.service` logged an error during it, or the warnings "queued write conflicts; keeping a conflict copy" and "a fuse worker has held the same job for a long time" |
+| `--journal-check` | Fails the run if `proton-drive.service` logged an error or a panic during it, or the warnings "queued write conflicts; keeping a conflict copy" and "a fuse worker has held the same job for a long time". A `Failed to send FUSE reply: No such file or directory` during a stop does not count: it is a request answering after the stop aborted its connection |
 | `--durability` | Restarts the service mid-suite and checks the bytes written before it. Proves the queue survives a restart. `PDFS_ACCEPTANCE_UNIT` names another unit |
 | `--fail-fast` | Stops at the first failure |
 | `--list` | Prints every case and its targets |
