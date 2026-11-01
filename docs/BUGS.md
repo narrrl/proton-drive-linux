@@ -70,7 +70,6 @@ original wording.
 |---|---|---|
 | [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
 | [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
-| [B270](#b270--one-file-left-in-a-mirror-folder-clears-the-wipe-guard-for-all-the-others) | One file left in a mirror folder clears the wipe guard for all the others | Not fixed |
 | [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
@@ -84,6 +83,7 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B270](#b270--one-file-left-in-a-mirror-folder-clears-the-wipe-guard-for-all-the-others) | One file left in a mirror folder clears the wipe guard for all the others | A loss under nine in ten still goes through; no choice offered in the app |
 | [B269](#b269--a-restore-that-skipped-every-folder-reports-success) | A restore that skipped every folder reports success | The app shows the result only in the activity feed; no offer to replace or reset the folder in the way |
 | [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | The sync engine's state is not checked |
 | [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Errors no retry fixes back off like network errors |
@@ -600,7 +600,7 @@ nothing left to apply. The progress count inside one large folder is unchanged.
 
 ### B270 — One file left in a mirror folder clears the wipe guard for all the others
 
-**Status:** Open
+**Status:** Partly fixed
 **Found:** 2026-10-31, code audit after issue #46, whose reporter emptied a synced folder
 several times.
 **Where:** `guard_local_wipe` and `guard_remote_wipe` in `crates/pdfs-fuse/src/sync/planner.rs`
@@ -614,8 +614,20 @@ that two computers sync, the other computer then deletes its copies too.
 path is enough to clear it, so it guards against an empty folder and nothing short of that.
 The remote guard has the same shape.
 
-**Fix.** Not done. Also refuse when most of a large baseline is missing at once, and leave the
-choice to the user: delete on the other side, or sync from scratch.
+**Fix.** Both guards also refuse a pass when nine in ten or more of the tracked paths of a
+folder with at least 20 are missing at once (`looks_like_a_wipe`). The folder goes into error with
+the count in its reason, `pdfs diagnose` reports it, and **Sync From Scratch…** brings the files
+back. A smaller folder still stops only on a total loss, since an ordinary cleanup can delete most
+of it.
+
+**What is left.** A loss under nine in ten, such as a disk that is half there, still goes
+through. The app does not offer the choice yet: confirm the deletions on the other side, or sync
+from scratch.
+
+**Test:** `one_survivor_of_a_large_folder_does_not_clear_the_wipe_guards`,
+`a_small_folder_trips_the_wipe_guards_only_when_everything_is_gone` in
+`crates/pdfs-fuse/src/sync/planner.rs`.
+
 
 ---
 

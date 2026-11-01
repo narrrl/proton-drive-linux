@@ -180,18 +180,42 @@ pub(super) fn local_deletions<B, L>(
     missing
 }
 
-/// Refuse to run a pass whose local side has vanished in its entirety.
+/// How many tracked paths a folder needs before a mass disappearance, short of
+/// a total one, trips a wipe guard. Below this, a few survivors say little.
+const MASS_LOSS_MIN_PATHS: usize = 20;
+
+/// The share of a large folder's tracked paths that may vanish in one pass, in
+/// tenths, before a wipe guard stops it: 9 of 10 and up is refused.
+const MASS_LOSS_TENTHS: usize = 9;
+
+/// Whether `missing` of `total` tracked paths gone at once looks like a lost
+/// tree rather than deletions. All of them always does. Most of a large
+/// folder does too: one surviving file used to clear the guard, so a
+/// half-mounted disk, or a script that emptied the folder and wrote one file
+/// back, trashed everything else on Drive (B270).
+fn looks_like_a_wipe(missing: usize, total: usize) -> bool {
+    total > 0
+        && (missing == total
+            || (total >= MASS_LOSS_MIN_PATHS && missing * 10 >= total * MASS_LOSS_TENTHS))
+}
+
+/// Refuse to run a pass whose local side has vanished in its entirety, or
+/// nearly so ([`looks_like_a_wipe`]).
 ///
-/// When every baseline path is absent locally, the likely cause is an unavailable
-/// mount or unreadable folder rather than a deliberate whole-tree deletion.
-/// One surviving path is enough to clear the guard.
+/// When the synced paths are all or nearly all absent locally, the likely
+/// cause is an unavailable mount or unreadable folder rather than a deliberate
+/// deletion of the whole tree.
 pub(super) fn guard_local_wipe<B, L>(
     baseline: &HashMap<String, B>,
     local: &HashMap<String, L>,
 ) -> Result<(), String> {
-    if !baseline.is_empty() && baseline.keys().all(|rel| !local.contains_key(rel)) {
+    let missing = baseline
+        .keys()
+        .filter(|rel| !local.contains_key(*rel))
+        .count();
+    if looks_like_a_wipe(missing, baseline.len()) {
         return Err(format!(
-            "every one of the {} synced paths is missing locally; refusing to trash \
+            "{missing} of the {} synced paths are missing locally; refusing to trash \
              them on Drive. Check that the folder is mounted and readable; to download \
              them again, sync the folder from scratch.",
             baseline.len()
@@ -200,20 +224,24 @@ pub(super) fn guard_local_wipe<B, L>(
     Ok(())
 }
 
-/// Refuse to run a pass whose remote side has vanished in its entirety: the
-/// remote twin of [`guard_local_wipe`].
+/// Refuse to run a pass whose remote side has vanished in its entirety, or
+/// nearly so: the remote twin of [`guard_local_wipe`].
 ///
 /// An empty or truncated remote walk reads to the planner as "Drive deleted
-/// everything", which a pass answers by deleting the local copies. When not
-/// one synced path is left on Drive, a failed listing is far likelier than a
-/// deliberate wipe of the whole folder, so the pass stops instead.
+/// everything", which a pass answers by deleting the local copies. When all or
+/// nearly all synced paths are gone from Drive at once, a failed listing is far
+/// likelier than a deliberate wipe of the folder, so the pass stops instead.
 pub(super) fn guard_remote_wipe<B, R>(
     baseline: &HashMap<String, B>,
     remote: &HashMap<String, R>,
 ) -> Result<(), String> {
-    if !baseline.is_empty() && baseline.keys().all(|rel| !remote.contains_key(rel)) {
+    let missing = baseline
+        .keys()
+        .filter(|rel| !remote.contains_key(*rel))
+        .count();
+    if looks_like_a_wipe(missing, baseline.len()) {
         return Err(format!(
-            "every one of the {} synced paths is missing on Proton Drive; refusing to \
+            "{missing} of the {} synced paths are missing on Proton Drive; refusing to \
              delete them here. If they were deleted on purpose, remove the folder from sync; \
              to upload them again, sync the folder from scratch.",
             baseline.len()
@@ -816,7 +844,7 @@ mod file_plan_tests {
     /// An empty or failed remote listing must not read as "Drive deleted
     /// everything" and delete the local copies.
     #[test]
-    fn the_remote_wipe_guard_blocks_only_a_total_disappearance() {
+    fn the_remote_wipe_guard_blocks_a_total_disappearance() {
         let base = HashMap::from([("a".to_string(), ()), ("b".to_string(), ())]);
         let none: HashMap<String, RemoteItem> = HashMap::new();
         assert!(guard_remote_wipe(&base, &none).is_err());
@@ -824,6 +852,37 @@ mod file_plan_tests {
         assert!(guard_remote_wipe(&base, &one).is_ok());
         let empty: HashMap<String, ()> = HashMap::new();
         assert!(guard_remote_wipe(&empty, &none).is_ok());
+    }
+
+    /// One path left of a large folder no longer clears either guard: most
+    /// of it gone at once is a lost tree, not a cleanup (B270).
+    #[test]
+    fn one_survivor_of_a_large_folder_does_not_clear_the_wipe_guards() {
+        let base: HashMap<String, ()> = (0..40).map(|n| (format!("f{n}.txt"), ())).collect();
+        let survivors = |n: usize| -> HashMap<String, ()> {
+            (0..n).map(|n| (format!("f{n}.txt"), ())).collect()
+        };
+        assert!(guard_local_wipe(&base, &survivors(1)).is_err());
+        assert!(guard_remote_wipe(&base, &survivors(1)).is_err());
+        // 36 of 40 gone is nine tenths: still refused.
+        assert!(guard_local_wipe(&base, &survivors(4)).is_err());
+        // 35 of 40 gone is under nine tenths: a pass may delete that much.
+        assert!(guard_local_wipe(&base, &survivors(5)).is_ok());
+        assert!(guard_remote_wipe(&base, &survivors(5)).is_ok());
+        let reason = guard_local_wipe(&base, &survivors(1)).unwrap_err();
+        assert!(reason.starts_with("39 of the 40 synced paths"), "{reason}");
+    }
+
+    /// A small folder still loses most of its files to an ordinary cleanup, so
+    /// only a total loss stops it.
+    #[test]
+    fn a_small_folder_trips_the_wipe_guards_only_when_everything_is_gone() {
+        let base: HashMap<String, ()> = (0..19).map(|n| (format!("f{n}.txt"), ())).collect();
+        let one: HashMap<String, ()> = [("f0.txt".to_string(), ())].into_iter().collect();
+        assert!(guard_local_wipe(&base, &one).is_ok());
+        assert!(guard_remote_wipe(&base, &one).is_ok());
+        let none: HashMap<String, ()> = HashMap::new();
+        assert!(guard_local_wipe(&base, &none).is_err());
     }
 
     /// A node that failed to decrypt has no name, so everything a short
