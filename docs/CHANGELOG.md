@@ -11,6 +11,30 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+
+- **The app and the tray say why your Drive does not open** (B263, #40). When the service runs
+  but its mount keeps failing, the app shows **Can't open your Drive** with the last error and a
+  **Retry** button, instead of "Connecting…" for as long as it lasts. The tray says "can't open
+  your Drive", `pdfs diagnose` reports `mount: failing for …`, and
+  `systemctl --user status proton-drive` shows the error as the unit's status.
+
+- **`pdfs diagnostics` shows what the sync engine is doing**, in a new `sync engine:` line:
+  idle, the folder it is on and for how long, or stopped. The journal warns when the engine has
+  stopped, or when a pass makes no progress for 15 minutes (B259, #53).
+
+- **`pdfs diagnose` reports more problems** (B268, #53): writes that keep failing, data that has
+  waited a day or more to be sent, a paused sync, synced folders in error or conflict, and a
+  control socket file that nothing listens on.
+
+### Changed
+
+- **A mount that keeps failing retries less often**, doubling from 5 seconds to every 2 minutes,
+  instead of every 5 seconds forever (B263).
+
+- **`proton-sdk` and `proton-drive-rs` 0.10.1.** Dependencies are updated, among them
+  `rusqlite` 0.41 with a newer bundled SQLite.
+
 ### Fixed
 
 - **My files no longer opens over a folder that already has files in it** (#67, B277). The files
@@ -26,6 +50,42 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   trashed everything else on Proton Drive, and on every other computer syncing the folder. A
   folder with 20 or more files and folders now also stops when nine in ten of them are missing,
   on this computer or on Proton Drive. **Sync From Scratch…** brings them back.
+
+- **My Files opens for accounts whose address keys depend on an inactive account key** (B265,
+  #40). The mount retried `missing key` forever. Address key tokens are now decrypted with every
+  account key the password opens, and one address whose keys do not open no longer breaks the
+  others.
+
+- **A new folder starts its first sync at once** (B260, #53), instead of waiting until every
+  other folder was walked again. A folder watch that failed partway is retried every 10 minutes
+  instead of never (B262), and a folder removed and added again keeps its watch (B272).
+
+- **A crash in one folder's sync no longer stops all syncing until a restart** (B259, #53). That
+  folder shows a sync error, and the next pass tries it again.
+
+- **A folder reads "waiting for first sync" until its first sync finishes**, instead of "up to
+  date", on **Sync → Folders** and on the Computers page (B261, #53).
+
+- **A large first sync goes on when one folder on Proton Drive fails to list** (B271, #46). It
+  used to start over from nothing. The folder that failed is tried again on the next pass, and
+  nothing under it is deleted.
+
+- **A restore that skipped folders is reported as failed**, with the reason for each, instead of
+  "restored 0 folder(s)" as a success (B269).
+
+- **"You're offline" no longer appears for a cache or database error** when pinning, unpinning,
+  searching or loading a folder (B266, #38). The app shows the actual error.
+
+- **A save no longer fails with "Input/output error"** when the file is opened for writing just
+  as its last change finishes uploading (B274).
+
+- **`journalctl --user -u proton-drive.service -p warning` shows the service's warnings and
+  errors** (B258, #53). Every line was stored at info level, so the filter showed nothing.
+
+- **Stopping the service no longer ends with a panic in the journal** (B276).
+
+- **A failed mount attempt stops the workers it started** (B264). They kept running beside the
+  next attempt and held the database.
 
 - **A new file reads without the network as soon as `pdfs status` shows nothing queued**
   (B257). A new file's upload counted as done before its bytes were cached, so a script that
