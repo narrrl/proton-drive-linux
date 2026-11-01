@@ -44,6 +44,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
   files in it. **After upgrading:** if your `~/ProtonDrive` has files underneath, for example
   saved there while the service was stopped, My files does not open until you move them out.
 
+- **The sidebar no longer says "Proton Drive isn't running" while the service is running**
+  (B263, B277). When the service runs but cannot open My files, for example because its folder
+  has files in it, the status at the bottom of the sidebar and on the Sync page now reads
+  "Can't open your Drive" with the reason, like the page itself.
+
 - **A synced folder stops instead of deleting when nearly all of it vanishes at once** (B270).
   The guard against a lost folder, such as a disk that is not mounted, stopped a pass only when
   every synced file was gone. One file left over was enough to clear it, and the next pass
