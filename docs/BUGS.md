@@ -110,7 +110,6 @@ a live account since.
 | Entry | Title |
 |---|---|
 | [B277](#b277--my-files-mounted-over-a-folder-with-files-in-it-and-hid-them) | My files mounted over a folder with files in it, and hid them |
-| [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
 | [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing |
@@ -119,7 +118,6 @@ a live account since.
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder |
-| [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B257](#b257--deleting-a-new-file-while-it-is-open-can-drop-the-bytes-its-handle-reads) | Deleting a new file while it is open can drop the bytes its handle reads |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
@@ -295,6 +293,8 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
+| [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
 | [B255](#b255--a-synced-folder-whose-files-are-all-gone-here-is-stuck-for-good) | A synced folder whose files are all gone here is stuck for good |
 | [B194](#b194--on-a-fresh-install-the-tray-exits-and-the-takeout-page-cannot-remember-its-archives) | On a fresh install the tray exits and the Takeout page cannot remember its archives |
@@ -423,7 +423,8 @@ simulation `a_mount_over_local_files_is_refused_and_leaves_them_alone`.
 
 ### B276 — A stop can end with a panic in a thread the stop never waited for
 
-**Status:** Fixed, not verified live
+**Status:** Fixed, checked on 2026-11-01 by an account run of `scripts/fuse-acceptance.sh
+--journal-check --durability`: eight daemon restarts, and no panic in the journal
 **Found:** 2026-10-31, by an account run of `scripts/fuse-acceptance.sh --journal-check
 --durability` against the audit branches. Every case passed, and the run still failed. During
 the restart in the durability case on My files, the journal had three
@@ -966,7 +967,8 @@ is why it helps.
 
 ### B258 — `journalctl -p warning` shows nothing, whatever the daemon logged
 
-**Status:** Fixed, not verified live
+**Status:** Fixed, checked on 2026-11-01 on a live account: after an acceptance run,
+`journalctl --user -u proton-drive.service -p warning` listed all 76 `WARN` lines the run logged
 **Found:** 2026-10-31, issue #53: the reporter ran `journalctl --user -u proton-drive.service -b
 -p warning`, as `docs/TROUBLESHOOTING.md` tells them to, and got `-- No entries --`.
 **Where:** `main` in `crates/pdfs-cli/src/main.rs`; `packaging/proton-drive.service`
