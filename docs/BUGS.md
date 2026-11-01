@@ -68,6 +68,10 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B275](#b275--on-a-slow-link-a-files-last-write-can-land-only-in-a-conflict-copy) | On a slow link, a file's last write can land only in a conflict copy | Cause not found; seen once in CI |
+| [B273](#b273--a-restore-proposes-another-computers-paths-when-the-two-share-a-hostname) | A restore proposes another computer's paths when the two share a hostname | Not fixed |
+| [B270](#b270--one-file-left-in-a-mirror-folder-clears-the-wipe-guard-for-all-the-others) | One file left in a mirror folder clears the wipe guard for all the others | Not fixed |
+| [B267](#b267--a-key-failure-at-a-start-from-a-warm-cache-shows-as-offline-for-good) | A key failure at a start from a warm cache shows as offline for good | Not fixed |
 | [B134](#b134--a-file-deleted-online-while-the-drain-checks-its-write-is-kept-as-a-conflict-copy) | A file deleted online while the drain checks its write is kept as a conflict copy | Only with `local_first` off |
 | [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on) | The daemon hung overnight, and nothing could say what it was waiting on | The cause is not diagnosed; the daemon now reports where it is stuck and is restarted |
 | [B67](#b67--fresh-state-restore-can-silently-select-a-new-device-high-22) | Fresh-state restore can silently select a new device (HIGH-22) | An ambiguous device after a loss of local state is not asked about |
@@ -80,6 +84,11 @@ original wording.
 
 | Entry | Title | What is left |
 |---|---|---|
+| [B269](#b269--a-restore-that-skipped-every-folder-reports-success) | A restore that skipped every folder reports success | The app shows the result only in the activity feed; no offer to replace or reset the folder in the way |
+| [B268](#b268--pdfs-diagnose-says-no-problems-found-while-sync-is-stuck) | `pdfs diagnose` says "No problems found" while sync is stuck | The sync engine's state is not checked |
+| [B263](#b263--a-mount-that-can-never-succeed-retries-every-5-s-and-tells-only-the-journal) | A mount that can never succeed retries every 5 s and tells only the journal | Errors no retry fixes back off like network errors |
+| [B262](#b262--watching-a-large-synced-folder-holds-up-the-sync-engine-and-a-failed-watch-is-never-retried) | Watching a large synced folder holds up the sync engine, and a failed watch is never retried | The first pass still waits for the watch; a failed watch is not shown in the app |
+| [B259](#b259--the-sync-engine-can-die-or-hang-and-nothing-shows-it-until-a-restart) | The sync engine can die or hang, and nothing shows it until a restart | No pass deadline; an ended engine is reported, not restarted; the trigger in #53 is not known |
 | [B199](#b199--a-stopped-share-stays-on-the-shared-by-me-page-for-minutes) | A stopped share stays on the Shared by me page for minutes | The share itself is not deleted; the SDK has no call for it |
 | [B88](#b88--pdfs-pin-rename-move-delete-and-sharing-still-cannot-name-a-path-under-a-secondary-mount) | `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount | `pin`, `unpin`, opening a file, thumbnails, uploads, sharing and versions |
 | [B72](#b72--pdfs-trash-never-returns) | `pdfs trash` never returns | The slowness of the first refresh is unmeasured |
@@ -100,6 +109,15 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
+| [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
+| [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing |
+| [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" |
+| [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running |
+| [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
+| [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
+| [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder |
+| [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B257](#b257--deleting-a-new-file-while-it-is-open-can-drop-the-bytes-its-handle-reads) | Deleting a new file while it is open can drop the bytes its handle reads |
 | [B254](#b254--an-edit-in-the-same-second-as-a-new-upload-never-arrives) | An edit in the same second as a new upload never arrives |
 | [B253](#b253--the-app-shows-the-sign-in-page-when-the-keyring-is-locked) | The app shows the sign-in page when the keyring is locked |
@@ -359,6 +377,505 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B275 — On a slow link, a file's last write can land only in a conflict copy
+
+**Status:** Open
+**Found:** 2026-10-31, CI on #60: `one_client_on_a_slow_link`, profile `one-client-wifi` seed 2,
+failed with `Drive does not hold what the clients wrote, 120s after the links came up`. The
+same seed passed 4 times locally, and #60 changes no daemon logic, so the failure depends on
+timing.
+**Where:** not located; the drain's conflict check in `crates/pdfs-fuse/src/drain.rs` is the
+first suspect
+
+**Repro:** Only the CI run above. The last steps created `x/z/y/a.txt` (37 bytes), wrote 42
+bytes into it at offset 20, and brought every link up. Drive then held the file at its first
+37 bytes, and the full content was in `x/z/y/a (sync-conflict …).txt`. No other client wrote
+to it.
+
+**Cause.** Not known. Nothing was lost, since the conflict copy holds the bytes, but the file
+conflicted with its own create. B183 and B184 found the same symptom after a lost create
+reply.
+
+**Fix.** Not done. Needs a reproduction: run the seed in a loop under load and keep the state
+directory of a failing run.
+
+---
+
+### B274 — Opening a file for writing fails with EIO while its queued revision lands
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, CI: the simulation
+`a_file_whose_upload_was_not_read_back_takes_two_writes_at_once` failed once with
+`Input/output error` on a write, after `copy queued revision into write scratch failed … No
+such file or directory`. It did not fail in 54 local runs.
+**Where:** the write open in `crates/pdfs-fuse/src/filesystem.rs`
+
+**Repro:** Write a file, and open it for writing again at the moment its queued revision
+finishes uploading. The open fails with EIO, and the program sees its save fail.
+
+**Cause.** The open samples the queued revision, then copies its blob into the new handle's
+scratch file. The drain lets go of the pending entry and then deletes the blob when the upload
+lands. A blob deleted between the sample and the copy failed the open, although the re-check
+just after the copy already retries a revision that changed during it.
+
+**Fix.** A failed copy checks whether the pending entry still names that blob. When it does
+not, the revision landed or was replaced, and the open goes around again with the base the
+file has now, as the re-check does. Since the drain drops the entry before the blob, a blob
+that is gone and still named is a real failure and still returns EIO.
+
+**Test:** none deterministic; the simulation above covers the window.
+
+---
+
+### B273 — A restore proposes another computer's paths when the two share a hostname
+
+**Status:** Open
+**Found:** 2026-10-31, code audit after issue #46.
+**Where:** `saved_folder` in `crates/pdfs-core/src/profile.rs`
+
+**Repro:** Two computers with the same hostname, for example both left at a distribution's
+default `archlinux`, sync the same device. Restore a folder on one of them. The proposed local
+path and mode come from whichever of the two profiles is found first, not from this computer's.
+
+**Cause.** `saved_folder` prefers the profile whose `hostname` matches. The machine id that
+B252 added tells computers apart, but this lookup does not use it.
+
+**Fix.** Not done. Match on the machine id first, then fall back to the hostname for profiles
+written before it existed.
+
+---
+
+### B272 — After a folder is removed and added again, its file events go to the old id
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, code audit after issue #53.
+**Where:** `rewatch` in `crates/pdfs-fuse/src/sync/engine.rs`
+
+**Repro:** Remove a synced folder and add the same path again before the engine handles the
+first `Rewatch`, so both land in one burst. Edits in the folder are not synced until the
+two-minute poll, and the same goes for every later edit until the daemon restarts.
+
+**Cause.** `rewatch` matches the watches it has against the ones it wants by path alone. The
+path is still wanted, so the old entry stays with the removed folder's id. Its events become
+`Reconcile(old id)`, `sync_folder_get` finds no row, and the request is dropped.
+
+**Fix.** `keep_wanted` keeps a watch whose path is still wanted and gives it the id the
+folder list has now.
+
+**Test:** `a_re_added_folder_keeps_its_watch_under_the_new_id` in `pdfs-fuse`.
+
+---
+
+### B271 — One failed listing makes a large first sync start over from nothing
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, code audit after issue #46: a folder of about 19,900 items restored on a
+second computer sat at `scanning…` with nothing downloaded, and the journal showed
+`RequestTimeout (http 408)`.
+**Where:** `walk_remote` in `crates/pdfs-fuse/src/sync.rs`
+
+**Repro:** Restore or add a mirror folder with tens of thousands of items on Drive, on a link
+that drops a request now and then. The pass walks the whole remote tree before it downloads
+anything. When one folder's listing fails after the SDK's retries, the pass fails, and the
+next one walks the whole tree again. On a slow enough link it never gets past the walk.
+
+**Cause.** Each `enumerate_folder_children_node_uids`, `enumerate_nodes_light` and
+`enumerate_nodes` call in the walk ends the whole walk through `?`. Nothing is applied until
+the walk is done. Files that did download keep their baseline rows, so only the walk is lost,
+but on a first sync that is all of it. Progress is also counted only after a folder's full
+listing, so a large folder shows `scanning…` with 0 checked for a long time.
+
+**Fix.** A listing that fails below the sync root records that folder as a gap in
+`RemoteGaps`, next to the folders whose listing came back short. The planner deletes nothing
+under a gap, the rest of the pass still applies, and the pass report names the folder as
+tried again next pass. A failed listing of the root itself still fails the pass, since there is
+nothing left to apply. The progress count inside one large folder is unchanged.
+
+**Test:** `a_folder_that_failed_to_list_hides_everything_under_it` in `sync::planner`.
+
+---
+
+### B270 — One file left in a mirror folder clears the wipe guard for all the others
+
+**Status:** Open
+**Found:** 2026-10-31, code audit after issue #46, whose reporter emptied a synced folder
+several times.
+**Where:** `guard_local_wipe` and `guard_remote_wipe` in `crates/pdfs-fuse/src/sync/planner.rs`
+
+**Repro:** Sync a mirror folder with many files. Make all of them but one unavailable here: a
+half-mounted disk, a restored backup that brought back one file, or a script that emptied the
+folder and wrote one file back. The next pass trashes every other file on Drive. On a device
+that two computers sync, the other computer then deletes its copies too.
+
+**Cause.** The guard refuses a pass only when every baseline path is missing. One surviving
+path is enough to clear it, so it guards against an empty folder and nothing short of that.
+The remote guard has the same shape.
+
+**Fix.** Not done. Also refuse when most of a large baseline is missing at once, and leave the
+choice to the user: delete on the other side, or sync from scratch.
+
+---
+
+### B269 — A restore that skipped every folder reports success
+
+**Status:** Partly fixed
+**Found:** 2026-10-31, code audit after issue #46: the journal showed `restore complete
+restored=0 skipped=1` several times, and the user saw nothing.
+**Where:** the `RestoreSyncFolders` and `RestoreDeviceFolders` handler in
+`crates/pdfs-fuse/src/control.rs`; `restore_sync_folders` in `crates/pdfs-fuse/src/profile.rs`
+
+**Repro:** Restore a folder from another computer to a path that is already a sync root here,
+for example a folder left over from an earlier attempt. `pdfs devices join` prints `restoring
+folders`, and the app shows the same. Nothing downloads, and no error appears anywhere.
+
+**Cause.** The daemon acks before it works, because a restore outlasts the socket timeout. The
+result, `restored 0 folder(s); skipped: …`, is then logged as a successful activity, so the
+reason is only in the activity text and the journal. When the database insert fails partway,
+the `?` also skips the `Rewatch` for the folders already restored.
+
+**Fix.** `restore_sync_folders` returns what it restored and what it skipped, with the reason
+for each skip. The daemon logs a restore that skipped any folder as a failed activity, with the
+reasons as its detail, and warns in the journal. A database error partway now sends the
+`Rewatch` for the folders already restored before it returns. `pdfs devices join` points to
+`pdfs activity` for the result.
+
+Left: the app shows the result only in the activity feed, and nothing offers to replace or reset
+the folder in the way.
+
+---
+
+### B268 — `pdfs diagnose` says "No problems found" while sync is stuck
+
+**Status:** Partly fixed. The sync engine's own state is not checked yet.
+**Found:** 2026-10-31, issue #53: a folder that never synced, and `diagnose` found nothing.
+**Where:** `diagnose` in `crates/pdfs-cli/src/main.rs`
+
+**Repro:** Leave a synced folder in `error`, or have queued writes that keep failing, or pause
+sync. `pdfs diagnose` reports every check `[ok]` and exits 0.
+
+**Cause.** The `Status` reply is matched with `..`, which drops `failing_ops`, `failing_error`,
+`parked_uploads`, `staged_oldest_secs` and `paused`. `diagnose` never asks for the synced
+folders or for `Diagnostics`, so a folder in error and a stalled worker are not seen. A
+control socket file with no daemon behind it is also reported `[ok]`; only the next line says
+the daemon does not answer.
+
+**Fix.** `diagnose` warns about writes that keep failing (with the last error), a write that
+has waited a day or more to upload, a pause, and each synced folder in `error` or `conflict`
+(`sync_health` and `folder_health` in `crates/pdfs-cli/src/main.rs`). A control socket file
+that nothing listens on is a warning, not `[ok]`. Parked uploads are left out: a file still
+wearing a download's temporary name is normal. Not done: the sync engine's state, which
+`Diagnostics` reports once B259's change is in.
+
+**Test:** `a_stuck_queue_or_a_pause_is_reported` and `a_synced_folder_in_error_is_reported` in
+`pdfs-cli`. On 2026-10-31 the new `diagnose` against a healthy 3.6.0 daemon still reported
+"No problems found".
+
+---
+
+### B267 — A key failure at a start from a warm cache shows as offline for good
+
+**Status:** Open
+**Found:** 2026-10-31, code audit after issue #40. B202 fixed the same path for a refused
+session only.
+**Where:** `fetch_or_recall_root` in `crates/pdfs-fuse/src/mount.rs`; `run_online_probe` in
+`crates/pdfs-fuse/src/link.rs`
+
+**Repro:** Sign in once so the cache holds the My Files root. Then start the daemon in a state
+where the root cannot be decrypted, for example the address-key failure of B265. The mount
+comes up "offline", the app says you are offline, and it stays so while the network is fine.
+
+**Cause.** Any error from `get_my_files_folder` other than a revoked session becomes
+`Start::Offline` when a cached root exists. The online probe then retries the same call and
+logs its failures at debug level, so the journal at the default level says nothing.
+
+**Fix.** Not done. Use `Start::Offline` only for an error `is_network_error` accepts, and
+report the others as their own state through `Status`.
+
+---
+
+### B266 — Pin, unpin, search and node loads report a database error as "offline"
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, code audit after issue #38. B205 fixed the photo upload path only.
+**Where:** `CoreError::from_api` in `crates/pdfs-core/src/error.rs`; its callers in
+`crates/pdfs-fuse/src/lib.rs` (`pin`, `unpin`, the searches, `load node`)
+
+**Repro:** Pin a folder while the cache database is locked or full. The app says "You're
+offline" and drops the reason.
+
+**Cause.** `from_api` classifies any error that is not a `ProtonError` as `Offline`, because
+it was written for SDK calls, where that means a transport error. These callers pass it
+`pdfs_core::Error` values from the cache and the database. A `ProtonError` wrapped in
+`pdfs_core::Error::Proton` also misses the downcast, since the source chain is not walked.
+
+**Fix.** `from_api` walks the source chain. The first `ProtonError` or `pdfs_core::Error` in it
+decides the kind, the same way `From<Error>` does, and only an error with neither, a transport
+error, reads as offline. That covers every caller at once, the database ones included.
+
+**Test:** `a_database_error_handed_to_from_api_is_not_offline` in `pdfs-core`.
+
+---
+
+### B265 — Address keys whose token is for an inactive account key never open
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, code audit after issue #40: a Duo account whose mount failed on every
+start with `fetch My Files root: cryptography error: failed to decrypt: missing key`, after three
+`failed to decrypt address key token` warnings. The web app worked. B210's fix does not apply,
+because the account has an active volume.
+**Where:** `user_keys` and `decrypt_address` in `proton-sdk` (`crates/proton-sdk/src/account.rs`
+in `proton-sdk-rs`)
+
+**Repro:** Not reproduced. An account whose address-key tokens are encrypted to an account key
+that is no longer active cannot open those address keys, and so cannot open the My Files share.
+
+**Cause.** `user_keys` skips every inactive account key, even one the password opens, and the
+address-key tokens are decrypted only with what it returns. `keycheck.rs` in this repository
+already reports "token is for inactive account key", so the case is known. Separately,
+`addresses()` fails as a whole through `?` when one address has no usable primary key, which
+takes the working addresses down with it.
+
+**Fix.** In `proton-sdk` 0.10.1 (narrrl/proton-sdk-rs#3). Tokens are tried with every account
+key that opens, active ones first, and signing uses active keys only. An address that cannot be
+opened is left out with a warning, and the others work; `addresses()` fails only when none
+opens. When the left-out address is the default, `default_address` fails with the reason
+rather than signing with another address. `key_report` walks the same chain, so `pdfs diagnose`
+reports such a key as opening. Not verified against an account with an inactive key, since
+none is at hand; issue #40's reporter can confirm.
+
+**Test:** `an_address_key_whose_token_is_for_an_inactive_account_key_opens`,
+`an_address_whose_keys_do_not_open_leaves_the_others_working` and
+`an_account_whose_addresses_all_fail_to_open_is_an_error` in `proton-sdk`.
+
+---
+
+### B264 — A mount that fails after starting its workers leaves them running
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, code audit after issue #40.
+**Where:** `run_mount` in `crates/pdfs-fuse/src/mount.rs`
+
+**Repro:** Make the mount fail after the workers start: a busy mountpoint, or a control socket
+whose permissions cannot be set. The daemon retries every 5 s, and the drain, sync, sweep,
+probe and index threads of the failed attempt keep running beside the next one.
+
+**Cause.** The early returns after the workers are spawned (the `?` on the socket bind, the
+permission check, a `spawn_session` error, and a `?` on a later thread spawn) skip
+`stop_workers`. The threads hold a `Core`, and the `Core` holds the database. If that keeps
+the `flock` held, every later attempt fails with "another daemon is using cache.db" instead
+of the real error. That part is inferred from the code and not observed.
+
+**Fix.** Every early return in `mount` after the first worker starts stops the workers
+(`abandon_workers`, `keep_or_abandon` in `crates/pdfs-fuse/src/mount.rs`). Unlike a normal stop
+it does not send `STOPPING=1`, because the daemon is about to retry and systemd would
+otherwise wait for it to exit and then kill it. The control-thread failure path, which already
+stopped its workers, no longer sends it either.
+
+**Test:** none of its own; the simulations (`sim::daemon`, 55 passed) cover the normal start
+and stop.
+
+---
+
+### B263 — A mount that can never succeed retries every 5 s and tells only the journal
+
+**Status:** Partly fixed. Errors that no retry fixes are not told apart from network errors yet.
+**Found:** 2026-10-31, issue #40: the app showed "Connecting… waiting for the Proton Drive
+service" for days, `pdfs diagnose` only reported the control socket missing, and the reporter
+uninstalled.
+**Where:** the mount loop in `crates/pdfs-cli/src/main.rs`; `run_mount` in
+`crates/pdfs-fuse/src/mount.rs`
+
+**Repro:** Start the daemon with a session whose keys cannot open My Files (B265). The journal
+shows `mount failed; retrying in 5s` forever. The app and the tray wait for the service, and
+nothing says why.
+
+**Cause.** Every mount error gets the same 5 s retry, whether it is a network error or one that
+no retry fixes, such as a key or a 4xx answer. Each attempt builds a new client and sends about
+four requests, so a broken account sends tens of thousands a day, which may also feed
+Proton's sign-in blocks (#39). The control socket is bound only after the mount succeeds, and
+the error is written nowhere a front end can read it.
+
+**Fix.**
+- The retry doubles from 5 s to a 2-minute ceiling (`mount_retry_delay` in
+  `crates/pdfs-cli/src/main.rs`), about 720 attempts a day instead of 17,000. The ceiling stays
+  at minutes because a cold start without a network fails the same way and has to mount soon
+  after the network returns.
+- Each failure is written to `mount-failure.json` in the state directory
+  (`crates/pdfs-core/src/mountfail.rs`), with the error, since when it fails and the attempt
+  count. A mount that comes up removes it, and so does a new daemon.
+- The app shows "Can't open your Drive" with the error and a Retry button instead of
+  "Connecting…". The tray says "Signed in as … — can't open your Drive". `pdfs diagnose` reports
+  `[FAIL] mount: failing for …`. `systemctl --user status` shows the error as the unit's status.
+- Not done: key, `KeysLocked` and 4xx errors still retry like network errors, only less often.
+
+**Test:** `a_failing_mount_backs_off_to_a_ceiling` in `pdfs-cli`;
+`a_recorded_failure_reads_back_until_cleared` in `pdfs-core`. On 2026-10-31 a second
+`pdfs daemon` beside the running one failed on the database lock three times in 18 s (at 0, 5
+and 15 s) and recorded `attempts: 3` with the lock error.
+
+---
+
+### B262 — Watching a large synced folder holds up the sync engine, and a failed watch is never retried
+
+**Status:** Partly fixed. A watch is still set up before the first pass, and a failed watch
+is not shown in the folder's state.
+**Found:** 2026-10-31, code audit after issue #53.
+**Where:** `rewatch` and `engine_loop` in `crates/pdfs-fuse/src/sync/engine.rs`
+
+**Repro:** Add a synced folder with many subfolders, or one that holds a symlink to a large
+tree, on a system near `fs.inotify.max_user_watches`. The new folder's first pass waits until
+the recursive watch is set up. When the watch fails, the journal has one `sync: watch failed`
+line, the folder is never watched, and later changes are found only by the two-minute poll.
+
+**Cause.**
+- `rewatch` runs on the engine thread before the reconcile, and notify's recursive watch walks
+  the whole tree, at startup for every folder.
+- notify follows symlinks by default, and the local walk does not.
+- When `watch` fails partway, the watches added before the failure stay registered, but the
+  folder is not recorded as watched. Their events match no folder and become `ReconcileAll`,
+  and they use up watches the next folder needs.
+- Errors the watcher reports later are dropped in its callback.
+
+**Fix.**
+- A failed watch is unwatched, which removes the watches it had added under the folder, and
+  is tried again every 10 minutes. The warning names `fs.inotify.max_user_watches`.
+- The watcher no longer follows symlinks.
+- Errors the watcher reports are logged.
+- Not done: the watch still runs before the folder's first pass. Watching first is what keeps
+  a change made during the pass from being missed, so the order stays; the cost is one walk
+  of a new folder's tree. A failed watch is not shown in the folder's state yet.
+
+**Test:** none for the watch failure itself; it needs the inotify limit reached.
+
+---
+
+### B261 — A folder that has never synced reads "up to date"
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, issue #53: "In Computers I add the folder. It appears as synced."
+**Where:** `sync_folder` in `crates/pdfs-core/src/db/migrations.rs`; `sync_state_label` in
+`crates/pdfs-gui/src/app/pages/devices.rs`; the location rows in
+`crates/pdfs-gui/src/app/pages/locations.rs`
+
+**Repro:** Add a synced folder. Until its first pass starts, the app shows it as up to date.
+The same happens after a switch from on-demand to mirror, after **Sync From Scratch…**, and for
+every folder while sync is paused for the whole account.
+
+**Cause.** The `state` column defaults to `idle`, and every state the label does not know reads
+"up to date". `last_sync` is 0 for a folder that has never synced, but the rows do not look at
+it, and a test pins the label for that case. The rows only show a folder's own pause, not the
+account-wide one.
+
+**Fix.** A mirror folder whose `last_sync` is 0 and whose state is `idle` reads "waiting for
+first sync" on its row. The This computer row on the Computers page counts such folders, as in
+"2 folders backed up · 1 waiting for its first sync". An on-demand folder has no first sync,
+so it is left out. The account-wide pause stays where it already is, the pause card at the top
+of the page; repeating it on every row would only add noise.
+
+**Test:** `a_folder_reads_up_to_date_only_after_its_first_sync` and
+`a_folder_before_its_first_sync_is_not_counted_as_backed_up` in `pdfs-gui`; the pinned test now
+expects the new label.
+
+---
+
+### B260 — The poll pushes a new folder's first sync behind every other folder
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, code audit after issue #53.
+**Where:** `engine_loop` in `crates/pdfs-fuse/src/sync/engine.rs`
+
+**Repro:** Sync a few large mirror folders whose passes take longer than two minutes, then add
+another folder. Its first pass waits until every other folder has been walked again, each
+time.
+
+**Cause.** The poll sends `ReconcileAll` every two minutes whether or not a pass is still
+running. When a burst holds both a `ReconcileAll` and a folder's `Reconcile(id)`, the loop runs
+only `reconcile_all`, which goes in id order. A new folder has the highest id, so it always
+goes last.
+
+**Fix.** `run_burst` runs the folders a burst names by id first, lowest id first, and then
+every other folder when the burst also holds a `ReconcileAll`. A named folder is read again
+before its pass. A pause that lands between passes now stops the rest of the burst.
+
+**Test:** `named_folders_run_before_the_rest_of_a_burst` in `pdfs-fuse`.
+
+---
+
+### B259 — The sync engine can die or hang, and nothing shows it until a restart
+
+**Status:** Partly fixed. A hung pass is reported but not ended, and a panic outside a pass
+still stops the engine; it is reported, not restarted.
+**Found:** 2026-10-31, issue #53: a newly added folder did not sync until the reporter restarted
+the app. All FUSE workers were idle, nothing was queued, and the warning-level journal was
+empty (B258).
+**Where:** `spawn` and `engine_loop` in `crates/pdfs-fuse/src/sync/engine.rs`;
+`reconcile_pass` in `crates/pdfs-fuse/src/sync.rs`; `crates/pdfs-fuse/src/diagnostics.rs`
+
+**Repro:** Not reproduced. Make one pass panic, or block in a call that does not return. Every
+later add, `pdfs sync now`, file event and poll is dropped without a word. The folder that was
+syncing stays `syncing` with its last progress. A restart runs a pass over every folder, which
+is why it helps.
+
+**Cause.**
+- The engine is one thread, and nothing catches a panic in a pass. When it unwinds, the
+  receiver is gone and every `let _ = sync_tx.send(..)` fails silently. The poll thread stops
+  at its first failed send.
+- The thread's `JoinHandle` is checked only at shutdown.
+- A pass has no overall deadline. Each request is bounded, but a pass is not; B165 dealt with
+  the stop only.
+- Nothing logs a pass starting, or ending without changes. `Diagnostics` covers the FUSE
+  workers and the request queue, not this thread, so "workers idle, nothing queued" says
+  nothing about sync.
+- A database error when the engine reads a folder drops that folder's request without a log.
+
+**Fix.**
+- Each pass runs under `catch_unwind` (`EngineHealth::contain` in
+  `crates/pdfs-fuse/src/sync/engine.rs`). A panic ends that pass only: its progress is cleared,
+  the folder is set to `error`, the activity feed says so, and the next poll tries again.
+- `Diagnostics` carries the engine's state: running or not, the folder of the running pass, how
+  long it has run and how long since it last reported progress, and how many passes panicked.
+  `pdfs diagnostics` prints it as `sync engine: …`.
+- The supervisor warns when the engine thread has ended, and when a pass has reported no
+  progress for 15 minutes.
+- A first pass logs its start and end at info, as does any pass that changed something or
+  took 30 s or more. A request for a folder the database cannot read is logged.
+- Not done: a deadline for a pass, and restarting an engine thread that has ended. The
+  channel's receiver ends with the thread, so a restart needs a new channel in every `Core`
+  clone.
+
+**Test:** `a_panicking_pass_is_contained_and_counted`, `the_running_pass_is_reported` and
+`the_engine_reads_as_stopped_once_its_thread_ends` in `pdfs-fuse`;
+`a_stopped_sync_engine_is_a_stall` and `only_a_quiet_sync_pass_is_a_stall` in the supervisor.
+
+---
+
+### B258 — `journalctl -p warning` shows nothing, whatever the daemon logged
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, issue #53: the reporter ran `journalctl --user -u proton-drive.service -b
+-p warning`, as `docs/TROUBLESHOOTING.md` tells them to, and got `-- No entries --`.
+**Where:** `main` in `crates/pdfs-cli/src/main.rs`; `packaging/proton-drive.service`
+
+**Repro:** Make the daemon log a warning, then run the command above. It prints no entries.
+Without `-p` the warning is there.
+
+**Cause.** The daemon logs with plain `tracing_subscriber::fmt()` to standard output. journald
+stores every line of a service's output at the unit's default priority, info, unless the line
+starts with a `<N>` prefix. So every `WARN` and `ERROR` line is stored as info, and the
+troubleshooting guide's filter hides all of them.
+
+**Fix.** When standard output is the journal stream (`JOURNAL_STREAM` names the same
+device and inode as fd 1), each line starts with the `<N>` prefix for its level, and ANSI colours
+are off. A terminal that merely inherited `JOURNAL_STREAM` keeps the plain format
+(`crates/pdfs-cli/src/journal.rs`).
+
+**Test:** `each_line_opens_with_the_priority_of_its_level` and
+`journal_stream_must_name_the_same_file` in `pdfs-cli`. On 2026-10-31, `pdfs diagnose` run with
+`RUST_LOG=debug` under `systemd-run --user -p StandardOutput=journal` stored its debug lines at
+`PRIORITY=7` and its report at 6.
+
+---
 
 ### B257 — Deleting a new file while it is open can drop the bytes its handle reads
 
@@ -1562,6 +2079,8 @@ what it holds. What was synced in it is still deleted.
 ### B210 — After a password reset, the mount retries "missing key" forever
 
 **Status:** Fixed, not verified live
+**See also:** B265. The account in issue #40 has an active volume, so this fix does not run for
+it; its "missing key" comes from address keys that do not open.
 **Found:** 2026-10-15, issue #40: on a fresh 3.4.0 install the sign-in worked, but the daemon
 logged `mount failed: fetch My Files root: cryptography error: failed to decrypt: missing key`
 every 5 seconds. The app stayed on "Connecting…" because the daemon never got far enough to
@@ -1707,6 +2226,7 @@ front-end is the stale one, and restarting the service would not help.
 ### B205 — A photo upload the SDK refuses says "You're offline"
 
 **Status:** Fixed, not verified live
+**See also:** B266, the same misclassification on the pin, unpin, search and node-load paths.
 **Found:** 2026-10-11, issue #38: uploading an image from the Photos page showed "You're offline"
 while other uploads went through. Each `upload_photo` failed about 5 µs after it started, with no
 request sent, and the journal gave no reason.
@@ -1791,6 +2311,7 @@ taken as this session's, so the daemon keeps writing its later rotations.
 ### B202 — A refused session shows as offline forever, and nothing says to sign in again
 
 **Status:** Fixed, not verified live
+**See also:** B267. Other errors at a start from a warm cache still mount as offline.
 **Found:** 2026-10-09, issue #35: the tray and `pdfs diagnose` said "offline, 3 queued", and
 diagnose also said "keyring session: ok", while every call in the log failed with
 `InvalidRefreshToken (http 400)`. `pdfs sync now` and restarting the service changed nothing.
@@ -2732,6 +3253,8 @@ fix).
 ### B165 — A stop waits on a stuck thread until systemd kills the daemon
 
 **Status:** Fixed (unverified).
+**See also:** B259. A pass still has no deadline while the daemon runs, and a stuck or dead
+sync engine is not reported.
 **Found:** 2026-10-04, by the account run on 2.10.0 (cleanup after on-demand pairing 2). The
 daemon was stopped at 15:53:04 and logged "control socket closing", but never "sync engine
 stopping" or "daemon stopping". systemd killed it 15 s later (`TimeoutStopSec`). The run's

@@ -124,7 +124,7 @@ use mount::{
 };
 use reads::{BlockFlight, BlockRing, PREFETCH_BUDGET, Prefetch, ReaderSlot, STREAM_BYPASS_MIN};
 use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle};
-pub use systemd::idle_sleep;
+pub use systemd::{idle_sleep, status as notify_status};
 use tracing::{debug, error, info, warn};
 use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
 use r#virtual::{
@@ -728,6 +728,8 @@ struct Core {
     /// can say what a pass is doing rather than just "syncing". An entry exists
     /// only while that folder's reconcile pass is running.
     sync_progress: Arc<Mutex<HashMap<i64, SyncProgress>>>,
+    /// Whether the folder-sync engine is alive, and which pass it is on.
+    sync_engine: Arc<sync::EngineHealth>,
     /// Channel to the folder-sync engine: nudges it to
     /// reconcile a folder, reconcile everything, or re-scan its watch set.
     sync_tx: std::sync::mpsc::Sender<sync::SyncMsg>,
@@ -5997,6 +5999,7 @@ impl Core {
         if let Some(p) = self.sync_progress.lock().get_mut(&folder_id) {
             f(p);
         }
+        self.sync_engine.moved();
     }
 
     /// Set the number of items the scan expects to check, from the size of the

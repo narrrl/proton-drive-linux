@@ -608,14 +608,22 @@ mod tests {
             daemon.pending(),
             drive.tree()
         );
-        // The bytes kept for the handle went once the trash landed with it closed.
-        let cached: Vec<_> = std::fs::read_dir(dir.join("cache"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.file_name())
-            .collect();
-        assert!(cached.is_empty(), "{cached:?}");
+        // The bytes kept for the handle went once the trash landed with it
+        // closed. The queue empties as the trash's row goes, a moment before
+        // the eviction, so this waits too.
+        let cached = || -> Vec<_> {
+            std::fs::read_dir(dir.join("cache"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.file_name())
+                .collect()
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || cached().is_empty()),
+            "{:?}",
+            cached()
+        );
 
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2063,6 +2071,21 @@ mod tests {
         daemon.write_new(&path, b"first").unwrap();
         assert!(wait_until(Duration::from_secs(30), || held.reached()));
         std::fs::write(&path, b"second").unwrap();
+        // The kernel sends the release after `close` returns. Attaching the
+        // bytes resets the create's attempts, so a release that came after the
+        // lost reply had it retried at once, and the retry landed before
+        // anything here saw it fail. The bytes it replaced go only once they
+        // are attached.
+        let staged = dir.join("cache").join("staging");
+        assert!(wait_until(Duration::from_secs(30), || {
+            let blobs: Vec<Vec<u8>> = std::fs::read_dir(&staged)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::read(e.path()).ok())
+                .collect();
+            blobs.iter().any(|b| b == b"second") && !blobs.iter().any(|b| b == b"first")
+        }));
         drop(held);
         assert!(wait_until(Duration::from_secs(30), || {
             daemon
