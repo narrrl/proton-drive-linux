@@ -1387,12 +1387,39 @@ pub(crate) fn paint_status(ui: &Rc<Ui>, status: Response) {
 /// read-out so the page doesn't flicker on a blip.
 pub(crate) fn paint_disconnected(ui: &Rc<Ui>) {
     set_mounted(ui, false);
-    paint_sync_status(ui, SyncState::Disconnected);
     for r in ui.status.pin_rows.borrow().iter() {
         if let Some(b) = &r.unpin {
             b.set_sensitive(false);
         }
     }
+    // A running daemon whose mount fails on every try never answers either,
+    // and "isn't running" would be wrong for it (B263, B277). The pages read
+    // the same failure record.
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let failure = if service_down().await {
+            None
+        } else {
+            let state_dir = ui.dirs.state_dir();
+            gio::spawn_blocking(move || pdfs_core::mountfail::read(&state_dir))
+                .await
+                .ok()
+                .flatten()
+        };
+        // The daemon may have answered while this looked.
+        if *ui.mounted.borrow() {
+            return;
+        }
+        paint_sync_status(
+            &ui,
+            match failure {
+                Some(failure) => SyncState::CannotOpen {
+                    not_empty: failure.not_empty.is_some(),
+                },
+                None => SyncState::Disconnected,
+            },
+        );
+    });
 }
 
 /// What the sidebar's status strip reports, most urgent first.
@@ -1436,6 +1463,11 @@ pub(crate) enum SyncState {
     },
     /// No mount daemon answered: still starting, or the service is down.
     Disconnected,
+    /// The service runs, but its mount fails on every try. `not_empty` when
+    /// it refuses a folder that already has files in it.
+    CannotOpen {
+        not_empty: bool,
+    },
     /// The daemon is running but didn't answer in time.
     NotResponding,
 }
@@ -1444,7 +1476,10 @@ pub(crate) enum SyncState {
 /// one-line state, and a detail line.
 fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
     let paused = matches!(state, SyncState::Paused { .. });
-    let connected = !matches!(state, SyncState::Disconnected | SyncState::NotResponding);
+    let connected = !matches!(
+        state,
+        SyncState::Disconnected | SyncState::CannotOpen { .. } | SyncState::NotResponding
+    );
     let expired = matches!(state, SyncState::SessionExpired { .. });
     let outdated = matches!(state, SyncState::Outdated { .. });
     let (icon, class, title, detail) = match state {
@@ -1535,6 +1570,16 @@ fn paint_sync_status(ui: &Rc<Ui>, state: SyncState) {
             Some("warning"),
             gettext("Not connected"),
             Some(gettext("Proton Drive isn't running")),
+        ),
+        SyncState::CannotOpen { not_empty } => (
+            "dialog-warning-symbolic",
+            Some("warning"),
+            gettext("Can't open your Drive"),
+            Some(if not_empty {
+                gettext("Your Proton Drive folder isn't empty")
+            } else {
+                gettext("Proton Drive keeps trying to start")
+            }),
         ),
         SyncState::NotResponding => (
             "dialog-warning-symbolic",
