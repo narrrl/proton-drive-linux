@@ -3561,7 +3561,35 @@ JOURNAL_WARNINGS = (
     "queued write conflicts; keeping a conflict copy",
     "a fuse worker has held the same job for a long time",
     "re-interned an authority missing from the local tree",
+    # A Rust panic goes to stderr without a tracing level, so the ERROR match
+    # does not see it (`docs/BUGS.md` B276).
+    "panicked at",
 )
+
+# A stop aborts each mount's FUSE connection so the unmount cannot hang. A
+# request still running then replies into a connection the kernel has
+# closed, and the kernel refuses that reply with ENOENT. While a stop is in
+# progress that error is expected (`docs/BUGS.md` B276); at any other time it
+# still counts.
+STOP_STARTED = "aborted FUSE connection to unblock unmount"
+STOP_ENDED = ("daemon stopping", "control socket listening")
+LATE_REPLY = "Failed to send FUSE reply: No such file or directory"
+
+
+def journal_problems(lines: list[str]) -> list[str]:
+    """The lines of `lines` that count as problems."""
+    problems = []
+    stopping = False
+    for line in lines:
+        if STOP_STARTED in line:
+            stopping = True
+        elif any(marker in line for marker in STOP_ENDED):
+            stopping = False
+        if stopping and LATE_REPLY in line:
+            continue
+        if ERROR_LEVEL.search(line) or any(warning in line for warning in JOURNAL_WARNINGS):
+            problems.append(line)
+    return problems
 
 
 def read_journal(unit: str, since: float) -> list[str] | None:
@@ -3621,11 +3649,7 @@ class JournalWatch:
         # Filtering on syslog priority (`-p err`) finds nothing: the daemon writes
         # tracing levels as text on stdout, which journald files at the unit's
         # default priority. Match the level token instead.
-        return [
-            line
-            for line in lines
-            if ERROR_LEVEL.search(line) or any(warning in line for warning in JOURNAL_WARNINGS)
-        ]
+        return journal_problems(lines)
 
 
 # --------------------------------------------------------------------------

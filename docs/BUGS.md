@@ -109,13 +109,14 @@ a live account since.
 
 | Entry | Title |
 |---|---|
-| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
+| [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
+| [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
 | [B271](#b271--one-failed-listing-makes-a-large-first-sync-start-over-from-nothing) | One failed listing makes a large first sync start over from nothing |
 | [B266](#b266--pin-unpin-search-and-node-loads-report-a-database-error-as-offline) | Pin, unpin, search and node loads report a database error as "offline" |
+| [B265](#b265--address-keys-whose-token-is-for-an-inactive-account-key-never-open) | Address keys whose token is for an inactive account key never open |
 | [B264](#b264--a-mount-that-fails-after-starting-its-workers-leaves-them-running) | A mount that fails after starting its workers leaves them running |
 | [B261](#b261--a-folder-that-has-never-synced-reads-up-to-date) | A folder that has never synced reads "up to date" |
-| [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
 | [B260](#b260--the-poll-pushes-a-new-folders-first-sync-behind-every-other-folder) | The poll pushes a new folder's first sync behind every other folder |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B257](#b257--deleting-a-new-file-while-it-is-open-can-drop-the-bytes-its-handle-reads) | Deleting a new file while it is open can drop the bytes its handle reads |
@@ -377,6 +378,65 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B276 — A stop can end with a panic in a thread the stop never waited for
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, by an account run of `scripts/fuse-acceptance.sh --journal-check
+--durability` against the audit branches. Every case passed, and the run still failed. During
+the restart in the durability case on My files, the journal had three
+`ERROR fuser::reply: Failed to send FUSE reply: No such file or directory (os error 2)` lines,
+and after them a panic that the check did not report:
+
+```
+thread '<unnamed>' (1536340) panicked at .../tokio-1.53.1/src/runtime/time/entry.rs:539:9:
+A Tokio 1.x context was found, but it is being shutdown.
+```
+
+The same panic is in the journal of a 3.6.0 stop on 2026-10-28, twice. B91 first saw it in a
+meta worker.
+
+**Where:** `mount_once` and `release_runtime` in `crates/pdfs-cli/src/main.rs`;
+`JournalWatch` and `journal_problems` in `scripts/fuse-acceptance.py`.
+
+**Cause.** A stop joins the drain workers, the sync engine and the FUSE worker pool, and then
+`mount_once` shut the tokio runtime down. Other threads also use the runtime and are never
+joined: a size lookup for a listing, a profile backup, a control request, a database vacuum.
+A request still in progress when the stop began can start one of them. The thread id here is
+nine below the next daemon's pid, so this thread started during the stop. Once the runtime is
+shut down, that thread's next timer panics. Every call to Drive has a timer, because each one is
+bounded.
+
+The three `fuser::reply` lines are part of a correct stop. The stop aborts each mount's FUSE
+connection so the unmount cannot hang. A request that was still running replies after that,
+and the kernel answers a reply on an aborted connection with `ENOENT`.
+
+The journal check matched only the `ERROR` token. A panic goes to stderr with no tracing level,
+so the check did not see it.
+
+**Fix.**
+
+- On a stop, `release_runtime` leaves the runtime running for the process to end with, instead
+  of shutting it down. The process exits right after, so a thread the stop did not wait for
+  can finish its call or be ended by the exit, but it cannot panic. A mount that is about to
+  be tried again still shuts its runtime down with the 2 s limit from B165, because a new
+  runtime replaces it.
+- The journal check counts `panicked at` lines.
+- The journal check ignores the `ENOENT` reply error between the connection abort and the end
+  of that stop ("daemon stopping", or "control socket listening" for a mount that comes back).
+  At any other time the error still counts.
+
+Making the bounded call helpers refuse new calls once the stop flag is set was rejected. The
+stop sets that flag before it waits up to 10 s for the drain workers, so the refusal would cut
+off the second half of an upload the stop is waiting for.
+
+**Test:** `a_thread_left_running_at_a_stop_can_still_use_the_runtime` and
+`a_mount_tried_again_shuts_its_runtime_down` in `crates/pdfs-cli/src/main.rs`. With the old
+shutdown, the first one fails with the same panic at `entry.rs:539`. The new journal
+filter was run on the journal of the run that found this: the three reply errors are no longer
+counted, and the panic is.
+
+---
 
 ### B275 — On a slow link, a file's last write can land only in a conflict copy
 
