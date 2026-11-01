@@ -33,7 +33,7 @@ anyhow = "1"
 # wedge every later acquisition of it: `Workers` catches the unwind to keep the
 # pool alive, and `std::sync::Mutex` would defeat that by poisoning the state
 # the recovered worker needs.
-parking_lot = "0.12"
+parking_lot = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
@@ -49,7 +49,7 @@ sha1 = "0.11"
 # formats a camera or phone actually produces — the rest of the crate's codecs
 # would be dead weight in the daemon.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "rayon"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # keyring 4 split into `keyring-core` plus per-platform stores. The libdbus
 # Secret Service store is the one keyring 3's `sync-secret-service` wrapped, and
 # with no `target` it matches items v3 wrote, so existing logins survive.

@@ -48,7 +48,8 @@ pub(crate) fn init() {
         .ok()
         .and_then(|dirs| dirs.load_config().language)
         .filter(|code| LANGUAGES.iter().any(|(known, _)| known == code));
-    gettextrs::setlocale(LocaleCategory::LcAll, "");
+    // SAFETY: `init` runs at the top of `main`, before any other thread exists.
+    unsafe { gettextrs::setlocale(LocaleCategory::LcAll, "") };
     if let Some(code) = language {
         apply_language(&code);
     }
@@ -97,14 +98,17 @@ pub(crate) fn country_name(code: &str) -> String {
 fn apply_language(code: &str) {
     // SAFETY: `init` runs at the top of `main`, before any other thread exists.
     unsafe { std::env::set_var("LANGUAGE", code) };
-    let current = gettextrs::setlocale(LocaleCategory::LcMessages, "")
+    // SAFETY: as above, still single-threaded.
+    let current = unsafe { gettextrs::setlocale(LocaleCategory::LcMessages, "") }
         .map(|name| String::from_utf8_lossy(&name).into_owned())
         .unwrap_or_default();
     if !is_c_locale(&current) {
         return;
     }
     for candidate in message_locales(code) {
-        if gettextrs::setlocale(LocaleCategory::LcMessages, candidate.as_str()).is_some() {
+        // SAFETY: as above, still single-threaded.
+        if unsafe { gettextrs::setlocale(LocaleCategory::LcMessages, candidate.as_str()) }.is_some()
+        {
             // SAFETY: as above, still single-threaded.
             unsafe { std::env::set_var("LC_MESSAGES", &candidate) };
             return;

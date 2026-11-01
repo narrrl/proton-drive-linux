@@ -1344,7 +1344,7 @@ impl Core {
         let next = |current| if current == u64::MAX { 1 } else { current + 1 };
         let previous = self
             .file_thumb_generation
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(next(current))
             })
             .expect("generation update always succeeds");

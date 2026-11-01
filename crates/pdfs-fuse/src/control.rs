@@ -110,7 +110,7 @@ struct ControlHandlerPermit;
 impl ControlHandlerPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_CONTROL_HANDLERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONTROL_HANDLERS).then_some(active + 1)
             })
             .ok()
