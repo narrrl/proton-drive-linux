@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B277](#b277--my-files-mounted-over-a-folder-with-files-in-it-and-hid-them) | My files mounted over a folder with files in it, and hid them |
 | [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
@@ -378,6 +379,47 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B277 — My files mounted over a folder with files in it, and hid them
+
+**Status:** Fixed, not verified live
+**Found:** 2026-10-31, issue #67. The reporter chose an existing working folder as the My files
+location. Its folders disappeared and looked deleted; they came back when the service stopped.
+**Where:** `mount_with` and `check_mountpoint` in `crates/pdfs-fuse/src/mount.rs`;
+`crates/pdfs-core/src/mountpoint.rs`; `prompt_mountpoint` in
+`crates/pdfs-gui/src/app/pages/status.rs`
+
+**Repro:** Stop the service. Put a file and a folder in `~/ProtonDrive`, or choose a folder with
+files in it under Preferences → General → Location. Start the service. The files are hidden
+under the mount: not uploaded, not in the queue, and back only once the service stops.
+
+**Cause.** FUSE mounts over a folder that is not empty without a word, and nothing checked the
+folder first. `mount_once` only created it. On-demand synced folders were already checked when
+they were mounted again after a restart (`restore_ondemand_mounts`); My files was not. The
+folder picker took any folder.
+
+**Fix.**
+
+- The daemon refuses to mount My files over a folder with anything in it, hidden files
+  included, before it fetches the root or starts a worker. A dead mount is cleared first, so it
+  can be listed. One of this client's own live mounts is left to the mount, which clears it as
+  before.
+- The refusal is a mount failure like any other: it backs off and tries again, so emptying the
+  folder is enough. The failure record now carries the folder and its first entries
+  (`MountFailure::not_empty`), which an older reader ignores.
+- The app explains it in the user's language, and offers to open the folder or choose another
+  one. The folder picker refuses a folder with files in it.
+
+Merging an existing folder into My files is not done here. #67 proposes `pdfs sync attach` for
+that, as a separate change.
+
+**Test:** `a_folder_with_files_is_refused_and_named`, `a_hidden_file_alone_is_enough_to_refuse`,
+`an_empty_or_missing_folder_takes_the_mount` in `crates/pdfs-core/src/mountpoint.rs`;
+`a_failure_an_older_daemon_wrote_still_reads` in `mountfail.rs`;
+`a_mount_refused_over_files_is_recorded_as_such` in `crates/pdfs-cli/src/main.rs`; the
+simulation `a_mount_over_local_files_is_refused_and_leaves_them_alone`.
+
+---
 
 ### B276 — A stop can end with a panic in a thread the stop never waited for
 

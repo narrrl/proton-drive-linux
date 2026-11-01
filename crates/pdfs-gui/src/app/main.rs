@@ -125,6 +125,9 @@ struct Ui {
     /// Whether this run already asked for the mailbox password of a locked
     /// account, so a refresh never re-opens a dialog the user cancelled.
     unlock_offered: Cell<bool>,
+    /// The `since` of the run of mount failures whose "folder isn't empty"
+    /// dialog this run already showed, so a page reload never shows it again.
+    not_empty_offered: Cell<i64>,
     /// Whether the last refresh saw a live mount daemon. Gates the unpin buttons
     /// (which need the daemon to evict + re-hydrate) and every mutating action.
     mounted: RefCell<bool>,
@@ -403,6 +406,7 @@ fn build_window(app: &adw::Application) {
         opening: RefCell::new(HashSet::new()),
         session: RefCell::new(startup_session),
         unlock_offered: Cell::new(false),
+        not_empty_offered: Cell::new(0),
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
         nav: split.clone(),
@@ -1807,6 +1811,23 @@ pub(crate) fn service_unreachable(
             .ok()
             .flatten();
         match failure {
+            Some(failure) if failure.not_empty.is_some() => {
+                let found = failure.not_empty.as_ref().expect("checked above");
+                status(
+                    &ui,
+                    "dialog-warning-symbolic",
+                    &gettext("Can't open your Drive"),
+                    // Translators: {path} is the folder My files is mounted at.
+                    &gettext_f(
+                        "“{path}” already has files in it, and My files would hide them. Proton Drive tries again on its own once the folder is empty. You can also choose another folder for My files in Preferences.",
+                        &[("path", &found.path.display().to_string())],
+                    ),
+                    true,
+                );
+                if ui.not_empty_offered.replace(failure.since) != failure.since {
+                    offer_not_empty(&ui, found);
+                }
+            }
             Some(failure) => status(
                 &ui,
                 "dialog-warning-symbolic",
@@ -1832,6 +1853,37 @@ pub(crate) fn service_unreachable(
             }
         });
     });
+}
+
+/// Tell the user the daemon will not mount My files over a folder with files
+/// in it (B277), and offer the two ways out: open the folder to move them, or
+/// choose another one.
+fn offer_not_empty(ui: &Rc<Ui>, found: &pdfs_core::mountpoint::NotEmpty) {
+    let path = found.path.display().to_string();
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Your Proton Drive Folder Isn't Empty"))
+        // Translators: {path} is the folder My files is mounted at; {n} is how
+        // many files and folders are already in it.
+        .body(ngettext_f(
+            "“{path}” already has {n} item in it. My files would hide it, so Proton Drive does not open there. Move the item to another folder, or choose another folder for My files.",
+            "“{path}” already has {n} items in it. My files would hide them, so Proton Drive does not open there. Move the items to another folder, or choose another folder for My files.",
+            found.count as u64,
+            &[("path", &path)],
+        ))
+        .build();
+    dialog.add_response("close", &gettext("Not Now"));
+    dialog.add_response("open", &gettext("Open Folder"));
+    dialog.add_response("choose", &gettext("Choose Another Folder…"));
+    dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("choose"));
+    dialog.set_close_response("close");
+    let ui_response = ui.clone();
+    dialog.connect_response(None, move |_, response| match response {
+        "open" => open_path(&path),
+        "choose" => prompt_mountpoint(&ui_response),
+        _ => {}
+    });
+    dialog.present(ui_window(ui).as_ref());
 }
 
 /// How long a copy button shows its check after copying.

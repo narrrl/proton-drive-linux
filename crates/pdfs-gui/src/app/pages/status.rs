@@ -806,7 +806,8 @@ pub(crate) fn settings_request(ui: &Rc<Ui>, req: Request, done: String, failed: 
 }
 
 /// Prompt for a new mountpoint folder, persist it to config, and offer to restart
-/// the mount service so the daemon picks it up.
+/// the mount service so the daemon picks it up. A folder with files in it is
+/// refused: the mount would hide them (B277).
 pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let dialog = gtk4::FileDialog::builder()
@@ -816,44 +817,87 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
     dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
         let Ok(folder) = res else { return };
         let Some(path) = folder.path() else { return };
-        let path_str = path.display().to_string();
-
-        // Persist the choice to config so the next mount uses it.
-        let mut config = ui.dirs.load_config();
-        config.mountpoint = Some(path_str.clone());
-        if let Err(e) = ui.dirs.save_config(&config) {
-            toast_error(&ui, &gettext("Couldn't save the folder"), &e.to_string());
+        // The folder My files is mounted at lists Drive's files, not its own,
+        // so picking it again is not checked.
+        if path == ui.dirs.resolved_mountpoint(&ui.dirs.load_config()) {
+            use_mountpoint(&ui, &path);
             return;
         }
-        ui.status.mountpoint_row.set_subtitle(&path_str);
-        // The Locations page shows the same path as a row title. Any other page
-        // reads it again on the next visit.
-        if ui.stack.visible_child_name().as_deref() == Some("locations") {
-            load_locations(&ui);
-        }
-
-        // The daemon only reads the mountpoint at mount time, so offer a restart.
-        let confirm = adw::AlertDialog::builder()
-            .heading(gettext("Restart Proton Drive?"))
-            // Translators: {path} is the folder the drive is mounted at.
-            .body(gettext_f(
-                "My files now appears in “{path}” after Proton Drive restarts.",
-                &[("path", &path_str)],
-            ))
-            .build();
-        confirm.add_response("later", &gettext("Later"));
-        confirm.add_response("restart", &gettext("Restart Now"));
-        confirm.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
-        confirm.set_default_response(Some("restart"));
-        confirm.set_close_response("later");
-        let ui_restart = ui.clone();
-        confirm.connect_response(None, move |_, resp| {
-            if resp == "restart" {
-                restart_service_then(&ui_restart, |_| {});
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let checked = path.clone();
+            let found = gio::spawn_blocking(move || pdfs_core::mountpoint::not_empty(&checked))
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("the check did not finish")));
+            match found {
+                Ok(None) => use_mountpoint(&ui, &path),
+                Ok(Some(found)) => refuse_mountpoint(&ui, &found),
+                Err(e) => toast_error(&ui, &gettext("Couldn't read the folder"), &e.to_string()),
             }
         });
-        confirm.present(ui_window(&ui).as_ref());
     });
+}
+
+/// Explain why the folder `found` cannot hold My files.
+fn refuse_mountpoint(ui: &Rc<Ui>, found: &pdfs_core::mountpoint::NotEmpty) {
+    let path = found.path.display().to_string();
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext("Choose an Empty Folder"))
+        // Translators: {path} is the folder the user picked; {n} is how many
+        // files and folders are already in it.
+        .body(ngettext_f(
+            "“{path}” already has {n} item in it. My files would hide it while Proton Drive runs, and it would not be uploaded.",
+            "“{path}” already has {n} items in it. My files would hide them while Proton Drive runs, and they would not be uploaded.",
+            found.count as u64,
+            &[("path", &path)],
+        ))
+        .build();
+    dialog.add_response("close", &gettext("Close"));
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+    dialog.present(ui_window(ui).as_ref());
+}
+
+/// Make `path` the folder My files is mounted at, and offer the restart that
+/// moves it there.
+fn use_mountpoint(ui: &Rc<Ui>, path: &std::path::Path) {
+    let path_str = path.display().to_string();
+
+    // Persist the choice to config so the next mount uses it.
+    let mut config = ui.dirs.load_config();
+    config.mountpoint = Some(path_str.clone());
+    if let Err(e) = ui.dirs.save_config(&config) {
+        toast_error(ui, &gettext("Couldn't save the folder"), &e.to_string());
+        return;
+    }
+    ui.status.mountpoint_row.set_subtitle(&path_str);
+    // The Locations page shows the same path as a row title. Any other page
+    // reads it again on the next visit.
+    if ui.stack.visible_child_name().as_deref() == Some("locations") {
+        load_locations(ui);
+    }
+
+    // The daemon only reads the mountpoint at mount time, so offer a restart.
+    let confirm = adw::AlertDialog::builder()
+        .heading(gettext("Restart Proton Drive?"))
+        // Translators: {path} is the folder the drive is mounted at.
+        .body(gettext_f(
+            "My files now appears in “{path}” after Proton Drive restarts.",
+            &[("path", &path_str)],
+        ))
+        .build();
+    confirm.add_response("later", &gettext("Later"));
+    confirm.add_response("restart", &gettext("Restart Now"));
+    confirm.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
+    confirm.set_default_response(Some("restart"));
+    confirm.set_close_response("later");
+    let ui_restart = ui.clone();
+    confirm.connect_response(None, move |_, resp| {
+        if resp == "restart" {
+            restart_service_then(&ui_restart, |_| {});
+        }
+    });
+    confirm.present(ui_window(ui).as_ref());
 }
 
 /// Connect the Files/Photos "Retry" buttons (shown by [`browser_unreachable`] /

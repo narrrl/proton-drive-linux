@@ -76,7 +76,7 @@ fix it.
 
 | Key | Type | Default | In the app | Meaning |
 |---|---|---|---|---|
-| `mountpoint` | path | `~/ProtonDrive` | General → Location | Where My files is mounted |
+| `mountpoint` | path | `~/ProtonDrive` | General → Location | Where My files is mounted. Must be empty: the service does not mount over files |
 | `cache_budget` | bytes | 5 GiB | Storage → Cache | Soft limit for cached content. `0` means unlimited. Available-offline files do not count against it |
 | `upload_limit` | bytes/s | none | General → Network | Shared cap for all uploads. `0` or `null` means none |
 | `download_limit` | bytes/s | none | General → Network | Shared cap for all downloads, reads from the mount included |
