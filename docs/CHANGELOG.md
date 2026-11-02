@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.7.0] — 2026-11-02
+
+Schema: **44**, unchanged.
+
 ### Added
 
 - **The app and the tray say why your Drive does not open** (B263, #40). When the service runs
