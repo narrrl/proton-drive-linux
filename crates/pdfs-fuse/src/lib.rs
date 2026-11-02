@@ -79,6 +79,7 @@ use proton_drive_rs::{
 };
 
 mod albums;
+mod attach;
 mod background;
 mod conflicts;
 mod control;

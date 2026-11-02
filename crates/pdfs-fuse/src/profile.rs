@@ -389,6 +389,7 @@ impl Core {
         items: &[pdfs_core::control::RestoreItem],
         device: Option<&str>,
     ) -> CoreResult<RestoreOutcome> {
+        let _registration = super::devices::SYNC_ROOT_REGISTRATION.lock();
         if items.is_empty() {
             return Err(CoreError::invalid("nothing to restore"));
         }

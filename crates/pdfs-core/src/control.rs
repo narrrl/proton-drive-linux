@@ -469,6 +469,13 @@ pub enum Request {
     /// Add a local folder to this machine's device, uploading its tree and
     /// registering the device on first use. Replies with [`Response::Ok`].
     AddSyncFolder { local_path: String },
+    /// Keep a real local directory in step with an existing folder in My files.
+    /// First sync unions one-sided files and preserves differing versions.
+    /// Replies with [`Response::Ok`]; no device backup is created.
+    AttachSyncFolder {
+        local_path: String,
+        remote_path: String,
+    },
     /// List this device's synced folders. Replies with [`Response::SyncFolders`].
     ListSyncFolders,
     /// Remove a synced folder by id; `delete_remote` also trashes its cloud copy.

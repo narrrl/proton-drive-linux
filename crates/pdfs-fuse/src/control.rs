@@ -385,6 +385,7 @@ fn touched_topics(request: &CtlRequest) -> &'static [Topic] {
         R::RenameDevice { .. } | R::DeleteDevice { .. } => &[Topic::Devices],
         R::AdoptDevice { .. } | R::MigrateDevice { .. } => &[Topic::Devices, Topic::Locations],
         R::AddSyncFolder { .. }
+        | R::AttachSyncFolder { .. }
         | R::RemoveSyncFolder { .. }
         | R::SetSyncFolderMode { .. }
         | R::SetSyncFolderPaused { .. }
@@ -1395,6 +1396,31 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             });
             CtlResponse::Ok {
                 message: format!("adding {local_path}"),
+            }
+        }
+        Ok(CtlRequest::AttachSyncFolder {
+            local_path,
+            remote_path,
+        }) => {
+            let result = rel_to_mount(mountpoint, &remote_path).and_then(|remote| {
+                core.attach_sync_folder(Path::new(&local_path), &remote, mountpoint)
+            });
+            match result {
+                Ok(folder) => {
+                    core.log_activity(
+                        ActivityKind::Upload,
+                        &local_path,
+                        "attached existing My files folder",
+                        true,
+                    );
+                    CtlResponse::Ok {
+                        message: format!(
+                            "sync folder {} attached: {}",
+                            folder.id, folder.local_path
+                        ),
+                    }
+                }
+                Err(error) => CtlResponse::error(error),
             }
         }
         Ok(CtlRequest::ListSyncFolders) => match core.list_sync_folders() {

@@ -696,6 +696,15 @@ enum SyncCmd {
         /// Local directory to sync.
         path: PathBuf,
     },
+    /// Sync a real local folder with an existing folder in My files.
+    /// The first pass preserves local-only files and keeps differing versions.
+    Attach {
+        /// Existing local directory; it remains a real local directory.
+        path: PathBuf,
+        /// Existing folder in My files, relative to the cloud mount or inside it.
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// List this machine's synced folders.
     List,
     /// Remove a synced folder by id.
@@ -1115,6 +1124,22 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                 .ok_or_else(|| anyhow!("path is not valid UTF-8"))?
                 .to_string();
             ok_or_bail(control_request(CtlRequest::AddSyncFolder { local_path })?)?
+        }
+        SyncCmd::Attach { path, to } => {
+            let abs = std::fs::canonicalize(&path)
+                .with_context(|| format!("resolve {}", path.display()))?;
+            let local_path = abs
+                .to_str()
+                .ok_or_else(|| anyhow!("path is not valid UTF-8"))?
+                .to_owned();
+            let remote_path = to
+                .to_str()
+                .ok_or_else(|| anyhow!("remote path is not valid UTF-8"))?
+                .to_owned();
+            ok_or_bail(control_request(CtlRequest::AttachSyncFolder {
+                local_path,
+                remote_path,
+            })?)?
         }
         SyncCmd::List => {
             let response = control_request(CtlRequest::ListSyncFolders)?;

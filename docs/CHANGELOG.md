@@ -11,6 +11,11 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Added
+
+- `pdfs sync attach PATH --to REMOTE` connects an existing local directory to an existing
+  My files folder. The first sync preserves one-sided files and differing versions (#67).
+
 ## [3.7.0] — 2026-11-02
 
 Schema: **44**, unchanged.

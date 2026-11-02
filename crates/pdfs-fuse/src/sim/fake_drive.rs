@@ -1123,6 +1123,14 @@ fn delete_one(server: &mut Server, uid: &NodeUid) -> Result<()> {
 
 #[async_trait]
 impl DriveApi for FakeClient {
+    async fn context_share_id(&self, uid: &NodeUid) -> Result<ShareId> {
+        self.request(false, |server| {
+            assert_eq!(uid, &server.root);
+            Ok(ShareId::new("my-files-share"))
+        })
+        .await
+    }
+
     async fn get_my_files_folder(&self) -> Result<Node> {
         self.request(false, |server| {
             let root = server.root.clone();

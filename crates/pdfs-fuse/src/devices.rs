@@ -33,6 +33,11 @@ use super::{
     now_secs, parse_uid, spawn_session, sync_folder_info, this_hostname,
 };
 
+/// Registration validates local and remote root overlap before inserting a
+/// mapping. Serialize all registration paths so concurrent control requests
+/// cannot both validate against the same old set of roots.
+pub(super) static SYNC_ROOT_REGISTRATION: Mutex<()> = Mutex::new(());
+
 /// A mode that this daemon is allowed to apply.
 ///
 /// Persisted and control-protocol values first pass through [`MountMode`] so
@@ -513,6 +518,7 @@ impl Core {
     /// tree into it once, and record the mapping. Phase 1 is a one-shot upload —
     /// the two-way engine (Phase 2) reconciles later changes.
     pub(crate) fn add_sync_folder(&self, local: &Path) -> CoreResult<StoredSyncFolder> {
+        let _registration = SYNC_ROOT_REGISTRATION.lock();
         let meta = std::fs::metadata(local)
             .map_err(|e| CoreError::internal(format!("stat {}: {e}", local.display())))?;
         if !meta.is_dir() {
