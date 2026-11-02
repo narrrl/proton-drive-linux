@@ -1036,10 +1036,7 @@ fn cmd_devices(action: DeviceCmd) -> Result<()> {
                 CtlResponse::Devices { items } if items.is_empty() => println!("No devices."),
                 CtlResponse::Devices { items } => {
                     for d in items {
-                        let sync = d
-                            .last_sync
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "never".to_string());
+                        let sync = last_synced(d.last_sync);
                         let tag = match (d.adopted, d.this_device) {
                             (true, _) => "  *adopted*",
                             (false, true) => "  *this machine*",
@@ -1130,11 +1127,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                 }
                 CtlResponse::SyncFolders { items } => {
                     for f in items {
-                        let sync = if f.last_sync == 0 {
-                            "never".to_string()
-                        } else {
-                            f.last_sync.to_string()
-                        };
+                        let sync = last_synced(Some(f.last_sync));
                         // A queued switch is reported as the mode the folder is moving
                         // to, so `sync list` never reads as if the request was dropped.
                         let mode = match &f.pending_mode {
@@ -1913,6 +1906,15 @@ fn format_epoch(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let _ = y;
     format!("{m:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// The `synced:` column of `sync list` and `devices list`: when the last pass
+/// finished, or `never`. The daemon reports 0 for a folder that never synced.
+fn last_synced(secs: Option<i64>) -> String {
+    match secs {
+        Some(secs) if secs > 0 => format_epoch(secs),
+        _ => "never".to_string(),
+    }
 }
 
 fn cmd_leave(uid: String) -> Result<()> {
@@ -4450,6 +4452,14 @@ mod login_wait_tests {
         assert_eq!(format_epoch_utc(951_782_400), "2000-02-29");
         assert_eq!(format_epoch_utc(1_700_000_000), "2023-11-14");
         assert_eq!(format_epoch_utc(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn last_synced_shows_a_time_not_epoch_seconds() {
+        // B278: issue #46 showed `synced: 1793570850`.
+        assert_eq!(last_synced(Some(1_793_570_850)), "11-01 22:07");
+        assert_eq!(last_synced(Some(0)), "never");
+        assert_eq!(last_synced(None), "never");
     }
 
     #[test]
