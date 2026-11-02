@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B278](#b278--sync-list-and-devices-list-show-the-last-sync-as-epoch-seconds) | `sync list` and `devices list` show the last sync as epoch seconds |
 | [B277](#b277--my-files-mounted-over-a-folder-with-files-in-it-and-hid-them) | My files mounted over a folder with files in it, and hid them |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
 | [B272](#b272--after-a-folder-is-removed-and-added-again-its-file-events-go-to-the-old-id) | After a folder is removed and added again, its file events go to the old id |
@@ -380,6 +381,26 @@ a live account since.
 
 Newest first.
 
+### B278 — `sync list` and `devices list` show the last sync as epoch seconds
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-02, issue #46. The reporter's `pdfs sync list` on 3.6.0 read
+`synced: 1793570850`, a pass that finished at 2026-11-01 22:07 UTC.
+**Where:** `cmd_sync` and `cmd_devices` in `crates/pdfs-cli/src/main.rs`
+
+**Repro:** Let a synced folder finish one pass and run `pdfs sync list`, or `pdfs devices list`
+on an account with a device that synced.
+
+**Cause.** Both commands printed `last_sync` with `to_string()`. The activity feed already
+formats the same epoch seconds with `format_epoch`.
+
+**Fix.** Both columns go through `last_synced`, which prints `MM-DD HH:MM` in UTC like
+`pdfs activity`, and `never` for 0 or no value. `--json` output is unchanged.
+
+**Test:** `last_synced_shows_a_time_not_epoch_seconds` in `crates/pdfs-cli/src/main.rs`.
+
+---
+
 ### B277 — My files mounted over a folder with files in it, and hid them
 
 **Status:** Fixed, not verified live
@@ -575,7 +596,9 @@ folder list has now.
 **Status:** Fixed, not verified live
 **Found:** 2026-10-31, code audit after issue #46: a folder of about 19,900 items restored on a
 second computer sat at `scanning…` with nothing downloaded, and the journal showed
-`RequestTimeout (http 408)`.
+`RequestTimeout (http 408)`. On 2026-11-01 the reporter's 3.6.0 journal showed the same pass
+failing four times in four minutes with `reconcile failed id=1 error=enumerate …: HTTP transport
+error`, after the laptop woke from sleep; a later pass finished.
 **Where:** `walk_remote` in `crates/pdfs-fuse/src/sync.rs`
 
 **Repro:** Restore or add a mirror folder with tens of thousands of items on Drive, on a link

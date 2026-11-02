@@ -11,6 +11,10 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+## [3.7.0] — 2026-11-02
+
+Schema: **44**, unchanged.
+
 ### Added
 
 - **The app and the tray say why your Drive does not open** (B263, #40). When the service runs
@@ -77,6 +81,9 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 - **A restore that skipped folders is reported as failed**, with the reason for each, instead of
   "restored 0 folder(s)" as a success (B269).
+
+- **`pdfs sync list` and `pdfs devices list` show when a folder last synced as a time**, such as
+  `synced: 11-01 22:07` in UTC like `pdfs activity`, instead of seconds since 1970 (B278, #46).
 
 - **"You're offline" no longer appears for a cache or database error** when pinning, unpinning,
   searching or loading a folder (B266, #38). The app shows the actual error.
