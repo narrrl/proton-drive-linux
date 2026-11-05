@@ -6442,6 +6442,7 @@ fn sync_folder_info(
 ) -> SyncFolderInfo {
     SyncFolderInfo {
         id: f.id,
+        kind: f.kind,
         local_path: f.local_path,
         remote_uid: f.remote_uid,
         mode: f.mode,

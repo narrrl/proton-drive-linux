@@ -79,8 +79,8 @@ commands are for scripts and for cases where the mount is not available.
 
 | Command | Description |
 |---|---|
-| `pdfs sync attach PATH --to REMOTE` | Merge a real local folder with an existing My files folder, keeping both versions on initial conflicts. |
 | `pdfs sync add PATH` | Back up a local folder under this computer and keep it in sync. |
+| `pdfs sync attach PATH --to REMOTE` | Merge a real local folder with an existing My files folder, keeping both versions on initial conflicts. |
 | `pdfs sync list` | List synced folders with their IDs and state. |
 | `pdfs sync rm ID [--delete-remote]` | Stop syncing. Local files stay; `--delete-remote` also removes the copy on Proton Drive. |
 | `pdfs sync mode ID mirror\|ondemand` | Switch between a full local copy (`mirror`) and online only (`ondemand`). |

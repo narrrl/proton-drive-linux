@@ -1406,20 +1406,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 core.attach_sync_folder(Path::new(&local_path), &remote, mountpoint)
             });
             match result {
-                Ok(folder) => {
-                    core.log_activity(
-                        ActivityKind::Upload,
-                        &local_path,
-                        "attached existing My files folder",
-                        true,
-                    );
-                    CtlResponse::Ok {
-                        message: format!(
-                            "sync folder {} attached: {}",
-                            folder.id, folder.local_path
-                        ),
-                    }
-                }
+                Ok(folder) => CtlResponse::Ok {
+                    message: format!("sync folder {} attached: {}", folder.id, folder.local_path),
+                },
                 Err(error) => CtlResponse::error(error),
             }
         }

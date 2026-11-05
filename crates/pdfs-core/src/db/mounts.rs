@@ -1,6 +1,6 @@
 //! Unified mount/location presentation rows.
 //!
-//! A device row stores only its `sync_folder` identity. Its path, remote root,
+//! A device or attached row stores only its `sync_folder` identity. Its path, remote root,
 //! mode, state, pending mode, and last-sync timestamp are selected from
 //! `sync_folder`, which remains the authoritative sync-engine table.
 
@@ -72,7 +72,7 @@ impl Db {
         )? > 0)
     }
 
-    /// Every local location, with device fields joined from `sync_folder`.
+    /// Every local location, with synced-folder fields joined from `sync_folder`.
     pub fn mount_list(&self) -> Result<Vec<MountSpec>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
@@ -81,14 +81,14 @@ impl Db {
                  m.kind,
                  m.sync_folder_id,
                  m.share_root_uid,
-                 CASE WHEN m.kind = 'device' THEN sf.local_path ELSE m.local_path END,
-                 CASE WHEN m.kind = 'device' THEN sf.remote_uid ELSE m.root_uid END,
-                 CASE WHEN m.kind = 'device' THEN sf.remote_share_id ELSE m.root_share_id END,
-                 CASE WHEN m.kind = 'device' THEN sf.mode ELSE m.mode END,
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.local_path ELSE m.local_path END,
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.remote_uid ELSE m.root_uid END,
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.remote_share_id ELSE m.root_share_id END,
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.mode ELSE m.mode END,
                  m.access,
-                 CASE WHEN m.kind = 'device' THEN sf.state ELSE 'idle' END,
-                 CASE WHEN m.kind = 'device' THEN sf.last_sync ELSE 0 END,
-                 CASE WHEN m.kind = 'device' THEN sf.pending_mode ELSE NULL END
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.state ELSE 'idle' END,
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.last_sync ELSE 0 END,
+                 CASE WHEN m.kind IN ('device', 'attached') THEN sf.pending_mode ELSE NULL END
                FROM mount AS m
                LEFT JOIN sync_folder AS sf ON sf.id = m.sync_folder_id
               ORDER BY CASE m.kind
@@ -134,6 +134,11 @@ impl Db {
             let kind = match kind.as_str() {
                 "myfiles" => MountKind::MyFiles,
                 "device" => MountKind::Device {
+                    sync_folder_id: sync_folder_id.ok_or_else(|| {
+                        Error::Other(format!("mount row {id} has no sync_folder_id"))
+                    })?,
+                },
+                "attached" => MountKind::Attached {
                     sync_folder_id: sync_folder_id.ok_or_else(|| {
                         Error::Other(format!("mount row {id} has no sync_folder_id"))
                     })?,

@@ -81,6 +81,8 @@ pub enum MountKind {
     MyFiles,
     /// A folder owned by this machine's Proton Drive device.
     Device { sync_folder_id: i64 },
+    /// A real local mirror of an existing My files folder.
+    Attached { sync_folder_id: i64 },
     /// A future standalone mount rooted at a node shared with this account.
     Shared { share_root_uid: String },
 }
@@ -88,8 +90,8 @@ pub enum MountKind {
 /// One local Proton Drive location as exposed over the control protocol.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MountSpec {
-    /// Presentation-row id. Device actions use the `sync_folder_id` carried by
-    /// [`MountKind::Device`], not this id.
+    /// Presentation-row id. Synced-folder actions use the `sync_folder_id`
+    /// carried by [`MountKind::Device`] or [`MountKind::Attached`], not this id.
     pub id: i64,
     pub kind: MountKind,
     pub local_path: String,

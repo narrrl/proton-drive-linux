@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 impl Core {
     /// A bounded, server-verified ancestry walk. Do not decide ownership or
     /// remote-root overlap from a possibly incomplete cached folder listing.
-    fn attach_ancestors(&self, start: &NodeUid) -> CoreResult<Vec<NodeUid>> {
+    pub(super) fn attach_ancestors(&self, start: &NodeUid) -> CoreResult<Vec<NodeUid>> {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::new();
         let mut next = Some(start.clone());
@@ -100,7 +100,7 @@ impl Core {
                 "choose an owned folder below My files, not its root or a shared folder",
             ));
         }
-        for other in &existing {
+        for other in existing.iter().filter(|f| f.kind == "attached") {
             let uid = parse_uid(&other.remote_uid)
                 .ok_or_else(|| CoreError::internal("invalid existing remote sync root"))?;
             if uid == remote_uid
@@ -122,7 +122,7 @@ impl Core {
         }
         let id = self
             .db
-            .sync_folder_add(&local.to_string_lossy(), &remote_uid.to_string(), &share_id)
+            .sync_folder_attach(&local.to_string_lossy(), &remote_uid.to_string(), &share_id)
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
         // An empty baseline makes one-sided files new, never deletions. The
         // engine hashes matching-size files and preserves divergent versions.

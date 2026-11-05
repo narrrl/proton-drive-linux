@@ -1361,6 +1361,9 @@ fn location_row(ui: &Rc<Ui>, spec: &MountSpec) -> LocationRow {
                 prompt_mountpoint(&ui)
             });
         }
+        MountKind::Attached { sync_folder_id } => {
+            add_device_items(ui, &mut menu, spec, *sync_folder_id);
+        }
         MountKind::Device { sync_folder_id } => {
             row.add_suffix(&mode_button(ui, spec, *sync_folder_id));
             add_device_items(ui, &mut menu, spec, *sync_folder_id);
@@ -1520,8 +1523,9 @@ fn add_device_items(ui: &Rc<Ui>, menu: &mut ActionMenu, spec: &MountSpec, id: i6
     // The folder's *current* mode, not a queued one: a switch that hasn't landed
     // yet has not moved the files anywhere.
     let is_ondemand = spec.mode == MountMode::OnDemand;
+    let attached = matches!(spec.kind, MountKind::Attached { .. });
     menu.item(&gettext("Stop Syncing…"), move || {
-        prompt_remove_sync_folder(&ui, id, &path, is_ondemand)
+        prompt_remove_sync_folder(&ui, id, &path, is_ondemand, attached)
     });
 }
 
@@ -1699,7 +1703,7 @@ fn sync_folder_now(ui: &Rc<Ui>, id: i64) {
 pub(crate) fn location_icon(kind: &MountKind) -> &'static str {
     match kind {
         MountKind::MyFiles => "folder-remote-symbolic",
-        MountKind::Device { .. } => "folder-symbolic",
+        MountKind::Device { .. } | MountKind::Attached { .. } => "folder-symbolic",
         MountKind::Shared { .. } => "pdfs-people-symbolic",
     }
 }
@@ -1716,6 +1720,7 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
     match &spec.kind {
         MountKind::MyFiles => parts.push(gettext("My files")),
         MountKind::Shared { .. } => parts.push(gettext("Shared folder")),
+        MountKind::Attached { .. } => parts.push(gettext("My files mirror")),
         MountKind::Device { .. } => match (spec.pending_mode, spec.mode) {
             (Some(MountMode::OnDemand), _) => parts.push(gettext("Going online only")),
             (Some(MountMode::Mirror), _) => parts.push(gettext("Switching to synced")),
@@ -1725,7 +1730,10 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
             (Some(MountMode::Unknown) | None, _) => parts.push(folder_mode_label(false)),
         },
     }
-    if matches!(spec.kind, MountKind::Device { .. }) {
+    if matches!(
+        spec.kind,
+        MountKind::Device { .. } | MountKind::Attached { .. }
+    ) {
         parts.push(match &spec.progress {
             Some(p) => sync_progress_label(p),
             None if spec.paused => pgettext("state", "paused"),
@@ -1737,8 +1745,10 @@ pub(crate) fn location_subtitle(spec: &MountSpec) -> String {
     }
     // Only the locations that are supposed to have a session report its absence:
     // a mirror folder never has one.
-    let expects_session = !matches!(spec.kind, MountKind::Device { .. })
-        || spec.mode == MountMode::OnDemand
+    let expects_session = !matches!(
+        spec.kind,
+        MountKind::Device { .. } | MountKind::Attached { .. }
+    ) || spec.mode == MountMode::OnDemand
         || spec.pending_mode == Some(MountMode::OnDemand);
     if expects_session && !spec.mounted {
         // Translators: a folder's files can't be opened right now.
@@ -1767,6 +1777,18 @@ mod tests {
             progress: None,
             paused: false,
         }
+    }
+
+    #[test]
+    fn an_attached_mirror_is_available_without_a_fuse_session() {
+        let spec = spec(
+            MountKind::Attached { sync_folder_id: 7 },
+            MountMode::Mirror,
+            false,
+        );
+        let subtitle = location_subtitle(&spec);
+        assert!(subtitle.contains("My files mirror"), "{subtitle}");
+        assert!(!subtitle.contains("not available"), "{subtitle}");
     }
 
     #[test]

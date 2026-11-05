@@ -170,7 +170,24 @@ impl Core {
         }
         let started = Instant::now();
         self.progress_begin(folder.id);
-        let result = if push_only {
+        // An attachment's root can be trashed or moved by the web app. A
+        // missing root must never turn into a scan of an empty remote tree.
+        let attached_root = if current.kind == "attached" {
+            self.attach_ancestors(&remote_root).and_then(|ancestors| {
+                if ancestors.contains(&self.primary_root_uid) {
+                    Ok(())
+                } else {
+                    Err(pdfs_core::CoreError::invalid(
+                        "attached folder is no longer below My files",
+                    ))
+                }
+            })
+        } else {
+            Ok(())
+        };
+        let result = if let Err(error) = attached_root {
+            Err(PassAbort::Failed(error.to_string()))
+        } else if push_only {
             self.push_pass(folder.id, &local_root, &remote_root, &rules)
         } else {
             match self.do_reconcile(folder.id, &local_root, &remote_root, &rules) {

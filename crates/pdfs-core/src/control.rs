@@ -992,14 +992,17 @@ impl SyncIssue {
     }
 }
 
-/// One synced local folder on this machine's device (in [`Response::SyncFolders`]).
+/// One device backup or attached My files mirror (in [`Response::SyncFolders`]).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncFolderInfo {
     /// Row id — the handle for [`Request::RemoveSyncFolder`]/[`Request::SetSyncFolderMode`].
     pub id: i64,
+    /// `device` backup or `attached` My files mirror. Older daemons only had backups.
+    #[serde(default = "default_sync_folder_kind")]
+    pub kind: String,
     /// Absolute local folder path.
     pub local_path: String,
-    /// The uid of the folder's remote root under the device root.
+    /// The uid of the remote root under the device root or My files.
     pub remote_uid: String,
     /// `mirror` (full local copy, two-way synced) or `ondemand` (FUSE mount).
     pub mode: String,
@@ -1020,6 +1023,10 @@ pub struct SyncFolderInfo {
     /// The folder is paused on its own (see [`Request::SetSyncFolderPaused`]).
     #[serde(default)]
     pub paused: bool,
+}
+
+fn default_sync_folder_kind() -> String {
+    "device".into()
 }
 
 /// A folder under this machine's device offered for restore (in

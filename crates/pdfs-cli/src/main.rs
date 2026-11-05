@@ -2319,6 +2319,9 @@ fn cmd_locations() -> Result<()> {
                     MountKind::Device { sync_folder_id } => {
                         format!("Device folder {sync_folder_id}")
                     }
+                    MountKind::Attached { sync_folder_id } => {
+                        format!("My files mirror {sync_folder_id}")
+                    }
                     MountKind::Shared { .. } => "Shared folder".to_string(),
                 };
                 let mode = match location.pending_mode {
@@ -4293,6 +4296,7 @@ mod diagnose_tests {
     #[test]
     fn a_synced_folder_in_error_is_reported() {
         let folder = |id: i64, state: &str| pdfs_core::control::SyncFolderInfo {
+            kind: "device".into(),
             id,
             local_path: format!("/home/u/f{id}"),
             remote_uid: "vol~link".into(),
