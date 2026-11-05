@@ -200,6 +200,7 @@ impl Core {
         let reader = CountingReader::new(std::io::BufReader::new(file), &guard);
         let metadata = PhotoUploadMetadata {
             capture_time: Some(candidate.wanted),
+            last_modification_time: pdfs_core::timestamp::modification_time(candidate.wanted),
             ..Default::default()
         };
         let uploaded = self.rt.block_on(photos.upload_photo_from(

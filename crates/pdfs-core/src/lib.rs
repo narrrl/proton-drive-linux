@@ -29,6 +29,7 @@ pub mod similar;
 pub mod syncignore;
 pub mod syncroot;
 pub mod takeout;
+pub mod timestamp;
 pub mod tray;
 pub mod update;
 

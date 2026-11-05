@@ -11,6 +11,13 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+### Changed
+
+- Update `proton-sdk` and `proton-drive-rs` to 0.11.0.
+  Convert epoch timestamps at the SDK boundary and explicitly preserve photo modification
+  times now that they are independent of capture times. See [the SDK review](SDK-0.11.0.md)
+  for features and breaking changes.
+
 ## [3.7.0] — 2026-11-02
 
 Schema: **44**, unchanged.
