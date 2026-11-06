@@ -11,6 +11,16 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
+Schema: **45**. Synced folders now distinguish device backups from My files attachments.
+Existing folders remain device backups; older builds cannot open the upgraded database.
+
+### Added
+
+- `pdfs sync attach PATH --to REMOTE` connects an existing local directory to an existing
+  My files folder. The first sync preserves one-sided files and differing versions (#67).
+  Attachments stay in mirror mode, are excluded from device profiles, and cannot delete
+  the remote root when syncing is stopped.
+
 ## [3.7.0] — 2026-11-02
 
 Schema: **44**, unchanged.

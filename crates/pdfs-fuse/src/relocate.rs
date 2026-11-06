@@ -555,6 +555,7 @@ mod tests {
 
     fn folder(id: i64, local_path: &str, mode: &str) -> StoredSyncFolder {
         StoredSyncFolder {
+            kind: "device".into(),
             id,
             local_path: local_path.to_string(),
             remote_uid: format!("vol~root{id}"),

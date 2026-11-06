@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 pub struct StoredSyncFolder {
     pub id: i64,
+    /// `device` backup or `attached` My files mirror.
+    pub kind: String,
     pub local_path: String,
     pub remote_uid: String,
     pub remote_share_id: String,
@@ -60,11 +62,31 @@ impl Db {
         remote_uid: &str,
         remote_share_id: &str,
     ) -> Result<i64> {
+        self.sync_folder_insert(local_path, remote_uid, remote_share_id, "device")
+    }
+
+    /// Attach an existing My files folder, without creating a device backup.
+    pub fn sync_folder_attach(
+        &self,
+        local_path: &str,
+        remote_uid: &str,
+        remote_share_id: &str,
+    ) -> Result<i64> {
+        self.sync_folder_insert(local_path, remote_uid, remote_share_id, "attached")
+    }
+
+    fn sync_folder_insert(
+        &self,
+        local_path: &str,
+        remote_uid: &str,
+        remote_share_id: &str,
+        kind: &str,
+    ) -> Result<i64> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO sync_folder (local_path, remote_uid, remote_share_id)
-             VALUES (?1, ?2, ?3)",
-            params![local_path, remote_uid, remote_share_id],
+            "INSERT INTO sync_folder (local_path, remote_uid, remote_share_id, kind)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![local_path, remote_uid, remote_share_id, kind],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -73,7 +95,7 @@ impl Db {
     pub fn sync_folder_list(&self) -> Result<Vec<StoredSyncFolder>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
+            "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync, kind
              FROM sync_folder ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -86,6 +108,7 @@ impl Db {
                 pending_mode: r.get(5)?,
                 state: r.get(6)?,
                 last_sync: r.get(7)?,
+                kind: r.get(8)?,
             })
         })?;
         let mut items = Vec::new();
@@ -99,7 +122,7 @@ impl Db {
     pub fn sync_folder_get(&self, id: i64) -> Result<Option<StoredSyncFolder>> {
         let conn = self.read();
         conn.query_row(
-            "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
+            "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync, kind
              FROM sync_folder WHERE id = ?1",
             params![id],
             |r| {
@@ -112,6 +135,7 @@ impl Db {
                     pending_mode: r.get(5)?,
                     state: r.get(6)?,
                     last_sync: r.get(7)?,
+                    kind: r.get(8)?,
                 })
             },
         )

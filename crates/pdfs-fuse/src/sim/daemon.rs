@@ -2912,6 +2912,433 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "mounts FUSE: run explicitly on an isolated fake Drive"]
+    fn attaching_my_files_preserves_local_files_and_syncs_both_ways() {
+        use std::os::unix::fs::MetadataExt;
+        let drive = FakeDrive::new();
+        let dir = scratch("attach-my-files");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir(daemon.mountpoint.join("Work")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("Work").is_some()
+        }));
+        drive.device().write("Work/cloud.txt", b"from cloud");
+        drive.device().write("Work/common.txt", b"remote version");
+        drive.device().write("Work/identical.txt", b"same bytes");
+        let local = dir.join("local");
+        std::fs::create_dir(&local).unwrap();
+        std::fs::write(local.join("local.txt"), b"only on this computer").unwrap();
+        std::fs::write(local.join("common.txt"), b"local  version").unwrap();
+        std::fs::write(local.join("identical.txt"), b"same bytes").unwrap();
+        daemon
+            .request(&Request::AttachSyncFolder {
+                local_path: local.to_str().unwrap().into(),
+                remote_path: "Work".into(),
+            })
+            .unwrap();
+        let folder = match daemon.request(&Request::ListSyncFolders).unwrap() {
+            Response::SyncFolders { items } => {
+                items
+                    .into_iter()
+                    .find(|f| f.local_path == local.to_str().unwrap())
+                    .unwrap()
+                    .id
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.lookup("Work/local.txt").is_some()
+                && std::fs::read(local.join("cloud.txt")).is_ok_and(|b| b == b"from cloud")
+                && std::fs::read(local.join("common.txt")).is_ok_and(|b| b == b"remote version")
+                && !conflict_copies(&local, "common").is_empty()
+        }));
+        assert_ne!(
+            std::fs::metadata(&local).unwrap().dev(),
+            std::fs::metadata(&daemon.mountpoint).unwrap().dev()
+        );
+        assert!(
+            conflict_copies(&local, "common")
+                .iter()
+                .any(|p| std::fs::read(p).is_ok_and(|b| b == b"local  version"))
+        );
+        assert!(
+            daemon
+                .request(&Request::AttachSyncFolder {
+                    local_path: local.to_str().unwrap().into(),
+                    remote_path: "Work".into()
+                })
+                .is_err()
+        );
+        let duplicate = dir.join("duplicate");
+        std::fs::create_dir(&duplicate).unwrap();
+        assert!(
+            daemon
+                .request(&Request::AttachSyncFolder {
+                    local_path: duplicate.to_str().unwrap().into(),
+                    remote_path: "Work".into()
+                })
+                .is_err()
+        );
+        assert!(
+            daemon
+                .request(&Request::AttachSyncFolder {
+                    local_path: duplicate.to_str().unwrap().into(),
+                    remote_path: "../Work".into()
+                })
+                .is_err()
+        );
+        // Parent/child mappings, the account root and files cannot be attached.
+        std::fs::create_dir(daemon.mountpoint.join("Work/Sub")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("Work/Sub").is_some()
+        }));
+        for remote in ["Work/Sub", ".", "Work/cloud.txt"] {
+            assert!(
+                daemon
+                    .request(&Request::AttachSyncFolder {
+                        local_path: duplicate.to_str().unwrap().into(),
+                        remote_path: remote.into(),
+                    })
+                    .is_err()
+            );
+        }
+        // Local overlap and symlink aliases into the actual cloud mount are refused.
+        let alias = dir.join("cloud-alias");
+        std::os::unix::fs::symlink(daemon.mountpoint.join("Work"), &alias).unwrap();
+        std::fs::create_dir_all(local.join("Sub")).unwrap();
+        for path in [
+            local.join("Sub"),
+            dir.clone(),
+            daemon.mountpoint.join("Work"),
+            alias,
+        ] {
+            let error = daemon
+                .request(&Request::AttachSyncFolder {
+                    local_path: path.to_string_lossy().into_owned(),
+                    remote_path: "Work/Sub".into(),
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("overlaps"), "{error}");
+        }
+        assert!(conflict_copies(&local, "identical").is_empty());
+        assert_eq!(
+            std::fs::read(local.join("identical.txt")).unwrap(),
+            b"same bytes"
+        );
+        // Simultaneous requests cannot register two local trees for one cloud root.
+        std::fs::create_dir(daemon.mountpoint.join("Other")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty()) && drive.lookup("Other").is_some()
+        }));
+        let candidate_a = dir.join("candidate-a");
+        let candidate_b = dir.join("candidate-b");
+        std::fs::create_dir(&candidate_a).unwrap();
+        std::fs::create_dir(&candidate_b).unwrap();
+        let outcomes = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                daemon
+                    .request(&Request::AttachSyncFolder {
+                        local_path: candidate_a.to_str().unwrap().into(),
+                        remote_path: "Other".into(),
+                    })
+                    .map_err(|e| e.to_string())
+            });
+            let b = scope.spawn(|| {
+                daemon
+                    .request(&Request::AttachSyncFolder {
+                        local_path: candidate_b.to_str().unwrap().into(),
+                        remote_path: "Other".into(),
+                    })
+                    .map_err(|e| e.to_string())
+            });
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(
+            outcomes.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one mapping may own a remote root: {outcomes:?}"
+        );
+        drive
+            .device()
+            .write("Work/cloud.txt", b"new cloud revision");
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || std::fs::read(
+            local.join("cloud.txt")
+        )
+        .is_ok_and(|b| b == b"new cloud revision")));
+        std::fs::write(local.join("local.txt"), b"new local revision").unwrap();
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || drive
+            .tree()
+            .get("Work/local.txt")
+            == Some(&Entry::File(Arc::new(b"new local revision".to_vec())))));
+        assert!(wait_until(Duration::from_secs(30), || listed_folder(
+            &daemon, folder
+        )
+        .is_some_and(|f| f.state == "idle")));
+        daemon
+            .request(&Request::SetSyncFolderPaused {
+                id: folder,
+                paused: true,
+            })
+            .unwrap();
+        let before = drive.tree();
+        for entry in std::fs::read_dir(&local).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        daemon
+            .request(&Request::SetSyncFolderPaused {
+                id: folder,
+                paused: false,
+            })
+            .unwrap();
+        daemon
+            .request(&Request::SyncNow { id: Some(folder) })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || listed_folder(
+            &daemon, folder
+        )
+        .is_some_and(|f| f.state == "error")));
+        assert_eq!(
+            drive.tree(),
+            before,
+            "the wipe guard must preserve the remote tree"
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let db = Db::open(&dir.join("pdfs.db")).unwrap();
+        assert_eq!(
+            db.sync_folder_get(folder).unwrap().unwrap().remote_share_id,
+            "my-files-share"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn attached_my_files(daemon: &Daemon, drive: &FakeDrive, local: &Path) -> i64 {
+        std::fs::create_dir(daemon.mountpoint.join("Work")).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.drained() && drive.lookup("Work").is_some()
+        }));
+        std::fs::create_dir(local).unwrap();
+        daemon
+            .request(&Request::AttachSyncFolder {
+                local_path: local.to_string_lossy().into_owned(),
+                remote_path: "Work".into(),
+            })
+            .unwrap();
+        match daemon.request(&Request::ListSyncFolders).unwrap() {
+            Response::SyncFolders { items } => {
+                items
+                    .into_iter()
+                    .find(|f| f.local_path == local.to_string_lossy())
+                    .unwrap()
+                    .id
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run explicitly on an isolated fake Drive"]
+    fn attached_my_files_views_preserve_concurrent_edits() {
+        let drive = FakeDrive::new();
+        let dir = scratch("attach-views");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let local = dir.join("local");
+        let id = attached_my_files(&daemon, &drive, &local);
+        let mounted = daemon.mountpoint.join("Work");
+        // Prime the mount listing before a mirror upload, to catch stale listings.
+        assert_eq!(std::fs::read_dir(&mounted).unwrap().count(), 0);
+        std::fs::write(local.join("mirror.txt"), b"mirror bytes").unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                std::fs::read_dir(&mounted)
+                    .unwrap()
+                    .any(|e| e.unwrap().file_name() == "mirror.txt")
+                    && std::fs::read(mounted.join("mirror.txt")).is_ok_and(|b| b == b"mirror bytes")
+            }),
+            "mirror upload must reach the mounted view without a restart"
+        );
+        std::fs::write(mounted.join("mount.txt"), b"mounted bytes").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()));
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                std::fs::read(local.join("mount.txt")).is_ok_and(|b| b == b"mounted bytes")
+                    && listed_folder(&daemon, id).is_some_and(|f| f.state == "idle")
+            }),
+            "mounted writes must reach the mirror"
+        );
+
+        daemon
+            .request(&Request::SetSyncFolderPaused { id, paused: true })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            listed_folder(&daemon, id).is_some_and(|f| f.state != "syncing")
+        }));
+        std::fs::write(mounted.join("mount.txt"), b"mount changed").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || daemon.drained()));
+        std::fs::write(local.join("mount.txt"), b"local changed").unwrap();
+        daemon
+            .request(&Request::SetSyncFolderPaused { id, paused: false })
+            .unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                std::fs::read(local.join("mount.txt")).is_ok_and(|b| b == b"mount changed")
+                    && conflict_copies(&local, "mount")
+                        .iter()
+                        .any(|p| std::fs::read(p).is_ok_and(|b| b == b"local changed"))
+                    && drive.tree().iter().any(|(path, entry)| {
+                        path.starts_with("Work/mount (sync-conflict")
+                            && entry == &Entry::File(Arc::new(b"local changed".to_vec()))
+                    })
+            }),
+            "both edits must survive the next pass"
+        );
+
+        let error = daemon
+            .request(&Request::SetSyncFolderMode {
+                id,
+                mode: "ondemand".into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only support mirror"), "{error}");
+        let error = daemon
+            .request(&Request::RemoveSyncFolder {
+                id,
+                delete_remote: true,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be deleted"), "{error}");
+        let folder = listed_folder(&daemon, id).unwrap();
+        assert_eq!(folder.kind, "attached");
+        assert_eq!(folder.mode, "mirror");
+        assert!(folder.pending_mode.is_none());
+        // Restore must not reclassify a My files root as a device backup,
+        // which would make the device-only destructive operations available.
+        let restore_path = dir.join("forged-device-restore");
+        daemon
+            .request(&Request::RestoreSyncFolders {
+                items: vec![control::RestoreItem {
+                    remote_uid: folder.remote_uid.clone(),
+                    local_path: restore_path.to_string_lossy().into_owned(),
+                    mode: "ondemand".into(),
+                }],
+            })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            matches!(daemon.request(&Request::ListActivity { limit: 100 }),
+            Ok(Response::Activity { items }) if items.iter().any(|item| {
+                !item.ok && item.detail.contains("not a folder under this device")
+            }))
+        }));
+        assert!(!restore_path.exists());
+        match daemon.request(&Request::ListLocations).unwrap() {
+            Response::Locations { items } => assert!(items.iter().any(|m| {
+                matches!(m.kind, pdfs_core::mounts::MountKind::Attached { sync_folder_id } if sync_folder_id == id)
+            })),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        daemon
+            .request(&Request::RemoveSyncFolder {
+                id,
+                delete_remote: false,
+            })
+            .unwrap();
+        assert!(listed_folder(&daemon, id).is_none());
+        assert!(drive.lookup("Work/mount.txt").is_some());
+        assert_eq!(
+            std::fs::read(local.join("mount.txt")).unwrap(),
+            b"mount changed"
+        );
+        daemon.stop().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run explicitly on an isolated fake Drive"]
+    fn attached_my_files_trashed_root_keeps_local_files() {
+        attached_root_loss_keeps_local_files(false);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run explicitly on an isolated fake Drive"]
+    fn attached_my_files_root_moved_outside_my_files_keeps_local_files() {
+        attached_root_loss_keeps_local_files(true);
+    }
+
+    fn attached_root_loss_keeps_local_files(move_outside: bool) {
+        let drive = FakeDrive::new();
+        let dir = scratch("attach-root-gone");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let local = dir.join("local");
+        let id = attached_my_files(&daemon, &drive, &local);
+        std::fs::write(local.join("keep.txt"), b"keep my bytes").unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            drive.lookup("Work/keep.txt").is_some()
+                && listed_folder(&daemon, id).is_some_and(|f| f.state == "idle")
+        }));
+        daemon
+            .request(&Request::SetSyncFolderPaused { id, paused: true })
+            .unwrap();
+        if move_outside {
+            use crate::drive::DriveApi;
+            let rt = daemon.rt.as_ref().unwrap();
+            let device = rt
+                .block_on(
+                    daemon
+                        .client
+                        .create_device("other computer", proton_drive_rs::DeviceType::Linux),
+                )
+                .unwrap();
+            let root = drive.lookup("Work").unwrap();
+            rt.block_on(daemon.client.move_node(&root, &device.root_folder_uid))
+                .unwrap();
+        } else {
+            drive.device().trash("Work");
+        }
+        daemon
+            .request(&Request::SetSyncFolderPaused { id, paused: false })
+            .unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            listed_folder(&daemon, id).is_some_and(|f| f.state == "error")
+        }));
+        assert_eq!(
+            std::fs::read(local.join("keep.txt")).unwrap(),
+            b"keep my bytes"
+        );
+        assert_eq!(std::fs::read_dir(&local).unwrap().count(), 1);
+        let daemon = daemon.restart().unwrap();
+        daemon.request(&Request::SyncNow { id: Some(id) }).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            listed_folder(&daemon, id).is_some_and(|f| f.state == "error")
+        }));
+        assert_eq!(
+            std::fs::read(local.join("keep.txt")).unwrap(),
+            b"keep my bytes"
+        );
+        daemon.stop().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Register `local` as a synced folder in `mode` and wait until the daemon
     /// lists it that way, returning its id.
     fn sync_folder(daemon: &Daemon, local: &Path, mode: &str) -> i64 {

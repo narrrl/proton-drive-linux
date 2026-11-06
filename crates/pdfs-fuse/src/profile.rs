@@ -141,19 +141,11 @@ impl Core {
 
     /// Snapshot the local arrangement into a [`Profile`].
     fn build_profile(&self, device_uid: &str, machine_id: &str) -> CoreResult<Profile> {
-        let folders = self
-            .db
-            .sync_folder_list()
-            .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
-            .into_iter()
-            .map(|f| ProfileFolder {
-                remote_uid: f.remote_uid,
-                local_path: f.local_path,
-                // A queued switch is where the user asked the folder to be, so
-                // that is what the next machine should set up.
-                mode: MountMode::from(f.pending_mode.unwrap_or(f.mode).as_str()),
-            })
-            .collect();
+        let folders = profile_folders(
+            self.db
+                .sync_folder_list()
+                .map_err(|e| CoreError::internal(format!("db: {e:?}")))?,
+        );
         let pins = self
             .db
             .pin_list()
@@ -389,6 +381,7 @@ impl Core {
         items: &[pdfs_core::control::RestoreItem],
         device: Option<&str>,
     ) -> CoreResult<RestoreOutcome> {
+        let _registration = super::devices::SYNC_ROOT_REGISTRATION.lock();
         if items.is_empty() {
             return Err(CoreError::invalid("nothing to restore"));
         }
@@ -398,6 +391,11 @@ impl Core {
             .sync_folder_list()
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
 
+        // A caller must not smuggle a My files root into a device mapping,
+        // where destructive device-only operations would otherwise be allowed.
+        let device_root = super::parse_uid(&device.root_uid)
+            .ok_or_else(|| CoreError::internal("invalid device root"))?;
+        let children = self.device_root_nodes(&device_root)?;
         let reserved = crate::devices::sync_root_reserved();
         let mut roots: Vec<PathBuf> = existing
             .iter()
@@ -406,6 +404,18 @@ impl Core {
         let mut restored = 0usize;
         let mut skipped: Vec<String> = Vec::new();
         for item in items {
+            if !children.iter().any(|node| {
+                node.uid.to_string() == item.remote_uid
+                    && node.is_folder()
+                    && !node.trashed
+                    && node.name != PROFILE_DIR_NAME
+            }) {
+                skipped.push(format!(
+                    "{}: not a folder under this device",
+                    item.local_path
+                ));
+                continue;
+            }
             // The path is proposed from the profile another machine wrote, and
             // may hold a folder name from Drive: checked like any new root.
             let local = match pdfs_core::syncroot::resolve(Path::new(&item.local_path)) {
@@ -466,6 +476,19 @@ impl Core {
         info!(restored, skipped = skipped.len(), "restore complete");
         Ok(RestoreOutcome { restored, skipped })
     }
+}
+
+/// Only device backups belong in the device's cross-machine profile.
+fn profile_folders(folders: Vec<pdfs_core::db::StoredSyncFolder>) -> Vec<ProfileFolder> {
+    folders
+        .into_iter()
+        .filter(|f| f.kind == "device")
+        .map(|f| ProfileFolder {
+            remote_uid: f.remote_uid,
+            local_path: f.local_path,
+            mode: MountMode::from(f.pending_mode.unwrap_or(f.mode).as_str()),
+        })
+        .collect()
 }
 
 /// What a restore did: how many folders it attached, and why it left out the
@@ -529,6 +552,21 @@ fn default_local_path(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attached_my_files_folders_are_not_in_the_device_profile() {
+        let dir = crate::sim::daemon::scratch("profile-folder-kinds");
+        let db = pdfs_core::db::Db::open(&dir.join("cache.db")).unwrap();
+        db.sync_folder_add("/backup", "vol~backup", "device-share")
+            .unwrap();
+        db.sync_folder_attach("/work", "vol~work", "my-files-share")
+            .unwrap();
+        let folders = profile_folders(db.sync_folder_list().unwrap());
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].remote_uid, "vol~backup");
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn foreign_home_is_not_reused() {

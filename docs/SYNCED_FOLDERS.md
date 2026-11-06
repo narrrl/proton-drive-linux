@@ -5,6 +5,7 @@ up to Proton Drive and kept in step with it. This page covers adding one, what t
 that should not be backed up, changes that are still waiting to upload, conflicts, and pausing.
 
 - [Add a folder](#add-a-folder)
+- [Attach an existing My files folder](#attach-an-existing-my-files-folder)
 - [Synced or online only](#synced-or-online-only)
 - [Move files between synced folders and My files](#move-files-between-synced-folders-and-my-files)
 - [Stop syncing a folder](#stop-syncing-a-folder)
@@ -74,7 +75,8 @@ again when they move into a synced one.
 
 **Stop Syncing** in the app, or `pdfs sync rm ID`, keeps both the local files and the copy on
 Proton Drive. To delete the copy on Proton Drive as well, tick **Also delete from Proton Drive**,
-or add `--delete-remote`.
+or add `--delete-remote`. Attached My files folders always keep the cloud copy;
+`--delete-remote` is refused for them.
 
 ## Sync a folder from scratch
 
@@ -169,3 +171,28 @@ The version you do not keep goes to the Trash, so a wrong choice can be undone.
   `pdfs sync resume` continues at once.
 - **Limit bandwidth** under **Preferences → General → Network**, or with
   `pdfs sync limit --up 2M --down 10M`. `0` removes a limit.
+
+## Attach an existing My files folder
+
+Run `pdfs sync attach /path/to/local --to Work` to merge a real local directory
+with the existing `Work` folder in My files. `--to` also accepts an absolute path
+inside the My files mount. Both folders must already exist.
+
+The local directory stays a normal mirrored directory. The first pass copies files
+found on only one side, adopts identical files, and keeps a conflict copy when
+versions differ; it does not propagate deletions. Later passes use ordinary
+bidirectional sync, including deletions and the existing wipe guards.
+
+The My files root, shared folders, overlapping sync roots, and local paths inside
+or containing the cloud mount are refused. Use `pdfs sync list` to find the new
+folder's ID and monitor its state. `pdfs sync rm ID` stops syncing and keeps both
+copies. `--delete-remote` is refused for attached folders.
+
+Attached folders support **mirror** mode only. Use the main My files mount for online-only
+access. They are listed separately from device backups and are not included in the device
+profile used to restore another computer.
+
+On the first sync, the remote version keeps the original name when both versions differ.
+The local version is preserved as a conflict copy next to it and is uploaded too. If the
+remote root is trashed or moved outside My files, syncing stops with an error and local
+files are kept.
