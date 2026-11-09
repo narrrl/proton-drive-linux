@@ -588,6 +588,7 @@ fn platform_label(device_type: &str) -> &str {
 /// How many folders this machine backs up, and whether any of them needs
 /// attention — the one fact worth surfacing away from the folder list itself.
 pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
+    let folders: Vec<_> = folders.iter().filter(|f| f.kind == "device").collect();
     if folders.is_empty() {
         return gettext("No folders backed up yet");
     }
@@ -939,7 +940,13 @@ pub(crate) fn reload_sync_pages(ui: &Rc<Ui>) {
 }
 
 /// Confirm, then stop syncing a folder. Offers to also delete the cloud copy.
-pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondemand: bool) {
+pub(crate) fn prompt_remove_sync_folder(
+    ui: &Rc<Ui>,
+    id: i64,
+    path: &str,
+    ondemand: bool,
+    attached: bool,
+) {
     let win = ui_window(ui);
     // The two modes leave the user in opposite places, so they can't share a
     // sentence. A mirror folder's files are already on this disk and stay there.
@@ -947,7 +954,12 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
     // in Proton Drive, so unmounting it leaves an empty directory — which is a
     // nasty surprise if the dialog claimed the local files were safe, and is
     // recoverable only by turning On-demand off *first* and letting it download.
-    let body = if ondemand {
+    let body = if attached {
+        gettext_f(
+            "Stop syncing “{path}”? Both the local files and the folder in My files are kept.",
+            &[("path", path)],
+        )
+    } else if ondemand {
         // Translators: {path} is a local folder path.
         gettext_f(
             "Stop syncing “{path}”?\n\nThis folder is online only: its files live in Proton Drive, not on this disk, so the folder will be empty once it stops syncing. To keep a local copy, cancel, switch the folder to Synced, and wait for the download to finish before removing it.",
@@ -975,7 +987,9 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
         .active(false)
         .build();
     group.add(&delete_remote);
-    dialog.set_extra_child(Some(&group));
+    if !attached {
+        dialog.set_extra_child(Some(&group));
+    }
     dialog.add_response("cancel", &gettext("Cancel"));
     dialog.add_response("remove", &gettext("Stop Syncing"));
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
@@ -988,7 +1002,7 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
                 &ui,
                 Request::RemoveSyncFolder {
                     id,
-                    delete_remote: delete_remote.is_active(),
+                    delete_remote: !attached && delete_remote.is_active(),
                 },
                 &gettext("Stopped syncing folder"),
                 &gettext("Couldn't stop syncing the folder"),
@@ -1291,6 +1305,7 @@ mod tests {
 
     fn folder(state: &str) -> SyncFolderInfo {
         SyncFolderInfo {
+            kind: "device".into(),
             id: 1,
             local_path: "/home/u/Documents".into(),
             remote_uid: "vol~link".into(),
@@ -1301,6 +1316,16 @@ mod tests {
             progress: None,
             paused: false,
         }
+    }
+
+    #[test]
+    fn attached_my_files_folders_do_not_count_as_device_backups() {
+        let mut attached = folder("error");
+        attached.kind = "attached".into();
+        assert_eq!(
+            this_computer_subtitle(&[attached]),
+            "No folders backed up yet"
+        );
     }
 
     #[test]

@@ -696,6 +696,15 @@ enum SyncCmd {
         /// Local directory to sync.
         path: PathBuf,
     },
+    /// Sync a real local folder with an existing folder in My files.
+    /// The first pass preserves local-only files and keeps differing versions.
+    Attach {
+        /// Existing local directory; it remains a real local directory.
+        path: PathBuf,
+        /// Existing folder in My files, relative to the cloud mount or inside it.
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// List this machine's synced folders.
     List,
     /// Remove a synced folder by id.
@@ -1115,6 +1124,22 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
                 .ok_or_else(|| anyhow!("path is not valid UTF-8"))?
                 .to_string();
             ok_or_bail(control_request(CtlRequest::AddSyncFolder { local_path })?)?
+        }
+        SyncCmd::Attach { path, to } => {
+            let abs = std::fs::canonicalize(&path)
+                .with_context(|| format!("resolve {}", path.display()))?;
+            let local_path = abs
+                .to_str()
+                .ok_or_else(|| anyhow!("path is not valid UTF-8"))?
+                .to_owned();
+            let remote_path = to
+                .to_str()
+                .ok_or_else(|| anyhow!("remote path is not valid UTF-8"))?
+                .to_owned();
+            ok_or_bail(control_request(CtlRequest::AttachSyncFolder {
+                local_path,
+                remote_path,
+            })?)?
         }
         SyncCmd::List => {
             let response = control_request(CtlRequest::ListSyncFolders)?;
@@ -2293,6 +2318,9 @@ fn cmd_locations() -> Result<()> {
                     MountKind::MyFiles => "My Files".to_string(),
                     MountKind::Device { sync_folder_id } => {
                         format!("Device folder {sync_folder_id}")
+                    }
+                    MountKind::Attached { sync_folder_id } => {
+                        format!("My files mirror {sync_folder_id}")
                     }
                     MountKind::Shared { .. } => "Shared folder".to_string(),
                 };
@@ -4268,6 +4296,7 @@ mod diagnose_tests {
     #[test]
     fn a_synced_folder_in_error_is_reported() {
         let folder = |id: i64, state: &str| pdfs_core::control::SyncFolderInfo {
+            kind: "device".into(),
             id,
             local_path: format!("/home/u/f{id}"),
             remote_uid: "vol~link".into(),

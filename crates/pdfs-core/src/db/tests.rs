@@ -2076,7 +2076,11 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TRIGGER mount_sync_folder_insert;
+            "DROP TRIGGER IF EXISTS mount_sync_folder_kind_update;
+             DROP TRIGGER mount_sync_folder_insert;
+             DROP TRIGGER sync_folder_attached_insert;
+             DROP TRIGGER sync_folder_attached_update;
+             ALTER TABLE sync_folder DROP COLUMN kind;
              DROP TABLE mount;
              DROP TABLE share_access;
              DROP TABLE album_photos;
@@ -7690,4 +7694,70 @@ fn a_queued_op_stops_existing_once_the_node_is_deleted() {
     let blobs = db.delete_ops_for_uid(&uid("journal").to_string()).unwrap();
     assert_eq!(blobs, vec!["/staging/journal"]);
     assert!(!db.op_exists(id).unwrap());
+}
+
+#[test]
+fn attachments_have_their_own_location_and_cannot_evict_local_files() {
+    use crate::mounts::MountKind;
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_attach("/work", "vol~work", "myfiles-share")
+        .unwrap();
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.kind, "attached");
+    assert_eq!(folder.mode, "mirror");
+    assert_eq!(db.sync_folder_list().unwrap()[0].kind, "attached");
+    let locations = db.mount_list().unwrap();
+    assert!(
+        matches!(locations[0].kind, MountKind::Attached { sync_folder_id } if sync_folder_id == id)
+    );
+    assert_eq!(locations[0].local_path, "/work");
+    assert_eq!(locations[0].root_share_id, "myfiles-share");
+    assert!(db.sync_folder_set_mode(id, "ondemand").is_err());
+    assert!(
+        db.sync_folder_set_pending_mode(id, Some("ondemand"))
+            .is_err()
+    );
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().mode, "mirror");
+    db.sync_folder_remove(id).unwrap();
+    assert!(db.mount_list().unwrap().is_empty());
+}
+
+#[test]
+fn migration_v45_keeps_existing_device_folders_and_location_ids() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/backup", "vol~backup", "share")
+        .unwrap();
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+    let location_id = db.mount_list().unwrap()[0].id;
+    db.conn
+        .lock()
+        .execute_batch(
+            "DROP TRIGGER sync_folder_attached_insert;
+         DROP TRIGGER sync_folder_attached_update;
+         DROP TRIGGER IF EXISTS mount_sync_folder_kind_update;
+         DROP TRIGGER mount_sync_folder_insert;
+         ALTER TABLE sync_folder DROP COLUMN kind;
+         CREATE TRIGGER mount_sync_folder_insert AFTER INSERT ON sync_folder BEGIN
+           INSERT INTO mount (kind, sync_folder_id) VALUES ('device', NEW.id); END;
+         UPDATE sync_state SET value = '44' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    db.migrate().unwrap();
+    let folder = db.sync_folder_get(id).unwrap().unwrap();
+    assert_eq!(folder.kind, "device");
+    assert_eq!(folder.mode, "ondemand");
+    assert_eq!(folder.pending_mode.as_deref(), Some("mirror"));
+    assert_eq!(db.mount_list().unwrap()[0].id, location_id);
+    let attached = db
+        .sync_folder_attach("/work", "vol~work", "myfiles")
+        .unwrap();
+    assert_eq!(
+        db.sync_folder_get(attached).unwrap().unwrap().kind,
+        "attached"
+    );
+    db.migrate().unwrap();
+    assert_eq!(db.mount_list().unwrap().len(), 2);
 }

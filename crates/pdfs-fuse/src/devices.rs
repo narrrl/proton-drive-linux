@@ -33,6 +33,11 @@ use super::{
     now_secs, parse_uid, spawn_session, sync_folder_info, this_hostname,
 };
 
+/// Registration validates local and remote root overlap before inserting a
+/// mapping. Serialize all registration paths so concurrent control requests
+/// cannot both validate against the same old set of roots.
+pub(super) static SYNC_ROOT_REGISTRATION: Mutex<()> = Mutex::new(());
+
 /// A mode that this daemon is allowed to apply.
 ///
 /// Persisted and control-protocol values first pass through [`MountMode`] so
@@ -152,7 +157,9 @@ impl Core {
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?;
         for location in &mut locations {
             location.mounted = self.states.is_mounted_at(Path::new(&location.local_path));
-            if let MountKind::Device { sync_folder_id } = &location.kind {
+            if let MountKind::Device { sync_folder_id } | MountKind::Attached { sync_folder_id } =
+                &location.kind
+            {
                 location.progress = progress.get(sync_folder_id).cloned();
                 location.paused = self.sync_folder_paused(*sync_folder_id);
             }
@@ -495,7 +502,7 @@ impl Core {
     }
 
     /// Everything directly under a device root, trashed nodes included.
-    fn device_root_nodes(&self, root_uid: &NodeUid) -> CoreResult<Vec<Node>> {
+    pub(super) fn device_root_nodes(&self, root_uid: &NodeUid) -> CoreResult<Vec<Node>> {
         let uids = self
             .rt
             .block_on(self.drive.enumerate_folder_children_node_uids(root_uid))
@@ -513,6 +520,7 @@ impl Core {
     /// tree into it once, and record the mapping. Phase 1 is a one-shot upload —
     /// the two-way engine (Phase 2) reconciles later changes.
     pub(crate) fn add_sync_folder(&self, local: &Path) -> CoreResult<StoredSyncFolder> {
+        let _registration = SYNC_ROOT_REGISTRATION.lock();
         let meta = std::fs::metadata(local)
             .map_err(|e| CoreError::internal(format!("stat {}: {e}", local.display())))?;
         if !meta.is_dir() {
@@ -699,6 +707,11 @@ impl Core {
             .sync_folder_get(id)
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
             .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
+        if folder.kind == "attached" && delete_remote {
+            return Err(CoreError::invalid(
+                "attached My files folders cannot be deleted by stopping sync; omit --delete-remote",
+            ));
+        }
         // An `ondemand` folder *is* a FUSE mount over its local path, so dropping
         // only the row would strand the mount: the path would keep serving a
         // folder the daemon no longer tracks, and nothing would ever unmount it.
@@ -785,6 +798,11 @@ impl Core {
             .sync_folder_get(id)
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
             .ok_or_else(|| CoreError::not_found(format!("no synced folder with id {id}")))?;
+        if folder.kind == "attached" && target_mode != ApplicableMountMode::Mirror {
+            return Err(CoreError::invalid(
+                "attached My files folders only support mirror mode; use the My files mount for online-only access",
+            ));
+        }
         let current_mode = ApplicableMountMode::parse(&folder.mode)
             .map_err(|error| CoreError::invalid(format!("unsupported current mode: {error}")))?;
         // A switch waits on the folder's reconcile, which a pause skips; refuse
@@ -960,6 +978,11 @@ impl Core {
             .sync_folder_get(id)
             .map_err(|e| SwitchBlocked::Failed(format!("db: {e:?}")))?
             .ok_or_else(|| SwitchBlocked::Failed(format!("no synced folder with id {id}")))?;
+        if folder.kind == "attached" && mode != ApplicableMountMode::Mirror {
+            return Err(SwitchBlocked::Failed(
+                "attached My files folders only support mirror mode".into(),
+            ));
+        }
         if !pending_intent_matches(folder.pending_mode.as_deref(), expected_pending) {
             return Err(SwitchBlocked::Superseded);
         }
@@ -1199,7 +1222,7 @@ impl Core {
             }
         };
         for folder in folders {
-            if folder.mode != "ondemand" {
+            if folder.kind != "device" || folder.mode != "ondemand" {
                 continue;
             }
             let Some(root_uid) = parse_uid(&folder.remote_uid) else {
@@ -1395,6 +1418,7 @@ mod tests {
 
     fn folder(local_path: &str, remote_uid: &str, mode: &str) -> StoredSyncFolder {
         StoredSyncFolder {
+            kind: "device".into(),
             id: 7,
             local_path: local_path.to_string(),
             remote_uid: remote_uid.to_string(),

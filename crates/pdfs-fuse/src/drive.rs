@@ -26,7 +26,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use proton_drive_rs::proton_sdk::account::Quota;
 use proton_drive_rs::proton_sdk::error::Result;
-use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid};
+use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid, ShareId};
 use proton_drive_rs::{
     AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem,
     ProtonDriveClient, RevisionReader, Thumbnail,
@@ -42,6 +42,8 @@ pub(crate) type OutcomeStream<'a> = BoxStream<'a, Result<(NodeUid, Result<()>)>>
 #[async_trait]
 pub(crate) trait DriveApi: Send + Sync {
     async fn get_my_files_folder(&self) -> Result<Node>;
+
+    async fn context_share_id(&self, uid: &NodeUid) -> Result<ShareId>;
 
     async fn get_node(&self, uid: &NodeUid) -> Result<Option<Node>>;
 
@@ -305,6 +307,10 @@ impl RevisionRead for RevisionReader {
 
 #[async_trait]
 impl DriveApi for ProtonDriveClient {
+    async fn context_share_id(&self, uid: &NodeUid) -> Result<ShareId> {
+        ProtonDriveClient::context_share_id(self, uid).await
+    }
+
     async fn get_my_files_folder(&self) -> Result<Node> {
         ProtonDriveClient::get_my_files_folder(self).await
     }

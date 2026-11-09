@@ -11,7 +11,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 44;
+pub(super) const SCHEMA_VERSION: i64 = 45;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -465,6 +465,29 @@ impl Db {
             )? > 0;
             if has_entries && !has_column {
                 tx.execute_batch(MIGRATION_V44)?;
+            }
+        }
+        if current < 45 {
+            let has_folders: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_folder'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_kind: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sync_folder') WHERE name = 'kind'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_folders && !has_kind {
+                tx.execute_batch(MIGRATION_V45_FOLDERS)?;
+                let has_mounts: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'mount'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? > 0;
+                if has_mounts {
+                    tx.execute_batch(MIGRATION_V45_MOUNTS)?;
+                }
             }
         }
         tx.execute(
@@ -1381,4 +1404,58 @@ CREATE INDEX IF NOT EXISTS pending_op_kind_name ON pending_op(kind, name);
 /// the next time its path is synced.
 const MIGRATION_V44: &str = "
 ALTER TABLE sync_entry ADD COLUMN remote_revision_id TEXT;
+";
+
+/// Schema v45: distinguish device backups from My files attachments. Existing
+/// released rows are device backups. Attachments cannot evict their local tree.
+const MIGRATION_V45_FOLDERS: &str = "
+ALTER TABLE sync_folder ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'
+  CHECK (kind IN ('device', 'attached'));
+CREATE TRIGGER sync_folder_attached_insert
+BEFORE INSERT ON sync_folder
+WHEN NEW.kind = 'attached' AND (NEW.mode != 'mirror' OR NEW.pending_mode IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'attached folders only support mirror mode'); END;
+CREATE TRIGGER sync_folder_attached_update
+BEFORE UPDATE ON sync_folder
+WHEN NEW.kind = 'attached' AND (NEW.mode != 'mirror' OR NEW.pending_mode IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'attached folders only support mirror mode'); END;
+";
+
+const MIGRATION_V45_MOUNTS: &str = "
+DROP TRIGGER mount_sync_folder_insert;
+DROP INDEX mount_myfiles;
+DROP INDEX mount_device;
+DROP INDEX mount_shared;
+ALTER TABLE mount RENAME TO mount_v44;
+CREATE TABLE mount (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('myfiles', 'device', 'attached', 'shared')),
+  sync_folder_id INTEGER REFERENCES sync_folder(id) ON DELETE CASCADE,
+  share_root_uid TEXT,
+  local_path TEXT NOT NULL DEFAULT '',
+  root_uid TEXT NOT NULL DEFAULT '',
+  root_share_id TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'unknown',
+  access TEXT NOT NULL DEFAULT 'rw' CHECK (access IN ('rw', 'ro')),
+  CHECK (
+    (kind = 'myfiles' AND sync_folder_id IS NULL AND share_root_uid IS NULL)
+    OR (kind IN ('device', 'attached') AND sync_folder_id IS NOT NULL AND share_root_uid IS NULL)
+    OR (kind = 'shared' AND sync_folder_id IS NULL AND share_root_uid IS NOT NULL)
+  )
+);
+INSERT INTO mount SELECT * FROM mount_v44;
+DROP TABLE mount_v44;
+CREATE UNIQUE INDEX mount_myfiles ON mount(kind) WHERE kind = 'myfiles';
+CREATE UNIQUE INDEX mount_device ON mount(sync_folder_id) WHERE kind IN ('device', 'attached');
+CREATE UNIQUE INDEX mount_shared ON mount(share_root_uid) WHERE kind = 'shared';
+CREATE TRIGGER mount_sync_folder_insert
+AFTER INSERT ON sync_folder
+BEGIN
+  INSERT INTO mount (kind, sync_folder_id) VALUES (NEW.kind, NEW.id);
+END;
+CREATE TRIGGER mount_sync_folder_kind_update
+AFTER UPDATE OF kind ON sync_folder
+BEGIN
+  UPDATE mount SET kind = NEW.kind WHERE sync_folder_id = NEW.id;
+END;
 ";
