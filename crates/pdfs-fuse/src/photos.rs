@@ -72,6 +72,105 @@ const UPLOAD_THUMB_QUALITIES: [u8; 4] = [65, 50, 35, 20];
 /// Largest still image read whole to render the thumbnail its upload carries.
 const UPLOAD_IMAGE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How much memory every thumbnail decode in the daemon may hold at once:
+/// the encoded file plus its decoded pixels.
+///
+/// Without a limit, each of the 16 drain workers decoded its own full-size
+/// photo. A batch of 100-megapixel JPEGs then held about 9 GiB, which swapped the
+/// machine until the watchdog killed the daemon, on every restart
+/// (`docs/BUGS.md` B280). With this budget, a phone photo still decodes beside
+/// several others, and a 100-megapixel one decodes alone.
+const DECODE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The process-wide [`DecodeBudget`] every thumbnail decode draws from.
+static DECODE_BUDGET: DecodeBudget = DecodeBudget::new(DECODE_BUDGET_BYTES);
+
+/// A counting gate over bytes: [`acquire`](Self::acquire) waits until the cost
+/// fits beside what is already held.
+struct DecodeBudget {
+    limit: u64,
+    used: std::sync::Mutex<u64>,
+    freed: std::sync::Condvar,
+}
+
+/// A share of a [`DecodeBudget`], given back on drop.
+struct DecodePermit<'a> {
+    budget: &'a DecodeBudget,
+    cost: u64,
+}
+
+impl DecodeBudget {
+    const fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: std::sync::Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait until `cost` bytes fit, and hold them. A cost above the limit is
+    /// cut down to the limit, so the largest image waits for an idle budget
+    /// and then runs alone, instead of waiting forever.
+    fn acquire(&self, cost: u64) -> DecodePermit<'_> {
+        let cost = cost.clamp(1, self.limit);
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *used + cost > self.limit {
+            used = self
+                .freed
+                .wait(used)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *used += cost;
+        DecodePermit { budget: self, cost }
+    }
+}
+
+impl Drop for DecodePermit<'_> {
+    fn drop(&mut self) {
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *used -= self.cost;
+        self.budget.freed.notify_all();
+    }
+}
+
+/// What decoding an image of `encoded_len` bytes and `dimensions` costs in
+/// memory: the encoded bytes, the decoded pixels at up to 4 bytes each, and a
+/// second copy of the pixels when [`decode_upright`] rotates them. When the
+/// header gives no dimensions, assume the image is compressed 16 to 1.
+fn decode_cost(encoded_len: u64, dimensions: Option<(u32, u32)>) -> u64 {
+    let pixels = match dimensions {
+        Some((width, height)) => u64::from(width) * u64::from(height) * 4 * 2,
+        None => encoded_len.saturating_mul(16),
+    };
+    encoded_len.saturating_add(pixels)
+}
+
+/// The pixel dimensions in the header of an encoded image, without decoding it.
+fn dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// [`dimensions_of`] for an image file. Reads only the header.
+fn dimensions_of_file(path: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 /// The aspect ratio (w/h) of an encoded image, read from its header alone — no
 /// pixels are decoded. `None` when the format is unknown or the header is torn.
 fn ratio_of(bytes: &[u8]) -> Option<f64> {
@@ -209,7 +308,14 @@ fn thumbnail_build_may_start(status: &ThumbnailBuildStatus, path: &str) -> CoreR
 /// formats return an undecodable verdict.
 ///
 /// CPU-bound (a 20 MP JPEG is real work), so callers run it on the blocking pool.
+/// Waits for its share of [`DECODE_BUDGET`] first.
 fn scale_thumbnail(bytes: &[u8], name: &str, staging_dir: &Path) -> ScaleAttempt {
+    let _permit = DECODE_BUDGET.acquire(decode_cost(bytes.len() as u64, dimensions_of(bytes)));
+    scale_thumbnail_unbudgeted(bytes, name, staging_dir)
+}
+
+/// [`scale_thumbnail`] for a caller that already holds its [`DecodePermit`].
+fn scale_thumbnail_unbudgeted(bytes: &[u8], name: &str, staging_dir: &Path) -> ScaleAttempt {
     scale_thumbnail_with_exiftool(
         bytes,
         name,
@@ -544,11 +650,20 @@ fn upload_thumbnails_with(
         }
         video_file_thumbnail(path, ffmpeg, FFMPEG_TIMEOUT)
     } else if is_thumbnail_image_name(name) {
-        let fits = std::fs::metadata(path).is_ok_and(|meta| meta.len() <= UPLOAD_IMAGE_MAX_BYTES);
-        let Some(bytes) = fits.then(|| std::fs::read(path).ok()).flatten() else {
+        let Some(len) = std::fs::metadata(path)
+            .ok()
+            .map(|meta| meta.len())
+            .filter(|len| *len <= UPLOAD_IMAGE_MAX_BYTES)
+        else {
             return Vec::new();
         };
-        scale_thumbnail(&bytes, name, staging_dir)
+        // Taken before the read, so the encoded bytes count against the
+        // budget too.
+        let _permit = DECODE_BUDGET.acquire(decode_cost(len, dimensions_of_file(path)));
+        let Ok(bytes) = std::fs::read(path) else {
+            return Vec::new();
+        };
+        scale_thumbnail_unbudgeted(&bytes, name, staging_dir)
     } else {
         return Vec::new();
     };
@@ -2113,6 +2228,66 @@ impl Core {
             .store(uid, mtime, size, &bytes)
             .map_err(|e| CoreError::internal(format!("cache store: {e}")))?;
         Ok(self.cache.content_path(uid))
+    }
+}
+
+#[cfg(test)]
+mod decode_budget_tests {
+    use super::{DecodeBudget, decode_cost};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// A decode that does not fit beside the ones running waits for them,
+    /// instead of every drain worker decoding at once (`docs/BUGS.md` B280).
+    #[test]
+    fn a_decode_over_the_budget_waits_for_the_running_one() {
+        let budget = Arc::new(DecodeBudget::new(100));
+        let first = budget.acquire(60);
+        let started = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (budget, started) = (budget.clone(), started.clone());
+            std::thread::spawn(move || {
+                let _second = budget.acquire(60);
+                started.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "second decode ran over budget"
+        );
+        drop(first);
+        waiter.join().expect("waiter");
+        assert!(started.load(Ordering::SeqCst));
+    }
+
+    /// Decodes that fit together run together.
+    #[test]
+    fn small_decodes_share_the_budget() {
+        let budget = DecodeBudget::new(100);
+        let _a = budget.acquire(30);
+        let _b = budget.acquire(30);
+        let _c = budget.acquire(30);
+    }
+
+    /// An image bigger than the whole budget still decodes, alone, rather than
+    /// waiting forever.
+    #[test]
+    fn an_image_over_the_whole_budget_still_decodes() {
+        let budget = DecodeBudget::new(100);
+        drop(budget.acquire(10_000));
+        let _again = budget.acquire(100);
+    }
+
+    /// The cost of the 102-megapixel JPEG that set off B280 fills the real
+    /// budget, so it never decodes beside another one.
+    #[test]
+    fn a_hundred_megapixel_photo_costs_the_whole_budget() {
+        let cost = decode_cost(97_266_141, Some((11_656, 8_742)));
+        assert!(cost >= super::DECODE_BUDGET_BYTES);
+        let phone = decode_cost(4_000_000, Some((4_000, 3_000)));
+        assert!(phone * 4 < super::DECODE_BUDGET_BYTES);
     }
 }
 

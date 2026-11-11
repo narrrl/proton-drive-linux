@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed) | Uploading a batch of large photos swaps the machine until the daemon is killed |
 | [B279](#b279--after-a-watchdog-kill-the-mount-never-comes-back) | After a watchdog kill the mount never comes back |
 | [B278](#b278--sync-list-and-devices-list-show-the-last-sync-as-epoch-seconds) | `sync list` and `devices list` show the last sync as epoch seconds |
 | [B277](#b277--my-files-mounted-over-a-folder-with-files-in-it-and-hid-them) | My files mounted over a folder with files in it, and hid them |
@@ -382,6 +383,35 @@ a live account since.
 
 Newest first.
 
+### B280 — Uploading a batch of large photos swaps the machine until the daemon is killed
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-12, after B279. 868 new pictures (15.6 GiB) were copied into
+`~/ProtonDrive/Pictures`. Each restart reached 1.7 GiB resident and 9.8 GiB of swap within 40 s.
+The 16 `pdfs-drain-*` threads were all busy, cgroup memory pressure (`full avg10`) was 77 %, and
+the system's 15 GiB of swap was full. The watchdog killed the daemon, and the next start did the
+same. The largest picture was a 97 MB JPEG of 11656×8742 pixels.
+**Where:** `upload_thumbnails_with` and `scale_thumbnail` in `crates/pdfs-fuse/src/photos.rs`
+
+**Repro:** Queue more large photos than there are drain workers, for example by copying a folder
+of 100-megapixel JPEGs into the mount, and start the daemon.
+
+**Cause.** Every upload of an image builds its thumbnail by decoding the whole file. Nothing
+limited how many of these decodes ran at once, so all 16 drain workers did it together. One
+102-megapixel JPEG holds about 300 MB of pixels, and twice that when it has to be turned upright.
+Sixteen of them do not fit in memory, and `MemoryHigh=2G` throttled the daemon into swap until it
+stopped answering.
+
+**Fix.** Each thumbnail decode first takes a share of a process-wide 512 MiB budget. The share is
+the encoded size plus 8 bytes per pixel, read from the image header. A 12-megapixel phone photo
+still decodes beside four others. A 100-megapixel photo waits until no other decode runs, and
+then runs alone. The upload path takes its share before it reads the file.
+
+**Test:** `decode_budget_tests` in `crates/pdfs-fuse/src/photos.rs`. On 2026-11-12 the same queue
+on the fixed build peaked at 1.3 GiB resident and 90 MB of swap, with memory pressure near 0 %.
+
+---
+
 ### B279 — After a watchdog kill the mount never comes back
 
 **Status:** Fixed, not verified live
@@ -415,8 +445,8 @@ supervisor first gets an answer from the control socket, it sends the unit's own
 The supervisor also probes and pings on its first tick, not one period later. A startup that
 hangs for good is still aborted, only later.
 
-What is left: why the daemon stopped answering during the copy. Its swap use points at memory
-growth during a large batch of new files (compare [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on)).
+The daemon stopped answering during the copy because of
+[B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed).
 
 **Test:** `first_watchdog_ping_is_due_at_once` in `crates/pdfs-fuse/src/supervisor.rs`. The
 stale-mount path and the watchdog handshake need a live systemd unit to check.
