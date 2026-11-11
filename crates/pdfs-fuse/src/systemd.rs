@@ -102,6 +102,37 @@ pub fn idle_sleep(duration: Duration) {
     }
 }
 
+/// How long a mount may take to start before the watchdog counts it as hung.
+///
+/// Startup has no control socket to probe yet, and on a large account it is
+/// long: hydrating 48 000 nodes took 70 s on 2026-11-12, and the secondary
+/// mounts followed. Under the 2-minute `WatchdogSec` that run was aborted just
+/// before its first ping, and left six dead mounts behind (`docs/BUGS.md` B279).
+const STARTUP_WATCHDOG: Duration = Duration::from_secs(600);
+
+/// Give the mount about to start [`STARTUP_WATCHDOG`] before the watchdog fires.
+///
+/// Sends `WATCHDOG_USEC=`, which replaces the unit's timeout and restarts its
+/// timer. The supervisor puts the configured timeout back with
+/// [`restore_watchdog`] once it can prove the daemon answers. A startup that
+/// wedges for good is still aborted, only later.
+pub fn stretch_watchdog_for_startup() {
+    if watchdog_period().is_some() {
+        notify(&format!("WATCHDOG_USEC={}\n", STARTUP_WATCHDOG.as_micros()));
+    }
+}
+
+/// Put back the timeout the unit configured, undoing
+/// [`stretch_watchdog_for_startup`].
+pub(crate) fn restore_watchdog() {
+    if watchdog_period().is_none() {
+        return;
+    }
+    if let Ok(usec) = std::env::var("WATCHDOG_USEC") {
+        notify(&format!("WATCHDOG_USEC={usec}\n"));
+    }
+}
+
 /// Tell the manager the daemon is stopping, so a slow teardown is not mistaken
 /// for a hang by the watchdog it is racing.
 pub(crate) fn stopping() {

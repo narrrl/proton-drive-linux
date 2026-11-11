@@ -196,6 +196,20 @@ pub(super) fn clear_stale_mount(mountpoint: &Path) {
     }
 }
 
+/// Make sure `mountpoint` is a directory a mount can go on, clearing a dead
+/// mount a killed daemon left there first.
+///
+/// A dead mount answers `ENOTCONN`, which `create_dir_all` takes for "absent";
+/// it then tries `mkdir` and fails with `EEXIST`. The daemon retried that error
+/// forever and never got as far as [`check_mountpoint`], which would have
+/// cleared the mount (`docs/BUGS.md` B279).
+pub fn prepare_mountpoint(mountpoint: &Path) -> std::io::Result<()> {
+    if is_stale_mount(mountpoint) {
+        clear_stale_mount(mountpoint);
+    }
+    std::fs::create_dir_all(mountpoint)
+}
+
 /// Refuse to mount My files over a folder that already has files in it: FUSE
 /// would hide them, unsent and out of sight, until the service stops
 /// (`docs/BUGS.md` B277). Runs before the root fetch and before any worker

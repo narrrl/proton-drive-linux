@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B279](#b279--after-a-watchdog-kill-the-mount-never-comes-back) | After a watchdog kill the mount never comes back |
 | [B278](#b278--sync-list-and-devices-list-show-the-last-sync-as-epoch-seconds) | `sync list` and `devices list` show the last sync as epoch seconds |
 | [B277](#b277--my-files-mounted-over-a-folder-with-files-in-it-and-hid-them) | My files mounted over a folder with files in it, and hid them |
 | [B274](#b274--opening-a-file-for-writing-fails-with-eio-while-its-queued-revision-lands) | Opening a file for writing fails with EIO while its queued revision lands |
@@ -380,6 +381,47 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B279 — After a watchdog kill the mount never comes back
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-12, copying a folder of pictures into `~/ProtonDrive/Pictures`. The daemon
+stopped answering, the watchdog aborted it after 4 h 39 min (2.5 GiB memory peak, 11.8 GiB swap
+peak), and every restart then logged
+`create mountpoint /home/narl/ProtonDrive: File exists (os error 17)`. After the dead mounts were
+cleared by hand, the next start mounted all six folders and was aborted again, 120 s after it
+began, leaving six dead mounts behind once more.
+**Where:** `mount_once` in `crates/pdfs-cli/src/main.rs`; `prepare_mountpoint` in
+`crates/pdfs-fuse/src/mount.rs`; `crates/pdfs-fuse/src/supervisor.rs`;
+`crates/pdfs-fuse/src/systemd.rs`
+
+**Repro:** Kill the daemon with `SIGABRT` while it is mounted. Each restart fails with `EEXIST`
+until `fusermount3 -uz` clears every mount. Then restart on an account where hydrating the
+metadata cache takes about a minute: the watchdog aborts the new daemon before it pings.
+
+**Cause.** Two faults, one after the other.
+
+1. A dead FUSE mount answers `ENOTCONN`. `create_dir_all` in `mount_once` read that as "absent",
+   tried `mkdir`, and failed with `EEXIST`. The daemon retried that error forever and never
+   reached `check_mountpoint`, which clears a dead mount.
+2. systemd arms the watchdog when the process starts, but the supervisor sent its first ping one
+   full period (60 s) after it started. The supervisor starts only once the mount is live: 74 s
+   in on this account (70 s of that is hydrating 47 958 nodes). 74 s + 60 s is past the 120 s
+   `WatchdogSec`, so the run was aborted just before its first ping.
+
+**Fix.** `mount_once` calls `prepare_mountpoint`, which clears a dead mount before it creates the
+directory. Before startup, the daemon sends `WATCHDOG_USEC=` to allow 10 minutes. When the
+supervisor first gets an answer from the control socket, it sends the unit's own timeout back.
+The supervisor also probes and pings on its first tick, not one period later. A startup that
+hangs for good is still aborted, only later.
+
+What is left: why the daemon stopped answering during the copy. Its swap use points at memory
+growth during a large batch of new files (compare [B91](#b91--the-daemon-hung-overnight-and-nothing-could-say-what-it-was-waiting-on)).
+
+**Test:** `first_watchdog_ping_is_due_at_once` in `crates/pdfs-fuse/src/supervisor.rs`. The
+stale-mount path and the watchdog handshake need a live systemd unit to check.
+
+---
 
 ### B278 — `sync list` and `devices list` show the last sync as epoch seconds
 

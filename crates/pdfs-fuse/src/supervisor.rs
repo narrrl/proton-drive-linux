@@ -57,7 +57,10 @@ pub(crate) fn run(core: Core, control_socket: PathBuf) {
     }
 
     let mut last_rss = Instant::now();
-    let mut last_ping = Instant::now();
+    // `None` until the first probe, which runs on the first tick: startup has
+    // already used up much of the watchdog's time (`docs/BUGS.md` B279).
+    let mut last_ping: Option<Instant> = None;
+    let mut restored = false;
     // Per-lane completion counts from the previous tick, to tell a queue that is
     // being worked through from one that is not moving at all.
     let mut last_completed = (0_u64, 0_u64);
@@ -84,16 +87,22 @@ pub(crate) fn run(core: Core, control_socket: PathBuf) {
         // throw away in-flight uploads. The probe decides that; a stall only
         // gets said out loud.
         if let Some(period) = watchdog
-            && last_ping.elapsed() >= period
+            && ping_due(last_ping, period)
         {
             if probe(&control_socket) {
+                if !restored {
+                    // Startup ran on the longer timeout the daemon asked for.
+                    // The socket answers now, so the unit's own one applies.
+                    systemd::restore_watchdog();
+                    restored = true;
+                }
                 systemd::watchdog_ping();
             } else {
                 warn!(
                     "daemon did not answer its own control socket; withholding the watchdog ping"
                 );
             }
-            last_ping = Instant::now();
+            last_ping = Some(Instant::now());
         }
     }
 }
@@ -165,6 +174,11 @@ fn report_stalls(report: &pdfs_core::control::Diagnostics, last_completed: (u64,
     stalled
 }
 
+/// Whether the watchdog wants its next ping. The first one is due at once.
+fn ping_due(last_ping: Option<Instant>, period: Duration) -> bool {
+    last_ping.is_none_or(|at| at.elapsed() >= period)
+}
+
 /// One round trip over the control socket: connect, ask for the cheapest
 /// request there is, read the answer.
 ///
@@ -203,6 +217,18 @@ mod tests {
             label: "read".into(),
             age_secs,
         }
+    }
+
+    /// The first ping goes out on the first tick, not a full period after the
+    /// supervisor starts: startup has already spent most of the watchdog's time
+    /// (`docs/BUGS.md` B279).
+    #[test]
+    fn first_watchdog_ping_is_due_at_once() {
+        let period = Duration::from_secs(60);
+        assert!(ping_due(None, period));
+        assert!(!ping_due(Some(Instant::now()), period));
+        let long_ago = Instant::now().checked_sub(period).expect("uptime");
+        assert!(ping_due(Some(long_ago), period));
     }
 
     /// A worker doing normal work must not be reported: a WARN every tick is a
