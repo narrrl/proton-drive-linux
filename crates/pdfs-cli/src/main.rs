@@ -2520,7 +2520,10 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
     // An explicit `--mountpoint` wins; otherwise honor the Settings-page choice
     // (config), falling back to the default location.
     let mountpoint = mountpoint.unwrap_or_else(|| dirs.resolved_mountpoint(&config));
-    std::fs::create_dir_all(&mountpoint)
+    // Hydrating a large account and remounting its folders can outlast the
+    // unit's watchdog before the supervisor sends its first ping (B279).
+    pdfs_fuse::stretch_watchdog_for_startup();
+    pdfs_fuse::prepare_mountpoint(&mountpoint)
         .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
 
     let username = auth::load().map(|s| s.username).unwrap_or_default();

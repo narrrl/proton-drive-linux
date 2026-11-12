@@ -119,13 +119,14 @@ mod workers;
 use background::{forget_and_notify, run_event_sync, run_local_index, run_photos_event_sync};
 use link::BATCH_CALL_TIMEOUT;
 pub(crate) use mount::is_stale_mount;
+pub use mount::prepare_mountpoint;
 pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
 use reads::{BlockFlight, BlockRing, PREFETCH_BUDGET, Prefetch, ReaderSlot, STREAM_BYPASS_MIN};
 use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle};
-pub use systemd::{idle_sleep, status as notify_status};
+pub use systemd::{idle_sleep, status as notify_status, stretch_watchdog_for_startup};
 use tracing::{debug, error, info, warn};
 use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
 use r#virtual::{
