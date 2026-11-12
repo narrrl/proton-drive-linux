@@ -11,15 +11,38 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-Schema: **45**. Synced folders now distinguish device backups from My files attachments.
-Existing folders remain device backups; older builds cannot open the upgraded database.
+## [3.8.0] — 2026-11-12
+
+Schema: **45**. Synced folders now tell device backups apart from folders attached to My files.
+Existing folders stay device backups. Older builds cannot open the upgraded database.
 
 ### Added
 
-- `pdfs sync attach PATH --to REMOTE` connects an existing local directory to an existing
-  My files folder. The first sync preserves one-sided files and differing versions (#67).
-  Attachments stay in mirror mode, are excluded from device profiles, and cannot delete
-  the remote root when syncing is stopped.
+- **Sync a local folder with a folder you already have in My files** (#67, #77).
+  `pdfs sync attach ~/Work --to Work` keeps `~/Work` an ordinary local folder and syncs it both
+  ways with My files/Work. The first sync uploads files that are only on this computer, downloads
+  files that are only on Proton Drive, and keeps both versions of a file that differs: the one on
+  Proton Drive keeps its name, and the local one becomes a conflict copy next to it and is
+  uploaded too. Attached folders are always kept on this computer, never online only. They are
+  listed apart from device backups and are not part of the device profile used to restore another
+  computer. Stopping one keeps both copies, and `--delete-remote` is refused for it. If the folder
+  on Proton Drive is trashed or moved out of My files, syncing stops with an error and the local
+  files stay. Attaching a folder is done from a terminal for now.
+
+### Fixed
+
+- **My files comes back after the service was killed for hanging** (B279). A killed service left
+  its folders behind as dead mounts, and every restart then failed with `File exists` and retried
+  forever without opening anything, until the mounts were cleared by hand. The service now clears
+  a dead mount before it opens the folder. On a large account a restart that did open My files was
+  killed again, because loading the account took longer than the 2 minutes the service has to
+  report in. Startup now gets 10 minutes, and the 2 minutes apply again once the service answers.
+
+- **Uploading many large photos no longer runs the computer out of memory** (B280). Every image
+  upload decodes the whole picture to make its thumbnail, and up to 16 did so at once. A batch of
+  100-megapixel photos took about 9 GiB, filled the swap, and the service was killed on every
+  restart. Thumbnails now share 512 MiB between them: phone photos are still made side by side,
+  and a very large photo waits and is made on its own.
 
 ## [3.7.0] — 2026-11-02
 
