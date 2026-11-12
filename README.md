@@ -125,7 +125,7 @@ The documentation is in [`docs/`](docs/README.md) and on the
 | [Getting started](docs/GETTING_STARTED.md) | From installing to your first synced folder |
 | [User guide](docs/USER_GUIDE.md) | Everything the app, tray and launcher do |
 | [FAQ](docs/FAQ.md) | Short answers to common questions |
-| [Command-line reference](docs/CLI.md) | Every `pdfs` command and scripting with `--json` |
+| [Command-line reference](docs/CLI.md) | Every `pdfs` command, Tab completion and scripting with `--json` |
 | [Configuration](docs/CONFIGURATION.md) | `config.json`, file locations, environment variables, the service |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Diagnosing problems and fixing common ones |
 | [Recovering on a new computer](docs/RECOVERY.md) | Getting your synced folders back after a reinstall or a lost machine |

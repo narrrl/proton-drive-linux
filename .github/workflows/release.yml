@@ -160,6 +160,7 @@ jobs:
           cp packaging/proton-drive.service deb/usr/lib/systemd/user/
           cp LICENSE deb/usr/share/licenses/proton-drive-linux/
           po/build.sh deb/usr/share/locale
+          packaging/completions.sh target/release/pdfs deb/usr/share
 
           # Stops the running daemon before removal, so the mount stops mirroring deletes
           install -m755 packaging/deb/prerm deb/DEBIAN/prerm

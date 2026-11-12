@@ -40,6 +40,7 @@ rustPlatform.buildRustPackage {
       ../io.narl.proton-drive-linux.desktop
       ../io.narl.proton-drive-linux-tray.desktop
       ../io.narl.proton-drive-linux.svg
+      ../completions.sh
     ];
   };
 
@@ -106,6 +107,9 @@ rustPlatform.buildRustPackage {
 
     patchShebangs po/build.sh
     po/build.sh $out/share/locale
+
+    patchShebangs packaging/completions.sh
+    packaging/completions.sh $out/bin/pdfs $out/share
 
     # Nix brings new releases, so the app never checks for them itself.
     install -Dm644 /dev/null $out/share/proton-drive-linux/managed-updates

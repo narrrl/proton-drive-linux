@@ -64,6 +64,14 @@ package() {
   install -dm755 "$pkgdir/usr/share"
   cp -r --no-preserve=ownership "$srcdir/locale" "$pkgdir/usr/share/locale"
 
+  # Shell completion for bash, zsh and fish, written by the binary itself.
+  local share="$pkgdir/usr/share"
+  install -d "$share/bash-completion/completions" "$share/zsh/site-functions" \
+    "$share/fish/vendor_completions.d"
+  "$srcdir/pdfs" completions bash > "$share/bash-completion/completions/pdfs"
+  "$srcdir/pdfs" completions zsh > "$share/zsh/site-functions/_pdfs"
+  "$srcdir/pdfs" completions fish > "$share/fish/vendor_completions.d/pdfs.fish"
+
   install -Dm644 "$srcdir/LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
   # pacman brings new releases, so the app never checks for them itself.
