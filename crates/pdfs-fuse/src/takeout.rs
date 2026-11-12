@@ -344,6 +344,9 @@ impl Core {
                 );
                 let metadata = PhotoUploadMetadata {
                     capture_time: photo.capture_time,
+                    last_modification_time: photo
+                        .capture_time
+                        .and_then(pdfs_core::timestamp::modification_time),
                     ..Default::default()
                 };
                 // A thumbnail is made from a file, so a photo that can have one
@@ -365,10 +368,13 @@ impl Core {
                         let thumbnails = self.upload_thumbnails(path, &photo.name);
                         // No sidecar and no date in the name: the photo's own
                         // EXIF, before Drive files it under today.
+                        let capture_time = metadata
+                            .capture_time
+                            .or_else(|| pdfs_core::exiftime::capture_time_of(path));
                         let metadata = PhotoUploadMetadata {
-                            capture_time: metadata
-                                .capture_time
-                                .or_else(|| pdfs_core::exiftime::capture_time_of(path)),
+                            capture_time,
+                            last_modification_time: capture_time
+                                .and_then(pdfs_core::timestamp::modification_time),
                             ..metadata
                         };
                         std::fs::File::open(path)

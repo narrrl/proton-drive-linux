@@ -12,6 +12,7 @@ description = "Core auth/session/config for the Proton Drive Linux client"
 [dependencies]
 proton-sdk.workspace = true
 proton-drive-rs.workspace = true
+chrono.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

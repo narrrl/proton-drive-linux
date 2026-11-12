@@ -939,6 +939,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     });
                     let metadata = proton_drive_rs::PhotoUploadMetadata {
                         capture_time,
+                        last_modification_time: capture_time
+                            .and_then(pdfs_core::timestamp::modification_time),
                         ..Default::default()
                     };
                     let thumbnails = core.upload_thumbnails(Path::new(&source_path), &name);
