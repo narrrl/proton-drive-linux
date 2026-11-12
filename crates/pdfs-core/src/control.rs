@@ -2405,9 +2405,17 @@ impl Request {
 ///
 /// Shared by the CLI and GUI so both speak the wire format identically.
 pub fn send(socket: &Path, req: &Request) -> Result<Response> {
+    send_with_timeout(socket, req, req.read_timeout())
+}
+
+/// [`send`] with a caller-chosen limit on how long the daemon may take to
+/// answer, which also bounds the write. For a caller that must never keep a
+/// person waiting, such as shell completion, where a slow answer is worth less
+/// than none.
+pub fn send_with_timeout(socket: &Path, req: &Request, timeout: Duration) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(req.read_timeout()))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout.min(WRITE_TIMEOUT)))?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     stream.write_all(&line)?;

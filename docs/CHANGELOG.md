@@ -22,6 +22,12 @@ Existing folders remain device backups; older builds cannot open the upgraded da
 
 ### Added
 
+- Shell completion for `pdfs` in bash, zsh and fish, installed by every package, plus elvish
+  and PowerShell through `pdfs completions SHELL`. Besides commands and options it completes
+  paths in My files and the ids and uids the running service knows (synced folders, the queue,
+  computers, trash, albums, shares, invitations, bookmarks, conflicts and versions), each with
+  a description. Share roles are now checked by the CLI (`viewer`, `editor`, `admin`) before
+  the request.
 - `pdfs sync attach PATH --to REMOTE` connects an existing local directory to an existing
   My files folder. The first sync preserves one-sided files and differing versions (#67).
   Attachments stay in mirror mode, are excluded from device profiles, and cannot delete

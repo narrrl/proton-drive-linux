@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueHint};
+use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter};
 use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
@@ -20,6 +21,7 @@ use pdfs_core::control::{
 use pdfs_core::db::Db;
 use pdfs_core::service;
 
+mod complete;
 mod journal;
 
 /// `println!` for this binary, shadowing std's, which panics when stdout is
@@ -165,6 +167,7 @@ enum Command {
     /// Mount Proton Drive at the given (or default) path. Blocks until unmounted.
     Mount {
         /// Mountpoint; defaults to ~/ProtonDrive.
+        #[arg(value_hint = ValueHint::DirPath)]
         mountpoint: Option<PathBuf>,
     },
     /// Run the auto-mount daemon: wait for login, mount, and keep it mounted
@@ -172,6 +175,7 @@ enum Command {
     /// don't invoke it by hand.
     Daemon {
         /// Mountpoint; defaults to ~/ProtonDrive.
+        #[arg(value_hint = ValueHint::DirPath)]
         mountpoint: Option<PathBuf>,
     },
     /// Keep a file or folder on this device (download + cache it). A folder's
@@ -179,11 +183,13 @@ enum Command {
     /// Needs a running mount.
     Pin {
         /// File or folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
     },
     /// Stop keeping a file or folder on this device, evicting its cached content.
     Unpin {
         /// File or folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
     },
     /// List files and folders pinned to this device.
@@ -191,6 +197,7 @@ enum Command {
     /// List a directory via the running daemon (in-app browser backend).
     Ls {
         /// Directory path, inside the mountpoint or relative to it. Root if omitted.
+        #[arg(add = ArgValueCompleter::new(complete::drive_dir))]
         path: Option<PathBuf>,
     },
     /// List the photos timeline (newest first) via the running daemon.
@@ -224,7 +231,7 @@ enum Command {
     /// so an interrupted import can simply be run again.
     ImportGooglePhotos {
         /// The export's `.zip` files (e.g. `takeout-*.zip`).
-        #[arg(required = true)]
+        #[arg(required = true, value_hint = ValueHint::FilePath)]
         archives: Vec<PathBuf>,
         /// Report what would be imported without uploading anything.
         #[arg(long)]
@@ -277,6 +284,7 @@ enum Command {
     /// List the photos in one album (newest capture first).
     Album {
         /// Album node uid in `volume~link` form (from `pdfs albums`).
+        #[arg(add = ArgValueCandidates::new(complete::album_uid))]
         uid: String,
         /// Max photos to list.
         #[arg(long, default_value_t = 50)]
@@ -293,6 +301,7 @@ enum Command {
     /// Rename a photo album.
     RenameAlbum {
         /// Album node uid in `volume~link` form (from `pdfs albums`).
+        #[arg(add = ArgValueCandidates::new(complete::album_uid))]
         uid: String,
         /// New name.
         name: String,
@@ -300,6 +309,7 @@ enum Command {
     /// Delete a photo album. Its photos stay in the timeline.
     DeleteAlbum {
         /// Album node uid in `volume~link` form (from `pdfs albums`).
+        #[arg(add = ArgValueCandidates::new(complete::album_uid))]
         uid: String,
         /// Also delete photos that exist only in this album (saved from a
         /// shared album); without it the server refuses to delete such an album.
@@ -309,6 +319,7 @@ enum Command {
     /// Add photos to an album.
     AddToAlbum {
         /// Album node uid in `volume~link` form (from `pdfs albums`).
+        #[arg(add = ArgValueCandidates::new(complete::album_uid))]
         uid: String,
         /// Photo node uids (from `pdfs photos`).
         #[arg(required = true)]
@@ -317,6 +328,7 @@ enum Command {
     /// Take photos out of an album. They stay in the timeline.
     RemoveFromAlbum {
         /// Album node uid in `volume~link` form (from `pdfs albums`).
+        #[arg(add = ArgValueCandidates::new(complete::album_uid))]
         uid: String,
         /// Photo node uids (from `pdfs album <uid>`).
         #[arg(required = true)]
@@ -335,13 +347,14 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
         /// Only search below this folder (under the mountpoint).
-        #[arg(long = "in", value_name = "FOLDER")]
+        #[arg(long = "in", value_name = "FOLDER", add = ArgValueCompleter::new(complete::drive_dir))]
         scope: Option<PathBuf>,
     },
     /// Rename a file or folder via the running daemon.
     Rename {
         /// File/folder path, inside My files or an on-demand synced folder, or
         /// relative to the mountpoint.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// New name (a single path component).
         new_name: String,
@@ -355,7 +368,7 @@ enum Command {
     Move {
         /// Files/folders to move, then the destination folder: each inside a
         /// location, or relative to the mountpoint.
-        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        #[arg(required = true, num_args = 2.., value_name = "PATH", add = ArgValueCompleter::new(complete::drive_path))]
         paths: Vec<PathBuf>,
     },
     /// Copy files or folders into another folder in My files via the running
@@ -367,7 +380,7 @@ enum Command {
     Copy {
         /// Files/folders to copy, then the destination folder: inside My files,
         /// or relative to the mountpoint.
-        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        #[arg(required = true, num_args = 2.., value_name = "PATH", add = ArgValueCompleter::new(complete::drive_path))]
         paths: Vec<PathBuf>,
     },
     /// Show how much a folder holds on Proton Drive.
@@ -376,18 +389,21 @@ enum Command {
     /// encrypted bytes on storage and includes items in the trash.
     Du {
         /// Folder path, inside My files or relative to the mountpoint.
+        #[arg(add = ArgValueCompleter::new(complete::drive_dir))]
         path: PathBuf,
     },
     /// Trash a file or folder via the running daemon.
     Rm {
         /// File/folder path, inside My files or an on-demand synced folder, or
         /// relative to the mountpoint.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
     },
     /// Create a folder via the running daemon.
     Mkdir {
         /// Parent folder path, inside My files or an on-demand synced folder,
         /// or relative to the mountpoint.
+        #[arg(add = ArgValueCompleter::new(complete::drive_dir))]
         parent: PathBuf,
         /// New folder name (a single path component).
         name: String,
@@ -397,10 +413,10 @@ enum Command {
     /// background; watch progress with `pdfs transfers`.
     Upload {
         /// Local files and/or folders to upload.
-        #[arg(required = true)]
+        #[arg(required = true, value_hint = ValueHint::AnyPath)]
         sources: Vec<PathBuf>,
         /// Destination folder, inside the mountpoint or relative to it.
-        #[arg(short = 't', long = "to", default_value = ".")]
+        #[arg(short = 't', long = "to", default_value = ".", add = ArgValueCompleter::new(complete::drive_dir))]
         parent: PathBuf,
     },
     /// Show the daemon's in-flight transfers (active uploads/downloads).
@@ -415,13 +431,13 @@ enum Command {
     /// Restore trashed items, by uid, to the folders they were trashed from.
     Restore {
         /// Node uids (`volume~link`), as printed by `pdfs trash`.
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCandidates::new(complete::trash_uid))]
         uids: Vec<String>,
     },
     /// Permanently delete trashed items by uid. This cannot be undone.
     DeleteForever {
         /// Node uids (`volume~link`), as printed by `pdfs trash`.
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCandidates::new(complete::trash_uid))]
         uids: Vec<String>,
     },
     /// Permanently delete everything in the trash. This cannot be undone.
@@ -433,6 +449,7 @@ enum Command {
     Refresh {
         /// What to refresh: a folder path (inside the mountpoint or relative to
         /// it), `trash`, or `photos`. The mount root if omitted.
+        #[arg(add = ArgValueCompleter::new(complete::refresh_target))]
         target: Option<String>,
         /// With `photos`: read every photo's metadata again instead of only what
         /// changed. Minutes on a large library; for a gallery that disagrees with
@@ -459,12 +476,13 @@ enum Command {
     /// Share a file or folder with Proton and/or external email addresses.
     Share {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// One or more invitee emails (Proton or external, auto-detected).
         #[arg(required = true)]
         emails: Vec<String>,
         /// Role to grant: viewer, editor or admin.
-        #[arg(long, default_value = "viewer")]
+        #[arg(long, default_value = "viewer", value_parser = ["viewer", "editor", "admin"], ignore_case = true)]
         role: String,
         /// Optional message included in the invitation email.
         #[arg(long)]
@@ -473,17 +491,21 @@ enum Command {
     /// List a node's members, pending invitations and public link.
     Members {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
     },
     /// Change the role of a member or pending invitation on a node's share.
     ShareRole {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Entry id (membership or invitation id), from `pdfs members`.
+        #[arg(add = ArgValueCompleter::new(complete::share_entry_id))]
         id: String,
         /// Entry kind: member, proton or external.
         kind: ShareKindArg,
         /// New role: viewer, editor or admin.
+        #[arg(value_parser = ["viewer", "editor", "admin"], ignore_case = true)]
         role: String,
     },
     /// Stop sharing a node, or remove one member or pending invitation.
@@ -492,9 +514,10 @@ enum Command {
     /// member. With an id and kind (from `pdfs members`), removes that entry.
     Unshare {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Entry id (membership or invitation id), from `pdfs members`.
-        #[arg(requires = "kind")]
+        #[arg(requires = "kind", add = ArgValueCompleter::new(complete::share_entry_id))]
         id: Option<String>,
         /// Entry kind: member, proton or external.
         kind: Option<ShareKindArg>,
@@ -515,18 +538,22 @@ enum Command {
     SharedWithMe {
         /// Folder uid to list into, in `volume~link` form (from a previous run).
         /// Omit for the top level.
+        #[arg(add = ArgValueCandidates::new(complete::shared_uid))]
         uid: Option<String>,
     },
     /// Download a file shared with me by its uid (from `pdfs shared-with-me`).
     SharedGet {
         /// Node uid in `volume~link` form.
+        #[arg(add = ArgValueCandidates::new(complete::shared_uid))]
         uid: String,
         /// Where to write it. Omit to leave it in the cache and print the path.
+        #[arg(value_hint = ValueHint::AnyPath)]
         dest: Option<PathBuf>,
     },
     /// Leave a shared node by its uid (from `pdfs shared-with-me`).
     Leave {
         /// Node uid in `volume~link` form.
+        #[arg(add = ArgValueCandidates::new(complete::shared_uid))]
         uid: String,
     },
     /// Manage invitations addressed to me.
@@ -557,6 +584,17 @@ enum Command {
     /// Runs without a daemon on purpose: the state worth diagnosing is usually
     /// the state where the daemon will not start.
     Diagnose,
+    /// Print the shell completion script for bash, zsh, fish, elvish or
+    /// PowerShell.
+    ///
+    /// Besides commands and options, it completes values from the running
+    /// service: paths in My files, synced-folder and queue ids, computers,
+    /// trash, albums, shares and versions. Load it with, for example,
+    /// `pdfs completions fish | source` or `source <(pdfs completions bash)`.
+    Completions {
+        /// The shell to write the script for.
+        shell: complete::ShellArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -604,6 +642,7 @@ enum VersionCmd {
     /// List a file's versions, newest first.
     List {
         /// File path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
     },
     /// Make an earlier version the file's current content.
@@ -612,25 +651,32 @@ enum VersionCmd {
     /// moment to show up in the mount.
     Restore {
         /// File path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Version id, from `pdfs versions list`.
+        #[arg(add = ArgValueCompleter::new(complete::version_id))]
         id: String,
     },
     /// Write an earlier version to a local file, leaving the file untouched.
     Save {
         /// File path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Version id, from `pdfs versions list`.
+        #[arg(add = ArgValueCompleter::new(complete::version_id))]
         id: String,
         /// Where to write it. Must not already exist.
+        #[arg(value_hint = ValueHint::AnyPath)]
         dest: PathBuf,
     },
     /// Permanently delete an earlier version. The content is unrecoverable, and
     /// the version that is currently active cannot be deleted.
     Rm {
         /// File path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Version id, from `pdfs versions list`.
+        #[arg(add = ArgValueCompleter::new(complete::version_id))]
         id: String,
     },
 }
@@ -640,13 +686,21 @@ enum DeviceCmd {
     /// List registered devices.
     List,
     /// Rename a device by uid.
-    Rename { uid: String, name: String },
+    Rename {
+        #[arg(add = ArgValueCandidates::new(complete::device_uid))]
+        uid: String,
+        name: String,
+    },
     /// Delete (deregister) a device by uid.
-    Rm { uid: String },
+    Rm {
+        #[arg(add = ArgValueCandidates::new(complete::device_uid))]
+        uid: String,
+    },
     /// Adopt an existing device as this machine's, so a hostname change or a
     /// reinstall re-attaches to it instead of registering a duplicate.
     Adopt {
         /// Device uid (from `devices list`). Omit with `--clear`.
+        #[arg(add = ArgValueCandidates::new(complete::device_uid))]
         uid: Option<String>,
         /// Drop the adoption and go back to matching by hostname.
         #[arg(long, conflicts_with = "uid")]
@@ -657,6 +711,7 @@ enum DeviceCmd {
     /// here. Both computers keep them in step.
     Join {
         /// Device uid (from `devices list`).
+        #[arg(add = ArgValueCandidates::new(complete::device_uid))]
         uid: String,
         /// Skip the confirmation and accept every proposed local path.
         #[arg(long)]
@@ -666,6 +721,7 @@ enum DeviceCmd {
     /// them here. The other computer stays registered, without those folders.
     Migrate {
         /// Device uid (from `devices list`).
+        #[arg(add = ArgValueCandidates::new(complete::device_uid))]
         uid: String,
         /// Skip the confirmation and accept every proposed local path.
         #[arg(long)]
@@ -678,6 +734,7 @@ enum ConflictCmd {
     /// Decide which side of a conflict to keep. Whatever is removed goes to Trash.
     Resolve {
         /// The conflict copy, absolute or relative to the mountpoint.
+        #[arg(add = ArgValueCandidates::new(complete::conflict_path))]
         path: PathBuf,
         /// `original` trashes the copy; `copy` trashes the original and gives the
         /// copy its name; `both` renames the copy to `--name`.
@@ -694,15 +751,17 @@ enum SyncCmd {
     /// Add a local folder to this machine's device and upload its contents.
     Add {
         /// Local directory to sync.
+        #[arg(value_hint = ValueHint::DirPath)]
         path: PathBuf,
     },
     /// Sync a real local folder with an existing folder in My files.
     /// The first pass preserves local-only files and keeps differing versions.
     Attach {
         /// Existing local directory; it remains a real local directory.
+        #[arg(value_hint = ValueHint::DirPath)]
         path: PathBuf,
         /// Existing folder in My files, relative to the cloud mount or inside it.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(complete::drive_dir))]
         to: PathBuf,
     },
     /// List this machine's synced folders.
@@ -710,6 +769,7 @@ enum SyncCmd {
     /// Remove a synced folder by id.
     Rm {
         /// Synced-folder id (from `sync list`).
+        #[arg(add = ArgValueCandidates::new(complete::sync_folder_id))]
         id: i64,
         /// Also delete the folder's copy in Proton Drive.
         #[arg(long)]
@@ -718,6 +778,7 @@ enum SyncCmd {
     /// Force a sync pass now (all folders, or one by id).
     Now {
         /// Optional synced-folder id; omit to reconcile every folder.
+        #[arg(add = ArgValueCandidates::new(complete::sync_folder_id))]
         id: Option<i64>,
     },
     /// Forget what a synced folder synced before and compare it with Proton
@@ -725,6 +786,7 @@ enum SyncCmd {
     /// that differs keeps both versions. Nothing is deleted.
     Reset {
         /// Synced-folder id (from `sync list`).
+        #[arg(add = ArgValueCandidates::new(complete::sync_folder_id))]
         id: i64,
     },
     /// Pause syncing: queued uploads and mirror folders wait, reads keep working.
@@ -734,13 +796,13 @@ enum SyncCmd {
         #[arg(long = "for", value_parser = parse_pause_duration, conflicts_with = "folder")]
         duration: Option<u64>,
         /// Pause only this mirror folder (id from `sync list`) until resumed.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::sync_folder_id))]
         folder: Option<i64>,
     },
     /// Resume syncing after `pdfs sync pause`.
     Resume {
         /// Resume only this folder, paused with `sync pause --folder`.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::sync_folder_id))]
         folder: Option<i64>,
     },
     /// Cap upload and download speed, or show the caps with no options.
@@ -759,8 +821,10 @@ enum SyncCmd {
     /// Save the content of a queued upload (by id from `sync queue`) to a file.
     Export {
         /// Queue id.
+        #[arg(add = ArgValueCandidates::new(complete::queue_id))]
         id: i64,
         /// Where to save it: a new file, or an existing folder to save it in.
+        #[arg(value_hint = ValueHint::AnyPath)]
         dest: PathBuf,
     },
     /// Drop a queued change (by id from `sync queue`) and undo it here: a new file
@@ -768,6 +832,7 @@ enum SyncCmd {
     /// content is lost unless saved with `sync export` first.
     Discard {
         /// Queue id.
+        #[arg(add = ArgValueCandidates::new(complete::queue_id))]
         id: i64,
         /// Do not ask first.
         #[arg(long)]
@@ -776,11 +841,13 @@ enum SyncCmd {
     /// Retry a queued operation now (by id from `sync queue`), or every failed one.
     Retry {
         /// Queue id; omit to retry every failed operation.
+        #[arg(add = ArgValueCandidates::new(complete::queue_id))]
         id: Option<i64>,
     },
     /// Switch a folder between full-copy sync and on-demand (FUSE, no local storage).
     Mode {
         /// Synced-folder id (from `sync list`).
+        #[arg(add = ArgValueCandidates::new(complete::sync_folder_id))]
         id: i64,
         /// `mirror` (full local copy) or `ondemand` (FUSE mount, reclaims disk).
         #[arg(value_parser = ["mirror", "ondemand"])]
@@ -794,7 +861,7 @@ enum SyncCmd {
         yes: bool,
         /// Restore another computer's folders instead, by device uid (from
         /// `pdfs devices list`).
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(complete::device_uid))]
         device: Option<String>,
     },
 }
@@ -804,9 +871,10 @@ enum PublicLinkCmd {
     /// Create a public link on a node.
     Create {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Role: viewer or editor.
-        #[arg(long, default_value = "viewer")]
+        #[arg(long, default_value = "viewer", value_parser = ["viewer", "editor"], ignore_case = true)]
         role: String,
         /// Optional custom password protecting the link.
         #[arg(long)]
@@ -819,11 +887,13 @@ enum PublicLinkCmd {
     /// given is kept.
     Update {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Public-link id, from `pdfs members`.
+        #[arg(add = ArgValueCompleter::new(complete::public_link_id))]
         id: String,
         /// New role: viewer or editor.
-        #[arg(long)]
+        #[arg(long, value_parser = ["viewer", "editor"], ignore_case = true)]
         role: Option<String>,
         /// New custom password protecting the link.
         #[arg(long, conflicts_with = "no_password")]
@@ -841,8 +911,10 @@ enum PublicLinkCmd {
     /// Remove a node's public link.
     Remove {
         /// File/folder path, inside the mountpoint or relative to it.
+        #[arg(add = ArgValueCompleter::new(complete::drive_path))]
         path: PathBuf,
         /// Public-link id, from `pdfs members`.
+        #[arg(add = ArgValueCompleter::new(complete::public_link_id))]
         id: String,
     },
 }
@@ -852,9 +924,15 @@ enum InvitationCmd {
     /// List invitations addressed to me.
     List,
     /// Accept an invitation by id.
-    Accept { id: String },
+    Accept {
+        #[arg(add = ArgValueCandidates::new(complete::invitation_id))]
+        id: String,
+    },
     /// Reject an invitation by id.
-    Reject { id: String },
+    Reject {
+        #[arg(add = ArgValueCandidates::new(complete::invitation_id))]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -870,7 +948,10 @@ enum BookmarkCmd {
         password: Option<String>,
     },
     /// Remove a saved bookmark by its token.
-    Rm { token: String },
+    Rm {
+        #[arg(add = ArgValueCandidates::new(complete::bookmark_token))]
+        token: String,
+    },
 }
 
 /// Render a daemon failure for a terminal.
@@ -890,6 +971,9 @@ fn cli_error(kind: ErrorKind, message: &str) -> String {
 }
 
 fn main() -> Result<()> {
+    // First: a completion request answers on stdout and exits, so nothing may
+    // write there before it.
+    complete::handle_request();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         // `pgp` logs a benign WARN when it re-serializes a Proton secret-key
         // packet with a longer (but equivalent) length encoding than the
@@ -1030,6 +1114,7 @@ fn main() -> Result<()> {
         Command::Activity { limit } => cmd_activity(limit),
         Command::Quota => cmd_quota(),
         Command::Cache { action } => cmd_cache(action),
+        Command::Completions { shell } => cmd_completions(shell),
         Command::Diagnose => cmd_diagnose(),
     }
 }
@@ -3804,6 +3889,15 @@ fn writable_probe(dir: &Path) -> std::io::Result<()> {
     drop(file);
     let remove = std::fs::remove_file(path);
     result.and(remove)
+}
+
+/// Print the completion script for `shell`. Touches no account state, so
+/// packaging can run it at build time.
+fn cmd_completions(shell: complete::ShellArg) -> Result<()> {
+    let mut script = Vec::new();
+    complete::write_script(shell, &mut script)?;
+    print!("{}", String::from_utf8_lossy(&script));
+    Ok(())
 }
 
 /// Self-check the installation, reporting each finding and exiting non-zero if

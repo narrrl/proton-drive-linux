@@ -8,6 +8,7 @@ talks to the running service (`proton-drive.service`); `login`, `logout`, `mount
 what the commands do in the app, see the [user guide](USER_GUIDE.md).
 
 - [Conventions](#conventions)
+- [Shell completion](#shell-completion)
 - [Account and service](#account-and-service)
 - [Files](#files)
 - [Available offline](#available-offline)
@@ -31,6 +32,36 @@ what the commands do in the app, see the [user guide](USER_GUIDE.md).
 - **Exit codes**: `0` on success, non-zero on any failure, including an error reported by the
   service.
 - **Output** is English and stable enough for `grep`; use `--json` where it is available.
+
+## Shell completion
+
+Tab completes commands and options, and also the values the service knows. Paths complete
+from My files, and these complete with a description: synced-folder and queue ids, computers,
+trash items, albums, items shared with you, invitations, bookmarks, conflict copies, and a file's
+versions or a share's members and link once the path is typed. Values come from the running
+service. Without it, only commands, options and local paths complete.
+
+| Example | Completes |
+|---|---|
+| `pdfs pin Doc<Tab>` | `Documents/`; Tab again lists its contents |
+| `pdfs sync rm <Tab>` | `1  /home/me/Documents (mirror)` … |
+| `pdfs devices rm <Tab>` | computer uids, with their names |
+| `pdfs versions restore Documents/a.pdf <Tab>` | version ids, with date and size |
+
+The packages install completion for bash, zsh and fish, which these shells load by themselves. For
+a source build, or another shell, load the script that `pdfs completions <shell>` prints:
+
+| Shell | Add to |
+|---|---|
+| bash | `~/.bashrc`: `source <(pdfs completions bash)` |
+| zsh | `~/.zshrc`, after `compinit`: `source <(pdfs completions zsh)` |
+| fish | `~/.config/fish/config.fish`: `pdfs completions fish \| source` |
+| elvish | `~/.config/elvish/rc.elv`: `eval (pdfs completions elvish \| slurp)` |
+| PowerShell | `$PROFILE`: `pdfs completions powershell \| Out-String \| Invoke-Expression` |
+
+The script runs `pdfs` from `PATH` on every Tab, so it keeps working after an update. A
+`pdfs` that is not on `PATH` prints a script for its own location with
+`PDFS_COMPLETE=<shell> ./pdfs`.
 
 ## Account and service
 
@@ -185,6 +216,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs cache inspect [--deep]` | Database size, reclaimable space, row counts, cache use against the limit. `--deep` also runs SQLite's integrity check (slow). |
 | `pdfs cache vacuum` | Compact the database. Needs free space for a second copy of it while it runs. |
 | `pdfs cache clear` | Delete cached file content. Files kept available offline stay. |
+| `pdfs completions SHELL` | Print the [shell completion](#shell-completion) script for bash, zsh, fish, elvish or powershell. |
 
 [Troubleshooting](TROUBLESHOOTING.md) explains when to use each of these.
 
