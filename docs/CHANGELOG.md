@@ -29,6 +29,16 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   on Proton Drive is trashed or moved out of My files, syncing stops with an error and the local
   files stay. Attaching a folder is done from a terminal for now.
 
+- **Tab completion for `pdfs`** in bash, zsh and fish, installed by every package. Besides
+  commands and options it completes paths in My files (`pdfs pin Doc<Tab>`) and what the running
+  service knows, each with a description: synced folders, queued changes, computers, trash, albums,
+  items shared with you, invitations, bookmarks and conflict copies, and once a path is typed, the
+  file's versions or the share's members and link. Without the service it still completes commands
+  and options. Elvish and PowerShell load it from `pdfs completions SHELL`, and so does a source
+  build; the [command-line reference](CLI.md#shell-completion) has the line for each shell.
+  `pdfs share` and `pdfs share-role` now check the role (`viewer`, `editor` or `admin`) before
+  sending the request, and `pdfs public-link` does the same for `viewer` and `editor`.
+
 ### Fixed
 
 - **My files comes back after the service was killed for hanging** (B279). A killed service left
