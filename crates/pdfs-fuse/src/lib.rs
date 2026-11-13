@@ -4270,7 +4270,12 @@ impl Core {
     /// recursive pin and downloads every descendant file on a background thread,
     /// reported as a job: a big folder far outlasts the socket read timeout.
     /// Returns a human message.
-    fn pin(&self, rel: &Path) -> CoreResult<String> {
+    ///
+    /// `recorded` is the path the pin registry keeps for the front ends to
+    /// open the pin by: `rel` itself on the primary mount, which they join to
+    /// the mountpoint, and the absolute local path on an on-demand folder's
+    /// mount, whose node is not reachable under the primary mountpoint at all.
+    fn pin(&self, rel: &Path, recorded: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder, mtime, size) = {
             let st = self.state();
@@ -4294,7 +4299,7 @@ impl Core {
             // Record the recursive pin first so every descendant is eviction-
             // exempt before we start filling the cache with the subtree.
             self.cache
-                .add_pin(&uid, rel, true)
+                .add_pin(&uid, recorded, true)
                 .map_err(|e| CoreError::from_api(&e, "pin"))?;
             let core = self.clone();
             let folder = name.clone();
@@ -4306,7 +4311,7 @@ impl Core {
         }
         self.fetch_content(&uid, &name, mtime, size)?;
         self.cache
-            .add_pin(&uid, rel, false)
+            .add_pin(&uid, recorded, false)
             .map_err(|e| CoreError::from_api(&e, "pin"))?;
         Ok(name)
     }

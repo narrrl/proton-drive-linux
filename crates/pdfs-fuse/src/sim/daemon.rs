@@ -3447,6 +3447,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn pinning_a_file_in_an_on_demand_folder_keeps_that_folders_copy() {
+        // Keeping a file offline took only paths under the primary mount, so
+        // the copy in an on-demand synced folder could not be kept, and a
+        // program reading it there downloaded it every time (B281).
+        let drive = FakeDrive::new();
+        let dir = scratch("pin-in-ondemand");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let ondemand = dir.join("ondemand");
+        sync_folder(&daemon, &ondemand, "ondemand");
+
+        let content = b"not a real png, but kept all the same".repeat(64);
+        let file = ondemand.join("photo.png");
+        std::fs::write(&file, &content).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        daemon.request(&Request::PurgeCache).unwrap();
+
+        let path = file.canonicalize().unwrap().to_string_lossy().into_owned();
+        let pinned = daemon
+            .request(&Request::Pin { path: path.clone() })
+            .unwrap();
+        assert!(matches!(pinned, Response::Ok { .. }), "{pinned:?}");
+        let pins = || match daemon.request(&Request::ListPins) {
+            Ok(Response::Pins { pins }) => pins,
+            other => panic!("pins: {other:?}"),
+        };
+        let listed = pins();
+        assert!(
+            listed.iter().any(|pin| pin.path == path && pin.cached),
+            "the pin opens by the path it was made through: {listed:?}"
+        );
+
+        // With the link gone, only a kept copy can answer the read.
+        daemon.client.set_online(false);
+        assert_eq!(std::fs::read(&file).unwrap(), content);
+        daemon.client.set_online(true);
+
+        let unpinned = daemon
+            .request(&Request::Unpin { path: path.clone() })
+            .unwrap();
+        assert!(matches!(unpinned, Response::Ok { .. }), "{unpinned:?}");
+        assert!(pins().is_empty());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The synced folder `id` as the daemon lists it.
     fn listed_folder(daemon: &Daemon, id: i64) -> Option<control::SyncFolderInfo> {
         match daemon.request(&Request::ListSyncFolders) {

@@ -102,7 +102,7 @@ commands are for scripts and for cases where the mount is not available.
 
 | Command | Description |
 |---|---|
-| `pdfs pin PATH` | Download a file completely and keep it on this computer. For a folder, its files download in the background (`pdfs transfers` shows the progress). |
+| `pdfs pin PATH` | Download a file completely and keep it on this computer. For a folder, its files download in the background (`pdfs transfers` shows the progress). PATH can be under the Proton Drive mount or in an on-demand synced folder. A file in a mirror folder is already on this computer. |
 | `pdfs unpin PATH` | Release it back to online only. A file inside a folder kept offline cannot be released on its own. |
 | `pdfs pins` | List files and folders kept available offline. |
 

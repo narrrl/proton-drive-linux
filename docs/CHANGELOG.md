@@ -54,6 +54,11 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   restart. Thumbnails now share 512 MiB between them: phone photos are still made side by side,
   and a very large photo waits and is made on its own.
 
+- **Keep a file offline in an on-demand synced folder** (B281). `pdfs pin` and `pdfs unpin` now
+  accept a path in a synced folder such as `~/Pictures`. Before, they only took paths under the
+  Proton Drive mount, so the copy in the synced folder was downloaded again by every program that
+  read it.
+
 ## [3.7.0] — 2026-11-02
 
 Schema: **44**, unchanged.

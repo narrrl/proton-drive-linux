@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B281](#b281--a-file-in-a-synced-folder-cannot-be-kept-offline) | A file in a synced folder cannot be kept offline |
 | [B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed) | Uploading a batch of large photos swaps the machine until the daemon is killed |
 | [B279](#b279--after-a-watchdog-kill-the-mount-never-comes-back) | After a watchdog kill the mount never comes back |
 | [B278](#b278--sync-list-and-devices-list-show-the-last-sync-as-epoch-seconds) | `sync list` and `devices list` show the last sync as epoch seconds |
@@ -382,6 +383,39 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B281 — A file in a synced folder cannot be kept offline
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-13. An image was made available offline in the app, and it opened from the app
+with no download. `feh` opened it from a terminal and downloaded it each time. The two were not
+the same file. The app had kept `~/ProtonDrive/Pictures/photo.png`, in My files. The
+terminal opened `~/Pictures/photo.png`, in the on-demand synced folder `~/Pictures`. That
+copy is a separate node under Computers, uploaded on its own, with the same name and size but a
+different mtime. The daemon treats every program the same way: it does not look at the process
+that reads.
+**Where:** the `Pin` and `Unpin` handlers in `crates/pdfs-fuse/src/control.rs`
+
+**Repro:** Add a synced folder in on-demand mode and put a file in it. `pdfs pin` on its absolute
+path fails with "is not under the mountpoint". A relative path is resolved against My files, so
+it keeps a file of the same name there, if one exists, or fails. Reading the file in the synced
+folder then downloads it.
+
+**Cause:** Both handlers turned the path into a mount-relative one with `rel_to_mount`, which only
+knows the primary mount. B86 moved `ls`, `refresh`, `rm` and `mv` to `route_to_mount`, which finds
+the mount that serves an absolute path. Pin and unpin were left out.
+
+**Fix:** Pin and unpin route through `route_to_mount` and run on the mount that owns the path. A
+path in a mirror folder gets an error that says its files are already on this computer. The pin
+registry records the absolute local path for a pin made through an on-demand folder, so
+`pdfs pins`, the prompt and the HUD open the file through the folder it was kept from. Pins
+under the primary mount still record the path relative to it.
+
+**Test:** `pinning_a_file_in_an_on_demand_folder_keeps_that_folders_copy` in
+`crates/pdfs-fuse/src/sim/daemon.rs`. It pins a file through an on-demand folder's absolute path,
+takes the link down, and reads the file through that folder.
+
+---
 
 ### B280 — Uploading a batch of large photos swaps the machine until the daemon is killed
 
