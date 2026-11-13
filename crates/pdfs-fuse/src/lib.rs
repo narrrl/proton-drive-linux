@@ -91,6 +91,7 @@ mod drive;
 use drive::{DriveApi, RevisionRead};
 mod events;
 mod filesystem;
+mod keeper;
 mod link;
 pub use filesystem::ProtonFs;
 mod mount;
@@ -589,6 +590,8 @@ struct Core {
     /// Nudges the drain workers: set true and notify to have them re-examine
     /// the queue instead of waiting out their backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
+    /// The pins the keeper owes a check (`keeper`).
+    pin_work: Arc<Mutex<keeper::PinWork>>,
     /// The daemon's stop signal, shared with every background loop this `Core`
     /// was cloned into so teardown can end and join them (`docs/BUGS.md` B44).
     shutdown: Arc<shutdown::Shutdown>,
@@ -4309,6 +4312,12 @@ impl Core {
                 .map_err(|e| CoreError::internal(format!("spawn pin: {e}")))?;
             return Ok(format!("{name}: downloading its files in the background"));
         }
+        // Stored under a provisional size, the copy would never match the
+        // plaintext it holds (`docs/BUGS.md` B282).
+        let size = match self.kept_file(ino) {
+            Some(file) if file.uid == uid => file.size,
+            _ => size,
+        };
         self.fetch_content(&uid, &name, mtime, size)?;
         self.cache
             .add_pin(&uid, recorded, false)
@@ -4329,14 +4338,20 @@ impl Core {
             Ok(files) => {
                 job.set_total(files.len() as u64);
                 let mut failed = 0usize;
-                for (uid, file, mtime, size) in files {
+                for ino in files {
                     if self.shutdown.is_stopping() || !self.cache.is_pinned(folder) {
                         return;
                     }
-                    job.detail(file.clone());
-                    if let Err(e) = self.fetch_pinned(&uid, &file, mtime, size) {
-                        warn!(%uid, error = %e, "pin folder: download failed");
-                        failed += 1;
+                    // A file with a queued write, or no readable size, is
+                    // left to the drain and the keeper (`keeper::kept_file`).
+                    if let Some(file) = self.kept_file(ino) {
+                        job.detail(file.name.clone());
+                        if let Err(e) =
+                            self.fetch_pinned(&file.uid, &file.name, file.mtime, file.size)
+                        {
+                            warn!(uid = %file.uid, error = %e, "pin folder: download failed");
+                            failed += 1;
+                        }
                     }
                     job.step();
                 }
@@ -4370,9 +4385,9 @@ impl Core {
         Ok(())
     }
 
-    /// Every file in the subtree rooted at folder `ino`.
-    fn pin_subtree_files(&self, ino: u64) -> CoreResult<Vec<(NodeUid, String, i64, u64)>> {
-        let mut files: Vec<(NodeUid, String, i64, u64)> = Vec::new();
+    /// The inode of every file in the subtree rooted at folder `ino`.
+    fn pin_subtree_files(&self, ino: u64) -> CoreResult<Vec<u64>> {
+        let mut files: Vec<u64> = Vec::new();
         let mut stack = vec![ino];
         while let Some(dir) = stack.pop() {
             if self.shutdown.is_stopping() {
@@ -4387,12 +4402,7 @@ impl Core {
                         if e.node.is_folder() {
                             stack.push(k);
                         } else {
-                            files.push((
-                                e.uid.clone(),
-                                e.node.name.clone(),
-                                e.node.modification_time,
-                                node_size(&e.node),
-                            ));
+                            files.push(k);
                         }
                     }
                 }

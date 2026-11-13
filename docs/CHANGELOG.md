@@ -59,6 +59,13 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   Proton Drive mount, so the copy in the synced folder was downloaded again by every program that
   read it.
 
+- **Files kept offline stay on this computer when they change elsewhere** (B282). A change from
+  another device, even a rename, deleted the copy of a file kept offline, and nothing downloaded
+  it again, so the next read downloaded it or failed without a network. Files added to a folder
+  kept offline from another device were never downloaded. The copy now stays until the new
+  version is downloaded, which happens on its own. Files kept offline are also checked at
+  startup and when the connection returns, and failed downloads are tried again.
+
 ## [3.7.0] — 2026-11-02
 
 Schema: **44**, unchanged.

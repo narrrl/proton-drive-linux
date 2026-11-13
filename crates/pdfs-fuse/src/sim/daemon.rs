@@ -3497,6 +3497,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_kept_offline_stays_on_disk_through_changes_made_elsewhere() {
+        // A change from another device deleted a pinned file's copy and
+        // nothing downloaded it again, and a file added to a pinned folder
+        // elsewhere was never downloaded: both were listed as kept offline
+        // and read only with a network (B282).
+        let drive = FakeDrive::new();
+        let dir = scratch("pin-keeper");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir(daemon.mountpoint.join("Docs")).unwrap();
+        std::fs::write(daemon.mountpoint.join("Docs/a.txt"), b"first").unwrap();
+        std::fs::write(daemon.mountpoint.join("solo.txt"), b"alone").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("Docs/a.txt").is_some()
+                && drive.lookup("solo.txt").is_some()
+        }));
+        daemon.request(&Request::PurgeCache).unwrap();
+        let entry = |folder: &str, name: &str| match daemon.request(&Request::ListDir {
+            path: folder.into(),
+        }) {
+            Ok(Response::Entries { entries }) => entries.into_iter().find(|e| e.name == name),
+            _ => None,
+        };
+        for path in ["Docs", "solo.txt"] {
+            let pinned = daemon.request(&Request::Pin { path: path.into() }).unwrap();
+            assert!(matches!(pinned, Response::Ok { .. }), "{pinned:?}");
+        }
+        assert!(wait_until(Duration::from_secs(30), || {
+            entry("Docs", "a.txt").is_some_and(|e| e.cached)
+                && entry("", "solo.txt").is_some_and(|e| e.cached)
+        }));
+
+        // Another device edits both files and adds one to the kept folder.
+        drive.device().write("Docs/a.txt", b"second, and longer");
+        drive.device().write("solo.txt", b"alone, edited");
+        drive.device().write("Docs/new.txt", b"made elsewhere");
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                entry("Docs", "a.txt").is_some_and(|e| e.cached && e.size == 18)
+                    && entry("", "solo.txt").is_some_and(|e| e.cached && e.size == 13)
+                    && entry("Docs", "new.txt").is_some_and(|e| e.cached)
+            }),
+            "the keeper downloaded the new content: {:?} {:?} {:?}",
+            entry("Docs", "a.txt"),
+            entry("", "solo.txt"),
+            entry("Docs", "new.txt"),
+        );
+
+        // With the link gone, only the kept copies can answer.
+        daemon.client.set_online(false);
+        let read = |rel: &str| std::fs::read(daemon.mountpoint.join(rel)).unwrap();
+        assert_eq!(read("Docs/a.txt"), b"second, and longer");
+        assert_eq!(read("solo.txt"), b"alone, edited");
+        assert_eq!(read("Docs/new.txt"), b"made elsewhere");
+        daemon.client.set_online(true);
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The synced folder `id` as the daemon lists it.
     fn listed_folder(daemon: &Daemon, id: i64) -> Option<control::SyncFolderInfo> {
         match daemon.request(&Request::ListSyncFolders) {

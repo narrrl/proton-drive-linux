@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B282](#b282--a-file-kept-offline-is-downloaded-again-after-a-change-made-elsewhere) | A file kept offline is downloaded again after a change made elsewhere |
 | [B281](#b281--a-file-in-a-synced-folder-cannot-be-kept-offline) | A file in a synced folder cannot be kept offline |
 | [B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed) | Uploading a batch of large photos swaps the machine until the daemon is killed |
 | [B279](#b279--after-a-watchdog-kill-the-mount-never-comes-back) | After a watchdog kill the mount never comes back |
@@ -383,6 +384,45 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B282 — A file kept offline is downloaded again after a change made elsewhere
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-13, while looking into B281. Nothing downloaded a pinned file again after the
+pin had downloaded it once.
+**Where:** `apply_event` in `crates/pdfs-fuse/src/background.rs`; the new pin keeper in
+`crates/pdfs-fuse/src/keeper.rs`
+
+**Repro:** Pin a file, then change it from another device. The event deletes the cached copy.
+The file stays listed as kept offline, `cached` is false, and the next read downloads it, or
+fails without a network. Rename or move it elsewhere and the same happens, though its content
+did not change. Add a file to a pinned folder from another device and it is never downloaded.
+A folder pin whose downloads failed while the link was down never retries them.
+
+**Cause:** A remote change to a known node called `ContentCache::evict`, which does not check
+pins, and only the pin request itself downloaded anything. The copy was also stored under the
+size the listing held at pin time. That is the ciphertext size until the size upgrade lands
+(B12), and a copy stored under it never matches the plaintext it holds.
+
+**Fix:** A remote change no longer evicts a pinned file's copy. The copy is checked against the
+revision's `(mtime, size)`, so a read of a newer revision does not take it. A rename keeps the
+revision's mtime (B123), so the copy stays valid. A pin keeper thread checks pins again and
+downloads files that are missing or stale:
+
+- the pins a batch of remote events changed, after the batch's listings are dropped;
+- a pinned folder that gets a new file;
+- every pin at startup, when the link comes back, and after the event feed loses continuity;
+- a file whose version is restored.
+
+Failed downloads are tried again with a backoff from 30 s to 30 min. Pinning settles a
+provisional size before it stores the copy.
+
+**Test:** `a_file_kept_offline_stays_on_disk_through_changes_made_elsewhere` in
+`crates/pdfs-fuse/src/sim/daemon.rs`. Another device edits a pinned file and a file in a pinned
+folder, and adds a file to that folder. The test waits until all three are cached, then reads
+them with the link down. With the keeper disabled, it fails with all three uncached.
+
+---
 
 ### B281 — A file in a synced folder cannot be kept offline
 
