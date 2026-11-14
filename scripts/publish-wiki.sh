@@ -91,7 +91,7 @@ SECTIONS = [
 ]
 
 # Too long or too internal for the wiki; links to them go to GitHub.
-EXCLUDED = {"BUGS.md", "CHANGELOG.md", "SDK-0.11.0.md"}
+EXCLUDED = {"BUGS.md", "CHANGELOG.md", "ISSUE-78.md", "SDK-0.11.0.md"}
 
 # Files outside docs/ whose links are checked but not published.
 CHECKED = ["README.md", "CONTRIBUTING.md", "SECURITY.md"]

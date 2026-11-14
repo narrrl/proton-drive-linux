@@ -40,6 +40,8 @@ use widgets::crumb::*;
 use widgets::details::*;
 use widgets::file_list::*;
 use widgets::menu::*;
+use widgets::photo_drag::*;
+use widgets::player::*;
 use widgets::scrubber::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
@@ -457,6 +459,8 @@ fn build_window(app: &adw::Application) {
             files: browser_widgets.files.clone(),
             history: RefCell::new(Vec::new()),
             future: RefCell::new(Vec::new()),
+            places: RefCell::new(HashMap::new()),
+            restore: RefCell::new(None),
             crumb: browser_widgets.crumb.clone(),
             content: browser_widgets.content.clone(),
             status: browser_widgets.status.clone(),
@@ -523,6 +527,7 @@ fn build_window(app: &adw::Application) {
             jump: Cell::new(None),
             burst: Cell::new(false),
             import_banner: gallery_widgets.import_banner.clone(),
+            upload_bar: gallery_widgets.upload_bar.clone(),
             upload: gallery_widgets.upload.clone(),
             empty_actions: gallery_widgets.empty_actions.clone(),
             title: gallery_widgets.title.clone(),
@@ -726,17 +731,26 @@ fn build_window(app: &adw::Application) {
         cancel_file_thumbnails(&ui_nav);
         sync_sidebar(&ui_nav);
         match st.visible_child_name().as_deref() {
-            Some("browser") => load_browser(&ui_nav),
+            Some("browser") => reload_browser_view(&ui_nav),
             // The Albums and Places listings are re-read in place. Loading the
             // timeline instead would swap it in under the Albums or Places toggle.
+            // The timeline, an album or a place comes back as it was left,
+            // scrolled where it was, unless photos changed while it was out of
+            // sight (see `follow_changes`) or nothing is loaded yet.
             Some("gallery") if !ui_nav.gallery.in_collection() => {
                 match ui_nav.gallery.view_switch.active() {
                     VIEW_ALBUMS => load_albums(&ui_nav),
                     VIEW_PLACES => load_places(&ui_nav),
-                    _ => load_gallery(&ui_nav, false),
+                    _ if ui_nav.gallery.timeline_stale.replace(false)
+                        || ui_nav.gallery.model.n_items() == 0 =>
+                    {
+                        load_gallery(&ui_nav, false)
+                    }
+                    _ => {}
                 }
             }
-            Some("gallery") => load_gallery(&ui_nav, false),
+            Some("gallery") if ui_nav.gallery.model.n_items() == 0 => load_gallery(&ui_nav, false),
+            Some("gallery") => {}
             // Every visit reads the page again. The rows already on screen stay
             // up while it does, so arriving costs no "Loading…" flash.
             Some("sharedbyme") => load_shared_by_me(&ui_nav),
@@ -1066,7 +1080,7 @@ fn reload_current_page(ui: &Rc<Ui>) {
     match ui.stack.visible_child_name().as_deref() {
         Some("browser") => {
             let path = ui.browser.path.borrow().clone();
-            refresh_then(ui, RefreshScope::Dir { path }, load_browser);
+            refresh_then(ui, RefreshScope::Dir { path }, reload_browser_view);
         }
         // One scope covers the whole photos view, so Refresh reloads whichever of
         // the views — a grid, or the timeline, an album or a place — is on screen.
@@ -1328,7 +1342,7 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     // The Albums view's New Album button.
     let new_album = gio::SimpleAction::new("new-album", None);
     let ui_album = ui.clone();
-    new_album.connect_activate(move |_, _| prompt_new_album(&ui_album, Vec::new()));
+    new_album.connect_activate(move |_, _| prompt_new_album(&ui_album, Vec::new(), None));
     window.add_action(&new_album);
 
     let shortcuts = gio::SimpleAction::new("shortcuts", None);
@@ -1506,7 +1520,7 @@ fn debug_info(ui: &Rc<Ui>) -> String {
 /// The keyboard-shortcut cheatsheet behind the menu entry, listing exactly what
 /// [`install_shortcuts`], the Photos page and the photo viewer bind.
 fn show_shortcuts(window: &adw::ApplicationWindow) {
-    const GROUPS: [(&str, &[(&str, &str)]); 4] = [
+    const GROUPS: [(&str, &[(&str, &str)]); 5] = [
         (
             gettext_noop("General"),
             &[
@@ -1539,6 +1553,7 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("<Control>minus", gettext_noop("Smaller thumbnails")),
                 ("<Control>0", gettext_noop("Reset thumbnail size")),
                 ("<Control>a", gettext_noop("Select all")),
+                ("Escape <Alt>Left", gettext_noop("Back")),
             ],
         ),
         (
@@ -1548,8 +1563,20 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("Home End", gettext_noop("First / last photo")),
                 ("i", gettext_noop("Show details")),
                 ("f", gettext_noop("Fullscreen")),
+                ("F5", gettext_noop("Slideshow")),
+                ("F10", gettext_noop("More")),
+                ("<Control>c", gettext_noop("Copy Image")),
                 ("Delete", gettext_noop("Move to Trash")),
-                ("Escape", gettext_noop("Close")),
+                ("Escape <Alt>Left", gettext_noop("Close")),
+            ],
+        ),
+        (
+            gettext_noop("Video Player"),
+            &[
+                ("space k", gettext_noop("Play / pause")),
+                ("j l", gettext_noop("Back / forward 10 seconds")),
+                ("m", gettext_noop("Mute")),
+                ("f", gettext_noop("Fullscreen")),
             ],
         ),
     ];
@@ -1575,8 +1602,17 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     controller.connect_key_pressed(move |_, key, _, state| {
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let alt = state.contains(gtk4::gdk::ModifierType::ALT_MASK);
-        let on_browser = ui.stack.visible_child_name().as_deref() == Some("browser");
-        let on_trash = ui.stack.visible_child_name().as_deref() == Some("trash");
+        let page = ui.stack.visible_child_name();
+        let on_browser = page.as_deref() == Some("browser");
+        let on_trash = page.as_deref() == Some("trash");
+        let on_gallery = page.as_deref() == Some("gallery");
+        // Pages with a level to go back to, besides My files' own history.
+        let in_collection = on_gallery && ui.gallery.in_collection();
+        let in_shared_folder =
+            page.as_deref() == Some("shared") && !ui.shared.nav.borrow().is_empty();
+        let in_device_folder =
+            page.as_deref() == Some("devices") && !ui.devices.nav.borrow().is_empty();
+        let back_key = (key == gtk4::gdk::Key::Left && alt) || key == gtk4::gdk::Key::BackSpace;
         match key {
             // Refresh works on every page, so it is matched before the
             // browser-only bindings.
@@ -1633,6 +1669,21 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::gdk::Key::BackSpace if on_browser => {
                 ui.browser.actions.activate_action("back", None)
             }
+            // Selection mode ends before Escape leaves anything; the grid
+            // handles this itself while it has the focus.
+            gtk4::gdk::Key::Escape if on_gallery && ui.gallery.selecting.get() => {
+                set_selection_mode(&ui, false)
+            }
+            // An album or a place is a level below Photos, as a folder is
+            // below its parent: Back leaves it, and so does Escape.
+            _ if in_collection
+                && !ui.gallery.selecting.get()
+                && (back_key || key == gtk4::gdk::Key::Escape) =>
+            {
+                ui.gallery.back.emit_clicked()
+            }
+            _ if in_shared_folder && back_key => shared_back(&ui),
+            _ if in_device_folder && back_key => devices_back(&ui),
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
             gtk4::gdk::Key::Menu if visible_file_list(&ui).is_some() => {
                 if let Some(list) = visible_file_list(&ui) {
@@ -1974,6 +2025,7 @@ mod tests {
             favorite: false,
             group_size: 2,
             has_raw: kind == PhotoKind::Raw,
+            place_id: None,
         }
     }
 
@@ -1994,6 +2046,40 @@ mod tests {
         // jumping somewhere arbitrary.
         assert_eq!(next("elsewhere"), None);
         assert!(next_group_member(&[], "jpeg").is_none());
+    }
+
+    /// The upload bar counts the upload under way, not the ones finished.
+    #[test]
+    fn the_upload_bar_counts_the_upload_under_way() {
+        assert_eq!(upload_progress_text(0, 12), "Uploading 1 of 12 items…");
+        assert_eq!(upload_progress_text(11, 12), "Uploading 12 of 12 items…");
+    }
+
+    /// The pill names what kind of shot it switches through, and lights up
+    /// on the file that is not the shot's main one.
+    #[test]
+    fn the_group_pill_names_the_kind_of_shot() {
+        let pair = [
+            member("jpeg", Some("IMG_1.JPG"), PhotoKind::Photo),
+            member("raw", Some("IMG_1.CR2"), PhotoKind::Raw),
+        ];
+        assert_eq!(group_pill(&pair, "jpeg"), Some(("RAW".into(), false)));
+        assert_eq!(group_pill(&pair, "raw"), Some(("RAW".into(), true)));
+
+        let live = [
+            member("still", Some("IMG_2.HEIC"), PhotoKind::Photo),
+            member("clip", Some("IMG_2.MOV"), PhotoKind::Video),
+        ];
+        assert_eq!(group_pill(&live, "still"), Some(("Live".into(), false)));
+        assert_eq!(group_pill(&live, "clip"), Some(("Live".into(), true)));
+
+        let burst = [
+            member("a", None, PhotoKind::Photo),
+            member("b", None, PhotoKind::Photo),
+            member("c", None, PhotoKind::Photo),
+        ];
+        assert_eq!(group_pill(&burst, "b"), Some(("2 of 3".into(), false)));
+        assert_eq!(group_pill(&burst, "elsewhere"), None);
     }
 
     /// The switch names what it will show; a file whose name the daemon has not

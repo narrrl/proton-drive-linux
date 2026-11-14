@@ -11,32 +11,40 @@ scratch (user data in `staging/` and `recovery/` is never touched by this).
 
 ## [Unreleased]
 
-### Changed
+## [3.8.0] — 2026-11-14
 
-- Update `proton-sdk` and `proton-drive-rs` to 0.11.0.
-  Convert epoch timestamps at the SDK boundary and explicitly preserve photo modification
-  times now that they are independent of capture times. See [the SDK review](SDK-0.11.0.md)
-  for features and breaking changes.
-Schema: **45**. Synced folders now distinguish device backups from My files attachments.
-Existing folders remain device backups; older builds cannot open the upgraded database.
+Schema: **45**. Synced folders now tell device backups apart from folders attached to My files.
+Existing folders stay device backups. Older builds cannot open the upgraded database.
 
 ### Added
 
-- Shell completion for `pdfs` in bash, zsh and fish, installed by every package, plus elvish
-  and PowerShell through `pdfs completions SHELL`. Besides commands and options it completes
-  paths in My files and the ids and uids the running service knows (synced folders, the queue,
-  computers, trash, albums, shares, invitations, bookmarks, conflicts and versions), each with
-  a description. Share roles are now checked by the CLI (`viewer`, `editor`, `admin`) before
-  the request.
-- `pdfs sync attach PATH --to REMOTE` connects an existing local directory to an existing
-  My files folder. The first sync preserves one-sided files and differing versions (#67).
-  Attachments stay in mirror mode, are excluded from device profiles, and cannot delete
-  the remote root when syncing is stopped.
+- **Sync a local folder with a folder you already have in My files** (#67, #77).
+  `pdfs sync attach ~/Work --to Work` keeps `~/Work` an ordinary local folder and syncs it both
+  ways with My files/Work. The first sync uploads files that are only on this computer, downloads
+  files that are only on Proton Drive, and keeps both versions of a file that differs: the one on
+  Proton Drive keeps its name, and the local one becomes a conflict copy next to it and is
+  uploaded too. Attached folders are always kept on this computer, never online only. They are
+  listed apart from device backups and are not part of the device profile used to restore another
+  computer. Stopping one keeps both copies, and `--delete-remote` is refused for it. If the folder
+  on Proton Drive is trashed or moved out of My files, syncing stops with an error and the local
+  files stay. Attaching a folder is done from a terminal for now.
+
+- **Tab completion for `pdfs`** in bash, zsh and fish, installed by every package. Besides
+  commands and options it completes paths in My files (`pdfs pin Doc<Tab>`) and what the running
+  service knows, each with a description: synced folders, queued changes, computers, trash, albums,
+  items shared with you, invitations, bookmarks and conflict copies, and once a path is typed, the
+  file's versions or the share's members and link. Without the service it still completes commands
+  and options. Elvish and PowerShell load it from `pdfs completions SHELL`, and so does a source
+  build; the [command-line reference](CLI.md#shell-completion) has the line for each shell.
+  `pdfs share` and `pdfs share-role` now check the role (`viewer`, `editor` or `admin`) before
+  sending the request, and `pdfs public-link` does the same for `viewer` and `editor`.
+
 - **Video thumbnails in My files, Shared, Trash and the launcher**, as in Photos, with a play
   badge in the grid. A video's thumbnail is the one its uploader attached when it has one.
   Otherwise the daemon takes a frame with ffmpeg from the start of the file, plus an MP4's
   index, and never downloads more than about 16 MiB of a video for it, however large the
   video is. **Build Thumbnails** covers videos too (B283).
+
 - **A new layout for Photos.**
   - The grid shows every photo at its own shape, in rows that fill the width (portraits
     are no longer cropped to squares). **Square Tiles** in the page menu brings the even
@@ -61,18 +69,125 @@ Existing folders remain device backups; older builds cannot open the upgraded da
   - The zoom level and the tile shape are remembered between runs.
   - In the photo viewer, the details panel lies over the photo when the window is
     narrow instead of squeezing it.
+
 - **Larger icons in My files.** The icon size slider goes up to 256 px, big enough to
   tell photos apart by their thumbnail. Ctrl+scroll, Ctrl+plus, Ctrl+minus and Ctrl+0
   change it too, and the size is remembered between runs.
 
+- **Back takes you to where you were.** Back, Forward and Up in My files return to a folder
+  scrolled where it was left, with the same items selected, and closing the photo viewer scrolls
+  the grid to the photo it was showing. Alt+Left and Backspace go back a level in Shared with me
+  and Computers and leave an open album or place in Photos, as Escape does too.
+
+- **Share photos, and more in the photo viewer.**
+  - **Share…** in a photo's menu and in the viewer's ⋮ menu opens the usual Share dialog: invite
+    people or make a public link. It is not offered for a photo in an album someone else shared.
+  - **Copy Image** (Ctrl+C) puts the photo on screen on the clipboard.
+  - A strip of thumbnails along the bottom of the viewer shows the photos around the one on
+    screen; click one to jump to it. It fades with the other controls and stays hidden during a
+    slideshow.
+  - The line under the date names the town the photo was taken in, when it is known.
+
+- **Drag photos out of Photos.** Select photos, then drag one of them into a file manager, a chat
+  or any app that takes files. The photos download when dropped and arrive under their own
+  names. A drag that starts on a photo that is not selected still selects, as before.
+
+- **Upload progress in Photos.** Uploading several photos at once shows "Uploading 3 of 12
+  items…" with a progress bar above the timeline, instead of a single toast at the start.
+
+- **Videos and music play in the app.** Opening a video or a song in My files, by a double-click
+  or **Open**, plays it in a player window, streamed from the mount like before. **Open With…**
+  still hands it to another player, and the separate **Play** item is gone. When the file can't
+  be played (a codec GStreamer lacks), the window says so and offers **Open With…**. Both this
+  player and the one in Photos gained a fullscreen button, fullscreen on a double-click,
+  **Repeat** in the ⋮ menu, `K` to play and pause, `J` and `L` (or Shift+←/→) to jump
+  10 seconds, and `M` to mute. The volume carries over from one video to the next, and the
+  thumbnail strip in Photos stays off a video, where it covered the seek bar.
+
+- **Album covers for songs.** A song in My files, in search and in Shared shows its cover as its
+  thumbnail, and the player shows it above the controls instead of a music note. The cover is the
+  picture in the song's tags (MP3, FLAC, Ogg, Opus, M4A, WAV, AIFF, WavPack, Monkey's Audio), or
+  else a `cover`, `folder`, `front` or `album` image (`.jpg`, `.png`, `.webp`) in the same folder.
+  Only the song's tags are downloaded for it, not the whole song. Songs uploaded from this computer
+  carry their cover as their thumbnail, so they show it at once on other devices too. A cover
+  image added to a folder later is picked up once the song changes or the service restarts.
+
+### Changed
+
+- **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
+  from the SDK, and a photo keeps its own modification time now that it no longer follows the
+  capture time. [The SDK review](SDK-0.11.0.md) lists the new features and breaking changes.
+
 ### Fixed
 
-- Large `.ts` recordings (MPEG transport streams) show and open as videos: the video icon, a
-  thumbnail, and the `@media` open rule rather than `@text`. A `.ts` of 1 MiB or more counts
-  as a video, a smaller one stays TypeScript source, and the daemon checks the stream's sync
-  byte before it takes a frame (B283).
-- A video over 256 MiB never got a thumbnail, and a smaller one was downloaded whole into
-  memory for one frame (B283).
+- **Photos zoomed all the way out shows the whole timeline.** The first 200 photos fit on one
+  screen there, and with nothing to scroll no more were loaded. More now load whenever the photos
+  don't fill the window, also after a zoom or a resize.
+
+- **Thumbnails appear in the folder you are looking at as soon as they are made.** During
+  **Build thumbnails**, the folder on screen kept its file icons until you left it and opened it
+  again. Its tiles now fill in while the build runs, and the same goes for any tile whose
+  thumbnail is made while it is on screen.
+
+- **My files comes back after the service was killed for hanging** (B279). A killed service left
+  its folders behind as dead mounts, and every restart then failed with `File exists` and retried
+  forever without opening anything, until the mounts were cleared by hand. The service now clears
+  a dead mount before it opens the folder. On a large account a restart that did open My files was
+  killed again, because loading the account took longer than the 2 minutes the service has to
+  report in. Startup now gets 10 minutes, and the 2 minutes apply again once the service answers.
+
+- **Uploading many large photos no longer runs the computer out of memory** (B280). Every image
+  upload decodes the whole picture to make its thumbnail, and up to 16 did so at once. A batch of
+  100-megapixel photos took about 9 GiB, filled the swap, and the service was killed on every
+  restart. Thumbnails now share 512 MiB between them: phone photos are still made side by side,
+  and a very large photo waits and is made on its own.
+
+- **Keep a file offline in an on-demand synced folder** (B281). `pdfs pin` and `pdfs unpin` now
+  accept a path in a synced folder such as `~/Pictures`. Before, they only took paths under the
+  Proton Drive mount, so the copy in the synced folder was downloaded again by every program that
+  read it.
+
+- **Files kept offline stay on this computer when they change elsewhere** (B282). A change from
+  another device, even a rename, deleted the copy of a file kept offline, and nothing downloaded
+  it again, so the next read downloaded it or failed without a network. Files added to a folder
+  kept offline from another device were never downloaded. The copy now stays until the new
+  version is downloaded, which happens on its own. Files kept offline are also checked at
+  startup and when the connection returns, and failed downloads are tried again.
+
+- **Large `.ts` recordings show and open as videos** (B283). An MPEG transport stream got the
+  text icon, no thumbnail, and the `@text` open rule. It now gets the video icon, a thumbnail
+  and the `@media` rule. A `.ts` of 1 MiB or more counts as a video, a smaller one stays
+  TypeScript source, and the daemon checks the stream's sync byte before it takes a frame.
+
+- **Videos over 256 MiB get a thumbnail** (B283). They never got one, and a smaller video was
+  downloaded whole into memory for one frame.
+
+- **A folder opens at the top.** A folder opened in My files, Shared with me or Computers could
+  open scrolled to where its parent was left, often at the bottom. Another folder, a new search
+  and a new Photos filter, album or place now start at the top, and a refresh keeps its place.
+
+- **Closing a photo opened from the Places map goes back to the map**, not to the town's
+  timeline.
+
+- **Albums and Places stay on screen.** They could switch to the timeline by themselves when a
+  timeline page arrived late, after an upload or after a trash Undo. Coming back to Photos no
+  longer reloads the timeline and loses its scroll position, unless photos changed while it was
+  out of sight. After an album or a place, the timeline came back unfiltered while the kind tab
+  and the date still showed the filter.
+
+- **A search in My files stays.** It was replaced by the folder's listing whenever files
+  changed, on refresh and on coming back to the page, while the query stayed in the box.
+
+- **The photo viewer's buttons are readable on any photo.** They were white on a see-through
+  white, and vanished over a bright photo. The bar now keeps only the favorite star, the details
+  and a menu, which names Slideshow, Save a Copy, Open With, Add to Album, Show on Map and Move to
+  Trash in words where eight icons stood. A shot stored as more than one file shows a "RAW" or
+  "Live" switch, or "2 of 3" for a burst, where an unlabelled icon was. The title reads
+  "Wednesday, October 7, 2026, 13:42" rather than a timestamp. Delete asks first, as it does in
+  the grid, and Alt+Left closes the viewer.
+
+- **A date jump in Photos stops when you look elsewhere.** A jump still loading the timeline
+  kept going after another filter, album or place was opened.
 
 ## [3.7.0] — 2026-11-02
 

@@ -1,6 +1,14 @@
 use crate::activation::{DriveActivation, drive_activation, mounted_path, present_within};
 use crate::*;
 
+/// How a folder in My files was left: scrolled `offset` px down, with the
+/// entries named `selected` highlighted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FolderPlace {
+    pub(crate) offset: f64,
+    pub(crate) selected: Vec<String>,
+}
+
 pub(crate) struct BrowserState {
     // Files (browser) page.
     /// The grid and list; the model is repopulated per directory.
@@ -10,6 +18,13 @@ pub(crate) struct BrowserState {
     /// breadcrumb.
     pub(crate) history: RefCell<Vec<String>>,
     pub(crate) future: RefCell<Vec<String>>,
+    /// Where each folder left by Back, Forward, Up or a descent was scrolled
+    /// and what was selected in it, by path. Back, Forward and Up put the
+    /// folder back that way; opening it afresh starts at the top.
+    pub(crate) places: RefCell<HashMap<String, FolderPlace>>,
+    /// The folder whose [`Self::places`] entry the next listing restores, set
+    /// by Back, Forward and Up.
+    pub(crate) restore: RefCell<Option<String>>,
     /// Clickable breadcrumb trail (a button per path segment); rebuilt per load
     /// by [`repaint_crumb`] so each ancestor folder navigates on click.
     pub(crate) crumb: gtk4::Box,
@@ -883,27 +898,15 @@ fn show_location_column(ui: &Rc<Ui>, visible: bool) {
 pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     let mut menu = ActionMenu::new();
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    // Open does what a double-click does: a video or a song plays in the app,
+    // and Open With is the way to another player.
     menu.item(&pgettext("verb", "Open"), move || {
-        // Open always means "download a local copy and hand off", even for a
-        // media file — `activate_entry` would otherwise stream it.
-        if is_streamable_media_entry(&entry_c) {
-            download_and_open(&ui_c, &entry_c);
-        } else {
-            activate_entry(&ui_c, &entry_c);
-        }
+        activate_entry(&ui_c, &entry_c)
     });
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     menu.item(&gettext("Open With…"), move || {
         open_entry_with(&ui_c, &entry_c)
     });
-    // Play streams from the mount, no download; Open above still fetches a
-    // local copy for anyone who wants one.
-    if is_streamable_media_entry(entry) {
-        let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        menu.item(&pgettext("verb", "Play"), move || {
-            stream_entry(&ui_c, &entry_c)
-        });
-    }
     menu.section();
 
     // Kept through a pinned folder above it, the entry has no pin of its own
@@ -1092,38 +1095,8 @@ pub(crate) fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Op
     Some(entry)
 }
 
-/// Whether an entry can be opened through FUSE instead of fully materialized.
-pub(crate) fn is_streamable_media_entry(entry: &DirEntry) -> bool {
-    drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia
-}
-
-/// Stream media straight from the mount, no download. Drive folders *are* part
-/// of the FUSE mount, so a player pointed at `<mountpoint>/<rel>` reads the file
-/// through [`Core::read_range_remote`] — 4 MB blocks fetched on demand as it
-/// seeks and buffers — instead of waiting for the whole file to land like
-/// [`Request::OpenFile`] does. This is the point of the feature: a 2 GB HEVC
-/// `.mkv` starts playing in seconds.
-pub(crate) fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
-    let rel = entry_rel(ui, entry);
-    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
-    let abs = mounted_path(&mountpoint, &rel);
-    let Some(path) = abs.to_str() else {
-        toast_error(
-            ui,
-            &gettext("Couldn't play media"),
-            &gettext("The file path isn't valid UTF-8."),
-        );
-        return;
-    };
-    toast(
-        ui,
-        &gettext_f("Streaming “{name}”…", &[("name", &entry.name)]),
-    );
-    play_external(path);
-}
-
-/// Open an entry the Nautilus way: folders descend, media streams from the mount,
-/// other files download-and-open.
+/// Open an entry the Nautilus way: folders descend, media plays in the app,
+/// streamed from the mount, other files download-and-open.
 pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
     if entry.is_dir {
@@ -1136,16 +1109,16 @@ pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     } else if drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia {
         // Media streams rather than downloads: that is exactly the "play it,
         // don't fetch the whole thing" behaviour this is for.
-        stream_entry(ui, entry);
+        open_media_player(ui, entry);
     } else {
         download_and_open(ui, entry);
     }
 }
 
 /// Hand a file to the user's default application: through the mount when it is
-/// there, otherwise downloaded into the cache first. The open path behind both
-/// a plain double-click and the context menu's "Open" (including for a video,
-/// when the user wants their default application rather than the player).
+/// there, otherwise downloaded into the cache first. The open path behind a
+/// double-click and the context menu's "Open" for anything but a folder or
+/// media, and for media the mount doesn't show.
 ///
 /// The mount comes first because the cache blob is a *copy* keyed by content
 /// hash — an application saving into it writes where Drive will never look, and
@@ -1556,8 +1529,29 @@ pub(crate) fn sort_entries(entries: &mut [DirEntry], view: FilesView) {
     });
 }
 
+/// Remember how the folder on screen is scrolled and what is selected in it,
+/// for Back, Forward or Up to bring it back that way. Only a listing of the
+/// folder itself counts; search hits are not its rows.
+fn remember_place(ui: &Rc<Ui>) {
+    let path = ui.browser.path.borrow().clone();
+    if ui.browser.listed.borrow().as_deref() != Some(path.as_str()) {
+        return;
+    }
+    let files = &ui.browser.files;
+    let place = FolderPlace {
+        offset: files.scroll_offset(),
+        selected: files
+            .selected()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    };
+    ui.browser.places.borrow_mut().insert(path, place);
+}
+
 /// Open the folder on screen in a new place, remembering where we were.
 pub(crate) fn browse_to(ui: &Rc<Ui>, target: String) {
+    remember_place(ui);
     let left = ui.browser.path.replace(target.clone());
     if left != target {
         ui.browser.history.borrow_mut().push(left);
@@ -1582,6 +1576,8 @@ fn browse_back(ui: &Rc<Ui>) {
     let Some(previous) = ui.browser.history.borrow_mut().pop() else {
         return;
     };
+    remember_place(ui);
+    *ui.browser.restore.borrow_mut() = Some(previous.clone());
     let left = ui.browser.path.replace(previous);
     ui.browser.future.borrow_mut().push(left);
     load_browser(ui);
@@ -1592,6 +1588,8 @@ fn browse_forward(ui: &Rc<Ui>) {
         return;
     };
     ui.browser.search.set_text("");
+    remember_place(ui);
+    *ui.browser.restore.borrow_mut() = Some(next.clone());
     let left = ui.browser.path.replace(next);
     ui.browser.history.borrow_mut().push(left);
     load_browser(ui);
@@ -1604,6 +1602,7 @@ fn browse_up(ui: &Rc<Ui>) {
     }
     ui.browser.search.set_text("");
     let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or_default();
+    *ui.browser.restore.borrow_mut() = Some(parent.to_string());
     browse_to(ui, parent.to_string());
 }
 
@@ -2921,6 +2920,18 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     });
 }
 
+/// Read again what My files shows: the search hits while there is a query,
+/// the folder otherwise. [`load_browser`] alone would swap a search's hits
+/// for the folder while the query stays in the box.
+pub(crate) fn reload_browser_view(ui: &Rc<Ui>) {
+    let query = ui.browser.search.text().trim().to_string();
+    if query.is_empty() {
+        load_browser(ui);
+    } else {
+        run_search(ui, &query);
+    }
+}
+
 /// Clear the model and show the daemon's error on the status page. Used for
 /// in-band failures (a bad path, a permission error) — the mount is up, so Retry
 /// (which restarts the service) wouldn't help and isn't offered.
@@ -2959,7 +2970,10 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
 pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     show_location_column(ui, false);
     *ui.browser.listing.borrow_mut() = entries.to_vec();
-    *ui.browser.listed.borrow_mut() = Some(ui.browser.path.borrow().clone());
+    // `listed` still names the folder the rows belong to only on a refresh;
+    // any other load forgot it (see `load_browser`).
+    let path = ui.browser.path.borrow().clone();
+    let another_folder = ui.browser.listed.replace(Some(path.clone())).as_ref() != Some(&path);
     ui.browser.summary.set_label(&listing_summary(
         entries.iter().filter(|entry| !entry.is_dir).count(),
         entries.iter().filter(|entry| entry.is_dir).count(),
@@ -2988,6 +3002,16 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     // Only the rows that changed are swapped, so a refresh keeps the
     // selection, the scroll position and the thumbnails already drawn.
     replace_items(&ui.browser.files.model, &sorted);
+    // Back, Forward and Up return to a folder as it was left; any other way
+    // in starts at the top.
+    let restore = ui.browser.restore.take().filter(|target| *target == path);
+    if another_folder {
+        let place = restore.and_then(|path| ui.browser.places.borrow().get(&path).cloned());
+        match place {
+            Some(place) => ui.browser.files.restore(place.offset, &place.selected),
+            None => ui.browser.files.scroll_to_top(),
+        }
+    }
 }
 
 /// Forget which folder the rows belong to and drop the selection, before the
@@ -3166,6 +3190,9 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
         .collect();
     sort_entries(&mut entries, ui.browser.view.get());
     replace_items(&ui.browser.files.model, &entries);
+    // Every search starts over (`run_search` forgets the listing), so its hits
+    // read from the first one.
+    ui.browser.files.scroll_to_top();
 }
 
 fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {

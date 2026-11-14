@@ -467,6 +467,7 @@ both with `pdfs_core::search::relevance_score`, so the prompt can merge them int
 | `pdfs-sync`, `pdfs-sync-poll` | Mirror passes and the remote poll (§7) |
 | Tokio runtime | Remote calls, and the Drive and photos event streams (§6) |
 | `pdfs-online-probe` | Probes Drive while offline |
+| `pdfs-pin-keeper` | Checks pins once a second for work: every pin at startup, when the link returns and after the event feed loses continuity, and the pins a batch of remote events changed. Downloads files kept offline that are missing or stale; failures retry with a backoff of 30 s to 30 min (`docs/BUGS.md` B282) |
 | `pdfs-supervisor` | Logs workers that hold one job for minutes, a queue that stops draining, and control requests that never return; samples memory; pings the systemd watchdog only after a round trip over the control socket succeeds (`WatchdogSec=120`) |
 | `pdfs-conflict-sweep` | Optional. After 30 s, then every 5 minutes, finds `(sync-conflict …)` copies identical (size and SHA-1) to their original. `conflict_sweep` decides: `off`, `report` (default) or `enforce`, which trashes them after re-checking each one |
 | Smaller helpers | `pdfs-localindex` (home index for search), `pdfs-pause` (ends a timed pause), `pdfs-similar` (similar photos, on request), `pdfs-diagnostics` |

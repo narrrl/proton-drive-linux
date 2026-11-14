@@ -40,6 +40,8 @@ pub struct StoredPhoto {
     /// Whether any member of the group is a camera raw file. The grid badges
     /// that, because the JPEG it shows is not the whole of what is stored.
     pub has_raw: bool,
+    /// The town the photo was taken in, once its location has been read.
+    pub place_id: Option<u32>,
 }
 
 /// A town photos were taken in: its GeoNames id (see [`crate::places`]), how
@@ -256,7 +258,7 @@ fn group_photos(entries: &[Grouped]) -> Vec<String> {
 /// own group: the column is `NULL` until the next refresh computes it, and a
 /// `NULL` would otherwise match nothing and drop the photo off the page.
 const PHOTO_SELECT: &str = "SELECT p.uid, p.capture_time, p.name, p.ratio, p.thumb_state, \
-     p.kind, p.favorite, g.n, g.raw \
+     p.kind, p.favorite, g.n, g.raw, p.place_id \
      FROM photos p JOIN (SELECT COALESCE(group_key, uid) AS k, COUNT(*) AS n, \
      MAX(kind = 2) AS raw FROM photos GROUP BY k) g ON g.k = COALESCE(p.group_key, p.uid)";
 
@@ -272,6 +274,7 @@ fn stored_photo(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPhoto> {
         favorite: r.get::<_, i64>(6)? != 0,
         group_size: r.get::<_, i64>(7)?.max(1) as usize,
         has_raw: r.get::<_, i64>(8)? != 0,
+        place_id: r.get(9)?,
     })
 }
 

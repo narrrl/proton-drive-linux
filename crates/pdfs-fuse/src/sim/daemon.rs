@@ -3447,6 +3447,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn pinning_a_file_in_an_on_demand_folder_keeps_that_folders_copy() {
+        // Keeping a file offline took only paths under the primary mount, so
+        // the copy in an on-demand synced folder could not be kept, and a
+        // program reading it there downloaded it every time (B281).
+        let drive = FakeDrive::new();
+        let dir = scratch("pin-in-ondemand");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        let ondemand = dir.join("ondemand");
+        sync_folder(&daemon, &ondemand, "ondemand");
+
+        let content = b"not a real png, but kept all the same".repeat(64);
+        let file = ondemand.join("photo.png");
+        std::fs::write(&file, &content).unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+        }));
+        daemon.request(&Request::PurgeCache).unwrap();
+
+        let path = file.canonicalize().unwrap().to_string_lossy().into_owned();
+        let pinned = daemon
+            .request(&Request::Pin { path: path.clone() })
+            .unwrap();
+        assert!(matches!(pinned, Response::Ok { .. }), "{pinned:?}");
+        let pins = || match daemon.request(&Request::ListPins) {
+            Ok(Response::Pins { pins }) => pins,
+            other => panic!("pins: {other:?}"),
+        };
+        let listed = pins();
+        assert!(
+            listed.iter().any(|pin| pin.path == path && pin.cached),
+            "the pin opens by the path it was made through: {listed:?}"
+        );
+
+        // With the link gone, only a kept copy can answer the read.
+        daemon.client.set_online(false);
+        assert_eq!(std::fs::read(&file).unwrap(), content);
+        daemon.client.set_online(true);
+
+        let unpinned = daemon
+            .request(&Request::Unpin { path: path.clone() })
+            .unwrap();
+        assert!(matches!(unpinned, Response::Ok { .. }), "{unpinned:?}");
+        assert!(pins().is_empty());
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_file_kept_offline_stays_on_disk_through_changes_made_elsewhere() {
+        // A change from another device deleted a pinned file's copy and
+        // nothing downloaded it again, and a file added to a pinned folder
+        // elsewhere was never downloaded: both were listed as kept offline
+        // and read only with a network (B282).
+        let drive = FakeDrive::new();
+        let dir = scratch("pin-keeper");
+        let daemon = Daemon::start(&dir, drive.client(1, Faults::lan())).unwrap();
+        std::fs::create_dir(daemon.mountpoint.join("Docs")).unwrap();
+        std::fs::write(daemon.mountpoint.join("Docs/a.txt"), b"first").unwrap();
+        std::fs::write(daemon.mountpoint.join("solo.txt"), b"alone").unwrap();
+        assert!(wait_until(Duration::from_secs(30), || {
+            daemon.pending().is_ok_and(|items| items.is_empty())
+                && drive.lookup("Docs/a.txt").is_some()
+                && drive.lookup("solo.txt").is_some()
+        }));
+        daemon.request(&Request::PurgeCache).unwrap();
+        let entry = |folder: &str, name: &str| match daemon.request(&Request::ListDir {
+            path: folder.into(),
+        }) {
+            Ok(Response::Entries { entries }) => entries.into_iter().find(|e| e.name == name),
+            _ => None,
+        };
+        for path in ["Docs", "solo.txt"] {
+            let pinned = daemon.request(&Request::Pin { path: path.into() }).unwrap();
+            assert!(matches!(pinned, Response::Ok { .. }), "{pinned:?}");
+        }
+        assert!(wait_until(Duration::from_secs(30), || {
+            entry("Docs", "a.txt").is_some_and(|e| e.cached)
+                && entry("", "solo.txt").is_some_and(|e| e.cached)
+        }));
+
+        // Another device edits both files and adds one to the kept folder.
+        drive.device().write("Docs/a.txt", b"second, and longer");
+        drive.device().write("solo.txt", b"alone, edited");
+        drive.device().write("Docs/new.txt", b"made elsewhere");
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                entry("Docs", "a.txt").is_some_and(|e| e.cached && e.size == 18)
+                    && entry("", "solo.txt").is_some_and(|e| e.cached && e.size == 13)
+                    && entry("Docs", "new.txt").is_some_and(|e| e.cached)
+            }),
+            "the keeper downloaded the new content: {:?} {:?} {:?}",
+            entry("Docs", "a.txt"),
+            entry("", "solo.txt"),
+            entry("Docs", "new.txt"),
+        );
+
+        // With the link gone, only the kept copies can answer.
+        daemon.client.set_online(false);
+        let read = |rel: &str| std::fs::read(daemon.mountpoint.join(rel)).unwrap();
+        assert_eq!(read("Docs/a.txt"), b"second, and longer");
+        assert_eq!(read("solo.txt"), b"alone, edited");
+        assert_eq!(read("Docs/new.txt"), b"made elsewhere");
+        daemon.client.set_online(true);
+
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The synced folder `id` as the daemon lists it.
     fn listed_folder(daemon: &Daemon, id: i64) -> Option<control::SyncFolderInfo> {
         match daemon.request(&Request::ListSyncFolders) {
@@ -3616,6 +3728,88 @@ mod tests {
             drive.tree().keys().collect::<Vec<_>>()
         );
 
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A song with no picture in its tags shows the cover image in its folder,
+    /// and the daemon tells a following front-end that a thumbnail landed, so
+    /// a folder on screen fills in without being opened again.
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_song_without_a_cover_shows_its_folders_and_says_so() {
+        let dir = scratch("song-cover");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Silent MPEG-1 Layer III frames, without any tag.
+        let mut frame = vec![0u8; 417];
+        frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        let song = frame.repeat(64);
+        let mut cover = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut cover)
+            .encode_image(&image::RgbImage::new(300, 300))
+            .unwrap();
+
+        let drive = FakeDrive::new();
+        drive.device().write("track one.mp3", &song);
+        drive.device().write("Cover.jpg", &cover);
+        let client = drive.client(1, Faults::lan());
+        let daemon = Daemon::start(&dir.join("daemon"), client).unwrap();
+
+        let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut subscription = control::subscribe(&daemon.socket).unwrap();
+        let flag = landed.clone();
+        std::thread::spawn(move || {
+            // The first change names every topic: a new subscription catches up.
+            let mut caught_up = false;
+            while let Ok(Some(event)) = subscription.next_event() {
+                if let control::Event::Changed { topics } = event {
+                    if caught_up && topics.contains(&control::Topic::Thumbnails) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    caught_up = true;
+                }
+            }
+        });
+
+        let Ok(Response::Entries { entries }) = daemon.request(&Request::ListDir {
+            path: String::new(),
+        }) else {
+            panic!("listing");
+        };
+        let song = entries
+            .iter()
+            .find(|entry| entry.name == "track one.mp3")
+            .expect("the song is listed");
+        let items = vec![control::FileThumbRequest {
+            uid: song.uid.clone(),
+            modified: song.modified,
+            name: song.name.clone(),
+        }];
+        let Ok(Response::FileThumbGeneration { generation }) =
+            daemon.request(&Request::ReserveFileThumbGeneration)
+        else {
+            panic!("generation");
+        };
+        let mut path = None;
+        let settled = wait_until(Duration::from_secs(60), || {
+            let Ok(Response::Thumbs { items: replies }) = daemon.request(&Request::FileThumbs {
+                items: items.clone(),
+                generation,
+            }) else {
+                return false;
+            };
+            path = replies.first().and_then(|reply| reply.path.clone());
+            path.is_some()
+        });
+        assert!(settled, "the song got no thumbnail");
+        let thumb = image::load_from_memory(&std::fs::read(path.unwrap()).unwrap()).unwrap();
+        assert_eq!(thumb.width(), thumb.height(), "the square cover");
+        assert!(
+            wait_until(Duration::from_secs(15), || landed
+                .load(std::sync::atomic::Ordering::SeqCst)),
+            "no thumbnails change was published"
+        );
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }

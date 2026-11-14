@@ -157,6 +157,17 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
             if ours {
                 debug!(uid = %node_uid, "ignoring remote event for a node with a queued write");
             }
+            // A file kept offline keeps its copy through a change, and the
+            // keeper replaces it once this batch's listings are read again.
+            // The copy is checked against the revision's `(mtime, size)`, so
+            // no read takes it for a newer revision. Evicted, it was gone until
+            // something read the file, which then downloaded it (B282). A
+            // node new in, or moved into, a kept folder is fetched by checking
+            // that folder.
+            let kept = match !*is_trashed && !ours {
+                true => kept_by_pin(core, node_uid, parent_node_uid.as_ref()),
+                false => None,
+            };
             let mut had_node = false;
             core.for_each_mount(|st, notify| {
                 if *is_trashed {
@@ -172,8 +183,11 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
                 }
             });
             // Once, not once per mount: the content cache is per-daemon.
-            if had_node {
+            if had_node && kept.is_none() {
                 core.cache.evict(node_uid);
+            }
+            if let Some(kept) = kept {
+                dirty.kept.insert(kept);
             }
             // A create, rename or move-in shows up as a change to the parent
             // listing too, which is recorded for the end of the batch rather
@@ -205,6 +219,8 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         | DriveEvent::ScopeAccessLost { .. }
         | DriveEvent::SharedWithMeUpdated { .. } => {
             warn!("event access continuity lost; downgrading shared trees and resyncing lazily");
+            // Changes went by unseen, kept files among them (B282).
+            core.recheck_all_pins();
             apply_result = apply_result.and(core.db.clear_state(SHARED_WITH_ME_SYNCED_MS));
             core.for_each_mount(|st, notify| {
                 let dirs: Vec<u64> = st.children.keys().copied().collect();
@@ -296,6 +312,21 @@ struct DirtyParents {
     /// Checked per mount — a mount that already lists every one of those
     /// children under that parent keeps its listing.
     ours: HashMap<NodeUid, HashSet<NodeUid>>,
+    /// Pinned files and folders the batch changed, for the pin keeper to
+    /// check once the listings above are dropped (`keeper`).
+    kept: HashSet<NodeUid>,
+}
+
+/// What the pin keeper has to check after a remote change to `node_uid`,
+/// whose parent is now `parent_uid`: the node itself when a pin keeps it, or
+/// else the parent, when a pinned folder holds it and the node is new there.
+fn kept_by_pin(core: &Core, node_uid: &NodeUid, parent_uid: Option<&NodeUid>) -> Option<NodeUid> {
+    if core.cache.is_pinned(node_uid) {
+        return Some(node_uid.clone());
+    }
+    parent_uid
+        .filter(|parent| core.cache.is_pinned(parent))
+        .cloned()
 }
 
 /// Whether this mount's cached listing of `parent_uid` already accounts for
@@ -476,6 +507,9 @@ pub(super) async fn run_event_sync(
             cursor = Some(applied);
         }
         flush_dirty_parents(&core, &dirty);
+        for uid in &dirty.kept {
+            core.recheck_pinned(uid);
+        }
         // Another device changed the tree: whatever a front-end lists may have
         // moved, including what is shared and what is in the trash.
         core.events

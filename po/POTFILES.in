@@ -24,6 +24,7 @@ crates/pdfs-gui/src/app/widgets/compat.rs
 crates/pdfs-gui/src/app/widgets/details.rs
 crates/pdfs-gui/src/app/widgets/file_list.rs
 crates/pdfs-gui/src/app/widgets/menu.rs
+crates/pdfs-gui/src/app/widgets/player.rs
 crates/pdfs-gui/src/app/widgets/share_dialog.rs
 crates/pdfs-gui/src/app/widgets/thumbnails.rs
 crates/pdfs-gui/src/app/widgets/versions_dialog.rs

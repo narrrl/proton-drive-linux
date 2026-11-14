@@ -109,7 +109,10 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B284](#b284--a-keyring-entry-reported-missing-discards-refreshed-session-tokens) | A keyring entry reported missing discards refreshed session tokens |
 | [B283](#b283--videos-have-no-thumbnail-outside-photos-and-a-ts-recording-looks-like-source-code) | Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code |
+| [B282](#b282--a-file-kept-offline-is-downloaded-again-after-a-change-made-elsewhere) | A file kept offline is downloaded again after a change made elsewhere |
+| [B281](#b281--a-file-in-a-synced-folder-cannot-be-kept-offline) | A file in a synced folder cannot be kept offline |
 | [B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed) | Uploading a batch of large photos swaps the machine until the daemon is killed |
 | [B279](#b279--after-a-watchdog-kill-the-mount-never-comes-back) | After a watchdog kill the mount never comes back |
 | [B278](#b278--sync-list-and-devices-list-show-the-last-sync-as-epoch-seconds) | `sync list` and `devices list` show the last sync as epoch seconds |
@@ -384,6 +387,34 @@ a live account since.
 
 Newest first.
 
+### B284 — A keyring entry reported missing discards refreshed session tokens
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-14, investigating [issue #78](https://github.com/narrrl/proton-drive-linux/issues/78)
+after the reporter's oo7 0.7.0 retest ruled out the original persistence fix as a sufficient
+explanation. See [the investigation and isolated reproducer](ISSUE-78.md).
+**Where:** `crates/pdfs-core/src/auth.rs`, `TokenSink::flush`
+
+**Repro:** Refresh a session while the keyring lookup reports `NoEntry` for its existing blob.
+oo7 0.7.0 does this for a locked collection (upstream #614), reproduced with fake tokens on a
+private D-Bus connection. pdfs dropped the pending rotation and returned success, leaving the
+spent refresh token in the saved blob without triggering B61's retry or kernel recovery paths.
+The running session can still work, but restarting it exposes the stale saved credentials.
+
+**Fix:** Propagate the missing-session error so the rotation stays pending and is retried.
+Persistence still requires the matching existing blob; a retry never recreates a deleted
+session or overwrites a new login. This does not make a locked keyring writable, and pending
+tokens still need to reach it before power-off to survive a cold boot.
+
+**Verified:** The two regression tests
+`auth::tests::a_temporarily_missing_session_does_not_discard_a_rotation` and
+`auth::tests::retrying_a_missing_session_never_recreates_it_or_overwrites_a_new_login`
+failed before the fix and pass afterward. The oo7 fixture confirms its locked lookup behavior
+and repeated binary `SetSecret` persistence. The reporter's complete Fedora cold-boot sequence
+has not been reproduced; issue #78's precise trigger remains unconfirmed.
+
+---
+
 ### B283 — Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code
 
 **Status:** Fixed, not verified live
@@ -426,6 +457,76 @@ A `.ts` whose head lacks the 0x47 sync byte is recorded as having no thumbnail.
 videos of over 70 MiB and takes nothing from a video with an uploader's thumbnail.
 `real_video_fixture_yields_a_frame` passed on 2026-11-14 with ffmpeg 9.0 for a 46 MB MP4 with its
 index at the end, an MPEG-TS and an MKV.
+
+### B282 — A file kept offline is downloaded again after a change made elsewhere
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-13, while looking into B281. Nothing downloaded a pinned file again after the
+pin had downloaded it once.
+**Where:** `apply_event` in `crates/pdfs-fuse/src/background.rs`; the new pin keeper in
+`crates/pdfs-fuse/src/keeper.rs`
+
+**Repro:** Pin a file, then change it from another device. The event deletes the cached copy.
+The file stays listed as kept offline, `cached` is false, and the next read downloads it, or
+fails without a network. Rename or move it elsewhere and the same happens, though its content
+did not change. Add a file to a pinned folder from another device and it is never downloaded.
+A folder pin whose downloads failed while the link was down never retries them.
+
+**Cause:** A remote change to a known node called `ContentCache::evict`, which does not check
+pins, and only the pin request itself downloaded anything. The copy was also stored under the
+size the listing held at pin time. That is the ciphertext size until the size upgrade lands
+(B12), and a copy stored under it never matches the plaintext it holds.
+
+**Fix:** A remote change no longer evicts a pinned file's copy. The copy is checked against the
+revision's `(mtime, size)`, so a read of a newer revision does not take it. A rename keeps the
+revision's mtime (B123), so the copy stays valid. A pin keeper thread checks pins again and
+downloads files that are missing or stale:
+
+- the pins a batch of remote events changed, after the batch's listings are dropped;
+- a pinned folder that gets a new file;
+- every pin at startup, when the link comes back, and after the event feed loses continuity;
+- a file whose version is restored.
+
+Failed downloads are tried again with a backoff from 30 s to 30 min. Pinning settles a
+provisional size before it stores the copy.
+
+**Test:** `a_file_kept_offline_stays_on_disk_through_changes_made_elsewhere` in
+`crates/pdfs-fuse/src/sim/daemon.rs`. Another device edits a pinned file and a file in a pinned
+folder, and adds a file to that folder. The test waits until all three are cached, then reads
+them with the link down. With the keeper disabled, it fails with all three uncached.
+
+---
+
+### B281 — A file in a synced folder cannot be kept offline
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-13. An image was made available offline in the app, and it opened from the app
+with no download. `feh` opened it from a terminal and downloaded it each time. The two were not
+the same file. The app had kept `~/ProtonDrive/Pictures/photo.png`, in My files. The
+terminal opened `~/Pictures/photo.png`, in the on-demand synced folder `~/Pictures`. That
+copy is a separate node under Computers, uploaded on its own, with the same name and size but a
+different mtime. The daemon treats every program the same way: it does not look at the process
+that reads.
+**Where:** the `Pin` and `Unpin` handlers in `crates/pdfs-fuse/src/control.rs`
+
+**Repro:** Add a synced folder in on-demand mode and put a file in it. `pdfs pin` on its absolute
+path fails with "is not under the mountpoint". A relative path is resolved against My files, so
+it keeps a file of the same name there, if one exists, or fails. Reading the file in the synced
+folder then downloads it.
+
+**Cause:** Both handlers turned the path into a mount-relative one with `rel_to_mount`, which only
+knows the primary mount. B86 moved `ls`, `refresh`, `rm` and `mv` to `route_to_mount`, which finds
+the mount that serves an absolute path. Pin and unpin were left out.
+
+**Fix:** Pin and unpin route through `route_to_mount` and run on the mount that owns the path. A
+path in a mirror folder gets an error that says its files are already on this computer. The pin
+registry records the absolute local path for a pin made through an on-demand folder, so
+`pdfs pins`, the prompt and the HUD open the file through the folder it was kept from. Pins
+under the primary mount still record the path relative to it.
+
+**Test:** `pinning_a_file_in_an_on_demand_folder_keeps_that_folders_copy` in
+`crates/pdfs-fuse/src/sim/daemon.rs`. It pins a file through an on-demand folder's absolute path,
+takes the link down, and reads the file through that folder.
 
 ---
 

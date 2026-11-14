@@ -3,6 +3,8 @@ pub(crate) mod crumb;
 pub(crate) mod details;
 pub(crate) mod file_list;
 pub(crate) mod menu;
+pub(crate) mod photo_drag;
+pub(crate) mod player;
 pub(crate) mod scrubber;
 pub(crate) mod share_dialog;
 pub(crate) mod thumbnails;

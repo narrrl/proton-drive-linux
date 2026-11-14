@@ -24,6 +24,7 @@ const STOCK: &[&str] = &[
     // GTK's built-in icons
     "info-outline-symbolic",
     // Adwaita
+    "audio-x-generic-symbolic",
     "checkbox-checked-symbolic",
     "checkbox-symbolic",
     "computer-symbolic",
@@ -68,12 +69,14 @@ const STOCK: &[&str] = &[
     "text-x-generic-symbolic",
     "user-trash-symbolic",
     "video-x-generic-symbolic",
+    "view-fullscreen-symbolic",
     "view-grid-symbolic",
     "view-list-symbolic",
     "view-more-symbolic",
     "view-paged-symbolic",
     "view-pin-symbolic",
     "view-refresh-symbolic",
+    "view-restore-symbolic",
     "window-close-symbolic",
     "zoom-fit-best-symbolic",
     "zoom-in-symbolic",
