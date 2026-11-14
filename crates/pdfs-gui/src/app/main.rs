@@ -488,6 +488,7 @@ fn build_window(app: &adw::Application) {
             empty_actions: browser_widgets.empty_actions.clone(),
             summary: browser_widgets.summary.clone(),
             zoom: browser_widgets.zoom.clone(),
+            zoom_save: RefCell::new(None),
         },
         details: DetailsState {
             details: browser_widgets.details,
@@ -1523,6 +1524,9 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("<Alt>Left <Alt>Right", gettext_noop("Back / forward")),
                 ("<Alt>Up", gettext_noop("Parent folder")),
                 ("<Control>1 <Control>2", gettext_noop("Grid / list")),
+                ("<Control>plus", gettext_noop("Larger thumbnails")),
+                ("<Control>minus", gettext_noop("Smaller thumbnails")),
+                ("<Control>0", gettext_noop("Reset thumbnail size")),
                 ("F2", gettext_noop("Rename")),
                 ("Delete", gettext_noop("Move to Trash")),
                 ("Escape", gettext_noop("Clear the selection")),
@@ -1588,6 +1592,21 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 ui.browser.search.grab_focus();
             }
             gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
+            gtk4::gdk::Key::plus | gtk4::gdk::Key::equal | gtk4::gdk::Key::KP_Add
+                if ctrl && on_browser && !ui.browser.files.shows_list() =>
+            {
+                zoom_files(&ui, 1)
+            }
+            gtk4::gdk::Key::minus | gtk4::gdk::Key::KP_Subtract
+                if ctrl && on_browser && !ui.browser.files.shows_list() =>
+            {
+                zoom_files(&ui, -1)
+            }
+            gtk4::gdk::Key::_0 | gtk4::gdk::Key::KP_0
+                if ctrl && on_browser && !ui.browser.files.shows_list() =>
+            {
+                zoom_files(&ui, 0)
+            }
             gtk4::gdk::Key::_1 | gtk4::gdk::Key::_2 if ctrl && on_browser => set_files_view(
                 &ui,
                 FilesView {

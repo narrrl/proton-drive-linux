@@ -77,6 +77,8 @@ pub(crate) struct BrowserState {
     /// zoom value, and Proton account storage usage.
     pub(crate) summary: gtk4::Label,
     pub(crate) zoom: gtk4::Scale,
+    /// Saves the zoom once the slider rests, not on every step.
+    pub(crate) zoom_save: RefCell<Option<glib::SourceId>>,
 }
 
 /// Idle pause after the last keystroke before a search query is sent, so typing
@@ -87,9 +89,11 @@ pub(crate) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 pub(crate) const SEARCH_LIMIT: usize = 200;
 
 /// Browser grid thumbnail size controlled by the bottom zoom slider. The
-/// default preserves the former fixed 72 px presentation.
+/// default preserves the former fixed 72 px presentation. The largest size is
+/// big enough to tell photos apart by their thumbnail, and thumbnails are
+/// 512 px, so they stay sharp up to it on a 2× screen.
 pub(crate) const GRID_THUMB_MIN: i32 = 48;
-pub(crate) const GRID_THUMB_MAX: i32 = 144;
+pub(crate) const GRID_THUMB_MAX: i32 = 256;
 pub(crate) const GRID_THUMB_DEFAULT: i32 = 72;
 pub(crate) const GRID_THUMB_STEP: i32 = 8;
 
@@ -801,6 +805,7 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>) {
             &[],
         )));
         ui_zoom.browser.files.set_thumbnail_size(size);
+        save_icon_size(&ui_zoom, size);
     });
 
     files
@@ -1306,6 +1311,11 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
 
     let view = ui.dirs.load_config().files_view;
     ui.browser.view.set(view);
+    if let Some(size) = view.icon_size {
+        ui.browser
+            .zoom
+            .set_value(f64::from(size.clamp(GRID_THUMB_MIN, GRID_THUMB_MAX)));
+    }
     let layout = gio::SimpleAction::new_stateful(
         "view",
         Some(glib::VariantTy::STRING),
@@ -1405,6 +1415,41 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
         true
     });
     ui.browser.content.add_controller(drop);
+}
+
+/// Remember the grid's icon size, once the slider has rested for a moment.
+fn save_icon_size(ui: &Rc<Ui>, size: i32) {
+    let mut view = ui.browser.view.get();
+    if view.icon_size == Some(size) {
+        return;
+    }
+    view.icon_size = Some(size);
+    ui.browser.view.set(view);
+    if let Some(source) = ui.browser.zoom_save.borrow_mut().take() {
+        source.remove();
+    }
+    let ui_save = ui.clone();
+    let source = glib::timeout_add_local_once(Duration::from_millis(500), move || {
+        ui_save.browser.zoom_save.borrow_mut().take();
+        let mut config = ui_save.dirs.load_config();
+        config.files_view.icon_size = ui_save.browser.view.get().icon_size;
+        if let Err(e) = ui_save.dirs.save_config(&config) {
+            tracing::warn!("cannot save the icon size: {e}");
+        }
+    });
+    *ui.browser.zoom_save.borrow_mut() = Some(source);
+}
+
+/// Step the grid's icon size by `steps` slider notches; `0` resets it.
+pub(crate) fn zoom_files(ui: &Rc<Ui>, steps: i32) {
+    let zoom = &ui.browser.zoom;
+    let size = if steps == 0 {
+        GRID_THUMB_DEFAULT
+    } else {
+        (zoom.value().round() as i32 + steps * GRID_THUMB_STEP)
+            .clamp(GRID_THUMB_MIN, GRID_THUMB_MAX)
+    };
+    zoom.set_value(f64::from(size));
 }
 
 fn layout_name(view: FilesView) -> &'static str {

@@ -61,6 +61,9 @@ Existing folders remain device backups; older builds cannot open the upgraded da
   - The zoom level and the tile shape are remembered between runs.
   - In the photo viewer, the details panel lies over the photo when the window is
     narrow instead of squeezing it.
+- **Larger icons in My files.** The icon size slider goes up to 256 px, big enough to
+  tell photos apart by their thumbnail. Ctrl+plus, Ctrl+minus and Ctrl+0 change it from
+  the keyboard, and the size is remembered between runs.
 
 ### Fixed
 

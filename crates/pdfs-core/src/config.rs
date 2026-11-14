@@ -224,6 +224,10 @@ pub struct FilesView {
     pub descending: bool,
     /// Folders ahead of files, whatever the sort.
     pub folders_first: bool,
+    /// The icon grid's thumbnail edge in logical pixels. `None` means the
+    /// app's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_size: Option<i32>,
 }
 
 impl Default for FilesView {
@@ -233,6 +237,7 @@ impl Default for FilesView {
             sort: FileSort::Name,
             descending: false,
             folders_first: true,
+            icon_size: None,
         }
     }
 }
@@ -777,6 +782,7 @@ mod tests {
                 sort: FileSort::Modified,
                 descending: true,
                 folders_first: false,
+                icon_size: Some(192),
             },
             photos_view: PhotosView {
                 row_height: Some(240),
@@ -856,6 +862,7 @@ mod tests {
         let partial: FilesView = serde_json::from_str(r#"{"sort":"size"}"#).unwrap();
         assert_eq!(partial.sort, FileSort::Size);
         assert!(partial.folders_first);
+        assert_eq!(partial.icon_size, None);
     }
 
     #[test]
