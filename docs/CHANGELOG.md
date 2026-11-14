@@ -136,6 +136,14 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 - **A search in My files stays.** It was replaced by the folder's listing whenever files
   changed, on refresh and on coming back to the page, while the query stayed in the box.
 
+- **The photo viewer's buttons are readable on any photo.** They were white on a see-through
+  white, and vanished over a bright photo. The bar now keeps only the favorite star, the details
+  and a menu, which names Slideshow, Save a Copy, Open With, Add to Album, Show on Map and Move to
+  Trash in words where eight icons stood. A shot stored as more than one file shows a "RAW" or
+  "Live" switch, or "2 of 3" for a burst, where an unlabelled icon was. The title reads
+  "Wednesday, October 7, 2026, 13:42" rather than a timestamp. Delete asks first, as it does in
+  the grid, and Alt+Left closes the viewer.
+
 - **A date jump in Photos stops when you look elsewhere.** A jump still loading the timeline
   kept going after another filter, album or place was opened.
 

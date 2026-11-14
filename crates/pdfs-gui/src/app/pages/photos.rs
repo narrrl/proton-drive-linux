@@ -1441,7 +1441,7 @@ pub(crate) fn wire_gallery(
     let ui_album = ui.clone();
     selection.album.connect_clicked(move |_| {
         let uids: Vec<String> = ui_album.gallery.selected.borrow().iter().cloned().collect();
-        prompt_add_to_album(&ui_album, uids);
+        prompt_add_to_album(&ui_album, uids, None);
     });
     let ui_remove = ui.clone();
     selection.remove.connect_clicked(move |_| {
@@ -2764,6 +2764,18 @@ pub(crate) fn delete_selected(ui: &Rc<Ui>) {
 
 /// Confirm, then move the photos behind `uids` to Proton trash.
 pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
+    ask_trash_photos(ui, uids, None, || {});
+}
+
+/// [`confirm_trash_photos`] over `parent` rather than the main window, for
+/// the photo viewer, which covers it. `before` runs once the user confirms,
+/// before the photos go.
+pub(crate) fn ask_trash_photos(
+    ui: &Rc<Ui>,
+    uids: Vec<String>,
+    parent: Option<gtk4::Window>,
+    before: impl Fn() + 'static,
+) {
     if uids.is_empty() {
         return;
     }
@@ -2803,10 +2815,11 @@ pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
-    let win = ui_window(ui);
+    let win = parent.or_else(|| ui_window(ui));
     let ui = ui.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "trash" {
+            before();
             trash_photos(&ui, uids.clone(), false);
         }
     });
@@ -3979,7 +3992,7 @@ fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64
     menu.section();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     menu.item(&gettext("Add to Album…"), move || {
-        prompt_add_to_album(&ui_c, vec![uid.clone()])
+        prompt_add_to_album(&ui_c, vec![uid.clone()], None)
     });
     let open_album = ui.gallery.album.borrow().clone();
     if let Some(album) = open_album.filter(|album| !album.shared) {

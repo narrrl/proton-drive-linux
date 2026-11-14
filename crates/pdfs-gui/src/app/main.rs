@@ -1339,7 +1339,7 @@ fn install_window_actions(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     // The Albums view's New Album button.
     let new_album = gio::SimpleAction::new("new-album", None);
     let ui_album = ui.clone();
-    new_album.connect_activate(move |_, _| prompt_new_album(&ui_album, Vec::new()));
+    new_album.connect_activate(move |_, _| prompt_new_album(&ui_album, Vec::new(), None));
     window.add_action(&new_album);
 
     let shortcuts = gio::SimpleAction::new("shortcuts", None);
@@ -1560,8 +1560,10 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("Home End", gettext_noop("First / last photo")),
                 ("i", gettext_noop("Show details")),
                 ("f", gettext_noop("Fullscreen")),
+                ("F5", gettext_noop("Slideshow")),
+                ("F10", gettext_noop("More")),
                 ("Delete", gettext_noop("Move to Trash")),
-                ("Escape", gettext_noop("Close")),
+                ("Escape <Alt>Left", gettext_noop("Close")),
             ],
         ),
     ];
@@ -2030,6 +2032,33 @@ mod tests {
         // jumping somewhere arbitrary.
         assert_eq!(next("elsewhere"), None);
         assert!(next_group_member(&[], "jpeg").is_none());
+    }
+
+    /// The pill names what kind of shot it switches through, and lights up
+    /// on the file that is not the shot's main one.
+    #[test]
+    fn the_group_pill_names_the_kind_of_shot() {
+        let pair = [
+            member("jpeg", Some("IMG_1.JPG"), PhotoKind::Photo),
+            member("raw", Some("IMG_1.CR2"), PhotoKind::Raw),
+        ];
+        assert_eq!(group_pill(&pair, "jpeg"), Some(("RAW".into(), false)));
+        assert_eq!(group_pill(&pair, "raw"), Some(("RAW".into(), true)));
+
+        let live = [
+            member("still", Some("IMG_2.HEIC"), PhotoKind::Photo),
+            member("clip", Some("IMG_2.MOV"), PhotoKind::Video),
+        ];
+        assert_eq!(group_pill(&live, "still"), Some(("Live".into(), false)));
+        assert_eq!(group_pill(&live, "clip"), Some(("Live".into(), true)));
+
+        let burst = [
+            member("a", None, PhotoKind::Photo),
+            member("b", None, PhotoKind::Photo),
+            member("c", None, PhotoKind::Photo),
+        ];
+        assert_eq!(group_pill(&burst, "b"), Some(("2 of 3".into(), false)));
+        assert_eq!(group_pill(&burst, "elsewhere"), None);
     }
 
     /// The switch names what it will show; a file whose name the daemon has not
