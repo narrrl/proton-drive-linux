@@ -1792,6 +1792,11 @@ pub struct PhotoItem {
     /// the JPEG it shows is not the whole of what is stored.
     #[serde(default)]
     pub has_raw: bool,
+    /// GeoNames id of the town the photo was taken in, when its location is
+    /// known; [`crate::places::city`] names it. Older daemons omit it, and
+    /// album entries do not carry it.
+    #[serde(default)]
+    pub place_id: Option<u32>,
 }
 
 /// A daemon too old to classify a timeline entry is assumed to have served a

@@ -334,6 +334,13 @@ pub(crate) struct ShareDialog {
 /// Open the per-node Share dialog: invite Proton/external users, manage who has
 /// access and their roles, and create/copy/remove a public link.
 pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
+    open_share_dialog_over(ui, entry, None);
+}
+
+/// [`open_share_dialog`] over `parent` rather than the main window. The photo
+/// viewer is a window of its own, and a dialog on the main window would open
+/// behind it.
+pub(crate) fn open_share_dialog_over(ui: &Rc<Ui>, entry: &DirEntry, parent: Option<gtk4::Window>) {
     if !*ui.mounted.borrow() {
         toast_error(
             ui,
@@ -491,7 +498,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         }
     });
     share_dialog_reload(&state);
-    dialog.present(ui_window(ui).as_ref());
+    dialog.present(parent.or_else(|| ui_window(ui)).as_ref());
 }
 
 /// Re-fetch the node's share and rebuild the people + public-link sections.

@@ -1562,6 +1562,7 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("f", gettext_noop("Fullscreen")),
                 ("F5", gettext_noop("Slideshow")),
                 ("F10", gettext_noop("More")),
+                ("<Control>c", gettext_noop("Copy Image")),
                 ("Delete", gettext_noop("Move to Trash")),
                 ("Escape <Alt>Left", gettext_noop("Close")),
             ],
@@ -2012,6 +2013,7 @@ mod tests {
             favorite: false,
             group_size: 2,
             has_raw: kind == PhotoKind::Raw,
+            place_id: None,
         }
     }
 

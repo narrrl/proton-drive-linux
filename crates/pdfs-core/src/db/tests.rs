@@ -363,6 +363,23 @@ fn place_photos_carry_their_own_location() {
     );
 }
 
+/// A timeline photo names the town it was taken in, so the viewer can show it;
+/// one without a location names none.
+#[test]
+fn timeline_photos_name_their_town() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        located("b", 500, "IMG_5.JPG", BERLIN),
+        TimelineRow::new("n", 400),
+    ])
+    .unwrap();
+    let berlin = db.photo_places().unwrap()[0].id;
+    let mut photos = db.photos_by_uid(&["b".into(), "n".into()]).unwrap();
+    photos.sort_by(|a, b| a.uid.cmp(&b.uid));
+    let towns: Vec<Option<u32>> = photos.iter().map(|photo| photo.place_id).collect();
+    assert_eq!(towns, [Some(berlin), None]);
+}
+
 /// A refresh that skips an already-resolved photo keeps where it was taken; one
 /// that reads the node again takes what the node now says.
 #[test]

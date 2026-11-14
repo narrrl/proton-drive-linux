@@ -186,6 +186,8 @@ impl Db {
                     // made, and it shows exactly what they put in it.
                     group_size: 1,
                     has_raw: false,
+                    // Album rows carry no location.
+                    place_id: None,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -247,6 +249,8 @@ impl Db {
                     // made, and it shows exactly what they put in it.
                     group_size: 1,
                     has_raw: false,
+                    // Album rows carry no location.
+                    place_id: None,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

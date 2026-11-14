@@ -81,6 +81,11 @@ pub(crate) struct Viewer {
     /// rests; whether the pointer is over one of them (which keeps them up);
     /// and the pending fade-out.
     pub(crate) chrome: Vec<gtk4::Revealer>,
+    /// The strip of thumbnails along the bottom, its selection (the photo on
+    /// screen), and the revealer it fades with. Hidden in a slideshow.
+    pub(crate) strip: gtk4::ListView,
+    pub(crate) strip_selection: gtk4::SingleSelection,
+    pub(crate) strip_reveal: gtk4::Revealer,
     pub(crate) chrome_hover: Cell<bool>,
     pub(crate) chrome_source: RefCell<Option<glib::SourceId>>,
     /// The ⋮ button, and whether its menu is open, which keeps the controls
@@ -93,6 +98,8 @@ pub(crate) struct Viewer {
     pub(crate) slideshow: Cell<bool>,
     pub(crate) slide_source: RefCell<Option<glib::SourceId>>,
     pub(crate) slide_fullscreened: Cell<bool>,
+    /// Toasts over the lightbox. The main window's would land behind it.
+    pub(crate) toasts: adw::ToastOverlay,
 }
 
 /// Camera/exposure/location facts pulled from a photo's own EXIF tags, as
@@ -389,6 +396,7 @@ fn start_slideshow(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
         viewer.slide_fullscreened.set(true);
     }
     hide_chrome(viewer);
+    viewer.strip_reveal.set_visible(false);
     if !viewer.loading.get() {
         arm_slide(ui, viewer);
     }
@@ -397,6 +405,9 @@ fn start_slideshow(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
 /// Stop the slideshow, leaving fullscreen only if the slideshow entered it.
 fn stop_slideshow(viewer: &Rc<Viewer>) {
     viewer.slideshow.set(false);
+    viewer
+        .strip_reveal
+        .set_visible(viewer.strip_selection.n_items() > 1);
     disarm_slide(viewer);
     if viewer.slide_fullscreened.replace(false) {
         viewer.window.unfullscreen();
@@ -854,14 +865,14 @@ fn hide_chrome(viewer: &Rc<Viewer>) {
 }
 
 /// Copy the photo on screen to where the user picks, under its Drive name.
-pub(crate) fn save_photo_to_disk(ui: &Rc<Ui>, window: &gtk4::Window, source: &str, name: &str) {
+pub(crate) fn save_photo_to_disk(viewer: &Rc<Viewer>, source: &str, name: &str) {
     let dialog = gtk4::FileDialog::builder()
         .title(gettext("Save a Copy"))
         .initial_name(name)
         .build();
     let source = source.to_string();
-    let ui = ui.clone();
-    dialog.save(Some(window), gio::Cancellable::NONE, move |res| {
+    let toasts = viewer.toasts.clone();
+    dialog.save(Some(&viewer.window), gio::Cancellable::NONE, move |res| {
         // An error here is the dialog being dismissed.
         let Some(dest) = res.ok().and_then(|file| file.path()) else {
             return;
@@ -870,24 +881,65 @@ pub(crate) fn save_photo_to_disk(ui: &Rc<Ui>, window: &gtk4::Window, source: &st
         glib::spawn_future_local(async move {
             let copied =
                 gio::spawn_blocking(move || std::fs::copy(&source, &dest).map(|_| dest)).await;
-            match copied {
+            let message = match copied {
                 Ok(Ok(dest)) => {
                     let saved = dest.file_name().map_or_else(
                         || dest.display().to_string(),
                         |name| name.to_string_lossy().into_owned(),
                     );
                     // Translators: {name} is the saved file's name.
-                    toast(&ui, &gettext_f("Saved “{name}”", &[("name", &saved)]));
+                    gettext_f("Saved “{name}”", &[("name", &saved)])
                 }
-                Ok(Err(e)) => toast_error(&ui, &gettext("Couldn't save the copy"), &e.to_string()),
-                Err(_) => toast_error(
-                    &ui,
+                Ok(Err(e)) => failure(&gettext("Couldn't save the copy"), &e.to_string()),
+                Err(_) => failure(
                     &gettext("Couldn't save the copy"),
                     &gettext("The copy was interrupted."),
                 ),
-            }
+            };
+            toasts.add_toast(
+                adw::Toast::builder()
+                    .title(&message)
+                    .use_markup(false)
+                    .build(),
+            );
         });
     });
+}
+
+/// A failed action's toast text, worded like [`toast_error`]'s.
+fn failure(what: &str, detail: &str) -> String {
+    tracing::warn!("{what}: {detail}");
+    // Translators: a failed action's toast. {what} says what failed, such as
+    // "Couldn't rename"; {detail} is the reason, usually untranslated text
+    // from the mount service.
+    gettext_f("{what}: {detail}", &[("what", what), ("detail", detail)])
+}
+
+/// Put the photo on screen on the clipboard as an image, for pasting into a
+/// chat or a document.
+fn copy_shown_photo(_ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    let Some(texture) = viewer
+        .picture
+        .paintable()
+        .and_downcast::<gtk4::gdk::Texture>()
+    else {
+        return;
+    };
+    viewer.window.clipboard().set_texture(&texture);
+    viewer.toasts.add_toast(
+        adw::Toast::builder()
+            // Translators: toast after the photo viewer put the photo on the clipboard.
+            .title(gettext("Image copied"))
+            .use_markup(false)
+            .build(),
+    );
+}
+
+/// Open the Share dialog for the photo on screen, over the lightbox.
+fn share_shown_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+    let uid = viewer.uid.borrow().clone();
+    let name = viewer.name.borrow().clone().unwrap_or_default();
+    share_photo(ui, uid, name, Some(viewer.window.clone()));
 }
 
 /// A symlink to the cached file `path` under its Drive `name`, in a directory
@@ -1040,16 +1092,105 @@ fn photo_title(capture_time: i64) -> String {
     }
 }
 
-/// Set the lightbox's title (the photo's date) and its "12 of 340" counter.
+/// Set the lightbox's title (the photo's date) and the line under it: the town
+/// it was taken in, when known, and its "12 of 340" counter.
 fn show_photo_position(ui: &Rc<Ui>, viewer: &Rc<Viewer>, index: u32, capture_time: i64) {
     let loaded = ui.gallery.model.n_items();
     let more = ui.gallery.has_more.get();
     viewer.prev.set_sensitive(index > 0);
     viewer.next.set_sensitive(index + 1 < loaded || more);
     viewer.title.set_label(&photo_title(capture_time));
+    let position = position_label(index, loaded, more, gallery_total(ui));
+    let place = viewer_item(ui, viewer, &viewer.uid.borrow())
+        .and_then(|item| item.place_id)
+        .and_then(pdfs_core::places::city)
+        .map(|city| city.name);
+    let line = match place {
+        Some(place) => {
+            let args = [("place", place), ("position", position.as_str())];
+            // Translators: the line under the photo viewer's title, such as "Berlin · 12 of 340"; {place} is a town, {position} the counter.
+            gettext_f("{place} · {position}", &args)
+        }
+        None => position,
+    };
+    viewer.counter.set_label(&line);
     viewer
-        .counter
-        .set_label(&position_label(index, loaded, more, gallery_total(ui)));
+        .strip_reveal
+        .set_visible(loaded > 1 && !viewer.slideshow.get());
+    mark_in_strip(viewer, index);
+}
+
+/// Mark the photo at `index` in the strip and bring it into view.
+fn mark_in_strip(viewer: &Rc<Viewer>, index: u32) {
+    if index >= viewer.strip_selection.n_items() {
+        return;
+    }
+    viewer.strip_selection.set_selected(index);
+    viewer
+        .strip
+        .scroll_to(index, gtk4::ListScrollFlags::NONE, None);
+}
+
+/// The strip of thumbnails along the lightbox's bottom edge: the gallery's
+/// photos in its order, the one on screen marked. A click steps straight to a
+/// photo; the thumbnails come through the gallery's own pipeline and cache.
+fn build_strip(ui: &Rc<Ui>) -> (gtk4::ListView, gtk4::SingleSelection) {
+    let selection = gtk4::SingleSelection::new(Some(ui.gallery.model.clone()));
+    selection.set_autoselect(false);
+    selection.set_can_unselect(true);
+
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        let picture = gtk4::Picture::builder()
+            .content_fit(gtk4::ContentFit::Cover)
+            .width_request(56)
+            .height_request(56)
+            .can_shrink(true)
+            .build();
+        picture.add_css_class("viewer-strip-thumb");
+        // The arrow keys belong to the lightbox, not to the strip.
+        item.set_focusable(false);
+        item.set_child(Some(&picture));
+    });
+    let ui_bind = ui.clone();
+    factory.connect_bind(move |_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        let Some(picture) = item.child().and_downcast::<gtk4::Picture>() else {
+            return;
+        };
+        let Some(boxed) = item.item().and_downcast::<BoxedAnyObject>() else {
+            return;
+        };
+        let photo = boxed.borrow::<PhotoItem>().clone();
+        picture.set_paintable(gtk4::gdk::Paintable::NONE);
+        picture.set_tooltip_text(Some(&dates::full(photo.capture_time)));
+        want_thumb(&ui_bind, &photo, &picture);
+        schedule_thumbs(&ui_bind);
+    });
+    let ui_unbind = ui.clone();
+    factory.connect_unbind(move |_, item| {
+        let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+        let (Some(picture), Some(boxed)) = (
+            item.child().and_downcast::<gtk4::Picture>(),
+            item.item().and_downcast::<BoxedAnyObject>(),
+        ) else {
+            return;
+        };
+        let uid = boxed.borrow::<PhotoItem>().uid.clone();
+        ui_unbind
+            .gallery
+            .release_thumb(&uid, |waiting| waiting == &picture);
+    });
+
+    let list = gtk4::ListView::builder()
+        .model(&selection)
+        .factory(&factory)
+        .orientation(gtk4::Orientation::Horizontal)
+        .focusable(false)
+        .build();
+    list.add_css_class("viewer-strip");
+    (list, selection)
 }
 
 /// The in-app lightbox: the photo or video, edge-to-edge on a dark backdrop,
@@ -1208,6 +1349,20 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
     let top_reveal = fade(top_bar.upcast_ref(), gtk4::Align::Fill, gtk4::Align::Start);
     overlay.add_overlay(&top_reveal);
 
+    let (strip, strip_selection) = build_strip(ui);
+    let strip_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::External)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&strip)
+        .build();
+    strip_scroll.add_css_class("viewer-strip-bar");
+    let strip_reveal = fade(
+        strip_scroll.upcast_ref(),
+        gtk4::Align::Fill,
+        gtk4::Align::End,
+    );
+    overlay.add_overlay(&strip_reveal);
+
     // Details panel: docked beside the image as a real surface, so opening it
     // narrows the photo instead of covering part of it.
     let info_rows = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
@@ -1295,7 +1450,9 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
     narrow.add_setter(&info_split, "collapsed", Some(&true.to_value()));
     adw_window.add_breakpoint(narrow);
     let body = info_split.clone();
-    adw_window.set_content(Some(&body));
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&body));
+    adw_window.set_content(Some(&toasts));
 
     let viewer = Rc::new(Viewer {
         window: window.clone(),
@@ -1326,7 +1483,15 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         pinch_start: Cell::new(1.0),
         drag_start: Cell::new((0.0, 0.0)),
         pointer: Cell::new((0.0, 0.0)),
-        chrome: vec![top_reveal.clone(), prev_reveal.clone(), next_reveal.clone()],
+        chrome: vec![
+            top_reveal.clone(),
+            prev_reveal.clone(),
+            next_reveal.clone(),
+            strip_reveal.clone(),
+        ],
+        strip: strip.clone(),
+        strip_selection: strip_selection.clone(),
+        strip_reveal: strip_reveal.clone(),
         chrome_hover: Cell::new(false),
         chrome_source: RefCell::new(None),
         more: more_btn.clone(),
@@ -1334,6 +1499,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         slideshow: Cell::new(false),
         slide_source: RefCell::new(None),
         slide_fullscreened: Cell::new(false),
+        toasts,
     });
 
     let initial_idx = find_photo_index(&ui.gallery.model, &initial_uid).unwrap_or(0);
@@ -1359,7 +1525,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         }
     });
     body.add_controller(motion);
-    for revealer in [&top_reveal, &prev_reveal, &next_reveal] {
+    for revealer in [&top_reveal, &prev_reveal, &next_reveal, &strip_reveal] {
         let hover = gtk4::EventControllerMotion::new();
         let viewer_enter = Rc::downgrade(&viewer);
         hover.connect_enter(move |_, _, _| {
@@ -1475,13 +1641,53 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         w_close.close();
     });
 
+    // A click on a thumbnail selects it; step there. Every selection the
+    // lightbox sets itself is the photo on screen, and the model's own changes
+    // (a page landing, a favorite rewritten in place) keep the selected photo
+    // or drop it, so a selection elsewhere can only be the user's.
+    let ui_strip = ui.clone();
+    let viewer_strip = Rc::downgrade(&viewer);
+    strip_selection.connect_selection_changed(move |selection, _, _| {
+        let Some(viewer) = viewer_strip.upgrade() else {
+            return;
+        };
+        let picked = selection.selected();
+        let Some(current) = find_photo_index(&ui_strip.gallery.model, &viewer.uid.borrow()) else {
+            return;
+        };
+        if picked != gtk4::INVALID_LIST_POSITION && picked != current {
+            navigate_photo(&ui_strip, &viewer, picked as i32 - current as i32);
+        }
+    });
+    let viewer_items = Rc::downgrade(&viewer);
+    let ui_items = ui.clone();
+    let items_handler = ui
+        .gallery
+        .model
+        .connect_items_changed(move |model, _, _, _| {
+            let Some(viewer) = viewer_items.upgrade() else {
+                return;
+            };
+            if let Some(index) = find_photo_index(model, &viewer.uid.borrow()) {
+                viewer.strip_selection.set_selected(index);
+            }
+            viewer
+                .strip_reveal
+                .set_visible(ui_items.gallery.model.n_items() > 1 && !viewer.slideshow.get());
+        });
+
     // The one strong handle on the viewer. Every handler holds a weak one: a
     // strong one in a handler of a widget the viewer holds is a cycle, which
     // kept every closed lightbox, its window and its full-size photo in memory
     // for the life of the app.
     let keep = RefCell::new(Some(viewer.clone()));
     let ui_close = ui.clone();
+    let items_handler = RefCell::new(Some(items_handler));
     window.connect_close_request(move |_| {
+        // The gallery's model outlives the lightbox.
+        if let Some(handler) = items_handler.borrow_mut().take() {
+            ui_close.gallery.model.disconnect(handler);
+        }
         if let Some(viewer) = keep.borrow_mut().take() {
             reveal_photo(&ui_close, &viewer.uid.borrow());
             stop_video(&viewer);
@@ -1700,6 +1906,9 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
             Some("Delete" | "KP_Delete") => trash_shown_photo(&ui_key, &viewer_key),
             Some("Escape" | "q") => w_key.close(),
             Some("w") if ctrl => w_key.close(),
+            Some("c") if ctrl && viewer_key.path.borrow().is_some() && !playing_video => {
+                copy_shown_photo(&ui_key, &viewer_key)
+            }
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
@@ -1726,10 +1935,18 @@ fn open_viewer_menu(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
     let mut menu = ActionMenu::new();
     menu.item(&gettext("Slideshow"), with_viewer(toggle_slideshow, ui));
     menu.section();
-    // Both need the full-size file, which may still be downloading.
+    // These need the full-size file, which may still be downloading.
     if viewer.path.borrow().is_some() {
+        let still = viewer.media.visible_child_name().as_deref() == Some("photo");
+        if still {
+            // Translators: menu item that puts the photo on the clipboard as an image.
+            menu.item(&gettext("Copy Image"), with_viewer(copy_shown_photo, ui));
+        }
         menu.item(&gettext("Save a Copy…"), with_viewer(save_shown_photo, ui));
         menu.item(&gettext("Open With…"), with_viewer(open_shown_photo, ui));
+    }
+    if photo_shareable(ui) {
+        menu.item(&gettext("Share…"), with_viewer(share_shown_photo, ui));
     }
     // A RAW is not on the timeline, and an album holds the shot it belongs to.
     if find_photo_index(&ui.gallery.model, &viewer.uid.borrow()).is_some() {
@@ -1766,10 +1983,10 @@ fn open_viewer_menu(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
     });
 }
 
-fn save_shown_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
+fn save_shown_photo(_ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
     if let Some(path) = viewer.path.borrow().as_deref() {
         let name = viewer.name.borrow();
-        save_photo_to_disk(ui, &viewer.window, path, name.as_deref().unwrap_or("photo"));
+        save_photo_to_disk(viewer, path, name.as_deref().unwrap_or("photo"));
     }
 }
 

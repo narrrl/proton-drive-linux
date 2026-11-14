@@ -73,6 +73,13 @@ scale.browser-status-meter trough { min-width: 140px; min-height: 6px; }
 .viewer-group-pill { color: white; background-color: rgba(0, 0, 0, 0.5); border-radius: 999px; min-height: 36px; padding: 0 14px; font-weight: 700; font-size: 0.85rem; }
 .viewer-group-pill:hover { background-color: rgba(0, 0, 0, 0.75); color: white; }
 .viewer-group-pill.lit { background-color: var(--accent-bg-color); color: var(--accent-fg-color); }
+/* The thumbnail strip along the lightbox's bottom edge, the photo on screen ringed in the accent. */
+.viewer-strip-bar { background: linear-gradient(to top, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0)); padding: 28px 12px 10px 12px; }
+.viewer-strip { background: none; }
+.viewer-strip > row { padding: 2px; margin: 0 2px; border-radius: 8px; background: none; }
+.viewer-strip > row:hover { background-color: rgba(255, 255, 255, 0.15); }
+.viewer-strip > row:selected { background-color: var(--accent-bg-color); }
+.viewer-strip-thumb { border-radius: 6px; background-color: rgba(255, 255, 255, 0.08); }
 .viewer-nav-btn { background-color: rgba(0, 0, 0, 0.45); color: white; margin: 20px; min-width: 44px; min-height: 44px; border-radius: 50%; opacity: 0.7; transition: opacity 150ms ease, background-color 150ms ease; }
 .viewer-nav-btn:hover { background-color: rgba(0, 0, 0, 0.85); color: white; opacity: 1; }
 .viewer-nav-btn:disabled { opacity: 0; }

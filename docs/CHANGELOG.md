@@ -79,6 +79,15 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   the grid to the photo it was showing. Alt+Left and Backspace go back a level in Shared with me
   and Computers and leave an open album or place in Photos, as Escape does too.
 
+- **Share photos, and more in the photo viewer.**
+  - **Share…** in a photo's menu and in the viewer's ⋮ menu opens the usual Share dialog: invite
+    people or make a public link. It is not offered for a photo in an album someone else shared.
+  - **Copy Image** (Ctrl+C) puts the photo on screen on the clipboard.
+  - A strip of thumbnails along the bottom of the viewer shows the photos around the one on
+    screen; click one to jump to it. It fades with the other controls and stays hidden during a
+    slideshow.
+  - The line under the date names the town the photo was taken in, when it is known.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter

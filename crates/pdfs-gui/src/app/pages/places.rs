@@ -267,7 +267,12 @@ fn want_map_thumb(ui: &Rc<Ui>, photo: &PhotoItem) {
     }
     // A town's card may be waiting for the same photo: share its picture
     // rather than take its place in the queue.
-    let waiting = ui.gallery.thumb_wanted.borrow().get(&photo.uid).cloned();
+    let waiting = ui
+        .gallery
+        .thumb_wanted
+        .borrow()
+        .get(&photo.uid)
+        .and_then(|waiting| waiting.first().cloned());
     let picture = waiting.unwrap_or_else(|| {
         let picture = gtk4::Picture::new();
         want_thumb(ui, photo, &picture);
@@ -362,7 +367,12 @@ fn show_spot_photos(ui: &Rc<Ui>, photos: Vec<(PlaceInfo, PhotoItem)>, (x, y): (f
 /// Show photo's thumbnail in `picture`, sharing one another widget is
 /// already waiting for.
 fn spot_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture) {
-    let waiting = ui.gallery.thumb_wanted.borrow().get(&photo.uid).cloned();
+    let waiting = ui
+        .gallery
+        .thumb_wanted
+        .borrow()
+        .get(&photo.uid)
+        .and_then(|waiting| waiting.first().cloned());
     match waiting {
         Some(waiting) => {
             waiting

@@ -598,10 +598,7 @@ pub(crate) fn want_cover(ui: &Rc<Ui>, uid: String, picture: &gtk4::Picture) {
     if ui.gallery.photo_nothumb.borrow().contains(&uid) {
         return;
     }
-    ui.gallery
-        .thumb_wanted
-        .borrow_mut()
-        .insert(uid.clone(), picture.clone());
+    ui.gallery.await_thumb(&uid, picture);
     let mut queue = ui.gallery.thumb_queue.borrow_mut();
     if !queue.contains(&uid) {
         queue.push_back(uid);
