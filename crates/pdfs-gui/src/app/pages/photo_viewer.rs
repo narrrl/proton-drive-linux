@@ -279,6 +279,7 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     clear_info(viewer);
     stop_video(viewer);
     viewer.media.set_visible_child_name("photo");
+    sync_strip(viewer);
     reset_zoom(viewer);
     // A slideshow waits for this photo to land before it starts counting.
     disarm_slide(viewer);
@@ -356,6 +357,7 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
             None => {
                 viewer.video.set_filename(Some(&path));
                 viewer.media.set_visible_child_name("video");
+                sync_strip(&viewer);
                 *viewer.path.borrow_mut() = Some(path.clone());
                 show_info(&viewer, size, ExifInfo::default());
             }
@@ -396,7 +398,7 @@ fn start_slideshow(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
         viewer.slide_fullscreened.set(true);
     }
     hide_chrome(viewer);
-    viewer.strip_reveal.set_visible(false);
+    sync_strip(viewer);
     if !viewer.loading.get() {
         arm_slide(ui, viewer);
     }
@@ -405,9 +407,7 @@ fn start_slideshow(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
 /// Stop the slideshow, leaving fullscreen only if the slideshow entered it.
 fn stop_slideshow(viewer: &Rc<Viewer>) {
     viewer.slideshow.set(false);
-    viewer
-        .strip_reveal
-        .set_visible(viewer.strip_selection.n_items() > 1);
+    sync_strip(viewer);
     disarm_slide(viewer);
     if viewer.slide_fullscreened.replace(false) {
         viewer.window.unfullscreen();
@@ -1114,10 +1114,18 @@ fn show_photo_position(ui: &Rc<Ui>, viewer: &Rc<Viewer>, index: u32, capture_tim
         None => position,
     };
     viewer.counter.set_label(&line);
+    sync_strip(viewer);
+    mark_in_strip(viewer, index);
+}
+
+/// Show the strip of thumbnails when there is more than one photo to pick
+/// from. Not in a slideshow, and not over a video, where it would cover the
+/// player's seek bar.
+fn sync_strip(viewer: &Rc<Viewer>) {
+    let video = viewer.media.visible_child_name().as_deref() == Some("video");
     viewer
         .strip_reveal
-        .set_visible(loaded > 1 && !viewer.slideshow.get());
-    mark_in_strip(viewer, index);
+        .set_visible(viewer.strip_selection.n_items() > 1 && !viewer.slideshow.get() && !video);
 }
 
 /// Mark the photo at `index` in the strip and bring it into view.
@@ -1239,6 +1247,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         .hexpand(true)
         .vexpand(true)
         .build();
+    wire_player(&video, &window);
     let media = gtk4::Stack::new();
     media.add_named(&scroller, Some("photo"));
     media.add_named(&video, Some("video"));
@@ -1335,6 +1344,9 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
     // Everything used less often than the favorite and the details sits in
     // one menu, named in words rather than in icons.
     let more_btn = action("view-more-symbolic", &gettext("More"));
+    let fullscreen_btn = fullscreen_button(&window);
+    fullscreen_btn.add_css_class("flat");
+    fullscreen_btn.add_css_class("viewer-action-btn");
     let close_btn = action("window-close-symbolic", &gettext("Close (Esc)"));
     close_btn.add_css_class("viewer-close-btn");
 
@@ -1344,6 +1356,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
     top_bar.append(&group_btn);
     top_bar.append(&favorite_btn);
     top_bar.append(&info_toggle);
+    top_bar.append(&fullscreen_btn);
     top_bar.append(&more_btn);
     top_bar.append(&close_btn);
     let top_reveal = fade(top_bar.upcast_ref(), gtk4::Align::Fill, gtk4::Align::Start);
@@ -1660,7 +1673,6 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         }
     });
     let viewer_items = Rc::downgrade(&viewer);
-    let ui_items = ui.clone();
     let items_handler = ui
         .gallery
         .model
@@ -1671,9 +1683,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
             if let Some(index) = find_photo_index(model, &viewer.uid.borrow()) {
                 viewer.strip_selection.set_selected(index);
             }
-            viewer
-                .strip_reveal
-                .set_visible(ui_items.gallery.model.n_items() > 1 && !viewer.slideshow.get());
+            sync_strip(&viewer);
         });
 
     // The one strong handle on the viewer. Every handler holds a weak one: a
@@ -1873,6 +1883,12 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let alt = state.contains(gtk4::gdk::ModifierType::ALT_MASK);
         let playing_video = viewer_key.media.visible_child_name().as_deref() == Some("video");
+        if playing_video
+            && let Some(name) = key.name()
+            && player_key(&viewer_key.video, &name, state)
+        {
+            return glib::Propagation::Stop;
+        }
         match key.name().as_deref() {
             Some("space") if playing_video => {
                 if let Some(stream) = viewer_key.video.media_stream() {
@@ -1896,13 +1912,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
             Some("i") => viewer_key
                 .info_toggle
                 .set_active(!viewer_key.info_toggle.is_active()),
-            Some("f" | "F11") => {
-                if w_key.is_fullscreen() {
-                    w_key.unfullscreen();
-                } else {
-                    w_key.fullscreen();
-                }
-            }
+            Some("f" | "F11") => toggle_fullscreen(&w_key),
             Some("Delete" | "KP_Delete") => trash_shown_photo(&ui_key, &viewer_key),
             Some("Escape" | "q") => w_key.close(),
             Some("w") if ctrl => w_key.close(),
@@ -1934,6 +1944,12 @@ fn open_viewer_menu(ui: &Rc<Ui>, viewer: &Rc<Viewer>) {
     };
     let mut menu = ActionMenu::new();
     menu.item(&gettext("Slideshow"), with_viewer(toggle_slideshow, ui));
+    if viewer.media.visible_child_name().as_deref() == Some("video") {
+        let video = viewer.video.clone();
+        menu.toggle(&gettext("Repeat"), video.is_loop(), move |on| {
+            video.set_loop(on)
+        });
+    }
     menu.section();
     // These need the full-size file, which may still be downloading.
     if viewer.path.borrow().is_some() {

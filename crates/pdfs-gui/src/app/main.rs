@@ -41,6 +41,7 @@ use widgets::details::*;
 use widgets::file_list::*;
 use widgets::menu::*;
 use widgets::photo_drag::*;
+use widgets::player::*;
 use widgets::scrubber::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
@@ -1519,7 +1520,7 @@ fn debug_info(ui: &Rc<Ui>) -> String {
 /// The keyboard-shortcut cheatsheet behind the menu entry, listing exactly what
 /// [`install_shortcuts`], the Photos page and the photo viewer bind.
 fn show_shortcuts(window: &adw::ApplicationWindow) {
-    const GROUPS: [(&str, &[(&str, &str)]); 4] = [
+    const GROUPS: [(&str, &[(&str, &str)]); 5] = [
         (
             gettext_noop("General"),
             &[
@@ -1567,6 +1568,15 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("<Control>c", gettext_noop("Copy Image")),
                 ("Delete", gettext_noop("Move to Trash")),
                 ("Escape <Alt>Left", gettext_noop("Close")),
+            ],
+        ),
+        (
+            gettext_noop("Video Player"),
+            &[
+                ("space k", gettext_noop("Play / pause")),
+                ("j l", gettext_noop("Back / forward 10 seconds")),
+                ("m", gettext_noop("Mute")),
+                ("f", gettext_noop("Fullscreen")),
             ],
         ),
     ];
