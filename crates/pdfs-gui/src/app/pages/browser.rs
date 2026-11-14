@@ -1,6 +1,14 @@
 use crate::activation::{DriveActivation, drive_activation, mounted_path, present_within};
 use crate::*;
 
+/// How a folder in My files was left: scrolled `offset` px down, with the
+/// entries named `selected` highlighted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FolderPlace {
+    pub(crate) offset: f64,
+    pub(crate) selected: Vec<String>,
+}
+
 pub(crate) struct BrowserState {
     // Files (browser) page.
     /// The grid and list; the model is repopulated per directory.
@@ -10,6 +18,13 @@ pub(crate) struct BrowserState {
     /// breadcrumb.
     pub(crate) history: RefCell<Vec<String>>,
     pub(crate) future: RefCell<Vec<String>>,
+    /// Where each folder left by Back, Forward, Up or a descent was scrolled
+    /// and what was selected in it, by path. Back, Forward and Up put the
+    /// folder back that way; opening it afresh starts at the top.
+    pub(crate) places: RefCell<HashMap<String, FolderPlace>>,
+    /// The folder whose [`Self::places`] entry the next listing restores, set
+    /// by Back, Forward and Up.
+    pub(crate) restore: RefCell<Option<String>>,
     /// Clickable breadcrumb trail (a button per path segment); rebuilt per load
     /// by [`repaint_crumb`] so each ancestor folder navigates on click.
     pub(crate) crumb: gtk4::Box,
@@ -1556,8 +1571,29 @@ pub(crate) fn sort_entries(entries: &mut [DirEntry], view: FilesView) {
     });
 }
 
+/// Remember how the folder on screen is scrolled and what is selected in it,
+/// for Back, Forward or Up to bring it back that way. Only a listing of the
+/// folder itself counts; search hits are not its rows.
+fn remember_place(ui: &Rc<Ui>) {
+    let path = ui.browser.path.borrow().clone();
+    if ui.browser.listed.borrow().as_deref() != Some(path.as_str()) {
+        return;
+    }
+    let files = &ui.browser.files;
+    let place = FolderPlace {
+        offset: files.scroll_offset(),
+        selected: files
+            .selected()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    };
+    ui.browser.places.borrow_mut().insert(path, place);
+}
+
 /// Open the folder on screen in a new place, remembering where we were.
 pub(crate) fn browse_to(ui: &Rc<Ui>, target: String) {
+    remember_place(ui);
     let left = ui.browser.path.replace(target.clone());
     if left != target {
         ui.browser.history.borrow_mut().push(left);
@@ -1582,6 +1618,8 @@ fn browse_back(ui: &Rc<Ui>) {
     let Some(previous) = ui.browser.history.borrow_mut().pop() else {
         return;
     };
+    remember_place(ui);
+    *ui.browser.restore.borrow_mut() = Some(previous.clone());
     let left = ui.browser.path.replace(previous);
     ui.browser.future.borrow_mut().push(left);
     load_browser(ui);
@@ -1592,6 +1630,8 @@ fn browse_forward(ui: &Rc<Ui>) {
         return;
     };
     ui.browser.search.set_text("");
+    remember_place(ui);
+    *ui.browser.restore.borrow_mut() = Some(next.clone());
     let left = ui.browser.path.replace(next);
     ui.browser.history.borrow_mut().push(left);
     load_browser(ui);
@@ -1604,6 +1644,7 @@ fn browse_up(ui: &Rc<Ui>) {
     }
     ui.browser.search.set_text("");
     let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or_default();
+    *ui.browser.restore.borrow_mut() = Some(parent.to_string());
     browse_to(ui, parent.to_string());
 }
 
@@ -3003,8 +3044,15 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     // Only the rows that changed are swapped, so a refresh keeps the
     // selection, the scroll position and the thumbnails already drawn.
     replace_items(&ui.browser.files.model, &sorted);
+    // Back, Forward and Up return to a folder as it was left; any other way
+    // in starts at the top.
+    let restore = ui.browser.restore.take().filter(|target| *target == path);
     if another_folder {
-        ui.browser.files.scroll_to_top();
+        let place = restore.and_then(|path| ui.browser.places.borrow().get(&path).cloned());
+        match place {
+            Some(place) => ui.browser.files.restore(place.offset, &place.selected),
+            None => ui.browser.files.scroll_to_top(),
+        }
     }
 }
 

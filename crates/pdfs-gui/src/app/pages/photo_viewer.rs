@@ -1428,8 +1428,10 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Windo
     // kept every closed lightbox, its window and its full-size photo in memory
     // for the life of the app.
     let keep = RefCell::new(Some(viewer.clone()));
+    let ui_close = ui.clone();
     window.connect_close_request(move |_| {
         if let Some(viewer) = keep.borrow_mut().take() {
+            reveal_photo(&ui_close, &viewer.uid.borrow());
             stop_video(&viewer);
             disarm_slide(&viewer);
             if let Some(source) = viewer.chrome_source.borrow_mut().take() {

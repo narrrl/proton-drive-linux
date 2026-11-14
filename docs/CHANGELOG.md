@@ -74,6 +74,11 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   tell photos apart by their thumbnail. Ctrl+scroll, Ctrl+plus, Ctrl+minus and Ctrl+0
   change it too, and the size is remembered between runs.
 
+- **Back takes you to where you were.** Back, Forward and Up in My files return to a folder
+  scrolled where it was left, with the same items selected, and closing the photo viewer scrolls
+  the grid to the photo it was showing. Alt+Left and Backspace go back a level in Shared with me
+  and Computers and leave an open album or place in Photos, as Escape does too.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
@@ -130,6 +135,9 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 
 - **A search in My files stays.** It was replaced by the folder's listing whenever files
   changed, on refresh and on coming back to the page, while the query stayed in the box.
+
+- **A date jump in Photos stops when you look elsewhere.** A jump still loading the timeline
+  kept going after another filter, album or place was opened.
 
 ## [3.7.0] — 2026-11-02
 

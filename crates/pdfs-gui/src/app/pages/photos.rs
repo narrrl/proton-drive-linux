@@ -3288,6 +3288,16 @@ fn top_anchor(ui: &Rc<Ui>) -> Option<(String, f32)> {
         .or(first)
 }
 
+/// Scroll the grid just far enough to show photo `uid`, as the lightbox
+/// closes: paging with the arrow keys may have left the grid far behind.
+pub(crate) fn reveal_photo(ui: &Rc<Ui>, uid: &str) {
+    if let Some(row) = row_of_photo(&ui.gallery.groups, uid) {
+        ui.gallery
+            .list
+            .scroll_to(row, gtk4::ListScrollFlags::NONE, None);
+    }
+}
+
 /// Which row of the rendered model holds `uid`, if any.
 fn row_of_photo(store: &gio::ListStore, uid: &str) -> Option<u32> {
     (0..store.n_items()).find(|i| {
@@ -4035,6 +4045,8 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     // be read again when they switch back to it.
     if !photo_grid_shown(ui) {
         ui.gallery.timeline_stale.set(true);
+        // A scrubber jump was paging the grid the user has just left.
+        ui.gallery.jump.set(None);
         return;
     }
     if ui.gallery.loading.get() {
@@ -4052,6 +4064,9 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     let place = ui.gallery.place.borrow().as_ref().map(|p| p.id);
     let collection = album.is_some() || place.is_some();
     if !append {
+        // A scrubber jump looks for a month of the listing being replaced:
+        // another filter, album or place has its own months, if any.
+        ui.gallery.jump.set(None);
         // Fresh load: clear the timeline and show Loading until the first page lands.
         ui.gallery.model.remove_all();
         gallery_status(

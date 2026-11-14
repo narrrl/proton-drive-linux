@@ -190,10 +190,9 @@ pub(crate) fn wire_devices(ui: &Rc<Ui>, widgets: &DevicesWidgets) {
         }));
 
     let ui_back = ui.clone();
-    widgets.back.connect_clicked(move |_| {
-        ui_back.devices.nav.borrow_mut().pop();
-        load_devices(&ui_back);
-    });
+    widgets
+        .back
+        .connect_clicked(move |_| devices_back(&ui_back));
     let ui_retry = ui.clone();
     widgets
         .retry
@@ -209,6 +208,14 @@ pub(crate) fn devices_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
         .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.devices.retry.set_visible(retry);
     ui.devices.content.set_visible_child_name("status");
+}
+
+/// Back out of a computer's folder to the level above: the page's Back button, and
+/// Alt+Left or Backspace. A no-op at the top.
+pub(crate) fn devices_back(ui: &Rc<Ui>) {
+    if ui.devices.nav.borrow_mut().pop().is_some() {
+        load_devices(ui);
+    }
 }
 
 /// Load the view [`DevicesState::nav`] points at: the device list, or a folder
