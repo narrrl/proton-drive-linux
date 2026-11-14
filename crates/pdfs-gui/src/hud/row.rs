@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk4::{gdk, gio};
+use gtk4::{gdk, gio, glib};
 
 use super::highlight;
 use super::thumbs::Thumbs;
@@ -53,7 +53,7 @@ pub(crate) fn fill_slot(slot: &gtk4::Overlay, hit: &Hit, thumbs: &Rc<Thumbs>, mo
     let Some(picture) = fallback.next_sibling().and_downcast::<gtk4::Picture>() else {
         return;
     };
-    fallback.set_from_gicon(&icon_for(hit.name(), hit.is_dir()));
+    fallback.set_from_gicon(&icon_for(hit.name(), hit.is_dir(), hit.size()));
     fallback.set_visible(true);
     picture.set_visible(false);
     picture.set_paintable(gdk::Paintable::NONE);
@@ -63,7 +63,7 @@ pub(crate) fn fill_slot(slot: &gtk4::Overlay, hit: &Hit, thumbs: &Rc<Thumbs>, mo
 /// The desktop's own full-colour icon for a file name, so results look like
 /// the user's file manager. Folders are Proton's purple ones while the Proton
 /// theme is on, as in the app's browser.
-pub(crate) fn icon_for(name: &str, is_dir: bool) -> gio::Icon {
+pub(crate) fn icon_for(name: &str, is_dir: bool, size: u64) -> gio::Icon {
     if is_dir {
         let folder = if proton_theme_active() {
             "pdfs-proton-folder"
@@ -72,8 +72,21 @@ pub(crate) fn icon_for(name: &str, is_dir: bool) -> gio::Icon {
         };
         return gio::ThemedIcon::new(folder).upcast();
     }
-    let (content_type, _uncertain) = gio::functions::content_type_guess(Some(name), None);
-    gio::functions::content_type_get_icon(&content_type)
+    gio::functions::content_type_get_icon(&content_type_for(name, size))
+}
+
+/// The content type of a file named `name` of `size` bytes, guessed from the
+/// name. GIO takes every `.ts` for TypeScript (or Qt translations); a
+/// recording's size says otherwise (see
+/// [`is_video_file_name`](pdfs_core::control::is_video_file_name)).
+pub(crate) fn content_type_for(name: &str, size: u64) -> glib::GString {
+    let transport_stream = std::path::Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"));
+    if transport_stream && pdfs_core::control::is_video_file_name(name, Some(size)) {
+        return glib::GString::from("video/mp2t");
+    }
+    gio::functions::content_type_guess(Some(name), None).0
 }
 
 /// The sync badge of a Drive file, as in the app's browser: pinned, cached,

@@ -29,7 +29,7 @@ use proton_drive_rs::proton_sdk::error::Result;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, NodeUid, ShareId};
 use proton_drive_rs::{
     AvailableNameTarget, Device, DeviceType, DriveEvent, DriveEventScopeId, Node, NodeMoveItem,
-    ProtonDriveClient, RevisionReader, Thumbnail,
+    ProtonDriveClient, RevisionReader, Thumbnail, ThumbnailType,
 };
 
 /// One outcome per node of a batch request; see [`ProtonDriveClient::trash_nodes`].
@@ -117,6 +117,14 @@ pub(crate) trait DriveApi: Send + Sync {
     ) -> Result<()>;
 
     async fn open_revision(&self, uid: &NodeUid) -> Result<Arc<dyn RevisionRead>>;
+
+    /// The file's thumbnail of `thumbnail_type`, or `None` when its revision
+    /// carries none.
+    async fn download_thumbnail(
+        &self,
+        uid: &NodeUid,
+        thumbnail_type: ThumbnailType,
+    ) -> Result<Option<Vec<u8>>>;
 
     async fn download_file_to_dyn(
         &self,
@@ -443,6 +451,14 @@ impl DriveApi for ProtonDriveClient {
     async fn open_revision(&self, uid: &NodeUid) -> Result<Arc<dyn RevisionRead>> {
         let reader = ProtonDriveClient::open_revision(self, uid).await?;
         Ok(Arc::new(reader))
+    }
+
+    async fn download_thumbnail(
+        &self,
+        uid: &NodeUid,
+        thumbnail_type: ThumbnailType,
+    ) -> Result<Option<Vec<u8>>> {
+        ProtonDriveClient::download_thumbnail(self, uid, thumbnail_type).await
     }
 
     async fn download_file_to_dyn(

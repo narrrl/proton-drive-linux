@@ -1728,8 +1728,9 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
     let text = if status.scanning {
         ui.browser.thumbnail_progress.pulse();
         let folders = ngettext_f("{n} folder", "{n} folders", status.folders_scanned, &[]);
-        let images = ngettext_f("{n} image", "{n} images", status.images_found, &[]);
-        // Translators: {root} is a folder path or "Proton Drive"; {folders} and {images} are counts such as "3 folders" and "12 images".
+        // Translators: a count of images and videos that can have a thumbnail.
+        let images = ngettext_f("{n} file", "{n} files", status.images_found, &[]);
+        // Translators: {root} is a folder path or "Proton Drive"; {folders} and {images} are counts such as "3 folders" and "12 files".
         gettext_f(
             "Scanning {root}… {folders}, {images}",
             &[("root", root), ("folders", &folders), ("images", &images)],
@@ -1743,7 +1744,7 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
         ui.browser
             .thumbnail_progress
             .set_fraction(fraction.clamp(0.0, 1.0));
-        // Translators: {root} is a folder path or "Proton Drive"; {done} and {total} are image counts.
+        // Translators: {root} is a folder path or "Proton Drive"; {done} and {total} are counts of images and videos.
         gettext_f(
             "Building thumbnails in {root}… {done} of {total}",
             &[
@@ -1756,17 +1757,17 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
         ui.browser.thumbnail_progress.set_fraction(1.0);
         let available = status.completed.saturating_sub(status.failed);
         match status.failed {
-            // Translators: {root} is a folder path or "Proton Drive".
+            // Translators: {root} is a folder path or "Proton Drive"; {n} counts images and videos.
             0 => ngettext_f(
-                "Thumbnails ready for {n} image in {root}",
-                "Thumbnails ready for {n} images in {root}",
+                "Thumbnails ready for {n} file in {root}",
+                "Thumbnails ready for {n} files in {root}",
                 available,
                 &[("root", root)],
             ),
-            // Translators: {root} is a folder path or "Proton Drive"; {failed} is how many images could not get a thumbnail.
+            // Translators: {root} is a folder path or "Proton Drive"; {failed} is how many images and videos could not get a thumbnail.
             failed => ngettext_f(
-                "Thumbnails ready for {n} image in {root}; {failed} unavailable",
-                "Thumbnails ready for {n} images in {root}; {failed} unavailable",
+                "Thumbnails ready for {n} file in {root}; {failed} unavailable",
+                "Thumbnails ready for {n} files in {root}; {failed} unavailable",
                 available,
                 &[("root", root), ("failed", &failed.to_string())],
             ),
@@ -2765,6 +2766,11 @@ pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {
     if entry.is_dir {
         return "folder";
     }
+    // Every video type, including a `.ts` recording, which by its name alone
+    // is TypeScript.
+    if pdfs_core::control::is_video_file_name(&entry.name, Some(entry.size)) {
+        return "video-x-generic";
+    }
     let ext = entry
         .name
         .rsplit('.')
@@ -2775,7 +2781,6 @@ pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "heic" | "tiff" => {
             "image-x-generic"
         }
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" => "video-x-generic",
         "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" => "audio-x-generic",
         "pdf" | "doc" | "docx" | "odt" => "x-office-document",
         "xls" | "xlsx" | "ods" | "csv" => "x-office-spreadsheet",
@@ -3122,7 +3127,7 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoveTarget, badge_for, copy_target_allowed, hit_location, listing_summary,
+        MoveTarget, badge_for, copy_target_allowed, hit_location, icon_base_for, listing_summary,
         move_target_allowed, show_thumbnail_build_progress, sort_entries,
     };
     use pdfs_core::config::{FileSort, FilesView};
@@ -3147,6 +3152,32 @@ mod tests {
             trashed_from: None,
             issue: None,
         }
+    }
+
+    #[test]
+    fn every_video_type_gets_the_video_icon() {
+        const MIB: u64 = 1024 * 1024;
+        for name in [
+            "clip.mp4",
+            "clip.MKV",
+            "broadcast.m2ts",
+            "camera.mts",
+            "old.flv",
+        ] {
+            assert_eq!(
+                icon_base_for(&entry(name, false, 10, 0)),
+                "video-x-generic",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            icon_base_for(&entry("recording.ts", false, 900 * MIB, 0)),
+            "video-x-generic"
+        );
+        assert_eq!(
+            icon_base_for(&entry("app.ts", false, 4096, 0)),
+            "text-x-generic"
+        );
     }
 
     fn names(entries: &[DirEntry]) -> Vec<&str> {

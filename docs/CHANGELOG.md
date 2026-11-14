@@ -32,6 +32,20 @@ Existing folders remain device backups; older builds cannot open the upgraded da
   My files folder. The first sync preserves one-sided files and differing versions (#67).
   Attachments stay in mirror mode, are excluded from device profiles, and cannot delete
   the remote root when syncing is stopped.
+- **Video thumbnails in My files, Shared, Trash and the launcher**, as in Photos, with a play
+  badge in the grid. A video's thumbnail is the one its uploader attached when it has one.
+  Otherwise the daemon takes a frame with ffmpeg from the start of the file, plus an MP4's
+  index, and never downloads more than about 16 MiB of a video for it, however large the
+  video is. **Build Thumbnails** covers videos too (B283).
+
+### Fixed
+
+- Large `.ts` recordings (MPEG transport streams) show and open as videos: the video icon, a
+  thumbnail, and the `@media` open rule rather than `@text`. A `.ts` of 1 MiB or more counts
+  as a video, a smaller one stays TypeScript source, and the daemon checks the stream's sync
+  byte before it takes a frame (B283).
+- A video over 256 MiB never got a thumbnail, and a smaller one was downloaded whole into
+  memory for one frame (B283).
 
 ## [3.7.0] — 2026-11-02
 

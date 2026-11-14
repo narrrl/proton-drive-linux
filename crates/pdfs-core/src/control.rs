@@ -1851,6 +1851,34 @@ pub fn is_thumbnail_image_name(name: &str) -> bool {
         || RAW_THUMBNAIL_EXTENSIONS.contains(&extension.as_str())
 }
 
+/// The smallest `.ts` file taken for an MPEG transport stream. `.ts` is
+/// TypeScript source as often as it is a recording, and the two sit far apart
+/// in size: a source file is kilobytes, while a second of broadcast video is
+/// already megabytes. Drive often stores either kind as
+/// `application/octet-stream`, so the size is the only signal a listing has.
+pub const TS_VIDEO_MIN_BYTES: u64 = 1024 * 1024;
+
+/// Whether a file named `name`, of `size` bytes when the caller knows it, is a
+/// video. The extension decides, except for `.ts`, which counts as video only
+/// from [`TS_VIDEO_MIN_BYTES`] up. A `.ts` of unknown size counts as video, as
+/// [`PhotoKind::classify`] has it.
+pub fn is_video_file_name(name: &str, size: Option<u64>) -> bool {
+    if PhotoKind::classify(Some(name), None) != PhotoKind::Video {
+        return false;
+    }
+    let transport_stream = name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("ts"));
+    !transport_stream || size.is_none_or(|size| size >= TS_VIDEO_MIN_BYTES)
+}
+
+/// Whether file listings show a thumbnail for a file named `name`, of `size`
+/// bytes when known: an image [`is_thumbnail_image_name`] accepts, or a video,
+/// whose thumbnail is a frame the daemon takes with ffmpeg.
+pub fn is_thumbnail_media_name(name: &str, size: Option<u64>) -> bool {
+    is_thumbnail_image_name(name) || is_video_file_name(name, size)
+}
+
 /// Whether `name` is one of the concrete RAW formats handled by the exiftool
 /// embedded-preview path. Deliberately excludes generic/legacy grab-bags whose
 /// preview availability is not dependable.
@@ -2673,6 +2701,41 @@ mod tests {
         // Extension wins over mime: a name ending .jpg is a photo even if the mime
         // is nonsense.
         assert_eq!(PhotoKind::classify(Some("x.jpg"), Some("video/mp4")), Photo);
+    }
+
+    #[test]
+    fn a_ts_file_is_a_video_only_at_the_size_of_one() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        assert!(!is_video_file_name("app.ts", Some(3 * 1024)));
+        assert!(!is_video_file_name(
+            "bundle.TS",
+            Some(TS_VIDEO_MIN_BYTES - 1)
+        ));
+        assert!(is_video_file_name("recording.ts", Some(9 * GB)));
+        assert!(is_video_file_name("recording.TS", Some(TS_VIDEO_MIN_BYTES)));
+        assert!(is_video_file_name("recording.ts", None));
+        // Only `.ts` is in doubt; every other video name is one at any size.
+        assert!(is_video_file_name("clip.mkv", Some(10)));
+        assert!(is_video_file_name("clip.m2ts", Some(10)));
+        assert!(!is_video_file_name("notes.txt", Some(9 * GB)));
+        assert!(!is_video_file_name("ts", Some(9 * GB)));
+    }
+
+    #[test]
+    fn listings_thumbnail_images_and_videos() {
+        assert!(is_thumbnail_media_name("photo.JPG", Some(10)));
+        assert!(is_thumbnail_media_name("camera.nef", None));
+        assert!(is_thumbnail_media_name("clip.mp4", Some(10)));
+        assert!(is_thumbnail_media_name(
+            "recording.ts",
+            Some(64 * 1024 * 1024)
+        ));
+        assert!(!is_thumbnail_media_name("app.ts", Some(2048)));
+        assert!(!is_thumbnail_media_name(
+            "song.flac",
+            Some(64 * 1024 * 1024)
+        ));
+        assert!(!is_thumbnail_media_name("notes.txt", None));
     }
 
     /// Keep every extension accepted by the shared classifier covered.  Drive

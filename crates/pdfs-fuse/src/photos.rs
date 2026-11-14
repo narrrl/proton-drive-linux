@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,14 +20,17 @@ use base64::Engine as _;
 use pdfs_core::control::{
     FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoLocation, PhotoThumb, PlaceInfo,
     ThumbnailBuildStatus, Topic, is_raw_image_name, is_thumbnail_image_name,
+    is_thumbnail_media_name,
 };
 use pdfs_core::db::{self, StoredPhoto};
 use pdfs_core::{CoreError, CoreResult};
 
+use proton_drive_rs::proton_sdk::error::Result as DriveResult;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{NodeKind, PhotoTag, PhotoTagsUpdate, Thumbnail, ThumbnailType};
 use tracing::{debug, info, warn};
 
+use super::drive::RevisionRead;
 use super::{
     Core, PHOTOS_AVAILABLE, PHOTOS_SYNCED_MS, TIMELINE_ENRICH_CHUNK, TIMELINE_TTL, WriteAuthority,
     node_size, now_ms, parse_uid,
@@ -58,9 +61,18 @@ const EXIFTOOL_TIMEOUT: Duration = Duration::from_secs(20);
 static RAW_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static EXIFTOOL_MISSING_WARNING: Once = Once::new();
 static FFMPEG_MISSING_WARNING: Once = Once::new();
-/// Largest video downloaded whole to grab one frame for its thumbnail. The
-/// download lands in memory, so a long 4K recording is left without one.
-const VIDEO_THUMB_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// How much of a video's start a thumbnail downloads. The first frame, and
+/// the one a second in, sit inside it at any common bitrate. A video is never
+/// downloaded whole for one frame: a recording can be many gigabytes.
+const VIDEO_HEAD_BYTES: u64 = 16 * 1024 * 1024;
+/// A video no larger than this is downloaded whole: its head and tail would
+/// cover most of it anyway.
+const VIDEO_WHOLE_MAX_BYTES: u64 = 24 * 1024 * 1024;
+/// Largest MP4/MOV index (`moov` box) fetched from past the head. An hour of
+/// video indexes in a few MiB; anything larger is not worth one frame.
+const VIDEO_INDEX_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Top-level boxes walked looking for the index before giving up.
+const VIDEO_BOX_WALK_MAX: usize = 32;
 /// A single frame is seconds of work even for 4K; this only stops a wedged
 /// ffmpeg from holding a thumbnail permit.
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
@@ -245,8 +257,8 @@ struct RawPreviewUnavailable;
 /// the photo will never have a thumbnail, and only that verdict is persisted.
 enum ThumbAttempt {
     Made(GeneratedThumb),
-    /// Decoded nothing — a format this build has no decoder for, or a video
-    /// too large to fetch for one frame. Permanent.
+    /// Decoded nothing: a format this build has no decoder for, a video
+    /// ffmpeg takes no frame from, or a `.ts` that is not one. Permanent.
     Undecodable,
     /// The photo couldn't be downloaded. Transient: try again next time.
     Unavailable,
@@ -577,21 +589,6 @@ fn warn_ffmpeg_missing() {
     });
 }
 
-/// A thumbnail from one frame of a downloaded video, which ffmpeg reads from a
-/// staging copy. See [`video_file_thumbnail`].
-fn video_thumbnail(
-    bytes: &[u8],
-    name: &str,
-    staging_dir: &Path,
-    ffmpeg: &OsStr,
-    timeout: Duration,
-) -> ScaleAttempt {
-    let Some(file) = RawTempFile::create_in(staging_dir, bytes, name) else {
-        return ScaleAttempt::Unavailable;
-    };
-    video_file_thumbnail(&file.0, ffmpeg, timeout)
-}
-
 /// A thumbnail from one frame of the video at `path`. A second in, past the
 /// black lead-in most clips open on, and the first frame for a clip shorter than
 /// that. ffmpeg applies the clip's rotation, so a portrait phone video comes out
@@ -622,6 +619,151 @@ fn video_file_thumbnail(path: &Path, ffmpeg: &OsStr, timeout: Duration) -> Scale
         }
     }
     ScaleAttempt::Undecodable
+}
+
+/// What a thumbnail is made from.
+enum Fetched {
+    /// The thumbnail itself, from the server.
+    Ready(Vec<u8>),
+    /// Nothing: a video with no server thumbnail, and no ffmpeg to take one.
+    Nothing,
+    /// A whole image.
+    Whole(Vec<u8>),
+    Video(VideoSample),
+}
+
+/// The parts of a video its thumbnail needs, downloaded: the start of the
+/// file, and for an MP4 or MOV whose index is further in, that index.
+struct VideoSample {
+    /// The whole file's length.
+    size: u64,
+    head: Vec<u8>,
+    /// The `moov` box and its offset, when it is not inside `head`.
+    index: Option<(u64, Vec<u8>)>,
+}
+
+impl VideoSample {
+    /// Whether this could be an MPEG transport stream: one opens on the 0x47
+    /// sync byte, and repeats it every 188-byte packet. Only asked of `.ts`
+    /// files, which are TypeScript source as often as they are video.
+    fn is_transport_stream(&self) -> bool {
+        self.head.first() == Some(&0x47) && self.head.get(188).is_none_or(|&byte| byte == 0x47)
+    }
+}
+
+/// Download what a thumbnail of the video `reader` reads needs. A file of up
+/// to [`VIDEO_WHOLE_MAX_BYTES`] comes whole. A larger one brings its first
+/// [`VIDEO_HEAD_BYTES`], which is all a stream format (Matroska, WebM, MPEG-TS,
+/// AVI) needs for a frame, plus the index of an ISO media file (MP4, MOV, 3GP)
+/// written with its index after the media data, which is how most cameras and
+/// phones write it.
+async fn sample_video(reader: &dyn RevisionRead) -> DriveResult<VideoSample> {
+    let size = reader.size();
+    if size <= VIDEO_WHOLE_MAX_BYTES {
+        let head = reader.read_at(0, size).await?;
+        return Ok(VideoSample {
+            size,
+            head,
+            index: None,
+        });
+    }
+    let head = reader.read_at(0, VIDEO_HEAD_BYTES).await?;
+    let index = match iso_media_index(reader, &head, size).await? {
+        Some((offset, len)) if offset.saturating_add(len) > head.len() as u64 => {
+            Some((offset, reader.read_at(offset, len).await?))
+        }
+        _ => None,
+    };
+    Ok(VideoSample { size, head, index })
+}
+
+/// Where the `moov` box of an ISO media file sits, as `(offset, length)`.
+/// `None` for a file that is not one, or whose index is missing, oversized or
+/// past [`VIDEO_BOX_WALK_MAX`] boxes. Box headers past `head` are read one at a
+/// time, 16 bytes each.
+async fn iso_media_index(
+    reader: &dyn RevisionRead,
+    head: &[u8],
+    size: u64,
+) -> DriveResult<Option<(u64, u64)>> {
+    const FIRST_BOXES: [&[u8; 4]; 6] = [b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip"];
+    if !head
+        .get(4..8)
+        .is_some_and(|kind| FIRST_BOXES.iter().any(|known| kind == *known))
+    {
+        return Ok(None);
+    }
+    let mut offset = 0u64;
+    for _ in 0..VIDEO_BOX_WALK_MAX {
+        if offset.saturating_add(8) > size {
+            break;
+        }
+        let header = match usize::try_from(offset)
+            .ok()
+            .and_then(|start| head.get(start..start.checked_add(16)?))
+        {
+            Some(header) => header.to_vec(),
+            None => reader.read_at(offset, 16).await?,
+        };
+        let Some((kind, len)) = iso_box_header(&header, size - offset) else {
+            break;
+        };
+        if kind == *b"moov" {
+            return Ok((len <= VIDEO_INDEX_MAX_BYTES).then_some((offset, len)));
+        }
+        offset = offset.saturating_add(len);
+    }
+    Ok(None)
+}
+
+/// The type and length of the ISO box whose header starts `header`, of a box
+/// that may run at most `left` bytes to the end of the file.
+fn iso_box_header(header: &[u8], left: u64) -> Option<([u8; 4], u64)> {
+    let size = u32::from_be_bytes(header.get(0..4)?.try_into().ok()?);
+    let kind: [u8; 4] = header.get(4..8)?.try_into().ok()?;
+    let len = match size {
+        // Runs to the end of the file.
+        0 => left,
+        // The real length follows as 64 bits.
+        1 => u64::from_be_bytes(header.get(8..16)?.try_into().ok()?),
+        len => u64::from(len),
+    };
+    (8..=left).contains(&len).then_some((kind, len))
+}
+
+/// A thumbnail from one frame of a downloaded [`VideoSample`]. The sample is
+/// laid out in a staging file at the offsets it came from, so ffmpeg finds an
+/// index where the file's own boxes say it is. The gap between holds no data
+/// and costs no disk.
+fn video_sample_thumbnail(
+    sample: &VideoSample,
+    name: &str,
+    staging_dir: &Path,
+    ffmpeg: &OsStr,
+    timeout: Duration,
+) -> ScaleAttempt {
+    let transport_stream_name = Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"));
+    if transport_stream_name && !sample.is_transport_stream() {
+        return ScaleAttempt::Undecodable;
+    }
+    let Some(file) = RawTempFile::create_in(staging_dir, &sample.head, name) else {
+        return ScaleAttempt::Unavailable;
+    };
+    if let Some((offset, index)) = &sample.index {
+        let laid_out = OpenOptions::new()
+            .write(true)
+            .open(&file.0)
+            .and_then(|staged| {
+                staged.write_all_at(index, *offset)?;
+                staged.set_len(sample.size.max(offset + index.len() as u64))
+            });
+        if laid_out.is_err() {
+            return ScaleAttempt::Unavailable;
+        }
+    }
+    video_file_thumbnail(&file.0, ffmpeg, timeout)
 }
 
 /// The thumbnail to attach to an upload of the local file at `path`, which is
@@ -1406,10 +1548,10 @@ impl Core {
             .map(|item| (item.uid.clone(), item.name.clone()))
             .collect();
 
-        // Proton only stores server-generated thumbnails for nodes in Photos.
-        // These requests come exclusively from ordinary Drive, Shared and Trash
-        // views, so downloading a remote thumbnail here would be a guaranteed
-        // miss. Generate directly from the full image and cache the result.
+        // Drive makes no thumbnails itself; a file has one only when its
+        // uploader attached it, as this client and Proton's apps do. The
+        // generation step asks for that first, and only makes one from the
+        // file's content without it.
         let mut wanted = Vec::new();
         let mut seen = HashSet::new();
         for (raw, uid, modified) in &parsed {
@@ -1560,7 +1702,10 @@ impl Core {
                             return (uid, ThumbAttempt::Cancelled);
                         }
                         let video = is_video_name(&name);
-                        if video && !ffmpeg_available() {
+                        // Without ffmpeg a video can still have its uploader's
+                        // thumbnail, but Photos has asked the server already.
+                        let can_sample = !video || ffmpeg_available();
+                        if !can_sample && matches!(job, ThumbJob::Photos) {
                             return (uid, ThumbAttempt::Unavailable);
                         }
 
@@ -1609,21 +1754,34 @@ impl Core {
                             return (uid, ThumbAttempt::Cancelled);
                         }
 
-                        // A video is downloaded whole for one frame, so a long
-                        // recording is not worth it — and would not fit in memory.
-                        if video {
-                            match core.photos().get_node(&uid).await {
-                                Ok(Some(node)) if node_size(&node) > VIDEO_THUMB_MAX_BYTES => {
-                                    info!(%uid, size = node_size(&node), "video too large for a local thumbnail");
-                                    return (uid, ThumbAttempt::Undecodable);
-                                }
-                                Ok(Some(_)) => {}
-                                Ok(None) | Err(_) => return (uid, ThumbAttempt::Unavailable),
-                            }
-                        }
-
                         let download_uid = uid.clone();
-                        let download = async move { client.download_file(&download_uid).await };
+                        let drive = core.drive.clone();
+                        let download = async move {
+                            // Photos asked the server in one batch already. A
+                            // file view's or a build's file may carry a
+                            // thumbnail its uploader made, which costs one
+                            // small download instead of its content.
+                            if !matches!(job, ThumbJob::Photos)
+                                && let Some(bytes) = drive
+                                    .download_thumbnail(&download_uid, ThumbnailType::Thumbnail)
+                                    .await?
+                                    .filter(|bytes| !bytes.is_empty())
+                            {
+                                return Ok(Fetched::Ready(bytes));
+                            }
+                            if !can_sample {
+                                return Ok(Fetched::Nothing);
+                            }
+                            if video {
+                                let reader = drive.open_revision(&download_uid).await?;
+                                sample_video(reader.as_ref()).await.map(Fetched::Video)
+                            } else {
+                                client
+                                    .download_file(&download_uid)
+                                    .await
+                                    .map(Fetched::Whole)
+                            }
+                        };
                         tokio::pin!(download);
                         let downloaded = match job {
                             ThumbJob::Files(_) => loop {
@@ -1661,10 +1819,10 @@ impl Core {
                         let Some(downloaded) = downloaded else {
                             return (uid, ThumbAttempt::Cancelled);
                         };
-                        let bytes = match downloaded {
-                            Ok(bytes) => bytes,
+                        let fetched = match downloaded {
+                            Ok(fetched) => fetched,
                             Err(e) => {
-                                warn!(%uid, error = %e, "image download for thumbnail failed");
+                                warn!(%uid, error = %e, "download for a thumbnail failed");
                                 return (uid, ThumbAttempt::Unavailable);
                             }
                         };
@@ -1674,18 +1832,20 @@ impl Core {
                         // Decoding + scaling a 20 MP JPEG is CPU-bound and would
                         // stall the runtime's worker; hand it to the blocking pool.
                         let staging_dir = core.cache.raw_thumbnail_staging_dir().to_path_buf();
-                        let made = tokio::task::spawn_blocking(move || {
-                            if video {
-                                video_thumbnail(
-                                    &bytes,
-                                    &name,
-                                    &staging_dir,
-                                    OsStr::new("ffmpeg"),
-                                    FFMPEG_TIMEOUT,
-                                )
-                            } else {
-                                scale_thumbnail(&bytes, &name, &staging_dir)
-                            }
+                        let made = tokio::task::spawn_blocking(move || match fetched {
+                            Fetched::Video(sample) => video_sample_thumbnail(
+                                &sample,
+                                &name,
+                                &staging_dir,
+                                OsStr::new("ffmpeg"),
+                                FFMPEG_TIMEOUT,
+                            ),
+                            Fetched::Whole(bytes) => scale_thumbnail(&bytes, &name, &staging_dir),
+                            Fetched::Nothing => ScaleAttempt::Unavailable,
+                            Fetched::Ready(bytes) => match ratio_of(&bytes) {
+                                Some(ratio) => ScaleAttempt::Made(GeneratedThumb { bytes, ratio }),
+                                None => ScaleAttempt::Undecodable,
+                            },
                         })
                         .await
                         .unwrap_or(ScaleAttempt::Unavailable);
@@ -1869,7 +2029,7 @@ impl Core {
                     if seen_folders.insert(entry.uid) {
                         folders.push(folder.join(entry.name));
                     }
-                } else if is_thumbnail_image_name(&entry.name) {
+                } else if is_thumbnail_media_name(&entry.name, Some(entry.size)) {
                     match parse_uid(&entry.uid) {
                         Some(uid) if seen_images.insert(uid.clone()) => {
                             found_here += 1;
@@ -2295,15 +2455,19 @@ mod decode_budget_tests {
 mod thumb_tests {
     use super::{
         RawTempFile, ScaleAttempt, THUMB_EDGE, UPLOAD_IMAGE_MAX_BYTES, UPLOAD_THUMB_MAX_BYTES,
-        can_make_thumbnail, exiftool_binary, ffmpeg_available, fit_upload_thumb, is_video_name,
-        ratio_of, scale_thumbnail, scale_thumbnail_with_exiftool, similar_hashes,
-        thumbnail_build_may_start, upload_thumbnails_with, video_thumbnail,
+        VIDEO_HEAD_BYTES, VIDEO_WHOLE_MAX_BYTES, VideoSample, can_make_thumbnail, exiftool_binary,
+        ffmpeg_available, fit_upload_thumb, is_video_name, ratio_of, sample_video, scale_thumbnail,
+        scale_thumbnail_with_exiftool, similar_hashes, thumbnail_build_may_start,
+        upload_thumbnails_with, video_sample_thumbnail,
     };
+    use crate::drive::RevisionRead;
     use pdfs_core::control::{ThumbnailBuildStatus, is_thumbnail_image_name};
     use proton_drive_rs::ThumbnailType;
+    use proton_drive_rs::proton_sdk::error::Result as DriveResult;
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     /// A `width`×`height` JPEG, standing in for a camera photo the server never
@@ -2536,6 +2700,199 @@ mod thumb_tests {
         std::env::temp_dir().join(format!("pdfs-{test}-{}", std::process::id()))
     }
 
+    /// A sample of a video small enough to come whole.
+    fn whole(bytes: &[u8]) -> VideoSample {
+        VideoSample {
+            size: bytes.len() as u64,
+            head: bytes.to_vec(),
+            index: None,
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// A Drive revision of `size` bytes, zero except for the parts written in,
+    /// that counts the bytes read from it. Stands for a recording far larger
+    /// than a test should hold in memory.
+    struct FakeRevision {
+        size: u64,
+        parts: Vec<(u64, Vec<u8>)>,
+        read: AtomicU64,
+    }
+
+    impl FakeRevision {
+        fn new(size: u64) -> Self {
+            Self {
+                size,
+                parts: Vec::new(),
+                read: AtomicU64::new(0),
+            }
+        }
+
+        fn with(mut self, offset: u64, bytes: Vec<u8>) -> Self {
+            self.parts.push((offset, bytes));
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RevisionRead for FakeRevision {
+        fn size(&self) -> u64 {
+            self.size
+        }
+
+        fn block_sizes(&self) -> &[u64] {
+            &[]
+        }
+
+        async fn read_at(&self, offset: u64, length: u64) -> DriveResult<Vec<u8>> {
+            let end = offset.saturating_add(length).min(self.size);
+            let mut out = vec![0u8; end.saturating_sub(offset) as usize];
+            for (start, bytes) in &self.parts {
+                let part_end = start + bytes.len() as u64;
+                let (from, to) = (offset.max(*start), end.min(part_end));
+                if from < to {
+                    out[(from - offset) as usize..(to - offset) as usize]
+                        .copy_from_slice(&bytes[(from - start) as usize..(to - start) as usize]);
+                }
+            }
+            self.read.fetch_add(out.len() as u64, Ordering::Relaxed);
+            Ok(out)
+        }
+    }
+
+    /// An ISO media box of `len` bytes, of which only the header is returned.
+    fn iso_box_header(kind: &[u8; 4], len: u64) -> Vec<u8> {
+        if let Ok(len) = u32::try_from(len) {
+            [&len.to_be_bytes()[..], kind].concat()
+        } else {
+            [&1u32.to_be_bytes()[..], kind, &len.to_be_bytes()[..]].concat()
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn a_large_stream_video_downloads_its_head_alone() {
+        let mut head = vec![0u8; 188 * 2];
+        head[0] = 0x47;
+        head[188] = 0x47;
+        let revision = FakeRevision::new(9 * GIB).with(0, head);
+        let sample = block_on(sample_video(&revision)).unwrap();
+        assert_eq!(sample.size, 9 * GIB);
+        assert_eq!(sample.head.len() as u64, VIDEO_HEAD_BYTES);
+        assert!(sample.index.is_none());
+        assert!(sample.is_transport_stream());
+        assert_eq!(revision.read.load(Ordering::Relaxed), VIDEO_HEAD_BYTES);
+    }
+
+    /// A camera MP4 keeps its index after gigabytes of media data. The sample
+    /// is the head, the box headers on the way, and the index itself.
+    #[test]
+    fn a_large_mp4_downloads_its_head_and_its_index() {
+        let ftyp = [
+            iso_box_header(b"ftyp", 24),
+            b"isom\0\0\0\0mp41isom".to_vec(),
+        ]
+        .concat();
+        let mdat_len = 6 * GIB;
+        let moov_at = ftyp.len() as u64 + mdat_len;
+        let moov = [iso_box_header(b"moov", 4096), vec![7u8; 4088]].concat();
+        let size = moov_at + moov.len() as u64;
+        let revision = FakeRevision::new(size)
+            .with(0, ftyp.clone())
+            .with(ftyp.len() as u64, iso_box_header(b"mdat", mdat_len))
+            .with(moov_at, moov.clone());
+
+        let sample = block_on(sample_video(&revision)).unwrap();
+        assert_eq!(sample.index, Some((moov_at, moov)));
+        assert!(
+            revision.read.load(Ordering::Relaxed) <= VIDEO_HEAD_BYTES + 4096 + 16,
+            "read {} bytes",
+            revision.read.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn an_mp4_with_its_index_up_front_downloads_its_head_alone() {
+        let ftyp = [iso_box_header(b"ftyp", 16), b"isom\0\0\0\0".to_vec()].concat();
+        let moov = [iso_box_header(b"moov", 64), vec![1u8; 56]].concat();
+        let revision = FakeRevision::new(GIB)
+            .with(0, ftyp.clone())
+            .with(ftyp.len() as u64, moov)
+            .with(80, iso_box_header(b"mdat", GIB - 80));
+        let sample = block_on(sample_video(&revision)).unwrap();
+        assert!(sample.index.is_none());
+        assert_eq!(revision.read.load(Ordering::Relaxed), VIDEO_HEAD_BYTES);
+    }
+
+    #[test]
+    fn a_small_video_downloads_whole() {
+        let revision = FakeRevision::new(VIDEO_WHOLE_MAX_BYTES).with(0, vec![3u8; 64]);
+        let sample = block_on(sample_video(&revision)).unwrap();
+        assert_eq!(sample.head.len() as u64, VIDEO_WHOLE_MAX_BYTES);
+        assert!(sample.index.is_none());
+    }
+
+    /// `.ts` that is TypeScript reaches ffmpeg never: the sync byte is missing,
+    /// and that is a final answer, not a retry.
+    #[test]
+    fn a_ts_without_the_sync_byte_is_no_video() {
+        let attempt = video_sample_thumbnail(
+            &whole(b"export const answer = 42;"),
+            "bundle.ts",
+            &std::env::temp_dir(),
+            OsStr::new("pdfs-ffmpeg-deliberately-absent"),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(attempt, ScaleAttempt::Undecodable));
+    }
+
+    /// ffmpeg reads the index where the file's own boxes put it, so the staging
+    /// file has the full length and the index at its offset.
+    #[test]
+    fn the_index_is_staged_at_its_own_offset() {
+        let tmp = scratch("video-index");
+        let frame = tmp.join("frame.jpg");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&frame, jpeg(640, 360)).unwrap();
+        let size: u64 = 3 * GIB;
+        let at: u64 = size - 4096;
+        // Arguments: -nostdin -loglevel error -ss <seek> -i <path> …
+        let ffmpeg = fake_ffmpeg(
+            &tmp,
+            &format!(
+                "[ \"$(stat -c %s \"$7\")\" = {size} ] && \
+                 [ \"$(tail -c +{} \"$7\" | head -c 4)\" = moov ] && cat '{}'",
+                // The box type, after its 4-byte length; `tail` counts from 1.
+                at + 5,
+                frame.display()
+            ),
+        );
+        let sample = VideoSample {
+            size,
+            head: vec![0u8; 1024],
+            index: Some((
+                at,
+                [iso_box_header(b"moov", 4096), vec![0u8; 4088]].concat(),
+            )),
+        };
+        let attempt = video_sample_thumbnail(
+            &sample,
+            "clip.mp4",
+            &tmp,
+            ffmpeg.as_os_str(),
+            Duration::from_secs(10),
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(matches!(attempt, ScaleAttempt::Made(_)));
+    }
+
     #[test]
     fn a_video_frame_becomes_a_thumbnail() {
         let tmp = scratch("video-frame");
@@ -2544,8 +2901,8 @@ mod thumb_tests {
         std::fs::write(&frame, jpeg(1080, 1920)).unwrap();
         let ffmpeg = fake_ffmpeg(&tmp, &format!("cat '{}'", frame.display()));
 
-        let ScaleAttempt::Made(thumb) = video_thumbnail(
-            b"video bytes",
+        let ScaleAttempt::Made(thumb) = video_sample_thumbnail(
+            &whole(b"video bytes"),
             "clip.mp4",
             &tmp,
             ffmpeg.as_os_str(),
@@ -2561,8 +2918,8 @@ mod thumb_tests {
     fn a_video_ffmpeg_cannot_read_is_a_permanent_miss() {
         let tmp = scratch("video-broken");
         let ffmpeg = fake_ffmpeg(&tmp, "exit 1");
-        let attempt = video_thumbnail(
-            b"not a video",
+        let attempt = video_sample_thumbnail(
+            &whole(b"not a video"),
             "clip.mp4",
             &tmp,
             ffmpeg.as_os_str(),
@@ -2574,8 +2931,8 @@ mod thumb_tests {
 
     #[test]
     fn missing_ffmpeg_is_retryable() {
-        let attempt = video_thumbnail(
-            b"video bytes",
+        let attempt = video_sample_thumbnail(
+            &whole(b"video bytes"),
             "clip.mp4",
             &std::env::temp_dir(),
             OsStr::new("pdfs-ffmpeg-deliberately-absent"),
@@ -2591,9 +2948,12 @@ mod thumb_tests {
         let path = std::env::var_os("PDFS_VIDEO_FIXTURE").expect("PDFS_VIDEO_FIXTURE");
         let path = std::path::PathBuf::from(path);
         let name = path.file_name().unwrap().to_string_lossy();
-        let bytes = std::fs::read(&path).unwrap();
-        let ScaleAttempt::Made(thumb) = video_thumbnail(
-            &bytes,
+        // Through the same partial download a Drive video gets.
+        let revision = FakeRevision::new(std::fs::read(&path).unwrap().len() as u64)
+            .with(0, std::fs::read(&path).unwrap());
+        let sample = block_on(sample_video(&revision)).unwrap();
+        let ScaleAttempt::Made(thumb) = video_sample_thumbnail(
+            &sample,
             &name,
             &std::env::temp_dir(),
             OsStr::new("ffmpeg"),

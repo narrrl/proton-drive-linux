@@ -3619,4 +3619,110 @@ mod tests {
         assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A video in My files gets a thumbnail from a frame of its own, but a
+    /// recording can be gigabytes: only its start, and an MP4's index, are
+    /// downloaded for it. A video with a thumbnail from its uploader is not
+    /// downloaded at all, and a `.ts` that is TypeScript gets no thumbnail.
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_video_thumbnail_downloads_a_small_part_of_the_video() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: needs ffmpeg");
+            return;
+        }
+        let dir = scratch("video-thumbs");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Twenty seconds at 30 Mbit/s: larger than a thumbnail downloads whole.
+        // An MP4 written this way has its index at the end.
+        let encode = |name: &str| {
+            let path = dir.join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi"])
+                .args(["-i", "testsrc2=size=1280x720:rate=30", "-t", "20"])
+                .args(["-c:v", "libx264", "-preset", "ultrafast"])
+                .args(["-b:v", "30M", "-maxrate", "30M", "-bufsize", "30M"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(bytes.len() > 30 << 20, "{name} is {} bytes", bytes.len());
+            bytes
+        };
+        let (recording, clip) = (encode("recording.ts"), encode("clip.mp4"));
+        let source = b"export const answer = 42;\n".repeat(64 * 1024);
+
+        let drive = FakeDrive::new();
+        drive.device().write("recording.ts", &recording);
+        drive.device().write("clip.mp4", &clip);
+        drive.device().write("app.ts", &source);
+        let phone = drive.device().write("phone.mp4", &clip);
+        let mut frame = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut frame)
+            .encode_image(&image::RgbImage::new(320, 180))
+            .unwrap();
+        let client = drive.client(1, Faults::lan());
+        client.set_thumbnail(&phone, frame);
+        let daemon = Daemon::start(&dir.join("daemon"), client.clone()).unwrap();
+        let Ok(Response::Entries { entries }) = daemon.request(&Request::ListDir {
+            path: String::new(),
+        }) else {
+            panic!("listing");
+        };
+        let items: Vec<control::FileThumbRequest> = entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| control::FileThumbRequest {
+                uid: entry.uid.clone(),
+                modified: entry.modified,
+                name: entry.name.clone(),
+            })
+            .collect();
+        let Ok(Response::FileThumbGeneration { generation }) =
+            daemon.request(&Request::ReserveFileThumbGeneration)
+        else {
+            panic!("generation");
+        };
+        let read_before = client.content_read();
+
+        let mut paths = std::collections::HashMap::new();
+        let settled = wait_until(Duration::from_secs(120), || {
+            let Ok(Response::Thumbs { items: replies }) = daemon.request(&Request::FileThumbs {
+                items: items.clone(),
+                generation,
+            }) else {
+                return false;
+            };
+            paths = replies
+                .iter()
+                .filter_map(|reply| {
+                    let name = &items.iter().find(|item| item.uid == reply.uid)?.name;
+                    Some((name.clone(), (reply.path.clone(), reply.pending)))
+                })
+                .collect();
+            paths.values().all(|(_, pending)| !pending) && paths.len() == 4
+        });
+        assert!(settled, "{paths:?}");
+        let read = client.content_read() - read_before;
+
+        for name in ["recording.ts", "clip.mp4", "phone.mp4"] {
+            assert!(paths[name].0.is_some(), "{name} has a thumbnail: {paths:?}");
+        }
+        assert_eq!(paths["app.ts"].0, None, "TypeScript is no video");
+        // Two 16 MiB heads, one MP4 index and the TypeScript file, and nothing
+        // of the video that came with a thumbnail.
+        assert!(
+            read < 34 << 20,
+            "downloaded {} MiB for three thumbnails",
+            read >> 20
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

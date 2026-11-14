@@ -94,7 +94,7 @@ pub(crate) fn icon_name(hit: &Hit) -> String {
     let name = hit.name();
     if is_image(name) {
         "image-x-generic"
-    } else if is_media(name) {
+    } else if is_media(name) || pdfs_core::control::is_video_file_name(name, Some(hit.size())) {
         "video-x-generic"
     } else if is_document(name) {
         "text-x-generic"
