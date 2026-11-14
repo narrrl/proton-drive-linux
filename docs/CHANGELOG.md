@@ -74,6 +74,11 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   tell photos apart by their thumbnail. Ctrl+scroll, Ctrl+plus, Ctrl+minus and Ctrl+0
   change it too, and the size is remembered between runs.
 
+- **Back takes you to where you were.** Back, Forward and Up in My files return to a folder
+  scrolled where it was left, with the same items selected, and closing the photo viewer scrolls
+  the grid to the photo it was showing. Alt+Left and Backspace go back a level in Shared with me
+  and Computers and leave an open album or place in Photos, as Escape does too.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
@@ -114,6 +119,25 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 
 - **Videos over 256 MiB get a thumbnail** (B283). They never got one, and a smaller video was
   downloaded whole into memory for one frame.
+
+- **A folder opens at the top.** A folder opened in My files, Shared with me or Computers could
+  open scrolled to where its parent was left, often at the bottom. Another folder, a new search
+  and a new Photos filter, album or place now start at the top, and a refresh keeps its place.
+
+- **Closing a photo opened from the Places map goes back to the map**, not to the town's
+  timeline.
+
+- **Albums and Places stay on screen.** They could switch to the timeline by themselves when a
+  timeline page arrived late, after an upload or after a trash Undo. Coming back to Photos no
+  longer reloads the timeline and loses its scroll position, unless photos changed while it was
+  out of sight. After an album or a place, the timeline came back unfiltered while the kind tab
+  and the date still showed the filter.
+
+- **A search in My files stays.** It was replaced by the folder's listing whenever files
+  changed, on refresh and on coming back to the page, while the query stayed in the box.
+
+- **A date jump in Photos stops when you look elsewhere.** A jump still loading the timeline
+  kept going after another filter, album or place was opened.
 
 ## [3.7.0] — 2026-11-02
 

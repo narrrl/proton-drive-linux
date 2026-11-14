@@ -279,10 +279,7 @@ pub(crate) fn wire_shared(ui: &Rc<Ui>, widgets: &SharedWidgets) {
         }));
 
     let ui_back = ui.clone();
-    widgets.back.connect_clicked(move |_| {
-        ui_back.shared.nav.borrow_mut().pop();
-        load_shared(&ui_back);
-    });
+    widgets.back.connect_clicked(move |_| shared_back(&ui_back));
     let ui_retry = ui.clone();
     widgets
         .retry
@@ -316,6 +313,14 @@ pub(crate) fn shared_status(ui: &Rc<Ui>, icon: &str, title: &str, description: &
         .set_description(Some(&gtk4::glib::markup_escape_text(description)));
     ui.shared.retry.set_visible(retry);
     ui.shared.content.set_visible_child_name("status");
+}
+
+/// Back out of a shared folder to the level above: the page's Back button, and
+/// Alt+Left or Backspace. A no-op at the top.
+pub(crate) fn shared_back(ui: &Rc<Ui>) {
+    if ui.shared.nav.borrow_mut().pop().is_some() {
+        load_shared(ui);
+    }
 }
 
 /// Fetch the top level (shared-with-me, invitations, saved links) in parallel
@@ -443,6 +448,7 @@ fn repaint_shared_files(ui: &Rc<Ui>, entries: &[DirEntry]) {
     let nav = ui.shared.nav.borrow().clone();
     repaint_shared_crumb(ui, &nav);
     let top = nav.is_empty();
+    let another_folder = ui.shared.listed.borrow().as_ref() != Some(&nav);
     *ui.shared.listed.borrow_mut() = Some(nav);
     if entries.is_empty() {
         ui.shared.files.model.remove_all();
@@ -467,8 +473,11 @@ fn repaint_shared_files(ui: &Rc<Ui>, entries: &[DirEntry]) {
     }
     ui.shared.files_content.set_visible_child_name("list");
     // Only the rows that changed are swapped, so a refresh keeps the selection
-    // and the scroll position.
+    // and the scroll position. Another folder starts from its first entry.
     replace_items(&ui.shared.files.model, entries);
+    if another_folder {
+        ui.shared.files.scroll_to_top();
+    }
 }
 
 /// Rebuild the breadcrumb trail for `nav`: "Shared with me", then each folder

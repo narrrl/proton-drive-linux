@@ -457,6 +457,8 @@ fn build_window(app: &adw::Application) {
             files: browser_widgets.files.clone(),
             history: RefCell::new(Vec::new()),
             future: RefCell::new(Vec::new()),
+            places: RefCell::new(HashMap::new()),
+            restore: RefCell::new(None),
             crumb: browser_widgets.crumb.clone(),
             content: browser_widgets.content.clone(),
             status: browser_widgets.status.clone(),
@@ -726,17 +728,26 @@ fn build_window(app: &adw::Application) {
         cancel_file_thumbnails(&ui_nav);
         sync_sidebar(&ui_nav);
         match st.visible_child_name().as_deref() {
-            Some("browser") => load_browser(&ui_nav),
+            Some("browser") => reload_browser_view(&ui_nav),
             // The Albums and Places listings are re-read in place. Loading the
             // timeline instead would swap it in under the Albums or Places toggle.
+            // The timeline, an album or a place comes back as it was left,
+            // scrolled where it was, unless photos changed while it was out of
+            // sight (see `follow_changes`) or nothing is loaded yet.
             Some("gallery") if !ui_nav.gallery.in_collection() => {
                 match ui_nav.gallery.view_switch.active() {
                     VIEW_ALBUMS => load_albums(&ui_nav),
                     VIEW_PLACES => load_places(&ui_nav),
-                    _ => load_gallery(&ui_nav, false),
+                    _ if ui_nav.gallery.timeline_stale.replace(false)
+                        || ui_nav.gallery.model.n_items() == 0 =>
+                    {
+                        load_gallery(&ui_nav, false)
+                    }
+                    _ => {}
                 }
             }
-            Some("gallery") => load_gallery(&ui_nav, false),
+            Some("gallery") if ui_nav.gallery.model.n_items() == 0 => load_gallery(&ui_nav, false),
+            Some("gallery") => {}
             // Every visit reads the page again. The rows already on screen stay
             // up while it does, so arriving costs no "Loading…" flash.
             Some("sharedbyme") => load_shared_by_me(&ui_nav),
@@ -1066,7 +1077,7 @@ fn reload_current_page(ui: &Rc<Ui>) {
     match ui.stack.visible_child_name().as_deref() {
         Some("browser") => {
             let path = ui.browser.path.borrow().clone();
-            refresh_then(ui, RefreshScope::Dir { path }, load_browser);
+            refresh_then(ui, RefreshScope::Dir { path }, reload_browser_view);
         }
         // One scope covers the whole photos view, so Refresh reloads whichever of
         // the views — a grid, or the timeline, an album or a place — is on screen.
@@ -1539,6 +1550,7 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("<Control>minus", gettext_noop("Smaller thumbnails")),
                 ("<Control>0", gettext_noop("Reset thumbnail size")),
                 ("<Control>a", gettext_noop("Select all")),
+                ("Escape <Alt>Left", gettext_noop("Back")),
             ],
         ),
         (
@@ -1575,8 +1587,17 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
     controller.connect_key_pressed(move |_, key, _, state| {
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let alt = state.contains(gtk4::gdk::ModifierType::ALT_MASK);
-        let on_browser = ui.stack.visible_child_name().as_deref() == Some("browser");
-        let on_trash = ui.stack.visible_child_name().as_deref() == Some("trash");
+        let page = ui.stack.visible_child_name();
+        let on_browser = page.as_deref() == Some("browser");
+        let on_trash = page.as_deref() == Some("trash");
+        let on_gallery = page.as_deref() == Some("gallery");
+        // Pages with a level to go back to, besides My files' own history.
+        let in_collection = on_gallery && ui.gallery.in_collection();
+        let in_shared_folder =
+            page.as_deref() == Some("shared") && !ui.shared.nav.borrow().is_empty();
+        let in_device_folder =
+            page.as_deref() == Some("devices") && !ui.devices.nav.borrow().is_empty();
+        let back_key = (key == gtk4::gdk::Key::Left && alt) || key == gtk4::gdk::Key::BackSpace;
         match key {
             // Refresh works on every page, so it is matched before the
             // browser-only bindings.
@@ -1633,6 +1654,21 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             gtk4::gdk::Key::BackSpace if on_browser => {
                 ui.browser.actions.activate_action("back", None)
             }
+            // Selection mode ends before Escape leaves anything; the grid
+            // handles this itself while it has the focus.
+            gtk4::gdk::Key::Escape if on_gallery && ui.gallery.selecting.get() => {
+                set_selection_mode(&ui, false)
+            }
+            // An album or a place is a level below Photos, as a folder is
+            // below its parent: Back leaves it, and so does Escape.
+            _ if in_collection
+                && !ui.gallery.selecting.get()
+                && (back_key || key == gtk4::gdk::Key::Escape) =>
+            {
+                ui.gallery.back.emit_clicked()
+            }
+            _ if in_shared_folder && back_key => shared_back(&ui),
+            _ if in_device_folder && back_key => devices_back(&ui),
             gtk4::gdk::Key::u | gtk4::gdk::Key::U if ctrl && on_browser => prompt_upload(&ui),
             gtk4::gdk::Key::Menu if visible_file_list(&ui).is_some() => {
                 if let Some(list) = visible_file_list(&ui) {

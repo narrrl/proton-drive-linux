@@ -1001,7 +1001,10 @@ fn show_photo_position(ui: &Rc<Ui>, viewer: &Rc<Viewer>, index: u32, capture_tim
 ///
 /// Closing it is deliberately hard to get wrong — Escape, `q`, Ctrl+W, the close
 /// button, or a click on the backdrop beside the photo all dismiss it.
-pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
+///
+/// Returns the lightbox's window, for a caller that has to put the page
+/// behind it back once it closes.
+pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) -> gtk4::Window {
     let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
 
     // An `adw::Window` for its breakpoints: the details panel lies over the
@@ -1425,8 +1428,10 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     // kept every closed lightbox, its window and its full-size photo in memory
     // for the life of the app.
     let keep = RefCell::new(Some(viewer.clone()));
+    let ui_close = ui.clone();
     window.connect_close_request(move |_| {
         if let Some(viewer) = keep.borrow_mut().take() {
+            reveal_photo(&ui_close, &viewer.uid.borrow());
             stop_video(&viewer);
             disarm_slide(&viewer);
             if let Some(source) = viewer.chrome_source.borrow_mut().take() {
@@ -1510,6 +1515,9 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
             let failed = match rx.recv().await {
                 Ok(Ok(Response::Ok { .. })) => {
                     set_gallery_favorite(&ui_result, &uid, favorite);
+                    // The tiles hold their own copy of the photo, so the star
+                    // shows on the grid only once it is laid out again.
+                    repaint_gallery(&ui_result);
                     None
                 }
                 Ok(Ok(Response::Error { message, .. })) => Some(message),
@@ -1718,6 +1726,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     window.add_controller(key_controller);
 
     window.present();
+    window
 }
 
 /// Whether `(x, y)` — in `picture`'s coordinates — lands on the photo itself

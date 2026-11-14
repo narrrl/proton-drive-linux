@@ -392,21 +392,45 @@ fn load_place_locations(ui: &Rc<Ui>, id: u32) {
     });
 }
 
-/// Open `place` and then photo `uid` in it, paging through the town until
-/// the photo has loaded.
+/// Open photo `uid` of `place` from the map or a spot's list, paging through
+/// the town until the photo has loaded.
+///
+/// The lightbox steps through the gallery's model, so the town is opened
+/// behind it. Closing the lightbox goes back to the map rather than leaving
+/// the user in a town timeline they never asked for.
 fn open_place_photo(ui: &Rc<Ui>, place: PlaceInfo, uid: String) {
+    let id = place.id;
     open_place(ui, place);
-    view_when_loaded(ui, uid);
+    view_when_loaded(ui, id, uid);
 }
 
-fn view_when_loaded(ui: &Rc<Ui>, uid: String) {
+/// The open place's id, if a place is open.
+fn open_place_id(ui: &Ui) -> Option<u32> {
+    ui.gallery.place.borrow().as_ref().map(|place| place.id)
+}
+
+fn view_when_loaded(ui: &Rc<Ui>, id: u32, uid: String) {
     let ui_page = ui.clone();
     ui.gallery.page_waiters.borrow_mut().push(Box::new(move || {
         let ui = ui_page;
+        // The user went elsewhere while the town loaded: whatever page lands
+        // now belongs to that, and must not pop the lightbox up over it.
+        if open_place_id(&ui) != Some(id) {
+            return;
+        }
         if find_photo_index(&ui.gallery.model, &uid).is_some() {
-            open_photo_viewer(&ui, uid);
-        } else if ui.gallery.has_more.get() && ui.gallery.place.borrow().is_some() {
-            view_when_loaded(&ui, uid);
+            let window = open_photo_viewer(&ui, uid);
+            let ui_close = ui.clone();
+            window.connect_close_request(move |_| {
+                // Only if the town is still what the lightbox was showing: "Show
+                // on map" in the lightbox has already moved on by itself.
+                if open_place_id(&ui_close) == Some(id) {
+                    show_place_grid(&ui_close);
+                }
+                glib::Propagation::Proceed
+            });
+        } else if ui.gallery.has_more.get() {
+            view_when_loaded(&ui, id, uid);
             ui.gallery.burst.set(true);
             load_gallery(&ui, true);
         }
