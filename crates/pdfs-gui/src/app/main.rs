@@ -726,17 +726,26 @@ fn build_window(app: &adw::Application) {
         cancel_file_thumbnails(&ui_nav);
         sync_sidebar(&ui_nav);
         match st.visible_child_name().as_deref() {
-            Some("browser") => load_browser(&ui_nav),
+            Some("browser") => reload_browser_view(&ui_nav),
             // The Albums and Places listings are re-read in place. Loading the
             // timeline instead would swap it in under the Albums or Places toggle.
+            // The timeline, an album or a place comes back as it was left,
+            // scrolled where it was, unless photos changed while it was out of
+            // sight (see `follow_changes`) or nothing is loaded yet.
             Some("gallery") if !ui_nav.gallery.in_collection() => {
                 match ui_nav.gallery.view_switch.active() {
                     VIEW_ALBUMS => load_albums(&ui_nav),
                     VIEW_PLACES => load_places(&ui_nav),
-                    _ => load_gallery(&ui_nav, false),
+                    _ if ui_nav.gallery.timeline_stale.replace(false)
+                        || ui_nav.gallery.model.n_items() == 0 =>
+                    {
+                        load_gallery(&ui_nav, false)
+                    }
+                    _ => {}
                 }
             }
-            Some("gallery") => load_gallery(&ui_nav, false),
+            Some("gallery") if ui_nav.gallery.model.n_items() == 0 => load_gallery(&ui_nav, false),
+            Some("gallery") => {}
             // Every visit reads the page again. The rows already on screen stay
             // up while it does, so arriving costs no "Loading…" flash.
             Some("sharedbyme") => load_shared_by_me(&ui_nav),
@@ -1066,7 +1075,7 @@ fn reload_current_page(ui: &Rc<Ui>) {
     match ui.stack.visible_child_name().as_deref() {
         Some("browser") => {
             let path = ui.browser.path.borrow().clone();
-            refresh_then(ui, RefreshScope::Dir { path }, load_browser);
+            refresh_then(ui, RefreshScope::Dir { path }, reload_browser_view);
         }
         // One scope covers the whole photos view, so Refresh reloads whichever of
         // the views — a grid, or the timeline, an album or a place — is on screen.

@@ -224,6 +224,19 @@ impl FileList {
             .set_visible_child_name(if list { "list" } else { "grid" });
     }
 
+    /// Bring both views back to the first entry. For a listing of something
+    /// else: [`replace_items`] keeps the scroll position, which is right for a
+    /// refresh, but another folder would open where the last one was left —
+    /// often at its bottom.
+    pub(crate) fn scroll_to_top(&self) {
+        if self.model.n_items() == 0 {
+            return;
+        }
+        self.grid.scroll_to(0, gtk4::ListScrollFlags::NONE, None);
+        self.column_view
+            .scroll_to(0, None, gtk4::ListScrollFlags::NONE, None);
+    }
+
     /// Whether the list, rather than the grid, is on screen.
     pub(crate) fn shows_list(&self) -> bool {
         self.views.visible_child_name().as_deref() == Some("list")

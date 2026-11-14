@@ -2921,6 +2921,18 @@ pub(crate) fn load_browser(ui: &Rc<Ui>) {
     });
 }
 
+/// Read again what My files shows: the search hits while there is a query,
+/// the folder otherwise. [`load_browser`] alone would swap a search's hits
+/// for the folder while the query stays in the box.
+pub(crate) fn reload_browser_view(ui: &Rc<Ui>) {
+    let query = ui.browser.search.text().trim().to_string();
+    if query.is_empty() {
+        load_browser(ui);
+    } else {
+        run_search(ui, &query);
+    }
+}
+
 /// Clear the model and show the daemon's error on the status page. Used for
 /// in-band failures (a bad path, a permission error) — the mount is up, so Retry
 /// (which restarts the service) wouldn't help and isn't offered.
@@ -2959,7 +2971,10 @@ pub(crate) fn browser_unreachable(ui: &Rc<Ui>) {
 pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     show_location_column(ui, false);
     *ui.browser.listing.borrow_mut() = entries.to_vec();
-    *ui.browser.listed.borrow_mut() = Some(ui.browser.path.borrow().clone());
+    // `listed` still names the folder the rows belong to only on a refresh;
+    // any other load forgot it (see `load_browser`).
+    let path = ui.browser.path.borrow().clone();
+    let another_folder = ui.browser.listed.replace(Some(path.clone())).as_ref() != Some(&path);
     ui.browser.summary.set_label(&listing_summary(
         entries.iter().filter(|entry| !entry.is_dir).count(),
         entries.iter().filter(|entry| entry.is_dir).count(),
@@ -2988,6 +3003,9 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
     // Only the rows that changed are swapped, so a refresh keeps the
     // selection, the scroll position and the thumbnails already drawn.
     replace_items(&ui.browser.files.model, &sorted);
+    if another_folder {
+        ui.browser.files.scroll_to_top();
+    }
 }
 
 /// Forget which folder the rows belong to and drop the selection, before the
@@ -3166,6 +3184,9 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
         .collect();
     sort_entries(&mut entries, ui.browser.view.get());
     replace_items(&ui.browser.files.model, &entries);
+    // Every search starts over (`run_search` forgets the listing), so its hits
+    // read from the first one.
+    ui.browser.files.scroll_to_top();
 }
 
 fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {

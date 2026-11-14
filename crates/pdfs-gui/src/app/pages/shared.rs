@@ -443,6 +443,7 @@ fn repaint_shared_files(ui: &Rc<Ui>, entries: &[DirEntry]) {
     let nav = ui.shared.nav.borrow().clone();
     repaint_shared_crumb(ui, &nav);
     let top = nav.is_empty();
+    let another_folder = ui.shared.listed.borrow().as_ref() != Some(&nav);
     *ui.shared.listed.borrow_mut() = Some(nav);
     if entries.is_empty() {
         ui.shared.files.model.remove_all();
@@ -467,8 +468,11 @@ fn repaint_shared_files(ui: &Rc<Ui>, entries: &[DirEntry]) {
     }
     ui.shared.files_content.set_visible_child_name("list");
     // Only the rows that changed are swapped, so a refresh keeps the selection
-    // and the scroll position.
+    // and the scroll position. Another folder starts from its first entry.
     replace_items(&ui.shared.files.model, entries);
+    if another_folder {
+        ui.shared.files.scroll_to_top();
+    }
 }
 
 /// Rebuild the breadcrumb trail for `nav`: "Shared with me", then each folder

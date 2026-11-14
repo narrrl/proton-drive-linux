@@ -297,6 +297,7 @@ fn load_device_folder(ui: &Rc<Ui>, nav: &[(String, String)]) {
         };
         ui.devices.content.set_visible_child_name("browse");
         repaint_device_crumb(&ui, &nav);
+        let another_folder = ui.devices.listed.borrow().as_ref() != Some(&nav);
         *ui.devices.listed.borrow_mut() = Some(nav);
         if entries.is_empty() {
             ui.devices.files.model.remove_all();
@@ -304,6 +305,10 @@ fn load_device_folder(ui: &Rc<Ui>, nav: &[(String, String)]) {
         } else {
             ui.devices.files_content.set_visible_child_name("list");
             replace_items(&ui.devices.files.model, &entries);
+            // A refresh keeps its place; another folder starts at the top.
+            if another_folder {
+                ui.devices.files.scroll_to_top();
+            }
         }
     });
 }

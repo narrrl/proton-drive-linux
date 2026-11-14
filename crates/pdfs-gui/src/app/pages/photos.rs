@@ -3952,7 +3952,9 @@ fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64
     } else {
         pgettext("verb", "Open")
     };
-    menu.item(&label, move || open_photo_viewer(&ui_c, uid.clone()));
+    menu.item(&label, move || {
+        open_photo_viewer(&ui_c, uid.clone());
+    });
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     // Translators: a check item in a photo's menu, on while the photo is a favorite.
     let favorite_label = pgettext("state", "Favorite");
@@ -4020,8 +4022,21 @@ fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
     });
 }
 
+/// Whether the photo grid is the view the Photos page shows: an album or a
+/// place, or the timeline itself. Under Albums or Places it is out of sight.
+pub(crate) fn photo_grid_shown(ui: &Ui) -> bool {
+    ui.gallery.in_collection() || ui.gallery.view_switch.active() == VIEW_TIMELINE
+}
+
 pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     sync_filter_badge(ui);
+    // A load would put the grid, or its status page, on screen in place of
+    // the Albums or Places view the user is looking at. Leave the timeline to
+    // be read again when they switch back to it.
+    if !photo_grid_shown(ui) {
+        ui.gallery.timeline_stale.set(true);
+        return;
+    }
     if ui.gallery.loading.get() {
         // A filter flipped while a page is on its way: that page answers the
         // old question, so fetch again once it lands. More pages can wait.
@@ -4098,6 +4113,12 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         if !waiters.is_empty() {
             glib::idle_add_local_once(move || waiters.into_iter().for_each(|waiter| waiter()));
         }
+        // The user left for Albums or Places while the page was on its way;
+        // painting it now would switch the view under them.
+        if !photo_grid_shown(&ui) {
+            ui.gallery.timeline_stale.set(true);
+            return;
+        }
         match result {
             Ok(Ok(Response::Photos {
                 available,
@@ -4138,6 +4159,20 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                     ui.gallery.model.append(&BoxedAnyObject::new(item.clone()));
                 }
                 repaint_gallery(&ui);
+                // The rows are swapped in place, which keeps the old scroll
+                // offset; a fresh load (another kind, month, album or place)
+                // reads from its newest photo.
+                if !append
+                    && ui
+                        .gallery
+                        .list
+                        .model()
+                        .is_some_and(|rows| rows.n_items() > 0)
+                {
+                    ui.gallery
+                        .list
+                        .scroll_to(0, gtk4::ListScrollFlags::NONE, None);
+                }
                 if ui.gallery.model.n_items() == 0 {
                     let filtered = ui.gallery.kind.get().is_some()
                         || ui.gallery.favorites.get()

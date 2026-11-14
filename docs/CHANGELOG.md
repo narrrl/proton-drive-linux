@@ -115,6 +115,22 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 - **Videos over 256 MiB get a thumbnail** (B283). They never got one, and a smaller video was
   downloaded whole into memory for one frame.
 
+- **A folder opens at the top.** A folder opened in My files, Shared with me or Computers could
+  open scrolled to where its parent was left, often at the bottom. Another folder, a new search
+  and a new Photos filter, album or place now start at the top, and a refresh keeps its place.
+
+- **Closing a photo opened from the Places map goes back to the map**, not to the town's
+  timeline.
+
+- **Albums and Places stay on screen.** They could switch to the timeline by themselves when a
+  timeline page arrived late, after an upload or after a trash Undo. Coming back to Photos no
+  longer reloads the timeline and loses its scroll position, unless photos changed while it was
+  out of sight. After an album or a place, the timeline came back unfiltered while the kind tab
+  and the date still showed the filter.
+
+- **A search in My files stays.** It was replaced by the folder's listing whenever files
+  changed, on refresh and on coming back to the page, while the query stayed in the box.
+
 ## [3.7.0] — 2026-11-02
 
 Schema: **44**, unchanged.

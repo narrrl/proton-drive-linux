@@ -664,12 +664,25 @@ pub(crate) fn wire_albums(ui: &Rc<Ui>) {
         }
         close_album(&ui_photos);
         close_place(&ui_photos);
-        ui_photos.gallery.filters.set_visible(true);
-        ui_photos.gallery.content.set_visible_child_name("timeline");
+        let gallery = &ui_photos.gallery;
+        gallery.filters.set_visible(true);
+        gallery.content.set_visible_child_name("timeline");
+        // An album or a place cleared the kind and the month it does not use;
+        // the filter controls still show them, so the timeline comes back
+        // filtered the way they say.
+        let kind = kind_for_tab(gallery.tabs.active() as usize);
+        let range = gallery
+            .date_ranges
+            .borrow()
+            .get(gallery.dates.selected() as usize)
+            .copied()
+            .flatten();
+        let kind_changed = gallery.kind.replace(kind) != kind;
+        let range_changed = gallery.range.replace(range) != range;
+        let refiltered = kind_changed || range_changed;
         // The timeline comes back as it was left unless an album took over the
         // model since; then it has to be reloaded.
-        if ui_photos.gallery.timeline_stale.replace(false) || ui_photos.gallery.model.n_items() == 0
-        {
+        if gallery.timeline_stale.replace(false) || refiltered || gallery.model.n_items() == 0 {
             load_gallery(&ui_photos, false);
         } else {
             update_gallery_subtitle(&ui_photos);
