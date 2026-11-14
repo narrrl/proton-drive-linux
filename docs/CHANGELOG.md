@@ -104,6 +104,14 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   10 seconds, and `M` to mute. The volume carries over from one video to the next, and the
   thumbnail strip in Photos stays off a video, where it covered the seek bar.
 
+- **Album covers for songs.** A song in My files, in search and in Shared shows its cover as its
+  thumbnail, and the player shows it above the controls instead of a music note. The cover is the
+  picture in the song's tags (MP3, FLAC, Ogg, Opus, M4A, WAV, AIFF, WavPack, Monkey's Audio), or
+  else a `cover`, `folder`, `front` or `album` image (`.jpg`, `.png`, `.webp`) in the same folder.
+  Only the song's tags are downloaded for it, not the whole song. Songs uploaded from this computer
+  carry their cover as their thumbnail, so they show it at once on other devices too. A cover
+  image added to a folder later is picked up once the song changes or the service restarts.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
