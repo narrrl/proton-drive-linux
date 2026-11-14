@@ -10,7 +10,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk4::{gio, glib};
 
-use super::row::{fill_slot, thumb_slot};
+use super::row::{content_type_for, fill_slot, thumb_slot};
 use super::thumbs::Thumbs;
 use crate::{Hit, dates, gettext, human_bytes, pgettext};
 
@@ -235,7 +235,7 @@ impl Preview {
         let content_type = if hit.is_dir() {
             glib::GString::from("inode/directory")
         } else {
-            gio::functions::content_type_guess(Some(hit.name()), None).0
+            content_type_for(hit.name(), hit.size())
         };
         self.kind
             .set_label(&gio::functions::content_type_get_description(&content_type));

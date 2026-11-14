@@ -422,9 +422,7 @@ fn open_place(ui: &Rc<Ui>, place: PlaceInfo) {
 
     // As in an album: no filters, no Upload, no view switch — back leads out.
     ui.gallery.filters.set_visible(false);
-    ui.gallery.view_switch.widget().set_visible(false);
-    ui.gallery.upload.set_visible(false);
-    ui.gallery.back.set_visible(true);
+    sync_header(ui);
     ui.gallery.kind.set(None);
     ui.gallery.range.set(None);
 
@@ -439,9 +437,7 @@ pub(crate) fn close_place(ui: &Rc<Ui>) {
         return;
     }
     ui.gallery.title.set_title(&gettext("Photos"));
-    ui.gallery.view_switch.widget().set_visible(true);
-    ui.gallery.upload.set_visible(true);
-    ui.gallery.back.set_visible(false);
+    sync_header(ui);
 }
 
 /// Show the place grid's own status page (loading, empty, or an error).

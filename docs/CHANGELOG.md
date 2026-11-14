@@ -32,6 +32,47 @@ Existing folders remain device backups; older builds cannot open the upgraded da
   My files folder. The first sync preserves one-sided files and differing versions (#67).
   Attachments stay in mirror mode, are excluded from device profiles, and cannot delete
   the remote root when syncing is stopped.
+- **Video thumbnails in My files, Shared, Trash and the launcher**, as in Photos, with a play
+  badge in the grid. A video's thumbnail is the one its uploader attached when it has one.
+  Otherwise the daemon takes a frame with ffmpeg from the start of the file, plus an MP4's
+  index, and never downloads more than about 16 MiB of a video for it, however large the
+  video is. **Build Thumbnails** covers videos too (B283).
+- **A new layout for Photos.**
+  - The grid shows every photo at its own shape, in rows that fill the width (portraits
+    are no longer cropped to squares). **Square Tiles** in the page menu brings the even
+    grid back, and the Year zoom stays square.
+  - Timeline, Albums and Places switch in the header. The filters take one row, which
+    scrolls sideways in a narrow window.
+  - The section you are in floats over the top of the grid once its heading has scrolled
+    away. Headings are larger, and a check beside each one selects the whole day, month or
+    year.
+  - Selection mode works as in other GNOME apps: the header shows the count and
+    **Cancel**, and a bar along the bottom has these actions:
+    - **Add to Favorites**, or remove them when every selected photo is already one;
+    - **Add to Album**;
+    - **Remove from Album**;
+    - **Save Copies**, into a folder you pick, never overwriting a file;
+    - **Move to Trash**.
+  - Favorites carry a star on their tile, and a video waiting for its thumbnail shows a
+    video glyph.
+  - New icons for Photos, albums and the slideshow.
+  - **Upload** takes several photos and videos at once, and you can drop files onto the
+    timeline to upload them.
+  - The zoom level and the tile shape are remembered between runs.
+  - In the photo viewer, the details panel lies over the photo when the window is
+    narrow instead of squeezing it.
+- **Larger icons in My files.** The icon size slider goes up to 256 px, big enough to
+  tell photos apart by their thumbnail. Ctrl+scroll, Ctrl+plus, Ctrl+minus and Ctrl+0
+  change it too, and the size is remembered between runs.
+
+### Fixed
+
+- Large `.ts` recordings (MPEG transport streams) show and open as videos: the video icon, a
+  thumbnail, and the `@media` open rule rather than `@text`. A `.ts` of 1 MiB or more counts
+  as a video, a smaller one stays TypeScript source, and the daemon checks the stream's sync
+  byte before it takes a frame (B283).
+- A video over 256 MiB never got a thumbnail, and a smaller one was downloaded whole into
+  memory for one frame (B283).
 
 ## [3.7.0] — 2026-11-02
 

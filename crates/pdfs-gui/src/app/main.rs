@@ -71,7 +71,7 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 
-use pdfs_core::config::{AppDirs, FileSort, FilesView, WindowState};
+use pdfs_core::config::{AppDirs, FileSort, FilesView, PhotosView, WindowState};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
@@ -488,6 +488,7 @@ fn build_window(app: &adw::Application) {
             empty_actions: browser_widgets.empty_actions.clone(),
             summary: browser_widgets.summary.clone(),
             zoom: browser_widgets.zoom.clone(),
+            zoom_save: RefCell::new(None),
         },
         details: DetailsState {
             details: browser_widgets.details,
@@ -587,10 +588,13 @@ fn build_window(app: &adw::Application) {
             selected: RefCell::new(HashSet::new()),
             select_anchor: RefCell::new(None),
             select_btn: gallery_widgets.select_btn.clone(),
-            select_bar: gallery_widgets.select_bar.clone(),
-            select_label: gallery_widgets.select_label.clone(),
-            select_trash: gallery_widgets.select_trash.clone(),
-            select_album: gallery_widgets.select_album.clone(),
+            selection: gallery_widgets.selection.clone(),
+            more: gallery_widgets.more.clone(),
+            upload_face: gallery_widgets.upload_face.clone(),
+            float_heading: gallery_widgets.float_heading.clone(),
+            float_label: gallery_widgets.float_label.clone(),
+            square: Cell::new(false),
+            zoom_save: RefCell::new(None),
         },
         shared: SharedState::new(&shared_widgets),
         shared_by_me: SharedByMeState::new(&shared_by_me_widgets),
@@ -693,7 +697,7 @@ fn build_window(app: &adw::Application) {
         &ui,
         &gallery_widgets.list,
         &gallery_widgets.scroll,
-        &gallery_widgets.select_done,
+        &gallery_widgets.square_action,
     );
     wire_gallery_empty(
         &ui,
@@ -795,6 +799,7 @@ fn build_window(app: &adw::Application) {
 /// split collapsed whatever the width.
 fn set_narrow(ui: &Ui, narrow: bool) {
     ui.narrow.set(narrow);
+    set_photos_narrow(ui, narrow);
     if ui.session.borrow().is_some() {
         ui.nav.set_collapsed(narrow);
     }
@@ -858,11 +863,7 @@ fn window_hidden(window: &adw::ApplicationWindow) -> bool {
 /// sync, set off by a separator.
 const DESTINATIONS: [(&str, &str, &str); 7] = [
     ("browser", gettext_noop("My files"), "folder-symbolic"),
-    (
-        "gallery",
-        gettext_noop("Photos"),
-        "image-x-generic-symbolic",
-    ),
+    ("gallery", gettext_noop("Photos"), "pdfs-photos-symbolic"),
     (
         "shared",
         gettext_noop("Shared with me"),
@@ -1523,6 +1524,9 @@ fn show_shortcuts(window: &adw::ApplicationWindow) {
                 ("<Alt>Left <Alt>Right", gettext_noop("Back / forward")),
                 ("<Alt>Up", gettext_noop("Parent folder")),
                 ("<Control>1 <Control>2", gettext_noop("Grid / list")),
+                ("<Control>plus", gettext_noop("Larger thumbnails")),
+                ("<Control>minus", gettext_noop("Smaller thumbnails")),
+                ("<Control>0", gettext_noop("Reset thumbnail size")),
                 ("F2", gettext_noop("Rename")),
                 ("Delete", gettext_noop("Move to Trash")),
                 ("Escape", gettext_noop("Clear the selection")),
@@ -1588,6 +1592,21 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 ui.browser.search.grab_focus();
             }
             gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
+            gtk4::gdk::Key::plus | gtk4::gdk::Key::equal | gtk4::gdk::Key::KP_Add
+                if ctrl && on_browser && !ui.browser.files.shows_list() =>
+            {
+                zoom_files(&ui, 1)
+            }
+            gtk4::gdk::Key::minus | gtk4::gdk::Key::KP_Subtract
+                if ctrl && on_browser && !ui.browser.files.shows_list() =>
+            {
+                zoom_files(&ui, -1)
+            }
+            gtk4::gdk::Key::_0 | gtk4::gdk::Key::KP_0
+                if ctrl && on_browser && !ui.browser.files.shows_list() =>
+            {
+                zoom_files(&ui, 0)
+            }
             gtk4::gdk::Key::_1 | gtk4::gdk::Key::_2 if ctrl && on_browser => set_files_view(
                 &ui,
                 FilesView {

@@ -478,7 +478,7 @@ pub(crate) fn text_column(
 
 fn resize_grid_tile(thumbnail: &gtk4::Overlay, label: &gtk4::Label, size: i32) {
     resize_file_thumbnail(thumbnail, size, grid_fallback_size(size));
-    let name_width = (size / 6 + 1).clamp(8, 24);
+    let name_width = (size / 6 + 1).clamp(8, 40);
     label.set_width_chars(name_width);
     label.set_max_width_chars(name_width);
 }

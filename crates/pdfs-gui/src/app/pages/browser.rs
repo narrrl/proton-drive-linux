@@ -77,6 +77,8 @@ pub(crate) struct BrowserState {
     /// zoom value, and Proton account storage usage.
     pub(crate) summary: gtk4::Label,
     pub(crate) zoom: gtk4::Scale,
+    /// Saves the zoom once the slider rests, not on every step.
+    pub(crate) zoom_save: RefCell<Option<glib::SourceId>>,
 }
 
 /// Idle pause after the last keystroke before a search query is sent, so typing
@@ -87,9 +89,11 @@ pub(crate) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 pub(crate) const SEARCH_LIMIT: usize = 200;
 
 /// Browser grid thumbnail size controlled by the bottom zoom slider. The
-/// default preserves the former fixed 72 px presentation.
+/// default preserves the former fixed 72 px presentation. The largest size is
+/// big enough to tell photos apart by their thumbnail, and thumbnails are
+/// 512 px, so they stay sharp up to it on a 2× screen.
 pub(crate) const GRID_THUMB_MIN: i32 = 48;
-pub(crate) const GRID_THUMB_MAX: i32 = 144;
+pub(crate) const GRID_THUMB_MAX: i32 = 256;
 pub(crate) const GRID_THUMB_DEFAULT: i32 = 72;
 pub(crate) const GRID_THUMB_STEP: i32 = 8;
 
@@ -801,7 +805,35 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>) {
             &[],
         )));
         ui_zoom.browser.files.set_thumbnail_size(size);
+        save_icon_size(&ui_zoom, size);
     });
+    // Ctrl+scroll steps the icon size, as in Photos. Capture phase so the
+    // scrolled window does not scroll the grid as well. A touchpad sends many
+    // small deltas, so they add up to a whole notch before each step.
+    if let Some(grid_scroll) = files.views.child_by_name("grid") {
+        let wheel = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        wheel.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let ui_wheel = ui.clone();
+        let pending = Cell::new(0.0_f64);
+        wheel.connect_scroll(move |controller, _dx, dy| {
+            if !controller
+                .current_event_state()
+                .contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            {
+                pending.set(0.0);
+                return glib::Propagation::Proceed;
+            }
+            let total = pending.get() + dy;
+            let steps = total.trunc();
+            pending.set(total - steps);
+            if steps != 0.0 {
+                // Scrolling up (negative dy) makes the icons bigger.
+                zoom_files(&ui_wheel, -(steps as i32));
+            }
+            glib::Propagation::Stop
+        });
+        grid_scroll.add_controller(wheel);
+    }
 
     files
         .column_view
@@ -1306,6 +1338,11 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
 
     let view = ui.dirs.load_config().files_view;
     ui.browser.view.set(view);
+    if let Some(size) = view.icon_size {
+        ui.browser
+            .zoom
+            .set_value(f64::from(size.clamp(GRID_THUMB_MIN, GRID_THUMB_MAX)));
+    }
     let layout = gio::SimpleAction::new_stateful(
         "view",
         Some(glib::VariantTy::STRING),
@@ -1405,6 +1442,41 @@ pub(crate) fn wire_browser_actions(ui: &Rc<Ui>, build_thumbnails: &gtk4::Button)
         true
     });
     ui.browser.content.add_controller(drop);
+}
+
+/// Remember the grid's icon size, once the slider has rested for a moment.
+fn save_icon_size(ui: &Rc<Ui>, size: i32) {
+    let mut view = ui.browser.view.get();
+    if view.icon_size == Some(size) {
+        return;
+    }
+    view.icon_size = Some(size);
+    ui.browser.view.set(view);
+    if let Some(source) = ui.browser.zoom_save.borrow_mut().take() {
+        source.remove();
+    }
+    let ui_save = ui.clone();
+    let source = glib::timeout_add_local_once(Duration::from_millis(500), move || {
+        ui_save.browser.zoom_save.borrow_mut().take();
+        let mut config = ui_save.dirs.load_config();
+        config.files_view.icon_size = ui_save.browser.view.get().icon_size;
+        if let Err(e) = ui_save.dirs.save_config(&config) {
+            tracing::warn!("cannot save the icon size: {e}");
+        }
+    });
+    *ui.browser.zoom_save.borrow_mut() = Some(source);
+}
+
+/// Step the grid's icon size by `steps` slider notches; `0` resets it.
+pub(crate) fn zoom_files(ui: &Rc<Ui>, steps: i32) {
+    let zoom = &ui.browser.zoom;
+    let size = if steps == 0 {
+        GRID_THUMB_DEFAULT
+    } else {
+        (zoom.value().round() as i32 + steps * GRID_THUMB_STEP)
+            .clamp(GRID_THUMB_MIN, GRID_THUMB_MAX)
+    };
+    zoom.set_value(f64::from(size));
 }
 
 fn layout_name(view: FilesView) -> &'static str {
@@ -1728,8 +1800,9 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
     let text = if status.scanning {
         ui.browser.thumbnail_progress.pulse();
         let folders = ngettext_f("{n} folder", "{n} folders", status.folders_scanned, &[]);
-        let images = ngettext_f("{n} image", "{n} images", status.images_found, &[]);
-        // Translators: {root} is a folder path or "Proton Drive"; {folders} and {images} are counts such as "3 folders" and "12 images".
+        // Translators: a count of images and videos that can have a thumbnail.
+        let images = ngettext_f("{n} file", "{n} files", status.images_found, &[]);
+        // Translators: {root} is a folder path or "Proton Drive"; {folders} and {images} are counts such as "3 folders" and "12 files".
         gettext_f(
             "Scanning {root}… {folders}, {images}",
             &[("root", root), ("folders", &folders), ("images", &images)],
@@ -1743,7 +1816,7 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
         ui.browser
             .thumbnail_progress
             .set_fraction(fraction.clamp(0.0, 1.0));
-        // Translators: {root} is a folder path or "Proton Drive"; {done} and {total} are image counts.
+        // Translators: {root} is a folder path or "Proton Drive"; {done} and {total} are counts of images and videos.
         gettext_f(
             "Building thumbnails in {root}… {done} of {total}",
             &[
@@ -1756,17 +1829,17 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
         ui.browser.thumbnail_progress.set_fraction(1.0);
         let available = status.completed.saturating_sub(status.failed);
         match status.failed {
-            // Translators: {root} is a folder path or "Proton Drive".
+            // Translators: {root} is a folder path or "Proton Drive"; {n} counts images and videos.
             0 => ngettext_f(
-                "Thumbnails ready for {n} image in {root}",
-                "Thumbnails ready for {n} images in {root}",
+                "Thumbnails ready for {n} file in {root}",
+                "Thumbnails ready for {n} files in {root}",
                 available,
                 &[("root", root)],
             ),
-            // Translators: {root} is a folder path or "Proton Drive"; {failed} is how many images could not get a thumbnail.
+            // Translators: {root} is a folder path or "Proton Drive"; {failed} is how many images and videos could not get a thumbnail.
             failed => ngettext_f(
-                "Thumbnails ready for {n} image in {root}; {failed} unavailable",
-                "Thumbnails ready for {n} images in {root}; {failed} unavailable",
+                "Thumbnails ready for {n} file in {root}; {failed} unavailable",
+                "Thumbnails ready for {n} files in {root}; {failed} unavailable",
                 available,
                 &[("root", root), ("failed", &failed.to_string())],
             ),
@@ -2765,6 +2838,11 @@ pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {
     if entry.is_dir {
         return "folder";
     }
+    // Every video type, including a `.ts` recording, which by its name alone
+    // is TypeScript.
+    if pdfs_core::control::is_video_file_name(&entry.name, Some(entry.size)) {
+        return "video-x-generic";
+    }
     let ext = entry
         .name
         .rsplit('.')
@@ -2775,7 +2853,6 @@ pub(crate) fn icon_base_for(entry: &DirEntry) -> &'static str {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "heic" | "tiff" => {
             "image-x-generic"
         }
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" => "video-x-generic",
         "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" => "audio-x-generic",
         "pdf" | "doc" | "docx" | "odt" => "x-office-document",
         "xls" | "xlsx" | "ods" | "csv" => "x-office-spreadsheet",
@@ -3122,7 +3199,7 @@ fn listing_summary(files: usize, folders: usize, file_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoveTarget, badge_for, copy_target_allowed, hit_location, listing_summary,
+        MoveTarget, badge_for, copy_target_allowed, hit_location, icon_base_for, listing_summary,
         move_target_allowed, show_thumbnail_build_progress, sort_entries,
     };
     use pdfs_core::config::{FileSort, FilesView};
@@ -3147,6 +3224,32 @@ mod tests {
             trashed_from: None,
             issue: None,
         }
+    }
+
+    #[test]
+    fn every_video_type_gets_the_video_icon() {
+        const MIB: u64 = 1024 * 1024;
+        for name in [
+            "clip.mp4",
+            "clip.MKV",
+            "broadcast.m2ts",
+            "camera.mts",
+            "old.flv",
+        ] {
+            assert_eq!(
+                icon_base_for(&entry(name, false, 10, 0)),
+                "video-x-generic",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            icon_base_for(&entry("recording.ts", false, 900 * MIB, 0)),
+            "video-x-generic"
+        );
+        assert_eq!(
+            icon_base_for(&entry("app.ts", false, 4096, 0)),
+            "text-x-generic"
+        );
     }
 
     fn names(entries: &[DirEntry]) -> Vec<&str> {

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Album: a photo in front of the edge of another, a stack of them. -->
+  <path fill="#222222" d="M 4,1 H 13.5 A 1.5,1.5 0 0 1 15,2.5 V 12 H 13.5 V 2.5 H 4 Z"/>
+  <path fill="#222222" fill-rule="evenodd" d="M 2.5,4 H 10.5 A 1.5,1.5 0 0 1 12,5.5 V 13.5 A 1.5,1.5 0 0 1 10.5,15 H 2.5 A 1.5,1.5 0 0 1 1,13.5 V 5.5 A 1.5,1.5 0 0 1 2.5,4 Z M 2.5,5.5 V 13.5 H 10.5 V 5.5 Z"/>
+  <path fill="#222222" d="M 3.5,12.5 L 5.5,9.2 L 7.2,11.2 L 8.2,10.2 L 9.5,12.5 Z"/>
+</svg>
