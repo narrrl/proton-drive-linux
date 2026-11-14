@@ -1,0 +1,53 @@
+diff --git a/server/src/item/tests.rs b/server/src/item/tests.rs
+index 99c25dc..2ba705d 100644
+--- a/server/src/item/tests.rs
++++ b/server/src/item/tests.rs
+@@ -5,6 +5,48 @@ use tokio_stream::StreamExt;
+
+ use crate::{service::PrompterType, tests::TestServiceSetup};
+
++// Investigation for proton-drive-linux #78. Fake tokens and a private p2p bus;
++// no desktop keyring or Proton account is used.
++#[tokio::test]
++async fn issue78_locked_lookup_hides_saved_tokens() -> Result<(), Box<dyn std::error::Error>> {
++    let setup =
++        TestServiceSetup::with_login_keyring(oo7::Secret::from("test-password-long-enough"))
++            .await?;
++    let collection = setup.default_collection().await?;
++    let attributes = [("service", "proton-drive-linux"), ("username", "session")];
++    let secret = setup.create_dbus_secret(oo7::Secret::blob(b"fake-refresh-r1"))?;
++    collection
++        .create_item("pdfs fake session", &attributes, &secret, false, None)
++        .await?;
++
++    let (unlocked, locked) = setup.service_api.search_items(&attributes).await?;
++    assert_eq!((unlocked.len(), locked.len()), (1, 0));
++    setup.lock_collection(collection).await?;
++    assert!(collection.is_locked().await?);
++
++    let (unlocked, locked) = setup.service_api.search_items(&attributes).await?;
++    // This is the problematic reply, not the Secret Service behavior expected
++    // by keyring-store: the saved item is neither unlocked nor reported locked.
++    assert_eq!((unlocked.len(), locked.len()), (0, 0));
++    assert_eq!(setup.login_keyring().await?.items().await?.len(), 1);
++    eprintln!("oo7 0.7.0: locked session is on disk but SearchItems returns (0, 0)");
++
++    setup.unlock_collection(collection).await?;
++    let (unlocked, locked) = setup.service_api.search_items(&attributes).await?;
++    assert_eq!((unlocked.len(), locked.len()), (1, 0));
++
++    // Exercise the binary SetSecret path used by pdfs's keyring-store. Reopen
++    // the disk keyring after each update, rather than trusting a memory read.
++    for refresh in [b"fake-refresh-r2", b"fake-refresh-r3", b"fake-refresh-r4"] {
++        let secret = setup.create_dbus_secret(oo7::Secret::blob(refresh))?;
++        unlocked[0].set_secret(&secret).await?;
++        let items = setup.login_keyring().await?.items().await?;
++        assert_eq!(items[0].secret().as_bytes(), refresh);
++    }
++    eprintln!("oo7 0.7.0: all three binary SetSecret updates survived reopening the disk keyring");
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn label_property() -> Result<(), Box<dyn std::error::Error>> {
+     let setup = TestServiceSetup::plain_session(true).await?;
