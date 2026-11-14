@@ -807,6 +807,33 @@ pub(crate) fn wire_browser(ui: &Rc<Ui>) {
         ui_zoom.browser.files.set_thumbnail_size(size);
         save_icon_size(&ui_zoom, size);
     });
+    // Ctrl+scroll steps the icon size, as in Photos. Capture phase so the
+    // scrolled window does not scroll the grid as well. A touchpad sends many
+    // small deltas, so they add up to a whole notch before each step.
+    if let Some(grid_scroll) = files.views.child_by_name("grid") {
+        let wheel = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        wheel.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let ui_wheel = ui.clone();
+        let pending = Cell::new(0.0_f64);
+        wheel.connect_scroll(move |controller, _dx, dy| {
+            if !controller
+                .current_event_state()
+                .contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            {
+                pending.set(0.0);
+                return glib::Propagation::Proceed;
+            }
+            let total = pending.get() + dy;
+            let steps = total.trunc();
+            pending.set(total - steps);
+            if steps != 0.0 {
+                // Scrolling up (negative dy) makes the icons bigger.
+                zoom_files(&ui_wheel, -(steps as i32));
+            }
+            glib::Propagation::Stop
+        });
+        grid_scroll.add_controller(wheel);
+    }
 
     files
         .column_view
