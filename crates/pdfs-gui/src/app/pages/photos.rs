@@ -37,6 +37,9 @@ pub(crate) struct GalleryState {
     pub(crate) burst: Cell<bool>,
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
+    /// The bar that counts uploads from this computer through, under the
+    /// header while any run.
+    pub(crate) upload_bar: UploadBar,
     pub(crate) upload: adw::SplitButton,
     /// Upload / Import offered on the *empty timeline* status page, so a fresh
     /// account is a place to start rather than a dead end. Hidden on every other
@@ -478,6 +481,9 @@ pub(crate) struct GalleryWidgets {
     pub(crate) scrubber: Scrubber,
     /// Says a Google Photos import is running, with a way to its page.
     pub(crate) import_banner: adw::Banner,
+    /// The bar that counts uploads from this computer through, under the
+    /// header while any run.
+    pub(crate) upload_bar: UploadBar,
     pub(crate) list: gtk4::ListView,
     pub(crate) scroll: gtk4::ScrolledWindow,
     pub(crate) retry: gtk4::Button,
@@ -903,6 +909,8 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .action_name("win.show-import")
         .build();
 
+    let upload_bar = UploadBar::new();
+
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
     inner.set_margin_bottom(12);
@@ -913,6 +921,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     body.append(&import_banner);
+    body.append(&upload_bar.revealer);
     body.append(&inner);
     // The title slot holds the view switch on the page itself, the album's or
     // place's name inside one, and the count in selection mode (see
@@ -943,6 +952,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             pager,
             scrubber,
             import_banner,
+            upload_bar,
             list,
             scroll,
             retry,
@@ -1384,6 +1394,13 @@ pub(crate) fn wire_gallery(
         sync_float_heading(&ui_scroll);
         ui_scroll.gallery.scrubber.flash();
     });
+    // Zooming out or making the window taller can leave every loaded photo on
+    // one screen. Nothing scrolls then, so the scrolling above never asks for
+    // the next page: ask whenever the content shrinks under the viewport.
+    let ui_fill = ui.clone();
+    scroll
+        .vadjustment()
+        .connect_changed(move |_| fill_viewport(&ui_fill));
     wire_scrubber(ui);
     wire_drag_select(ui);
 
@@ -1513,9 +1530,11 @@ pub(crate) fn wire_gallery(
         gtk4::gdk::DragAction::COPY,
     );
     let ui_drop = ui.clone();
-    drop.connect_accept(move |_, _| {
+    drop.connect_accept(move |_, drop| {
         let gallery = &ui_drop.gallery;
-        !gallery.in_collection()
+        // Photos dragged out of the timeline are already in it.
+        drop.drag().is_none()
+            && !gallery.in_collection()
             && gallery.view_switch.active() == VIEW_TIMELINE
             && gallery.library.get()
             && *ui_drop.mounted.borrow()
@@ -1913,6 +1932,86 @@ pub(crate) fn copy_without_overwrite(
     unreachable!("some numbered name is free")
 }
 
+/// How far the uploads from this computer have come: a count and a bar, so a
+/// drop of a few hundred photos shows it is moving. Batches started while one
+/// runs join its count.
+#[derive(Clone)]
+pub(crate) struct UploadBar {
+    pub(crate) revealer: gtk4::Revealer,
+    label: gtk4::Label,
+    progress: gtk4::ProgressBar,
+    /// Uploads finished, and uploads asked for, since the bar last emptied.
+    count: Rc<Cell<(usize, usize)>>,
+}
+
+impl UploadBar {
+    fn new() -> Self {
+        let label = gtk4::Label::builder()
+            .halign(gtk4::Align::Start)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .build();
+        let progress = gtk4::ProgressBar::builder().hexpand(true).build();
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        content.set_margin_top(10);
+        content.set_margin_bottom(4);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        content.append(&label);
+        content.append(&progress);
+        let revealer = gtk4::Revealer::builder()
+            .transition_type(gtk4::RevealerTransitionType::SlideDown)
+            .child(&content)
+            .build();
+        Self {
+            revealer,
+            label,
+            progress,
+            count: Rc::default(),
+        }
+    }
+
+    /// Count `n` more uploads in.
+    pub(crate) fn add(&self, n: usize) {
+        let (done, total) = self.count.get();
+        self.count.set((done, total + n));
+        self.paint();
+    }
+
+    /// Count one upload as finished, whether or not it went through.
+    pub(crate) fn finish(&self) {
+        let (done, total) = self.count.get();
+        let done = (done + 1).min(total);
+        if done == total {
+            self.count.set((0, 0));
+            self.revealer.set_reveal_child(false);
+            return;
+        }
+        self.count.set((done, total));
+        self.paint();
+    }
+
+    fn paint(&self) {
+        let (done, total) = self.count.get();
+        if total == 0 {
+            return;
+        }
+        self.label.set_label(&upload_progress_text(done, total));
+        self.progress.set_fraction(done as f64 / total as f64);
+        self.revealer.set_reveal_child(true);
+    }
+}
+
+/// "Uploading 3 of 12 items…": the upload under way is number `done + 1`.
+pub(crate) fn upload_progress_text(done: usize, total: usize) -> String {
+    // Translators: progress above the photo timeline while photos upload; {position} is the upload under way, {n} how many there are.
+    ngettext_f(
+        "Uploading {position} of {n} item…",
+        "Uploading {position} of {n} items…",
+        total as u64,
+        &[("position", &thousands(done + 1))],
+    )
+}
+
 /// Upload photos and videos from this computer into the timeline, one after
 /// the other, then reload it once.
 pub(crate) fn upload_media(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
@@ -1927,15 +2026,7 @@ pub(crate) fn upload_media(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
     let total = uploads.len();
     ui.busy_begin();
     if total > 1 {
-        toast(
-            ui,
-            &ngettext_f(
-                "Uploading {n} item…",
-                "Uploading {n} items…",
-                total as u64,
-                &[],
-            ),
-        );
+        ui.gallery.upload_bar.add(total);
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -1972,6 +2063,9 @@ pub(crate) fn upload_media(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
                         ErrorKind::Remote,
                     ))
                 }
+            }
+            if total > 1 {
+                ui.gallery.upload_bar.finish();
             }
         }
         ui.busy_end();
@@ -2381,6 +2475,23 @@ impl TileWidget {
         });
         button.add_controller(context);
 
+        // A picked photo drags out, with the rest of the selection, into a
+        // file manager or any app that takes files. A drag from anywhere else
+        // selects instead (see `wire_drag_select`).
+        let drag_out = gtk4::DragSource::new();
+        drag_out.set_actions(gtk4::gdk::DragAction::COPY);
+        let ui_drag = ui.clone();
+        let drag_uid = uid.clone();
+        drag_out.connect_prepare(move |source, x, y| {
+            let photos = dragged_photos(&ui_drag, &drag_uid()?)?;
+            if let Some(tile) = source.widget() {
+                let icon = gtk4::WidgetPaintable::new(Some(&tile));
+                source.set_icon(Some(&icon), x as i32, y as i32);
+            }
+            Some(PhotoDrag::new(ui_drag.dirs.control_socket(), photos).upcast())
+        });
+        button.add_controller(drag_out);
+
         // A tile opens in the in-app lightbox, which plays a video in place.
         // In selection mode a tile picks instead of opening: the lightbox is
         // one Escape away.
@@ -2478,6 +2589,23 @@ impl TileWidget {
     }
 }
 
+/// The photos a drag that starts on `uid` carries out: the whole selection,
+/// in timeline order, as uid and name. `None` unless `uid` is picked.
+fn dragged_photos(ui: &Rc<Ui>, uid: &str) -> Option<Vec<(String, Option<String>)>> {
+    let selected = ui.gallery.selected.borrow();
+    if !ui.gallery.selecting.get() || !selected.contains(uid) {
+        return None;
+    }
+    let model = &ui.gallery.model;
+    let photos: Vec<(String, Option<String>)> = (0..model.n_items())
+        .filter_map(|index| model.item(index).and_downcast::<BoxedAnyObject>())
+        .map(|boxed| boxed.borrow::<PhotoItem>().clone())
+        .filter(|photo| selected.contains(&photo.uid))
+        .map(|photo| (photo.uid, photo.name))
+        .collect();
+    (!photos.is_empty()).then_some(photos)
+}
+
 /// Add or remove one CSS class, for widgets that are rebound rather than
 /// rebuilt.
 fn set_css_class(widget: &impl IsA<gtk4::Widget>, class: &str, on: bool) {
@@ -2556,6 +2684,9 @@ struct DragSelect {
     pointer: (f64, f64),
     /// The edge autoscroll, while the pointer is near the top or bottom.
     scroll: Option<glib::SourceId>,
+    /// The drag started on a picked photo, so it carries the selection out
+    /// of the app rather than selecting.
+    out: bool,
 }
 
 /// Dragging across the timeline selects every photo from where the drag
@@ -2572,21 +2703,33 @@ fn wire_drag_select(ui: &Rc<Ui>) {
     let state = Rc::new(RefCell::new(DragSelect::default()));
 
     let state_begin = state.clone();
-    drag.connect_drag_begin(move |_, x, y| {
+    let ui_begin = ui.clone();
+    drag.connect_drag_begin(move |gesture, x, y| {
         let mut drag = state_begin.borrow_mut();
         if let Some(source) = drag.scroll.take() {
             source.remove();
         }
+        let out = ui_begin.gallery.selecting.get()
+            && tile_at(&ui_begin, x, y)
+                .is_some_and(|uid| ui_begin.gallery.selected.borrow().contains(&uid));
         *drag = DragSelect {
             start: (x, y),
             pointer: (x, y),
+            out,
             ..DragSelect::default()
         };
+        // Left to the tile's own drag source.
+        if out {
+            gesture.set_state(gtk4::EventSequenceState::Denied);
+        }
     });
 
     let ui_update = ui.clone();
     let state_update = state.clone();
     drag.connect_drag_update(move |gesture, dx, dy| {
+        if state_update.borrow().out {
+            return;
+        }
         let (sx, sy) = state_update.borrow().start;
         state_update.borrow_mut().pointer = (sx + dx, sy + dy);
         if !state_update.borrow().active {
@@ -3954,15 +4097,30 @@ fn continue_jump(ui: &Rc<Ui>) {
 /// Load the next page when the timeline does not fill the window yet: with no
 /// scrollbar there is no scrolling to trigger it.
 fn fill_viewport(ui: &Rc<Ui>) {
+    if !ui.gallery.has_more.get() || ui.gallery.loading.get() {
+        return;
+    }
     let ui = ui.clone();
     glib::idle_add_local_once(move || {
         let Some(adj) = ui.gallery.list.vadjustment() else {
             return;
         };
-        if ui.gallery.has_more.get() && adj.upper() <= adj.page_size() + 1.0 {
+        let timeline = ui.gallery.content.visible_child_name().as_deref() == Some("timeline");
+        if timeline
+            && ui.gallery.has_more.get()
+            && adj.page_size() > 0.0
+            && viewport_unfilled(adj.upper(), adj.page_size())
+        {
             load_gallery(&ui, true);
         }
     });
+}
+
+/// Whether content `upper` px tall leaves a viewport `page_size` px tall short
+/// of a screen and a half to scroll through, the margin the scrolling pager
+/// keeps. Below it the pager would never fire.
+pub(crate) fn viewport_unfilled(upper: f64, page_size: f64) -> bool {
+    upper <= page_size * 2.5 + 1.0
 }
 
 /// Select every photo loaded so far (Ctrl+A).
@@ -4358,10 +4516,10 @@ pub(crate) fn play_external(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
+        Grouping, PHOTOS_PAGE, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
         TILE_RATIO_MIN, active_filters, copy_without_overwrite, empty_timeline_text, grouping_for,
         memory_years, month_index, month_range, plan_grid, plan_justified, section_heading,
-        tile_ratio,
+        tile_ratio, viewport_unfilled,
     };
     use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
 
@@ -4482,6 +4640,18 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("photo (3).jpg")).unwrap(), b"new");
         assert_eq!(std::fs::read(dir.join("escape")).unwrap(), b"new");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first page zoomed all the way out fits on one screen, with nothing
+    /// to scroll: the next page has to load without a scroll asking for it.
+    #[test]
+    fn a_page_zoomed_out_onto_one_screen_asks_for_more() {
+        let (columns, size) = plan_grid(1580, ROW_MIN);
+        let rows = PHOTOS_PAGE.div_ceil(columns) as i32;
+        let height = f64::from(rows * (size + TILE_GAP) + 40);
+        assert!(viewport_unfilled(height, 880.0));
+        assert!(viewport_unfilled(880.0, 880.0));
+        assert!(!viewport_unfilled(880.0 * 3.0, 880.0));
     }
 
     #[test]
