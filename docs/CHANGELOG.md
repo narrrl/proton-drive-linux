@@ -116,6 +116,11 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   screen there, and with nothing to scroll no more were loaded. More now load whenever the photos
   don't fill the window, also after a zoom or a resize.
 
+- **Thumbnails appear in the folder you are looking at as soon as they are made.** During
+  **Build thumbnails**, the folder on screen kept its file icons until you left it and opened it
+  again. Its tiles now fill in while the build runs, and the same goes for any tile whose
+  thumbnail is made while it is on screen.
+
 - **My files comes back after the service was killed for hanging** (B279). A killed service left
   its folders behind as dead mounts, and every restart then failed with `File exists` and retried
   forever without opening anything, until the mounts were cleared by hand. The service now clears

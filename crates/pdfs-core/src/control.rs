@@ -768,6 +768,9 @@ pub enum Topic {
     Conflicts,
     /// The activity log gained entries.
     Activity,
+    /// File thumbnails were made or fetched. A front-end asks again for the
+    /// tiles it still shows blank; the ones it already painted stay as they are.
+    Thumbnails,
     /// A topic from a newer daemon, which this front-end cannot act on.
     #[serde(other)]
     Unknown,
@@ -777,7 +780,7 @@ impl Topic {
     /// Every topic a front-end can act on. A new subscription is told all of
     /// them have changed, so it catches up on whatever happened while it was
     /// not connected.
-    pub const ALL: [Topic; 9] = [
+    pub const ALL: [Topic; 10] = [
         Topic::Files,
         Topic::Photos,
         Topic::Trash,
@@ -787,6 +790,7 @@ impl Topic {
         Topic::Queue,
         Topic::Conflicts,
         Topic::Activity,
+        Topic::Thumbnails,
     ];
 }
 
@@ -2661,6 +2665,16 @@ mod tests {
         }
         assert!(matches!(second, Some(Event::Heartbeat)), "{second:?}");
         assert!(end.is_none(), "{end:?}");
+    }
+
+    #[test]
+    fn a_thumbnail_change_travels_as_its_own_topic() {
+        let line = serde_json::to_string(&Event::Changed {
+            topics: vec![Topic::Thumbnails],
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"Changed":{"topics":["thumbnails"]}}"#);
+        assert!(Topic::ALL.contains(&Topic::Thumbnails));
     }
 
     #[test]

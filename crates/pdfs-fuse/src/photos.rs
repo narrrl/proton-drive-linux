@@ -1910,6 +1910,11 @@ impl Core {
                 ThumbAttempt::Cancelled => summary.cancelled += 1,
             }
         }
+        // A folder on screen whose tiles were given up on, as a recursive
+        // build's start does to them, fills in without being opened again.
+        if summary.made > 0 {
+            self.events.publish(&[Topic::Thumbnails]);
+        }
         summary
     }
 
