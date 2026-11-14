@@ -1027,6 +1027,7 @@ impl Core {
             favorite: photo.favorite,
             group_size: photo.group_size as u32,
             has_raw: photo.has_raw,
+            place_id: photo.place_id,
         }
     }
 

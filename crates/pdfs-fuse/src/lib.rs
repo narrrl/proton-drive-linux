@@ -3168,6 +3168,28 @@ impl Core {
         )
     }
 
+    /// [`Core::resolve_anywhere`], widened to the Photos timeline for sharing.
+    ///
+    /// A photo lives on the photos volume, which no location shows, so the
+    /// residency proof above never finds it. The timeline in the `photos` table
+    /// is this daemon's proof instead: it lists only photos on the user's own
+    /// volume, which are theirs to share. A photo in an album someone else
+    /// shared is not in it and stays refused.
+    pub(crate) fn resolve_shareable(&self, uid: &str) -> CoreResult<NodeUid> {
+        resolve_anywhere_with(
+            uid,
+            |uid| self.owns_visible_uid(uid),
+            |uid| {
+                let uid = uid.to_string();
+                Ok(self.db.mirror_contains_uid(&uid)?
+                    || !self
+                        .db
+                        .photos_by_uid(std::slice::from_ref(&uid))?
+                        .is_empty())
+            },
+        )
+    }
+
     fn source_parent_uid(&self, ino: u64, rel: &Path) -> CoreResult<NodeUid> {
         let state = self.state();
         let entry = state

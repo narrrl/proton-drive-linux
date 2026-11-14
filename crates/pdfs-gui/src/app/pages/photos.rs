@@ -157,10 +157,11 @@ pub(crate) struct GalleryState {
     /// Photos the daemon reported as having no thumbnail at all, so a tile that
     /// can never be filled isn't requested again on every scroll past it.
     pub(crate) photo_nothumb: RefCell<HashSet<String>>,
-    /// Tiles on screen still waiting for their thumbnail, by uid. Populated as
-    /// sections are bound, drained as batches land, cleared on unbind — so a
-    /// batch only ever paints a widget that is still showing that photo.
-    pub(crate) thumb_wanted: RefCell<HashMap<String, gtk4::Picture>>,
+    /// Pictures on screen still waiting for their thumbnail, by uid. Populated
+    /// as they are bound, drained as batches land, cleared on unbind — so a
+    /// batch only ever paints a widget that is still showing that photo. One
+    /// photo can be waited for twice: by its tile and by the lightbox's strip.
+    pub(crate) thumb_wanted: RefCell<HashMap<String, Vec<gtk4::Picture>>>,
     /// Uids queued for the next [`Request::PhotoThumbs`] batch, and whether a
     /// batch is already in flight (only one at a time, so a long scroll can't
     /// stack requests on the daemon).
@@ -242,6 +243,27 @@ impl GalleryState {
     /// Neither is filtered or dated, so the timeline's extras stay away.
     pub(crate) fn in_collection(&self) -> bool {
         self.album.borrow().is_some() || self.place.borrow().is_some()
+    }
+
+    /// Have `picture` painted with the thumbnail of `uid` once it lands.
+    pub(crate) fn await_thumb(&self, uid: &str, picture: &gtk4::Picture) {
+        let mut wanted = self.thumb_wanted.borrow_mut();
+        let waiting = wanted.entry(uid.to_string()).or_default();
+        if !waiting.contains(picture) {
+            waiting.push(picture.clone());
+        }
+    }
+
+    /// Stop waiting for `uid` in the pictures `drop` picks, because they show
+    /// another photo now.
+    pub(crate) fn release_thumb(&self, uid: &str, drop: impl Fn(&gtk4::Picture) -> bool) {
+        let mut wanted = self.thumb_wanted.borrow_mut();
+        if let Some(waiting) = wanted.get_mut(uid) {
+            waiting.retain(|picture| !drop(picture));
+            if waiting.is_empty() {
+                wanted.remove(uid);
+            }
+        }
     }
 }
 
@@ -1314,14 +1336,10 @@ pub(crate) fn wire_gallery(
         if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>()
             && let GalleryRow::Tiles { tiles, .. } = &*obj.borrow::<GalleryRow>()
         {
-            let mut wanted = ui_unbind.gallery.thumb_wanted.borrow_mut();
             for tile in tiles {
-                if wanted
-                    .get(&tile.photo.uid)
-                    .is_some_and(|picture| picture.is_ancestor(&row_box))
-                {
-                    wanted.remove(&tile.photo.uid);
-                }
+                ui_unbind
+                    .gallery
+                    .release_thumb(&tile.photo.uid, |picture| picture.is_ancestor(&row_box));
             }
         }
     });
@@ -1441,7 +1459,7 @@ pub(crate) fn wire_gallery(
     let ui_album = ui.clone();
     selection.album.connect_clicked(move |_| {
         let uids: Vec<String> = ui_album.gallery.selected.borrow().iter().cloned().collect();
-        prompt_add_to_album(&ui_album, uids);
+        prompt_add_to_album(&ui_album, uids, None);
     });
     let ui_remove = ui.clone();
     selection.remove.connect_clicked(move |_| {
@@ -2455,10 +2473,8 @@ impl TileWidget {
         let Some(photo) = self.photo.borrow_mut().take() else {
             return;
         };
-        let mut wanted = ui.gallery.thumb_wanted.borrow_mut();
-        if wanted.get(&photo.uid) == Some(&self.picture) {
-            wanted.remove(&photo.uid);
-        }
+        ui.gallery
+            .release_thumb(&photo.uid, |picture| picture == &self.picture);
     }
 }
 
@@ -2764,6 +2780,18 @@ pub(crate) fn delete_selected(ui: &Rc<Ui>) {
 
 /// Confirm, then move the photos behind `uids` to Proton trash.
 pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
+    ask_trash_photos(ui, uids, None, || {});
+}
+
+/// [`confirm_trash_photos`] over `parent` rather than the main window, for
+/// the photo viewer, which covers it. `before` runs once the user confirms,
+/// before the photos go.
+pub(crate) fn ask_trash_photos(
+    ui: &Rc<Ui>,
+    uids: Vec<String>,
+    parent: Option<gtk4::Window>,
+    before: impl Fn() + 'static,
+) {
     if uids.is_empty() {
         return;
     }
@@ -2803,10 +2831,11 @@ pub(crate) fn confirm_trash_photos(ui: &Rc<Ui>, uids: Vec<String>) {
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
-    let win = ui_window(ui);
+    let win = parent.or_else(|| ui_window(ui));
     let ui = ui.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "trash" {
+            before();
             trash_photos(&ui, uids.clone(), false);
         }
     });
@@ -2951,10 +2980,7 @@ pub(crate) fn want_thumb(ui: &Rc<Ui>, photo: &PhotoItem, picture: &gtk4::Picture
         return;
     }
 
-    ui.gallery
-        .thumb_wanted
-        .borrow_mut()
-        .insert(photo.uid.clone(), picture.clone());
+    ui.gallery.await_thumb(&photo.uid, picture);
 
     match photo.thumb_path.as_deref() {
         Some(path) => {
@@ -3173,7 +3199,8 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
                 }
             };
             ui.store_texture(&uid, texture.clone());
-            if let Some(picture) = ui.gallery.thumb_wanted.borrow_mut().remove(&uid) {
+            let waiting = ui.gallery.thumb_wanted.borrow_mut().remove(&uid);
+            for picture in waiting.into_iter().flatten() {
                 picture.set_paintable(Some(&texture));
             }
         }
@@ -3979,8 +4006,18 @@ fn show_photo_menu(ui: &Rc<Ui>, photo: &PhotoItem, anchor: &gtk4::Button, x: f64
     menu.section();
     let (ui_c, uid) = (ui.clone(), photo.uid.clone());
     menu.item(&gettext("Add to Album…"), move || {
-        prompt_add_to_album(&ui_c, vec![uid.clone()])
+        prompt_add_to_album(&ui_c, vec![uid.clone()], None)
     });
+    if photo_shareable(ui) {
+        let (ui_c, uid, name) = (
+            ui.clone(),
+            photo.uid.clone(),
+            photo.name.clone().unwrap_or_default(),
+        );
+        menu.item(&gettext("Share…"), move || {
+            share_photo(&ui_c, uid.clone(), name.clone(), None)
+        });
+    }
     let open_album = ui.gallery.album.borrow().clone();
     if let Some(album) = open_album.filter(|album| !album.shared) {
         let (ui_c, uid) = (ui.clone(), photo.uid.clone());
@@ -4030,6 +4067,27 @@ fn set_photo_favorite(ui: &Rc<Ui>, uid: String, favorite: bool) {
             ),
         }
     });
+}
+
+/// Whether the photos on show are the user's own to share: everything but an
+/// album someone else shared, whose photos live on that person's volume.
+pub(crate) fn photo_shareable(ui: &Ui) -> bool {
+    !ui.gallery
+        .album
+        .borrow()
+        .as_ref()
+        .is_some_and(|album| album.shared)
+}
+
+/// Open the Share dialog for one photo, addressed by uid: the photos volume
+/// has no path in any mount. Over `parent` when the lightbox is open.
+pub(crate) fn share_photo(ui: &Rc<Ui>, uid: String, name: String, parent: Option<gtk4::Window>) {
+    let entry = DirEntry {
+        uid,
+        name,
+        ..DirEntry::default()
+    };
+    open_share_dialog_over(ui, &entry, parent);
 }
 
 /// Whether the photo grid is the view the Photos page shows: an album or a
@@ -4490,6 +4548,7 @@ mod tests {
                 favorite: false,
                 group_size: 1,
                 has_raw: false,
+                place_id: None,
             }
         };
         // Newest first, the way the daemon sends them.
