@@ -88,6 +88,13 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
     slideshow.
   - The line under the date names the town the photo was taken in, when it is known.
 
+- **Drag photos out of Photos.** Select photos, then drag one of them into a file manager, a chat
+  or any app that takes files. The photos download when dropped and arrive under their own
+  names. A drag that starts on a photo that is not selected still selects, as before.
+
+- **Upload progress in Photos.** Uploading several photos at once shows "Uploading 3 of 12
+  items…" with a progress bar above the timeline, instead of a single toast at the start.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter

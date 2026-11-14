@@ -40,6 +40,7 @@ use widgets::crumb::*;
 use widgets::details::*;
 use widgets::file_list::*;
 use widgets::menu::*;
+use widgets::photo_drag::*;
 use widgets::scrubber::*;
 use widgets::share_dialog::*;
 use widgets::thumbnails::*;
@@ -525,6 +526,7 @@ fn build_window(app: &adw::Application) {
             jump: Cell::new(None),
             burst: Cell::new(false),
             import_banner: gallery_widgets.import_banner.clone(),
+            upload_bar: gallery_widgets.upload_bar.clone(),
             upload: gallery_widgets.upload.clone(),
             empty_actions: gallery_widgets.empty_actions.clone(),
             title: gallery_widgets.title.clone(),
@@ -2034,6 +2036,13 @@ mod tests {
         // jumping somewhere arbitrary.
         assert_eq!(next("elsewhere"), None);
         assert!(next_group_member(&[], "jpeg").is_none());
+    }
+
+    /// The upload bar counts the upload under way, not the ones finished.
+    #[test]
+    fn the_upload_bar_counts_the_upload_under_way() {
+        assert_eq!(upload_progress_text(0, 12), "Uploading 1 of 12 items…");
+        assert_eq!(upload_progress_text(11, 12), "Uploading 12 of 12 items…");
     }
 
     /// The pill names what kind of shot it switches through, and lights up
