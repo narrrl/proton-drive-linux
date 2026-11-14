@@ -58,6 +58,44 @@ can resolve the default alias to a locked collection. Both have fixes in
 after the reporter's November 7 retest. Neither can be assigned as this report's cause without
 matching runtime evidence.
 
+## A restarted Secret Service
+
+A second path to the same symptom, independent of locking (B285). The keyring store pdfs used
+holds one D-Bus connection and one Secret Service session for the whole process, and was
+installed once. The session lives only in the provider's memory. When the provider restarts,
+the new one answers every `GetSecret` and `SetSecret` on the old session with
+`org.freedesktop.Secret.Error.NoSession`, until the pdfs process itself restarts. Reproduced
+with both gnome-keyring 51.1 and oo7 0.7.1 using `--replace`.
+
+gnome-keyring practically never restarts within a desktop session. oo7 can:
+`oo7-daemon.service` has `Restart=on-failure`, the daemon allows itself to be replaced, and it
+exits on a wrong credential password and is D-Bus-activated again. A daemon that met a restarted
+provider kept every later token refresh only in memory and the kernel keyring, and a cold boot
+then left the spent refresh token in the saved blob.
+
+Now a platform failure drops the store and the call is retried once on a new connection. The
+daemon log shows `the Secret Service failed this process's connection; reconnecting` when that
+happens. To check whether a machine meets this, look for oo7 restarts in the same boot:
+
+```sh
+journalctl --user -b -1 -u oo7-daemon.service | grep -E 'Started|Stopped|Starting oo7|Main process exited'
+journalctl --user -b -1 -u proton-drive.service | grep -iE 'keyring|reconnecting|refresh'
+```
+
+Reproduce in a throwaway session bus (never against the desktop's keyring; the runtime directory
+must be short, as it holds a Unix socket):
+
+```sh
+T=$(mktemp -d /tmp/ss.XXXX); mkdir -p $T/data $T/run; chmod 700 $T/run
+XDG_DATA_HOME=$T/data XDG_RUNTIME_DIR=$T/run PDFS_SECRET_SERVICE_RESTART_TEST=1 \
+  PDFS_RESTART_PROVIDER='echo -n pw | gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null' \
+  dbus-run-session -- sh -c 'echo -n pw | gnome-keyring-daemon --unlock --components=secrets >/dev/null; sleep 1;
+    cargo test -p pdfs-core real_secret_service -- --ignored'
+```
+
+For oo7, start `oo7-daemon --login` with the password on stdin instead, and restart it with
+`--login --replace` in the background.
+
 ## Reproduce without a Proton account or desktop keyring
 
 The oo7 fixture uses fake tokens, a temporary disk keyring and a private peer-to-peer D-Bus

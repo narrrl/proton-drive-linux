@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B285](#b285--a-restarted-secret-service-leaves-the-process-on-a-dead-session) | A restarted Secret Service leaves the process on a dead session |
 | [B284](#b284--a-keyring-entry-reported-missing-discards-refreshed-session-tokens) | A keyring entry reported missing discards refreshed session tokens |
 | [B283](#b283--videos-have-no-thumbnail-outside-photos-and-a-ts-recording-looks-like-source-code) | Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code |
 | [B282](#b282--a-file-kept-offline-is-downloaded-again-after-a-change-made-elsewhere) | A file kept offline is downloaded again after a change made elsewhere |
@@ -386,6 +387,41 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B285 — A restarted Secret Service leaves the process on a dead session
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-14, following up [issue #78](https://github.com/narrrl/proton-drive-linux/issues/78)
+(signed out after every cold boot on Fedora 45, which replaced gnome-keyring with oo7). See
+[the investigation](ISSUE-78.md#a-restarted-secret-service).
+**Where:** `crates/pdfs-core/src/auth.rs`, `with_keyring_entry`
+
+**Repro:** Write the session blob, restart the Secret Service provider
+(`gnome-keyring-daemon --replace`, or `oo7-daemon --replace`), then read or write it again from
+the same process. `dbus-secret-service-keyring-store` keeps one D-Bus connection and one Secret
+Service session for the life of the process, and pdfs installed it once. The session exists only
+in the provider's memory, so the new provider answers every `GetSecret` and `SetSecret` with
+`org.freedesktop.Secret.Error.NoSession`, for as long as the process runs. A fresh store in the
+same process reads the same entry fine. oo7's systemd unit restarts the daemon on failure, and
+both providers can be replaced, so the daemon could meet this mid-session. A token refresh after
+that point reached only memory and the kernel keyring: B61's retry kept asking on the dead
+session, and the next cold boot read the spent refresh token (`InvalidRefreshToken`).
+
+**Fix:** Every keyring call goes through `with_keyring_entry`. A platform failure (which is what
+`NoSession` and other D-Bus errors become) logs "the Secret Service failed this process's
+connection; reconnecting", drops the store unless another thread already replaced it, and makes
+the call once more on a new connection and session. A locked keyring, a dismissed prompt and a
+missing entry come back unchanged. Affects the daemon, the app and the tray alike.
+
+**Verified:** `auth::tests::a_dropped_secret_service_session_is_reconnected_and_retried`,
+`a_rotation_lands_at_once_after_the_keyring_restarts` and `a_locked_keyring_is_not_reconnected`
+on the in-memory store. The ignored `auth::tests::real_secret_service_survives_a_provider_restart`
+passes against gnome-keyring 51.1 and oo7 0.7.1 (built from its tag), each in a throwaway session
+bus and restarted with `--replace`; it checks that a reconnect actually happened. A standalone
+program holding one store, as before the fix, gets `NoSession` on read and write after the same
+restart under both providers. Whether the reporter's oo7 restarts during a session is not known.
+
+---
 
 ### B284 — A keyring entry reported missing discards refreshed session tokens
 
