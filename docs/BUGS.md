@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B284](#b284--a-keyring-entry-reported-missing-discards-refreshed-session-tokens) | A keyring entry reported missing discards refreshed session tokens |
 | [B283](#b283--videos-have-no-thumbnail-outside-photos-and-a-ts-recording-looks-like-source-code) | Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code |
 | [B282](#b282--a-file-kept-offline-is-downloaded-again-after-a-change-made-elsewhere) | A file kept offline is downloaded again after a change made elsewhere |
 | [B281](#b281--a-file-in-a-synced-folder-cannot-be-kept-offline) | A file in a synced folder cannot be kept offline |
@@ -385,6 +386,34 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B284 — A keyring entry reported missing discards refreshed session tokens
+
+**Status:** Fixed (unverified)
+**Found:** 2026-11-14, investigating [issue #78](https://github.com/narrrl/proton-drive-linux/issues/78)
+after the reporter's oo7 0.7.0 retest ruled out the original persistence fix as a sufficient
+explanation. See [the investigation and isolated reproducer](ISSUE-78.md).
+**Where:** `crates/pdfs-core/src/auth.rs`, `TokenSink::flush`
+
+**Repro:** Refresh a session while the keyring lookup reports `NoEntry` for its existing blob.
+oo7 0.7.0 does this for a locked collection (upstream #614), reproduced with fake tokens on a
+private D-Bus connection. pdfs dropped the pending rotation and returned success, leaving the
+spent refresh token in the saved blob without triggering B61's retry or kernel recovery paths.
+The running session can still work, but restarting it exposes the stale saved credentials.
+
+**Fix:** Propagate the missing-session error so the rotation stays pending and is retried.
+Persistence still requires the matching existing blob; a retry never recreates a deleted
+session or overwrites a new login. This does not make a locked keyring writable, and pending
+tokens still need to reach it before power-off to survive a cold boot.
+
+**Verified:** The two regression tests
+`auth::tests::a_temporarily_missing_session_does_not_discard_a_rotation` and
+`auth::tests::retrying_a_missing_session_never_recreates_it_or_overwrites_a_new_login`
+failed before the fix and pass afterward. The oo7 fixture confirms its locked lookup behavior
+and repeated binary `SetSecret` persistence. The reporter's complete Fedora cold-boot sequence
+has not been reproduced; issue #78's precise trigger remains unconfirmed.
+
+---
 
 ### B283 — Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code
 

@@ -996,21 +996,15 @@ impl TokenSink {
         }
     }
 
-    /// Write the unsaved rotation, if there is one. A blob that moved on, or
-    /// is gone with a logout, drops it: there is nothing it may still go into.
+    /// Write the unsaved rotation, if there is one. A blob that moved on drops
+    /// it. A missing blob is retried: some Secret Service providers also report
+    /// locked or temporarily hidden items as absent. Never recreate it here.
     fn flush(&self) -> Result<()> {
         let mut state = self.state.lock();
         let Some(tokens) = state.unsaved.clone() else {
             return Ok(());
         };
-        let mut stored = match load() {
-            Ok(stored) => stored,
-            Err(Error::NotLoggedIn) => {
-                state.settle();
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+        let mut stored = load()?;
         match take_rotation(
             &mut stored,
             &self.session_id,
@@ -1304,6 +1298,47 @@ mod tests {
         if kept {
             assert!(kernelkey::UNSAVED_TOKENS.load().unwrap().is_none());
         }
+    }
+
+    /// oo7 0.7.0 reports a locked collection's items as absent (upstream #614).
+    /// Treating that as logout loses the only live tokens (B284, issue #78).
+    #[test]
+    fn a_temporarily_missing_session_does_not_discard_a_rotation() {
+        let _turn = mock_keyring();
+        write_stored(&stored_with("r")).unwrap();
+        let sink = Arc::new(TokenSink::new("s", "r".into()));
+        let entry = keyring_entry().unwrap();
+        entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap()
+            .set_error(keyring_core::Error::NoEntry);
+
+        assert!(sink.rotated(tokens("a2", "r2")).is_err());
+        assert!(sink.state.lock().unsaved.is_some());
+        assert_eq!(load().unwrap().refresh_token, "r");
+
+        sink.flush().unwrap();
+        assert_eq!(load().unwrap().refresh_token, "r2");
+        assert!(sink.state.lock().unsaved.is_none());
+    }
+
+    #[test]
+    fn retrying_a_missing_session_never_recreates_it_or_overwrites_a_new_login() {
+        let _turn = mock_keyring();
+        let sink = TokenSink::new("s", "r".into());
+        sink.state.lock().unsaved = Some(tokens("a2", "r2"));
+
+        assert!(matches!(sink.flush(), Err(Error::NotLoggedIn)));
+        assert!(matches!(load(), Err(Error::NotLoggedIn)));
+        assert!(sink.state.lock().unsaved.is_some());
+
+        let mut login = stored_with("fresh");
+        login.session_id = "new".into();
+        write_stored(&login).unwrap();
+        sink.flush().unwrap();
+        assert!(sink.state.lock().unsaved.is_none());
+        assert_eq!(load().unwrap().refresh_token, "fresh");
     }
 
     #[test]
