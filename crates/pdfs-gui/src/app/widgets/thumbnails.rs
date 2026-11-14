@@ -1,4 +1,4 @@
-//! Shared thumbnails for ordinary Drive image files.
+//! Shared thumbnails for ordinary Drive image and video files.
 //!
 //! The Photos gallery has timeline-specific batching and aspect-ratio state.
 //! File listings need a smaller, reusable surface: one loader backs My files,
@@ -6,7 +6,7 @@
 //! so a replaced image never flashes its previous contents.
 
 use crate::*;
-use pdfs_core::control::{FileThumbRequest, is_thumbnail_image_name};
+use pdfs_core::control::{FileThumbRequest, is_thumbnail_media_name, is_video_file_name};
 
 const THUMB_BATCH: usize = 32;
 const THUMB_CACHE_MAX: usize = 256;
@@ -125,6 +125,18 @@ pub(crate) fn file_thumbnail_widget(size: i32, fallback_size: i32) -> gtk4::Over
         .build();
     picture.add_css_class("file-thumbnail");
 
+    // Over a video's frame, so it does not pass for a photo.
+    let play = gtk4::Image::builder()
+        .icon_name("media-playback-start-symbolic")
+        .pixel_size(16)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .can_target(false)
+        .visible(false)
+        .build();
+    play.add_css_class("photo-video-badge");
+    play.add_css_class("photo-video-badge-small");
+
     let overlay = gtk4::Overlay::new();
     overlay.set_width_request(size);
     overlay.set_height_request(size);
@@ -133,8 +145,20 @@ pub(crate) fn file_thumbnail_widget(size: i32, fallback_size: i32) -> gtk4::Over
     overlay.set_overflow(gtk4::Overflow::Hidden);
     overlay.set_child(Some(&fallback));
     overlay.add_overlay(&picture);
+    overlay.add_overlay(&play);
     overlay
 }
+
+/// The play badge [`file_thumbnail_widget`] puts after `picture`.
+fn play_badge(picture: &gtk4::Picture) -> Option<gtk4::Image> {
+    picture
+        .next_sibling()
+        .and_downcast::<gtk4::Image>()
+        .filter(|image| image.has_css_class("photo-video-badge"))
+}
+
+/// Marks a play badge to show once its video's frame is painted.
+const VIDEO_BADGE: &str = "video";
 
 /// Resize an existing thumbnail surface. Grid rows are recycled, so changing
 /// these requests in place and rebinding the model is enough to implement the
@@ -179,6 +203,16 @@ pub(crate) fn bind_file_thumbnail(
     fallback.set_visible(true);
     picture.set_visible(false);
     picture.set_paintable(gtk4::gdk::Paintable::NONE);
+    // List rows are too small for a badge; their icon says video already.
+    let video = !entry.is_dir && is_video_file_name(&entry.name, Some(entry.size));
+    if let Some(play) = play_badge(&picture) {
+        play.set_visible(false);
+        play.set_widget_name(if video && !symbolic_fallback {
+            VIDEO_BADGE
+        } else {
+            ""
+        });
+    }
 
     // The widget name is a cheap binding token. List factories recycle their
     // children; a reply for the previous entry must not paint into the new one.
@@ -186,7 +220,10 @@ pub(crate) fn bind_file_thumbnail(
     picture.set_widget_name(&key);
     remove_waiter(ui, &picture);
 
-    if entry.is_dir || !is_image_name(&entry.name) || entry.uid.is_empty() {
+    if entry.is_dir
+        || !is_thumbnail_media_name(&entry.name, Some(entry.size))
+        || entry.uid.is_empty()
+    {
         return;
     }
     if let Some(texture) = ui.file_thumbs.textures.borrow().get(&key) {
@@ -214,12 +251,6 @@ pub(crate) fn bind_file_thumbnail(
     schedule_file_thumbs(ui);
 }
 
-/// Whether the file name denotes an image format for which Proton or the local
-/// decoder can reasonably provide a thumbnail.
-pub(crate) fn is_image_name(name: &str) -> bool {
-    is_thumbnail_image_name(name)
-}
-
 fn thumbnail_key(uid: &str, modified: i64) -> String {
     format!("{uid}:{modified}")
 }
@@ -238,6 +269,9 @@ fn paint(picture: &gtk4::Picture, key: &str, texture: &gtk4::gdk::Texture) {
     }
     picture.set_paintable(Some(texture));
     picture.set_visible(true);
+    if let Some(play) = play_badge(picture) {
+        play.set_visible(play.widget_name() == VIDEO_BADGE);
+    }
     if let Some(overlay) = picture.parent().and_downcast::<gtk4::Overlay>()
         && let Some(fallback) = overlay.child().and_downcast::<gtk4::Image>()
     {
@@ -413,7 +447,11 @@ fn retry_file_thumbs(ui: &Rc<Ui>, items: Vec<FileThumbRequest>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplyDisposition, is_image_name, reply_disposition};
+    use super::{ReplyDisposition, reply_disposition};
+
+    fn is_image_name(name: &str) -> bool {
+        pdfs_core::control::is_thumbnail_image_name(name)
+    }
 
     #[test]
     fn image_extensions_are_case_insensitive_and_specific() {

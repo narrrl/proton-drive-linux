@@ -163,6 +163,10 @@ pub struct AppConfig {
     /// Defaulted for configs predating the field.
     #[serde(default)]
     pub files_view: FilesView,
+    /// How the desktop app's Photos page lays out its grid. Defaulted for
+    /// configs predating the field.
+    #[serde(default)]
+    pub photos_view: PhotosView,
     /// The desktop app's main window size, remembered between runs. Defaulted
     /// for configs predating the field.
     #[serde(default)]
@@ -220,6 +224,10 @@ pub struct FilesView {
     pub descending: bool,
     /// Folders ahead of files, whatever the sort.
     pub folders_first: bool,
+    /// The icon grid's thumbnail edge in logical pixels. `None` means the
+    /// app's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_size: Option<i32>,
 }
 
 impl Default for FilesView {
@@ -229,8 +237,21 @@ impl Default for FilesView {
             sort: FileSort::Name,
             descending: false,
             folders_first: true,
+            icon_size: None,
         }
     }
+}
+
+/// The Photos page's grid choices, remembered between runs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PhotosView {
+    /// The zoom level: the row height the grid aims for, in logical pixels.
+    /// `None` means the app's default.
+    pub row_height: Option<i32>,
+    /// Crop every photo to a square tile instead of showing it at its own
+    /// shape.
+    pub square: bool,
 }
 
 /// The desktop app's main window, as it was when it last closed.
@@ -761,6 +782,11 @@ mod tests {
                 sort: FileSort::Modified,
                 descending: true,
                 folders_first: false,
+                icon_size: Some(192),
+            },
+            photos_view: PhotosView {
+                row_height: Some(240),
+                square: true,
             },
             window: WindowState {
                 width: 1200,
@@ -792,6 +818,7 @@ mod tests {
         assert_eq!(decoded.upload_limit, Some(500_000));
         assert_eq!(decoded.download_limit, None);
         assert_eq!(decoded.files_view, config.files_view);
+        assert_eq!(decoded.photos_view, config.photos_view);
         assert_eq!(decoded.window, config.window);
     }
 
@@ -835,6 +862,17 @@ mod tests {
         let partial: FilesView = serde_json::from_str(r#"{"sort":"size"}"#).unwrap();
         assert_eq!(partial.sort, FileSort::Size);
         assert!(partial.folders_first);
+        assert_eq!(partial.icon_size, None);
+    }
+
+    #[test]
+    fn a_config_without_a_photos_view_gets_the_default() {
+        let decoded: AppConfig =
+            serde_json::from_str(r#"{"app_version":"a","user_agent":"b"}"#).unwrap();
+        assert_eq!(decoded.photos_view, PhotosView::default());
+        let partial: PhotosView = serde_json::from_str(r#"{"square":true}"#).unwrap();
+        assert!(partial.square);
+        assert_eq!(partial.row_height, None);
     }
 
     #[test]

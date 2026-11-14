@@ -40,7 +40,9 @@ pub(crate) struct Viewer {
     /// Details panel: the toggle that reveals it, the rows it fills in, and the
     /// "Show on map" button (hidden when the photo carries no GPS tags).
     pub(crate) info_toggle: gtk4::ToggleButton,
-    pub(crate) info_revealer: gtk4::Revealer,
+    /// Lays the details panel beside the photo, or over it in a narrow
+    /// window.
+    pub(crate) info_split: adw::OverlaySplitView,
     pub(crate) info_rows: gtk4::Box,
     pub(crate) info_map: gtk4::Button,
     /// Coordinates behind `info_map`, once a photo with GPS tags is shown.
@@ -358,9 +360,7 @@ fn stop_slideshow(viewer: &Rc<Viewer>) {
     if viewer.slide_fullscreened.replace(false) {
         viewer.window.unfullscreen();
     }
-    viewer
-        .slideshow
-        .set_icon_name("media-playback-start-symbolic");
+    viewer.slideshow.set_icon_name("pdfs-slideshow-symbolic");
     if viewer.slideshow.is_active() {
         viewer.slideshow.set_active(false);
     }
@@ -1004,13 +1004,16 @@ fn show_photo_position(ui: &Rc<Ui>, viewer: &Rc<Viewer>, index: u32, capture_tim
 pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
 
-    let window = gtk4::Window::builder()
+    // An `adw::Window` for its breakpoints: the details panel lies over the
+    // photo once the window is too narrow to show both side by side.
+    let adw_window = adw::Window::builder()
         .title(gettext("Photo"))
         .modal(true)
         .transient_for(&parent)
         .default_width(1100)
         .default_height(760)
         .build();
+    let window: gtk4::Window = adw_window.clone().upcast();
     window.add_css_class("photo-viewer-window");
 
     let overlay = gtk4::Overlay::new();
@@ -1120,7 +1123,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     favorite_btn.add_css_class("viewer-action-btn");
 
     let slideshow_btn = gtk4::ToggleButton::builder()
-        .icon_name("media-playback-start-symbolic")
+        .icon_name("pdfs-slideshow-symbolic")
         .tooltip_text(gettext("Slideshow (F5)"))
         .valign(gtk4::Align::Center)
         .build();
@@ -1205,16 +1208,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let info_panel = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     info_panel.add_css_class("viewer-info-panel");
-    info_panel.set_width_request(320);
     info_panel.append(&info_scroll);
-
-    // Set explicitly: the title's hexpand would otherwise propagate up and have
-    // the revealer take half the window even while it is closed.
-    let info_revealer = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .hexpand(false)
-        .child(&info_panel)
-        .build();
 
     let spinner = spinner();
     spinner.set_halign(gtk4::Align::Center);
@@ -1232,10 +1226,23 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     status_label.add_css_class("viewer-status");
     overlay.add_overlay(&status_label);
 
-    let body = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    body.append(&overlay);
-    body.append(&info_revealer);
-    window.set_child(Some(&body));
+    // The panel docks beside the photo, or lies over it in a narrow window,
+    // where a click on the photo closes it again.
+    let info_split = adw::OverlaySplitView::builder()
+        .content(&overlay)
+        .sidebar(&info_panel)
+        .sidebar_position(gtk4::PackType::End)
+        .min_sidebar_width(300.0)
+        .max_sidebar_width(360.0)
+        .show_sidebar(false)
+        .build();
+    let narrow = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 800sp").expect("static breakpoint"),
+    );
+    narrow.add_setter(&info_split, "collapsed", Some(&true.to_value()));
+    adw_window.add_breakpoint(narrow);
+    let body = info_split.clone();
+    adw_window.set_content(Some(&body));
 
     let viewer = Rc::new(Viewer {
         window: window.clone(),
@@ -1250,7 +1257,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         prev: prev_btn.clone(),
         next: next_btn.clone(),
         info_toggle: info_toggle.clone(),
-        info_revealer: info_revealer.clone(),
+        info_split: info_split.clone(),
         info_rows,
         info_map: info_map.clone(),
         favorite: favorite_btn.clone(),
@@ -1435,9 +1442,14 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         let Some(viewer_info) = viewer_info.upgrade() else {
             return;
         };
-        viewer_info
-            .info_revealer
-            .set_reveal_child(toggle.is_active());
+        viewer_info.info_split.set_show_sidebar(toggle.is_active());
+    });
+    // A collapsed panel also closes on its own, by a click on the photo.
+    let toggle_info = info_toggle.clone();
+    info_split.connect_show_sidebar_notify(move |split| {
+        if toggle_info.is_active() != split.shows_sidebar() {
+            toggle_info.set_active(split.shows_sidebar());
+        }
     });
 
     let ui_slides = ui.clone();

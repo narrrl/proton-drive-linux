@@ -204,12 +204,37 @@ pub(crate) struct GalleryState {
     /// The photo last picked or unpicked by a click, which a Shift+click
     /// selects a range from.
     pub(crate) select_anchor: RefCell<Option<String>>,
-    /// The Select toggle, the bar it reveals, and the bar's own widgets.
-    pub(crate) select_btn: gtk4::ToggleButton,
-    pub(crate) select_bar: gtk4::Revealer,
-    pub(crate) select_label: gtk4::Label,
-    pub(crate) select_trash: gtk4::Button,
-    pub(crate) select_album: gtk4::Button,
+    /// The Select button, and what selection mode shows instead of the
+    /// page's own header and actions.
+    pub(crate) select_btn: gtk4::Button,
+    pub(crate) selection: SelectionBar,
+    /// The header's page menu and the Upload button's face, which drops its
+    /// label in a narrow window.
+    pub(crate) more: gtk4::MenuButton,
+    pub(crate) upload_face: adw::ButtonContent,
+    /// The section the top of the timeline is in, floating over the grid
+    /// once its own heading has scrolled away.
+    pub(crate) float_heading: gtk4::Revealer,
+    pub(crate) float_label: gtk4::Label,
+    /// Crop every photo to a square tile (the page menu's "Square Tiles").
+    pub(crate) square: Cell<bool>,
+    /// The pending save of the zoom level, debounced: a Ctrl+scroll is a
+    /// flood of steps and only where it stops is worth writing.
+    pub(crate) zoom_save: RefCell<Option<glib::SourceId>>,
+}
+
+/// Selection mode's controls: the header's "N selected" title and Cancel, and
+/// the action bar along the bottom of the page.
+#[derive(Clone)]
+pub(crate) struct SelectionBar {
+    pub(crate) bar: gtk4::ActionBar,
+    pub(crate) title: adw::WindowTitle,
+    pub(crate) cancel: gtk4::Button,
+    pub(crate) favorite: gtk4::Button,
+    pub(crate) album: gtk4::Button,
+    pub(crate) remove: gtk4::Button,
+    pub(crate) save: gtk4::Button,
+    pub(crate) trash: gtk4::Button,
 }
 
 impl GalleryState {
@@ -332,10 +357,14 @@ pub(crate) enum GalleryRow {
     /// outside the list as the user scrolled resized the viewport under them,
     /// and the list shook between the two heights near the top.
     Memories,
-    /// A day heading: "Today", "3 June 2026".
-    Heading(String),
+    /// A section heading: "Today", "3 June 2026", with the check that picks
+    /// every photo under it.
+    Heading(SectionHeading),
     /// One row of a day's grid, already justified to the current width and zoom.
     Tiles {
+        /// The heading of the section the row belongs to, for the heading that
+        /// floats over the grid.
+        section: String,
         tiles: Vec<Tile>,
         /// True for the last row of its day, which carries the section's bottom
         /// margin so days stay visually separated.
@@ -343,7 +372,28 @@ pub(crate) enum GalleryRow {
     },
 }
 
+/// A section heading row.
+#[derive(Clone, PartialEq)]
+pub(crate) struct SectionHeading {
+    pub(crate) label: String,
+    /// The photos of the section, which its check selects.
+    pub(crate) uids: Vec<String>,
+    /// Whether the grid is in selection mode, and whether every photo of the
+    /// section is picked.
+    pub(crate) selecting: bool,
+    pub(crate) selected: bool,
+}
+
 impl GalleryRow {
+    /// The section the row belongs to.
+    fn section(&self) -> Option<&str> {
+        match self {
+            GalleryRow::Memories => None,
+            GalleryRow::Heading(heading) => Some(&heading.label),
+            GalleryRow::Tiles { section, .. } => Some(section),
+        }
+    }
+
     /// The uid of the row's first photo, or `None` for a heading — the anchor a
     /// relayout scrolls back to.
     fn anchor(&self) -> Option<String> {
@@ -361,10 +411,19 @@ impl GalleryRow {
             (GalleryRow::Memories, GalleryRow::Memories) => true,
             (GalleryRow::Heading(a), GalleryRow::Heading(b)) => a == b,
             (
-                GalleryRow::Tiles { tiles: a, last: al },
-                GalleryRow::Tiles { tiles: b, last: bl },
+                GalleryRow::Tiles {
+                    tiles: a,
+                    last: al,
+                    section: sa,
+                },
+                GalleryRow::Tiles {
+                    tiles: b,
+                    last: bl,
+                    section: sb,
+                },
             ) => {
                 al == bl
+                    && sa == sb
                     && a.len() == b.len()
                     && a.iter().zip(b).all(|(x, y)| {
                         x.photo.uid == y.photo.uid
@@ -373,6 +432,7 @@ impl GalleryRow {
                             && x.selecting == y.selecting
                             && x.selected == y.selected
                             && x.grouping == y.grouping
+                            && x.photo.favorite == y.photo.favorite
                     })
             }
             _ => false,
@@ -403,13 +463,15 @@ pub(crate) struct GalleryWidgets {
     pub(crate) empty_actions: gtk4::Box,
     pub(crate) empty_upload: gtk4::Button,
     pub(crate) empty_import: gtk4::Button,
-    /// The Select toggle and the bar it reveals.
-    pub(crate) select_btn: gtk4::ToggleButton,
-    pub(crate) select_bar: gtk4::Revealer,
-    pub(crate) select_label: gtk4::Label,
-    pub(crate) select_trash: gtk4::Button,
-    pub(crate) select_album: gtk4::Button,
-    pub(crate) select_done: gtk4::Button,
+    /// The Select button and what selection mode shows.
+    pub(crate) select_btn: gtk4::Button,
+    pub(crate) selection: SelectionBar,
+    pub(crate) more: gtk4::MenuButton,
+    pub(crate) upload_face: adw::ButtonContent,
+    pub(crate) float_heading: gtk4::Revealer,
+    pub(crate) float_label: gtk4::Label,
+    /// The page menu's "Square Tiles" check.
+    pub(crate) square_action: gio::SimpleAction,
     /// The Albums grid, its own status page and the stack between them, plus the
     /// Photos/Albums switcher and the back button out of an album.
     pub(crate) albums: gtk4::FlowBox,
@@ -494,7 +556,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     status_child.append(&empty_actions);
 
     let status = adw::StatusPage::builder()
-        .icon_name("image-x-generic-symbolic")
+        .icon_name("pdfs-photos-symbolic")
         .vexpand(true)
         .child(&status_child)
         .build();
@@ -537,15 +599,14 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         Some(&gettext("Import from Google Photos…")),
         Some("win.show-import"),
     );
+    let upload_face = adw::ButtonContent::builder()
+        .label(pgettext("verb", "Upload"))
+        .icon_name("pdfs-upload-symbolic")
+        .build();
     let upload = adw::SplitButton::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .label(pgettext("verb", "Upload"))
-                .icon_name("list-add-symbolic")
-                .build(),
-        )
+        .child(&upload_face)
         .menu_model(&upload_menu)
-        .tooltip_text(gettext("Upload photos"))
+        .tooltip_text(gettext("Upload photos and videos"))
         .dropdown_tooltip(gettext("More ways to add photos"))
         .valign(gtk4::Align::Center)
         .build();
@@ -554,10 +615,20 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     // Hunting for duplicates is a rarer, heavier job than adding one photo, so
     // it waits in the page menu rather than taking a header button.
     let page_menu = gio::Menu::new();
-    page_menu.append(
+    // Each photo at its own shape is the default; a grid of squares is the
+    // other way to see a library, and some prefer its even sheet.
+    let view_section = gio::Menu::new();
+    view_section.append(Some(&gettext("Square Tiles")), Some("photos.square-tiles"));
+    page_menu.append_section(None, &view_section);
+    let tools_section = gio::Menu::new();
+    tools_section.append(
         Some(&gettext("Find Duplicates…")),
         Some("win.find-duplicates"),
     );
+    page_menu.append_section(None, &tools_section);
+    let square_action = gio::SimpleAction::new_stateful("square-tiles", None, &false.to_variant());
+    let page_actions = gio::SimpleActionGroup::new();
+    page_actions.add_action(&square_action);
     let more = gtk4::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text(gettext("More"))
@@ -566,51 +637,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     more.add_css_class("flat");
 
-    // Picking photos is a mode, so its control is a toggle rather than a
-    // button. It has a label: no icon says "select" in every theme.
-    let select_btn = gtk4::ToggleButton::builder()
-        .label(pgettext("verb", "Select"))
+    // Picking photos is a mode: the button enters it, and the header then
+    // trades the page's own controls for Cancel and a count, as GNOME apps do.
+    let select_btn = gtk4::Button::builder()
+        .icon_name("selection-mode-symbolic")
         .tooltip_text(gettext("Select photos"))
         .valign(gtk4::Align::Center)
         .build();
     select_btn.add_css_class("flat");
-
-    // What the selection can do, revealed with the mode. A revealer rather than
-    // a hidden box so the grid slides down instead of jumping.
-    let select_label = gtk4::Label::builder()
-        .label(gettext("Select photos"))
-        .hexpand(true)
-        .xalign(0.0)
-        .build();
-    let select_trash = gtk4::Button::builder()
-        .label(gettext("Move to Trash"))
-        .valign(gtk4::Align::Center)
-        .sensitive(false)
-        .build();
-    select_trash.add_css_class("destructive-action");
-    let select_album = gtk4::Button::builder()
-        .label(gettext("Add to Album…"))
-        .valign(gtk4::Align::Center)
-        .sensitive(false)
-        .build();
-    let select_done = gtk4::Button::builder()
-        .icon_name("window-close-symbolic")
-        .tooltip_text(gettext("Leave selection (Esc)"))
-        .valign(gtk4::Align::Center)
-        .build();
-    select_done.add_css_class("flat");
-    select_done.add_css_class("circular");
-    let select_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    select_box.add_css_class("toolbar");
-    select_box.add_css_class("bulk-bar");
-    select_box.append(&select_label);
-    select_box.append(&select_album);
-    select_box.append(&select_trash);
-    select_box.append(&select_done);
-    let select_bar = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideDown)
-        .child(&scroll_sideways(&select_box))
-        .build();
+    let selection = build_selection_bar();
 
     // All / Photos / Videos / Raw filter. Linked toggles acting as one segmented
     // control: exactly one is active, and flipping it reloads the timeline
@@ -669,30 +704,33 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     // The kind toggles and the Filters button travel together: they filter the
     // timeline, and neither applies to the album grid or to an open album.
+    // One row: the kind tabs scroll sideways in a narrow window, and the
+    // Filters button stays at the end where it can always be reached.
     let filters = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filters.set_hexpand(true);
-    filters.append(&tabs.widget());
-    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    filters.append(&spacer);
+    let tabs_scroll = scroll_sideways(&tabs.widget());
+    tabs_scroll.set_hexpand(true);
+    tabs_scroll.set_propagate_natural_width(false);
+    filters.append(&tabs_scroll);
     filters.append(&filter_btn);
 
-    // The page's two views, as one segmented control under the title: the
-    // timeline, and the albums. This is navigation, not a filter — which is why
-    // it sits above the filter row rather than beside the kind toggles.
-    // "Timeline", not "Photos": the kind filter below has a Photos tab too.
+    // The page's views, as the header's title: navigation belongs in the
+    // header, and the grid gets the rows it used to take. "Timeline", not
+    // "Photos": the kind filter has a Photos tab too.
     let view_switch = ToggleGroup::new(&[
         (&gettext("Timeline"), None),
         (&gettext("Albums"), None),
         (&gettext("Places"), None),
     ]);
+    view_switch.set_icons(&[
+        "pdfs-photos-symbolic",
+        "pdfs-album-symbolic",
+        "mark-location-symbolic",
+    ]);
     view_switch.set_round();
     let view_switch_widget = view_switch.widget();
     view_switch_widget.add_css_class("view-switch");
-    view_switch_widget.set_halign(gtk4::Align::Start);
-
-    let filter_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    filter_bar.append(&filters);
+    view_switch_widget.set_valign(gtk4::Align::Center);
 
     // "On this day": a card per earlier year that has photos from today's
     // date. Shown as the first row of the unfiltered timeline (see
@@ -717,12 +755,25 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    timeline.append(&select_bar);
     // The scrubber lies over the grid's right edge and only shows when wanted,
     // so the grid keeps its full width.
     let timeline_view = gtk4::Overlay::new();
     timeline_view.set_child(Some(&scroll));
     let scrubber = Scrubber::new(&timeline_view);
+    // The section at the top of the grid, once its heading has scrolled off:
+    // a long day or month otherwise leaves the user guessing where they are.
+    let float_label = gtk4::Label::new(None);
+    float_label.add_css_class("gallery-float-heading");
+    let float_heading = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::Crossfade)
+        .halign(gtk4::Align::Start)
+        .valign(gtk4::Align::Start)
+        .margin_top(8)
+        .margin_start(8)
+        .can_target(false)
+        .child(&float_label)
+        .build();
+    timeline_view.add_overlay(&float_heading);
     timeline.append(&timeline_view);
     timeline.append(&pager);
 
@@ -742,7 +793,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .child(&albums)
         .build();
     let albums_status = adw::StatusPage::builder()
-        .icon_name("view-grid-symbolic")
+        .icon_name("pdfs-album-symbolic")
         .vexpand(true)
         .build();
     albums_status.add_css_class("compact");
@@ -835,18 +886,29 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.set_margin_bottom(12);
     inner.set_margin_start(12);
     inner.set_margin_end(12);
-    inner.append(&view_switch_widget);
-    inner.append(&filter_bar);
+    inner.append(&filters);
     inner.append(&content);
 
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     body.append(&import_banner);
     body.append(&inner);
-    let (frame, header, title) = page_frame(&gettext("Photos"), &body);
+    // The title slot holds the view switch on the page itself, the album's or
+    // place's name inside one, and the count in selection mode (see
+    // [`sync_header`]).
+    let title = adw::WindowTitle::new(&gettext("Photos"), "");
+    title.set_visible(false);
+    let title_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    title_box.append(&view_switch_widget);
+    title_box.append(&title);
+    title_box.append(&selection.title);
+    let (frame, header) = page_frame_with(&title_box, &body);
+    frame.add_bottom_bar(&selection.bar);
+    frame.insert_action_group("photos", Some(&page_actions));
     header.pack_start(&back);
     header.pack_start(&upload);
     header.pack_end(&more);
     header.pack_end(&select_btn);
+    header.pack_end(&selection.cancel);
 
     (
         frame.upcast(),
@@ -867,11 +929,12 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             empty_upload,
             empty_import,
             select_btn,
-            select_bar,
-            select_label,
-            select_trash,
-            select_album,
-            select_done,
+            selection,
+            more,
+            upload_face,
+            float_heading,
+            float_label,
+            square_action,
             tabs,
             favorites_row,
             not_in_album_row,
@@ -897,6 +960,95 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             filters,
         },
     )
+}
+
+/// Selection mode's controls, hidden until it starts: the count and Cancel
+/// for the header, and the actions along the bottom of the page.
+fn build_selection_bar() -> SelectionBar {
+    let title = adw::WindowTitle::new(&gettext("Select photos"), "");
+    title.set_visible(false);
+    let cancel = gtk4::Button::builder()
+        .label(gettext("Cancel"))
+        .tooltip_text(gettext("Leave selection (Esc)"))
+        .valign(gtk4::Align::Center)
+        .visible(false)
+        .build();
+    let action = |icon: &str, tooltip: &str| {
+        let button = gtk4::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(tooltip)
+            .valign(gtk4::Align::Center)
+            .sensitive(false)
+            .build();
+        button.add_css_class("flat");
+        button
+    };
+    let favorite = action("starred-symbolic", &gettext("Add to Favorites"));
+    let album = action("pdfs-album-symbolic", &gettext("Add to Album…"));
+    let remove = action("list-remove-symbolic", &gettext("Remove from Album"));
+    remove.set_visible(false);
+    let save = action("folder-download-symbolic", &gettext("Save Copies…"));
+    let trash = action("user-trash-symbolic", &gettext("Move to Trash…"));
+    trash.remove_css_class("flat");
+    trash.add_css_class("destructive-action");
+    let bar = gtk4::ActionBar::new();
+    bar.set_revealed(false);
+    bar.pack_start(&favorite);
+    bar.pack_start(&album);
+    bar.pack_start(&remove);
+    bar.pack_start(&save);
+    bar.pack_end(&trash);
+    SelectionBar {
+        bar,
+        title,
+        cancel,
+        favorite,
+        album,
+        remove,
+        save,
+        trash,
+    }
+}
+
+/// Show what the page's state calls for in its header: the view switch on
+/// the page itself, the name and Back inside an album or a place, and the
+/// count and Cancel in selection mode. The one place that decides it, so
+/// entering an album while selecting cannot leave the two half applied.
+pub(crate) fn sync_header(ui: &Rc<Ui>) {
+    let gallery = &ui.gallery;
+    let selecting = gallery.selecting.get();
+    let collection = gallery.in_collection();
+    let timeline = collection || gallery.view_switch.active() == VIEW_TIMELINE;
+    gallery
+        .view_switch
+        .widget()
+        .set_visible(!selecting && !collection);
+    gallery.title.set_visible(!selecting && collection);
+    gallery.back.set_visible(!selecting && collection);
+    gallery.upload.set_visible(!selecting && !collection);
+    gallery.more.set_visible(!selecting);
+    gallery.select_btn.set_visible(!selecting && timeline);
+    gallery.selection.title.set_visible(selecting);
+    gallery.selection.cancel.set_visible(selecting);
+    gallery.selection.bar.set_revealed(selecting);
+    let owned_album = gallery
+        .album
+        .borrow()
+        .as_ref()
+        .is_some_and(|album| !album.shared);
+    gallery.selection.remove.set_visible(owned_album);
+}
+
+/// Follow the window's narrow breakpoint: the view switch shows its icons
+/// alone, and Upload its icon, so the header keeps room for the window
+/// buttons.
+pub(crate) fn set_photos_narrow(ui: &Ui, narrow: bool) {
+    ui.gallery.view_switch.set_compact(narrow);
+    ui.gallery.upload_face.set_label(&if narrow {
+        String::new()
+    } else {
+        pgettext("verb", "Upload")
+    });
 }
 
 /// The [`PhotoKind`] filter a gallery tab index selects: index 0 is All (no
@@ -1070,7 +1222,7 @@ pub(crate) fn wire_gallery(
     ui: &Rc<Ui>,
     list: &gtk4::ListView,
     scroll: &gtk4::ScrolledWindow,
-    select_done: &gtk4::Button,
+    square_action: &gio::SimpleAction,
 ) {
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
@@ -1110,15 +1262,9 @@ pub(crate) fn wire_gallery(
             GalleryRow::Heading(heading) => {
                 row_box.set_margin_top(8);
                 row_box.set_margin_bottom(0);
-                let label = gtk4::Label::builder()
-                    .label(heading)
-                    .halign(gtk4::Align::Start)
-                    .build();
-                label.add_css_class("heading");
-                label.add_css_class("gallery-day");
-                row_box.append(&label);
+                row_box.append(&section_heading_widget(&ui_bind, heading));
             }
-            GalleryRow::Tiles { tiles, last } => {
+            GalleryRow::Tiles { tiles, last, .. } => {
                 row_box.set_margin_top(0);
                 // The last row of a day carries the gap to the next heading.
                 row_box.set_margin_bottom(if *last { 4 } else { TILE_GAP });
@@ -1217,6 +1363,7 @@ pub(crate) fn wire_gallery(
             load_gallery(&ui_scroll, true);
         }
         sync_scrubber_position(&ui_scroll);
+        sync_float_heading(&ui_scroll);
         ui_scroll.gallery.scrubber.flash();
     });
     wire_scrubber(ui);
@@ -1274,22 +1421,110 @@ pub(crate) fn wire_gallery(
     list.add_controller(zoom_keys);
 
     let ui_select = ui.clone();
-    ui.gallery.select_btn.clone().connect_toggled(move |btn| {
-        set_selection_mode(&ui_select, btn.is_active());
-    });
-    let ui_trash = ui.clone();
+    ui.gallery
+        .select_btn
+        .connect_clicked(move |_| set_selection_mode(&ui_select, true));
+    let ui_view = ui.clone();
+    ui.gallery
+        .view_switch
+        .connect_changed(move |_| sync_header(&ui_view));
+    sync_header(ui);
+    let selection = ui.gallery.selection.clone();
+    let ui_cancel = ui.clone();
+    selection
+        .cancel
+        .connect_clicked(move |_| set_selection_mode(&ui_cancel, false));
+    let ui_favorite = ui.clone();
+    selection
+        .favorite
+        .connect_clicked(move |_| favorite_selected(&ui_favorite));
     let ui_album = ui.clone();
-    ui.gallery.select_album.clone().connect_clicked(move |_| {
+    selection.album.connect_clicked(move |_| {
         let uids: Vec<String> = ui_album.gallery.selected.borrow().iter().cloned().collect();
         prompt_add_to_album(&ui_album, uids);
     });
-    ui.gallery.select_trash.clone().connect_clicked(move |_| {
-        delete_selected(&ui_trash);
+    let ui_remove = ui.clone();
+    selection.remove.connect_clicked(move |_| {
+        let album = ui_remove.gallery.album.borrow().clone();
+        if let Some(album) = album {
+            let uids: Vec<String> = ui_remove
+                .gallery
+                .selected
+                .borrow()
+                .iter()
+                .cloned()
+                .collect();
+            remove_from_album(&ui_remove, &album, uids);
+        }
     });
-    let ui_done = ui.clone();
-    select_done
-        .clone()
-        .connect_clicked(move |_| set_selection_mode(&ui_done, false));
+    let ui_save = ui.clone();
+    selection
+        .save
+        .connect_clicked(move |_| save_selected(&ui_save));
+    let ui_trash = ui.clone();
+    selection
+        .trash
+        .connect_clicked(move |_| delete_selected(&ui_trash));
+
+    // The grid's shape, as the page menu's check and as saved for next time.
+    ui.gallery.row_height.set(
+        ui.dirs
+            .load_config()
+            .photos_view
+            .row_height
+            .unwrap_or(ROW_DEFAULT)
+            .clamp(ROW_MIN, ROW_MAX),
+    );
+    let square = ui.dirs.load_config().photos_view.square;
+    ui.gallery.square.set(square);
+    square_action.set_state(&square.to_variant());
+    let ui_square = ui.clone();
+    square_action.connect_activate(move |action, _| {
+        let square = !ui_square.gallery.square.get();
+        action.set_state(&square.to_variant());
+        ui_square.gallery.square.set(square);
+        save_photos_view(&ui_square);
+        relayout_gallery(&ui_square);
+    });
+
+    // Photos and videos dropped on the timeline upload into it, the empty
+    // timeline's status page included.
+    let content = ui.gallery.content.clone();
+    let drop = gtk4::DropTarget::new(
+        gtk4::gdk::FileList::static_type(),
+        gtk4::gdk::DragAction::COPY,
+    );
+    let ui_drop = ui.clone();
+    drop.connect_accept(move |_, _| {
+        let gallery = &ui_drop.gallery;
+        !gallery.in_collection()
+            && gallery.view_switch.active() == VIEW_TIMELINE
+            && gallery.library.get()
+            && *ui_drop.mounted.borrow()
+    });
+    let content_enter = content.clone();
+    drop.connect_enter(move |_, _, _| {
+        content_enter.add_css_class("files-drop-active");
+        gtk4::gdk::DragAction::COPY
+    });
+    let content_leave = content.clone();
+    drop.connect_leave(move |_| content_leave.remove_css_class("files-drop-active"));
+    let ui_dropped = ui.clone();
+    let content_drop = content.clone();
+    drop.connect_drop(move |_, value, _, _| {
+        content_drop.remove_css_class("files-drop-active");
+        let Ok(files) = value.get::<gtk4::gdk::FileList>() else {
+            return false;
+        };
+        let paths: Vec<PathBuf> = files
+            .files()
+            .iter()
+            .filter_map(|file| file.path())
+            .collect();
+        upload_media(&ui_dropped, paths);
+        true
+    });
+    content.add_controller(drop);
 
     // Filter toggles: flipping to a tab reloads the timeline filtered to that
     // kind. A redundant toggle to the already-current kind is a no-op.
@@ -1346,86 +1581,456 @@ pub(crate) fn wire_gallery(
     let ui_upload = ui.clone();
     ui.gallery.upload.connect_clicked(move |_| {
         let dialog = gtk4::FileDialog::builder()
-            .title(gettext("Select Photo to Upload"))
+            .title(gettext("Upload Photos and Videos"))
+            .accept_label(pgettext("verb", "Upload"))
             .build();
-
         let filter = gtk4::FileFilter::new();
-        filter.set_name(Some(&gettext("Images")));
+        filter.set_name(Some(&gettext("Photos and videos")));
         filter.add_mime_type("image/*");
+        filter.add_mime_type("video/*");
         let filters = gio::ListStore::new::<gtk4::FileFilter>();
         filters.append(&filter);
         dialog.set_filters(Some(&filters));
 
         let ui = ui_upload.clone();
         let parent_win = ui.stack.root().and_downcast::<gtk4::Window>();
-        dialog.open(parent_win.as_ref(), gio::Cancellable::NONE, move |res| {
-            if let Ok(file) = res
-                && let Some(path) = file.path()
-            {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("photo.jpg")
-                    .to_string();
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jpg")
-                    .to_lowercase();
-                let media_type = match ext.as_str() {
-                    "png" => "image/png",
-                    "gif" => "image/gif",
-                    "webp" => "image/webp",
-                    "tiff" | "tif" => "image/tiff",
-                    _ => "image/jpeg",
-                };
-                // The daemon dates the photo: by its EXIF, or by the file's
-                // modification time when it has none.
-                let capture_time = None;
-
-                ui.busy_begin();
-                let rx = spawn_request(
-                    ui.dirs.control_socket(),
-                    // The daemon opens the file itself: it runs on this machine,
-                    // and a photo's bytes through line-delimited JSON is an OOM
-                    // of both processes (see `Request::UploadPhoto`).
-                    Request::UploadPhoto {
-                        name,
-                        media_type: media_type.to_string(),
-                        source_path: path.display().to_string(),
-                        capture_time,
-                    },
-                );
-                let ui_clone = ui.clone();
-                glib::spawn_future_local(async move {
-                    let res = rx.recv().await;
-                    ui_clone.busy_end();
-                    match res {
-                        Ok(Ok(Response::Ok { message })) => {
-                            tracing::info!("Photo uploaded: {message}");
-                            load_gallery(&ui_clone, false);
-                            toast(&ui_clone, &gettext("Photo uploaded"));
-                        }
-                        Ok(Ok(Response::Error { message, kind })) => {
-                            toast_failure(
-                                &ui_clone,
-                                &gettext("Couldn't upload photo"),
-                                &message,
-                                kind,
-                            );
-                        }
-                        _ => {
-                            toast_error(
-                                &ui_clone,
-                                &gettext("Couldn't upload photo"),
-                                &gettext("The Proton Drive service didn't respond."),
-                            );
-                        }
-                    }
-                });
-            }
+        dialog.open_multiple(parent_win.as_ref(), gio::Cancellable::NONE, move |res| {
+            // An error here is the dialog being dismissed.
+            let Ok(files) = res else {
+                return;
+            };
+            let paths: Vec<PathBuf> = (0..files.n_items())
+                .filter_map(|index| files.item(index).and_downcast::<gio::File>())
+                .filter_map(|file| file.path())
+                .collect();
+            upload_media(&ui, paths);
         });
     });
+}
+
+/// A section heading: its label, and a check that picks every photo under it.
+/// The check shows on hover, and always in selection mode; picking a section
+/// starts selection mode, like Ctrl+click on a tile.
+fn section_heading_widget(ui: &Rc<Ui>, heading: &SectionHeading) -> gtk4::Box {
+    let label = gtk4::Label::builder()
+        .label(&heading.label)
+        .halign(gtk4::Align::Start)
+        .build();
+    label.add_css_class("gallery-day");
+    let check = gtk4::Button::builder()
+        .icon_name(if heading.selected {
+            "checkbox-checked-symbolic"
+        } else {
+            "checkbox-symbolic"
+        })
+        .tooltip_text(if heading.selected {
+            gettext("Deselect these photos")
+        } else {
+            gettext("Select these photos")
+        })
+        .valign(gtk4::Align::Center)
+        .build();
+    check.add_css_class("flat");
+    check.add_css_class("circular");
+    check.add_css_class("gallery-day-check");
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    row.add_css_class("gallery-heading");
+    if heading.selecting {
+        row.add_css_class("selecting");
+    }
+    row.append(&label);
+    row.append(&check);
+    let ui = ui.clone();
+    let uids = heading.uids.clone();
+    let selected = heading.selected;
+    check.connect_clicked(move |_| select_section(&ui, &uids, !selected));
+    row
+}
+
+/// Pick or unpick every photo of a section.
+fn select_section(ui: &Rc<Ui>, uids: &[String], pick: bool) {
+    set_selection_mode(ui, true);
+    {
+        let mut selected = ui.gallery.selected.borrow_mut();
+        for uid in uids {
+            if pick {
+                selected.insert(uid.clone());
+            } else {
+                selected.remove(uid);
+            }
+        }
+    }
+    *ui.gallery.select_anchor.borrow_mut() = uids.last().cloned();
+    sync_selection_bar(ui);
+    repaint_gallery(ui);
+}
+
+/// Float the heading of the section at the top of the timeline over the grid,
+/// while the section's own heading row is scrolled away.
+fn sync_float_heading(ui: &Rc<Ui>) {
+    let list = &ui.gallery.list;
+    let scrolled = list.vadjustment().is_some_and(|adj| adj.value() > 1.0);
+    let top = scrolled
+        .then(|| {
+            let bound = ui.gallery.bound.borrow();
+            bound.iter().find_map(|(position, (_, row))| {
+                let rect = row.compute_bounds(list)?;
+                (row.is_mapped() && rect.y() + rect.height() > 0.0).then_some(*position)
+            })
+        })
+        .flatten()
+        .and_then(|position| ui.gallery.groups.item(position))
+        .and_downcast::<BoxedAnyObject>();
+    let section = top.as_ref().and_then(|boxed| {
+        let row = boxed.borrow::<GalleryRow>();
+        // A heading row at the top already says it.
+        match &*row {
+            GalleryRow::Tiles { .. } => row.section().map(str::to_string),
+            GalleryRow::Memories | GalleryRow::Heading(_) => None,
+        }
+    });
+    if let Some(section) = &section {
+        ui.gallery.float_label.set_label(section);
+    }
+    ui.gallery.float_heading.set_reveal_child(section.is_some());
+}
+
+/// The photos in the loaded model with these uids.
+fn photos_by_uid(ui: &Rc<Ui>, uids: &HashSet<String>) -> Vec<PhotoItem> {
+    let model = &ui.gallery.model;
+    (0..model.n_items())
+        .filter_map(|index| model.item(index).and_downcast::<BoxedAnyObject>())
+        .map(|boxed| boxed.borrow::<PhotoItem>().clone())
+        .filter(|photo| uids.contains(&photo.uid))
+        .collect()
+}
+
+/// Star every selected photo, or unstar them all when every one already is.
+fn favorite_selected(ui: &Rc<Ui>) {
+    let photos = photos_by_uid(ui, &ui.gallery.selected.borrow());
+    let favorite = !photos.iter().all(|photo| photo.favorite);
+    let uids: Vec<String> = photos
+        .into_iter()
+        .filter(|photo| photo.favorite != favorite)
+        .map(|photo| photo.uid)
+        .collect();
+    if uids.is_empty() {
+        return;
+    }
+    let total = uids.len();
+    ui.busy_begin();
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let mut changed = 0;
+        let mut failure = None;
+        for uid in uids {
+            let rx = spawn_request(
+                ui.dirs.control_socket(),
+                Request::SetPhotoFavorite {
+                    uid: uid.clone(),
+                    favorite,
+                },
+            );
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => {
+                    set_gallery_favorite(&ui, &uid, favorite);
+                    changed += 1;
+                }
+                Ok(Ok(Response::Error { message, .. })) => failure = Some(message),
+                _ => failure = Some(gettext("The Proton Drive service didn't respond.")),
+            }
+        }
+        ui.busy_end();
+        repaint_gallery(&ui);
+        sync_selection_bar(&ui);
+        if let Some(message) = failure {
+            toast_error(
+                &ui,
+                &ngettext_f(
+                    "Couldn't change {failed} of {n} favorite",
+                    "Couldn't change {failed} of {n} favorites",
+                    total as u64,
+                    &[("failed", &(total - changed).to_string())],
+                ),
+                &message,
+            );
+        } else {
+            let n = changed as u64;
+            toast(
+                &ui,
+                &if favorite {
+                    ngettext_f(
+                        "Added {n} photo to Favorites",
+                        "Added {n} photos to Favorites",
+                        n,
+                        &[],
+                    )
+                } else {
+                    ngettext_f(
+                        "Removed {n} photo from Favorites",
+                        "Removed {n} photos from Favorites",
+                        n,
+                        &[],
+                    )
+                },
+            );
+        }
+    });
+}
+
+/// Save a copy of every selected photo into a folder the user picks, under
+/// its Drive name.
+fn save_selected(ui: &Rc<Ui>) {
+    let photos = photos_by_uid(ui, &ui.gallery.selected.borrow());
+    if photos.is_empty() {
+        return;
+    }
+    let dialog = gtk4::FileDialog::builder()
+        .title(gettext("Save Copies"))
+        .accept_label(gettext("Save Here"))
+        .build();
+    let ui = ui.clone();
+    let parent = ui_window(&ui);
+    dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |res| {
+        // An error here is the dialog being dismissed.
+        let Some(folder) = res.ok().and_then(|file| file.path()) else {
+            return;
+        };
+        save_copies(&ui, photos, folder);
+    });
+}
+
+/// Fetch each photo and copy it into `folder`, one at a time so a large
+/// selection does not ask the daemon for everything at once.
+fn save_copies(ui: &Rc<Ui>, photos: Vec<PhotoItem>, folder: PathBuf) {
+    let total = photos.len();
+    ui.busy_begin();
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let mut saved = 0;
+        let mut failure = None;
+        for photo in photos {
+            let rx = spawn_request(
+                ui.dirs.control_socket(),
+                Request::OpenPhoto {
+                    uid: photo.uid.clone(),
+                },
+            );
+            let source = match rx.recv().await {
+                Ok(Ok(Response::FilePath { path })) => path,
+                Ok(Ok(Response::Error { message, .. })) => {
+                    failure = Some(message);
+                    continue;
+                }
+                _ => {
+                    failure = Some(gettext("The Proton Drive service didn't respond."));
+                    continue;
+                }
+            };
+            let name = photo.name.clone().unwrap_or_else(|| photo.uid.clone());
+            let folder = folder.clone();
+            let copied =
+                gio::spawn_blocking(move || copy_without_overwrite(&source, &folder, &name)).await;
+            match copied {
+                Ok(Ok(())) => saved += 1,
+                Ok(Err(e)) => failure = Some(e.to_string()),
+                Err(_) => failure = Some(gettext("The copy was interrupted.")),
+            }
+        }
+        ui.busy_end();
+        match failure {
+            Some(message) => toast_error(
+                &ui,
+                &ngettext_f(
+                    "Couldn't save {failed} of {n} copy",
+                    "Couldn't save {failed} of {n} copies",
+                    total as u64,
+                    &[("failed", &(total - saved).to_string())],
+                ),
+                &message,
+            ),
+            None => toast(
+                &ui,
+                &ngettext_f("Saved {n} copy", "Saved {n} copies", saved as u64, &[]),
+            ),
+        }
+    });
+}
+
+/// Copy `source` into `folder` as `name`, or as "name (2)" and so on when that
+/// name is taken: a copy never replaces a file that is already there.
+pub(crate) fn copy_without_overwrite(
+    source: &str,
+    folder: &Path,
+    name: &str,
+) -> std::io::Result<()> {
+    let name = Path::new(name).file_name().map_or_else(
+        || "photo".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.clone(), String::new()),
+    };
+    let mut reader = std::fs::File::open(source)?;
+    for n in 1.. {
+        let candidate = if n == 1 {
+            folder.join(&name)
+        } else {
+            folder.join(format!("{stem} ({n}){ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut out) => {
+                std::io::copy(&mut reader, &mut out)?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("some numbered name is free")
+}
+
+/// Upload photos and videos from this computer into the timeline, one after
+/// the other, then reload it once.
+pub(crate) fn upload_media(ui: &Rc<Ui>, paths: Vec<PathBuf>) {
+    let uploads: Vec<(PathBuf, String)> = paths
+        .into_iter()
+        .filter_map(|path| upload_media_type(&path).map(|media_type| (path, media_type)))
+        .collect();
+    if uploads.is_empty() {
+        toast(ui, &gettext("Only photos and videos can go into Photos"));
+        return;
+    }
+    let total = uploads.len();
+    ui.busy_begin();
+    if total > 1 {
+        toast(
+            ui,
+            &ngettext_f(
+                "Uploading {n} item…",
+                "Uploading {n} items…",
+                total as u64,
+                &[],
+            ),
+        );
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let mut uploaded = 0;
+        let mut failure = None;
+        for (path, media_type) in uploads {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let rx = spawn_request(
+                ui.dirs.control_socket(),
+                // The daemon opens the file itself: it runs on this machine,
+                // and a photo's bytes through line-delimited JSON is an OOM
+                // of both processes (see `Request::UploadPhoto`). It also
+                // dates the photo: by its EXIF, or by the file's modification
+                // time when it has none.
+                Request::UploadPhoto {
+                    media_type,
+                    name,
+                    source_path: path.display().to_string(),
+                    capture_time: None,
+                },
+            );
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { message })) => {
+                    tracing::info!("Photo uploaded: {message}");
+                    uploaded += 1;
+                }
+                Ok(Ok(Response::Error { message, kind })) => failure = Some((message, kind)),
+                _ => {
+                    failure = Some((
+                        gettext("The Proton Drive service didn't respond."),
+                        ErrorKind::Remote,
+                    ))
+                }
+            }
+        }
+        ui.busy_end();
+        if uploaded > 0 {
+            load_gallery(&ui, false);
+        }
+        match failure {
+            Some((message, kind)) if total == 1 => {
+                toast_failure(&ui, &gettext("Couldn't upload photo"), &message, kind)
+            }
+            Some((message, kind)) => toast_failure(
+                &ui,
+                &ngettext_f(
+                    "Couldn't upload {failed} of {n} item",
+                    "Couldn't upload {failed} of {n} items",
+                    total as u64,
+                    &[("failed", &(total - uploaded).to_string())],
+                ),
+                &message,
+                kind,
+            ),
+            None if total == 1 => toast(&ui, &gettext("Photo uploaded")),
+            None => toast(
+                &ui,
+                &ngettext_f("Uploaded {n} item", "Uploaded {n} items", total as u64, &[]),
+            ),
+        }
+    });
+}
+
+/// The media type Drive records for an upload, or `None` for a file that is
+/// neither a photo nor a video. The desktop's MIME database decides, except
+/// for a transport stream: it takes `.ts` for TypeScript, so the app's own
+/// rule (a `.ts` of a recording's size is a video) goes first.
+pub(crate) fn upload_media_type(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let size = std::fs::metadata(path).ok().map(|meta| meta.len());
+    let (guess, _) = gio::content_type_guess(Some(name), None);
+    let mime = gio::content_type_get_mime_type(&guess)
+        .map(|mime| mime.to_string())
+        .unwrap_or_default();
+    if pdfs_core::control::is_video_file_name(name, size) {
+        return Some(if mime.starts_with("video/") {
+            mime
+        } else {
+            "video/mp2t".to_string()
+        });
+    }
+    if mime.starts_with("image/") {
+        return Some(mime);
+    }
+    pdfs_core::control::is_raw_image_name(name).then(|| "application/octet-stream".to_string())
+}
+
+/// Save the zoom level and the tile shape for the next run, shortly after the
+/// last change.
+fn save_photos_view(ui: &Rc<Ui>) {
+    if let Some(source) = ui.gallery.zoom_save.borrow_mut().take() {
+        source.remove();
+    }
+    let ui_save = ui.clone();
+    let source = glib::timeout_add_local_once(Duration::from_millis(500), move || {
+        ui_save.gallery.zoom_save.borrow_mut().take();
+        let mut config = ui_save.dirs.load_config();
+        let view = PhotosView {
+            row_height: Some(ui_save.gallery.row_height.get()),
+            square: ui_save.gallery.square.get(),
+        };
+        if config.photos_view == view {
+            return;
+        }
+        config.photos_view = view;
+        if let Err(e) = ui_save.dirs.save_config(&config) {
+            tracing::warn!("cannot save the Photos view: {e}");
+        }
+    });
+    *ui.gallery.zoom_save.borrow_mut() = Some(source);
 }
 
 /// One tile of the grid: the photo, and the box [`justify_rows`] sized it to.
@@ -1443,33 +2048,128 @@ pub(crate) struct Tile {
     pub(crate) grouping: Grouping,
 }
 
-/// Break one section's photos into rows of square tiles spanning `width`.
+/// Break one section's photos into rows spanning `width`.
 ///
-/// Squares, because a wide window and a day of a few photos do not mix with
-/// rows justified to each photo's shape: a short row stays short, and portrait
-/// phone shots come out as thin slivers. Every tile of a square grid is the
-/// same size whatever it shows, and the thumbnail is cropped to fill it.
+/// Each photo keeps its own shape (see [`plan_justified`]), so a portrait shot
+/// is not cropped to a sliver of itself. Two cases stay square: the Year zoom,
+/// where the tiles are too small for shape to show and a dense even sheet reads
+/// better, and the "Square tiles" choice in the page menu.
 pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec<Vec<Tile>> {
     let selecting = ui.gallery.selecting.get();
     let selected = ui.gallery.selected.borrow();
     let target = ui.gallery.row_height.get();
     let grouping = grouping_for(target);
-    let (columns, size) = plan_grid(width, target);
-    photos
-        .chunks(columns)
+    let tile = |photo: &PhotoItem, (width, height): (i32, i32)| Tile {
+        selecting,
+        selected: selecting && selected.contains(&photo.uid),
+        grouping,
+        photo: photo.clone(),
+        width,
+        height,
+    };
+    if ui.gallery.square.get() || grouping == Grouping::Year {
+        let (columns, size) = plan_grid(width, target);
+        return photos
+            .chunks(columns)
+            .map(|row| row.iter().map(|photo| tile(photo, (size, size))).collect())
+            .collect();
+    }
+    let ratios: Vec<f64> = photos.iter().map(|photo| tile_ratio(photo.ratio)).collect();
+    let mut photos = photos.iter();
+    plan_justified(&ratios, width, target)
+        .into_iter()
         .map(|row| {
-            row.iter()
-                .map(|photo| Tile {
-                    selecting,
-                    selected: selecting && selected.contains(&photo.uid),
-                    grouping,
-                    photo: photo.clone(),
-                    width: size,
-                    height: size,
-                })
+            row.into_iter()
+                .zip(photos.by_ref())
+                .map(|(size, photo)| tile(photo, size))
                 .collect()
         })
         .collect()
+}
+
+/// The narrowest and the widest shape a tile may take, as width over height.
+/// A panorama at its own shape would be a ribbon, and a screenshot of a phone
+/// a thread; past these the thumbnail is cropped to fit.
+pub(crate) const TILE_RATIO_MIN: f64 = 0.5;
+pub(crate) const TILE_RATIO_MAX: f64 = 2.5;
+
+/// The shape a photo's tile takes: its own, clamped, or square while the
+/// daemon has not seen a thumbnail of it yet.
+pub(crate) fn tile_ratio(ratio: Option<f64>) -> f64 {
+    ratio
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .unwrap_or(1.0)
+        .clamp(TILE_RATIO_MIN, TILE_RATIO_MAX)
+}
+
+/// The justified layout math: tiles of the given shapes, in order, broken into
+/// rows that each span `width` exactly, gaps included, at a height near
+/// `target`. Returns each row's `(width, height)` sizes.
+///
+/// A row takes photos until it is at least as wide as `width` at the target
+/// height, then keeps or gives back its last photo, whichever leaves the row
+/// height nearer the target. The last row of the section is not stretched:
+/// two photos from one day stay two photos at the target height, not two
+/// photos as tall as the window.
+pub(crate) fn plan_justified(ratios: &[f64], width: i32, target: i32) -> Vec<Vec<(i32, i32)>> {
+    let width = width.max(1);
+    let target = f64::from(target.clamp(ROW_MIN, ROW_MAX));
+    let gap = f64::from(TILE_GAP);
+    // The height that makes `ratios` span the width exactly.
+    let fit = |ratios: &[f64]| {
+        let gaps = gap * (ratios.len() as f64 - 1.0);
+        (f64::from(width) - gaps).max(1.0) / ratios.iter().sum::<f64>()
+    };
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < ratios.len() {
+        let mut end = start + 1;
+        while end < ratios.len() && fit(&ratios[start..end]) > target {
+            end += 1;
+        }
+        let full = fit(&ratios[start..end]) <= target;
+        // Giving the last photo back leaves the row taller than the target;
+        // keeping it, shorter. Whichever misses by less wins.
+        if full
+            && end - start > 1
+            && fit(&ratios[start..end - 1]) - target < target - fit(&ratios[start..end])
+        {
+            end -= 1;
+        }
+        let row = &ratios[start..end];
+        rows.push(if full {
+            size_row(row, fit(row), Some(width))
+        } else {
+            size_row(row, target, None)
+        });
+        start = end;
+    }
+    rows
+}
+
+/// Tile sizes for one row of shapes at `height`. With `span`, the widths are
+/// rounded so the row, gaps included, is exactly that wide: each tile ends
+/// where its share of the row ends, so no rounding error piles up at the end.
+fn size_row(ratios: &[f64], height: f64, span: Option<i32>) -> Vec<(i32, i32)> {
+    let tile_height = (height.round() as i32).max(1);
+    let Some(span) = span else {
+        return ratios
+            .iter()
+            .map(|ratio| (((ratio * height).round() as i32).max(1), tile_height))
+            .collect();
+    };
+    let content = f64::from(span - TILE_GAP * (ratios.len() as i32 - 1));
+    let total: f64 = ratios.iter().sum();
+    let mut sizes = Vec::with_capacity(ratios.len());
+    let mut done = 0.0;
+    let mut left = 0;
+    for ratio in ratios {
+        done += ratio;
+        let right = (content * done / total).round() as i32;
+        sizes.push(((right - left).max(1), tile_height));
+        left = right;
+    }
+    sizes
 }
 
 /// The layout math: how many square tiles of about `target` px fit across
@@ -1511,8 +2211,10 @@ pub(crate) fn gallery_width(ui: &Rc<Ui>) -> i32 {
 pub(crate) struct TileWidget {
     pub(crate) button: gtk4::Button,
     picture: gtk4::Picture,
+    placeholder: gtk4::Image,
     caption: gtk4::Label,
     video: gtk4::Image,
+    favorite: gtk4::Image,
     group: gtk4::Label,
     check: gtk4::Image,
     photo: Rc<RefCell<Option<PhotoItem>>>,
@@ -1521,9 +2223,10 @@ pub(crate) struct TileWidget {
 impl TileWidget {
     pub(crate) fn new(ui: &Rc<Ui>) -> Self {
         let picture = gtk4::Picture::builder()
-            // Every tile is square, so Cover crops the photo to fill it.
-            // Contain would letterbox it, and the bars would read as gaps in
-            // the sheet. The expands are what make the picture take the whole
+            // Cover fills the tile: a tile at the photo's own shape shows it
+            // whole, and a square tile or a clamped panorama crops it. Contain
+            // would letterbox it, and the bars would read as gaps in the
+            // sheet. The expands are what make the picture take the whole
             // overlay.
             .content_fit(gtk4::ContentFit::Cover)
             .can_shrink(true)
@@ -1534,7 +2237,7 @@ impl TileWidget {
         picture.add_css_class("photo-thumb");
 
         let placeholder = gtk4::Image::builder()
-            .icon_name("image-x-generic-symbolic")
+            .icon_name("pdfs-photos-symbolic")
             .pixel_size(24)
             .halign(gtk4::Align::Center)
             .valign(gtk4::Align::Center)
@@ -1572,6 +2275,18 @@ impl TileWidget {
             .build();
         group.add_css_class("photo-group-badge");
 
+        // A favorite says so in the corner nothing else uses.
+        let favorite = gtk4::Image::builder()
+            .icon_name("starred-symbolic")
+            .pixel_size(14)
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::End)
+            .margin_end(6)
+            .margin_bottom(6)
+            .can_target(false)
+            .build();
+        favorite.add_css_class("photo-favorite-badge");
+
         let check = gtk4::Image::builder()
             .pixel_size(16)
             .halign(gtk4::Align::Start)
@@ -1587,6 +2302,7 @@ impl TileWidget {
         overlay.add_overlay(&caption);
         overlay.add_overlay(&video);
         overlay.add_overlay(&group);
+        overlay.add_overlay(&favorite);
         overlay.add_overlay(&check);
 
         let button = gtk4::Button::builder().child(&overlay).build();
@@ -1665,8 +2381,10 @@ impl TileWidget {
         Self {
             button,
             picture,
+            placeholder,
             caption,
             video,
+            favorite,
             group,
             check,
             photo,
@@ -1688,7 +2406,15 @@ impl TileWidget {
         // Zoomed out, the play glyph shrinks with the tile so it marks the
         // video without covering it.
         let small = tile.grouping != Grouping::Day;
-        self.video.set_visible(tile.photo.kind == PhotoKind::Video);
+        let video = tile.photo.kind == PhotoKind::Video;
+        self.video.set_visible(video);
+        self.placeholder.set_icon_name(Some(if video {
+            "video-x-generic-symbolic"
+        } else {
+            "pdfs-photos-symbolic"
+        }));
+        self.favorite
+            .set_visible(tile.photo.favorite && tile.grouping != Grouping::Year);
         self.video.set_pixel_size(if small { 12 } else { 28 });
         set_css_class(&self.video, "photo-video-badge-small", small);
 
@@ -1758,9 +2484,7 @@ pub(crate) fn set_selection_mode(ui: &Rc<Ui>, selecting: bool) {
         ui.gallery.selected.borrow_mut().clear();
         ui.gallery.select_anchor.borrow_mut().take();
     }
-    if ui.gallery.select_btn.is_active() != selecting {
-        ui.gallery.select_btn.set_active(selecting);
-    }
+    sync_header(ui);
     sync_selection_bar(ui);
     repaint_gallery(ui);
 }
@@ -1982,17 +2706,37 @@ fn tile_at(ui: &Rc<Ui>, x: f64, y: f64) -> Option<String> {
 
 /// Reflect the selection in the bar above the grid.
 fn sync_selection_bar(ui: &Rc<Ui>) {
+    let selection = &ui.gallery.selection;
     let count = ui.gallery.selected.borrow().len();
-    ui.gallery.select_label.set_label(&match count {
+    selection.title.set_title(&match count {
         0 => gettext("Select photos"),
         // Translators: {n} is how many items are selected: files and folders in My Files, photos here.
         n => ngettext_f("{n} selected", "{n} selected", n as u64, &[]),
     });
-    ui.gallery.select_trash.set_sensitive(count > 0);
-    ui.gallery.select_album.set_sensitive(count > 0);
-    ui.gallery
-        .select_bar
-        .set_reveal_child(ui.gallery.selecting.get());
+    for button in [
+        &selection.favorite,
+        &selection.album,
+        &selection.remove,
+        &selection.save,
+        &selection.trash,
+    ] {
+        button.set_sensitive(count > 0);
+    }
+    // Favorite stars the selection, or unstars it once every photo is one.
+    let all_favorite = count > 0
+        && photos_by_uid(ui, &ui.gallery.selected.borrow())
+            .iter()
+            .all(|p| p.favorite);
+    selection.favorite.set_icon_name(if all_favorite {
+        "non-starred-symbolic"
+    } else {
+        "starred-symbolic"
+    });
+    selection.favorite.set_tooltip_text(Some(&if all_favorite {
+        gettext("Remove from Favorites")
+    } else {
+        gettext("Add to Favorites")
+    }));
 }
 
 /// Confirm, then move every selected photo to Proton trash.
@@ -2570,6 +3314,7 @@ pub(crate) fn set_gallery_tile(ui: &Rc<Ui>, tile: i32) {
         return;
     }
     ui.gallery.row_height.set(tile);
+    save_photos_view(ui);
     schedule_relayout(ui);
 }
 
@@ -2617,12 +3362,24 @@ fn build_rows(ui: &Rc<Ui>) -> Vec<GalleryRow> {
     if shows_memories(ui) {
         rows.push(GalleryRow::Memories);
     }
+    let selecting = ui.gallery.selecting.get();
     for group in group_photos(&ui.gallery.model, grouping) {
-        rows.push(GalleryRow::Heading(group.heading));
+        let uids: Vec<String> = group.photos.iter().map(|photo| photo.uid.clone()).collect();
+        let selected = selecting && {
+            let picked = ui.gallery.selected.borrow();
+            uids.iter().all(|uid| picked.contains(uid))
+        };
+        rows.push(GalleryRow::Heading(SectionHeading {
+            label: group.heading.clone(),
+            uids,
+            selecting,
+            selected,
+        }));
         let grid = justify_rows(ui, &group.photos, width);
         let last_index = grid.len().saturating_sub(1);
         for (index, tiles) in grid.into_iter().enumerate() {
             rows.push(GalleryRow::Tiles {
+                section: group.heading.clone(),
                 tiles,
                 last: index == last_index,
             });
@@ -2635,7 +3392,12 @@ fn clone_row(row: &GalleryRow) -> GalleryRow {
     match row {
         GalleryRow::Memories => GalleryRow::Memories,
         GalleryRow::Heading(heading) => GalleryRow::Heading(heading.clone()),
-        GalleryRow::Tiles { tiles, last } => GalleryRow::Tiles {
+        GalleryRow::Tiles {
+            section,
+            tiles,
+            last,
+        } => GalleryRow::Tiles {
+            section: section.clone(),
             tiles: tiles.clone(),
             last: *last,
         },
@@ -2944,7 +3706,7 @@ fn memory_card(ui: &Rc<Ui>, years_ago: u32, photos: Vec<PhotoItem>) -> gtk4::But
         .can_shrink(true)
         .build();
     let placeholder = gtk4::Image::builder()
-        .icon_name("image-x-generic-symbolic")
+        .icon_name("pdfs-photos-symbolic")
         .pixel_size(24)
         .build();
     placeholder.add_css_class("photo-placeholder");
@@ -3279,7 +4041,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         ui.gallery.model.remove_all();
         gallery_status(
             ui,
-            "image-x-generic-symbolic",
+            "pdfs-photos-symbolic",
             &gettext("Loading photos…"),
             &gettext("Reading your Proton Drive timeline."),
             false,
@@ -3406,7 +4168,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         if ui.gallery.favorites.get() {
                             "starred-symbolic"
                         } else {
-                            "image-x-generic-symbolic"
+                            "pdfs-photos-symbolic"
                         },
                         &title,
                         &description,
@@ -3488,9 +4250,10 @@ pub(crate) fn play_external(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, active_filters,
-        empty_timeline_text, grouping_for, memory_years, month_index, month_range, plan_grid,
-        section_heading,
+        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
+        TILE_RATIO_MIN, active_filters, copy_without_overwrite, empty_timeline_text, grouping_for,
+        memory_years, month_index, month_range, plan_grid, plan_justified, section_heading,
+        tile_ratio,
     };
     use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
 
@@ -3527,6 +4290,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every row but the last spans the width to the pixel, gaps included,
+    /// and no row is wider than the width.
+    #[test]
+    fn justified_rows_span_the_content_width() {
+        let ratios: Vec<f64> = (0..60)
+            .map(|i| [1.5, 0.75, 1.0, 1.78, 0.5625, 2.5, 1.33][i % 7])
+            .collect();
+        for width in [360, 640, 901, 1440, 2560] {
+            for target in [ROW_MIN, ROW_DEFAULT, ROW_MAX] {
+                let rows = plan_justified(&ratios, width, target);
+                assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), ratios.len());
+                for (index, row) in rows.iter().enumerate() {
+                    let span: i32 =
+                        row.iter().map(|(w, _)| w).sum::<i32>() + TILE_GAP * (row.len() as i32 - 1);
+                    assert!(span <= width, "{span}px overflows {width}px");
+                    if index + 1 < rows.len() {
+                        assert_eq!(span, width, "row {index} at {width}px, {target}px");
+                    }
+                    let height = row[0].1;
+                    assert!(row.iter().all(|(_, h)| *h == height), "one height per row");
+                }
+            }
+        }
+    }
+
+    /// A row lands near the zoom level: never more than half a tile's height
+    /// off, whichever way it rounds.
+    #[test]
+    fn justified_rows_stay_near_the_zoom_level() {
+        let ratios = vec![1.33; 40];
+        for target in [ROW_MIN, ROW_DEFAULT, ROW_MAX] {
+            let rows = plan_justified(&ratios, 1440, target);
+            for row in &rows[..rows.len() - 1] {
+                let height = row[0].1;
+                assert!(
+                    (height - target).abs() <= target / 2,
+                    "{height}px row for a {target}px zoom"
+                );
+            }
+        }
+    }
+
+    /// Two photos from one day stay at the zoom level rather than being
+    /// stretched to fill a wide window.
+    #[test]
+    fn the_last_row_is_not_stretched() {
+        let rows = plan_justified(&[1.5, 0.75], 1920, ROW_DEFAULT);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![(270, ROW_DEFAULT), (135, ROW_DEFAULT)]);
+    }
+
+    #[test]
+    fn a_tile_takes_the_shape_of_its_photo_within_bounds() {
+        assert_eq!(tile_ratio(None), 1.0);
+        assert_eq!(tile_ratio(Some(f64::NAN)), 1.0);
+        assert_eq!(tile_ratio(Some(0.0)), 1.0);
+        assert_eq!(tile_ratio(Some(1.5)), 1.5);
+        assert_eq!(tile_ratio(Some(0.1)), TILE_RATIO_MIN);
+        assert_eq!(tile_ratio(Some(9.0)), TILE_RATIO_MAX);
+        // A portrait photo is narrower than a landscape one in the same row.
+        let rows = plan_justified(&[1.5, 0.75, 1.5, 0.75, 1.5], 900, ROW_DEFAULT);
+        assert!(rows[0][0].0 > rows[0][1].0);
+    }
+
+    /// Saving copies never replaces a file: a taken name gets a number.
+    #[test]
+    fn a_saved_copy_takes_a_free_name() {
+        let dir = std::env::temp_dir().join(format!("pdfs-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(dir.join("photo.jpg"), b"old").unwrap();
+        let source = source.to_str().unwrap();
+        copy_without_overwrite(source, &dir, "photo.jpg").unwrap();
+        copy_without_overwrite(source, &dir, "photo.jpg").unwrap();
+        copy_without_overwrite(source, &dir, "../escape").unwrap();
+        assert_eq!(std::fs::read(dir.join("photo.jpg")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("photo (2).jpg")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.join("photo (3).jpg")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.join("escape")).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

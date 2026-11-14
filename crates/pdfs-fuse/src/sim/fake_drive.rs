@@ -62,7 +62,7 @@ use proton_drive_rs::proton_sdk::ids::{
 };
 use proton_drive_rs::{
     AvailableNameTarget, Device as Computer, DeviceType, DriveEvent, DriveEventScopeId, Node,
-    NodeKind, NodeMoveItem, RevisionState, Thumbnail,
+    NodeKind, NodeMoveItem, RevisionState, Thumbnail, ThumbnailType,
 };
 use sha1::{Digest as _, Sha1};
 
@@ -396,6 +396,8 @@ impl FakeDrive {
             hold_answer: Mutex::new(None),
             hold_trash: Mutex::new(None),
             hold_download: Mutex::new(None),
+            thumbnails: Mutex::new(HashMap::new()),
+            content_read: AtomicU64::new(0),
             hold_any_landing: AtomicBool::new(false),
             hold_landing: Mutex::new(None),
             drop_after_create: AtomicBool::new(false),
@@ -677,6 +679,10 @@ struct ClientInner {
     hold_trash: Mutex<Option<Arc<HoldState>>>,
     /// The download [`FakeClient::hold_next_download`] is waiting for.
     hold_download: Mutex<Option<Arc<HoldState>>>,
+    /// Thumbnails set by [`FakeClient::set_thumbnail`].
+    thumbnails: Mutex<HashMap<NodeUid, Vec<u8>>>,
+    /// File content bytes served, by downloads and ranged reads alike.
+    content_read: AtomicU64,
     /// The landing [`FakeClient::hold_next_landing`] is waiting for.
     hold_landing: Mutex<Option<Arc<HoldState>>>,
     /// Set by [`FakeClient::hold_next_landing_of_any`]: hold whichever node
@@ -821,6 +827,16 @@ impl FakeClient {
 
     /// Hold the next download of `uid`'s content once Drive has answered it,
     /// before the bytes reach the daemon, until the answer is dropped.
+    /// Give `uid` a server thumbnail, as an upload that carried one would.
+    pub(crate) fn set_thumbnail(&self, uid: &NodeUid, bytes: Vec<u8>) {
+        self.0.thumbnails.lock().insert(uid.clone(), bytes);
+    }
+
+    /// File content bytes served so far, by whole downloads and ranged reads.
+    pub(crate) fn content_read(&self) -> u64 {
+        self.0.content_read.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn hold_next_download(&self, uid: &NodeUid) -> Held {
         let state = Arc::new(HoldState {
             uid: uid.clone(),
@@ -1475,6 +1491,21 @@ impl DriveApi for FakeClient {
         }))
     }
 
+    async fn download_thumbnail(
+        &self,
+        uid: &NodeUid,
+        _thumbnail_type: ThumbnailType,
+    ) -> Result<Option<Vec<u8>>> {
+        self.request(false, |server| {
+            server
+                .current(uid)
+                .map(|_| ())
+                .ok_or_else(|| api(ResponseCode::DoesNotExist, "file not found"))
+        })
+        .await?;
+        Ok(self.0.thumbnails.lock().get(uid).cloned())
+    }
+
     async fn download_file_to_dyn(
         &self,
         uid: &NodeUid,
@@ -1490,6 +1521,9 @@ impl DriveApi for FakeClient {
             .await?;
         self.wait_if_held(&self.0.hold_download, std::slice::from_ref(uid))
             .await;
+        self.0
+            .content_read
+            .fetch_add(content.len() as u64, Ordering::SeqCst);
         output.write_all(&content).map_err(io_error)
     }
 
@@ -1733,13 +1767,19 @@ impl RevisionRead for FakeRevision {
 
     async fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
         let content = self.content.clone();
-        self.client
+        let read = self
+            .client
             .request(false, move |_| {
                 let start = (offset as usize).min(content.len());
                 let end = (offset.saturating_add(length) as usize).min(content.len());
                 Ok(content[start..end].to_vec())
             })
-            .await
+            .await?;
+        self.client
+            .0
+            .content_read
+            .fetch_add(read.len() as u64, Ordering::SeqCst);
+        Ok(read)
     }
 }
 

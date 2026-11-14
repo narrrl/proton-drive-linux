@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B283](#b283--videos-have-no-thumbnail-outside-photos-and-a-ts-recording-looks-like-source-code) | Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code |
 | [B282](#b282--a-file-kept-offline-is-downloaded-again-after-a-change-made-elsewhere) | A file kept offline is downloaded again after a change made elsewhere |
 | [B281](#b281--a-file-in-a-synced-folder-cannot-be-kept-offline) | A file in a synced folder cannot be kept offline |
 | [B280](#b280--uploading-a-batch-of-large-photos-swaps-the-machine-until-the-daemon-is-killed) | Uploading a batch of large photos swaps the machine until the daemon is killed |
@@ -384,6 +385,49 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B283 — Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-14, from a user report: large `.ts` video recordings in My files showed a text
+icon, and no video in My files had a thumbnail although the same videos had one in Photos.
+**Where:** `is_video_file_name` in `crates/pdfs-core/src/control.rs`; `generate_thumbs` and
+`sample_video` in `crates/pdfs-fuse/src/photos.rs`; `bind_file_thumbnail` in
+`crates/pdfs-gui/src/app/widgets/thumbnails.rs`
+
+**Repro:** Put an `.mp4` and a recorded `.ts` of a few GB in My files and open the folder in the
+app's grid view. Both show a generic icon, and the `.ts` shows a text one.
+
+**Cause.** Four things:
+- File views asked the daemon for thumbnails of images only (`is_thumbnail_image_name`), so a
+  video was never asked for.
+- `.ts` is TypeScript as often as it is an MPEG transport stream. Drive stores both as
+  `application/octet-stream`, and every place that names a file's type went by the extension:
+  the browser's icon list had no `.ts`, GIO guesses text, and the opener's `@text` class listed
+  `.ts`.
+- The daemon downloaded a video whole into memory for one frame, so it refused anything over
+  256 MiB, and the size check behind that refusal asked the Photos client, which knows nothing
+  of a My files node.
+- `file_thumbs` never asked for the thumbnail an uploader attached, on the belief that only
+  Photos nodes have one. This client attaches one to every upload it can make one for.
+
+**Fix.** `is_video_file_name(name, size)` is the one rule: a video extension, and for `.ts` a
+size of at least 1 MiB. The browser icon, the thumbnail gate, the launcher's icon and type, and
+the opener's classes use it. For a file view, the daemon first asks Drive for the file's own
+thumbnail. Without one, a video of up to 24 MiB is downloaded whole. A larger one brings its first
+16 MiB, and for an MP4 or MOV whose `moov` box lies further in, the box headers on the way and
+that box. The parts are laid out at their offsets in a sparse staging file, which ffmpeg reads.
+A `.ts` whose head lacks the 0x47 sync byte is recorded as having no thumbnail.
+
+**Test:** `a_ts_file_is_a_video_only_at_the_size_of_one` and
+`listings_thumbnail_images_and_videos` in `crates/pdfs-core/src/control.rs`;
+`a_ts_file_opens_as_media_or_text_by_its_size` in `crates/pdfs-core/src/opener.rs`;
+`a_large_mp4_downloads_its_head_and_its_index` and the other `sample_video` tests in
+`crates/pdfs-fuse/src/photos.rs`; the simulation
+`a_video_thumbnail_downloads_a_small_part_of_the_video`, which reads under 34 MiB for two
+videos of over 70 MiB and takes nothing from a video with an uploader's thumbnail.
+`real_video_fixture_yields_a_frame` passed on 2026-11-14 with ffmpeg 9.0 for a 46 MB MP4 with its
+index at the end, an MPEG-TS and an MKV.
 
 ### B282 — A file kept offline is downloaded again after a change made elsewhere
 

@@ -40,7 +40,7 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
     if ui.gallery.albums_stack.visible_child_name().as_deref() != Some("grid") {
         albums_status(
             ui,
-            "view-grid-symbolic",
+            "pdfs-album-symbolic",
             &gettext("Loading albums…"),
             &gettext("Reading your Proton Drive albums."),
         );
@@ -62,7 +62,7 @@ pub(crate) fn load_albums(ui: &Rc<Ui>) {
             ),
             Ok(Ok(Response::Albums { items, .. })) if items.is_empty() => albums_status(
                 &ui,
-                "view-grid-symbolic",
+                "pdfs-album-symbolic",
                 &gettext("No albums"),
                 &gettext("Create one with New Album, or in Proton Photos."),
             ),
@@ -136,7 +136,7 @@ fn album_card(ui: &Rc<Ui>, album: &AlbumInfo) -> gtk4::Button {
     picture.add_css_class("photo-thumb");
 
     let placeholder = gtk4::Image::builder()
-        .icon_name("view-grid-symbolic")
+        .icon_name("pdfs-album-symbolic")
         .pixel_size(32)
         .halign(gtk4::Align::Center)
         .valign(gtk4::Align::Center)
@@ -618,9 +618,7 @@ pub(crate) fn open_album(ui: &Rc<Ui>, album: AlbumInfo) {
     // would silently do something else. The Photos/Albums switcher goes too: an
     // album is a level below it, and back is the way out.
     ui.gallery.filters.set_visible(false);
-    ui.gallery.view_switch.widget().set_visible(false);
-    ui.gallery.upload.set_visible(false);
-    ui.gallery.back.set_visible(true);
+    sync_header(ui);
     // A stale kind/date filter would otherwise be sent with the album request.
     ui.gallery.kind.set(None);
     ui.gallery.range.set(None);
@@ -636,9 +634,7 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
         return;
     }
     ui.gallery.title.set_title(&gettext("Photos"));
-    ui.gallery.view_switch.widget().set_visible(true);
-    ui.gallery.upload.set_visible(true);
-    ui.gallery.back.set_visible(false);
+    sync_header(ui);
 }
 
 /// Show the album grid's own status page (loading, empty, or an error).

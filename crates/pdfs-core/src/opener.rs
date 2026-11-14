@@ -27,6 +27,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::control::is_video_file_name;
 use serde::{Deserialize, Serialize};
 
 /// Environment override for the terminal used by `"terminal": true` rules.
@@ -108,11 +109,12 @@ impl OpenWith {
     /// a Markdown file). The rules are about *what the user opened*, so the
     /// caller passes that name and the argv still gets the real path.
     pub fn command_for_named(&self, path: &Path, name: &str, is_dir: bool) -> Vec<String> {
+        let kind = Kind::of(path, name, is_dir);
         for rule in &self.rules {
             if rule.command.is_empty() {
                 continue;
             }
-            if !rule.patterns.iter().any(|p| matches(p, name, is_dir)) {
+            if !rule.patterns.iter().any(|p| matches(p, name, kind)) {
                 continue;
             }
             let argv = expand(&rule.command, path);
@@ -325,16 +327,46 @@ fn expand_env(token: &str) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
 
+/// What is being opened, as far as the `@class` patterns care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Dir,
+    Video,
+    File,
+}
+
+impl Kind {
+    /// `.ts` names TypeScript and MPEG transport streams alike, so for that
+    /// one extension the size on disk decides (see
+    /// [`is_video_file_name`](crate::control::is_video_file_name)). No other
+    /// name costs a `stat`.
+    fn of(path: &Path, name: &str, is_dir: bool) -> Kind {
+        if is_dir {
+            return Kind::Dir;
+        }
+        let size = extension(name)
+            .eq_ignore_ascii_case("ts")
+            .then(|| std::fs::metadata(path).ok().map(|meta| meta.len()))
+            .flatten();
+        if is_video_file_name(name, size) {
+            Kind::Video
+        } else {
+            Kind::File
+        }
+    }
+}
+
 /// Whether `pattern` — a glob or an `@class` — matches this name.
-fn matches(pattern: &str, name: &str, is_dir: bool) -> bool {
+fn matches(pattern: &str, name: &str, kind: Kind) -> bool {
     let name_lower = name.to_lowercase();
+    let file = kind == Kind::File;
     match pattern.to_lowercase().as_str() {
         "@any" => true,
-        "@dir" => is_dir,
-        "@text" => !is_dir && class_text(&name_lower),
-        "@document" => !is_dir && class_document(&name_lower),
-        "@image" => !is_dir && class_image(&name_lower),
-        "@media" => !is_dir && class_media(&name_lower),
+        "@dir" => kind == Kind::Dir,
+        "@text" => file && class_text(&name_lower),
+        "@document" => file && class_document(&name_lower),
+        "@image" => file && class_image(&name_lower),
+        "@media" => kind == Kind::Video || (file && class_media(&name_lower)),
         other if other.starts_with('@') => false,
         other => glob_match(other, &name_lower),
     }
@@ -531,6 +563,37 @@ mod tests {
                 "/home/me/.cache/proton-drive-linux/content/364d1d8cc8e6"
             ]
         );
+    }
+
+    #[test]
+    fn a_ts_file_opens_as_media_or_text_by_its_size() {
+        let policy = OpenWith {
+            terminal: Some(vec!["alacritty".into(), "-e".into()]),
+            default: None,
+            rules: vec![
+                rule(&["@text"], &["nvim"], true),
+                rule(&["@media"], &["mpv"], false),
+            ],
+        };
+        let dir = std::env::temp_dir().join(format!("pdfs-opener-ts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("blob-source");
+        std::fs::write(&source, "export const answer = 42;\n").unwrap();
+        let recording = dir.join("blob-recording");
+        std::fs::File::create(&recording)
+            .unwrap()
+            .set_len(crate::control::TS_VIDEO_MIN_BYTES)
+            .unwrap();
+
+        let source_argv = policy.command_for_named(&source, "app.ts", false);
+        let recording_argv = policy.command_for_named(&recording, "recording.ts", false);
+        // A file that is not on this machine yet has no size to go by.
+        let unknown_argv = policy.command_for_named(&dir.join("missing"), "recording.ts", false);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(source_argv[..3], ["alacritty", "-e", "nvim"]);
+        assert_eq!(recording_argv[0], "mpv");
+        assert_eq!(unknown_argv[0], "mpv");
     }
 
     #[test]

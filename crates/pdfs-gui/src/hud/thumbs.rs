@@ -9,8 +9,8 @@
 //!    matches the file's;
 //! 2. for local images, decoding the file itself, and writing the result back
 //!    to that cache for the next time and for every other application;
-//! 3. for Drive images, the daemon's `FileThumbs`, batched after a short quiet
-//!    period.
+//! 3. for Drive images and videos, the daemon's `FileThumbs`, batched after a
+//!    short quiet period.
 //!
 //! Workers hand back `gdk::Texture`s, never a `Pixbuf`, which may not cross
 //! threads. Each job carries the render epoch it was queued in, and workers
@@ -30,7 +30,9 @@ use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-use pdfs_core::control::{FileThumbRequest, Request, Response, is_thumbnail_image_name};
+use pdfs_core::control::{
+    FileThumbRequest, Request, Response, is_thumbnail_image_name, is_thumbnail_media_name,
+};
 
 use crate::{Hit, spawn_request};
 
@@ -165,7 +167,13 @@ impl Thumbs {
         // The widget name binds the picture to one key: a late reply for
         // another hit must not paint into it.
         picture.set_widget_name(&key);
-        if hit.is_dir() || !is_thumbnail_image_name(hit.name()) {
+        // A video's frame comes from the daemon, which has ffmpeg's help; a
+        // local video has only what another application cached.
+        let thumbnailed = match hit {
+            Hit::Drive(drive) => is_thumbnail_media_name(&drive.name, Some(drive.size)),
+            Hit::Local(_) => is_thumbnail_image_name(hit.name()),
+        };
+        if hit.is_dir() || !thumbnailed {
             return;
         }
         if matches!(hit, Hit::Drive(drive) if drive.uid.is_empty()) {
