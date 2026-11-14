@@ -352,7 +352,13 @@ impl DriveApi for ProtonDriveClient {
         name: &str,
         last_modification_time: Option<i64>,
     ) -> Result<NodeUid> {
-        ProtonDriveClient::create_folder(self, parent_uid, name, last_modification_time).await
+        ProtonDriveClient::create_folder(
+            self,
+            parent_uid,
+            name,
+            last_modification_time.and_then(pdfs_core::timestamp::modification_time),
+        )
+        .await
     }
 
     async fn upload_file(
@@ -384,7 +390,7 @@ impl DriveApi for ProtonDriveClient {
             reader,
             intended_size,
             thumbnails,
-            last_modification_time,
+            last_modification_time.and_then(pdfs_core::timestamp::modification_time),
             aead,
         )
         .await
@@ -409,7 +415,7 @@ impl DriveApi for ProtonDriveClient {
             reader,
             intended_size,
             thumbnails,
-            last_modification_time,
+            last_modification_time.and_then(pdfs_core::timestamp::modification_time),
             aead,
         )
         .await
@@ -429,7 +435,7 @@ impl DriveApi for ProtonDriveClient {
             reader,
             intended_size,
             thumbnails,
-            last_modification_time,
+            last_modification_time.and_then(pdfs_core::timestamp::modification_time),
         )
         .await
     }

@@ -39,6 +39,12 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   `pdfs share` and `pdfs share-role` now check the role (`viewer`, `editor` or `admin`) before
   sending the request, and `pdfs public-link` does the same for `viewer` and `editor`.
 
+### Changed
+
+- **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
+  from the SDK, and a photo keeps its own modification time now that it no longer follows the
+  capture time. [The SDK review](SDK-0.11.0.md) lists the new features and breaking changes.
+
 ### Fixed
 
 - **My files comes back after the service was killed for hanging** (B279). A killed service left
