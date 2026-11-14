@@ -1394,6 +1394,13 @@ pub(crate) fn wire_gallery(
         sync_float_heading(&ui_scroll);
         ui_scroll.gallery.scrubber.flash();
     });
+    // Zooming out or making the window taller can leave every loaded photo on
+    // one screen. Nothing scrolls then, so the scrolling above never asks for
+    // the next page: ask whenever the content shrinks under the viewport.
+    let ui_fill = ui.clone();
+    scroll
+        .vadjustment()
+        .connect_changed(move |_| fill_viewport(&ui_fill));
     wire_scrubber(ui);
     wire_drag_select(ui);
 
@@ -4090,15 +4097,30 @@ fn continue_jump(ui: &Rc<Ui>) {
 /// Load the next page when the timeline does not fill the window yet: with no
 /// scrollbar there is no scrolling to trigger it.
 fn fill_viewport(ui: &Rc<Ui>) {
+    if !ui.gallery.has_more.get() || ui.gallery.loading.get() {
+        return;
+    }
     let ui = ui.clone();
     glib::idle_add_local_once(move || {
         let Some(adj) = ui.gallery.list.vadjustment() else {
             return;
         };
-        if ui.gallery.has_more.get() && adj.upper() <= adj.page_size() + 1.0 {
+        let timeline = ui.gallery.content.visible_child_name().as_deref() == Some("timeline");
+        if timeline
+            && ui.gallery.has_more.get()
+            && adj.page_size() > 0.0
+            && viewport_unfilled(adj.upper(), adj.page_size())
+        {
             load_gallery(&ui, true);
         }
     });
+}
+
+/// Whether content `upper` px tall leaves a viewport `page_size` px tall short
+/// of a screen and a half to scroll through, the margin the scrolling pager
+/// keeps. Below it the pager would never fire.
+pub(crate) fn viewport_unfilled(upper: f64, page_size: f64) -> bool {
+    upper <= page_size * 2.5 + 1.0
 }
 
 /// Select every photo loaded so far (Ctrl+A).
@@ -4494,10 +4516,10 @@ pub(crate) fn play_external(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grouping, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
+        Grouping, PHOTOS_PAGE, ROW_DEFAULT, ROW_MAX, ROW_MIN, ROW_STEP, TILE_GAP, TILE_RATIO_MAX,
         TILE_RATIO_MIN, active_filters, copy_without_overwrite, empty_timeline_text, grouping_for,
         memory_years, month_index, month_range, plan_grid, plan_justified, section_heading,
-        tile_ratio,
+        tile_ratio, viewport_unfilled,
     };
     use pdfs_core::control::{PhotoItem, PhotoKind, PhotoMonth};
 
@@ -4618,6 +4640,18 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("photo (3).jpg")).unwrap(), b"new");
         assert_eq!(std::fs::read(dir.join("escape")).unwrap(), b"new");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first page zoomed all the way out fits on one screen, with nothing
+    /// to scroll: the next page has to load without a scroll asking for it.
+    #[test]
+    fn a_page_zoomed_out_onto_one_screen_asks_for_more() {
+        let (columns, size) = plan_grid(1580, ROW_MIN);
+        let rows = PHOTOS_PAGE.div_ceil(columns) as i32;
+        let height = f64::from(rows * (size + TILE_GAP) + 40);
+        assert!(viewport_unfilled(height, 880.0));
+        assert!(viewport_unfilled(880.0, 880.0));
+        assert!(!viewport_unfilled(880.0 * 3.0, 880.0));
     }
 
     #[test]
