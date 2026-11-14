@@ -50,6 +50,10 @@ sha1 = "0.11"
 # formats a camera or phone actually produces — the rest of the crate's codecs
 # would be dead weight in the daemon.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "rayon"] }
+# Cover pictures of songs, read from their tags (ID3, FLAC, Ogg, MP4, APE) for
+# the song's thumbnail. Its default feature is required: 0.25 does not build
+# without it.
+lofty = "0.25"
 rusqlite = { version = "0.41", features = ["bundled"] }
 # keyring 4 split into `keyring-core` plus per-platform stores. The libdbus
 # Secret Service store is the one keyring 3's `sync-secret-service` wrapped, and

@@ -63,6 +63,7 @@ scale.browser-status-meter trough { min-width: 140px; min-height: 6px; }
 .photo-viewer-window { background-color: #111014; }
 .media-player-window video { background-color: black; }
 .media-player-note { color: rgba(255, 255, 255, 0.5); }
+.media-player-note .file-thumbnail { border-radius: 12px; }
 .viewer-top-bar { background: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0.45) 60%, rgba(0, 0, 0, 0)); padding: 10px 16px 40px 20px; color: white; }
 .viewer-title { font-weight: 700; font-size: 1.05rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }
 .viewer-counter { font-size: 0.8rem; color: rgba(255, 255, 255, 0.72); text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }

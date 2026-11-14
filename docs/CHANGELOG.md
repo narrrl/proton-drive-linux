@@ -104,6 +104,14 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   10 seconds, and `M` to mute. The volume carries over from one video to the next, and the
   thumbnail strip in Photos stays off a video, where it covered the seek bar.
 
+- **Album covers for songs.** A song in My files, in search and in Shared shows its cover as its
+  thumbnail, and the player shows it above the controls instead of a music note. The cover is the
+  picture in the song's tags (MP3, FLAC, Ogg, Opus, M4A, WAV, AIFF, WavPack, Monkey's Audio), or
+  else a `cover`, `folder`, `front` or `album` image (`.jpg`, `.png`, `.webp`) in the same folder.
+  Only the song's tags are downloaded for it, not the whole song. Songs uploaded from this computer
+  carry their cover as their thumbnail, so they show it at once on other devices too. A cover
+  image added to a folder later is picked up once the song changes or the service restarts.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
@@ -115,6 +123,11 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 - **Photos zoomed all the way out shows the whole timeline.** The first 200 photos fit on one
   screen there, and with nothing to scroll no more were loaded. More now load whenever the photos
   don't fill the window, also after a zoom or a resize.
+
+- **Thumbnails appear in the folder you are looking at as soon as they are made.** During
+  **Build thumbnails**, the folder on screen kept its file icons until you left it and opened it
+  again. Its tiles now fill in while the build runs, and the same goes for any tile whose
+  thumbnail is made while it is on screen.
 
 - **My files comes back after the service was killed for hanging** (B279). A killed service left
   its folders behind as dead mounts, and every restart then failed with `File exists` and retried

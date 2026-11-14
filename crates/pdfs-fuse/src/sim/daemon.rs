@@ -3732,6 +3732,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A song with no picture in its tags shows the cover image in its folder,
+    /// and the daemon tells a following front-end that a thumbnail landed, so
+    /// a folder on screen fills in without being opened again.
+    #[test]
+    #[ignore = "mounts FUSE: run with `cargo test -p pdfs-fuse sim:: -- --ignored`"]
+    fn a_song_without_a_cover_shows_its_folders_and_says_so() {
+        let dir = scratch("song-cover");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Silent MPEG-1 Layer III frames, without any tag.
+        let mut frame = vec![0u8; 417];
+        frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        let song = frame.repeat(64);
+        let mut cover = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut cover)
+            .encode_image(&image::RgbImage::new(300, 300))
+            .unwrap();
+
+        let drive = FakeDrive::new();
+        drive.device().write("track one.mp3", &song);
+        drive.device().write("Cover.jpg", &cover);
+        let client = drive.client(1, Faults::lan());
+        let daemon = Daemon::start(&dir.join("daemon"), client).unwrap();
+
+        let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut subscription = control::subscribe(&daemon.socket).unwrap();
+        let flag = landed.clone();
+        std::thread::spawn(move || {
+            // The first change names every topic: a new subscription catches up.
+            let mut caught_up = false;
+            while let Ok(Some(event)) = subscription.next_event() {
+                if let control::Event::Changed { topics } = event {
+                    if caught_up && topics.contains(&control::Topic::Thumbnails) {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    caught_up = true;
+                }
+            }
+        });
+
+        let Ok(Response::Entries { entries }) = daemon.request(&Request::ListDir {
+            path: String::new(),
+        }) else {
+            panic!("listing");
+        };
+        let song = entries
+            .iter()
+            .find(|entry| entry.name == "track one.mp3")
+            .expect("the song is listed");
+        let items = vec![control::FileThumbRequest {
+            uid: song.uid.clone(),
+            modified: song.modified,
+            name: song.name.clone(),
+        }];
+        let Ok(Response::FileThumbGeneration { generation }) =
+            daemon.request(&Request::ReserveFileThumbGeneration)
+        else {
+            panic!("generation");
+        };
+        let mut path = None;
+        let settled = wait_until(Duration::from_secs(60), || {
+            let Ok(Response::Thumbs { items: replies }) = daemon.request(&Request::FileThumbs {
+                items: items.clone(),
+                generation,
+            }) else {
+                return false;
+            };
+            path = replies.first().and_then(|reply| reply.path.clone());
+            path.is_some()
+        });
+        assert!(settled, "the song got no thumbnail");
+        let thumb = image::load_from_memory(&std::fs::read(path.unwrap()).unwrap()).unwrap();
+        assert_eq!(thumb.width(), thumb.height(), "the square cover");
+        assert!(
+            wait_until(Duration::from_secs(15), || landed
+                .load(std::sync::atomic::Ordering::SeqCst)),
+            "no thumbnails change was published"
+        );
+        assert!(matches!(daemon.stop(), Ok(MountOutcome::Shutdown)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A video in My files gets a thumbnail from a frame of its own, but a
     /// recording can be gigabytes: only its start, and an MP4's index, are
     /// downloaded for it. A video with a thumbnail from its uploader is not

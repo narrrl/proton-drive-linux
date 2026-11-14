@@ -128,6 +128,10 @@ fn follow_changes(ui: &Rc<Ui>, state: &FeedState, topics: &[Topic]) {
     if changed(Topic::Shares) {
         refresh_invitations_badge(ui, Duration::ZERO);
     }
+    // On any page: a grid, a list or a player may show a tile still blank.
+    if changed(Topic::Thumbnails) {
+        refresh_file_thumbnails(ui);
+    }
     let page = ui.stack.visible_child_name();
     // A timeline out of sight is read again when the user comes back to it;
     // one on screen is left alone (below).

@@ -19,6 +19,9 @@ const SEEK_SHORT: i64 = 5;
 /// How much ↑ and ↓ change the volume in the My files player.
 const VOLUME_STEP: f64 = 0.1;
 
+/// The edge of a song's cover in the My files player, in logical pixels.
+const COVER_SIZE: i32 = 320;
+
 thread_local! {
     /// The volume and mute the user last set, applied to the next stream so
     /// muting one video doesn't leave the next one blaring. Kept for the run
@@ -202,16 +205,21 @@ fn build_media_player(ui: &Rc<Ui>, entry: &DirEntry, path: &Path) {
     wire_player(&video, &gtk_window);
 
     // A song has no picture, which would leave a black window above the
-    // controls: a note stands in for it.
-    let note = gtk4::Image::builder()
-        .icon_name("audio-x-generic-symbolic")
-        .pixel_size(128)
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .can_target(false)
-        .visible(false)
-        .build();
+    // controls: its cover stands in for it, the one its listing tile shows,
+    // and a note while there is none.
+    let note = file_thumbnail_widget(COVER_SIZE, 128);
+    note.set_can_target(false);
+    note.set_visible(false);
     note.add_css_class("media-player-note");
+    if let Some(cover) = note
+        .child()
+        .and_then(|fallback| fallback.next_sibling())
+        .and_downcast::<gtk4::Picture>()
+    {
+        // The whole cover, not a square cut out of it.
+        cover.set_content_fit(gtk4::ContentFit::Contain);
+    }
+    bind_file_thumbnail(ui, &note, entry, true);
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&video));
     overlay.add_overlay(&note);

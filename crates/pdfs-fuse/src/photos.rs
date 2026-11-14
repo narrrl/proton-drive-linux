@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use pdfs_core::control::{
     FileThumbRequest, MappingProgress, PhotoItem, PhotoKind, PhotoLocation, PhotoThumb, PlaceInfo,
-    ThumbnailBuildStatus, Topic, is_raw_image_name, is_thumbnail_image_name,
+    ThumbnailBuildStatus, Topic, is_audio_file_name, is_raw_image_name, is_thumbnail_image_name,
     is_thumbnail_media_name,
 };
 use pdfs_core::db::{self, StoredPhoto};
@@ -76,6 +76,36 @@ const VIDEO_BOX_WALK_MAX: usize = 32;
 /// A single frame is seconds of work even for 4K; this only stops a wedged
 /// ffmpeg from holding a thumbnail permit.
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// A song no larger than this is downloaded whole for its cover.
+const AUDIO_WHOLE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// How much of a song's start is read first, to learn where its tags end.
+const AUDIO_PROBE_BYTES: u64 = 64 * 1024;
+/// How much of a song's start is read when its first bytes don't say where its
+/// tags end: an Ogg comment packet, which holds the cover, has no size up front.
+const AUDIO_HEAD_BYTES: u64 = 4 * 1024 * 1024;
+/// Read past the tags at a song's start, so the first audio frames are there
+/// for a reader that looks for them.
+const AUDIO_HEAD_SLACK: u64 = 64 * 1024;
+/// Largest start of a song read for its tags. A cover bigger than this is not
+/// worth the download for a 512-pixel thumbnail.
+const AUDIO_TAG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// How much of a song's end is read in formats that keep their tags there
+/// (APE tags in WavPack and Monkey's Audio, `id3 ` chunks in WAV and AIFF).
+const AUDIO_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+/// Names of a folder's cover image, best first, matched without case and
+/// extension. A song without a picture in its tags gets this image's.
+const FOLDER_COVER_STEMS: [&str; 6] = [
+    "cover",
+    "folder",
+    "front",
+    "album",
+    "albumart",
+    "albumartsmall",
+];
+/// Image types a folder cover is taken in.
+const FOLDER_COVER_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+/// Largest folder cover image downloaded whole for a song's thumbnail.
+const FOLDER_COVER_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Largest thumbnail attached to an upload. Proton's own clients hold theirs to
 /// this, stepping the JPEG quality down until it fits.
 const UPLOAD_THUMB_MAX_BYTES: usize = 60 * 1024;
@@ -630,6 +660,7 @@ enum Fetched {
     /// A whole image.
     Whole(Vec<u8>),
     Video(VideoSample),
+    Audio(AudioSample),
 }
 
 /// The parts of a video its thumbnail needs, downloaded: the start of the
@@ -766,13 +797,181 @@ fn video_sample_thumbnail(
     video_file_thumbnail(&file.0, ffmpeg, timeout)
 }
 
+/// The parts of a song its cover needs, downloaded: the start, where most
+/// formats keep their tags, an M4A's index, and for formats that keep their
+/// tags at the end, the end.
+struct AudioSample {
+    /// The whole file's length.
+    size: u64,
+    /// Each part and the offset it came from.
+    parts: Vec<(u64, Vec<u8>)>,
+}
+
+/// Where the tags at the start of a song end, read from its first `probe`
+/// bytes: past an ID3v2 tag, and past FLAC's metadata blocks, which hold its
+/// picture. `None` when the start says nothing, as for Ogg. A FLAC block
+/// header past `probe` stops the walk with a guess of [`AUDIO_HEAD_BYTES`]
+/// more.
+fn audio_tags_end(probe: &[u8]) -> Option<u64> {
+    let mut offset = 0u64;
+    let mut known = false;
+    if probe.get(0..3) == Some(b"ID3") {
+        let size = probe.get(6..10)?;
+        if size.iter().any(|byte| byte & 0x80 != 0) {
+            return None;
+        }
+        let size = size
+            .iter()
+            .fold(0u64, |acc, byte| (acc << 7) | u64::from(*byte));
+        let footer = probe.get(5).is_some_and(|flags| flags & 0x10 != 0);
+        offset = 10 + size + if footer { 10 } else { 0 };
+        known = true;
+    }
+    let start = usize::try_from(offset).ok()?;
+    if probe.get(start..start + 4) == Some(b"fLaC") {
+        offset += 4;
+        loop {
+            let at = usize::try_from(offset).ok()?;
+            let Some(header) = probe.get(at..at + 4) else {
+                return Some(offset + AUDIO_HEAD_BYTES);
+            };
+            let len = u64::from_be_bytes([0, 0, 0, 0, 0, header[1], header[2], header[3]]);
+            offset += 4 + len;
+            if header[0] & 0x80 != 0 {
+                return Some(offset);
+            }
+        }
+    }
+    known.then_some(offset)
+}
+
+/// Whether a song in format `name` may keep its tags at its end.
+fn audio_tags_at_end(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(extension.as_str(), "wv" | "ape" | "wav" | "aif" | "aiff")
+}
+
+/// Download what the cover of the song `reader` reads, named `name`, needs. A
+/// song of up to [`AUDIO_WHOLE_MAX_BYTES`] comes whole; a larger one brings its
+/// tags, never its audio.
+async fn sample_audio(reader: &dyn RevisionRead, name: &str) -> DriveResult<AudioSample> {
+    let size = reader.size();
+    if size <= AUDIO_WHOLE_MAX_BYTES {
+        let whole = reader.read_at(0, size).await?;
+        return Ok(AudioSample {
+            size,
+            parts: vec![(0, whole)],
+        });
+    }
+    let probe = reader.read_at(0, AUDIO_PROBE_BYTES.min(size)).await?;
+    // An M4A keeps its cover in its index, fetched below wherever it sits.
+    let iso_media = probe.get(4..8) == Some(b"ftyp");
+    let want = match audio_tags_end(&probe) {
+        _ if iso_media => 0,
+        Some(end) => end.saturating_add(AUDIO_HEAD_SLACK),
+        None => AUDIO_HEAD_BYTES,
+    }
+    .min(AUDIO_TAG_MAX_BYTES)
+    .min(size);
+    let head = if want > probe.len() as u64 {
+        reader.read_at(0, want).await?
+    } else {
+        probe
+    };
+    let mut parts = Vec::new();
+    match iso_media_index(reader, &head, size).await? {
+        Some((offset, len)) if offset.saturating_add(len) > head.len() as u64 => {
+            parts.push((offset, reader.read_at(offset, len).await?));
+        }
+        _ => {}
+    }
+    let head_len = head.len() as u64;
+    parts.push((0, head));
+    if audio_tags_at_end(name) {
+        let start = size.saturating_sub(AUDIO_TAIL_BYTES).max(head_len);
+        if start < size {
+            parts.push((start, reader.read_at(start, size - start).await?));
+        }
+    }
+    Ok(AudioSample { size, parts })
+}
+
+/// The picture a song's tags carry: the front cover, or else the first one.
+/// `None` for a song without one, or one lofty can't read.
+fn embedded_cover(path: &Path) -> Option<Vec<u8>> {
+    use lofty::config::{ParseOptions, ParsingMode};
+    use lofty::file::TaggedFileExt as _;
+    use lofty::picture::PictureType;
+
+    let tagged = lofty::probe::Probe::open(path)
+        .ok()?
+        .options(
+            ParseOptions::new()
+                .read_properties(false)
+                .parsing_mode(ParsingMode::Relaxed),
+        )
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
+    let pictures = || tagged.tags().iter().flat_map(|tag| tag.pictures());
+    pictures()
+        .find(|picture| picture.pic_type() == PictureType::CoverFront)
+        .or_else(|| pictures().next())
+        .map(|picture| picture.data().to_vec())
+        .filter(|data| !data.is_empty())
+}
+
+/// A thumbnail from the cover in a downloaded [`AudioSample`]'s tags. The
+/// sample is laid out in a staging file at the offsets it came from, so the
+/// tags are where the file's own headers say they are; the audio between
+/// holds no data and costs no disk. A song without a cover, or with one the
+/// image decoder can't read, is [`ScaleAttempt::Undecodable`].
+fn audio_cover_thumbnail(sample: &AudioSample, name: &str, staging_dir: &Path) -> ScaleAttempt {
+    let Some(file) = RawTempFile::create_in(staging_dir, &[], name) else {
+        return ScaleAttempt::Unavailable;
+    };
+    let laid_out = OpenOptions::new()
+        .write(true)
+        .open(&file.0)
+        .and_then(|staged| {
+            for (offset, bytes) in &sample.parts {
+                staged.write_all_at(bytes, *offset)?;
+            }
+            staged.set_len(sample.size)
+        });
+    if laid_out.is_err() {
+        return ScaleAttempt::Unavailable;
+    }
+    match embedded_cover(&file.0) {
+        Some(picture) => scale_thumbnail(&picture, "cover", staging_dir),
+        None => ScaleAttempt::Undecodable,
+    }
+}
+
+/// How good a folder cover `name` is: its place in [`FOLDER_COVER_STEMS`],
+/// lowest best, or `None` for a file that is no cover image.
+fn cover_rank(name: &str) -> Option<usize> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    let extension = extension.to_ascii_lowercase();
+    if !FOLDER_COVER_EXTENSIONS.contains(&extension.as_str()) {
+        return None;
+    }
+    let stem = stem.to_ascii_lowercase();
+    FOLDER_COVER_STEMS.iter().position(|known| *known == stem)
+}
+
 /// The thumbnail to attach to an upload of the local file at `path`, which is
 /// named `name` in Drive. Without one, Drive's own apps show a generic icon and
 /// the gallery has to download the whole file to make its own.
 ///
-/// Best effort: a file that isn't an image or a video, is too large to read, or
-/// can't be decoded uploads without a thumbnail, as it always did. Blocking and
-/// CPU-bound, so async callers run it on the blocking pool.
+/// Best effort: a file that isn't an image, a video or a song with a cover in
+/// its tags, is too large to read, or can't be decoded uploads without a
+/// thumbnail, as it always did. Blocking and CPU-bound, so async callers run it
+/// on the blocking pool.
 pub(crate) fn upload_thumbnails(path: &Path, name: &str, staging_dir: &Path) -> Vec<Thumbnail> {
     if is_video_name(name) && !ffmpeg_available() {
         return Vec::new();
@@ -806,6 +1005,14 @@ fn upload_thumbnails_with(
             return Vec::new();
         };
         scale_thumbnail_unbudgeted(&bytes, name, staging_dir)
+    } else if is_audio_file_name(name) {
+        // Only the song's own picture: a cover image beside it is not known
+        // here, where `path` may be a staging copy rather than the song's
+        // folder. The daemon finds that one when a listing asks.
+        match embedded_cover(path) {
+            Some(picture) => scale_thumbnail(&picture, "cover", staging_dir),
+            None => return Vec::new(),
+        }
     } else {
         return Vec::new();
     };
@@ -1703,6 +1910,7 @@ impl Core {
                             return (uid, ThumbAttempt::Cancelled);
                         }
                         let video = is_video_name(&name);
+                        let audio = is_audio_file_name(&name);
                         // Without ffmpeg a video can still have its uploader's
                         // thumbnail, but Photos has asked the server already.
                         let can_sample = !video || ffmpeg_available();
@@ -1757,6 +1965,7 @@ impl Core {
 
                         let download_uid = uid.clone();
                         let drive = core.drive.clone();
+                        let audio_name = name.clone();
                         let download = async move {
                             // Photos asked the server in one batch already. A
                             // file view's or a build's file may carry a
@@ -1776,6 +1985,11 @@ impl Core {
                             if video {
                                 let reader = drive.open_revision(&download_uid).await?;
                                 sample_video(reader.as_ref()).await.map(Fetched::Video)
+                            } else if audio {
+                                let reader = drive.open_revision(&download_uid).await?;
+                                sample_audio(reader.as_ref(), &audio_name)
+                                    .await
+                                    .map(Fetched::Audio)
                             } else {
                                 client
                                     .download_file(&download_uid)
@@ -1833,7 +2047,11 @@ impl Core {
                         // Decoding + scaling a 20 MP JPEG is CPU-bound and would
                         // stall the runtime's worker; hand it to the blocking pool.
                         let staging_dir = core.cache.raw_thumbnail_staging_dir().to_path_buf();
+                        let staging = staging_dir.clone();
                         let made = tokio::task::spawn_blocking(move || match fetched {
+                            Fetched::Audio(sample) => {
+                                audio_cover_thumbnail(&sample, &name, &staging_dir)
+                            }
                             Fetched::Video(sample) => video_sample_thumbnail(
                                 &sample,
                                 &name,
@@ -1850,6 +2068,14 @@ impl Core {
                         })
                         .await
                         .unwrap_or(ScaleAttempt::Unavailable);
+                        // A song without a picture of its own shows its
+                        // folder's cover.
+                        let made = match made {
+                            ScaleAttempt::Undecodable if audio && core.thumb_job_current(job) => {
+                                core.folder_cover_thumbnail(&uid, staging).await
+                            }
+                            made => made,
+                        };
                         if !core.thumb_job_current(job) {
                             return (uid, ThumbAttempt::Cancelled);
                         }
@@ -1910,7 +2136,83 @@ impl Core {
                 ThumbAttempt::Cancelled => summary.cancelled += 1,
             }
         }
+        // A folder on screen whose tiles were given up on, as a recursive
+        // build's start does to them, fills in without being opened again.
+        if summary.made > 0 {
+            self.events.publish(&[Topic::Thumbnails]);
+        }
         summary
+    }
+
+    /// The cover image in the folder of the song `uid`: the best-named one of
+    /// [`FOLDER_COVER_STEMS`] among its siblings the database knows.
+    fn folder_cover(&self, uid: &NodeUid) -> Option<proton_drive_rs::Node> {
+        let node = self.db.node_by_uid(&uid.to_string()).ok()??;
+        let parent = node.parent_uid?;
+        let siblings = match self.db.children_if_listed(&parent) {
+            Ok(Some(children)) => children,
+            _ => self.db.known_children(&parent).ok()?,
+        };
+        siblings
+            .into_iter()
+            .filter(|sibling| !sibling.is_folder() && !sibling.trashed)
+            .filter_map(|sibling| cover_rank(&sibling.name).map(|rank| (rank, sibling)))
+            .min_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.name.cmp(&y.name)))
+            .map(|(_, cover)| cover)
+    }
+
+    /// A thumbnail of the song `uid` made from its folder's cover image: the
+    /// cover's own cached thumbnail when it has one, else the thumbnail its
+    /// uploader attached, else the image itself, up to
+    /// [`FOLDER_COVER_MAX_BYTES`].
+    ///
+    /// The result is stored under the song, so a cover added to the folder or
+    /// replaced later shows only once the song changes or the daemon restarts
+    /// and forgets the songs it found no cover for.
+    async fn folder_cover_thumbnail(&self, uid: &NodeUid, staging_dir: PathBuf) -> ScaleAttempt {
+        let Some(cover) = self.folder_cover(uid) else {
+            return ScaleAttempt::Undecodable;
+        };
+        let ttype = ThumbnailType::Thumbnail;
+        let cached = self
+            .cache
+            .cached_thumbnail_path(&cover.uid, ttype.as_i32(), cover.modification_time)
+            .and_then(|path| std::fs::read(path).ok());
+        let ready = match cached {
+            Some(bytes) => Some(bytes),
+            None => match self.drive.download_thumbnail(&cover.uid, ttype).await {
+                Ok(bytes) => bytes.filter(|bytes| !bytes.is_empty()),
+                Err(e) => {
+                    warn!(cover = %cover.uid, error = %e, "folder cover thumbnail download failed");
+                    return ScaleAttempt::Unavailable;
+                }
+            },
+        };
+        if let Some(bytes) = ready {
+            return match ratio_of(&bytes) {
+                Some(ratio) => ScaleAttempt::Made(GeneratedThumb { bytes, ratio }),
+                None => ScaleAttempt::Undecodable,
+            };
+        }
+        let read = async {
+            let reader = self.drive.open_revision(&cover.uid).await?;
+            if reader.size() > FOLDER_COVER_MAX_BYTES {
+                return Ok(None);
+            }
+            reader.read_at(0, reader.size()).await.map(Some)
+        };
+        let bytes = match read.await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return ScaleAttempt::Undecodable,
+            Err(e) => {
+                warn!(cover = %cover.uid, error = %e, "folder cover download failed");
+                return ScaleAttempt::Unavailable;
+            }
+        };
+        let name = cover.name;
+        tokio::task::spawn_blocking(move || scale_thumbnail(&bytes, &name, &staging_dir))
+            .await
+            .unwrap_or(ScaleAttempt::Unavailable)
     }
 
     pub(crate) fn thumbnail_build_status(&self) -> ThumbnailBuildStatus {
@@ -2455,6 +2757,10 @@ mod decode_budget_tests {
 #[cfg(test)]
 mod thumb_tests {
     use super::{
+        AUDIO_HEAD_BYTES, AUDIO_TAIL_BYTES, AudioSample, audio_cover_thumbnail, audio_tags_end,
+        cover_rank, sample_audio,
+    };
+    use super::{
         RawTempFile, ScaleAttempt, THUMB_EDGE, UPLOAD_IMAGE_MAX_BYTES, UPLOAD_THUMB_MAX_BYTES,
         VIDEO_HEAD_BYTES, VIDEO_WHOLE_MAX_BYTES, VideoSample, can_make_thumbnail, exiftool_binary,
         ffmpeg_available, fit_upload_thumb, is_video_name, ratio_of, sample_video, scale_thumbnail,
@@ -2965,6 +3271,28 @@ mod thumb_tests {
         assert!(thumb.ratio > 0.0);
     }
 
+    /// Optional check against real songs, through the same partial download a
+    /// Drive song gets. `PDFS_AUDIO_FIXTURE` lists files separated by `:`.
+    #[test]
+    #[ignore = "set PDFS_AUDIO_FIXTURE to songs with a cover in their tags"]
+    fn real_audio_fixture_yields_its_cover() {
+        let paths = std::env::var_os("PDFS_AUDIO_FIXTURE").expect("PDFS_AUDIO_FIXTURE");
+        for path in std::env::split_paths(&paths) {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let bytes = std::fs::read(&path).unwrap();
+            let revision = FakeRevision::new(bytes.len() as u64).with(0, bytes);
+            let sample = block_on(sample_audio(&revision, &name)).unwrap();
+            let read = revision.read.load(Ordering::Relaxed);
+            let attempt = audio_cover_thumbnail(&sample, &name, &std::env::temp_dir());
+            assert!(
+                matches!(attempt, ScaleAttempt::Made(_)),
+                "{name}: no cover, read {read} of {} bytes",
+                revision.size
+            );
+            eprintln!("{name}: read {read} of {} bytes", revision.size);
+        }
+    }
+
     #[test]
     fn videos_are_told_apart_by_name() {
         for name in [
@@ -3120,5 +3448,202 @@ mod thumb_tests {
             Some(small),
             "a small one is untouched"
         );
+    }
+
+    /// A `width`×`height` PNG, the cover a tag carries.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    /// An ID3v2.3 tag holding `picture` as its front cover.
+    fn id3_with_cover(picture: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8];
+        body.extend_from_slice(b"image/png\0");
+        body.push(3);
+        body.push(0);
+        body.extend_from_slice(picture);
+        let mut frame = b"APIC".to_vec();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&body);
+        let len = frame.len() as u32;
+        let mut tag = b"ID3\x03\x00\x00".to_vec();
+        tag.extend((0..4).rev().map(|i| ((len >> (7 * i)) & 0x7f) as u8));
+        tag.extend_from_slice(&frame);
+        tag
+    }
+
+    /// Ten silent MPEG-1 Layer III frames at 128 kbit/s and 44.1 kHz.
+    fn mpeg_frames() -> Vec<u8> {
+        let mut frame = vec![0u8; 417];
+        frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        frame.repeat(10)
+    }
+
+    /// A FLAC stream's metadata: STREAMINFO, then `picture` as its front cover.
+    fn flac_with_cover(picture: &[u8]) -> Vec<u8> {
+        let mut info = vec![0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0];
+        let packed: u64 = (44_100 << 44) | (1 << 41) | (15 << 36);
+        info.extend_from_slice(&packed.to_be_bytes());
+        info.extend_from_slice(&[0; 16]);
+        let mut block = Vec::new();
+        block.extend_from_slice(&3u32.to_be_bytes());
+        block.extend_from_slice(&9u32.to_be_bytes());
+        block.extend_from_slice(b"image/png");
+        block.extend_from_slice(&0u32.to_be_bytes());
+        for value in [16u32, 8, 24, 0, picture.len() as u32] {
+            block.extend_from_slice(&value.to_be_bytes());
+        }
+        block.extend_from_slice(picture);
+        let mut out = b"fLaC".to_vec();
+        out.push(0);
+        out.extend_from_slice(&(info.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(&info);
+        out.push(0x80 | 6);
+        out.extend_from_slice(&(block.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    fn whole_song(bytes: Vec<u8>) -> AudioSample {
+        AudioSample {
+            size: bytes.len() as u64,
+            parts: vec![(0, bytes)],
+        }
+    }
+
+    #[test]
+    fn a_song_shows_the_cover_in_its_tags() {
+        let tmp = scratch("song-cover");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut mp3 = id3_with_cover(&png(16, 8));
+        mp3.extend(mpeg_frames());
+        let ScaleAttempt::Made(thumb) = audio_cover_thumbnail(&whole_song(mp3), "song.mp3", &tmp)
+        else {
+            panic!("an ID3 cover scales");
+        };
+        assert!((thumb.ratio - 2.0).abs() < 1e-6);
+
+        let ScaleAttempt::Made(thumb) =
+            audio_cover_thumbnail(&whole_song(flac_with_cover(&png(8, 16))), "song.flac", &tmp)
+        else {
+            panic!("a FLAC picture scales");
+        };
+        assert!((thumb.ratio - 0.5).abs() < 1e-6);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_song_without_a_cover_is_no_thumbnail_of_its_own() {
+        let tmp = scratch("song-bare");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let attempt = audio_cover_thumbnail(&whole_song(mpeg_frames()), "song.mp3", &tmp);
+        assert!(matches!(attempt, ScaleAttempt::Undecodable));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn the_start_of_a_song_says_where_its_tags_end() {
+        let tag = id3_with_cover(&png(4, 4));
+        assert_eq!(audio_tags_end(&tag), Some(tag.len() as u64));
+        let flac = flac_with_cover(&png(4, 4));
+        assert_eq!(audio_tags_end(&flac), Some(flac.len() as u64));
+        // FLAC after an ID3 tag, as some taggers write it.
+        let both = [tag.clone(), flac.clone()].concat();
+        assert_eq!(audio_tags_end(&both), Some(both.len() as u64));
+        // The picture's block header cut off by the end of the probe, just
+        // past STREAMINFO: a guess past it.
+        let cut = &flac[..4 + 4 + 34 + 2];
+        assert!(audio_tags_end(cut).is_some_and(|end| end > cut.len() as u64));
+        assert_eq!(audio_tags_end(b"OggS\0\0\0\0"), None);
+        assert_eq!(
+            audio_tags_end(b"ID3\x03\x00\x00\x80\0\0\0"),
+            None,
+            "not synchsafe"
+        );
+    }
+
+    #[test]
+    fn a_large_song_downloads_its_tags_not_its_audio() {
+        const SIZE: u64 = 300 << 20;
+        let mut start = id3_with_cover(&png(16, 8));
+        start.extend(mpeg_frames());
+        let revision = FakeRevision::new(SIZE).with(0, start);
+        let sample = block_on(sample_audio(&revision, "long mix.mp3")).unwrap();
+        let read = revision.read.load(Ordering::Relaxed);
+        assert!(read < 1 << 20, "read {read} bytes");
+
+        let tmp = scratch("song-sparse");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ScaleAttempt::Made(thumb) = audio_cover_thumbnail(&sample, "long mix.mp3", &tmp) else {
+            panic!("the cover comes from the start alone");
+        };
+        assert!((thumb.ratio - 2.0).abs() < 1e-6);
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        // Ogg says nothing up front: a bounded head. WavPack keeps its tags at
+        // the end: the tail too.
+        let revision = FakeRevision::new(SIZE);
+        block_on(sample_audio(&revision, "live.ogg")).unwrap();
+        assert!(revision.read.load(Ordering::Relaxed) <= AUDIO_HEAD_BYTES + (64 << 10));
+        let revision = FakeRevision::new(SIZE);
+        let sample = block_on(sample_audio(&revision, "live.wv")).unwrap();
+        assert!(
+            sample
+                .parts
+                .iter()
+                .any(|(offset, bytes)| *offset == SIZE - AUDIO_TAIL_BYTES
+                    && bytes.len() as u64 == AUDIO_TAIL_BYTES)
+        );
+    }
+
+    #[test]
+    fn an_uploaded_song_carries_its_cover() {
+        let tmp = scratch("upload-song");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A staging blob has no extension: the format comes from the bytes.
+        let blob = tmp.join("blob");
+        let mut mp3 = id3_with_cover(&png(64, 64));
+        mp3.extend(mpeg_frames());
+        std::fs::write(&blob, mp3).unwrap();
+        let ffmpeg = fake_ffmpeg(&tmp, "exit 1");
+        let thumbs = upload_thumbnails_with(&blob, "song.mp3", &tmp, ffmpeg.as_os_str());
+        let [thumbnail] = thumbs.as_slice() else {
+            panic!("one thumbnail, got {}", thumbs.len());
+        };
+        assert!(matches!(thumbnail.thumbnail_type, ThumbnailType::Thumbnail));
+        assert_eq!(ratio_of(&thumbnail.content), Some(1.0));
+
+        std::fs::write(&blob, mpeg_frames()).unwrap();
+        assert!(
+            upload_thumbnails_with(&blob, "song.mp3", &tmp, ffmpeg.as_os_str()).is_empty(),
+            "a song without a cover uploads bare"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_folder_cover_is_found_by_its_usual_names() {
+        assert_eq!(cover_rank("cover.jpg"), Some(0));
+        assert_eq!(cover_rank("Cover.JPG"), Some(0));
+        assert_eq!(cover_rank("folder.png"), Some(1));
+        assert_eq!(cover_rank("AlbumArtSmall.jpg"), Some(5));
+        assert!(cover_rank("cover.jpg") < cover_rank("front.webp"));
+        for name in [
+            "cover.txt",
+            "my cover.jpg",
+            "cover",
+            "back.jpg",
+            "cover.jpg.part",
+        ] {
+            assert_eq!(cover_rank(name), None, "{name}");
+        }
     }
 }
