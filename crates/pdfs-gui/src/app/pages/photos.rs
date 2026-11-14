@@ -4502,17 +4502,6 @@ pub(crate) fn gallery_unreachable(ui: &Rc<Ui>) {
     service_unreachable(ui, "gallery", gallery_status, |ui| load_gallery(ui, false));
 }
 
-/// Play a video with an external player. Prefers `mpv` — it sniffs the container
-/// from the bytes, so the cache's extensionless blob plays fine, and it is the
-/// right tool for the HEVC `.mkv`s this is aimed at — and falls back to the
-/// user's default handler when mpv isn't installed.
-pub(crate) fn play_external(path: &str) {
-    match Command::new("mpv").arg(path).spawn() {
-        Ok(child) => pdfs_core::opener::reap(child),
-        Err(_) => open_path(path),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

@@ -95,6 +95,15 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 - **Upload progress in Photos.** Uploading several photos at once shows "Uploading 3 of 12
   items…" with a progress bar above the timeline, instead of a single toast at the start.
 
+- **Videos and music play in the app.** Opening a video or a song in My files, by a double-click
+  or **Open**, plays it in a player window, streamed from the mount like before. **Open With…**
+  still hands it to another player, and the separate **Play** item is gone. When the file can't
+  be played (a codec GStreamer lacks), the window says so and offers **Open With…**. Both this
+  player and the one in Photos gained a fullscreen button, fullscreen on a double-click,
+  **Repeat** in the ⋮ menu, `K` to play and pause, `J` and `L` (or Shift+←/→) to jump
+  10 seconds, and `M` to mute. The volume carries over from one video to the next, and the
+  thumbnail strip in Photos stays off a video, where it covered the seek bar.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
@@ -102,6 +111,10 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   capture time. [The SDK review](SDK-0.11.0.md) lists the new features and breaking changes.
 
 ### Fixed
+
+- **Photos zoomed all the way out shows the whole timeline.** The first 200 photos fit on one
+  screen there, and with nothing to scroll no more were loaded. More now load whenever the photos
+  don't fill the window, also after a zoom or a resize.
 
 - **My files comes back after the service was killed for hanging** (B279). A killed service left
   its folders behind as dead mounts, and every restart then failed with `File exists` and retried
