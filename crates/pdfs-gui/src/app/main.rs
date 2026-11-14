@@ -71,7 +71,7 @@ use gtk4::glib::BoxedAnyObject;
 
 use pdfs_core::auth;
 
-use pdfs_core::config::{AppDirs, FileSort, FilesView, WindowState};
+use pdfs_core::config::{AppDirs, FileSort, FilesView, PhotosView, WindowState};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
@@ -587,10 +587,13 @@ fn build_window(app: &adw::Application) {
             selected: RefCell::new(HashSet::new()),
             select_anchor: RefCell::new(None),
             select_btn: gallery_widgets.select_btn.clone(),
-            select_bar: gallery_widgets.select_bar.clone(),
-            select_label: gallery_widgets.select_label.clone(),
-            select_trash: gallery_widgets.select_trash.clone(),
-            select_album: gallery_widgets.select_album.clone(),
+            selection: gallery_widgets.selection.clone(),
+            more: gallery_widgets.more.clone(),
+            upload_face: gallery_widgets.upload_face.clone(),
+            float_heading: gallery_widgets.float_heading.clone(),
+            float_label: gallery_widgets.float_label.clone(),
+            square: Cell::new(false),
+            zoom_save: RefCell::new(None),
         },
         shared: SharedState::new(&shared_widgets),
         shared_by_me: SharedByMeState::new(&shared_by_me_widgets),
@@ -693,7 +696,7 @@ fn build_window(app: &adw::Application) {
         &ui,
         &gallery_widgets.list,
         &gallery_widgets.scroll,
-        &gallery_widgets.select_done,
+        &gallery_widgets.square_action,
     );
     wire_gallery_empty(
         &ui,
@@ -795,6 +798,7 @@ fn build_window(app: &adw::Application) {
 /// split collapsed whatever the width.
 fn set_narrow(ui: &Ui, narrow: bool) {
     ui.narrow.set(narrow);
+    set_photos_narrow(ui, narrow);
     if ui.session.borrow().is_some() {
         ui.nav.set_collapsed(narrow);
     }
@@ -858,11 +862,7 @@ fn window_hidden(window: &adw::ApplicationWindow) -> bool {
 /// sync, set off by a separator.
 const DESTINATIONS: [(&str, &str, &str); 7] = [
     ("browser", gettext_noop("My files"), "folder-symbolic"),
-    (
-        "gallery",
-        gettext_noop("Photos"),
-        "image-x-generic-symbolic",
-    ),
+    ("gallery", gettext_noop("Photos"), "pdfs-photos-symbolic"),
     (
         "shared",
         gettext_noop("Shared with me"),

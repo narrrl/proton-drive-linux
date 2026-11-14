@@ -10,6 +10,12 @@ use crate::*;
 pub(crate) struct ToggleGroup {
     widget: gtk4::Widget,
     options: Options,
+    /// Each option's label, kept while [`Self::set_compact`] shows the icons
+    /// alone.
+    labels: Rc<RefCell<Vec<String>>>,
+    /// Each option's own tooltip, as given.
+    tooltips: Rc<[Option<String>]>,
+    compact: Rc<Cell<bool>>,
 }
 
 #[derive(Clone)]
@@ -47,6 +53,9 @@ impl ToggleGroup {
             Self {
                 widget,
                 options: Options::Toggles(toggles),
+                labels: Rc::new(RefCell::new(labels_of(options))),
+                tooltips: tooltips_of(options),
+                compact: Rc::default(),
             }
         } else {
             let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -71,6 +80,9 @@ impl ToggleGroup {
             Self {
                 widget: bar.upcast(),
                 options: Options::Buttons(buttons),
+                labels: Rc::new(RefCell::new(labels_of(options))),
+                tooltips: tooltips_of(options),
+                compact: Rc::default(),
             }
         }
     }
@@ -115,15 +127,69 @@ impl ToggleGroup {
     }
 
     pub(crate) fn set_label(&self, index: u32, label: &str) {
+        if let Some(stored) = self.labels.borrow_mut().get_mut(index as usize) {
+            *stored = label.to_string();
+        }
+        self.show_label(index, label);
+    }
+
+    /// Put an icon before each option's label, in option order.
+    pub(crate) fn set_icons(&self, icons: &[&str]) {
+        match &self.options {
+            Options::Toggles(toggles) => {
+                for (toggle, icon) in toggles.iter().zip(icons) {
+                    toggle.set_property("icon-name", *icon);
+                }
+            }
+            Options::Buttons(buttons) => {
+                let labels = self.labels.borrow();
+                for ((button, icon), label) in buttons.iter().zip(icons).zip(labels.iter()) {
+                    let face = adw::ButtonContent::builder()
+                        .icon_name(*icon)
+                        .label(label.as_str())
+                        .build();
+                    button.set_child(Some(&face));
+                }
+            }
+        }
+    }
+
+    /// Show the icons alone, for a narrow window, with each label moved to
+    /// the option's tooltip; or bring the labels back.
+    pub(crate) fn set_compact(&self, compact: bool) {
+        if self.compact.replace(compact) == compact {
+            return;
+        }
+        let labels = self.labels.borrow().clone();
+        for (index, label) in labels.iter().enumerate() {
+            self.show_label(index as u32, label);
+        }
+    }
+
+    /// Show `label` on option `index`, or only in its tooltip while compact.
+    fn show_label(&self, index: u32, label: &str) {
+        let compact = self.compact.get();
+        let shown = if compact { "" } else { label };
+        let given = self.tooltips.get(index as usize).cloned().flatten();
+        let tooltip = if compact {
+            Some(label.to_string())
+        } else {
+            given
+        };
         match &self.options {
             Options::Toggles(toggles) => {
                 if let Some(toggle) = toggles.get(index as usize) {
-                    toggle.set_property("label", label);
+                    toggle.set_property("label", shown);
+                    toggle.set_property("tooltip", tooltip.unwrap_or_default());
                 }
             }
             Options::Buttons(buttons) => {
                 if let Some(button) = buttons.get(index as usize) {
-                    button.set_label(label);
+                    match button.child().and_downcast::<adw::ButtonContent>() {
+                        Some(face) => face.set_label(shown),
+                        None => button.set_label(shown),
+                    }
+                    button.set_tooltip_text(tooltip.as_deref());
                 }
             }
         }
@@ -269,6 +335,19 @@ fn shortcuts_dialog(groups: &[(String, Vec<(&str, String)>)]) -> adw::Dialog {
             toolbar
         })
         .build()
+}
+
+/// The labels of `(label, tooltip)` options.
+fn labels_of(options: &[(&str, Option<&str>)]) -> Vec<String> {
+    options.iter().map(|(label, _)| label.to_string()).collect()
+}
+
+/// The tooltips of `(label, tooltip)` options.
+fn tooltips_of(options: &[(&str, Option<&str>)]) -> Rc<[Option<String>]> {
+    options
+        .iter()
+        .map(|(_, tooltip)| tooltip.map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]

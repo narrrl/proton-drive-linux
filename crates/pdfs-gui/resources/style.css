@@ -80,7 +80,12 @@ scale.browser-status-meter trough { min-width: 104px; min-height: 6px; }
 .viewer-info-panel { background-color: var(--window-bg-color); border-left: 1px solid alpha(currentColor, 0.12); }
 
 /* Photos grid */
-.gallery-day { font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 2px 2px 6px 2px; }
+.gallery-day { font-size: 1.1rem; font-weight: 700; padding: 4px 2px 8px 2px; }
+/* The check that picks a whole section: on hover, and always while selecting. */
+.gallery-day-check { opacity: 0; transition: opacity 160ms ease; min-width: 24px; min-height: 24px; margin-bottom: 4px; }
+.gallery-heading:hover .gallery-day-check, .gallery-heading.selecting .gallery-day-check, .gallery-day-check:focus-visible { opacity: 1; }
+/* The section at the top of the grid, floating once its heading scrolled off. */
+.gallery-float-heading { font-weight: 700; padding: 4px 12px; border-radius: 999px; background-color: color-mix(in srgb, var(--popover-bg-color) 92%, transparent); color: var(--popover-fg-color); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); }
 .photo-tile { padding: 0; margin: 0; min-height: 0; min-width: 0; border: none; border-radius: 4px; background: none; box-shadow: none; }
 .photo-tile:focus { outline: 2px solid var(--accent-color); outline-offset: -2px; }
 .photo-thumb { transition: transform 220ms ease; }
@@ -94,6 +99,7 @@ scale.browser-status-meter trough { min-width: 104px; min-height: 6px; }
 .photo-video-badge { color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }
 .photo-video-badge-small { padding: 3px; min-width: 0; min-height: 0; }
 .photo-tile:hover .photo-video-badge { background: color-mix(in srgb, var(--accent-bg-color) 85%, transparent); }
+.photo-favorite-badge { color: white; -gtk-icon-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }
 .photo-group-badge { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; color: white; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 1px 5px; margin: 6px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }
 .memory-card { padding: 0; border-radius: 12px; }
 .memory-cover { border-radius: 12px; background: alpha(currentColor, 0.06); }
@@ -103,7 +109,7 @@ scale.browser-status-meter trough { min-width: 104px; min-height: 6px; }
 .album-cover { border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }
 .album-card:hover .album-cover { box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5); }
 .album-card:hover .photo-thumb { transform: scale(1.05); }
-.view-switch button, .view-switch toggle { padding-left: 18px; padding-right: 18px; }
+.view-switch button, .view-switch toggle { padding-left: 12px; padding-right: 12px; }
 
 /* Shared with Me: what a share lets me do, as a tinted pill beside the name. */
 .role-pill { padding: 2px 10px; border-radius: 999px; font-weight: 600; color: var(--accent-color); background-color: color-mix(in srgb, var(--accent-bg-color) 16%, transparent); }
