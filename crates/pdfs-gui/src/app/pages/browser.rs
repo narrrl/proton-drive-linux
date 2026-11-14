@@ -898,27 +898,15 @@ fn show_location_column(ui: &Rc<Ui>, visible: bool) {
 pub(crate) fn entry_context_menu(ui: &Rc<Ui>, entry: &DirEntry) -> ActionMenu {
     let mut menu = ActionMenu::new();
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
+    // Open does what a double-click does: a video or a song plays in the app,
+    // and Open With is the way to another player.
     menu.item(&pgettext("verb", "Open"), move || {
-        // Open always means "download a local copy and hand off", even for a
-        // media file — `activate_entry` would otherwise stream it.
-        if is_streamable_media_entry(&entry_c) {
-            download_and_open(&ui_c, &entry_c);
-        } else {
-            activate_entry(&ui_c, &entry_c);
-        }
+        activate_entry(&ui_c, &entry_c)
     });
     let (ui_c, entry_c) = (ui.clone(), entry.clone());
     menu.item(&gettext("Open With…"), move || {
         open_entry_with(&ui_c, &entry_c)
     });
-    // Play streams from the mount, no download; Open above still fetches a
-    // local copy for anyone who wants one.
-    if is_streamable_media_entry(entry) {
-        let (ui_c, entry_c) = (ui.clone(), entry.clone());
-        menu.item(&pgettext("verb", "Play"), move || {
-            stream_entry(&ui_c, &entry_c)
-        });
-    }
     menu.section();
 
     // Kept through a pinned folder above it, the entry has no pin of its own
@@ -1107,38 +1095,8 @@ pub(crate) fn entry_at(model: Option<&impl IsA<gio::ListModel>>, pos: u32) -> Op
     Some(entry)
 }
 
-/// Whether an entry can be opened through FUSE instead of fully materialized.
-pub(crate) fn is_streamable_media_entry(entry: &DirEntry) -> bool {
-    drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia
-}
-
-/// Stream media straight from the mount, no download. Drive folders *are* part
-/// of the FUSE mount, so a player pointed at `<mountpoint>/<rel>` reads the file
-/// through [`Core::read_range_remote`] — 4 MB blocks fetched on demand as it
-/// seeks and buffers — instead of waiting for the whole file to land like
-/// [`Request::OpenFile`] does. This is the point of the feature: a 2 GB HEVC
-/// `.mkv` starts playing in seconds.
-pub(crate) fn stream_entry(ui: &Rc<Ui>, entry: &DirEntry) {
-    let rel = entry_rel(ui, entry);
-    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
-    let abs = mounted_path(&mountpoint, &rel);
-    let Some(path) = abs.to_str() else {
-        toast_error(
-            ui,
-            &gettext("Couldn't play media"),
-            &gettext("The file path isn't valid UTF-8."),
-        );
-        return;
-    };
-    toast(
-        ui,
-        &gettext_f("Streaming “{name}”…", &[("name", &entry.name)]),
-    );
-    play_external(path);
-}
-
-/// Open an entry the Nautilus way: folders descend, media streams from the mount,
-/// other files download-and-open.
+/// Open an entry the Nautilus way: folders descend, media plays in the app,
+/// streamed from the mount, other files download-and-open.
 pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
     if entry.is_dir {
@@ -1151,16 +1109,16 @@ pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     } else if drive_activation(&entry.name, entry.is_dir) == DriveActivation::MountedMedia {
         // Media streams rather than downloads: that is exactly the "play it,
         // don't fetch the whole thing" behaviour this is for.
-        stream_entry(ui, entry);
+        open_media_player(ui, entry);
     } else {
         download_and_open(ui, entry);
     }
 }
 
 /// Hand a file to the user's default application: through the mount when it is
-/// there, otherwise downloaded into the cache first. The open path behind both
-/// a plain double-click and the context menu's "Open" (including for a video,
-/// when the user wants their default application rather than the player).
+/// there, otherwise downloaded into the cache first. The open path behind a
+/// double-click and the context menu's "Open" for anything but a folder or
+/// media, and for media the mount doesn't show.
 ///
 /// The mount comes first because the cache blob is a *copy* keyed by content
 /// hash — an application saving into it writes where Drive will never look, and
