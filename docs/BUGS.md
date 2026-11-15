@@ -305,6 +305,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B290](#b290--reopening-the-database-right-after-closing-it-can-be-refused-as-another-daemon) | Reopening the database right after closing it can be refused as another daemon |
 | [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
 | [B256](#b256--pdfs-copy-right-after-a-save-copies-the-old-version) | `pdfs copy` right after a save copies the old version |
@@ -391,6 +392,30 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B290 — Reopening the database right after closing it can be refused as another daemon
+
+**Status:** Fixed, 2026-11-15
+**Found:** 2026-11-15, CI on `chore/release-3.8.0` (fd6b2d3):
+`db::tests::what_a_create_sent_outlives_a_newer_blob_its_trash_and_a_restart` failed once with
+"another Proton Drive daemon is already using /tmp/pdfs-create-sent-….db". It passes on its own.
+**Where:** `crates/pdfs-core/src/db/mod.rs`, `acquire_single_writer_lock`
+
+**Repro:** In one process, drop a `Db` and open the same file again while another thread spawns a
+child process. Rare; seen once in about 500 tests that run in parallel, several of which spawn
+processes.
+
+**Cause:** The single-writer lock is a `flock` on `<db>.lock`, and a `flock` belongs to the open
+file, not to one descriptor. A child holds a copy of every descriptor from its fork until its exec
+closes the `O_CLOEXEC` ones. A lock dropped by the parent in that moment stays held by the child,
+and an immediate reopen gets `EWOULDBLOCK`, which reads as a second daemon.
+
+**Fix:** A refused lock is retried every 20 ms for up to 500 ms before it counts as another
+daemon. That covers any fork-to-exec window. A real second daemon is still refused, half a
+second later.
+
+**Verified:** `cargo test -p pdfs-core` on 2026-11-15, including
+`a_second_writer_is_refused_while_the_first_holds_the_database`.
 
 ### B289 — The Takeout import mixes in other services and drops location and live photos
 

@@ -445,6 +445,13 @@ fn is_in_memory(path: &Path) -> bool {
 /// SQLite uses POSIX record locks, so the two never interact, and a lock file
 /// left behind carries no state — the lock lives in the kernel and dies with
 /// the process, however it exits.
+///
+/// A refusal is retried for [`LOCK_RETRY`] before it counts as another
+/// daemon. A child this process spawns holds a copy of every descriptor from
+/// its fork until its exec closes them, and `flock` belongs to the open file,
+/// not the descriptor. So a lock the process has just let go of can stay held
+/// for that moment, and a reopen right after a drop is refused
+/// (`docs/BUGS.md` B290).
 fn acquire_single_writer_lock(path: &Path) -> Result<Option<File>> {
     if is_in_memory(path) {
         return Ok(None);
@@ -456,21 +463,31 @@ fn acquire_single_writer_lock(path: &Path) -> Result<Option<File>> {
         .truncate(false)
         .write(true)
         .open(&lock_path)?;
-    // SAFETY: `file` owns the descriptor and outlives the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    let deadline = std::time::Instant::now() + LOCK_RETRY;
+    loop {
+        // SAFETY: `file` owns the descriptor and outlives the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(file));
+        }
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(Error::Io(e));
+        }
+        if std::time::Instant::now() >= deadline {
             return Err(Error::Other(format!(
                 "another Proton Drive daemon is already using {} — \
                  stop it first (`systemctl --user stop proton-drive.service`)",
                 path.display()
             )));
         }
-        return Err(Error::Io(e));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Ok(Some(file))
 }
+
+/// How long a refused single-writer lock is retried; far longer than a fork
+/// takes to reach its exec, far shorter than anyone notices.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn lock_path_for(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
