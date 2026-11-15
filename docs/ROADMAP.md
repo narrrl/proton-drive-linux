@@ -63,7 +63,8 @@ them along.
 | Add someone else's photo to your album | Blocked | Needs `copyPhoto` in the SDK |
 | Photo name search | Not started | Photos search by date and filters only |
 | Automatic photo upload from a folder | Not started | |
-| Faster Google Photos import | Not started | Uploads run one at a time. Trash folders of locales missing from `TRASH_FOLDERS` import as photos; motion-photo `.MP` parts are skipped |
+| Faster Google Photos import | Not started | Uploads run one at a time. Trash folders of locales missing from `TRASH_FOLDERS` import as photos |
+| More of a Google Photos export | Not started | `.tgz` exports and extracted folders; shared albums told apart from own ones; album descriptions and covers; photo descriptions |
 | Content-addressed block cache | Idea | Store blocks by hash to deduplicate identical content |
 
 ## Performance and correctness

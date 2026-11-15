@@ -109,6 +109,10 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
+| [B288](#b288--an-interrupted-takeout-import-reads-as-finished-and-one-error-ends-it) | An interrupted Takeout import reads as finished, and one error ends it |
+| [B287](#b287--a-photo-draft-left-by-an-interrupted-upload-blocks-that-name) | A photo draft left by an interrupted upload blocks that name |
+| [B286](#b286--resuming-a-takeout-import-fails-on-a-draft-with-no-content-hash) | Resuming a Takeout import fails on a draft with no content hash |
 | [B285](#b285--a-restarted-secret-service-leaves-the-process-on-a-dead-session) | A restarted Secret Service leaves the process on a dead session |
 | [B284](#b284--a-keyring-entry-reported-missing-discards-refreshed-session-tokens) | A keyring entry reported missing discards refreshed session tokens |
 | [B283](#b283--videos-have-no-thumbnail-outside-photos-and-a-ts-recording-looks-like-source-code) | Videos have no thumbnail outside Photos, and a `.ts` recording looks like source code |
@@ -387,6 +391,127 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B289 — The Takeout import mixes in other services and drops location and live photos
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, auditing the Google Photos import alongside
+[issue #94](https://github.com/narrrl/proton-drive-linux/issues/94).
+**Where:** `crates/pdfs-core/src/takeout.rs`; `plan` and `upload_takeout_photo` in
+`crates/pdfs-fuse/src/takeout.rs`
+
+**Repro:** Import a Takeout export that also holds `Drive/` or `YouTube/`, with Pixel motion
+photos, iPhone live photos and photos that have a place in Google Photos.
+
+**Cause.** Five gaps in what the import carried over:
+- The service folder was dropped without being checked, so media from other Google services in
+  the same export landed in the photo timeline.
+- `geoData` was never read, although `docs/PHOTOS.md` said the import takes locations from the
+  export, and the SDK had no way to upload a location.
+- The two halves of a live or motion photo uploaded as unrelated photos, the `.MOV` half usually
+  without a date, and the `.MP` half of a Pixel motion photo was skipped as unknown.
+- `creationTime`, the day the photo reached Google, outranked the date in the file name and the
+  photo's own EXIF.
+- A sidecar with `null` in `favorited`, a numeric `timestamp` or a `0` timestamp lost its other
+  fields or filed the photo under 1970.
+
+**Fix:** The Photos service is the folder whose sidecars carry `photoTakenTime`, and only it is
+imported (everything, when no folder does). `geoData`, else `geoDataExif`, becomes the photo's
+`Location` attribute through SDK 0.12.0's `PhotoUploadMetadata::location`; `0, 0` is no position.
+Stills and videos with the same stem in one folder (`IMG_1.HEIC` + `IMG_1.MOV`,
+`PXL_1.MP.jpg` + `PXL_1.MP`) are paired unless their dates are minutes apart: the still is
+tagged as a live or motion photo, the video is uploaded after it with `main_photo_uid` and takes
+its date and place. The capture time is `photoTakenTime`, then the name, then EXIF, then
+`creationTime`. Favorites are also set on photos that were already on the account.
+
+**Verified:** `takeout::tests` in `pdfs-core` (services, locations, timestamps, live keys) and
+`pdfs-fuse` (pairing, skew, folded copies). Not run against a real export and account.
+
+---
+
+### B288 — An interrupted Takeout import reads as finished, and one error ends it
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, auditing the Google Photos import alongside
+[issue #94](https://github.com/narrrl/proton-drive-linux/issues/94).
+**Where:** `crates/pdfs-fuse/src/takeout.rs`; `refresh_takeout` in
+`crates/pdfs-gui/src/app/pages/takeout.rs`; `cmd_import_google_photos` in
+`crates/pdfs-cli/src/main.rs`
+
+**Repro:** Start an import of several archives, one of them damaged, and restart the service
+while it uploads.
+
+**Cause.**
+- The import state lived only in memory. After a restart `ImportStatus` had no summary, and the
+  app announced "Import finished". The archives had to be chosen again to continue.
+- A daemon shutdown broke the upload loop but still filed albums and logged a success.
+- One unreadable archive failed the scan, and a failed request in the middle of the run
+  discarded every count and skipped the albums for what had uploaded.
+- The progress total counted photos already on the account, so the bar stopped short of the
+  end; a dry run reported "Would upload: 0"; the job's phases reached the app in English.
+
+**Fix:** The last run's archives and summary are kept in `takeout-import.json` in the state
+directory. A run still marked running at start-up is `interrupted`, and `ImportStatus` lists
+its archives as `resumable`; `ResumeImport` (`pdfs import-google-photos --resume`, **Resume** in
+the app) starts it again, and the duplicate check skips what is there. An unreadable archive is
+listed in `unreadable_archives` and the rest imports. A failure keeps the counts and still files
+albums. `ImportStatus` carries the phase and its own progress, the summary says `dry_run`,
+`to_upload` and `error_kind`, and the app words them in the user's language. The inline
+timeline refresh of an empty gallery waits for a refresh already running instead of starting a
+second one (`refresh_timeline_joined`).
+
+**Verified:** `takeout::tests` in `pdfs-fuse` (saved state, resumable runs) and `pdfs-core`
+(unreadable archive), and the CLI tests for `--resume` and the exit status. Not run live.
+
+---
+
+### B287 — A photo draft left by an interrupted upload blocks that name
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, reading the SDK upload path for
+[issue #94](https://github.com/narrrl/proton-drive-linux/issues/94).
+**Where:** `upload_photo_from`, `upload_file_from_inner` and `abandon_file_draft` in
+`proton-drive-rs` (SDK 0.12.0)
+
+**Repro:** Interrupt a photo upload after its draft is created, sign in again, and upload a
+photo with the same name.
+
+**Cause.** Photo uploads replaced a leftover draft only when its `ClientUID` was the current
+session's. A new login is a new session, so the next upload of that name failed with 2500. A
+failed upload also never deleted its own draft, which the C# and TypeScript SDKs do.
+
+**Fix:** SDK 0.12.0 adds `PhotoUploadMetadata::replace_existing_draft`, which the Takeout import
+sets, and deletes the draft of a new file or photo whose upload fails. After a failed seal it
+only does so on a definite rejection, because a seal lost in transit may have been applied.
+
+**Verified:** SDK unit test `draft_cleanup_only_after_a_definite_seal_rejection`. Not run live.
+
+---
+
+### B286 — Resuming a Takeout import fails on a draft with no content hash
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, [issue #94](https://github.com/narrrl/proton-drive-linux/issues/94)
+(3.7.0, Fedora). An import stopped by a restart failed every re-run at once with
+`check for existing photos: serialization error: invalid type: null, expected a string at line
+1 column 2063`.
+**Where:** `FoundPhotoDuplicateDto` in `proton-drive-rs` (SDK 0.11.0)
+
+**Repro:** Interrupt a photo upload after its draft is created, then run the import again.
+
+**Cause.** The duplicates endpoint sends `ContentHash` (and can send `Hash`) as `null` for a
+draft, as its API schema says. The SDK declared both as `String` with `#[serde(default)]`,
+which covers a missing field but not `null`, so one draft failed the whole batch of 150 names
+and the import ended before uploading anything.
+
+**Fix:** SDK 0.12.0 makes both fields optional and skips drafts, trashed links and candidates
+without hashes, like the TypeScript SDK. Every other defaulted DTO field reads `null` as its
+default too, and an undecodable response is logged with its path.
+
+**Verified:** SDK unit tests `duplicate_response_tolerates_null_fields_and_skips_drafts` and
+`duplicate_response_tolerates_a_null_list`. Not run against the reporter's account.
+
+---
 
 ### B285 — A restarted Secret Service leaves the process on a dead session
 

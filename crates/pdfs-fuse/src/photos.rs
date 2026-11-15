@@ -1193,7 +1193,7 @@ impl Core {
             if known_empty && !self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
                 return Ok(None);
             }
-            if !self.rt.block_on(self.refresh_timeline())? {
+            if !self.refresh_timeline_joined()? {
                 return Ok(None);
             }
         } else if self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL) {
@@ -2640,6 +2640,36 @@ impl Core {
 
     /// Refresh the timeline off the request path, so a stale page is still served
     /// at DB speed. At most one refresh runs at a time.
+    /// Refresh the timeline and wait for it, sharing a refresh already under
+    /// way instead of starting a second one beside it.
+    ///
+    /// The first request after an empty cache has nothing to serve until the
+    /// fetch lands, so it waits. Two such requests (the gallery and its retry,
+    /// or a background refresh started by an import) used to each fetch the
+    /// whole library at once, sharing the session's rate limit and taking
+    /// minutes. Returns whether the account has a photos library.
+    pub(crate) fn refresh_timeline_joined(&self) -> CoreResult<bool> {
+        if self.timeline_refreshing.swap(true, Ordering::SeqCst) {
+            while self.timeline_refreshing.load(Ordering::SeqCst) && !self.shutdown.is_stopping() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            // A refresh that landed stamped the timeline fresh. One that failed
+            // did not, and the caller gets this refresh's own error instead of
+            // an empty timeline.
+            if !self.listing_stale(PHOTOS_SYNCED_MS, TIMELINE_TTL)
+                || self.timeline_refreshing.swap(true, Ordering::SeqCst)
+            {
+                return Ok(self.db.state_i64(PHOTOS_AVAILABLE).ok().flatten() != Some(0));
+            }
+        }
+        let refreshed = self.rt.block_on(self.refresh_timeline());
+        self.timeline_refreshing.store(false, Ordering::SeqCst);
+        if refreshed.is_ok() {
+            self.events.publish(&[Topic::Photos]);
+        }
+        refreshed
+    }
+
     pub(crate) fn spawn_timeline_refresh(&self) {
         if self.timeline_refreshing.swap(true, Ordering::SeqCst) {
             return;

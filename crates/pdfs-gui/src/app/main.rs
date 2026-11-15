@@ -77,11 +77,11 @@ use pdfs_core::config::{AppDirs, FileSort, FilesView, PhotosView, WindowState};
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, ConflictInfo, ConflictKeep, DeviceInfo,
-    DirEntry, ErrorKind, ImportSummary, InvitationInfo, JobItem, LinkChange, MappingProgress,
-    PendingOpInfo, PhotoItem, PhotoKind, PhotoMonth, PlaceInfo, PublicLinkInfo, RefreshScope,
-    Request, Response, RestorableFolder, RestoreItem, RevisionInfo, SearchHit, ShareEntry,
-    ShareEntryKind, SharedItem, SyncFolderInfo, SyncIssue, SyncPhase, SyncProgress,
-    ThumbnailBuildStatus, Topic, TransferDirection, TransferItem, send,
+    DirEntry, ErrorKind, ImportPhase, ImportProgress, ImportSummary, InvitationInfo, JobItem,
+    LinkChange, MappingProgress, PendingOpInfo, PhotoItem, PhotoKind, PhotoMonth, PlaceInfo,
+    PublicLinkInfo, RefreshScope, Request, Response, RestorableFolder, RestoreItem, RevisionInfo,
+    SearchHit, ShareEntry, ShareEntryKind, SharedItem, SyncFolderInfo, SyncIssue, SyncPhase,
+    SyncProgress, ThumbnailBuildStatus, Topic, TransferDirection, TransferItem, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -668,9 +668,11 @@ fn build_window(app: &adw::Application) {
             progress_bar: takeout_widgets.progress_bar.clone(),
             summary_group: takeout_widgets.summary_group.clone(),
             summary_rows: RefCell::new(Vec::new()),
+            resume_group: takeout_widgets.resume_group.clone(),
+            resume_row: takeout_widgets.resume_row.clone(),
+            resume_button: takeout_widgets.resume_button.clone(),
             inflight: Cell::new(false),
             running: Cell::new(false),
-            dry_run: Cell::new(false),
         },
         update,
     });

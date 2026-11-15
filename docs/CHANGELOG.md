@@ -112,13 +112,48 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   carry their cover as their thumbnail, so they show it at once on other devices too. A cover
   image added to a folder later is picked up once the song changes or the service restarts.
 
+- **Resume a Google Photos import** (B288). The archives and the outcome of the last import are
+  kept, so an import cut short by a restart or a reboot no longer has to be set up again. The
+  Import page offers **Resume**, and `pdfs import-google-photos --resume` does the same. Photos
+  that are already uploaded are skipped as before.
+
 ### Changed
 
-- **`proton-sdk` and `proton-drive-rs` 0.11.0.** Timestamps are converted where they enter
+- **`proton-sdk` and `proton-drive-rs` 0.12.0.** Timestamps are converted where they enter
   from the SDK, and a photo keeps its own modification time now that it no longer follows the
-  capture time. [The SDK review](SDK-0.11.0.md) lists the new features and breaking changes.
+  capture time. 0.12.0 fixes the photo duplicate check and failed-upload drafts below.
+  [The 0.11.0 review](SDK-0.11.0.md) and [the 0.12.0 review](SDK-0.12.0.md) list the new
+  features and breaking changes.
+
+- **The Google Photos import brings more of the export along** (B289).
+  - Places from Google Photos are kept, so imported photos show up under **Places**.
+  - Live photos and Pixel motion photos stay one photo: the video is filed with its still and
+    takes its date. The `.MP` half of a motion photo is no longer skipped.
+  - Only the Google Photos part of an export is imported. Files from Google Drive, YouTube and
+    other services in the same Takeout stay out of the timeline.
+  - A photo without a date of its own is dated by its file name and then by its EXIF before
+    the day it reached Google Photos.
+  - Favorites are also set on photos that were already in Proton Photos.
+
+- **The import reports what it is doing** (B288). The Import page shows the current step
+  (reading, checking for photos you already have, uploading, sorting into albums), the counts
+  so far, and a progress bar that reaches the end. A scan says how many photos and how much
+  data an import would upload. `pdfs import-google-photos --wait` prints its progress, and
+  `pdfs import-status` shows the step.
 
 ### Fixed
+
+- **Resuming a Google Photos import no longer fails at once** (#94, B286, B287). A photo upload
+  that was cut short left a draft behind, and every later run stopped with
+  `check for existing photos: serialization error: invalid type: null`. Such drafts are now
+  skipped by the duplicate check and replaced by the next upload of that photo, also after
+  signing in again. A failed upload removes its draft.
+
+- **One bad archive or error no longer ends the whole import** (B288). An archive that cannot be
+  read is left out and named in the report, and the rest of the export imports. When an import
+  stops early, it keeps the counts of what it did and still files the uploaded photos into their
+  albums. A restart of the service while importing is reported as an interruption, not as a
+  finished import.
 
 - **Photos zoomed all the way out shows the whole timeline.** The first 200 photos fit on one
   screen there, and with nothing to scroll no more were loaded. More now load whenever the photos

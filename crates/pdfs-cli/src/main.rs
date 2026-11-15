@@ -228,14 +228,19 @@ enum Command {
     /// numbered parts, and a photo's metadata often sits in a different part
     /// than the photo. Albums in the export are recreated as Proton albums, and
     /// photos already on the account (same name and same content) are skipped,
-    /// so an interrupted import can simply be run again.
+    /// so an interrupted import can simply be run again, or resumed with
+    /// `--resume` without naming the archives again.
     ImportGooglePhotos {
         /// The export's `.zip` files (e.g. `takeout-*.zip`).
-        #[arg(required = true, value_hint = ValueHint::FilePath)]
+        #[arg(required_unless_present = "resume", value_hint = ValueHint::FilePath)]
         archives: Vec<PathBuf>,
         /// Report what would be imported without uploading anything.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "resume")]
         dry_run: bool,
+        /// Start the last import again with the same archives, after it was
+        /// interrupted, stopped or failed.
+        #[arg(long, conflicts_with = "archives")]
+        resume: bool,
         /// Stay attached and print progress until the import finishes.
         #[arg(long)]
         wait: bool,
@@ -1030,8 +1035,9 @@ fn main() -> Result<()> {
         Command::ImportGooglePhotos {
             archives,
             dry_run,
+            resume,
             wait,
-        } => cmd_import_google_photos(archives, dry_run, wait),
+        } => cmd_import_google_photos(archives, dry_run, resume, wait),
         Command::RedatePhotos {
             dry_run,
             limit,
@@ -2916,24 +2922,34 @@ fn photo_count(n: usize) -> String {
     }
 }
 
-fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -> Result<()> {
-    // The daemon opens the archives itself off the shared filesystem, so it gets
-    // absolute paths — the same arrangement `pdfs upload` uses.
-    let mut absolute = Vec::with_capacity(archives.len());
-    for archive in &archives {
-        let path = std::fs::canonicalize(archive)
-            .with_context(|| format!("resolve {}", archive.display()))?;
-        absolute.push(
-            path.to_str()
-                .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?
-                .to_owned(),
-        );
-    }
+fn cmd_import_google_photos(
+    archives: Vec<PathBuf>,
+    dry_run: bool,
+    resume: bool,
+    wait: bool,
+) -> Result<()> {
+    let request = if resume {
+        CtlRequest::ResumeImport
+    } else {
+        // The daemon opens the archives itself off the shared filesystem, so it
+        // gets absolute paths — the same arrangement `pdfs upload` uses.
+        let mut absolute = Vec::with_capacity(archives.len());
+        for archive in &archives {
+            let path = std::fs::canonicalize(archive)
+                .with_context(|| format!("resolve {}", archive.display()))?;
+            absolute.push(
+                path.to_str()
+                    .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?
+                    .to_owned(),
+            );
+        }
+        CtlRequest::ImportTakeout {
+            archives: absolute,
+            dry_run,
+        }
+    };
 
-    match control_request(CtlRequest::ImportTakeout {
-        archives: absolute,
-        dry_run,
-    })? {
+    match control_request(request)? {
         CtlResponse::Ok { message } => println!("{message}"),
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
@@ -2945,25 +2961,80 @@ fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -
 
     // Poll rather than stream: the control protocol is request/response, and an
     // import runs for hours — a held-open socket would be the only long-lived
-    // connection the daemon has.
+    // connection the daemon has. A line is printed when the step changes and
+    // every few percent of it, not on every poll.
+    let mut last_line = String::new();
+    let mut last_printed = std::time::Instant::now();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         match control_request(CtlRequest::ImportStatus)? {
             CtlResponse::ImportStatus {
                 running: true,
-                summary: _,
-            } => continue,
-            CtlResponse::ImportStatus { summary, .. } => {
-                print_import_summary(summary.as_ref());
-                return finished_run(
-                    "the import",
-                    summary.map(|s| (s.failed, s.cancelled, s.error)),
-                );
+                progress,
+                ..
+            } => {
+                let line = progress.as_ref().map(progress_line).unwrap_or_default();
+                let step_changed = line.split(':').next() != last_line.split(':').next();
+                if !line.is_empty()
+                    && line != last_line
+                    && (step_changed || last_printed.elapsed().as_secs() >= 30)
+                {
+                    println!("{line}");
+                    last_line = line;
+                    last_printed = std::time::Instant::now();
+                }
+            }
+            CtlResponse::ImportStatus {
+                summary, resumable, ..
+            } => {
+                print_import_summary(summary.as_ref(), &resumable);
+                return import_outcome(summary.as_ref());
             }
             CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
             other => bail!("unexpected response: {other:?}"),
         }
     }
+}
+
+/// One line saying where a running import is.
+fn progress_line(progress: &pdfs_core::control::ImportProgress) -> String {
+    use pdfs_core::control::ImportPhase;
+    let step = match progress.phase {
+        ImportPhase::Scanning => "Reading archives",
+        ImportPhase::Checking => "Checking for photos already on Proton",
+        ImportPhase::Uploading => "Uploading",
+        ImportPhase::Albums => "Filing photos into albums",
+    };
+    match (progress.total, &progress.current) {
+        (0, _) => format!("{step}…"),
+        (total, Some(name)) => format!("{step}: {} of {total} ({name})", progress.done),
+        (total, None) => format!("{step}: {} of {total}", progress.done),
+    }
+}
+
+/// How an import `--wait` followed ended, as the exit status: an error unless
+/// it did everything it set out to do, so a script can tell.
+fn import_outcome(summary: Option<&pdfs_core::control::ImportSummary>) -> Result<()> {
+    let Some(summary) = summary else {
+        bail!("the import ended without a result; the service may have restarted");
+    };
+    if let Some(error) = &summary.error {
+        bail!("the import failed: {error}");
+    }
+    if summary.interrupted {
+        bail!("the import was interrupted; run `pdfs import-google-photos --resume` to continue");
+    }
+    if summary.cancelled {
+        bail!("the import was cancelled");
+    }
+    if summary.failed > 0 || !summary.unreadable_archives.is_empty() {
+        bail!(
+            "the import finished, but {} photo(s) and {} archive(s) failed",
+            summary.failed,
+            summary.unreadable_archives.len()
+        );
+    }
+    Ok(())
 }
 
 fn cmd_redate_photos(
@@ -3100,11 +3171,19 @@ fn print_redate_summary(summary: Option<&pdfs_core::control::RedateSummary>) {
 
 fn cmd_import_status() -> Result<()> {
     match control_request(CtlRequest::ImportStatus)? {
-        CtlResponse::ImportStatus { running, summary } => {
+        CtlResponse::ImportStatus {
+            running,
+            summary,
+            progress,
+            resumable,
+        } => {
             if running {
-                println!("Import running. `pdfs transfers` shows its progress.");
+                match progress.as_ref() {
+                    Some(progress) => println!("Import running. {}", progress_line(progress)),
+                    None => println!("Import running."),
+                }
             }
-            print_import_summary(summary.as_ref());
+            print_import_summary(summary.as_ref(), &resumable);
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
@@ -3121,18 +3200,28 @@ fn cmd_cancel_import() -> Result<()> {
     Ok(())
 }
 
-fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
+fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>, resumable: &[String]) {
     let Some(summary) = summary else {
         println!("No import has run yet.");
         return;
     };
+    if summary.dry_run {
+        println!("Scan only; nothing was uploaded.");
+    }
     if let Some(error) = &summary.error {
-        println!("Failed           : {error}");
-        return;
+        println!("Stopped by       : {error}");
     }
     println!("Photos in export : {}", summary.found);
-    println!("Uploaded         : {}", summary.uploaded);
+    if summary.dry_run {
+        println!("Would upload     : {}", summary.to_upload);
+        println!("Bytes to upload  : {}", summary.to_upload_bytes);
+    } else {
+        println!("Uploaded         : {}", summary.uploaded);
+    }
     println!("Already on Proton: {}", summary.duplicates);
+    if summary.live_photos > 0 {
+        println!("Live photos      : {}", summary.live_photos);
+    }
     if summary.skipped_trashed > 0 {
         println!("Skipped (trash)  : {}", summary.skipped_trashed);
     }
@@ -3145,11 +3234,19 @@ fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
     if summary.failed > 0 {
         println!("Failed           : {}", summary.failed);
     }
+    for archive in &summary.unreadable_archives {
+        println!("Unreadable       : {archive}");
+    }
     if summary.bytes > 0 {
         println!("Uploaded bytes   : {}", summary.bytes);
     }
-    if summary.cancelled {
+    if summary.interrupted {
+        println!("The service stopped before the import finished.");
+    } else if summary.cancelled {
         println!("Import was cancelled before it finished.");
+    }
+    if !resumable.is_empty() {
+        println!("Run `pdfs import-google-photos --resume` to continue it.");
     }
 }
 
@@ -4507,6 +4604,51 @@ mod login_wait_tests {
         let failed = finished_run("the import", Some((0, false, Some("not a zip".into()))));
         assert!(failed.unwrap_err().to_string().contains("not a zip"));
         assert!(finished_run("the import", None).is_err());
+    }
+
+    #[test]
+    fn a_waited_for_import_that_did_not_finish_exits_with_an_error() {
+        use pdfs_core::control::ImportSummary;
+        let done = ImportSummary {
+            uploaded: 4,
+            ..Default::default()
+        };
+        assert!(import_outcome(Some(&done)).is_ok());
+        assert!(import_outcome(None).is_err());
+        for broken in [
+            ImportSummary {
+                interrupted: true,
+                ..Default::default()
+            },
+            ImportSummary {
+                unreadable_archives: vec!["/exports/takeout-002.zip".into()],
+                ..Default::default()
+            },
+            ImportSummary {
+                error: Some("check for existing photos: offline".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(import_outcome(Some(&broken)).is_err(), "{broken:?}");
+        }
+        let interrupted = import_outcome(Some(&ImportSummary {
+            interrupted: true,
+            ..Default::default()
+        }));
+        assert!(interrupted.unwrap_err().to_string().contains("--resume"));
+    }
+
+    #[test]
+    fn resume_needs_no_archives_and_excludes_them() {
+        let cli = Cli::try_parse_from(["pdfs", "import-google-photos", "--resume"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ImportGooglePhotos { resume: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["pdfs", "import-google-photos"]).is_err());
+        assert!(
+            Cli::try_parse_from(["pdfs", "import-google-photos", "--resume", "a.zip"]).is_err()
+        );
     }
 
     #[test]
