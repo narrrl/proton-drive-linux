@@ -118,8 +118,8 @@ Gitignore-style rules applied to every synced folder, in addition to each folder
  ".fuse_hidden*", ".nfs*", "*.part", "*.crdownload", "*.kate-swp", ".~lock.*#", "~$*"]
 ```
 
-Preferences → Sync → Excluded Files edits this list, and `pdfs sync ignore` does the same from
-a terminal. A list equal to the defaults is saved as absent, so it follows the defaults of later
+Preferences → Sync → Excluded Files edits this list, **Add Pattern** on the Sync page's Folders
+view adds to it, and `pdfs sync ignore` does the same from a terminal. A list equal to the defaults is saved as absent, so it follows the defaults of later
 releases. Set it to `[]` to turn the defaults off. See
 [Synced folders](SYNCED_FOLDERS.md#excluding-files-with-pdfsignore) for how excluding behaves.
 

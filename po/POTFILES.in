@@ -18,6 +18,7 @@ crates/pdfs-gui/src/app/pages/preferences_sync.rs
 crates/pdfs-gui/src/app/pages/shared.rs
 crates/pdfs-gui/src/app/pages/shared_by_me.rs
 crates/pdfs-gui/src/app/pages/status.rs
+crates/pdfs-gui/src/app/pages/sync_exclusions.rs
 crates/pdfs-gui/src/app/pages/takeout.rs
 crates/pdfs-gui/src/app/pages/trash.rs
 crates/pdfs-gui/src/app/pages/verify.rs

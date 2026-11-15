@@ -17,6 +17,7 @@ pub(crate) mod preferences_sync;
 pub(crate) mod shared;
 pub(crate) mod shared_by_me;
 pub(crate) mod status;
+pub(crate) mod sync_exclusions;
 pub(crate) mod takeout;
 pub(crate) mod trash;
 pub(crate) mod verify;

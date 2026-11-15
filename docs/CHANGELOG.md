@@ -29,10 +29,13 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   - **Apps → Search Launcher**: whether `pdfs-prompt` opens its own window, your dmenu-style
     launcher (rofi, wofi, fuzzel, bemenu) or fzf in a terminal.
 
-  Each synced folder kept on this computer has **Excluded Files…** in its menu on the Sync page,
-  for its own `.pdfsignore`. It checks every line as you type, tells you whether a path is synced
-  and which pattern decides, and asks before replacing rules that changed on another computer
-  meanwhile. `pdfs sync ignore list|add|remove|reset|check` does the same from a terminal.
+  The Sync page's Folders view lists **Excluded Files** under the folders: how many patterns
+  apply to all of them and to each one, and **Add Pattern** to add one for all synced folders or
+  for a single folder. A folder's own rules (its `.pdfsignore`) open in an editor, also from the
+  folder's menu. It checks every line as you type, tells you whether a path is synced and which
+  pattern decides, and asks before replacing rules that changed on another computer meanwhile.
+  `pdfs sync ignore list|add|remove|reset|check` does the same from a terminal, and `--folder`
+  picks a single folder.
   `pdfs-app --page preferences-sync` (or `-apps`, `-storage`, plain `preferences`) opens
   Preferences at that page.
 - **More clutter left out of synced folders by default**: `desktop.ini`, `.directory`, trash

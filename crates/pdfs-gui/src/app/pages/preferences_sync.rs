@@ -85,6 +85,13 @@ pub(crate) fn wire_sync_prefs(ui: &Rc<Ui>, widgets: SyncPrefs) {
     let rows: Rc<RefCell<Vec<adw::PreferencesRow>>> = Rc::default();
     let config = ui.dirs.load_config();
     paint_patterns(ui, &widgets, &rows, &config);
+    // The Sync page and `pdfs sync ignore` change the patterns too: show the
+    // saved ones each time the page comes up.
+    let (ui_map, w_map, rows_map) = (ui.clone(), widgets.clone(), rows.clone());
+    widgets.page.connect_map(move |_| {
+        let config = ui_map.dirs.load_config();
+        paint_patterns(&ui_map, &w_map, &rows_map, &config);
+    });
 
     let mode = config.conflict_sweep.unwrap_or_default();
     let suppress = ui.status.settings_suppress.replace(true);
@@ -184,22 +191,14 @@ fn default_patterns() -> Vec<String> {
 }
 
 /// Apply `edit` to the patterns in effect and save them, then show them and
-/// have every synced folder sync with them. A list equal to the built-in one
-/// is saved as "unset", so it follows the built-in list in later releases.
-/// Says whether it saved.
+/// have every synced folder sync with them. Says whether it saved.
 fn change_patterns(
     ui: &Rc<Ui>,
     widgets: &Rc<SyncPrefs>,
     rows: &Rc<RefCell<Vec<adw::PreferencesRow>>>,
     edit: impl FnOnce(&mut Vec<String>),
 ) -> bool {
-    let saved = ui.dirs.update_config(|config| {
-        let mut list = config.resolved_ignore_patterns();
-        edit(&mut list);
-        config.ignore_patterns = (list != default_patterns()).then_some(list);
-        config.clone()
-    });
-    match saved {
+    match ui.dirs.change_ignore_patterns(edit) {
         Ok(config) => {
             paint_patterns(ui, widgets, rows, &config);
             // Best effort: the next pass picks the change up anyway.

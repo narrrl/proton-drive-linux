@@ -391,6 +391,27 @@ impl AppConfig {
     }
 }
 
+/// Apply `edit` to the ignore patterns in effect in the config at `path`,
+/// under the config lock, and return the saved config. A list equal to the
+/// built-in one is stored as unset, so it follows the built-in list in later
+/// releases.
+pub fn change_ignore_patterns_at(
+    path: &Path,
+    edit: impl FnOnce(&mut Vec<String>),
+) -> Result<AppConfig> {
+    update_config_at(path, |config| {
+        let mut list = config.resolved_ignore_patterns();
+        edit(&mut list);
+        let builtin = list.len() == DEFAULT_IGNORE_PATTERNS.len()
+            && list
+                .iter()
+                .zip(DEFAULT_IGNORE_PATTERNS)
+                .all(|(a, b)| a == b);
+        config.ignore_patterns = (!builtin).then_some(list);
+        config.clone()
+    })
+}
+
 /// Fail when the config file at `path` exists but does not parse, so that
 /// [`AppDirs::save_config`] never writes over settings it could not read.
 fn refuse_to_replace_unreadable(path: &Path) -> Result<()> {
@@ -563,6 +584,13 @@ impl AppDirs {
     /// B292).
     pub fn update_config<R>(&self, change: impl FnOnce(&mut AppConfig) -> R) -> Result<R> {
         update_config_at(&self.config_path(), change)
+    }
+
+    /// Apply `edit` to the ignore patterns in effect for every synced folder
+    /// and save them, returning the saved config. See
+    /// [`change_ignore_patterns_at`].
+    pub fn change_ignore_patterns(&self, edit: impl FnOnce(&mut Vec<String>)) -> Result<AppConfig> {
+        change_ignore_patterns_at(&self.config_path(), edit)
     }
 
     /// This machine's id (e.g. ~/.config/proton-drive-linux/machine-id). See
@@ -795,6 +823,31 @@ mod tests {
         let config = load_config_at(&path);
         assert_eq!(config.upload_limit, Some(100));
         assert_eq!(config.download_limit, Some(100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignore_patterns_back_at_the_built_in_list_are_stored_as_unset() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-cfg-ignore-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let config = change_ignore_patterns_at(&path, |list| list.push("*.db".into())).unwrap();
+        assert_eq!(
+            config.ignore_patterns.as_ref().unwrap().last().unwrap(),
+            "*.db"
+        );
+        let config = change_ignore_patterns_at(&path, |list| list.retain(|p| p != "*.db")).unwrap();
+        assert_eq!(config.ignore_patterns, None);
+        assert_eq!(load_config_at(&path).ignore_patterns, None);
+        // An empty list is a choice, not the built-in one.
+        let config = change_ignore_patterns_at(&path, Vec::clear).unwrap();
+        assert_eq!(config.ignore_patterns, Some(Vec::new()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
