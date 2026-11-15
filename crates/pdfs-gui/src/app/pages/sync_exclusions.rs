@@ -5,7 +5,9 @@
 //! The rows open the editors that already exist: Preferences → Sync for the
 //! patterns of all folders, the Excluded Files dialog for a folder's own
 //! `.pdfsignore`. Only folders kept on this computer are listed; an
-//! online-only folder has no local files for patterns to leave out.
+//! online-only folder has no local files for patterns to leave out. With none
+//! of those, the group still shows, so the patterns can be found and set up
+//! before a folder is switched to Synced, and says why they do nothing yet.
 
 use crate::*;
 use pdfs_core::syncignore::{FolderRules, add_folder_pattern, check_pattern};
@@ -61,7 +63,7 @@ pub(crate) fn wire_exclusions(ui: &Rc<Ui>) {
 }
 
 /// Rebuild the rows for the folders in `items` when the set of synced folders
-/// kept on this computer changed. The tick repaints the folder list every few
+/// kept on this computer changed, or on the first paint. The tick repaints the folder list every few
 /// seconds; the rows and their counts stay as they are in between.
 pub(crate) fn paint_exclusions(ui: &Rc<Ui>, items: &[MountSpec]) {
     let folders: Vec<(i64, PathBuf)> = items
@@ -90,10 +92,7 @@ pub(crate) fn refresh_exclusions(ui: &Rc<Ui>) {
         state.group.remove(&row);
     }
     let folders = state.folders.borrow().clone();
-    state.group.set_visible(!folders.is_empty());
-    if folders.is_empty() {
-        return;
-    }
+    state.group.set_visible(true);
     let generation = state.generation.get() + 1;
     state.generation.set(generation);
 
@@ -113,6 +112,17 @@ pub(crate) fn refresh_exclusions(ui: &Rc<Ui>) {
     });
     state.group.add(&all);
     let mut rows = vec![all];
+    if folders.is_empty() {
+        let none = adw::ActionRow::builder()
+            .title(gettext("No folder is set to Synced"))
+            .subtitle(gettext(
+                "Patterns apply only to folders kept on this computer. Online-only folders upload every file saved in them.",
+            ))
+            .build();
+        none.add_prefix(&gtk4::Image::from_icon_name("info-outline-symbolic"));
+        state.group.add(&none);
+        rows.push(none);
+    }
 
     let mut counted = Vec::new();
     for (id, root) in folders {
