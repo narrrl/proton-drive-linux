@@ -31,16 +31,6 @@ pkgbase = proton-drive-for-linux-bin
 	options = !strip
 	options = !debug
 	source = proton-drive-linux-3.7.0-x86_64.tar.gz::https://github.com/narrrl/proton-drive-linux/releases/download/v3.7.0/proton-drive-linux-3.7.0-x86_64.tar.gz
-	source = io.narl.proton-drive-linux-3.7.0.desktop::https://raw.githubusercontent.com/narrrl/proton-drive-linux/v3.7.0/packaging/io.narl.proton-drive-linux.desktop
-	source = io.narl.proton-drive-linux-tray-3.7.0.desktop::https://raw.githubusercontent.com/narrrl/proton-drive-linux/v3.7.0/packaging/io.narl.proton-drive-linux-tray.desktop
-	source = io.narl.proton-drive-linux-3.7.0.svg::https://raw.githubusercontent.com/narrrl/proton-drive-linux/v3.7.0/packaging/io.narl.proton-drive-linux.svg
-	source = proton-drive-3.7.0.service::https://raw.githubusercontent.com/narrrl/proton-drive-linux/v3.7.0/packaging/proton-drive.service
-	source = LICENSE-3.7.0::https://raw.githubusercontent.com/narrrl/proton-drive-linux/v3.7.0/LICENSE
-	sha256sums = 3f0d16c19b10b30e3f181e3c7fb439f0a8c38980e8ab7a4a96ae6596b349787c
-	sha256sums = d190d6771fff0b975271fb62fd3fb0fa8bbf17d7278c10853c18557855b0c123
-	sha256sums = 1d95e250370220e3bb6aead6ce34d1d6cc759f42c4803b75f1667e78ff47c6c0
-	sha256sums = e598a93c2715c3a9fdc7fb937902083d4a1135e8fbdfe6fe7e37f0383ebbd828
-	sha256sums = 44c25dca6e759c46fca50b58099aa6194abe78293dee07d971bbbce0ff3ca58f
-	sha256sums = 02c419e7f9af08dda720e4f852f3e57cf5a69e192605440f750e9d244fa2817c
+	sha256sums = SKIP
 
 pkgname = proton-drive-for-linux-bin

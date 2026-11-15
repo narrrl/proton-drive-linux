@@ -39,6 +39,15 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   folders, `.fuse_hidden*` and `.nfs*` leftovers, partial downloads (`*.part`, `*.crdownload`),
   Kate swap files and office lock files. This only changes folders where you never set your own
   list. Leaving a file out never deletes its copy on Proton Drive.
+- **An install without a package, for immutable distributions** (#99). The release `.tar.gz` now
+  carries everything around the programs and an `install.sh` that installs them into your home
+  folder, no root needed: `~/.local` for the programs, menu entry, icon, translations and shell
+  completion, `~/.config` for the service and the tray's login entry. It checks the libraries
+  first and names the packages to install, refuses to install next to a package of the client,
+  updates in place (restarting a running service) and removes itself with `--uninstall`, leaving
+  settings and data alone. The app finds its translations and the tray beside its own program, so
+  nothing has to be on the `PATH`. [Installation](INSTALL.md) also shows how to layer the COPR
+  package on Fedora Atomic (Silverblue, Kinoite, Bazzite, Bluefin).
 - **Sync a local folder with a folder you already have in My files** (#67, #77).
   `pdfs sync attach ~/Work --to Work` keeps `~/Work` an ordinary local folder and syncs it both
   ways with My files/Work. The first sync uploads files that are only on this computer, downloads
