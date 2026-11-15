@@ -124,6 +124,14 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   screen there, and with nothing to scroll no more were loaded. More now load whenever the photos
   don't fill the window, also after a zoom or a resize.
 
+- **Signed out after a cold boot on Fedora 45** (issue #78, B284, B285). Fedora 45 replaced the
+  GNOME keyring with oo7, and two things there could keep a refreshed sign-in from being saved:
+  oo7 reports the entries of a locked keyring as missing, which the client took for a sign-out,
+  and a restarted oo7 no longer knew the client's connection, which then failed every save until
+  the service restarted. The refreshed sign-in lived only in memory, and the next boot found the
+  spent one. The client now keeps such a sign-in and saves it once the keyring can be read, and
+  reconnects to a keyring service that restarted.
+
 - **Thumbnails appear in the folder you are looking at as soon as they are made.** During
   **Build thumbnails**, the folder on screen kept its file icons until you left it and opened it
   again. Its tiles now fill in while the build runs, and the same goes for any tile whose
