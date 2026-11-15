@@ -44,6 +44,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
+      - name: Shell scripts of the release tarball
+        run: shellcheck packaging/tarball/*.sh
+
       - name: Lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

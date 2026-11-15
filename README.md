@@ -77,7 +77,8 @@ scriptable CLI.
 | Arch Linux | [`proton-drive-for-linux`](https://aur.archlinux.org/packages/proton-drive-for-linux) (also `-bin` and `-git`) in the AUR |
 | Debian, Ubuntu 24.04 or newer | `.deb` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest) |
 | NixOS | The flake in this repository: see [Installation → NixOS](docs/INSTALL.md#nixos-flake) |
-| Anything else | [Build from source](docs/INSTALL.md#build-from-source) |
+| Fedora Atomic (Silverblue, Kinoite, Bazzite, Bluefin) | The COPR repository, layered with `rpm-ostree`: see [Installation → Fedora Atomic](docs/INSTALL.md#fedora-atomic-silverblue-kinoite-bazzite-bluefin) |
+| Anything else, immutable ones included | `.tar.gz` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest), installed into your home folder by its `install.sh`: see [Installation → Other distributions](docs/INSTALL.md#other-distributions), or [build from source](docs/INSTALL.md#build-from-source) |
 
 **Fedora**
 

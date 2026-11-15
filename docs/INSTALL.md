@@ -21,7 +21,8 @@ again.
 | [Arch Linux](#arch-linux-aur) | `proton-drive-for-linux` in the AUR | With your AUR helper |
 | [Debian, Ubuntu 24.04 or newer](#debian-and-ubuntu-2404-or-newer) | `.deb` from the release page | Download each release |
 | [NixOS](#nixos-flake) | The flake in this repository | With `nix flake update` |
-| [Anything else](#other-distributions) | `.tar.gz` from the release page, or [build from source](#build-from-source) | By hand |
+| [Fedora Atomic](#fedora-atomic-silverblue-kinoite-bazzite-bluefin) (Silverblue, Kinoite, Bazzite, Bluefin) | The COPR repository, layered with `rpm-ostree` | With `rpm-ostree upgrade` |
+| [Anything else](#other-distributions), immutable ones included | `.tar.gz` from the release page, installed into your home folder by its `install.sh`, or [build from source](#build-from-source) | Run the new release's `install.sh` |
 
 Release packages are for x86_64. You also need a Secret Service provider, such as GNOME
 Keyring, KWallet or KeePassXC, to keep your session. Most desktops have one already.
@@ -139,12 +140,42 @@ the module) and a Secret Service such as GNOME Keyring or KWallet. To leave out 
 it video thumbnails, override the package with `withFfmpeg = false`. The recipe is in
 [`packaging/nix/`](../packaging/nix/).
 
+### Fedora Atomic (Silverblue, Kinoite, Bazzite, Bluefin)
+
+The system is read-only, so layer the COPR package on top of it. It brings its libraries along:
+
+```bash
+sudo curl -o /etc/yum.repos.d/proton-drive-linux.repo \
+  "https://copr.fedorainfracloud.org/coprs/narl-rs/proton-drive-linux/repo/fedora-$(rpm -E %fedora)/narl-rs-proton-drive-linux-fedora-$(rpm -E %fedora).repo"
+rpm-ostree install proton-drive-linux
+systemctl reboot
+```
+
+`rpm-ostree upgrade` brings new releases with the system's own updates.
+
 ### Other distributions
 
-Unpack the `.tar.gz` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest)
-into a directory on your `PATH`, then install the service as shown in
-[Using a binary outside `/usr/bin`](#using-a-binary-outside-usrbin). The binaries need GTK 4.12,
-libadwaita 1.5, WebKitGTK 6.0 and FUSE 3; see [Requirements](#requirements).
+The `.tar.gz` from the [latest release](https://github.com/narrrl/proton-drive-linux/releases/latest)
+installs into your home folder, without root, so it also works where the system is read-only:
+
+```bash
+tar -xzf proton-drive-linux-*-x86_64.tar.gz
+proton-drive-linux-*-x86_64/install.sh
+```
+
+It puts the programs in `~/.local/bin`, the menu entry, icon, translations and shell completion in
+`~/.local/share`, the service in `~/.config/systemd/user` and the tray's login entry in
+`~/.config/autostart`, each pointing at `~/.local/bin`. Then open **Proton Drive for Linux** from
+your applications menu. `--prefix DIR` installs somewhere else.
+
+The system has to provide glibc 2.39 or newer (the binaries are built on Ubuntu 24.04), GTK 4.12,
+libadwaita 1.5, WebKitGTK 6.0 and FUSE 3 with a setuid `fusermount3`; see
+[Requirements](#requirements). `install.sh` checks the libraries first and names the packages to
+install for each distribution. It refuses to install next to a package of this client, since the
+two would run different versions of the service.
+
+To update, download the new release and run its `install.sh`; a running service restarts on the new
+version. Turn on **Preferences → General → Check for updates** to hear about new releases.
 
 ## Optional extras
 
@@ -195,7 +226,9 @@ browser, solve it, then press Enter.
 | COPR (Fedora) | `sudo dnf upgrade` |
 | AUR | `paru -Syu`, or your AUR helper's equivalent |
 | Nix flake | `nix flake update proton-drive-linux`, or change the pinned tag, then rebuild |
-| `.deb`, release `.rpm`, `.tar.gz` | Download the new release and install it over the old one |
+| Fedora Atomic | `rpm-ostree upgrade`, then reboot |
+| `.deb`, release `.rpm` | Download the new release and install it over the old one |
+| `.tar.gz` | Download the new release and run its `install.sh` |
 
 The service switches to the new version the next time it starts. To switch at once:
 
@@ -245,6 +278,8 @@ open in an older release, so going back to an older version means clearing the l
    | `.deb` | `sudo apt remove proton-drive-linux` |
    | AUR | `sudo pacman -R proton-drive-for-linux` (or the `-bin` or `-git` package) |
    | NixOS | Remove the module and the flake input, then rebuild |
+   | Fedora Atomic | `rpm-ostree uninstall proton-drive-linux`, remove `/etc/yum.repos.d/proton-drive-linux.repo`, then reboot |
+   | `.tar.gz` | `~/.local/share/proton-drive-linux/install.sh --uninstall` |
 
    Removing the package also stops the service of every logged-in user, in case step 1 was
    skipped.
@@ -353,8 +388,10 @@ sudo dnf install packaging/out/x86_64/proton-drive-linux-*.rpm
 
 ### Using a binary outside `/usr/bin`
 
-The service unit starts `/usr/bin/pdfs daemon`. If you installed the programs somewhere else, for
-example `~/.local/bin`, install the unit for your user and point it at your binary:
+The release tarball's `install.sh` does all of this for you (see
+[Other distributions](#other-distributions)). For programs you built yourself: the service unit
+starts `/usr/bin/pdfs daemon`. If you installed the programs somewhere else, for example
+`~/.local/bin`, install the unit for your user and point it at your binary:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -382,3 +419,7 @@ Every package installs the same files:
 | `/usr/lib/systemd/user/proton-drive.service` | User service that keeps the drive mounted |
 | `/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop` | Starts the tray at login |
 | `/usr/share/locale/*/LC_MESSAGES/pdfs.mo` | Translations |
+
+The release tarball's `install.sh` puts the same files under `~/.local` instead of `/usr`, the
+service in `~/.config/systemd/user` and the tray's login entry in `~/.config/autostart`. It keeps a
+list of them in `~/.local/share/proton-drive-linux/installed-files` for `--uninstall`.

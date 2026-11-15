@@ -344,7 +344,15 @@ fn present_window(app: &adw::Application) {
 
 /// Spawn the tray icon process in the background.
 pub(crate) fn spawn_tray() {
-    match Command::new("pdfs-tray").spawn() {
+    // The tray installed next to this app, as the tray finds the app; the
+    // bare name for a PATH install. An install into ~/.local is often not on
+    // the PATH of a desktop session.
+    let tray = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("pdfs-tray")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("pdfs-tray"));
+    match Command::new(&tray).spawn() {
         Ok(child) => {
             tracing::info!("spawned `pdfs-tray`");
             pdfs_core::opener::reap(child);

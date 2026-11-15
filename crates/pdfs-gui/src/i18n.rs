@@ -13,6 +13,7 @@
 
 use gettextrs::LocaleCategory;
 use pdfs_core::config::AppDirs;
+use std::path::{Path, PathBuf};
 
 /// The gettext text domain, matching `po/pdfs.pot` and the installed `.mo` name.
 pub(crate) const DOMAIN: &str = "pdfs";
@@ -53,14 +54,11 @@ pub(crate) fn init() {
     if let Some(code) = language {
         apply_language(&code);
     }
-    let dir = std::env::var(LOCALEDIR_ENV)
-        .ok()
-        .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| {
-            option_env!("PDFS_LOCALEDIR")
-                .unwrap_or(DEFAULT_LOCALEDIR)
-                .to_string()
-        });
+    let dir = locale_dir(
+        std::env::var(LOCALEDIR_ENV).ok(),
+        option_env!("PDFS_LOCALEDIR"),
+        std::env::current_exe().ok(),
+    );
     if let Err(e) = gettextrs::bindtextdomain(DOMAIN, dir) {
         tracing::warn!("bindtextdomain failed: {e}");
     }
@@ -71,6 +69,33 @@ pub(crate) fn init() {
     if let Err(e) = gettextrs::textdomain(DOMAIN) {
         tracing::warn!("textdomain failed: {e}");
     }
+}
+
+/// Where the catalogs are: `$PDFS_LOCALEDIR`, then the directory the build
+/// named, then `share/locale` beside the `bin` directory the program runs
+/// from when that holds a catalog of ours, then [`DEFAULT_LOCALEDIR`].
+///
+/// The third is for an install outside `/usr`, such as the release tarball's
+/// `install.sh` into `~/.local`: its programs find their translations without
+/// a wrapper setting the variable.
+fn locale_dir(env: Option<String>, build: Option<&str>, exe: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = env.filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = build {
+        return PathBuf::from(dir);
+    }
+    let beside = exe
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|prefix| prefix.join("share/locale"))
+        .filter(|dir| {
+            LANGUAGES
+                .iter()
+                .any(|(code, _)| dir.join(code).join("LC_MESSAGES/pdfs.mo").is_file())
+        });
+    beside.unwrap_or_else(|| PathBuf::from(DEFAULT_LOCALEDIR))
 }
 
 /// The iso-codes text domain that translates ISO 3166-1 country names.
@@ -233,6 +258,32 @@ fn fill(template: &str, args: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_catalogs_are_found_beside_an_install_outside_usr() {
+        let prefix = std::env::temp_dir().join(format!("pdfs-locale-{}", std::process::id()));
+        let mo = prefix.join("share/locale/de/LC_MESSAGES/pdfs.mo");
+        std::fs::create_dir_all(mo.parent().unwrap()).unwrap();
+        std::fs::write(&mo, b"").unwrap();
+        let exe = Some(prefix.join("bin/pdfs-app"));
+
+        assert_eq!(
+            locale_dir(None, None, exe.clone()),
+            prefix.join("share/locale")
+        );
+        // The variable and the build's own choice still win.
+        assert_eq!(
+            locale_dir(Some("/x".into()), Some("/y"), exe.clone()),
+            PathBuf::from("/x")
+        );
+        assert_eq!(locale_dir(None, Some("/y"), exe), PathBuf::from("/y"));
+        // A prefix without our catalogs falls back to the system's.
+        assert_eq!(
+            locale_dir(None, None, Some(PathBuf::from("/nonexistent/bin/pdfs-app"))),
+            PathBuf::from(DEFAULT_LOCALEDIR)
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
 
     #[test]
     fn fill_replaces_named_placeholders_in_any_order() {
