@@ -1115,9 +1115,6 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
     // count falling to zero is what "the sync finished" looks like from here.
     // Jobs are deliberately not counted — a bulk upload retires its scan job and
     // starts its upload job mid-flight, which is not a thing finishing.
-    // The Import page reads its progress off the same snapshot rather than
-    // polling the daemon a second time for numbers already on the wire.
-    takeout_progress(ui, jobs);
 
     let previous = ui.status.active_transfers.replace(items.len());
     if !items.is_empty() {
@@ -1211,13 +1208,18 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
 pub(crate) fn job_line(j: &JobItem) -> ActivityLine {
     let done = j.done.to_string();
     let total = j.total.to_string();
+    let (title, detail) = if j.title == IMPORT_JOB {
+        import_job_text(&j.detail)
+    } else {
+        (j.title.clone(), j.detail.clone())
+    };
     let args: [(&str, &str); 4] = [
-        ("title", &j.title),
-        ("detail", &j.detail),
+        ("title", &title),
+        ("detail", &detail),
         ("done", &done),
         ("total", &total),
     ];
-    let text = match (j.total > 0, j.detail.is_empty()) {
+    let text = match (j.total > 0, detail.is_empty()) {
         // Translators: a background job's progress. {title} is the job, such as
         // "Scanning Photos"; {done} and {total} are counts.
         (true, true) => gettext_f("{title} — {done} of {total}", &args),

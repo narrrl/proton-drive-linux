@@ -196,6 +196,7 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs add-to-album UID PHOTOS...` | Add photos to an album. |
 | `pdfs remove-from-album UID PHOTOS...` | Take photos out of an album. |
 | `pdfs import-google-photos ARCHIVES... [--dry-run] [--wait]` | Import a Google Takeout export. Pass every `.zip` of the export. |
+| `pdfs import-google-photos --resume [--wait]` | Start the last import again with the same archives after it was interrupted, stopped or failed. |
 | `pdfs import-status` / `pdfs cancel-import` | Follow or stop a running import. |
 | `pdfs redate-photos [--dry-run] [--from DATE] [--to DATE] [--limit N] [--wait]` | Fix photos filed under their upload day when the file name carries the real date. |
 | `pdfs redate-status` / `pdfs cancel-redate` | Follow or stop a running re-date. |

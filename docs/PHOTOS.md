@@ -55,6 +55,7 @@ server learns which areas you look at.
 2. In the app, open the **Upload** menu on the Photos page and choose **Import from Google
    Photos…**. Select all the `.zip` files at once, because a photo and its details are often in
    different parts of the export.
+3. Choose **Scan** to see what an import would do without uploading anything, then **Import**.
 
 From a terminal:
 
@@ -63,8 +64,22 @@ pdfs import-google-photos --dry-run ~/Downloads/takeout-*.zip   # show what woul
 pdfs import-google-photos --wait ~/Downloads/takeout-*.zip
 ```
 
-The import recreates your albums and takes capture dates and locations from the export. Photos
-already in your library are skipped, so an interrupted import can simply be run again.
+What the import takes from the export:
+
+- **Albums** are recreated. A photo that is in several albums is uploaded once and added to each.
+- **Dates** come from the export's details, else from a date in the file name, else from the
+  photo's EXIF.
+- **Places** come from the export, so imported photos appear under [Places](#places).
+- **Favorites** are kept.
+- **Live photos and motion photos** stay one photo: the video is filed with its still.
+
+What it leaves out: photos in Google's trash, and files from other Google services (Drive,
+YouTube) that are in the same export. A `.zip` that cannot be read is left out and named in the
+report; the rest still imports.
+
+Photos already in your library are skipped, so an interrupted import can simply be run again.
+If the import was cut short, for example by a restart, the Import page offers **Resume**, and
+`pdfs import-google-photos --resume` does the same without naming the archives again.
 `pdfs import-status` shows how far an import is, and `pdfs cancel-import` stops it.
 
 ## Fixing photos filed under the wrong date

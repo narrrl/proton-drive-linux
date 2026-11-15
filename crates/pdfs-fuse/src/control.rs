@@ -877,35 +877,23 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             if archives.is_empty() {
                 CtlResponse::error(CoreError::invalid("no Takeout archives given"))
             } else {
-                let paths: Vec<PathBuf> = archives.into_iter().map(PathBuf::from).collect();
-                let missing: Vec<String> = paths
-                    .iter()
-                    .filter(|path| !path.is_file())
-                    .map(|path| path.display().to_string())
-                    .collect();
-                if !missing.is_empty() {
-                    CtlResponse::error(CoreError::not_found(format!(
-                        "cannot read: {}",
-                        missing.join(", ")
-                    )))
-                } else {
-                    let count = paths.len();
-                    match core.spawn_takeout_import(paths, dry_run) {
-                        Ok(()) => CtlResponse::Ok {
-                            message: format!(
-                                "{} {count} archive(s)",
-                                if dry_run { "scanning" } else { "importing" }
-                            ),
-                        },
-                        Err(e) => CtlResponse::error(e),
-                    }
-                }
+                let paths = archives.into_iter().map(PathBuf::from).collect();
+                start_takeout_import(core, paths, dry_run)
             }
         }
         Ok(CtlRequest::ImportStatus) => {
-            let (running, summary) = crate::takeout::import_status();
-            CtlResponse::ImportStatus { running, summary }
+            let report = crate::takeout::import_status();
+            CtlResponse::ImportStatus {
+                running: report.running,
+                summary: report.summary,
+                progress: report.progress,
+                resumable: report.resumable,
+            }
         }
+        Ok(CtlRequest::ResumeImport) => match crate::takeout::resumable_archives() {
+            None => CtlResponse::error(CoreError::not_found("there is no import to resume")),
+            Some(paths) => start_takeout_import(core, paths, false),
+        },
         Ok(CtlRequest::CancelImport) => {
             if crate::takeout::cancel_import() {
                 CtlResponse::Ok {
@@ -2006,6 +1994,31 @@ pub(crate) fn run_control_socket(
                 warn!(error = %e, "control: accept failed");
             }
         }
+    }
+}
+
+/// Check that every archive is there, then start the import in the background.
+fn start_takeout_import(core: &Core, paths: Vec<PathBuf>, dry_run: bool) -> CtlResponse {
+    let missing: Vec<String> = paths
+        .iter()
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect();
+    if !missing.is_empty() {
+        return CtlResponse::error(CoreError::not_found(format!(
+            "cannot read: {}",
+            missing.join(", ")
+        )));
+    }
+    let count = paths.len();
+    match core.spawn_takeout_import(paths, dry_run) {
+        Ok(()) => CtlResponse::Ok {
+            message: format!(
+                "{} {count} archive(s)",
+                if dry_run { "scanning" } else { "importing" }
+            ),
+        },
+        Err(e) => CtlResponse::error(e),
     }
 }
 

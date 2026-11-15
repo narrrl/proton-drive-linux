@@ -562,6 +562,12 @@ impl AppDirs {
         self.state_dir().join("control.sock")
     }
 
+    /// The Google Photos import's last run: its archives and how it ended, so
+    /// an import cut short by a restart can be resumed.
+    pub fn takeout_import_path(&self) -> PathBuf {
+        self.state_dir().join("takeout-import.json")
+    }
+
     /// Unix domain socket the tray uses to ensure single instance.
     pub fn tray_socket(&self) -> PathBuf {
         self.state_dir().join("tray.sock")

@@ -3640,6 +3640,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "pdfs-core",
  "proton-drive-rs",
+ "serde",
  "serde_json",
  "sha1 0.11.0",
  "tokio",
@@ -3890,9 +3891,9 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14a22e621abbc1c61b4640728a7de969c16b66d5d983b59c638d501fda25a7b9"
+checksum = "4265c2cf3bdc59ee273d7363c8b6a7cb4e98be6102ffa18144c4d8ebda00737b"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3918,9 +3919,9 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd55a5e8b6600f3aa282ebbdf13ff366431ff9aae84d4eb20b0ef06d598919fe"
+checksum = "fb98ab3e336ed95f82368a50348dad00e5fc919e982d748e83e844afcadbd5d8"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-trait",
