@@ -117,6 +117,9 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   Import page offers **Resume**, and `pdfs import-google-photos --resume` does the same. Photos
   that are already uploaded are skipped as before.
 
+- **More pages to open the app on.** `pdfs-app --page` also takes `albums`, `places`,
+  `places-map` and `sync-folders`.
+
 ### Changed
 
 - **`proton-sdk` and `proton-drive-rs` 0.12.0.** Timestamps are converted where they enter
