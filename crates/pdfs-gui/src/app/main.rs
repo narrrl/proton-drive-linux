@@ -31,6 +31,7 @@ use pages::preferences_sync::*;
 use pages::shared::*;
 use pages::shared_by_me::*;
 use pages::status::*;
+use pages::sync_exclusions::*;
 use pages::takeout::*;
 use pages::trash::*;
 use pages::verify::*;
@@ -681,6 +682,13 @@ fn build_window(app: &adw::Application) {
             views: locations_widgets.views.clone(),
             banner: locations_widgets.banner.clone(),
             failing: Cell::new(0),
+            exclusions: ExclusionsState {
+                group: locations_widgets.exclusions_group.clone(),
+                add: locations_widgets.add_pattern.clone(),
+                rows: RefCell::new(Vec::new()),
+                folders: RefCell::new(Vec::new()),
+                generation: Cell::new(0),
+            },
         },
         activity: ActivityState {
             content: activity_widgets.content.clone(),
@@ -764,6 +772,7 @@ fn build_window(app: &adw::Application) {
     wire_shared_by_me(&ui, &shared_by_me_widgets);
     wire_devices(&ui, &devices_widgets);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
+    wire_exclusions(&ui);
     wire_activity(&ui, &activity_widgets);
     wire_takeout(&ui, &takeout_widgets);
     wire_retry(&ui);

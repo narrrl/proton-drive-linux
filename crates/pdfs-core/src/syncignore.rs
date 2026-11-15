@@ -262,6 +262,82 @@ impl FolderRules {
         }
         Ok(written?)
     }
+
+    /// The patterns in the rules: every line that is not blank or a comment,
+    /// trimmed of surrounding white space.
+    pub fn patterns(&self) -> Vec<&str> {
+        self.text
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+}
+
+/// How often [`add_folder_pattern`] and [`remove_folder_pattern`] read the
+/// rules again when they changed between the read and the write.
+const RULES_RETRIES: usize = 3;
+
+/// Add `pattern` at the end of the own rules of the folder at `root`, keeping
+/// every other line and comment. Says whether it added it: a pattern already
+/// there is left alone.
+pub fn add_folder_pattern(root: &Path, pattern: &str) -> std::io::Result<bool> {
+    let pattern = pattern.trim();
+    edit_folder_rules(root, |rules| {
+        if rules.patterns().contains(&pattern) {
+            return None;
+        }
+        let mut text = rules.text.clone().unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(pattern);
+        text.push('\n');
+        Some(text)
+    })
+}
+
+/// Remove every line that is `pattern` from the own rules of the folder at
+/// `root`. Says whether there was one.
+pub fn remove_folder_pattern(root: &Path, pattern: &str) -> std::io::Result<bool> {
+    let pattern = pattern.trim();
+    edit_folder_rules(root, |rules| {
+        if !rules.patterns().contains(&pattern) {
+            return None;
+        }
+        let text = rules.text.as_deref().unwrap_or_default();
+        Some(
+            text.lines()
+                .filter(|line| line.trim() != pattern)
+                .map(|line| format!("{line}\n"))
+                .collect(),
+        )
+    })
+}
+
+/// Read the folder's rules, let `edit` return their new text (or `None` to
+/// leave them), and write it. Rules that changed in between, such as by sync
+/// bringing in an edit from another computer, are read again and edited anew.
+fn edit_folder_rules(
+    root: &Path,
+    edit: impl Fn(&FolderRules) -> Option<String>,
+) -> std::io::Result<bool> {
+    for _ in 0..RULES_RETRIES {
+        let rules = FolderRules::read(root)?;
+        let Some(text) = edit(&rules) else {
+            return Ok(false);
+        };
+        match rules.write(&text) {
+            Ok(()) => return Ok(true),
+            Err(WriteRulesError::Changed) => continue,
+            Err(WriteRulesError::Io(e)) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(
+        "the rules kept changing while they were being saved",
+    ))
 }
 
 /// Where a rule that decided about a path came from.
@@ -637,6 +713,44 @@ mod tests {
         let rules = FolderRules::read(dir.path()).unwrap();
         write(dir.path(), ".pdfsignore", "b/\n");
         assert!(matches!(rules.write("c/"), Err(WriteRulesError::Changed)));
+    }
+
+    #[test]
+    fn a_pattern_added_to_a_folder_keeps_its_other_lines() {
+        let dir = TempDir::new();
+        assert!(add_folder_pattern(dir.path(), " *.db ").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".pdfsignore")).unwrap(),
+            "*.db\n"
+        );
+
+        write(dir.path(), ".pdfsignore", "# my notes\nbuild/");
+        assert!(add_folder_pattern(dir.path(), "*.db").unwrap());
+        assert!(!add_folder_pattern(dir.path(), "build/").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".pdfsignore")).unwrap(),
+            "# my notes\nbuild/\n*.db\n"
+        );
+        assert_eq!(
+            FolderRules::read(dir.path()).unwrap().patterns(),
+            ["build/", "*.db"]
+        );
+    }
+
+    #[test]
+    fn removing_a_folder_pattern_keeps_comments_and_drops_an_empty_file() {
+        let dir = TempDir::new();
+        write(dir.path(), ".pdfsignore", "# keep\nbuild/\n*.db\n");
+        assert!(remove_folder_pattern(dir.path(), "build/").unwrap());
+        assert!(!remove_folder_pattern(dir.path(), "build/").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".pdfsignore")).unwrap(),
+            "# keep\n*.db\n"
+        );
+
+        write(dir.path(), ".pdfsignore", "*.db\n");
+        assert!(remove_folder_pattern(dir.path(), "*.db").unwrap());
+        assert!(!dir.path().join(".pdfsignore").exists());
     }
 
     #[test]

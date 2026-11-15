@@ -238,6 +238,7 @@ fn write_rules(
             Ok(()) => {
                 dialog.close();
                 toast(&ui, &gettext("Excluded files saved"));
+                refresh_exclusions(&ui);
                 let _ = spawn_request(ui.dirs.control_socket(), Request::SyncNow { id: Some(id) });
             }
             Err(WriteRulesError::Changed) => {

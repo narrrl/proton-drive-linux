@@ -35,6 +35,8 @@ pub(crate) struct LocationsState {
     pub(crate) banner: adw::Banner,
     /// Changes the daemon failed to upload, from the last status.
     pub(crate) failing: Cell<u64>,
+    /// Excluded Files, under the folder list.
+    pub(crate) exclusions: ExclusionsState,
 }
 
 /// The status card heading the Sync page's Overview, and Pause/Resume in the
@@ -120,6 +122,8 @@ pub(crate) struct LocationsWidgets {
     pub(crate) conflicts_group: adw::PreferencesGroup,
     pub(crate) views: adw::ViewStack,
     pub(crate) banner: adw::Banner,
+    pub(crate) exclusions_group: adw::PreferencesGroup,
+    pub(crate) add_pattern: gtk4::Button,
 }
 
 /// The Sync page: Overview (the status, conflicts, transfers and queue),
@@ -208,8 +212,14 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         .child(&status)
         .build();
 
+    // What the folders leave out, under them: the rules belong to the folders.
+    let (exclusions_group, add_pattern) = build_exclusions_group();
+    let folders = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+    folders.append(&group);
+    folders.append(&exclusions_group);
+
     let content = gtk4::Stack::new();
-    content.add_named(&scrolled_column(&group), Some("list"));
+    content.add_named(&scrolled_column(&folders), Some("list"));
     content.add_named(&status_scroll, Some("status"));
 
     let views = adw::ViewStack::new();
@@ -267,6 +277,8 @@ pub(crate) fn build_locations_page(history: &gtk4::Widget) -> (gtk4::Widget, Loc
         conflicts_group,
         views,
         banner,
+        exclusions_group,
+        add_pattern,
     };
     (frame.upcast(), widgets)
 }
@@ -1243,6 +1255,7 @@ pub(crate) fn repaint_locations(ui: &Rc<Ui>, items: &[MountSpec]) {
     };
     if !unchanged {
         rebuild_locations(ui, items, keys);
+        paint_exclusions(ui, items);
     }
     for (row, spec) in ui.locations.rows.borrow().iter().zip(items) {
         update_location_row(row, spec);

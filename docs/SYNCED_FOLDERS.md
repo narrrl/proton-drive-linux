@@ -108,10 +108,15 @@ apply together:
    lock files, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.directory`, trash folders, `.nfs*` and
    `.fuse_hidden*`). Each built-in pattern can be turned off on its own.
 
-To edit a folder's own rules in the app, open the **Sync** page, then **Folders**, and pick
-**Excluded Files…** in the folder's menu. It checks every line as you type, and **Check a path**
-tells you whether a file is synced and which pattern decides. If the file changed meanwhile, for
-example on another computer, it asks before replacing that version.
+In the app, open the **Sync** page, then **Folders**. Under the folder list, **Excluded Files**
+shows how many patterns apply to all synced folders and how many each folder has of its own:
+
+- **Add Pattern** asks for a pattern and where it applies: all synced folders, or one of them.
+- **All Synced Folders** opens Preferences → Sync, with every pattern and the built-in ones.
+- A folder opens the editor for its own rules, which **Excluded Files…** in the folder's menu
+  opens too. It checks every line as you type, and **Check a path** tells you whether a file is
+  synced and which pattern decides. If the file changed meanwhile, for example on another
+  computer, it asks before replacing that version.
 
 From a terminal:
 
@@ -120,6 +125,8 @@ pdfs sync ignore list            # the patterns for every synced folder
 pdfs sync ignore add '*.db'      # leave out files ending in .db
 pdfs sync ignore remove '*.db'
 pdfs sync ignore reset           # back to the built-in patterns
+pdfs sync ignore add 'cache/' --folder ~/Projects    # only in ~/Projects/.pdfsignore
+pdfs sync ignore list --folder ~/Projects
 pdfs sync ignore check ~/Projects/app/node_modules
 ```
 
