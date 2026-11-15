@@ -174,8 +174,10 @@ mkdir -p -- "$data_dir"
 printf '%s' "$new_files" >"$manifest"
 install -m755 -- "$here/install.sh" "$data_dir/install.sh"
 
-command -v gtk-update-icon-cache >/dev/null && [[ -f "$prefix/share/icons/hicolor/index.theme" ]] &&
+if command -v gtk-update-icon-cache >/dev/null &&
+    [[ -f "$prefix/share/icons/hicolor/index.theme" ]]; then
     gtk-update-icon-cache -q -t "$prefix/share/icons/hicolor" 2>/dev/null || true
+fi
 
 systemctl_user daemon-reload
 if [[ $service -eq 1 ]] && command -v systemctl >/dev/null &&
