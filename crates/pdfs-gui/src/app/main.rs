@@ -297,6 +297,27 @@ fn parse_launch(args: &[String]) -> Launch {
     Launch::Window
 }
 
+/// The Sync view a `--page` name opens: "activity" lives on as its History
+/// view, and "sync-folders" is its Folders view.
+fn sync_view(page: &str) -> Option<&'static str> {
+    match page {
+        "activity" => Some("history"),
+        "sync-folders" => Some("folders"),
+        _ => None,
+    }
+}
+
+/// The Photos view a `--page` name opens, and whether Places shows its map:
+/// "albums", "places" and "places-map". Other names are stack pages.
+fn photos_view(page: &str) -> Option<(u32, bool)> {
+    match page {
+        "albums" => Some((VIEW_ALBUMS, false)),
+        "places" => Some((VIEW_PLACES, false)),
+        "places-map" => Some((VIEW_PLACES, true)),
+        _ => None,
+    }
+}
+
 /// Raise the window if there is one, else build it. A second launch reaches
 /// the running instance, which must not open a second window.
 fn present_window(app: &adw::Application) {
@@ -1450,10 +1471,18 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
             show_login(&ui_page);
             return;
         }
-        // Activity lives on as the Sync page's History view.
-        if page == "activity" {
-            ui_page.locations.views.set_visible_child_name("history");
+        if let Some(view) = sync_view(page) {
+            ui_page.locations.views.set_visible_child_name(view);
             ui_page.stack.set_visible_child_name("locations");
+        } else if let Some((view, map)) = photos_view(page) {
+            ui_page.stack.set_visible_child_name("gallery");
+            if view == VIEW_PLACES {
+                ui_page
+                    .gallery
+                    .places_layout
+                    .set_active(if map { PLACES_MAP } else { 0 });
+            }
+            ui_page.gallery.view_switch.set_active(view);
         } else if ui_page.stack.child_by_name(page).is_some() {
             ui_page.stack.set_visible_child_name(page);
         }
@@ -2012,6 +2041,18 @@ mod tests {
         );
         // A trailing --page with no name is no request at all.
         assert_eq!(parse_launch(&args(&["--page"])), Launch::Window);
+    }
+
+    #[test]
+    fn a_page_name_can_open_a_photos_or_sync_view() {
+        assert_eq!(photos_view("albums"), Some((VIEW_ALBUMS, false)));
+        assert_eq!(photos_view("places"), Some((VIEW_PLACES, false)));
+        assert_eq!(photos_view("places-map"), Some((VIEW_PLACES, true)));
+        // The timeline is the Photos stack page itself.
+        assert_eq!(photos_view("gallery"), None);
+        assert_eq!(sync_view("activity"), Some("history"));
+        assert_eq!(sync_view("sync-folders"), Some("folders"));
+        assert_eq!(sync_view("locations"), None);
     }
 
     /// One file of a shot, for the group-switch tests.
