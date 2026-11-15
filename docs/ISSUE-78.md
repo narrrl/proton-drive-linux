@@ -58,6 +58,52 @@ can resolve the default alias to a locked collection. Both have fixes in
 after the reporter's November 7 retest. Neither can be assigned as this report's cause without
 matching runtime evidence.
 
+## SetSecret is kept only in memory in Fedora's oo7
+
+Follow-up on 2026-11-15. The reporter's `rpm -qa 'oo7*'` shows
+`oo7-daemon-0.7.0~beta^1.e91b98a-1.fc45`, not the 0.7.0 release assumed above. Bodhi lists that
+build as the stable oo7 for Fedora 45 and 46; neither has 0.7.0 or 0.7.1. Commit e91b98a
+(October 24) predates
+[7fb11dd](https://github.com/linux-credentials/oo7/commit/7fb11dd111c4be8fec01996e3caa31c44fa962b3)
+(October 28): "Setting the Label or Attributes of an item, or calling SetSecret, only changed the
+item in memory, so the old values came back once the daemon restarted." 0.7.0 carries it as
+37e3334.
+
+pdfs writes an existing entry with `SetSecret`, so on that build every saved token rotation was
+lost at the next reboot. This explains the reporter's log: the keyring was unlocked one second
+before pdfs started (they type their password at login) and still held a spent refresh token.
+It does not need a locked keyring or a restarted provider.
+
+pdfs now saves an existing entry with `CreateItem` and `replace` instead
+(`crates/pdfs-core/src/secretservice.rs`, B291), which e91b98a writes to the keyring file.
+Reproduced and verified with oo7-daemon built at e91b98a in a throwaway session bus:
+
+```sh
+git clone https://github.com/linux-credentials/oo7.git /tmp/oo7 && git -C /tmp/oo7 checkout e91b98a
+cargo build --manifest-path /tmp/oo7/Cargo.toml -p oo7-daemon --bin oo7-daemon
+OO7=/tmp/oo7/target/debug/oo7-daemon
+T=$(mktemp -d /tmp/ss.XXXX); mkdir -p $T/data $T/run; chmod 700 $T/run
+XDG_DATA_HOME=$T/data XDG_RUNTIME_DIR=$T/run OO7=$OO7 PDFS_SECRET_SERVICE_RESTART_TEST=1 \
+  PDFS_RESTART_PROVIDER='pkill -x oo7-daemon; sleep 1; (printf pw | setsid "$OO7" --login >/dev/null 2>&1 &); sleep 2' \
+  dbus-run-session -- sh -c 'printf pw | setsid "$OO7" --login >/dev/null 2>&1 & sleep 2;
+    cargo test -p pdfs-core real_secret_service_keeps -- --ignored'
+```
+
+With the in-place write, the read after the restart returns the first of three saves (`r1`);
+with the replacing write it returns the last (`r3`), and one item is left.
+
+The daemon also logs a short fingerprint of the refresh token when it resumes the stored session
+and each time it saves a rotation (`refresh=1a2b3c4d`). If a start is refused, compare the
+fingerprint it resumed with against the last one saved in the boot before:
+
+```sh
+journalctl --user -b -1 -u proton-drive.service | grep -E 'refresh=' | tail -2
+journalctl --user -b 0 -u proton-drive.service | grep -E 'refresh=' | head -2
+```
+
+The same fingerprint means the keyring kept the last save and Proton refused it; a different one
+means the keyring lost it.
+
 ## A restarted Secret Service
 
 A second path to the same symptom, independent of locking (B285). The keyring store pdfs used

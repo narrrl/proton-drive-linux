@@ -23,6 +23,7 @@ pub mod places;
 pub mod profile;
 pub mod sdkcache;
 pub mod search;
+mod secretservice;
 pub mod service;
 pub mod shell;
 pub mod similar;

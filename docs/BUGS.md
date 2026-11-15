@@ -109,6 +109,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B291](#b291--on-fedora-45s-oo7-every-saved-sign-in-is-lost-at-the-next-reboot) | On Fedora 45's oo7, every saved sign-in is lost at the next reboot |
 | [B289](#b289--the-takeout-import-mixes-in-other-services-and-drops-location-and-live-photos) | The Takeout import mixes in other services and drops location and live photos |
 | [B288](#b288--an-interrupted-takeout-import-reads-as-finished-and-one-error-ends-it) | An interrupted Takeout import reads as finished, and one error ends it |
 | [B287](#b287--a-photo-draft-left-by-an-interrupted-upload-blocks-that-name) | A photo draft left by an interrupted upload blocks that name |
@@ -393,6 +394,45 @@ a live account since.
 
 Newest first.
 
+### B291 — On Fedora 45's oo7, every saved sign-in is lost at the next reboot
+
+**Status:** Fixed, not verified live
+**Found:** 2026-11-15, from the reporter's package list in
+[issue #78](https://github.com/narrrl/proton-drive-linux/issues/78): `oo7-daemon-0.7.0~beta^1.e91b98a`,
+the build Fedora 45 and 46 ship as stable, from before oo7's
+[7fb11dd](https://github.com/linux-credentials/oo7/commit/7fb11dd111c4be8fec01996e3caa31c44fa962b3)
+("server: Write item changes to the keyring file"). See
+[the investigation](ISSUE-78.md#setsecret-is-kept-only-in-memory-in-fedoras-oo7).
+**Where:** `crates/pdfs-core/src/auth.rs`, `write_stored`; `crates/pdfs-core/src/secretservice.rs`
+
+**Repro:** With oo7-daemon at e91b98a, save the session blob, save it again with a new refresh
+token, and restart oo7-daemon. The read after the restart returns the first blob. The keyring
+store writes an existing item with `SetSecret`, and that oo7 build applies `SetSecret` only to the
+item in memory; the keyring file keeps what `CreateItem` wrote. Within a boot every read returns
+the new tokens, so nothing looks wrong. After a reboot the daemon resumes with the refresh token
+of the last `pdfs login`, which Proton spent long ago: `InvalidRefreshToken`, and the user has to
+sign in again. Typing the password at login, or the fixes for B284 and B285, change nothing.
+
+**Cause:** A bug in that oo7 build, fixed in oo7 0.7.0 but not packaged by Fedora. Every token
+refresh pdfs saved went through the one call it does not persist.
+
+**Fix:** An existing entry is saved by `CreateItem` with `replace`, which that build writes to the
+file: a new item in the old one's collection, with its label and all its attributes, so the
+provider replaces the old one. A duplicate that a provider leaves behind is removed; if it cannot
+be, the new item is taken out again and the save falls back to the usual `SetSecret`. The first
+save, a locked item, two matching items, or any failure before the new item exists also fall back
+to it. The connection used for this never shows a prompt. The daemon log now has a short
+fingerprint of the refresh token at each start and each save, so a log across a reboot shows
+whether the keyring returned the last token saved.
+
+**Verified:** 2026-11-15, `real_secret_service_keeps_the_last_save_across_a_provider_restart`
+(ignored; needs a throwaway Secret Service) against oo7-daemon built at e91b98a: with the
+in-place write it reads `r1` after the restart, with this change `r3` and one item. The same test
+and `real_secret_service_survives_a_provider_restart` pass against gnome-keyring. Not yet run on
+a Fedora 45 desktop with a real account.
+
+---
+
 ### B290 — Reopening the database right after closing it can be refused as another daemon
 
 **Status:** Fixed, 2026-11-15
@@ -416,6 +456,8 @@ second later.
 
 **Verified:** `cargo test -p pdfs-core` on 2026-11-15, including
 `a_second_writer_is_refused_while_the_first_holds_the_database`.
+
+---
 
 ### B289 — The Takeout import mixes in other services and drops location and live photos
 
