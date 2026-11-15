@@ -162,13 +162,13 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
   screen there, and with nothing to scroll no more were loaded. More now load whenever the photos
   don't fill the window, also after a zoom or a resize.
 
-- **Signed out after a cold boot on Fedora 45** (issue #78, B284, B285). Fedora 45 replaced the
-  GNOME keyring with oo7, and two things there could keep a refreshed sign-in from being saved:
-  oo7 reports the entries of a locked keyring as missing, which the client took for a sign-out,
-  and a restarted oo7 no longer knew the client's connection, which then failed every save until
-  the service restarted. The refreshed sign-in lived only in memory, and the next boot found the
-  spent one. The client now keeps such a sign-in and saves it once the keyring can be read, and
-  reconnects to a keyring service that restarted.
+- **Signed out after every reboot on Fedora 45** (issue #78, B284, B285, B291). Fedora 45 replaced
+  the GNOME keyring with oo7, and the oo7 build it ships keeps a changed keyring entry only in
+  memory: every refreshed sign-in the client saved was gone after a reboot, and the next start
+  found one Proton had already retired. The client now saves the sign-in as a new entry that
+  replaces the old one, which that oo7 does write to disk. It also no longer drops a refreshed
+  sign-in when oo7 reports the entries of a locked keyring as missing, and it reconnects to a
+  keyring service that restarted.
 
 - **Thumbnails appear in the folder you are looking at as soon as they are made.** During
   **Build thumbnails**, the folder on screen kept its file icons until you left it and opened it

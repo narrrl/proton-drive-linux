@@ -490,9 +490,46 @@ fn classify_verification_gate(e: ProtonError) -> Error {
     }
 }
 
+/// Save `stored` to the keyring.
+///
+/// An existing entry is replaced by a new item rather than edited, because
+/// oo7 before 0.7.0 keeps an edit only in memory and a reboot brings the
+/// spent refresh token back (`docs/BUGS.md` B291). The usual write is the
+/// fallback: for the first save, and whenever replacing is not possible.
 fn write_stored(stored: &StoredSession) -> Result<()> {
     let json = Zeroizing::new(serde_json::to_string(stored)?);
+    if replace_items() {
+        match crate::secretservice::replace(KEYRING_SERVICE, KEYRING_USER, json.as_bytes()) {
+            crate::secretservice::Replaced::Saved => return Ok(()),
+            crate::secretservice::Replaced::Skipped(why) => {
+                tracing::debug!(%why, "not replacing the keyring item; writing it in place");
+            }
+        }
+    }
     with_keyring(|entry| entry.set_password(&json))
+}
+
+/// Whether [`write_stored`] talks to the Secret Service directly: always,
+/// except in tests that use the in-memory store.
+#[cfg(not(test))]
+fn replace_items() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn replace_items() -> bool {
+    tests::MOCK_STORE.lock().is_none()
+}
+
+/// A short, one-way tag for a refresh token, for the log: enough to tell
+/// whether the token a start finds is the one the last save wrote, and
+/// nothing that helps anyone use it.
+fn fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Load the persisted session blob, or `Error::NotLoggedIn` if absent.
@@ -703,6 +740,10 @@ fn resume_stored(stored: &StoredSession) -> Result<ProtonApiSession> {
         resumed.access_token = tokens.access_token.clone();
         resumed.refresh_token = tokens.refresh_token.clone();
     }
+    tracing::info!(
+        refresh = %fingerprint(&resumed.refresh_token),
+        "resuming the stored session"
+    );
     let session = ProtonApiSession::resume(client_config(), resumed.to_params())?;
     let sink = register_refresh_handler(&session, stored.refresh_token.clone());
     if let Some(tokens) = unsaved {
@@ -1082,8 +1123,11 @@ impl TokenSink {
         ) {
             Rotation::Taken => {
                 write_stored(&stored)?;
+                tracing::info!(
+                    refresh = %fingerprint(&tokens.refresh_token),
+                    "successfully auto-persisted refreshed tokens in keyring"
+                );
                 state.stored_refresh = tokens.refresh_token;
-                tracing::info!("successfully auto-persisted refreshed tokens in keyring");
             }
             Rotation::MovedOn => {
                 tracing::info!(
@@ -1405,6 +1449,48 @@ mod tests {
         let read = with_keyring_entry(service, user, |e| e.get_password()).unwrap();
         assert_eq!(read, "after");
         with_keyring_entry(service, user, |e| e.delete_credential()).unwrap();
+        keyring_core::unset_default_store();
+    }
+
+    /// B291: every save after the first replaces the keyring item, so a
+    /// provider that keeps an edited secret only in memory (oo7 before 0.7.0)
+    /// still has the last one after a restart, and only one item is left.
+    ///
+    /// Run like [`real_secret_service_survives_a_provider_restart`], in a
+    /// throwaway session bus only.
+    #[test]
+    #[ignore = "needs a throwaway Secret Service; see real_secret_service_survives_a_provider_restart"]
+    fn real_secret_service_keeps_the_last_save_across_a_provider_restart() {
+        if std::env::var_os("PDFS_SECRET_SERVICE_RESTART_TEST").is_none() {
+            return;
+        }
+        let restart = std::env::var("PDFS_RESTART_PROVIDER").expect("PDFS_RESTART_PROVIDER");
+        let _turn = KEYRING.lock();
+        *MOCK_STORE.lock() = None;
+        keyring_core::unset_default_store();
+
+        for refresh in ["r1", "r2", "r3"] {
+            write_stored(&stored_with(refresh)).unwrap();
+        }
+        let status = std::process::Command::new("sh")
+            .args(["-c", &restart])
+            .status()
+            .unwrap();
+        assert!(status.success(), "restarting the provider failed");
+        std::thread::sleep(Duration::from_secs(1));
+
+        assert_eq!(load().unwrap().refresh_token, "r3");
+        let ss =
+            dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Plain)
+                .unwrap();
+        let found = ss
+            .search_items(std::collections::HashMap::from([
+                ("service", KEYRING_SERVICE),
+                ("username", KEYRING_USER),
+            ]))
+            .unwrap();
+        assert_eq!(found.unlocked.len() + found.locked.len(), 1);
+        with_keyring(|e| e.delete_credential()).unwrap();
         keyring_core::unset_default_store();
     }
 
