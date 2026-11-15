@@ -100,10 +100,32 @@ apply together:
    !important.log
    ```
 
-2. The `ignore_patterns` list in `config.json`, for every synced folder (see
-   [Configuration](CONFIGURATION.md#ignore_patterns)). When you have not set it, it skips
-   `.git/`, `.hg/`, `.svn/`, `node_modules/`, `target/`, `.venv/`, `__pycache__/`, `*~`,
-   `*.swp`, `*.tmp`, `.DS_Store` and `Thumbs.db`.
+2. The patterns for every synced folder: **Preferences → Sync → Excluded Files** in the app, or
+   `ignore_patterns` in `config.json` (see [Configuration](CONFIGURATION.md#ignore_patterns)).
+   Built in are version control (`.git/`, `.hg/`, `.svn/`), dependency and build folders
+   (`node_modules/`, `target/`, `.venv/`, `__pycache__/`), and what editors, downloads and other
+   systems leave behind (`*~`, `*.swp`, `*.tmp`, `*.part`, `*.crdownload`, `*.kate-swp`, office
+   lock files, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.directory`, trash folders, `.nfs*` and
+   `.fuse_hidden*`). Each built-in pattern can be turned off on its own.
+
+To edit a folder's own rules in the app, open the **Sync** page, then **Folders**, and pick
+**Excluded Files…** in the folder's menu. It checks every line as you type, and **Check a path**
+tells you whether a file is synced and which pattern decides. If the file changed meanwhile, for
+example on another computer, it asks before replacing that version.
+
+From a terminal:
+
+```bash
+pdfs sync ignore list            # the patterns for every synced folder
+pdfs sync ignore add '*.db'      # leave out files ending in .db
+pdfs sync ignore remove '*.db'
+pdfs sync ignore reset           # back to the built-in patterns
+pdfs sync ignore check ~/Projects/app/node_modules
+```
+
+The rules apply to folders kept on this computer. Files you save into `~/ProtonDrive` itself or into
+an online-only folder are always uploaded, except download and editor scratch files, which wait for
+their final name.
 
 Rules are read again on every sync pass. Excluding never deletes anything: a file that becomes
 excluded is no longer synced, and its copy on Proton Drive stays.

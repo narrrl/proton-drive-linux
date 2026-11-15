@@ -123,9 +123,7 @@ pub(crate) fn sync_root_reserved() -> pdfs_core::syncroot::Reserved {
 pub(crate) fn set_adopted_device_uid(uid: Option<&str>) -> CoreResult<()> {
     let dirs = pdfs_core::config::AppDirs::new()
         .map_err(|e| CoreError::internal(format!("config dirs: {e}")))?;
-    let mut cfg = dirs.load_config();
-    cfg.device_uid = uid.map(|u| u.to_string());
-    dirs.save_config(&cfg)
+    dirs.update_config(|cfg| cfg.device_uid = uid.map(|u| u.to_string()))
         .map_err(|e| CoreError::internal(format!("write config: {e}")))
 }
 

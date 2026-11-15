@@ -1431,9 +1431,11 @@ fn save_icon_size(ui: &Rc<Ui>, size: i32) {
     let ui_save = ui.clone();
     let source = glib::timeout_add_local_once(Duration::from_millis(500), move || {
         ui_save.browser.zoom_save.borrow_mut().take();
-        let mut config = ui_save.dirs.load_config();
-        config.files_view.icon_size = ui_save.browser.view.get().icon_size;
-        if let Err(e) = ui_save.dirs.save_config(&config) {
+        let icon_size = ui_save.browser.view.get().icon_size;
+        if let Err(e) = ui_save
+            .dirs
+            .update_config(|config| config.files_view.icon_size = icon_size)
+        {
             tracing::warn!("cannot save the icon size: {e}");
         }
     });
@@ -1464,9 +1466,7 @@ pub(crate) fn set_files_view(ui: &Rc<Ui>, view: FilesView) {
         return;
     }
     apply_files_view(ui, view);
-    let mut config = ui.dirs.load_config();
-    config.files_view = view;
-    if let Err(e) = ui.dirs.save_config(&config) {
+    if let Err(e) = ui.dirs.update_config(|config| config.files_view = view) {
         toast_error(ui, &gettext("Couldn't save the view"), &e.to_string());
     }
     if (old.sort, old.descending, old.folders_first)

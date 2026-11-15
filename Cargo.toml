@@ -39,6 +39,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
 ignore = "0.4"
+# Command lines typed into Preferences, split and shown the way a shell would.
+shell-words = "1"
 sha2 = "0.11"
 # Google Takeout exports are zip sets; the importer reads their central
 # directories and streams entries out without extracting to disk first.

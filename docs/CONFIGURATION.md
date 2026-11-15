@@ -44,8 +44,12 @@ the [security model](SECURITY_MODEL.md#what-is-kept-on-this-computer).
 ## `config.json`
 
 The file is created with defaults on first start. Every key is optional; a missing key takes its
-default. Edit it while the app is closed, then restart the service
+default. Most keys can be changed in the app, under **Preferences** (the "In app" column below).
+To edit the file by hand, close the app first, then restart the service
 (`systemctl --user restart proton-drive.service`) for service settings to apply.
+
+The app, the tray and the service each change the file under a lock (`config.json.lock` next to
+it), so two of them changing different settings at once both keep their change.
 
 An unreadable file is never overwritten: the programs log an error and run with defaults until you
 fix it.
@@ -80,9 +84,9 @@ fix it.
 | `cache_budget` | bytes | 5 GiB | Storage → Cache | Soft limit for cached content. `0` means unlimited. Available-offline files do not count against it |
 | `upload_limit` | bytes/s | none | General → Network | Shared cap for all uploads. `0` or `null` means none |
 | `download_limit` | bytes/s | none | General → Network | Shared cap for all downloads, reads from the mount included |
-| `ignore_patterns` | list | see below | — | Global ignore rules for synced folders |
+| `ignore_patterns` | list | see below | Sync → Excluded Files | Global ignore rules for synced folders |
 | `device_uid` | string | none | Computers → Continue This Backup Here… or Sync With This Computer… | The computer this machine syncs into. Unset means "match by hostname" |
-| `conflict_sweep` | `off` / `report` / `enforce` | `report` | — | See [`conflict_sweep`](#conflict_sweep) |
+| `conflict_sweep` | `off` / `report` / `enforce` | `report` | Sync → Conflict Copies | See [`conflict_sweep`](#conflict_sweep) |
 | `local_first` | bool | `true` | — | See [`local_first`](#local_first) |
 | `language` | gettext code | system | General → Appearance | Language of the app, tray and prompt, such as `de` or `pt_BR` |
 | `proton_theme` | bool | follow system | General → Appearance | Proton's colours instead of the system theme |
@@ -93,8 +97,8 @@ fix it.
 | `update_latest` | version | none | — | The latest release the update check found |
 | `files_view` | object | grid, by name | My files view menu | `list`, `sort` (`name`, `size`, `modified`), `descending`, `folders_first` |
 | `window` | object | 980 × 680 | Resizing the app window | `width`, `height` (the unmaximized size), `maximized` |
-| `open_with` | object | `xdg-open` | — | See [`open_with`](#open_with) |
-| `prompt` | object | built-in window | — | See [`prompt`](#prompt) |
+| `open_with` | object | `xdg-open` | Apps → Open Files With | See [`open_with`](#open_with) |
+| `prompt` | object | built-in window | Apps → Search Launcher | See [`prompt`](#prompt) |
 
 `app_version` and `user_agent` identify the client to Proton. When the keys are absent, the
 client sends its own release (`external-drive-linux@<version>-stable`, `proton-drive-linux/<version>`).
@@ -109,10 +113,14 @@ Gitignore-style rules applied to every synced folder, in addition to each folder
 
 ```json
 [".git/", ".hg/", ".svn/", "node_modules/", "target/", ".venv/", "__pycache__/",
- "*~", "*.swp", "*.tmp", ".DS_Store", "Thumbs.db"]
+ "*~", "*.swp", "*.tmp", ".DS_Store", "Thumbs.db",
+ "desktop.ini", ".directory", ".Trash-*/", ".Trashes/", ".Spotlight-V100/",
+ ".fuse_hidden*", ".nfs*", "*.part", "*.crdownload", "*.kate-swp", ".~lock.*#", "~$*"]
 ```
 
-Set it to `[]` to turn the defaults off. See
+Preferences → Sync → Excluded Files edits this list, and `pdfs sync ignore` does the same from
+a terminal. A list equal to the defaults is saved as absent, so it follows the defaults of later
+releases. Set it to `[]` to turn the defaults off. See
 [Synced folders](SYNCED_FOLDERS.md#excluding-files-with-pdfsignore) for how excluding behaves.
 
 ### `conflict_sweep`

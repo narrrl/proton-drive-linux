@@ -206,26 +206,23 @@ pub fn reap(mut child: std::process::Child) {
     });
 }
 
-/// [`open`] with the policy from the user's `config.json`, read once per
-/// process. For callers that open the occasional path and have no reason to
-/// carry a policy around; long-lived windows should hold their own copy.
+/// [`open`] with the policy from the user's `config.json`, read again on
+/// every call: the file is small, a path is opened by hand, and a rule changed
+/// in Preferences then applies to the next file opened, without a restart.
 pub fn open_default(path: &Path, is_dir: bool) {
-    open(default_policy(), path, is_dir);
+    open(&default_policy(), path, is_dir);
 }
 
 /// [`open_default`] matching the rules against `name` — see
 /// [`OpenWith::command_for_named`].
 pub fn open_default_named(path: &Path, name: &str, is_dir: bool) {
-    open_named(default_policy(), path, name, is_dir);
+    open_named(&default_policy(), path, name, is_dir);
 }
 
-fn default_policy() -> &'static OpenWith {
-    static POLICY: std::sync::OnceLock<OpenWith> = std::sync::OnceLock::new();
-    POLICY.get_or_init(|| {
-        crate::config::AppDirs::new()
-            .map(|dirs| dirs.load_config().resolved_open_with())
-            .unwrap_or_default()
-    })
+fn default_policy() -> OpenWith {
+    crate::config::AppDirs::new()
+        .map(|dirs| dirs.load_config().resolved_open_with())
+        .unwrap_or_default()
 }
 
 /// `$PDFS_TERMINAL`, then `$TERMINAL`, then the first [`KNOWN_TERMINALS`] entry
@@ -264,6 +261,33 @@ fn with_exec_flag(program: &str) -> Vec<String> {
         .map_or(&["-e"][..], |(_, flags)| *flags);
     argv.extend(flags.iter().map(|f| (*f).to_string()));
     argv
+}
+
+/// Split a command line typed by the user into argv, the way a shell would:
+/// quotes keep spaces, nothing is expanded. `None` for an unclosed quote.
+pub fn parse_command(line: &str) -> Option<Vec<String>> {
+    shell_words::split(line).ok()
+}
+
+/// Show `argv` as one line that [`parse_command`] turns back into it.
+pub fn format_command(argv: &[String]) -> String {
+    shell_words::join(argv)
+}
+
+/// Whether the program `argv` starts with can be found: an absolute or
+/// relative path to a file, or a name on `PATH`. A `$VAR` program counts as
+/// found, since it is looked up only when a file is opened.
+pub fn command_available(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    if program.starts_with('$') {
+        return true;
+    }
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+    on_path(program)
 }
 
 fn on_path(program: &str) -> bool {
@@ -702,5 +726,25 @@ mod tests {
         );
         // Unknown terminals get the near-universal `-e`.
         assert_eq!(with_exec_flag("mystery-term"), vec!["mystery-term", "-e"]);
+    }
+
+    #[test]
+    fn a_typed_command_line_round_trips() {
+        let argv = parse_command("alacritty -e 'my editor' --flag").unwrap();
+        assert_eq!(argv, ["alacritty", "-e", "my editor", "--flag"]);
+        assert_eq!(parse_command(&format_command(&argv)).unwrap(), argv);
+        assert_eq!(parse_command("nvim 'unclosed"), None);
+        assert_eq!(parse_command("   ").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_command_is_available_when_its_program_is() {
+        assert!(command_available(&["sh".to_string()]));
+        assert!(command_available(&["$EDITOR".to_string()]));
+        assert!(!command_available(&[]));
+        assert!(!command_available(
+            &["pdfs-no-such-program-xyz".to_string()]
+        ));
+        assert!(!command_available(&["/nonexistent/program".to_string()]));
     }
 }

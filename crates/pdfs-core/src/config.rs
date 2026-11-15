@@ -407,6 +407,116 @@ fn refuse_to_replace_unreadable(path: &Path) -> Result<()> {
     }
 }
 
+/// [`AppDirs::load_config`] for the file at `path`.
+fn load_config_at(path: &Path) -> AppConfig {
+    if path.exists() {
+        match std::fs::read_to_string(path)
+            .map_err(Error::from)
+            .and_then(|content| serde_json::from_str::<AppConfig>(&content).map_err(Error::from))
+        {
+            Ok(config) => return config,
+            Err(e) => {
+                // Preserve the original bytes for diagnosis/recovery.  In
+                // particular, never replace a truncated config with defaults
+                // and silently lose mount, device, or ignore settings.
+                // `save_config` refuses to write over it for the same reason.
+                tracing::error!(path = %path.display(), error = %e, "config is unreadable; using in-memory defaults without overwriting it");
+                return AppConfig::default();
+            }
+        }
+    }
+
+    let default_config = AppConfig::default();
+    if let Err(e) = save_config_at(path, &default_config) {
+        tracing::warn!(path = %path.display(), error = %e, "could not write the default config");
+    }
+    default_config
+}
+
+/// [`AppDirs::save_config`] for the file at `path`.
+fn save_config_at(path: &Path, config: &AppConfig) -> Result<()> {
+    refuse_to_replace_unreadable(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Other("configuration path has no parent".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("json.tmp-{}-{nonce}", std::process::id()));
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    use std::io::Write as _;
+    file.write_all(&serde_json::to_vec_pretty(config)?)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// [`AppDirs::update_config`] for the file at `path`.
+fn update_config_at<R>(path: &Path, change: impl FnOnce(&mut AppConfig) -> R) -> Result<R> {
+    let _lock = lock_config(path)?;
+    // Refuse before reading: an unreadable file loads as defaults, and the
+    // change must not be applied to those.
+    refuse_to_replace_unreadable(path)?;
+    let mut config = load_config_at(path);
+    let out = change(&mut config);
+    save_config_at(path, &config)?;
+    Ok(out)
+}
+
+/// How long [`lock_config`] waits for another writer. A change holds the lock
+/// for one small read and write; anything longer is a stuck process, and the
+/// setting is better reported as not saved than waited on forever.
+const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the lock that orders changes to the config file at `path`, held until
+/// the returned file is dropped.
+///
+/// A separate `config.json.lock`, never the config file itself: that file is
+/// replaced by a rename on every save, so a lock on it would guard a file
+/// nobody reads any more.
+fn lock_config(path: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(PathBuf::from(name))?;
+    let deadline = std::time::Instant::now() + CONFIG_LOCK_WAIT;
+    loop {
+        // SAFETY: `file` owns the descriptor and outlives the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(Error::Io(e));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Other(format!(
+                "{} is being changed by another process; try again",
+                path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Resolved XDG locations for state, cache, and the default mountpoint.
 pub struct AppDirs {
     dirs: ProjectDirs,
@@ -426,65 +536,33 @@ impl AppDirs {
 
     /// Load config from disk, creating default if missing.
     pub fn load_config(&self) -> AppConfig {
-        let path = self.config_path();
-        if path.exists() {
-            match std::fs::read_to_string(&path)
-                .map_err(Error::from)
-                .and_then(|content| {
-                    serde_json::from_str::<AppConfig>(&content).map_err(Error::from)
-                }) {
-                Ok(config) => return config,
-                Err(e) => {
-                    // Preserve the original bytes for diagnosis/recovery.  In
-                    // particular, never replace a truncated config with defaults
-                    // and silently lose mount, device, or ignore settings.
-                    // `save_config` refuses to write over it for the same reason.
-                    tracing::error!(path = %path.display(), error = %e, "config is unreadable; using in-memory defaults without overwriting it");
-                    return AppConfig::default();
-                }
-            }
-        }
-
-        let default_config = AppConfig::default();
-        if let Err(e) = self.save_config(&default_config) {
-            tracing::warn!(path = %path.display(), error = %e, "could not write the default config");
-        }
-        default_config
+        load_config_at(&self.config_path())
     }
 
     /// Persist `config` to [`config_path`](Self::config_path), creating the
-    /// config dir if missing. The Settings page calls this after editing the
-    /// cache budget or mountpoint; the daemon re-reads the file on its next mount.
+    /// config dir if missing.
     ///
-    /// Refuses while the file on disk does not parse. Every caller loads,
-    /// changes one field and saves, and [`load_config`](Self::load_config)
-    /// gives defaults for a file it cannot read, so the first change after
-    /// the file was damaged wrote defaults over the mountpoint, the device and
-    /// the ignore rules the user had (`docs/BUGS.md` B223).
+    /// Refuses while the file on disk does not parse: [`load_config`](Self::load_config)
+    /// gives defaults for a file it cannot read, so the first change after the
+    /// file was damaged would write defaults over the mountpoint, the device
+    /// and the ignore rules the user had (`docs/BUGS.md` B223).
+    ///
+    /// Writes the whole file. To change a setting, use
+    /// [`update_config`](Self::update_config), which does not lose another
+    /// process's change.
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
-        let path = self.config_path();
-        refuse_to_replace_unreadable(&path)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::Other("configuration path has no parent".into()))?;
-        std::fs::create_dir_all(parent)?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let tmp = path.with_extension(format!("json.tmp-{}-{nonce}", std::process::id()));
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        use std::io::Write as _;
-        file.write_all(&serde_json::to_vec_pretty(config)?)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        save_config_at(&self.config_path(), config)
+    }
+
+    /// Change settings in place: read the file, apply `change`, write it back,
+    /// all under a lock, and return what `change` returned.
+    ///
+    /// The app, the tray and the daemon each write the file. Without the lock,
+    /// two of them changing different settings at once both read the old file,
+    /// and the one that wrote last undid the other's change (`docs/BUGS.md`
+    /// B292).
+    pub fn update_config<R>(&self, change: impl FnOnce(&mut AppConfig) -> R) -> Result<R> {
+        update_config_at(&self.config_path(), change)
     }
 
     /// This machine's id (e.g. ~/.config/proton-drive-linux/machine-id). See
@@ -680,6 +758,64 @@ mod tests {
 
     fn mode_of(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Two writers changing different settings at once both keep their change
+    /// (`docs/BUGS.md` B292).
+    #[test]
+    fn concurrent_changes_to_different_settings_are_all_kept() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-cfg-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let a = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 1..=100u64 {
+                    update_config_at(&path, |c| c.upload_limit = Some(i)).unwrap();
+                }
+            })
+        };
+        let b = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 1..=100u64 {
+                    update_config_at(&path, |c| c.download_limit = Some(i)).unwrap();
+                }
+            })
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let config = load_config_at(&path);
+        assert_eq!(config.upload_limit, Some(100));
+        assert_eq!(config.download_limit, Some(100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_is_never_applied_over_an_unreadable_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-cfg-update-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, br#"{"mountpoint": "/home/me/Pro"#).unwrap();
+
+        assert!(update_config_at(&path, |c| c.tray_hidden = true).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            br#"{"mountpoint": "/home/me/Pro"#
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A damaged config must not be replaced by defaults the next time a

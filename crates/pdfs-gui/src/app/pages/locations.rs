@@ -1498,6 +1498,7 @@ fn folder_mode_label(ondemand: bool) -> String {
 /// synced folder's menu.
 fn add_device_items(ui: &Rc<Ui>, menu: &mut ActionMenu, spec: &MountSpec, id: i64) {
     if spec.mode != MountMode::OnDemand {
+        let ui_ignore = ui.clone();
         // A paused folder skips its passes, so Sync now would do nothing.
         if !spec.paused {
             let ui = ui.clone();
@@ -1516,6 +1517,14 @@ fn add_device_items(ui: &Rc<Ui>, menu: &mut ActionMenu, spec: &MountSpec, id: i6
         menu.item(&gettext("Sync From Scratch…"), move || {
             confirm_reset_sync_folder(&ui, id, &path)
         });
+        // Only a synced copy has local files for the rules to leave out.
+        if spec.mode == MountMode::Mirror {
+            let ui = ui_ignore;
+            let root = PathBuf::from(&spec.local_path);
+            menu.item(&gettext("Excluded Files…"), move || {
+                present_ignore_dialog(&ui, id, root.clone())
+            });
+        }
         menu.section();
     }
     let ui = ui.clone();
