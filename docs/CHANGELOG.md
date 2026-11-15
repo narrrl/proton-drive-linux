@@ -18,6 +18,27 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 
 ### Added
 
+- **Excluded files, opening files and the search launcher in Preferences** (#99). Settings that
+  could only be changed in `config.json` now have a place in the app:
+  - **Sync → Excluded Files**: the patterns every synced folder leaves out. Add your own, such as
+    `*.db` or `build/`, and turn each built-in pattern on or off. A change applies at once.
+  - **Sync → Conflict Copies**: whether identical conflict copies are only reported, moved to the
+    trash, or not looked for.
+  - **Apps → Open Files With**: which program opens which kind of file, in order, optionally in a
+    terminal, for example `nvim` for text files. A change applies to the next file opened.
+  - **Apps → Search Launcher**: whether `pdfs-prompt` opens its own window, your dmenu-style
+    launcher (rofi, wofi, fuzzel, bemenu) or fzf in a terminal.
+
+  Each synced folder kept on this computer has **Excluded Files…** in its menu on the Sync page,
+  for its own `.pdfsignore`. It checks every line as you type, tells you whether a path is synced
+  and which pattern decides, and asks before replacing rules that changed on another computer
+  meanwhile. `pdfs sync ignore list|add|remove|reset|check` does the same from a terminal.
+  `pdfs-app --page preferences-sync` (or `-apps`, `-storage`, plain `preferences`) opens
+  Preferences at that page.
+- **More clutter left out of synced folders by default**: `desktop.ini`, `.directory`, trash
+  folders, `.fuse_hidden*` and `.nfs*` leftovers, partial downloads (`*.part`, `*.crdownload`),
+  Kate swap files and office lock files. This only changes folders where you never set your own
+  list. Leaving a file out never deletes its copy on Proton Drive.
 - **Sync a local folder with a folder you already have in My files** (#67, #77).
   `pdfs sync attach ~/Work --to Work` keeps `~/Work` an ordinary local folder and syncs it both
   ways with My files/Work. The first sync uploads files that are only on this computer, downloads
@@ -146,6 +167,9 @@ Existing folders stay device backups. Older builds cannot open the upgraded data
 
 ### Fixed
 
+- **Two programs changing settings at once no longer lose one of the changes** (B292). The app,
+  the tray and the service now change `config.json` under a lock, so for example a new cache
+  size saved by the service and the window size saved by the app both stay.
 - **Resuming a Google Photos import no longer fails at once** (#94, B286, B287). A photo upload
   that was cut short left a draft behind, and every later run stopped with
   `check for existing photos: serialization error: invalid type: null`. Such drafts are now

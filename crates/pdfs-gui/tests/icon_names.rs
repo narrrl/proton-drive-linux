@@ -24,6 +24,7 @@ const STOCK: &[&str] = &[
     // GTK's built-in icons
     "info-outline-symbolic",
     // Adwaita
+    "application-x-executable-symbolic",
     "audio-x-generic-symbolic",
     "checkbox-checked-symbolic",
     "checkbox-symbolic",

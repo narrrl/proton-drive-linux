@@ -169,6 +169,9 @@ pub(crate) struct MainWidgets {
     pub(crate) tray_row: adw::SwitchRow,
     pub(crate) update_row: adw::SwitchRow,
     pub(crate) language_row: adw::ComboRow,
+    /// Preferences → Sync and → Apps, wired once the app's state exists.
+    pub(crate) sync_prefs: SyncPrefs,
+    pub(crate) apps_prefs: AppsPrefs,
 }
 
 /// Build the two surfaces that replaced the old Settings page:
@@ -267,6 +270,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
 
     let general = adw::PreferencesPage::builder()
         .title(gettext("General"))
+        .name("general")
         .icon_name("preferences-system-symbolic")
         .build();
     general.add(&startup_group);
@@ -335,6 +339,7 @@ pub(crate) fn build_main_page() -> MainWidgets {
 
     let storage = adw::PreferencesPage::builder()
         .title(gettext("Storage"))
+        .name("storage")
         .icon_name("drive-harddisk-symbolic")
         .build();
     storage.add(&storage_group);
@@ -343,7 +348,11 @@ pub(crate) fn build_main_page() -> MainWidgets {
     let prefs = adw::PreferencesDialog::builder()
         .search_enabled(false)
         .build();
+    let sync_prefs = build_sync_prefs();
+    let apps_prefs = build_apps_prefs();
     prefs.add(&general);
+    prefs.add(&sync_prefs.page);
+    prefs.add(&apps_prefs.page);
     prefs.add(&storage);
 
     // ---- Sidebar footer
@@ -463,6 +472,8 @@ pub(crate) fn build_main_page() -> MainWidgets {
         tray_row,
         update_row,
         language_row,
+        sync_prefs,
+        apps_prefs,
     }
 }
 
@@ -678,9 +689,10 @@ pub(crate) fn wire_settings(
             let rows = list.model.n_items();
             list.model.items_changed(0, rows, rows);
         }
-        let mut config = ui_theme.dirs.load_config();
-        config.proton_theme = Some(on);
-        if let Err(e) = ui_theme.dirs.save_config(&config) {
+        if let Err(e) = ui_theme
+            .dirs
+            .update_config(|config| config.proton_theme = Some(on))
+        {
             toast_error(
                 &ui_theme,
                 &gettext("Couldn't save the theme"),
@@ -700,9 +712,7 @@ pub(crate) fn wire_settings(
             .gallery
             .places_map
             .set_online(on, ui_map.dirs.cache_dir());
-        let mut config = ui_map.dirs.load_config();
-        config.online_map = on;
-        if let Err(e) = ui_map.dirs.save_config(&config) {
+        if let Err(e) = ui_map.dirs.update_config(|config| config.online_map = on) {
             toast_error(
                 &ui_map,
                 &gettext("Couldn't save the map setting"),
@@ -717,9 +727,10 @@ pub(crate) fn wire_settings(
         if ui_update.status.settings_suppress.get() {
             return;
         }
-        let mut config = ui_update.dirs.load_config();
-        config.update_check = row.is_active();
-        if let Err(e) = ui_update.dirs.save_config(&config) {
+        if let Err(e) = ui_update
+            .dirs
+            .update_config(|config| config.update_check = row.is_active())
+        {
             toast_error(
                 &ui_update,
                 &gettext("Couldn't save the update setting"),
@@ -739,9 +750,10 @@ pub(crate) fn wire_settings(
             return;
         }
         let show = row.is_active();
-        let mut config = ui_tray.dirs.load_config();
-        config.tray_hidden = !show;
-        if let Err(e) = ui_tray.dirs.save_config(&config) {
+        if let Err(e) = ui_tray
+            .dirs
+            .update_config(|config| config.tray_hidden = !show)
+        {
             toast_error(
                 &ui_tray,
                 &gettext("Couldn't save the tray setting"),
@@ -763,9 +775,9 @@ pub(crate) fn wire_settings(
         if ui_language.status.settings_suppress.get() {
             return;
         }
-        let mut config = ui_language.dirs.load_config();
-        config.language = language_at(row.selected()).map(str::to_string);
-        if let Err(e) = ui_language.dirs.save_config(&config) {
+        if let Err(e) = ui_language.dirs.update_config(|config| {
+            config.language = language_at(row.selected()).map(str::to_string)
+        }) {
             toast_error(
                 &ui_language,
                 &gettext("Couldn't save the language"),
@@ -864,9 +876,10 @@ fn use_mountpoint(ui: &Rc<Ui>, path: &std::path::Path) {
     let path_str = path.display().to_string();
 
     // Persist the choice to config so the next mount uses it.
-    let mut config = ui.dirs.load_config();
-    config.mountpoint = Some(path_str.clone());
-    if let Err(e) = ui.dirs.save_config(&config) {
+    if let Err(e) = ui
+        .dirs
+        .update_config(|config| config.mountpoint = Some(path_str.clone()))
+    {
         toast_error(ui, &gettext("Couldn't save the folder"), &e.to_string());
         return;
     }

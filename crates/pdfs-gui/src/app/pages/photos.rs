@@ -2129,16 +2129,17 @@ fn save_photos_view(ui: &Rc<Ui>) {
     let ui_save = ui.clone();
     let source = glib::timeout_add_local_once(Duration::from_millis(500), move || {
         ui_save.gallery.zoom_save.borrow_mut().take();
-        let mut config = ui_save.dirs.load_config();
         let view = PhotosView {
             row_height: Some(ui_save.gallery.row_height.get()),
             square: ui_save.gallery.square.get(),
         };
-        if config.photos_view == view {
+        if ui_save.dirs.load_config().photos_view == view {
             return;
         }
-        config.photos_view = view;
-        if let Err(e) = ui_save.dirs.save_config(&config) {
+        if let Err(e) = ui_save
+            .dirs
+            .update_config(|config| config.photos_view = view)
+        {
             tracing::warn!("cannot save the Photos view: {e}");
         }
     });

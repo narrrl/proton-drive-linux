@@ -26,6 +26,8 @@ use pages::photo_viewer::*;
 use pages::photos::*;
 use pages::places::*;
 use pages::places_map::*;
+use pages::preferences_apps::*;
+use pages::preferences_sync::*;
 use pages::shared::*;
 use pages::shared_by_me::*;
 use pages::status::*;
@@ -39,6 +41,7 @@ use widgets::compat::*;
 use widgets::crumb::*;
 use widgets::details::*;
 use widgets::file_list::*;
+use widgets::ignore_dialog::*;
 use widgets::menu::*;
 use widgets::photo_drag::*;
 use widgets::player::*;
@@ -303,6 +306,18 @@ fn sync_view(page: &str) -> Option<&'static str> {
     match page {
         "activity" => Some("history"),
         "sync-folders" => Some("folders"),
+        _ => None,
+    }
+}
+
+/// The Preferences page a `--page` name opens: "preferences" and
+/// "preferences-" followed by the page's name.
+fn preferences_page(page: &str) -> Option<&'static str> {
+    match page {
+        "preferences" | "preferences-general" => Some("general"),
+        "preferences-sync" => Some("sync"),
+        "preferences-apps" => Some("apps"),
+        "preferences-storage" => Some("storage"),
         _ => None,
     }
 }
@@ -710,6 +725,8 @@ fn build_window(app: &adw::Application) {
         &main_widgets.purge_button,
         &main_widgets.mountpoint_button,
     );
+    wire_sync_prefs(&ui, main_widgets.sync_prefs);
+    wire_apps_prefs(&ui, main_widgets.apps_prefs);
     wire_sidebar(&ui);
     wire_browser(&ui);
     wire_bulk(
@@ -868,12 +885,10 @@ fn save_window_state(ui: &Ui, window: &adw::ApplicationWindow) {
         height,
         maximized: window.is_maximized(),
     };
-    let mut config = ui.dirs.load_config();
-    if config.window == state {
+    if ui.dirs.load_config().window == state {
         return;
     }
-    config.window = state;
-    if let Err(e) = ui.dirs.save_config(&config) {
+    if let Err(e) = ui.dirs.update_config(|config| config.window = state) {
         tracing::warn!("cannot save the window size: {e}");
     }
 }
@@ -1471,7 +1486,10 @@ fn install_launch_actions(ui: &Rc<Ui>, app: &adw::Application, window: &adw::App
             show_login(&ui_page);
             return;
         }
-        if let Some(view) = sync_view(page) {
+        if let Some(name) = preferences_page(page) {
+            ui_page.status.prefs.set_visible_page_name(name);
+            ui_page.status.prefs.present(ui_window(&ui_page).as_ref());
+        } else if let Some(view) = sync_view(page) {
             ui_page.locations.views.set_visible_child_name(view);
             ui_page.stack.set_visible_child_name("locations");
         } else if let Some((view, map)) = photos_view(page) {
@@ -2053,6 +2071,15 @@ mod tests {
         assert_eq!(sync_view("activity"), Some("history"));
         assert_eq!(sync_view("sync-folders"), Some("folders"));
         assert_eq!(sync_view("locations"), None);
+    }
+
+    #[test]
+    fn a_page_name_can_open_a_preferences_page() {
+        assert_eq!(preferences_page("preferences"), Some("general"));
+        assert_eq!(preferences_page("preferences-sync"), Some("sync"));
+        assert_eq!(preferences_page("preferences-apps"), Some("apps"));
+        assert_eq!(preferences_page("preferences-storage"), Some("storage"));
+        assert_eq!(preferences_page("sync"), None);
     }
 
     /// One file of a shot, for the group-switch tests.

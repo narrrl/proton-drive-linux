@@ -119,6 +119,10 @@ commands are for scripts and for cases where the mount is not available.
 | `pdfs sync reset ID` | Forget what a synced folder synced before and compare it with Proton Drive again. A file on one side only is copied to the other, and a file that differs keeps both versions. Nothing is deleted. |
 | `pdfs sync pause [--for 1h] [--folder ID]` | Pause uploads and synced folders. Reading files keeps working. `--for` ends the pause by itself (`30m`, `1h`, `2d`). |
 | `pdfs sync resume [--folder ID]` | Resume after a pause. |
+| `pdfs sync ignore list` | Print the patterns every synced folder leaves out. Built-in ones are marked. |
+| `pdfs sync ignore add PATTERN` / `remove PATTERN` | Leave out, or stop leaving out, files matching a gitignore-style pattern such as `*.db` or `build/`. A pattern starting with `-` goes after `--`. |
+| `pdfs sync ignore reset` | Use the built-in patterns again. |
+| `pdfs sync ignore check PATH` | Say whether a file in a synced folder is synced, and which pattern decides. |
 | `pdfs sync limit [--up RATE] [--down RATE]` | Cap bandwidth, for example `500K` or `2M` per second. `0` removes a cap. Without options, prints the current caps. |
 | `pdfs sync queue` | List changes that have not reached Proton Drive yet. |
 | `pdfs sync issues` | List queued changes Proton Drive refused or that keep failing, and what to do. |

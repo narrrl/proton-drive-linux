@@ -30,6 +30,11 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 /// them. Version-control metadata, dependency and build trees, editor
 /// leftovers, and OS turds — none of which belong on Drive, all of which are
 /// large or rewritten constantly.
+///
+/// The second half is what Nextcloud, Dropbox and Syncthing leave out as well:
+/// files a desktop, a file system or a program in the middle of a write leaves
+/// behind, never anything a person made. Every one is in a test, next to a real
+/// file of a similar name that must stay synced.
 pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     ".git/",
     ".hg/",
@@ -43,6 +48,23 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "*.tmp",
     ".DS_Store",
     "Thumbs.db",
+    // Folder settings of Windows and KDE's Dolphin.
+    "desktop.ini",
+    ".directory",
+    // Trash folders and file-system leftovers: a file deleted while open on a
+    // FUSE or NFS mount lives on under one of these names until it is closed.
+    ".Trash-*/",
+    ".Trashes/",
+    ".Spotlight-V100/",
+    ".fuse_hidden*",
+    ".nfs*",
+    // Downloads and saves still being written.
+    "*.part",
+    "*.crdownload",
+    "*.kate-swp",
+    // Office lock files: LibreOffice's `.~lock.<name>#`, Microsoft Office's `~$<name>`.
+    ".~lock.*#",
+    "~$*",
 ];
 
 /// Suffixes that mean a file is incomplete *by construction*: only the program
@@ -119,6 +141,149 @@ pub fn is_scratch_name(name: &str) -> bool {
 /// Filenames accepted as a folder's ignore file, in precedence order.
 const IGNORE_FILE_NAMES: &[&str] = &[".pdfsignore", ".protonignore"];
 
+/// Whether `line` is a rule [`IgnoreRules::load`] accepts: a pattern, a
+/// comment or a blank line. The error says what is wrong with it.
+pub fn check_pattern(line: &str) -> Result<(), String> {
+    GitignoreBuilder::new("/")
+        .add_line(None, line)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The lines of an ignore file that [`IgnoreRules::load`] would skip, by line
+/// number (from 1), with what is wrong with each.
+pub fn check_rules(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(i, line)| check_pattern(line).err().map(|e| (i + 1, e)))
+        .collect()
+}
+
+/// A synced folder's own ignore file, read so it can be edited and written
+/// back. See [`FolderRules::read`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRules {
+    /// The file the rules are in: the one in use, or `.pdfsignore` when there
+    /// is none yet.
+    pub path: std::path::PathBuf,
+    /// The rules as read; empty when there is no file. `None` means there was
+    /// no file, which [`write`](Self::write) checks is still so.
+    pub text: Option<String>,
+}
+
+/// Why [`FolderRules::write`] did not write.
+#[derive(Debug)]
+pub enum WriteRulesError {
+    /// The file changed after it was read, for example by an edit on another
+    /// computer that sync brought in. The rules on disk are the new ones.
+    Changed,
+    /// Reading or writing failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for WriteRulesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed => f.write_str("the file changed since it was opened"),
+            Self::Io(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WriteRulesError {}
+
+impl From<std::io::Error> for WriteRulesError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl FolderRules {
+    /// Read the ignore file of the folder at `root`, the same one
+    /// [`IgnoreRules::load`] uses.
+    pub fn read(root: &Path) -> std::io::Result<Self> {
+        for name in IGNORE_FILE_NAMES {
+            let path = root.join(name);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    return Ok(Self {
+                        path,
+                        text: Some(text),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        // Like `load`, a missing folder reads as one without rules; the write
+        // is what fails then.
+        Ok(Self {
+            path: root.join(IGNORE_FILE_NAMES[0]),
+            text: None,
+        })
+    }
+
+    /// Replace the rules with `text`, unless the file changed since it was
+    /// read. Rules that are all blank remove the file, so a folder never keeps
+    /// an empty one around.
+    ///
+    /// Written to a temporary file and renamed over the old one, so the sync
+    /// pass reading the rules at the same moment sees the old ones or the new
+    /// ones, never half of them.
+    pub fn write(&self, text: &str) -> Result<(), WriteRulesError> {
+        let now = match std::fs::read_to_string(&self.path) {
+            Ok(now) => Some(now),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if now != self.text {
+            return Err(WriteRulesError::Changed);
+        }
+        if text.trim().is_empty() {
+            return match std::fs::remove_file(&self.path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            };
+        }
+        let Some(name) = self.path.file_name() else {
+            return Err(std::io::Error::other("the rules path has no file name").into());
+        };
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp = self.path.with_file_name(tmp_name);
+        let mut body = text.to_string();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &self.path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(written?)
+    }
+}
+
+/// Where a rule that decided about a path came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSource {
+    /// The rules for every synced folder (`ignore_patterns`).
+    AllFolders,
+    /// The folder's own ignore file.
+    ThisFolder,
+}
+
+/// What the rules say about one path, and which rule says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// No rule matches: the path is synced.
+    Synced,
+    /// Left out by `pattern`. `pattern` may name a folder the path is in.
+    Excluded { pattern: String, source: RuleSource },
+    /// A rule excluded it, and a later `!pattern` brought it back.
+    Included { pattern: String, source: RuleSource },
+}
+
 /// Compiled ignore rules for one synced folder.
 pub struct IgnoreRules {
     matcher: Option<Gitignore>,
@@ -153,6 +318,27 @@ impl IgnoreRules {
             break;
         }
 
+        if !any {
+            return Self { matcher: None };
+        }
+        Self {
+            matcher: builder.build().ok(),
+        }
+    }
+
+    /// [`load`](Self::load) with `text` standing in for the folder's ignore
+    /// file, for showing what rules being edited would do before they are
+    /// saved.
+    pub fn with_folder_text(root: &Path, globals: &[String], text: &str) -> Self {
+        let mut builder = GitignoreBuilder::new(root);
+        let mut any = false;
+        for pattern in globals {
+            any |= builder.add_line(None, pattern).is_ok();
+        }
+        let file = root.join(IGNORE_FILE_NAMES[0]);
+        for line in text.lines() {
+            any |= builder.add_line(Some(file.clone()), line).is_ok();
+        }
         if !any {
             return Self { matcher: None };
         }
@@ -207,6 +393,50 @@ impl IgnoreRules {
     }
 }
 
+impl IgnoreRules {
+    /// What the rules say about `rel`, and which rule decides, the way
+    /// [`is_ignored`](Self::is_ignored) decides it.
+    pub fn explain(&self, rel: &str, is_dir: bool) -> Verdict {
+        let Some(matcher) = &self.matcher else {
+            return Verdict::Synced;
+        };
+        let rel = rel.trim_matches('/');
+        if rel.is_empty() {
+            return Verdict::Synced;
+        }
+        let source = |glob: &ignore::gitignore::Glob| match glob.from() {
+            Some(_) => RuleSource::ThisFolder,
+            None => RuleSource::AllFolders,
+        };
+        let mut prefix = String::new();
+        let mut parts = rel.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let last = parts.peek().is_none();
+            let as_dir = if last { is_dir } else { true };
+            match matcher.matched(&prefix, as_dir) {
+                ignore::Match::Ignore(glob) => {
+                    return Verdict::Excluded {
+                        pattern: glob.original().to_string(),
+                        source: source(glob),
+                    };
+                }
+                ignore::Match::Whitelist(glob) if last => {
+                    return Verdict::Included {
+                        pattern: glob.original().to_string(),
+                        source: source(glob),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Verdict::Synced
+    }
+}
+
 impl std::fmt::Debug for IgnoreRules {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IgnoreRules")
@@ -253,6 +483,160 @@ mod tests {
 
     fn write(root: &Path, name: &str, body: &str) {
         std::fs::write(root.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn the_added_defaults_leave_out_clutter_but_not_look_alikes() {
+        let dir = TempDir::new();
+        let rules = IgnoreRules::load(dir.path(), &globals());
+        for (clutter, is_dir) in [
+            ("desktop.ini", false),
+            ("Photos/.directory", false),
+            (".Trash-1000", true),
+            (".Trashes", true),
+            (".Spotlight-V100", true),
+            (".fuse_hidden0000001a00000002", false),
+            (".nfs000000000123abcd", false),
+            ("movie.mkv.part", false),
+            ("setup.exe.crdownload", false),
+            ("notes.txt.kate-swp", false),
+            (".~lock.report.odt#", false),
+            ("~$budget.xlsx", false),
+        ] {
+            assert!(rules.is_ignored(clutter, is_dir), "{clutter}");
+        }
+        for kept in [
+            "Desktop/notes.txt",
+            "directory.txt",
+            "Trash-talk.md",
+            "nfs-setup.md",
+            "parts.csv",
+            "part.txt",
+            "report.odt",
+            "budget.xlsx",
+        ] {
+            assert!(!rules.is_ignored(kept, false), "{kept}");
+        }
+    }
+
+    #[test]
+    fn a_bad_pattern_is_reported_with_its_line() {
+        assert!(check_pattern("*.db").is_ok());
+        assert!(check_pattern("# a comment").is_ok());
+        assert!(check_pattern("").is_ok());
+        assert!(check_pattern("*.{jpg,png").is_err());
+        assert!(check_pattern("[z-a]").is_err());
+        let bad = check_rules("*.log\n{oops\nbuild/\n");
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].0, 2);
+    }
+
+    #[test]
+    fn explain_names_the_rule_and_where_it_came_from() {
+        let dir = TempDir::new();
+        write(dir.path(), ".pdfsignore", "*.db\n!keep.tmp\n");
+        let rules = IgnoreRules::load(dir.path(), &globals());
+        assert_eq!(
+            rules.explain("data/cache.db", false),
+            Verdict::Excluded {
+                pattern: "*.db".into(),
+                source: RuleSource::ThisFolder
+            }
+        );
+        assert_eq!(
+            rules.explain("app/node_modules/x/index.js", false),
+            Verdict::Excluded {
+                pattern: "node_modules/".into(),
+                source: RuleSource::AllFolders
+            }
+        );
+        assert_eq!(
+            rules.explain("keep.tmp", false),
+            Verdict::Included {
+                pattern: "!keep.tmp".into(),
+                source: RuleSource::ThisFolder
+            }
+        );
+        assert_eq!(rules.explain("src/main.rs", false), Verdict::Synced);
+        // `explain` and `is_ignored` never disagree.
+        for (path, is_dir) in [
+            ("data/cache.db", false),
+            ("keep.tmp", false),
+            ("x.tmp", false),
+        ] {
+            assert_eq!(
+                rules.is_ignored(path, is_dir),
+                matches!(rules.explain(path, is_dir), Verdict::Excluded { .. }),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_being_edited_explain_like_the_saved_ones() {
+        let dir = TempDir::new();
+        let text = "*.db\n!keep.db\n";
+        write(dir.path(), ".pdfsignore", text);
+        let saved = IgnoreRules::load(dir.path(), &globals());
+        let edited = IgnoreRules::with_folder_text(dir.path(), &globals(), text);
+        for path in ["a.db", "keep.db", "node_modules/x", "src/x.rs"] {
+            assert_eq!(
+                saved.explain(path, false),
+                edited.explain(path, false),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_rules_are_written_back_and_removed_when_blank() {
+        let dir = TempDir::new();
+        let rules = FolderRules::read(dir.path()).unwrap();
+        assert_eq!(rules.text, None);
+        assert_eq!(rules.path, dir.path().join(".pdfsignore"));
+        rules.write("*.db").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".pdfsignore")).unwrap(),
+            "*.db\n"
+        );
+        assert!(IgnoreRules::load(dir.path(), &[]).is_ignored("x.db", false));
+
+        let rules = FolderRules::read(dir.path()).unwrap();
+        rules.write("  \n").unwrap();
+        assert!(!dir.path().join(".pdfsignore").exists());
+    }
+
+    #[test]
+    fn folder_rules_keep_the_file_name_in_use() {
+        let dir = TempDir::new();
+        write(dir.path(), ".protonignore", "old/\n");
+        let rules = FolderRules::read(dir.path()).unwrap();
+        assert_eq!(rules.path, dir.path().join(".protonignore"));
+        rules.write("new/\n").unwrap();
+        assert!(!dir.path().join(".pdfsignore").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".protonignore")).unwrap(),
+            "new/\n"
+        );
+    }
+
+    #[test]
+    fn folder_rules_changed_elsewhere_are_not_written_over() {
+        let dir = TempDir::new();
+        write(dir.path(), ".pdfsignore", "a/\n");
+        let rules = FolderRules::read(dir.path()).unwrap();
+        write(dir.path(), ".pdfsignore", "b/\n");
+        assert!(matches!(rules.write("c/"), Err(WriteRulesError::Changed)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".pdfsignore")).unwrap(),
+            "b/\n"
+        );
+
+        // A file that appeared after an empty read counts as a change too.
+        let dir = TempDir::new();
+        let rules = FolderRules::read(dir.path()).unwrap();
+        write(dir.path(), ".pdfsignore", "b/\n");
+        assert!(matches!(rules.write("c/"), Err(WriteRulesError::Changed)));
     }
 
     #[test]

@@ -306,6 +306,7 @@ a live account since.
 
 | Entry | Title |
 |---|---|
+| [B292](#b292--two-programs-changing-settings-at-once-lose-one-of-the-changes) | Two programs changing settings at once lose one of the changes |
 | [B290](#b290--reopening-the-database-right-after-closing-it-can-be-refused-as-another-daemon) | Reopening the database right after closing it can be refused as another daemon |
 | [B276](#b276--a-stop-can-end-with-a-panic-in-a-thread-the-stop-never-waited-for) | A stop can end with a panic in a thread the stop never waited for |
 | [B258](#b258--journalctl--p-warning-shows-nothing-whatever-the-daemon-logged) | `journalctl -p warning` shows nothing, whatever the daemon logged |
@@ -393,6 +394,34 @@ a live account since.
 ## Entries
 
 Newest first.
+
+### B292 — Two programs changing settings at once lose one of the changes
+
+**Status:** Fixed
+
+**Found:** 2026-11-15, reading every writer of `config.json` while adding settings to Preferences.
+
+**Where:** `crates/pdfs-core/src/config.rs`, `AppDirs::save_config` and its callers in the app,
+the tray and the daemon
+
+**Repro:** Change the cache size in Preferences (the daemon writes `cache_budget`) while the app
+saves the window size or the tray hides itself. Both read the file before either wrote it, and
+the one that wrote last puts the other setting back. Not seen in the field; the window is a few
+milliseconds, but more settings in the app make it more likely.
+
+**Cause:** Every writer loaded the file, changed one field and wrote the whole file back, with
+nothing ordering them. The atomic rename kept the file whole, not the changes.
+
+**Fix:** `AppDirs::update_config` reads, changes and writes under an `flock` on
+`config.json.lock`, and every writer goes through it. It refuses an unreadable file before
+applying the change (B223). A lock held longer than 5 seconds is reported as an error instead of
+waited on.
+
+**Verified:** `cargo test -p pdfs-core config::tests` on 2026-11-15,
+`concurrent_changes_to_different_settings_are_all_kept` and
+`a_change_is_never_applied_over_an_unreadable_config`.
+
+---
 
 ### B291 — On Fedora 45's oo7, every saved sign-in is lost at the next reboot
 

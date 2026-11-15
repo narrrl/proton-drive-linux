@@ -398,12 +398,10 @@ fn open_manager(args: &[&str]) {
 /// Remember that the user hid the icon, so the next login's autostart and the
 /// app both leave it away, then exit.
 fn hide_tray() {
-    if let Ok(dirs) = AppDirs::new() {
-        let mut config = dirs.load_config();
-        config.tray_hidden = true;
-        if let Err(e) = dirs.save_config(&config) {
-            tracing::warn!("hide tray icon: {e}");
-        }
+    if let Ok(dirs) = AppDirs::new()
+        && let Err(e) = dirs.update_config(|config| config.tray_hidden = true)
+    {
+        tracing::warn!("hide tray icon: {e}");
     }
     std::process::exit(0);
 }

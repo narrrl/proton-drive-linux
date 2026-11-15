@@ -69,9 +69,10 @@ windowrulev2 = center, class:^(pdfs-prompt)$
 bind = SUPER, space, exec, pdfs-prompt --fzf
 ```
 
-To make `--dmenu` or `--fzf` the default without changing your shortcut, set `prompt.mode` in
-`config.json` (see [Configuration → `prompt`](CONFIGURATION.md#prompt)). `--gtk` always opens the
-built-in window.
+To make `--dmenu` or `--fzf` the default without changing your shortcut, pick it in
+**Preferences → Apps → Search Launcher**, or set `prompt.mode` in `config.json` (see
+[Configuration → `prompt`](CONFIGURATION.md#prompt)). `--gtk` always opens the built-in window.
+Which program opens a file you pick is set under **Preferences → Apps → Open Files With**.
 
 ## Tray
 

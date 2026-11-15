@@ -751,6 +751,32 @@ enum ConflictCmd {
     },
 }
 
+/// `pdfs sync ignore`: the patterns in `ignore_patterns`, for every synced
+/// folder. A folder's own rules are in its `.pdfsignore`.
+#[derive(Subcommand, Debug)]
+enum IgnoreCmd {
+    /// List the patterns every synced folder leaves out.
+    List,
+    /// Leave out files matching a gitignore-style pattern, e.g. `*.db` or `build/`.
+    Add {
+        /// The pattern; end it with `/` to match folders only.
+        pattern: String,
+    },
+    /// Stop leaving out files matching a pattern.
+    Remove {
+        /// The pattern, as `sync ignore list` shows it.
+        pattern: String,
+    },
+    /// Go back to the built-in patterns.
+    Reset,
+    /// Say whether a file in a synced folder is synced, and which pattern decides.
+    Check {
+        /// A file or folder inside a synced folder.
+        #[arg(value_hint = ValueHint::AnyPath)]
+        path: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum SyncCmd {
     /// Add a local folder to this machine's device and upload its contents.
@@ -848,6 +874,11 @@ enum SyncCmd {
         /// Queue id; omit to retry every failed operation.
         #[arg(add = ArgValueCandidates::new(complete::queue_id))]
         id: Option<i64>,
+    },
+    /// Show or change the patterns every synced folder leaves out, or check a path.
+    Ignore {
+        #[command(subcommand)]
+        action: IgnoreCmd,
     },
     /// Switch a folder between full-copy sync and on-demand (FUSE, no local storage).
     Mode {
@@ -1324,6 +1355,7 @@ fn cmd_sync(action: SyncCmd) -> Result<()> {
         SyncCmd::Issues => return cmd_sync_issues(),
         SyncCmd::Export { id, dest } => return cmd_sync_export(id, &dest),
         SyncCmd::Limit { up, down } => return cmd_sync_limit(up, down),
+        SyncCmd::Ignore { action } => return cmd_sync_ignore(action),
         SyncCmd::Discard { id, yes } => {
             if !yes {
                 confirm(&format!(
@@ -3699,6 +3731,104 @@ fn cmd_sync_limit(up: Option<u64>, down: Option<u64>) -> Result<()> {
     })?)
 }
 
+fn cmd_sync_ignore(action: IgnoreCmd) -> Result<()> {
+    use pdfs_core::syncignore::{
+        DEFAULT_IGNORE_PATTERNS, IgnoreRules, RuleSource, Verdict, check_pattern,
+    };
+    let dirs = AppDirs::new()?;
+    let defaults: Vec<String> = DEFAULT_IGNORE_PATTERNS
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+    // A list equal to the built-in one is stored as unset, so it follows the
+    // built-in list in later releases, as Preferences does.
+    let change = |edit: &dyn Fn(&mut Vec<String>)| -> Result<()> {
+        dirs.update_config(|config| {
+            let mut list = config.resolved_ignore_patterns();
+            edit(&mut list);
+            config.ignore_patterns = (list != defaults).then_some(list);
+        })?;
+        // The next pass picks the change up anyway; this only hurries it.
+        let _ = control_request(CtlRequest::SyncNow { id: None });
+        Ok(())
+    };
+    match action {
+        IgnoreCmd::List => {
+            let config = dirs.load_config();
+            let list = config.resolved_ignore_patterns();
+            if list.is_empty() {
+                println!("No patterns: every file is synced.");
+            }
+            for pattern in list {
+                if DEFAULT_IGNORE_PATTERNS.contains(&pattern.as_str()) {
+                    println!("{pattern}  (built in)");
+                } else {
+                    println!("{pattern}");
+                }
+            }
+        }
+        IgnoreCmd::Add { pattern } => {
+            let pattern = pattern.trim().to_string();
+            if let Err(e) = check_pattern(&pattern) {
+                bail!("not a valid pattern: {e}");
+            }
+            change(&|list| {
+                if !list.contains(&pattern) {
+                    list.push(pattern.clone());
+                }
+            })?;
+        }
+        IgnoreCmd::Remove { pattern } => {
+            let list = dirs.load_config().resolved_ignore_patterns();
+            if !list.contains(&pattern) {
+                bail!("`{pattern}` is not in the list; see `pdfs sync ignore list`");
+            }
+            change(&|list| list.retain(|p| *p != pattern))?;
+        }
+        IgnoreCmd::Reset => change(&|list| *list = defaults.clone())?,
+        IgnoreCmd::Check { path } => {
+            let path = std::path::absolute(&path)?;
+            let folders = match control_request(CtlRequest::ListSyncFolders)? {
+                CtlResponse::SyncFolders { items } => items,
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected reply: {other:?}"),
+            };
+            let Some(folder) = folders
+                .iter()
+                .filter(|f| path.starts_with(&f.local_path))
+                .max_by_key(|f| f.local_path.len())
+            else {
+                bail!("{} is not in a synced folder", path.display());
+            };
+            if folder.mode != "mirror" {
+                println!(
+                    "{} is online only; patterns apply only to folders kept on this computer.",
+                    folder.local_path
+                );
+                return Ok(());
+            }
+            let root = PathBuf::from(&folder.local_path);
+            let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+            let globals = dirs.load_config().resolved_ignore_patterns();
+            let rules = IgnoreRules::load(&root, &globals);
+            let source = |source: &RuleSource| match source {
+                RuleSource::AllFolders => "the patterns for all synced folders".to_string(),
+                RuleSource::ThisFolder => format!("{}/.pdfsignore", root.display()),
+            };
+            match rules.explain(&rel, path.is_dir()) {
+                Verdict::Synced => println!("Synced: no pattern matches it."),
+                Verdict::Excluded { pattern, source: s } => {
+                    println!("Not synced: excluded by `{pattern}` in {}.", source(&s))
+                }
+                Verdict::Included { pattern, source: s } => {
+                    println!("Synced: `{pattern}` in {} includes it again.", source(&s))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How long the oldest write may wait to upload before `diagnose` calls it
 /// out. Under a day it is a slow link or a big file; past it, something is
 /// holding the queue.
@@ -4646,6 +4776,21 @@ mod login_wait_tests {
             Command::ImportGooglePhotos { resume: true, .. }
         ));
         assert!(Cli::try_parse_from(["pdfs", "import-google-photos"]).is_err());
+    }
+
+    #[test]
+    fn sync_ignore_takes_a_pattern_that_looks_like_an_option_after_dashes() {
+        let cli = Cli::try_parse_from(["pdfs", "sync", "ignore", "add", "--", "-temp*"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync {
+                action: SyncCmd::Ignore {
+                    action: IgnoreCmd::Add { ref pattern }
+                }
+            } if pattern == "-temp*"
+        ));
+        assert!(Cli::try_parse_from(["pdfs", "sync", "ignore", "add"]).is_err());
+        assert!(Cli::try_parse_from(["pdfs", "sync", "ignore", "reset"]).is_ok());
         assert!(
             Cli::try_parse_from(["pdfs", "import-google-photos", "--resume", "a.zip"]).is_err()
         );
