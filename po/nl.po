@@ -5,7 +5,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: proton-drive-linux 2.1.0\n"
 "Report-Msgid-Bugs-To: https://github.com/narrrl/proton-drive-linux/issues\n"
-"POT-Creation-Date: 2026-11-16 00:15+0100\n"
+"POT-Creation-Date: 2026-11-16 00:38+0100\n"
 "PO-Revision-Date: 2026-09-23 12:00+0200\n"
 "Last-Translator: Proton Drive for Linux contributors\n"
 "Language-Team: Dutch\n"
@@ -57,7 +57,7 @@ msgstr "%-d %b %Y"
 msgid "%A, %B %-d, %Y, %H:%M"
 msgstr "%A %-d %B %Y, %H:%M"
 
-#: crates/pdfs-gui/src/app/main.rs:926
+#: crates/pdfs-gui/src/app/main.rs:934
 #: crates/pdfs-gui/src/app/pages/activity_text.rs:543
 #: crates/pdfs-gui/src/app/pages/browser.rs:473
 #: crates/pdfs-gui/src/app/pages/browser.rs:880
@@ -70,37 +70,37 @@ msgstr "%A %-d %B %Y, %H:%M"
 msgid "My files"
 msgstr "Mijn bestanden"
 
-#: crates/pdfs-gui/src/app/main.rs:927 crates/pdfs-gui/src/app/main.rs:1608
+#: crates/pdfs-gui/src/app/main.rs:935 crates/pdfs-gui/src/app/main.rs:1616
 #: crates/pdfs-gui/src/app/pages/albums.rs:636
 #: crates/pdfs-gui/src/app/pages/photos.rs:929
 #: crates/pdfs-gui/src/app/pages/places.rs:473
 msgid "Photos"
 msgstr "Foto's"
 
-#: crates/pdfs-gui/src/app/main.rs:930
+#: crates/pdfs-gui/src/app/main.rs:938
 #: crates/pdfs-gui/src/app/pages/shared.rs:168
 #: crates/pdfs-gui/src/app/pages/shared.rs:493
 msgid "Shared with me"
 msgstr "Gedeeld met mij"
 
-#: crates/pdfs-gui/src/app/main.rs:935
+#: crates/pdfs-gui/src/app/main.rs:943
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:120
 msgid "Shared by me"
 msgstr "Gedeeld door mij"
 
-#: crates/pdfs-gui/src/app/main.rs:938
+#: crates/pdfs-gui/src/app/main.rs:946
 #: crates/pdfs-gui/src/app/pages/devices.rs:140
 #: crates/pdfs-gui/src/app/pages/devices.rs:505
 msgid "Computers"
 msgstr "Computers"
 
-#: crates/pdfs-gui/src/app/main.rs:939
+#: crates/pdfs-gui/src/app/main.rs:947
 #: crates/pdfs-gui/src/app/pages/trash.rs:101
 msgid "Trash"
 msgstr "Prullenbak"
 
 #. Translators: sidebar entry for the page listing this computer's synced folders.
-#: crates/pdfs-gui/src/app/main.rs:941
+#: crates/pdfs-gui/src/app/main.rs:949
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:66
 msgid "Sync"
 msgstr "Synchronisatie"
@@ -108,12 +108,12 @@ msgstr "Synchronisatie"
 #. Translators: a failed action's toast. {what} says what failed, such as
 #. "Couldn't rename"; {detail} is the reason, usually untranslated text
 #. from the mount service.
-#: crates/pdfs-gui/src/app/main.rs:1291
+#: crates/pdfs-gui/src/app/main.rs:1299
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:915
 #: crates/pdfs-gui/src/app/pages/preferences_apps.rs:284
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:175
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:212
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:391
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:401
 #: crates/pdfs-gui/src/app/pages/takeout.rs:891
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:182
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:289
@@ -121,31 +121,31 @@ msgstr "Synchronisatie"
 msgid "{what}: {detail}"
 msgstr "{what}: {detail}"
 
-#: crates/pdfs-gui/src/app/main.rs:1314
+#: crates/pdfs-gui/src/app/main.rs:1322
 msgid "You're offline"
 msgstr "Je bent offline"
 
-#: crates/pdfs-gui/src/app/main.rs:1315
+#: crates/pdfs-gui/src/app/main.rs:1323
 msgid "That's not there any more"
 msgstr "Dat bestaat niet meer"
 
-#: crates/pdfs-gui/src/app/main.rs:1316
+#: crates/pdfs-gui/src/app/main.rs:1324
 msgid "You don't have access to that"
 msgstr "Je hebt daar geen toegang toe"
 
-#: crates/pdfs-gui/src/app/main.rs:1317
+#: crates/pdfs-gui/src/app/main.rs:1325
 msgid "Something changed this first"
 msgstr "Er is eerst iets anders gewijzigd"
 
-#: crates/pdfs-gui/src/app/main.rs:1318
+#: crates/pdfs-gui/src/app/main.rs:1326
 msgid "Your Proton Drive is full"
 msgstr "Je Proton Drive is vol"
 
-#: crates/pdfs-gui/src/app/main.rs:1405
+#: crates/pdfs-gui/src/app/main.rs:1413
 msgid "Proton Drive for Linux"
 msgstr "Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1413
+#: crates/pdfs-gui/src/app/main.rs:1421
 msgid ""
 "Files-on-demand Proton Drive for the Linux desktop.\n"
 "\n"
@@ -157,23 +157,23 @@ msgstr ""
 "Onofficiële client — niet gelieerd aan, onderschreven door of ondersteund "
 "door Proton AG."
 
-#: crates/pdfs-gui/src/app/main.rs:1418
+#: crates/pdfs-gui/src/app/main.rs:1426
 msgid "Source Code"
 msgstr "Broncode"
 
-#: crates/pdfs-gui/src/app/main.rs:1422
+#: crates/pdfs-gui/src/app/main.rs:1430
 msgid "Proton Terms of Service"
 msgstr "Servicevoorwaarden van Proton"
 
-#: crates/pdfs-gui/src/app/main.rs:1426
+#: crates/pdfs-gui/src/app/main.rs:1434
 msgid "Proton Privacy Policy"
 msgstr "Privacybeleid van Proton"
 
-#: crates/pdfs-gui/src/app/main.rs:1431
+#: crates/pdfs-gui/src/app/main.rs:1439
 msgid "Disclaimer"
 msgstr "Disclaimer"
 
-#: crates/pdfs-gui/src/app/main.rs:1435
+#: crates/pdfs-gui/src/app/main.rs:1443
 msgid ""
 "This is an unofficial, community-built client. It is not affiliated with, "
 "endorsed by, or supported by Proton AG.\n"
@@ -196,7 +196,7 @@ msgstr ""
 "Deze software wordt geleverd “zoals ze is”, zonder enige garantie. Bewaar "
 "een kopie van gegevens die je niet kwijt wilt raken."
 
-#: crates/pdfs-gui/src/app/main.rs:1443
+#: crates/pdfs-gui/src/app/main.rs:1451
 msgid ""
 "Places are named with data from <a href=\"https://www.geonames.org/"
 "\">GeoNames</a>, licensed under <a href=\"https://creativecommons.org/"
@@ -206,7 +206,7 @@ msgstr ""
 "\">GeoNames</a>, gelicentieerd onder <a href=\"https://creativecommons.org/"
 "licenses/by/4.0/\">CC BY 4.0</a>."
 
-#: crates/pdfs-gui/src/app/main.rs:1451
+#: crates/pdfs-gui/src/app/main.rs:1459
 msgid ""
 "The places map is drawn from <a href=\"https://www.naturalearthdata.com/"
 "\">Natural Earth</a> land outlines and country borders, which are in the "
@@ -216,7 +216,7 @@ msgstr ""
 "href=\"https://www.naturalearthdata.com/\">Natural Earth</a>, die in het "
 "publieke domein vallen."
 
-#: crates/pdfs-gui/src/app/main.rs:1459
+#: crates/pdfs-gui/src/app/main.rs:1467
 msgid ""
 "The street map, when turned on, comes from <a href=\"https://openfreemap.org/"
 "\">OpenFreeMap</a> in the <a href=\"https://www.openmaptiles.org/"
@@ -232,15 +232,15 @@ msgstr ""
 
 #. Translators: replace with your name(s) and email address(es), one
 #. per line, to be credited in the About dialog.
-#: crates/pdfs-gui/src/app/main.rs:1470
+#: crates/pdfs-gui/src/app/main.rs:1478
 msgid "translator-credits"
 msgstr "Bijdragers aan Proton Drive for Linux"
 
-#: crates/pdfs-gui/src/app/main.rs:1525
+#: crates/pdfs-gui/src/app/main.rs:1533
 msgid "Stop Proton Drive?"
 msgstr "Proton Drive stoppen?"
 
-#: crates/pdfs-gui/src/app/main.rs:1526
+#: crates/pdfs-gui/src/app/main.rs:1534
 msgid ""
 "My files goes offline and nothing syncs until you connect again. Proton "
 "Drive starts again at your next login."
@@ -248,7 +248,7 @@ msgstr ""
 "Mijn bestanden gaat offline en er wordt niets gesynchroniseerd tot je weer "
 "verbinding maakt. Proton Drive start opnieuw bij je volgende aanmelding."
 
-#: crates/pdfs-gui/src/app/main.rs:1528 crates/pdfs-gui/src/app/main.rs:1858
+#: crates/pdfs-gui/src/app/main.rs:1536 crates/pdfs-gui/src/app/main.rs:1866
 #: crates/pdfs-gui/src/app/pages/albums.rs:244
 #: crates/pdfs-gui/src/app/pages/albums.rs:431
 #: crates/pdfs-gui/src/app/pages/browser.rs:1989
@@ -277,7 +277,7 @@ msgstr ""
 #: crates/pdfs-gui/src/app/pages/shared.rs:1074
 #: crates/pdfs-gui/src/app/pages/shared_by_me.rs:551
 #: crates/pdfs-gui/src/app/pages/status.rs:641
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:239
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:249
 #: crates/pdfs-gui/src/app/pages/takeout.rs:431
 #: crates/pdfs-gui/src/app/pages/trash.rs:465
 #: crates/pdfs-gui/src/app/pages/trash.rs:498
@@ -288,30 +288,30 @@ msgstr ""
 msgid "Cancel"
 msgstr "Annuleren"
 
-#: crates/pdfs-gui/src/app/main.rs:1529
+#: crates/pdfs-gui/src/app/main.rs:1537
 msgctxt "verb"
 msgid "Stop"
 msgstr "Stoppen"
 
-#: crates/pdfs-gui/src/app/main.rs:1546
+#: crates/pdfs-gui/src/app/main.rs:1554
 msgid "Couldn't stop Proton Drive"
 msgstr "Kon Proton Drive niet stoppen"
 
-#: crates/pdfs-gui/src/app/main.rs:1547
+#: crates/pdfs-gui/src/app/main.rs:1555
 msgid "The Proton Drive service did not stop."
 msgstr "De Proton Drive-service is niet gestopt."
 
-#: crates/pdfs-gui/src/app/main.rs:1583
+#: crates/pdfs-gui/src/app/main.rs:1591
 #: crates/pdfs-gui/src/app/pages/status.rs:272
 msgid "General"
 msgstr "Algemeen"
 
-#: crates/pdfs-gui/src/app/main.rs:1585
+#: crates/pdfs-gui/src/app/main.rs:1593
 #: crates/pdfs-gui/src/app/pages/browser.rs:266
 msgid "Search Drive"
 msgstr "Drive doorzoeken"
 
-#: crates/pdfs-gui/src/app/main.rs:1586
+#: crates/pdfs-gui/src/app/main.rs:1594
 #: crates/pdfs-gui/src/app/pages/browser.rs:1019
 #: crates/pdfs-gui/src/app/pages/devices.rs:571
 #: crates/pdfs-gui/src/app/pages/shared.rs:590
@@ -320,55 +320,55 @@ msgstr "Drive doorzoeken"
 msgid "Refresh"
 msgstr "Verversen"
 
-#: crates/pdfs-gui/src/app/main.rs:1587
+#: crates/pdfs-gui/src/app/main.rs:1595
 #: crates/pdfs-gui/src/app/pages/status.rs:416
 msgid "Preferences"
 msgstr "Voorkeuren"
 
-#: crates/pdfs-gui/src/app/main.rs:1588
+#: crates/pdfs-gui/src/app/main.rs:1596
 msgid "Keyboard shortcuts"
 msgstr "Sneltoetsen"
 
-#: crates/pdfs-gui/src/app/main.rs:1592
+#: crates/pdfs-gui/src/app/main.rs:1600
 msgid "Files"
 msgstr "Bestanden"
 
-#: crates/pdfs-gui/src/app/main.rs:1594
+#: crates/pdfs-gui/src/app/main.rs:1602
 #: crates/pdfs-gui/src/app/pages/browser.rs:313
 msgid "New folder"
 msgstr "Nieuwe map"
 
-#: crates/pdfs-gui/src/app/main.rs:1595
+#: crates/pdfs-gui/src/app/main.rs:1603
 #: crates/pdfs-gui/src/app/pages/browser.rs:309
 msgid "Upload files"
 msgstr "Bestanden uploaden"
 
-#: crates/pdfs-gui/src/app/main.rs:1596
+#: crates/pdfs-gui/src/app/main.rs:1604
 msgid "Back / forward"
 msgstr "Terug / vooruit"
 
-#: crates/pdfs-gui/src/app/main.rs:1597
+#: crates/pdfs-gui/src/app/main.rs:1605
 #: crates/pdfs-gui/src/app/pages/browser.rs:2086
 msgid "Parent folder"
 msgstr "Bovenliggende map"
 
-#: crates/pdfs-gui/src/app/main.rs:1598
+#: crates/pdfs-gui/src/app/main.rs:1606
 msgid "Grid / list"
 msgstr "Raster / lijst"
 
-#: crates/pdfs-gui/src/app/main.rs:1599 crates/pdfs-gui/src/app/main.rs:1610
+#: crates/pdfs-gui/src/app/main.rs:1607 crates/pdfs-gui/src/app/main.rs:1618
 msgid "Larger thumbnails"
 msgstr "Grotere miniaturen"
 
-#: crates/pdfs-gui/src/app/main.rs:1600 crates/pdfs-gui/src/app/main.rs:1611
+#: crates/pdfs-gui/src/app/main.rs:1608 crates/pdfs-gui/src/app/main.rs:1619
 msgid "Smaller thumbnails"
 msgstr "Kleinere miniaturen"
 
-#: crates/pdfs-gui/src/app/main.rs:1601 crates/pdfs-gui/src/app/main.rs:1612
+#: crates/pdfs-gui/src/app/main.rs:1609 crates/pdfs-gui/src/app/main.rs:1620
 msgid "Reset thumbnail size"
 msgstr "Miniatuurgrootte herstellen"
 
-#: crates/pdfs-gui/src/app/main.rs:1602
+#: crates/pdfs-gui/src/app/main.rs:1610
 #: crates/pdfs-gui/src/app/pages/albums.rs:301
 #: crates/pdfs-gui/src/app/pages/browser.rs:1968
 #: crates/pdfs-gui/src/app/pages/browser.rs:1990
@@ -377,7 +377,7 @@ msgstr "Miniatuurgrootte herstellen"
 msgid "Rename"
 msgstr "Hernoemen"
 
-#: crates/pdfs-gui/src/app/main.rs:1603 crates/pdfs-gui/src/app/main.rs:1627
+#: crates/pdfs-gui/src/app/main.rs:1611 crates/pdfs-gui/src/app/main.rs:1635
 #: crates/pdfs-gui/src/app/pages/browser.rs:376
 #: crates/pdfs-gui/src/app/pages/browser.rs:959
 #: crates/pdfs-gui/src/app/pages/browser.rs:994
@@ -387,47 +387,47 @@ msgstr "Hernoemen"
 msgid "Move to Trash"
 msgstr "Naar prullenbak verplaatsen"
 
-#: crates/pdfs-gui/src/app/main.rs:1604
+#: crates/pdfs-gui/src/app/main.rs:1612
 msgid "Clear the selection"
 msgstr "Selectie wissen"
 
-#: crates/pdfs-gui/src/app/main.rs:1613
+#: crates/pdfs-gui/src/app/main.rs:1621
 msgid "Select all"
 msgstr "Alles selecteren"
 
-#: crates/pdfs-gui/src/app/main.rs:1614
+#: crates/pdfs-gui/src/app/main.rs:1622
 #: crates/pdfs-gui/src/app/pages/devices.rs:85
 #: crates/pdfs-gui/src/app/pages/shared.rs:109
 msgid "Back"
 msgstr "Terug"
 
-#: crates/pdfs-gui/src/app/main.rs:1618
+#: crates/pdfs-gui/src/app/main.rs:1626
 msgid "Photo Viewer"
 msgstr "Fotoweergave"
 
-#: crates/pdfs-gui/src/app/main.rs:1620
+#: crates/pdfs-gui/src/app/main.rs:1628
 msgid "Previous / next photo"
 msgstr "Vorige / volgende foto"
 
-#: crates/pdfs-gui/src/app/main.rs:1621
+#: crates/pdfs-gui/src/app/main.rs:1629
 msgid "First / last photo"
 msgstr "Eerste / laatste foto"
 
-#: crates/pdfs-gui/src/app/main.rs:1622
+#: crates/pdfs-gui/src/app/main.rs:1630
 msgid "Show details"
 msgstr "Details tonen"
 
-#: crates/pdfs-gui/src/app/main.rs:1623 crates/pdfs-gui/src/app/main.rs:1637
+#: crates/pdfs-gui/src/app/main.rs:1631 crates/pdfs-gui/src/app/main.rs:1645
 msgid "Fullscreen"
 msgstr "Volledig scherm"
 
-#: crates/pdfs-gui/src/app/main.rs:1624
+#: crates/pdfs-gui/src/app/main.rs:1632
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1946
 msgid "Slideshow"
 msgstr "Diavoorstelling"
 
 #. Translators: tooltip of a button that opens a menu of further actions.
-#: crates/pdfs-gui/src/app/main.rs:1625
+#: crates/pdfs-gui/src/app/main.rs:1633
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1346
 #: crates/pdfs-gui/src/app/pages/photos.rs:662
 #: crates/pdfs-gui/src/app/widgets/menu.rs:140
@@ -435,53 +435,53 @@ msgid "More"
 msgstr "Meer"
 
 #. Translators: menu item that puts the photo on the clipboard as an image.
-#: crates/pdfs-gui/src/app/main.rs:1626
+#: crates/pdfs-gui/src/app/main.rs:1634
 #: crates/pdfs-gui/src/app/pages/photo_viewer.rs:1959
 msgid "Copy Image"
 msgstr "Afbeelding kopiëren"
 
-#: crates/pdfs-gui/src/app/main.rs:1628
+#: crates/pdfs-gui/src/app/main.rs:1636
 #: crates/pdfs-gui/src/app/pages/status.rs:867
 msgid "Close"
 msgstr "Sluiten"
 
-#: crates/pdfs-gui/src/app/main.rs:1632
+#: crates/pdfs-gui/src/app/main.rs:1640
 msgid "Video Player"
 msgstr "Videospeler"
 
-#: crates/pdfs-gui/src/app/main.rs:1634
+#: crates/pdfs-gui/src/app/main.rs:1642
 msgid "Play / pause"
 msgstr "Afspelen / pauzeren"
 
-#: crates/pdfs-gui/src/app/main.rs:1635
+#: crates/pdfs-gui/src/app/main.rs:1643
 msgid "Back / forward 10 seconds"
 msgstr "10 seconden terug / vooruit"
 
-#: crates/pdfs-gui/src/app/main.rs:1636
+#: crates/pdfs-gui/src/app/main.rs:1644
 msgid "Mute"
 msgstr "Dempen"
 
-#: crates/pdfs-gui/src/app/main.rs:1766
+#: crates/pdfs-gui/src/app/main.rs:1774
 msgid "Select a single item to rename it"
 msgstr "Selecteer één item om het te hernoemen"
 
-#: crates/pdfs-gui/src/app/main.rs:1926
+#: crates/pdfs-gui/src/app/main.rs:1934
 #: crates/pdfs-gui/src/app/pages/albums.rs:85
 #: crates/pdfs-gui/src/app/pages/places.rs:104
 #: crates/pdfs-gui/src/app/pages/status.rs:1586
 msgid "Not connected"
 msgstr "Niet verbonden"
 
-#: crates/pdfs-gui/src/app/main.rs:1927
+#: crates/pdfs-gui/src/app/main.rs:1935
 msgid "The Proton Drive service isn't running."
 msgstr "De Proton Drive-service draait niet."
 
-#: crates/pdfs-gui/src/app/main.rs:1947 crates/pdfs-gui/src/app/main.rs:1962
+#: crates/pdfs-gui/src/app/main.rs:1955 crates/pdfs-gui/src/app/main.rs:1970
 #: crates/pdfs-gui/src/app/pages/status.rs:1592
 msgid "Can't open your Drive"
 msgstr "Kan Proton Drive niet openen"
 
-#: crates/pdfs-gui/src/app/main.rs:1950
+#: crates/pdfs-gui/src/app/main.rs:1958
 #, rust-format
 msgid ""
 "“{path}” already has files in it, and My files would hide them. Proton Drive "
@@ -492,7 +492,7 @@ msgstr ""
 "Drive probeert het zelf opnieuw zodra de map leeg is. Je kunt in Voorkeuren "
 "ook een andere map voor Mijn bestanden kiezen."
 
-#: crates/pdfs-gui/src/app/main.rs:1965
+#: crates/pdfs-gui/src/app/main.rs:1973
 #, rust-format
 msgid ""
 "The Proton Drive service keeps failing to start and tries again on its own. "
@@ -501,22 +501,22 @@ msgstr ""
 "De Proton Drive-service kan steeds niet starten en probeert het zelf "
 "opnieuw. Laatste fout: {error}"
 
-#: crates/pdfs-gui/src/app/main.rs:1973
+#: crates/pdfs-gui/src/app/main.rs:1981
 #: crates/pdfs-gui/src/app/pages/status.rs:364
 #: crates/pdfs-gui/src/hud/mod.rs:269 crates/pdfs-gui/src/hud/mod.rs:579
 #: crates/pdfs-gui/src/main.rs:491 crates/pdfs-gui/src/main.rs:533
 msgid "Connecting…"
 msgstr "Verbinden…"
 
-#: crates/pdfs-gui/src/app/main.rs:1974
+#: crates/pdfs-gui/src/app/main.rs:1982
 msgid "Waiting for the Proton Drive service to start."
 msgstr "Wachten tot de Proton Drive-service is gestart."
 
-#: crates/pdfs-gui/src/app/main.rs:1992
+#: crates/pdfs-gui/src/app/main.rs:2000
 msgid "Your Proton Drive Folder Isn't Empty"
 msgstr "Je Proton Drive-map is niet leeg"
 
-#: crates/pdfs-gui/src/app/main.rs:1996
+#: crates/pdfs-gui/src/app/main.rs:2004
 #, rust-format
 msgid ""
 "“{path}” already has {n} item in it. My files would hide it, so Proton Drive "
@@ -535,15 +535,15 @@ msgstr[1] ""
 "Drive opent daar niet. Verplaats de items naar een andere map, of kies een "
 "andere map voor Mijn bestanden."
 
-#: crates/pdfs-gui/src/app/main.rs:2002
+#: crates/pdfs-gui/src/app/main.rs:2010
 msgid "Not Now"
 msgstr "Niet nu"
 
-#: crates/pdfs-gui/src/app/main.rs:2003 crates/pdfs-gui/src/main.rs:498
+#: crates/pdfs-gui/src/app/main.rs:2011 crates/pdfs-gui/src/main.rs:498
 msgid "Open Folder"
 msgstr "Map openen"
 
-#: crates/pdfs-gui/src/app/main.rs:2004
+#: crates/pdfs-gui/src/app/main.rs:2012
 msgid "Choose Another Folder…"
 msgstr "Andere map kiezen…"
 
@@ -758,7 +758,7 @@ msgstr[0] "{n} map aangemaakt"
 msgstr[1] "{n} mappen aangemaakt"
 
 #: crates/pdfs-gui/src/app/pages/activity.rs:983
-#: crates/pdfs-gui/src/i18n.rs:195
+#: crates/pdfs-gui/src/i18n.rs:220
 #, rust-format
 msgid "{n} change"
 msgid_plural "{n} changes"
@@ -1989,7 +1989,7 @@ msgstr[1] "{n} mappen"
 #. Translators: a count of images and videos that can have a thumbnail.
 #: crates/pdfs-gui/src/app/pages/browser.rs:1803
 #: crates/pdfs-gui/src/app/pages/browser.rs:3200
-#: crates/pdfs-gui/src/i18n.rs:252
+#: crates/pdfs-gui/src/i18n.rs:303
 #, rust-format
 msgid "{n} file"
 msgid_plural "{n} files"
@@ -3308,7 +3308,7 @@ msgid "The Proton Drive service hasn't reported its folder yet."
 msgstr "De Proton Drive-service heeft zijn map nog niet gemeld."
 
 #: crates/pdfs-gui/src/app/pages/locations.rs:1309
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:168
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:178
 #, rust-format
 msgid "{path} · {state}"
 msgstr "{path} · {state}"
@@ -4672,7 +4672,7 @@ msgid "Use the built-in patterns again"
 msgstr "Weer de ingebouwde patronen gebruiken"
 
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:36
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:40
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:42
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:91
 msgid "Excluded Files"
 msgstr "Uitgesloten bestanden"
@@ -4690,8 +4690,8 @@ msgstr ""
 "iets weer op te nemen. Uitsluiten verwijdert nooit iets uit Proton Drive."
 
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:43
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:29
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:253
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:31
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:263
 msgid "Add Pattern"
 msgstr "Patroon toevoegen"
 
@@ -4733,7 +4733,7 @@ msgid "Your own patterns are removed, and the built-in ones apply again."
 msgstr "Je eigen patronen worden verwijderd, en de ingebouwde gelden weer."
 
 #: crates/pdfs-gui/src/app/pages/preferences_sync.rs:214
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:393
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:403
 #: crates/pdfs-gui/src/app/widgets/ignore_dialog.rs:291
 msgid "Couldn't save the patterns"
 msgstr "Kan de patronen niet opslaan"
@@ -5738,92 +5738,110 @@ msgid_plural "Show all {n} files"
 msgstr[0] "Alle {n} bestand tonen"
 msgstr[1] "Alle {n} bestanden tonen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:34
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:36
 msgid "Leave files matching a pattern out of all synced folders or one of them"
-msgstr "Bestanden die op een patroon passen weglaten uit alle gesynchroniseerde mappen of uit één ervan"
+msgstr ""
+"Bestanden die op een patroon passen weglaten uit alle gesynchroniseerde "
+"mappen of uit één ervan"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:42
-msgid "Files matching these patterns stay on this computer and are not synced. Excluding never deletes anything from Proton Drive."
-msgstr "Bestanden die op deze patronen passen blijven op deze computer en worden niet gesynchroniseerd. Uitsluiten verwijdert nooit iets uit Proton Drive."
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:44
+msgid ""
+"Files matching these patterns stay on this computer and are not synced. "
+"Excluding never deletes anything from Proton Drive."
+msgstr ""
+"Bestanden die op deze patronen passen blijven op deze computer en worden "
+"niet gesynchroniseerd. Uitsluiten verwijdert nooit iets uit Proton Drive."
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:102
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:101
 msgid "All Synced Folders"
 msgstr "Alle gesynchroniseerde mappen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:161
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:117
+msgid "No folder is set to Synced"
+msgstr "Geen map staat op “Gesynchroniseerd”"
+
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:119
+msgid "Patterns apply only to folders kept on this computer. Online-only folders upload every file saved in them."
+msgstr "Patronen gelden alleen voor mappen die op deze computer worden bewaard. Mappen die alleen online zijn, uploaden elk bestand dat erin wordt opgeslagen."
+
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:171
 msgid "no own patterns"
 msgstr "geen eigen patronen"
 
 #. Translators: how many patterns a synced folder has of its own.
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:163
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:173
 #, rust-format
 msgid "{n} own pattern"
 msgid_plural "{n} own patterns"
 msgstr[0] "{n} eigen patroon"
 msgstr[1] "{n} eigen patronen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:164
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:174
 msgid "own patterns unreadable"
 msgstr "eigen patronen onleesbaar"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:184
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:194
 msgid "No patterns: every file is synced"
 msgstr "Geen patronen: elk bestand wordt gesynchroniseerd"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:185
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:195
 #, rust-format
 msgid "{n} built-in pattern"
 msgid_plural "{n} built-in patterns"
 msgstr[0] "{n} ingebouwd patroon"
 msgstr[1] "{n} ingebouwde patronen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:186
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:196
 #, rust-format
 msgid "{n} pattern"
 msgid_plural "{n} patterns"
 msgstr[0] "{n} patroon"
 msgstr[1] "{n} patronen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:194
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:204
 msgid "Pattern"
 msgstr "Patroon"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:196
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:206
 msgid "All synced folders"
 msgstr "Alle gesynchroniseerde mappen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:204
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:214
 msgid "Apply To"
 msgstr "Toepassen op"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:216
-msgid "Use * for any characters, such as *.db, and end a pattern with / to match folders only, such as build/."
-msgstr "Gebruik * voor willekeurige tekens, zoals *.db, en eindig een patroon op / om alleen mappen te laten passen, zoals build/."
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:226
+msgid ""
+"Use * for any characters, such as *.db, and end a pattern with / to match "
+"folders only, such as build/."
+msgstr ""
+"Gebruik * voor willekeurige tekens, zoals *.db, en eindig een patroon op / "
+"om alleen mappen te laten passen, zoals build/."
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:240
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:250
 msgid "Add"
 msgstr "Toevoegen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:318
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:328
 msgid "A line starting with # is a comment, not a pattern."
 msgstr "Een regel die met # begint is een opmerking, geen patroon."
 
 #. Translators: {pattern} is what the user typed as a pattern.
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:324
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:334
 #, rust-format
 msgid "“{pattern}” isn't a valid pattern."
 msgstr "“{pattern}” is geen geldig patroon."
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:342
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:352
 msgid "all synced folders"
 msgstr "alle gesynchroniseerde mappen"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:372
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:382
 #, rust-format
 msgid "“{pattern}” is now excluded in {place}"
 msgstr "“{pattern}” wordt nu uitgesloten in {place}"
 
-#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:377
+#: crates/pdfs-gui/src/app/pages/sync_exclusions.rs:387
 #, rust-format
 msgid "“{pattern}” was already excluded in {place}"
 msgstr "“{pattern}” werd al uitgesloten in {place}"
@@ -7077,37 +7095,37 @@ msgctxt "file state"
 msgid "Online only"
 msgstr "Alleen online"
 
-#: crates/pdfs-gui/src/i18n.rs:85
+#: crates/pdfs-gui/src/i18n.rs:110
 msgid "Kosovo"
 msgstr "Kosovo"
 
-#: crates/pdfs-gui/src/i18n.rs:182
+#: crates/pdfs-gui/src/i18n.rs:207
 #, rust-format
 msgid "{n} upload queued"
 msgid_plural "{n} uploads queued"
 msgstr[0] "{n} upload in wachtrij"
 msgstr[1] "{n} uploads in wachtrij"
 
-#: crates/pdfs-gui/src/i18n.rs:188
+#: crates/pdfs-gui/src/i18n.rs:213
 #, rust-format
 msgid "{n} change queued"
 msgid_plural "{n} changes queued"
 msgstr[0] "{n} wijziging in wachtrij"
 msgstr[1] "{n} wijzigingen in wachtrij"
 
-#: crates/pdfs-gui/src/i18n.rs:194
+#: crates/pdfs-gui/src/i18n.rs:219
 #, rust-format
 msgid "{n} upload"
 msgid_plural "{n} uploads"
 msgstr[0] "{n} upload"
 msgstr[1] "{n} uploads"
 
-#: crates/pdfs-gui/src/i18n.rs:198
+#: crates/pdfs-gui/src/i18n.rs:223
 #, rust-format
 msgid "{uploads}, {changes} queued"
 msgstr "{uploads}, {changes} in wachtrij"
 
-#: crates/pdfs-gui/src/i18n.rs:255
+#: crates/pdfs-gui/src/i18n.rs:306
 #, rust-format
 msgid "{n} file in {dir}"
 msgid_plural "{n} files in {dir}"
